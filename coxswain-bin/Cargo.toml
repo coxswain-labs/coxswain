@@ -1,0 +1,20 @@
+[package]
+name = "coxswain-bin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "coxswain"
+path = "src/main.rs"
+
+[dependencies]
+arc-swap = { workspace = true }
+coxswain-core = { workspace = true }
+coxswain-controller = { workspace = true }
+coxswain-proxy = { workspace = true }
+clap = { workspace = true }
+pingora-core = { workspace = true }
+pingora-proxy = { workspace = true }
+tokio = { workspace = true }
