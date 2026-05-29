@@ -3,6 +3,7 @@ use arc_swap::ArcSwap;
 use clap::{Parser, ValueEnum};
 use coxswain_controller::watcher::Controller;
 use coxswain_core::routing::RoutingTable;
+use coxswain_proxy::engine::RoutingEngine;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::services::background::background_service;
@@ -78,14 +79,28 @@ pub struct Config {
     #[arg(long, env = "COXSWAIN_PROXY_THREADS", default_value_t = 2)]
     pub proxy_threads: usize,
 
-    /// Time to drain in-flight requests before closing connections on shutdown.
+    /// Drain window before the final shutdown step.
     ///
+    /// After a shutdown signal, existing connections are given this long to complete
+    /// before the final runtime-shutdown step begins.
     /// Accepts human-readable durations: `30s`, `1m`, `1m30s`. Set to `0s` to disable.
     /// Maps to Pingora's `grace_period_seconds`.
     #[arg(
         long,
-        env = "COXSWAIN_PROXY_SHUTDOWN_TIMEOUT",
+        env = "COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD",
         default_value = "30s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub proxy_shutdown_grace_period: Duration,
+
+    /// Hard deadline for the final runtime-shutdown step after the grace period expires.
+    ///
+    /// Accepts human-readable durations: `5s`, `10s`. Set to `0s` to disable.
+    /// Maps to Pingora's `graceful_shutdown_timeout_seconds`.
+    #[arg(
+        long,
+        env = "COXSWAIN_PROXY_SHUTDOWN_TIMEOUT",
+        default_value = "5s",
         value_parser = humantime::parse_duration,
     )]
     pub proxy_shutdown_timeout: Duration,
@@ -111,31 +126,29 @@ fn main() -> Result<()> {
     );
 
     let mut server = build_server(&args);
-    let routes = build_routing_table();
+    let engine = build_routing_engine();
+    let shared_table = engine.shared_table();
     let synced = build_flag();
     let leader = build_flag();
     register_controller(
         &mut server,
-        routes.clone(),
+        shared_table.clone(),
         synced.clone(),
         leader.clone(),
         args.controller_name.clone(),
         args.pod_name.clone(),
         args.pod_namespace.clone(),
     );
-    register_proxy(&mut server, routes.clone(), args.proxy_http_port);
-    register_health(
-        &mut server,
-        routes.clone(),
-        synced.clone(),
-        args.health_port,
-    );
-    register_admin(&mut server, routes, synced, leader, args.admin_port);
+    register_proxy(&mut server, engine, args.proxy_http_port);
+    register_health(&mut server, synced.clone(), args.health_port);
+    register_admin(&mut server, shared_table, synced, leader, args.admin_port);
 
     tracing::info!(
         proxy_port = args.proxy_http_port,
         health_port = args.health_port,
         admin_port = args.admin_port,
+        proxy_shutdown_grace_period = ?args.proxy_shutdown_grace_period,
+        proxy_shutdown_timeout = ?args.proxy_shutdown_timeout,
         "Listening"
     );
     server.run_forever();
@@ -144,7 +157,8 @@ fn main() -> Result<()> {
 fn build_server(args: &Config) -> Server {
     let conf = ServerConf {
         threads: args.proxy_threads,
-        grace_period_seconds: Some(args.proxy_shutdown_timeout.as_secs()),
+        grace_period_seconds: Some(args.proxy_shutdown_grace_period.as_secs()),
+        graceful_shutdown_timeout_seconds: Some(args.proxy_shutdown_timeout.as_secs()),
         ..Default::default()
     };
 
@@ -153,8 +167,8 @@ fn build_server(args: &Config) -> Server {
     server
 }
 
-fn build_routing_table() -> Arc<ArcSwap<RoutingTable>> {
-    Arc::new(ArcSwap::from_pointee(RoutingTable::new()))
+fn build_routing_engine() -> Arc<RoutingEngine> {
+    Arc::new(RoutingEngine::new(RoutingTable::default()))
 }
 
 fn build_flag() -> Arc<AtomicBool> {
@@ -184,15 +198,10 @@ fn register_controller(
     server.add_service(controller);
 }
 
-fn register_health(
-    server: &mut Server,
-    routes: Arc<ArcSwap<RoutingTable>>,
-    synced: Arc<AtomicBool>,
-    port: u16,
-) {
+fn register_health(server: &mut Server, synced: Arc<AtomicBool>, port: u16) {
     use coxswain_proxy::health::HealthService;
     use pingora_core::services::listening::Service;
-    let mut svc = Service::new("health".to_string(), HealthService { synced, routes });
+    let mut svc = Service::new("health".to_string(), HealthService { synced });
     svc.add_tcp(&format!("0.0.0.0:{port}"));
     server.add_service(svc);
 }
@@ -214,8 +223,8 @@ fn register_admin(
     );
 }
 
-fn register_proxy(server: &mut Server, routes: Arc<ArcSwap<RoutingTable>>, port: u16) {
-    let proxy_logic = coxswain_proxy::engine::CoxswainProxy { routes };
+fn register_proxy(server: &mut Server, engine: Arc<RoutingEngine>, port: u16) {
+    let proxy_logic = coxswain_proxy::engine::CoxswainProxy { engine };
     let mut proxy_service =
         http_proxy_service_with_name(&server.configuration, proxy_logic, "proxy");
     proxy_service.add_tcp(&format!("0.0.0.0:{port}"));

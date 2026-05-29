@@ -1,8 +1,8 @@
-use crate::gateway_api::GatewayApiTranslator;
-use crate::ingress::IngressTranslator;
+use crate::gateway_api::GatewayApiReconciler;
+use crate::ingress::IngressReconciler;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use coxswain_core::routing::RoutingTable;
+use coxswain_core::routing::{RoutingTable, RoutingTableBuilder};
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::httproutes::{
@@ -35,7 +35,7 @@ fn gateway_class_accepted(gc: &GatewayClass) -> bool {
     )
 }
 
-fn httproute_programmed(route: &HTTPRoute, controller_name: &str) -> bool {
+fn http_route_programmed(route: &HTTPRoute, controller_name: &str) -> bool {
     route
         .status
         .as_ref()
@@ -147,9 +147,9 @@ impl Controller {
                             tracing::info!("Ingress initial sync complete");
                         }
                         Ok(e) => {
-                            let mut table = (**self.shared_routes.load()).clone();
-                            IngressTranslator::translate(e, &mut table);
-                            self.shared_routes.store(Arc::new(table));
+                            let mut builder = RoutingTableBuilder::new();
+                            IngressReconciler::translate(e, &mut builder);
+                            self.store_table(builder);
                         }
                         Err(e) => tracing::warn!(error = %e, "Ingress watch error"),
                     }
@@ -163,12 +163,12 @@ impl Controller {
                         }
                         Ok(watcher::Event::Apply(route) | watcher::Event::InitApply(route)) => {
                             // All replicas update the local data plane unconditionally.
-                            let mut table = (**self.shared_routes.load()).clone();
-                            GatewayApiTranslator::apply(&route, &mut table);
-                            self.shared_routes.store(Arc::new(table));
+                            let mut builder = RoutingTableBuilder::new();
+                            GatewayApiReconciler::apply(&route, &mut builder);
+                            self.store_table(builder);
                             // Only the leader writes status back to the API server.
-                            if is_leader && !httproute_programmed(&route, &self.controller_name) {
-                                Self::mark_httproute_programmed(
+                            if is_leader && !http_route_programmed(&route, &self.controller_name) {
+                                Self::mark_http_route_programmed(
                                     &client,
                                     &route,
                                     &self.controller_name,
@@ -179,9 +179,9 @@ impl Controller {
                             }
                         }
                         Ok(e) => {
-                            let mut table = (**self.shared_routes.load()).clone();
-                            GatewayApiTranslator::translate(e, &mut table);
-                            self.shared_routes.store(Arc::new(table));
+                            let mut builder = RoutingTableBuilder::new();
+                            GatewayApiReconciler::translate(e, &mut builder);
+                            self.store_table(builder);
                         }
                         Err(e) => tracing::warn!(
                             error = %e,
@@ -229,6 +229,13 @@ impl Controller {
         }
     }
 
+    fn store_table(&self, builder: RoutingTableBuilder) {
+        match builder.build() {
+            Ok(table) => self.shared_routes.store(Arc::new(table)),
+            Err(e) => tracing::warn!(error = %e, "Failed to build routing table"),
+        }
+    }
+
     async fn try_renew(lease_lock: &LeaseLock, pod_name: &str) -> bool {
         match lease_lock.try_acquire_or_renew().await {
             Ok(LeaseLockResult::Acquired(_)) => true,
@@ -261,7 +268,7 @@ impl Controller {
         }
     }
 
-    async fn mark_httproute_programmed(client: &Client, route: &HTTPRoute, controller_name: &str) {
+    async fn mark_http_route_programmed(client: &Client, route: &HTTPRoute, controller_name: &str) {
         let name = match route.metadata.name.as_deref() {
             Some(n) => n,
             None => return,
