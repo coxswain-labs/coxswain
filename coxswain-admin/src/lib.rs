@@ -6,6 +6,7 @@ use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::protocols::http::ServerSession;
 use pingora_core::services::listening::Service;
 use prometheus::{Encoder, TextEncoder};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -16,11 +17,11 @@ pub struct AdminService {
 }
 
 impl AdminService {
-    pub fn into_service(self, port: u16) -> Service<HttpServer<Self>> {
+    pub fn into_service(self, addr: SocketAddr) -> Service<HttpServer<Self>> {
         let mut http_server = HttpServer::new_app(self);
         http_server.add_module(ResponseCompressionBuilder::enable(7));
         let mut svc = Service::new("admin".to_string(), http_server);
-        svc.add_tcp(&format!("0.0.0.0:{port}"));
+        svc.add_tcp(&addr.to_string());
         svc
     }
 }

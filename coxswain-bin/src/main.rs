@@ -8,6 +8,7 @@ use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::services::background::background_service;
 use pingora_proxy::http_proxy_service_with_name;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -66,13 +67,6 @@ pub struct Config {
     #[arg(long, env = "COXSWAIN_LOG", default_value = "info")]
     pub log_filter: String,
 
-    /// Port to listen on for inbound HTTP traffic.
-    #[arg(long, env = "COXSWAIN_PROXY_HTTP_PORT", default_value_t = 8080)]
-    pub proxy_http_port: u16,
-
-    // /// Port to listen on for inbound HTTPS traffic.
-    // #[arg(long, env = "COXSWAIN_PROXY_HTTPS_PORT", default_value_t = 8443)]
-    // pub proxy_https_port: u16,
     /// Worker threads per proxy service.
     ///
     /// Threads are not shared across services. Set to the available CPU core count for maximum throughput.
@@ -105,13 +99,17 @@ pub struct Config {
     )]
     pub proxy_shutdown_timeout: Duration,
 
-    /// Port to listen on for liveness and readiness health endpoints.
-    #[arg(long, env = "COXSWAIN_HEALTH_PORT", default_value_t = 8081)]
-    pub health_port: u16,
+    /// Socket address to listen on for the admin, metrics, and diagnostics endpoints.
+    #[arg(long, env = "COXSWAIN_ADMIN_ADDR", default_value = "0.0.0.0:8082")]
+    pub admin_addr: SocketAddr,
 
-    /// Port to listen on for the admin, metrics, and diagnostics endpoints.
-    #[arg(long, env = "COXSWAIN_ADMIN_PORT", default_value_t = 8082)]
-    pub admin_port: u16,
+    /// Socket address to listen on for liveness and readiness health endpoints.
+    #[arg(long, env = "COXSWAIN_HEALTH_ADDR", default_value = "0.0.0.0:8081")]
+    pub health_addr: SocketAddr,
+
+    /// Socket address to listen on for inbound HTTP traffic.
+    #[arg(long, env = "COXSWAIN_PROXY_ADDR", default_value = "0.0.0.0:8080")]
+    pub proxy_addr: SocketAddr,
 }
 
 fn main() -> Result<()> {
@@ -140,14 +138,14 @@ fn main() -> Result<()> {
         args.pod_namespace.clone(),
     );
     register_reconciler(&mut server, routing_table.clone());
-    register_proxy(&mut server, engine, args.proxy_http_port);
-    register_health(&mut server, synced.clone(), args.health_port);
-    register_admin(&mut server, routing_table, synced, leader, args.admin_port);
+    register_proxy(&mut server, engine, args.proxy_addr);
+    register_health(&mut server, synced.clone(), args.health_addr);
+    register_admin(&mut server, routing_table, synced, leader, args.admin_addr);
 
     tracing::info!(
-        proxy_port = args.proxy_http_port,
-        health_port = args.health_port,
-        admin_port = args.admin_port,
+        proxy_addr = %args.proxy_addr,
+        health_addr = %args.health_addr,
+        admin_addr = %args.admin_addr,
         proxy_shutdown_grace_period = ?args.proxy_shutdown_grace_period,
         proxy_shutdown_timeout = ?args.proxy_shutdown_timeout,
         "Listening"
@@ -191,11 +189,11 @@ fn register_controller(
     server.add_service(controller);
 }
 
-fn register_health(server: &mut Server, synced: Arc<AtomicBool>, port: u16) {
+fn register_health(server: &mut Server, synced: Arc<AtomicBool>, addr: SocketAddr) {
     use coxswain_proxy::health::HealthService;
     use pingora_core::services::listening::Service;
     let mut svc = Service::new("health".to_string(), HealthService { synced });
-    svc.add_tcp(&format!("0.0.0.0:{port}"));
+    svc.add_tcp(&addr.to_string());
     server.add_service(svc);
 }
 
@@ -204,7 +202,7 @@ fn register_admin(
     routes: SharedRoutingTable,
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
-    port: u16,
+    addr: SocketAddr,
 ) {
     server.add_service(
         coxswain_admin::AdminService {
@@ -212,7 +210,7 @@ fn register_admin(
             leader,
             routes,
         }
-        .into_service(port),
+        .into_service(addr),
     );
 }
 
@@ -223,11 +221,11 @@ fn register_reconciler(server: &mut Server, routes: SharedRoutingTable) {
     ));
 }
 
-fn register_proxy(server: &mut Server, engine: Arc<RoutingEngine>, port: u16) {
+fn register_proxy(server: &mut Server, engine: Arc<RoutingEngine>, addr: SocketAddr) {
     let proxy_logic = coxswain_proxy::engine::CoxswainProxy { engine };
     let mut proxy_service =
         http_proxy_service_with_name(&server.configuration, proxy_logic, "proxy");
-    proxy_service.add_tcp(&format!("0.0.0.0:{port}"));
+    proxy_service.add_tcp(&addr.to_string());
     server.add_service(proxy_service);
 }
 
