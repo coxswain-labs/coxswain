@@ -159,6 +159,15 @@ fn rebuild(
     }
     match builder.build() {
         Ok(table) => {
+            for c in table.conflicts() {
+                tracing::warn!(
+                    host = %c.host,
+                    path = %c.path,
+                    kind = c.kind.as_str(),
+                    rejected_upstream = %c.rejected_upstream,
+                    "Route conflict: path already claimed by an earlier rule — ignoring"
+                );
+            }
             shared.store(Arc::new(table));
             tracing::info!(
                 http_routes = routes.len(),

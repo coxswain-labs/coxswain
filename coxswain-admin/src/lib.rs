@@ -59,8 +59,38 @@ fn metrics_response() -> Response<Vec<u8>> {
 
 fn routes_response(routes: &SharedRoutingTable) -> Response<Vec<u8>> {
     let table = routes.load();
-    let hosts = table.host_names();
-    let body = serde_json::json!({ "hosts": hosts }).to_string();
+    let hosts: Vec<serde_json::Value> = table
+        .host_routes()
+        .into_iter()
+        .map(|(host, router)| {
+            let routes: Vec<serde_json::Value> = router
+                .routes()
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "type": r.kind.as_str(),
+                        "path": r.path,
+                        "upstream": r.upstream.name,
+                        "endpoints": r.upstream.endpoints().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            serde_json::json!({ "host": host, "routes": routes })
+        })
+        .collect();
+    let conflicts: Vec<serde_json::Value> = table
+        .conflicts()
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "host": c.host,
+                "type": c.kind.as_str(),
+                "path": c.path,
+                "rejected_upstream": c.rejected_upstream,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({ "hosts": hosts, "conflicts": conflicts }).to_string();
     json_response(body)
 }
 

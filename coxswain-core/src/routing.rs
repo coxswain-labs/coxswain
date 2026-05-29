@@ -66,6 +66,11 @@ impl Upstream {
         }
     }
 
+    /// Returns all endpoints in this upstream.
+    pub fn endpoints(&self) -> &[SocketAddr] {
+        &self.endpoints
+    }
+
     /// Returns the next endpoint using round-robin selection.
     ///
     /// Returns `None` if the upstream has no endpoints.
@@ -78,14 +83,55 @@ impl Upstream {
     }
 }
 
+/// How a path rule was registered — for introspection only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    Exact,
+    Prefix,
+    Regex,
+}
+
+impl RouteKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteKind::Exact => "exact",
+            RouteKind::Prefix => "prefix",
+            RouteKind::Regex => "regex",
+        }
+    }
+}
+
+/// Snapshot of a single path rule, kept alongside the compiled router for inspection.
+pub struct RouteInfo {
+    pub path: String,
+    pub kind: RouteKind,
+    pub upstream: Arc<Upstream>,
+}
+
+/// A path rule that was silently dropped because an earlier rule already claimed the same slot.
+pub struct RouteConflict {
+    /// Host pattern where the conflict occurred (`"*"` for catch-all, `"*.example.com"` for wildcard).
+    pub host: String,
+    pub path: String,
+    pub kind: RouteKind,
+    /// `Upstream::name` of the rule that was rejected.
+    pub rejected_upstream: String,
+}
+
 /// Compiled path-level router for a single virtual hostname.
 pub struct HostRouter {
     router: Router<Arc<Upstream>>,
     regex_set: RegexSet,
     regex_routes: Vec<(Regex, Arc<Upstream>)>,
+    route_info: Vec<RouteInfo>,
 }
 
 impl HostRouter {
+    /// All registered path rules, in insertion order, for introspection.
+    pub fn routes(&self) -> &[RouteInfo] {
+        &self.route_info
+    }
+
     /// Resolves `path` to an upstream. Checks matchit first, then the regex fallback.
     pub fn route(&self, path: &str) -> Option<Arc<Upstream>> {
         if let Ok(m) = self.router.at(path) {
@@ -122,25 +168,52 @@ impl HostRouterBuilder {
         self
     }
 
-    pub(crate) fn build(self) -> Result<HostRouter, RouterError> {
+    pub(crate) fn build(self, host: &str) -> Result<(HostRouter, Vec<RouteConflict>), RouterError> {
         let mut router = Router::new();
+        let mut route_info: Vec<RouteInfo> = Vec::new();
+        let mut conflicts: Vec<RouteConflict> = Vec::new();
 
         for (path, upstream) in self.exact_routes {
-            router.insert(path, upstream)?;
+            match router.insert(path.clone(), Arc::clone(&upstream)) {
+                Ok(()) => route_info.push(RouteInfo { path, kind: RouteKind::Exact, upstream }),
+                Err(_) => conflicts.push(RouteConflict {
+                    host: host.to_string(),
+                    path,
+                    kind: RouteKind::Exact,
+                    rejected_upstream: upstream.name.clone(),
+                }),
+            }
         }
 
         for (path, upstream) in self.prefix_routes {
             // Normalise: strip any trailing slash so "/api/" and "/api" are treated identically.
             let base = path.trim_end_matches('/');
-            if base.is_empty() {
+            let (p1, p2) = if base.is_empty() {
                 // Root prefix "/": matchit's {*rest} does not match an empty tail, so
                 // insert "/" explicitly for the root path itself.
-                router.insert("/".to_string(), upstream.clone())?;
-                router.insert("/{*rest}".to_string(), upstream)?;
+                ("/".to_string(), "/{*rest}".to_string())
             } else {
                 // Two inserts: the bare path itself, and everything beneath it.
-                router.insert(base.to_string(), upstream.clone())?;
-                router.insert(format!("{base}/{{*rest}}"), upstream)?;
+                (base.to_string(), format!("{base}/{{*rest}}"))
+            };
+
+            match router.insert(p1, Arc::clone(&upstream)) {
+                Ok(()) => {
+                    // Base inserted; the wildcard should succeed too — any failure here is an
+                    // edge case (another rule claimed the exact wildcard path). Still mark active
+                    // since the base path is routing.
+                    let _ = router.insert(p2, Arc::clone(&upstream));
+                    route_info.push(RouteInfo { path, kind: RouteKind::Prefix, upstream });
+                }
+                Err(_) => {
+                    // Base path already claimed by an earlier rule — skip the whole prefix.
+                    conflicts.push(RouteConflict {
+                        host: host.to_string(),
+                        path,
+                        kind: RouteKind::Prefix,
+                        rejected_upstream: upstream.name.clone(),
+                    });
+                }
             }
         }
 
@@ -149,14 +222,13 @@ impl HostRouterBuilder {
         let regex_routes = self
             .regex_routes
             .into_iter()
-            .map(|(p, u)| Ok((Regex::new(&p)?, u)))
+            .map(|(p, u)| {
+                route_info.push(RouteInfo { path: p.clone(), kind: RouteKind::Regex, upstream: Arc::clone(&u) });
+                Ok((Regex::new(&p)?, u))
+            })
             .collect::<Result<Vec<_>, regex::Error>>()?;
 
-        Ok(HostRouter {
-            router,
-            regex_set,
-            regex_routes,
-        })
+        Ok((HostRouter { router, regex_set, regex_routes, route_info }, conflicts))
     }
 }
 
@@ -193,27 +265,49 @@ impl RoutingTableBuilder {
     }
 
     /// Compiles all registered routes into an immutable [`RoutingTable`].
+    ///
+    /// Conflicts (duplicate host+path claims) are resolved by first-writer wins; the losing rules
+    /// are collected in [`RoutingTable::conflicts`] rather than failing the whole build.
     pub fn build(self) -> Result<RoutingTable, RouterError> {
+        let mut conflicts: Vec<RouteConflict> = Vec::new();
+
         let exact_hosts = self
             .exact_hosts
             .into_iter()
-            .map(|(h, b)| Ok((h, b.build()?)))
+            .map(|(h, b)| {
+                let (router, cs) = b.build(&h)?;
+                conflicts.extend(cs);
+                Ok((h, router))
+            })
             .collect::<Result<HashMap<_, _>, RouterError>>()?;
 
         let mut wildcard_hosts: Vec<(String, HostRouter)> = self
             .wildcard_hosts
             .into_iter()
-            .map(|(suffix, b)| Ok((suffix, b.build()?)))
+            .map(|(suffix, b)| {
+                let pattern = format!("*.{suffix}");
+                let (router, cs) = b.build(&pattern)?;
+                conflicts.extend(cs);
+                Ok((suffix, router))
+            })
             .collect::<Result<Vec<_>, RouterError>>()?;
         // Most specific (longest suffix) first — matches K8s Gateway API precedence.
         wildcard_hosts.sort_by_key(|e| Reverse(e.0.len()));
 
-        let catchall = self.catchall.map(HostRouterBuilder::build).transpose()?;
+        let catchall = match self.catchall {
+            Some(b) => {
+                let (router, cs) = b.build("*")?;
+                conflicts.extend(cs);
+                Some(router)
+            }
+            None => None,
+        };
 
         Ok(RoutingTable {
             exact_hosts,
             wildcard_hosts,
             catchall,
+            conflicts,
         })
     }
 }
@@ -228,6 +322,8 @@ pub struct RoutingTable {
     /// Sorted most-specific (longest suffix) first.
     wildcard_hosts: Vec<(String, HostRouter)>,
     catchall: Option<HostRouter>,
+    /// Rules that were dropped because an earlier rule already claimed the same host+path slot.
+    conflicts: Vec<RouteConflict>,
 }
 
 impl RoutingTable {
@@ -242,6 +338,29 @@ impl RoutingTable {
             }
         }
         self.catchall.as_ref()?.route(path)
+    }
+
+    /// Rules dropped due to host+path conflicts, in the order they were encountered.
+    pub fn conflicts(&self) -> &[RouteConflict] {
+        &self.conflicts
+    }
+
+    /// All host entries with their compiled routers, for introspection.
+    ///
+    /// Yields `(host_pattern, router)` tuples: exact hostnames as-is, wildcard
+    /// patterns with their `*.` prefix restored, and `"*"` for the catch-all.
+    pub fn host_routes(&self) -> Vec<(String, &HostRouter)> {
+        let mut result: Vec<(String, &HostRouter)> = Vec::new();
+        for (host, router) in &self.exact_hosts {
+            result.push((host.clone(), router));
+        }
+        for (suffix, router) in &self.wildcard_hosts {
+            result.push((format!("*.{suffix}"), router));
+        }
+        if let Some(router) = &self.catchall {
+            result.push(("*".to_string(), router));
+        }
+        result
     }
 
     /// All configured hostnames (exact and wildcard). Wildcard patterns include the `*.` prefix.
