@@ -1,18 +1,18 @@
-use coxswain_core::routing::RoutingTable;
+use coxswain_core::routing::RoutingTableBuilder;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
 use kube::runtime::watcher;
 
-pub struct GatewayApiTranslator;
+pub struct GatewayApiReconciler;
 
-impl GatewayApiTranslator {
-    pub fn apply(route: &HTTPRoute, _table: &mut RoutingTable) {
+impl GatewayApiReconciler {
+    pub fn apply(route: &HTTPRoute, _builder: &mut RoutingTableBuilder) {
         tracing::info!(name = ?route.metadata.name, "Reconciling Gateway HTTPRoute");
     }
 
-    pub fn translate(event: watcher::Event<HTTPRoute>, table: &mut RoutingTable) {
+    pub fn translate(event: watcher::Event<HTTPRoute>, builder: &mut RoutingTableBuilder) {
         match event {
             watcher::Event::Apply(route) | watcher::Event::InitApply(route) => {
-                Self::apply(&route, table);
+                Self::apply(&route, builder);
             }
             watcher::Event::Delete(route) => {
                 tracing::info!(name = ?route.metadata.name, "Deleting Gateway HTTPRoute paths");

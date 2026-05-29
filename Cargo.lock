@@ -501,9 +501,9 @@ dependencies = [
 name = "coxswain-core"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "matchit",
- "serde",
+ "regex",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

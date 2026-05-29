@@ -60,7 +60,7 @@ fn metrics_response() -> Response<Vec<u8>> {
 
 fn routes_response(routes: &Arc<ArcSwap<RoutingTable>>) -> Response<Vec<u8>> {
     let table = routes.load();
-    let hosts: Vec<&str> = table.hosts.keys().map(String::as_str).collect();
+    let hosts = table.host_names();
     let body = serde_json::json!({ "hosts": hosts }).to_string();
     json_response(body)
 }
@@ -75,7 +75,7 @@ fn status_response(
         "version": env!("CARGO_PKG_VERSION"),
         "synced": synced.load(Ordering::Acquire),
         "leader": leader.load(Ordering::Acquire),
-        "host_count": table.hosts.len(),
+        "host_count": table.host_count(),
     })
     .to_string();
     json_response(body)

@@ -1,6 +1,4 @@
-use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use coxswain_core::routing::RoutingTable;
 use http::Response;
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
@@ -9,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct HealthService {
     pub synced: Arc<AtomicBool>,
-    pub routes: Arc<ArcSwap<RoutingTable>>,
 }
 
 #[async_trait]
