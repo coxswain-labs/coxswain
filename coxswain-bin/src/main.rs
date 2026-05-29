@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use arc_swap::ArcSwap;
 use clap::{Parser, ValueEnum};
-use coxswain_controller::watcher::Controller;
-use coxswain_core::routing::RoutingTable;
+use coxswain_controller::controller::Controller;
+use coxswain_controller::reconciler::ReconcilerService;
+use coxswain_core::routing::SharedRoutingTable;
 use coxswain_proxy::engine::RoutingEngine;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt, ServerConf};
@@ -126,22 +126,23 @@ fn main() -> Result<()> {
     );
 
     let mut server = build_server(&args);
-    let engine = build_routing_engine();
-    let shared_table = engine.shared_table();
+    let routing_table = SharedRoutingTable::new();
+    let engine = build_routing_engine(routing_table.clone());
     let synced = build_flag();
     let leader = build_flag();
+
     register_controller(
         &mut server,
-        shared_table.clone(),
         synced.clone(),
         leader.clone(),
         args.controller_name.clone(),
         args.pod_name.clone(),
         args.pod_namespace.clone(),
     );
+    register_reconciler(&mut server, routing_table.clone());
     register_proxy(&mut server, engine, args.proxy_http_port);
     register_health(&mut server, synced.clone(), args.health_port);
-    register_admin(&mut server, shared_table, synced, leader, args.admin_port);
+    register_admin(&mut server, routing_table, synced, leader, args.admin_port);
 
     tracing::info!(
         proxy_port = args.proxy_http_port,
@@ -167,8 +168,8 @@ fn build_server(args: &Config) -> Server {
     server
 }
 
-fn build_routing_engine() -> Arc<RoutingEngine> {
-    Arc::new(RoutingEngine::new(RoutingTable::default()))
+fn build_routing_engine(table: SharedRoutingTable) -> Arc<RoutingEngine> {
+    Arc::new(RoutingEngine::new(table))
 }
 
 fn build_flag() -> Arc<AtomicBool> {
@@ -177,7 +178,6 @@ fn build_flag() -> Arc<AtomicBool> {
 
 fn register_controller(
     server: &mut Server,
-    routes: Arc<ArcSwap<RoutingTable>>,
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
     controller_name: String,
@@ -186,14 +186,7 @@ fn register_controller(
 ) {
     let controller = background_service(
         "controller",
-        Controller::new(
-            routes,
-            synced,
-            leader,
-            controller_name,
-            pod_name,
-            pod_namespace,
-        ),
+        Controller::new(synced, leader, controller_name, pod_name, pod_namespace),
     );
     server.add_service(controller);
 }
@@ -208,7 +201,7 @@ fn register_health(server: &mut Server, synced: Arc<AtomicBool>, port: u16) {
 
 fn register_admin(
     server: &mut Server,
-    routes: Arc<ArcSwap<RoutingTable>>,
+    routes: SharedRoutingTable,
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
     port: u16,
@@ -221,6 +214,13 @@ fn register_admin(
         }
         .into_service(port),
     );
+}
+
+fn register_reconciler(server: &mut Server, routes: SharedRoutingTable) {
+    server.add_service(background_service(
+        "reconciler",
+        ReconcilerService::new(routes),
+    ));
 }
 
 fn register_proxy(server: &mut Server, engine: Arc<RoutingEngine>, port: u16) {

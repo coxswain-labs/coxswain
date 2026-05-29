@@ -1,14 +1,9 @@
-use crate::gateway_api::GatewayApiReconciler;
-use crate::ingress::IngressReconciler;
-use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use coxswain_core::routing::{RoutingTable, RoutingTableBuilder};
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
 };
-use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::{
     Client,
@@ -49,7 +44,6 @@ fn http_route_programmed(route: &HTTPRoute, controller_name: &str) -> bool {
 }
 
 pub struct Controller {
-    shared_routes: Arc<ArcSwap<RoutingTable>>,
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
     controller_name: String,
@@ -59,7 +53,6 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(
-        shared_routes: Arc<ArcSwap<RoutingTable>>,
         synced: Arc<AtomicBool>,
         leader: Arc<AtomicBool>,
         controller_name: String,
@@ -67,7 +60,6 @@ impl Controller {
         pod_namespace: String,
     ) -> Self {
         Self {
-            shared_routes,
             synced,
             leader,
             controller_name,
@@ -96,11 +88,6 @@ impl Controller {
         let mut is_leader = Self::try_renew(&lease_lock, &self.pod_name).await;
         self.leader.store(is_leader, Ordering::Release);
 
-        let ingress_watcher = watcher(
-            Api::<Ingress>::all(client.clone()),
-            watcher::Config::default(),
-        )
-        .default_backoff();
         let route_watcher = watcher(
             Api::<HTTPRoute>::all(client.clone()),
             watcher::Config::default(),
@@ -112,7 +99,6 @@ impl Controller {
         )
         .default_backoff();
 
-        tokio::pin!(ingress_watcher);
         tokio::pin!(route_watcher);
         tokio::pin!(gateway_class_watcher);
 
@@ -140,21 +126,6 @@ impl Controller {
                     }
                 }
 
-                Some(event) = ingress_watcher.next() => {
-                    match event {
-                        Ok(watcher::Event::InitDone) => {
-                            self.synced.store(true, Ordering::Release);
-                            tracing::info!("Ingress initial sync complete");
-                        }
-                        Ok(e) => {
-                            let mut builder = RoutingTableBuilder::new();
-                            IngressReconciler::translate(e, &mut builder);
-                            self.store_table(builder);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "Ingress watch error"),
-                    }
-                }
-
                 Some(event) = route_watcher.next() => {
                     match event {
                         Ok(watcher::Event::InitDone) => {
@@ -162,10 +133,6 @@ impl Controller {
                             tracing::info!("HTTPRoute initial sync complete");
                         }
                         Ok(watcher::Event::Apply(route) | watcher::Event::InitApply(route)) => {
-                            // All replicas update the local data plane unconditionally.
-                            let mut builder = RoutingTableBuilder::new();
-                            GatewayApiReconciler::apply(&route, &mut builder);
-                            self.store_table(builder);
                             // Only the leader writes status back to the API server.
                             if is_leader && !http_route_programmed(&route, &self.controller_name) {
                                 Self::mark_http_route_programmed(
@@ -178,11 +145,7 @@ impl Controller {
                                 tracing::debug!("Skipping status update: replica is standby");
                             }
                         }
-                        Ok(e) => {
-                            let mut builder = RoutingTableBuilder::new();
-                            GatewayApiReconciler::translate(e, &mut builder);
-                            self.store_table(builder);
-                        }
+                        Ok(_) => {}
                         Err(e) => tracing::warn!(
                             error = %e,
                             "HTTPRoute watch error — Gateway API CRDs may not be installed"
@@ -226,13 +189,6 @@ impl Controller {
                     break;
                 }
             }
-        }
-    }
-
-    fn store_table(&self, builder: RoutingTableBuilder) {
-        match builder.build() {
-            Ok(table) => self.shared_routes.store(Arc::new(table)),
-            Err(e) => tracing::warn!(error = %e, "Failed to build routing table"),
         }
     }
 

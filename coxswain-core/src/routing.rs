@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use matchit::Router;
 use regex::{Regex, RegexSet};
 use std::cmp::Reverse;
@@ -5,6 +6,39 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A cheaply-cloneable handle to the active routing table.
+///
+/// Backed by `ArcSwap` for lock-free atomic swaps; the storage type is an
+/// implementation detail that may change without affecting callers.
+#[derive(Clone)]
+pub struct SharedRoutingTable {
+    inner: Arc<ArcSwap<RoutingTable>>,
+}
+
+impl SharedRoutingTable {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(RoutingTable::default())),
+        }
+    }
+
+    /// Returns a snapshot of the current routing table.
+    pub fn load(&self) -> Arc<RoutingTable> {
+        self.inner.load_full()
+    }
+
+    /// Atomically replaces the active routing table.
+    pub fn store(&self, table: Arc<RoutingTable>) {
+        self.inner.store(table);
+    }
+}
+
+impl Default for SharedRoutingTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {

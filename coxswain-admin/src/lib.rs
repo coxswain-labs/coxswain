@@ -1,6 +1,5 @@
-use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use coxswain_core::routing::RoutingTable;
+use coxswain_core::routing::SharedRoutingTable;
 use http::Response;
 use pingora_core::apps::http_app::{HttpServer, ServeHttp};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
@@ -13,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct AdminService {
     pub synced: Arc<AtomicBool>,
     pub leader: Arc<AtomicBool>,
-    pub routes: Arc<ArcSwap<RoutingTable>>,
+    pub routes: SharedRoutingTable,
 }
 
 impl AdminService {
@@ -58,7 +57,7 @@ fn metrics_response() -> Response<Vec<u8>> {
         .expect("infallible: static response headers are valid")
 }
 
-fn routes_response(routes: &Arc<ArcSwap<RoutingTable>>) -> Response<Vec<u8>> {
+fn routes_response(routes: &SharedRoutingTable) -> Response<Vec<u8>> {
     let table = routes.load();
     let hosts = table.host_names();
     let body = serde_json::json!({ "hosts": hosts }).to_string();
@@ -68,7 +67,7 @@ fn routes_response(routes: &Arc<ArcSwap<RoutingTable>>) -> Response<Vec<u8>> {
 fn status_response(
     synced: &Arc<AtomicBool>,
     leader: &Arc<AtomicBool>,
-    routes: &Arc<ArcSwap<RoutingTable>>,
+    routes: &SharedRoutingTable,
 ) -> Response<Vec<u8>> {
     let table = routes.load();
     let body = serde_json::json!({

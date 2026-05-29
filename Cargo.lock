@@ -465,7 +465,6 @@ name = "coxswain-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
  "clap",
  "coxswain-admin",
  "coxswain-controller",
@@ -501,6 +500,7 @@ dependencies = [
 name = "coxswain-core"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "matchit",
  "regex",
  "thiserror 2.0.18",

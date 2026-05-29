@@ -1,6 +1,5 @@
-use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use coxswain_core::routing::{RoutingTable, Upstream};
+use coxswain_core::routing::{SharedRoutingTable, Upstream};
 use pingora_core::Result;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::RequestHeader;
@@ -9,31 +8,19 @@ use std::sync::Arc;
 
 use crate::filter::TrafficFilter;
 
-/// Wraps the active [`RoutingTable`] behind an [`ArcSwap`] for lock-free atomic swaps.
+/// Wraps the active routing table for lock-free reads on the request hot path.
 pub struct RoutingEngine {
-    table: Arc<ArcSwap<RoutingTable>>,
+    table: SharedRoutingTable,
 }
 
 impl RoutingEngine {
-    pub fn new(initial: RoutingTable) -> Self {
-        Self {
-            table: Arc::new(ArcSwap::from_pointee(initial)),
-        }
-    }
-
-    /// Clones the inner `Arc` so the controller can hold a reference and call `.store()` directly.
-    pub fn shared_table(&self) -> Arc<ArcSwap<RoutingTable>> {
-        Arc::clone(&self.table)
+    pub fn new(table: SharedRoutingTable) -> Self {
+        Self { table }
     }
 
     /// Resolves `host` and `path` to an upstream. Zero-allocation on the hot path.
     pub fn route(&self, host: &str, path: &str) -> Option<Arc<Upstream>> {
         self.table.load().route(host, path)
-    }
-
-    /// Atomically replaces the active routing table.
-    pub fn swap(&self, new_table: RoutingTable) {
-        self.table.store(Arc::new(new_table));
     }
 }
 
