@@ -17,6 +17,7 @@ coxswain-admin = { workspace = true }
 coxswain-controller = { workspace = true }
 coxswain-proxy = { workspace = true }
 clap = { workspace = true }
+humantime = { workspace = true }
 pingora-core = { workspace = true }
 pingora-proxy = { workspace = true }
 tracing = { workspace = true }

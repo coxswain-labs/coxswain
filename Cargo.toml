@@ -23,6 +23,7 @@ coxswain-controller = { path = "./coxswain-controller" }
 coxswain-proxy = { path = "./coxswain-proxy" }
 
 anyhow = { version = "1.0" }
+humantime = { version = "2" }
 arc-swap = { version = "1.9" }
 async-trait = { version = "0.1" }
 clap = { version = "4.6", features = ["derive", "env"] }

@@ -9,6 +9,7 @@ use pingora_core::services::background::background_service;
 use pingora_proxy::http_proxy_service_with_name;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -77,11 +78,17 @@ pub struct Config {
     #[arg(long, env = "COXSWAIN_PROXY_THREADS", default_value_t = 2)]
     pub proxy_threads: usize,
 
-    /// Seconds to drain in-flight requests before closing connections on shutdown.
+    /// Time to drain in-flight requests before closing connections on shutdown.
     ///
-    /// Set to 0 to disable graceful drain. Maps to Pingora's `grace_period_seconds`.
-    #[arg(long, env = "COXSWAIN_PROXY_SHUTDOWN_TIMEOUT", default_value_t = 30)]
-    pub proxy_shutdown_timeout: u64,
+    /// Accepts human-readable durations: `30s`, `1m`, `1m30s`. Set to `0s` to disable.
+    /// Maps to Pingora's `grace_period_seconds`.
+    #[arg(
+        long,
+        env = "COXSWAIN_PROXY_SHUTDOWN_TIMEOUT",
+        default_value = "30s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub proxy_shutdown_timeout: Duration,
 
     /// Port to listen on for liveness and readiness health endpoints.
     #[arg(long, env = "COXSWAIN_HEALTH_PORT", default_value_t = 8081)]
@@ -137,7 +144,7 @@ fn main() -> Result<()> {
 fn build_server(args: &Config) -> Server {
     let conf = ServerConf {
         threads: args.proxy_threads,
-        grace_period_seconds: Some(args.proxy_shutdown_timeout),
+        grace_period_seconds: Some(args.proxy_shutdown_timeout.as_secs()),
         ..Default::default()
     };
 
