@@ -29,7 +29,7 @@ rules:
     verbs: ["get", "list", "watch"]
 
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses/status"]
+    resources: ["gatewayclasses/status", "httproutes/status"]
     verbs: ["patch", "update"]
 
 ---
@@ -47,4 +47,38 @@ subjects:
 roleRef:
   kind: ClusterRole
   name: coxswain-controller-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Namespace-scoped Role for leader-election Lease objects.
+# Kept separate from the ClusterRole to limit Lease access to coxswain-system only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coxswain-leader-election-role
+  namespace: coxswain-system
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coxswain-leader-election-binding
+  namespace: coxswain-system
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+subjects:
+  - kind: ServiceAccount
+    name: coxswain-controller
+    namespace: coxswain-system
+roleRef:
+  kind: Role
+  name: coxswain-leader-election-role
   apiGroup: rbac.authorization.k8s.io

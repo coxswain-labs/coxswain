@@ -40,6 +40,18 @@ pub struct Config {
     #[arg(long, env = "COXSWAIN_WATCH_NAMESPACE")]
     pub controller_watch_namespace: Option<String>,
 
+    /// Name of this pod, used as the leader-election holder identity.
+    ///
+    /// Injected automatically by Kubernetes via the Downward API in production.
+    #[arg(long, env = "POD_NAME", default_value = "coxswain-local")]
+    pub pod_name: String,
+
+    /// Namespace of this pod, used to scope the leader-election Lease resource.
+    ///
+    /// Injected automatically by Kubernetes via the Downward API in production.
+    #[arg(long, env = "POD_NAMESPACE", default_value = "coxswain-system")]
+    pub pod_namespace: String,
+
     /// Log output format: `json` (default) or `console`.
     ///
     /// Use `json` in production environments; `console` for local development.
@@ -59,7 +71,6 @@ pub struct Config {
     // /// Port to listen on for inbound HTTPS traffic.
     // #[arg(long, env = "COXSWAIN_PROXY_HTTPS_PORT", default_value_t = 8443)]
     // pub proxy_https_port: u16,
-
     /// Worker threads per proxy service.
     ///
     /// Threads are not shared across services. Set to the available CPU core count for maximum throughput.
@@ -94,11 +105,20 @@ fn main() -> Result<()> {
 
     let mut server = build_server(&args);
     let routes = build_routing_table();
-    let synced = build_sync_flag();
-    register_controller(&mut server, routes.clone(), synced.clone(), args.controller_name.clone());
+    let synced = build_flag();
+    let leader = build_flag();
+    register_controller(
+        &mut server,
+        routes.clone(),
+        synced.clone(),
+        leader.clone(),
+        args.controller_name.clone(),
+        args.pod_name.clone(),
+        args.pod_namespace.clone(),
+    );
     register_proxy(&mut server, routes.clone(), args.proxy_http_port);
     register_health(&mut server, routes.clone(), synced.clone(), args.health_port);
-    register_admin(&mut server, routes, synced, args.admin_port);
+    register_admin(&mut server, routes, synced, leader, args.admin_port);
 
     tracing::info!(
         proxy_port = args.proxy_http_port,
@@ -125,7 +145,7 @@ fn build_routing_table() -> Arc<ArcSwap<RoutingTable>> {
     Arc::new(ArcSwap::from_pointee(RoutingTable::new()))
 }
 
-fn build_sync_flag() -> Arc<AtomicBool> {
+fn build_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
@@ -133,13 +153,24 @@ fn register_controller(
     server: &mut Server,
     routes: Arc<ArcSwap<RoutingTable>>,
     synced: Arc<AtomicBool>,
+    leader: Arc<AtomicBool>,
     controller_name: String,
+    pod_name: String,
+    pod_namespace: String,
 ) {
-    let controller = background_service("controller", Controller::new(routes, synced, controller_name));
+    let controller = background_service(
+        "controller",
+        Controller::new(routes, synced, leader, controller_name, pod_name, pod_namespace),
+    );
     server.add_service(controller);
 }
 
-fn register_health(server: &mut Server, routes: Arc<ArcSwap<RoutingTable>>, synced: Arc<AtomicBool>, port: u16) {
+fn register_health(
+    server: &mut Server,
+    routes: Arc<ArcSwap<RoutingTable>>,
+    synced: Arc<AtomicBool>,
+    port: u16,
+) {
     use coxswain_proxy::health::HealthService;
     use pingora_core::services::listening::Service;
     let mut svc = Service::new("health".to_string(), HealthService { synced, routes });
@@ -147,13 +178,20 @@ fn register_health(server: &mut Server, routes: Arc<ArcSwap<RoutingTable>>, sync
     server.add_service(svc);
 }
 
-fn register_admin(server: &mut Server, routes: Arc<ArcSwap<RoutingTable>>, synced: Arc<AtomicBool>, port: u16) {
-    server.add_service(coxswain_admin::AdminService { synced, routes }.into_service(port));
+fn register_admin(
+    server: &mut Server,
+    routes: Arc<ArcSwap<RoutingTable>>,
+    synced: Arc<AtomicBool>,
+    leader: Arc<AtomicBool>,
+    port: u16,
+) {
+    server.add_service(coxswain_admin::AdminService { synced, leader, routes }.into_service(port));
 }
 
 fn register_proxy(server: &mut Server, routes: Arc<ArcSwap<RoutingTable>>, port: u16) {
     let proxy_logic = coxswain_proxy::engine::CoxswainProxy { routes };
-    let mut proxy_service = http_proxy_service_with_name(&server.configuration, proxy_logic, "proxy");
+    let mut proxy_service =
+        http_proxy_service_with_name(&server.configuration, proxy_logic, "proxy");
     proxy_service.add_tcp(&format!("0.0.0.0:{port}"));
     server.add_service(proxy_service);
 }

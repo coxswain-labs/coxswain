@@ -36,10 +36,7 @@ impl ServeHttp for HealthService {
                         .unwrap()
                 }
             }
-            _ => Response::builder()
-                .status(404)
-                .body(Vec::new())
-                .unwrap(),
+            _ => Response::builder().status(404).body(Vec::new()).unwrap(),
         }
     }
 }

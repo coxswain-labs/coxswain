@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct AdminService {
     pub synced: Arc<AtomicBool>,
+    pub leader: Arc<AtomicBool>,
     pub routes: Arc<ArcSwap<RoutingTable>>,
 }
 
@@ -31,11 +32,8 @@ impl ServeHttp for AdminService {
         match session.req_header().uri.path() {
             "/metrics" => metrics_response(),
             "/routes" => routes_response(&self.routes),
-            "/status" => status_response(&self.synced, &self.routes),
-            _ => Response::builder()
-                .status(404)
-                .body(Vec::new())
-                .unwrap(),
+            "/status" => status_response(&self.synced, &self.leader, &self.routes),
+            _ => Response::builder().status(404).body(Vec::new()).unwrap(),
         }
     }
 }
@@ -45,10 +43,7 @@ fn metrics_response() -> Response<Vec<u8>> {
     let mut buffer = Vec::new();
     if let Err(e) = encoder.encode(&prometheus::gather(), &mut buffer) {
         tracing::warn!(error = %e, "Failed to encode Prometheus metrics");
-        return Response::builder()
-            .status(500)
-            .body(Vec::new())
-            .unwrap();
+        return Response::builder().status(500).body(Vec::new()).unwrap();
     }
     Response::builder()
         .status(200)
@@ -64,11 +59,16 @@ fn routes_response(routes: &Arc<ArcSwap<RoutingTable>>) -> Response<Vec<u8>> {
     json_response(body)
 }
 
-fn status_response(synced: &Arc<AtomicBool>, routes: &Arc<ArcSwap<RoutingTable>>) -> Response<Vec<u8>> {
+fn status_response(
+    synced: &Arc<AtomicBool>,
+    leader: &Arc<AtomicBool>,
+    routes: &Arc<ArcSwap<RoutingTable>>,
+) -> Response<Vec<u8>> {
     let table = routes.load();
     let body = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "synced": synced.load(Ordering::Acquire),
+        "leader": leader.load(Ordering::Acquire),
         "host_count": table.hosts.len(),
     })
     .to_string();

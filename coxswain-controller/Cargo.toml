@@ -14,6 +14,7 @@ futures = { workspace = true }
 gateway-api = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
+kube-leader-election = { workspace = true }
 pingora-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
