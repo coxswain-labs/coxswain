@@ -1,4 +1,4 @@
-pub mod filter;
-pub mod proxy;
+pub(crate) mod filter;
+mod proxy;
 
 pub use proxy::{Proxy, RoutingEngine};

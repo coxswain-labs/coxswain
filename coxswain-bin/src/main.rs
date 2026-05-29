@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use coxswain_controller::controller::Controller;
-use coxswain_controller::reconciler::ReconcilerService;
+use coxswain_controller::Controller;
+use coxswain_controller::ReconcilerService;
 use coxswain_core::routing::SharedRoutingTable;
 use coxswain_proxy::RoutingEngine;
 use pingora_core::server::Server;
