@@ -190,7 +190,7 @@ fn register_controller(
 }
 
 fn register_health(server: &mut Server, synced: Arc<AtomicBool>, addr: SocketAddr) {
-    use coxswain_proxy::health::HealthService;
+    use coxswain_health::HealthService;
     use pingora_core::services::listening::Service;
     let mut svc = Service::new("health".to_string(), HealthService { synced });
     svc.add_tcp(&addr.to_string());

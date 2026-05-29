@@ -1,0 +1,11 @@
+[package]
+name = "coxswain-health"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+
+[dependencies]
+async-trait  = { workspace = true }
+http         = { workspace = true }
+pingora-core = { workspace = true }

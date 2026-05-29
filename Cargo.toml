@@ -5,6 +5,7 @@ members = [
     "coxswain-core",
     "coxswain-controller",
     "coxswain-proxy",
+    "coxswain-health",
     "coxswain-admin"
 ]
 
@@ -20,6 +21,7 @@ repository = "https://github.com/coxswain-labs/coxswain"
 coxswain-admin = { path = "./coxswain-admin" }
 coxswain-core = { path = "./coxswain-core" }
 coxswain-controller = { path = "./coxswain-controller" }
+coxswain-health = { path = "./coxswain-health" }
 coxswain-proxy = { path = "./coxswain-proxy" }
 
 anyhow = { version = "1.0" }

@@ -469,6 +469,7 @@ dependencies = [
  "coxswain-admin",
  "coxswain-controller",
  "coxswain-core",
+ "coxswain-health",
  "coxswain-proxy",
  "humantime",
  "pingora-core",
@@ -504,6 +505,15 @@ dependencies = [
  "matchit",
  "regex",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "coxswain-health"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "http",
+ "pingora-core",
 ]
 
 [[package]]
