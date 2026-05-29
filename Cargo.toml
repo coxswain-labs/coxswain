@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "coxswain-bin",
-    "coxswain-core",
-    "coxswain-controller",
-    "coxswain-proxy",
-    "coxswain-health",
-    "coxswain-admin"
+    "crates/coxswain-bin",
+    "crates/coxswain-core",
+    "crates/coxswain-controller",
+    "crates/coxswain-proxy",
+    "crates/coxswain-health",
+    "crates/coxswain-admin"
 ]
 
 [workspace.package]
@@ -18,11 +18,11 @@ license = "Apache-2.0"
 repository = "https://github.com/coxswain-labs/coxswain"
 
 [workspace.dependencies]
-coxswain-admin = { path = "./coxswain-admin" }
-coxswain-core = { path = "./coxswain-core" }
-coxswain-controller = { path = "./coxswain-controller" }
-coxswain-health = { path = "./coxswain-health" }
-coxswain-proxy = { path = "./coxswain-proxy" }
+coxswain-admin = { path = "./crates/coxswain-admin" }
+coxswain-core = { path = "./crates/coxswain-core" }
+coxswain-controller = { path = "./crates/coxswain-controller" }
+coxswain-health = { path = "./crates/coxswain-health" }
+coxswain-proxy = { path = "./crates/coxswain-proxy" }
 
 anyhow = { version = "1.0" }
 arc-swap = { version = "1.9" }
