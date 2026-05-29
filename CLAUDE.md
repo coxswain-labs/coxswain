@@ -52,33 +52,50 @@ coxswain-bin
 ```
 
 ### `coxswain-core`
-Shared types and the routing table. `RoutingTable` maps hostnames to per-host `matchit` radix-tree routers, each routing URL paths to a `RouteTarget` (a list of backend `BackendPod`s with IP, port, and weight). Uses `arc-swap` for lock-free atomic swaps so the controller and proxy can share state without locks or channels.
+Shared types and the routing table. `RoutingTable` maps hostnames to per-host `matchit` radix-tree routers, each routing URL paths to an `Upstream` (a named group of pod `SocketAddr`s with lock-free round-robin selection).
+
+`SharedRoutingTable` is an opaque newtype wrapping `Arc<ArcSwap<RoutingTable>>`. It exposes `load() -> Arc<RoutingTable>` and `store(Arc<RoutingTable>)`. The controller stores a new table on every reconcile; the proxy loads on every request. No locks or channels on the hot path. `arc-swap` is an implementation detail confined to this crate.
 
 ### `coxswain-controller`
-Kubernetes controller that reconciles `Ingress`, `HTTPRoute`, and `GatewayClass` resources. Uses `kube` (v3) for watch streams and `k8s-openapi`/`gateway-api` for typed API objects.
+Kubernetes controller split into two independent Pingora `BackgroundService`s.
 
-Key files:
-- `watcher.rs` — main event loop; runs three concurrent watch streams (`Ingress`, `HTTPRoute`, `GatewayClass`) inside a `tokio::select!` loop backed by a Pingora `BackgroundService`. Handles leader election and all status writes.
-- `ingress.rs` — `IngressTranslator`: translates `Ingress` watch events into `RoutingTable` mutations.
-- `gateway_api.rs` — `GatewayApiTranslator`: translates `HTTPRoute` watch events into `RoutingTable` mutations.
+**`controller.rs` — `Controller`**
+Status writer and leader elector. Runs two raw watch streams (`HTTPRoute`, `GatewayClass`) in a `tokio::select!` loop. Responsibilities:
+- Renews the `kube-leader-election` Lease every 5 s (15 s TTL); updates the `leader` flag.
+- On `HTTPRoute InitDone`: flips the `synced` flag, unblocking `/readyz`.
+- On `HTTPRoute Apply`/`InitApply`: if leader, patches "Programmed" status back to the API server.
+- On `GatewayClass Apply`/`InitApply`: if leader, patches "Accepted" status.
+- On shutdown: steps down from the Lease gracefully.
 
-**Leader election** uses `kube-leader-election` (Kubernetes `Lease` objects, 15s TTL, renewed every 5s). All replicas update the local `ArcSwap<RoutingTable>` unconditionally; only the leader patches resource status back to the API server (`GatewayClass` Accepted, `HTTPRoute` Accepted + Programmed). Status writes are idempotent — the controller checks whether the condition is already `True` before issuing a patch to avoid feedback loops.
+**`reconciler.rs` — `ReconcilerService`**
+Routing table builder. Spawns four tasks in a `JoinSet`:
+- Three reflector tasks — one each for `HTTPRoute`, `Ingress`, and `EndpointSlice`. Each task populates an in-memory store via `kube::runtime::reflector` and signals a shared `Notify` on every event.
+- One debounce+rebuild task — waits for the first `Notify`, then races further signals against a 500 ms timer (trailing-edge debounce). When the timer expires uninterrupted, calls `rebuild()`, which snapshots all three stores and constructs a fresh `RoutingTable` from scratch. On success, atomically publishes it via `SharedRoutingTable::store()`.
 
-**kube 3.x watcher event variants:**
-- `Event::InitApply(obj)` — existing objects from the initial LIST phase (startup)
-- `Event::Apply(obj)` — subsequent watch-stream updates (creates/updates after sync)
-- `Event::Delete(obj)` — deletions
-- `Event::InitDone` — signals the end of an initial list; used to flip the `synced` flag
+**`endpoints.rs`**
+`pub(crate) fn resolve(ns, svc, port, slices) -> Vec<SocketAddr>` — scans the local `EndpointSlice` store for ready pod addresses. Shared by both reconcilers; never queries the API server.
 
-Both `InitApply` and `Apply` must be handled identically for routing table updates.
+**`gateway_api.rs` — `GatewayApiReconciler`**
+`reconcile(route, slices, builder)` — translates one `HTTPRoute` into `RoutingTableBuilder` entries. Resolves pod addresses via `endpoints::resolve`. Handles exact/prefix/regex path types and exact/wildcard/catch-all host patterns.
+
+**`ingress.rs` — `IngressReconciler`**
+`reconcile(ingress, slices, builder)` — translates one `Ingress` into `RoutingTableBuilder` entries. Same endpoint resolution and host-pattern logic.
+
+**Leader election** uses `kube-leader-election` (Kubernetes `Lease` objects, 15 s TTL, renewed every 5 s). Only the active leader patches resource status; standby replicas skip writes to avoid feedback loops. Status writes are idempotent — the controller checks whether a condition is already `True` before patching.
+
+**kube 3.x watcher event variants (relevant to `controller.rs`):**
+- `Event::InitApply(obj)` — existing objects from the initial LIST phase
+- `Event::Apply(obj)` — subsequent watch-stream updates (creates/updates)
+- `Event::Delete(obj)` — deletions (routing table deletions handled automatically by the reflector stores in `ReconcilerService`)
+- `Event::InitDone` — end of initial list; used to flip `synced`
 
 ### `coxswain-proxy`
-Pingora-based reverse proxy. Reads routing decisions from `coxswain-core` and forwards requests upstream. Also hosts the health endpoints.
+Pingora-based reverse proxy. Reads routing decisions from `coxswain-core` and forwards requests upstream.
 
 Key files:
-- `engine.rs` — `CoxswainProxy`: implements `ProxyHttp`; calls `RoutingTable::match_route` on every request and selects the first backend.
+- `engine.rs` — `RoutingEngine` wraps `SharedRoutingTable` for reads on the hot path. `CoxswainProxy` implements `ProxyHttp`, calling `engine.route(host, path)` on every request.
 - `filter.rs` — `TrafficFilter`: injects the `X-Proxy-Engine: Coxswain-Pingora` header on upstream requests.
-- `health.rs` — `HealthService`: serves `/healthz` (always 200) and `/readyz` (200 once the initial sync completes, 503 before).
+- `health.rs` — `HealthService`: serves `/healthz` (always 200) and `/readyz` (200 once `synced`, 503 before).
 
 ### `coxswain-admin`
 Diagnostics and observability endpoints, served on a separate port.
@@ -90,12 +107,14 @@ Diagnostics and observability endpoints, served on a separate port.
 ### `coxswain-bin`
 Entry point only — parses CLI args, wires all services together, and starts the Pingora runtime.
 
+`SharedRoutingTable::new()` is created first in `main()` and cloned into `RoutingEngine`, `ReconcilerService`, and `AdminService`. The `Controller` and `ReconcilerService` are registered as Pingora `BackgroundService`s alongside the proxy, health, and admin services.
+
 ## Key design pattern
 
-The controller and proxy communicate through an `Arc<ArcSwap<RoutingTable>>` defined in `coxswain-core`. The controller swaps in a new table on every reconcile event; the proxy does a cheap `load()` on every request. There are no channels or locks on the hot path.
+`SharedRoutingTable` is the single shared state between the controller and proxy. `ReconcilerService` stores a new table after every debounced rebuild; the proxy loads atomically on every request with no locks.
 
 Three `Arc<AtomicBool>` flags are shared across services:
-- `synced` — flips to `true` when the initial LIST phase completes; gates `/readyz`.
+- `synced` — flips to `true` when `HTTPRoute` initial sync completes; gates `/readyz`.
 - `leader` — mirrors the current Lease election outcome; exposed on `/status`.
 
 ## Ports (default)
