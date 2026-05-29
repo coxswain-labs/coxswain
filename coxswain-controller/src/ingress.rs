@@ -22,6 +22,8 @@ impl IngressReconciler {
             _ => return,
         };
 
+        tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
+
         for rule in rules {
             let http = match rule.http.as_ref() {
                 Some(h) => h,

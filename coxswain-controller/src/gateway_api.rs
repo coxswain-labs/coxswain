@@ -34,6 +34,14 @@ impl GatewayApiReconciler {
             .map(String::as_str)
             .collect();
 
+        tracing::debug!(
+            name = ?route.metadata.name,
+            ns = route_ns,
+            rules = rules.len(),
+            hostnames = hostnames.len(),
+            "Reconciling HTTPRoute"
+        );
+
         for rule in rules {
             let backend_refs = match rule.backend_refs.as_deref() {
                 Some(b) if !b.is_empty() => b,

@@ -35,6 +35,7 @@ pub(crate) fn resolve(
             }
         }
     }
+    tracing::debug!(ns, svc, port, count = addrs.len(), "Resolved endpoints");
     addrs
 }
 

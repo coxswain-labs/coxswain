@@ -1,0 +1,77 @@
+# Two minimal echo servers used for local routing tests.
+# echo-a and echo-b respond with different body text so you can confirm
+# which backend handled a request.
+#
+# Apply: kubectl apply -f deploy/dev/echo-backends.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-a
+  namespace: default
+  labels:
+    app: echo-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-a
+  template:
+    metadata:
+      labels:
+        app: echo-a
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:0.2.3
+          args: ["-text=hello from echo-a", "-listen=:5678"]
+          ports:
+            - containerPort: 5678
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-a
+  namespace: default
+spec:
+  selector:
+    app: echo-a
+  ports:
+    - port: 5678
+      targetPort: 5678
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-b
+  namespace: default
+  labels:
+    app: echo-b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-b
+  template:
+    metadata:
+      labels:
+        app: echo-b
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:0.2.3
+          args: ["-text=hello from echo-b", "-listen=:5678"]
+          ports:
+            - containerPort: 5678
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-b
+  namespace: default
+spec:
+  selector:
+    app: echo-b
+  ports:
+    - port: 5678
+      targetPort: 5678
