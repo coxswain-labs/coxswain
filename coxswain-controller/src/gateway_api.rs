@@ -1,5 +1,5 @@
 use crate::endpoints;
-use coxswain_core::routing::{PathRouterBuilder, RoutingTableBuilder, Upstream};
+use coxswain_core::routing::{HostRouterBuilder, RoutingTableBuilder, Upstream};
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesMatchesPathType,
 };
@@ -54,7 +54,7 @@ impl GatewayApiReconciler {
             ));
 
             // Default to PathPrefix "/" when no matches are specified (Gateway API §4.1).
-            let apply = |pb: &mut PathRouterBuilder| match rule.matches.as_deref() {
+            let apply = |pb: &mut HostRouterBuilder| match rule.matches.as_deref() {
                 None | Some([]) => {
                     pb.add_prefix_route("/", Arc::clone(&upstream));
                 }

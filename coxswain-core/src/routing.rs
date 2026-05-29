@@ -53,6 +53,7 @@ pub struct Upstream {
     /// Service identity in `"namespace/name"` form — used for logging only.
     pub name: String,
     endpoints: Vec<SocketAddr>,
+    /// Round-robin cursor. Incremented on every call to `next_endpoint`.
     index: AtomicUsize,
 }
 
@@ -78,18 +79,20 @@ impl Upstream {
 }
 
 /// Compiled path-level router for a single virtual hostname.
-pub struct PathRouter {
+pub struct HostRouter {
     router: Router<Arc<Upstream>>,
     regex_set: RegexSet,
     regex_routes: Vec<(Regex, Arc<Upstream>)>,
 }
 
-impl PathRouter {
+impl HostRouter {
     /// Resolves `path` to an upstream. Checks matchit first, then the regex fallback.
     pub fn route(&self, path: &str) -> Option<Arc<Upstream>> {
         if let Ok(m) = self.router.at(path) {
             return Some(Arc::clone(m.value));
         }
+        // RegexSet matches all patterns simultaneously; take only the first hit so
+        // insertion order acts as priority (earlier-added patterns win).
         let idx = self.regex_set.matches(path).iter().next()?;
         self.regex_routes.get(idx).map(|(_, u)| Arc::clone(u))
     }
@@ -97,13 +100,13 @@ impl PathRouter {
 
 /// Builder for a single hostname's path-level routing rules.
 #[derive(Default)]
-pub struct PathRouterBuilder {
+pub struct HostRouterBuilder {
     exact_routes: Vec<(String, Arc<Upstream>)>,
     prefix_routes: Vec<(String, Arc<Upstream>)>,
     regex_routes: Vec<(String, Arc<Upstream>)>,
 }
 
-impl PathRouterBuilder {
+impl HostRouterBuilder {
     pub fn add_exact_route(&mut self, path: &str, upstream: Arc<Upstream>) -> &mut Self {
         self.exact_routes.push((path.to_string(), upstream));
         self
@@ -119,7 +122,7 @@ impl PathRouterBuilder {
         self
     }
 
-    pub(crate) fn build(self) -> Result<PathRouter, RouterError> {
+    pub(crate) fn build(self) -> Result<HostRouter, RouterError> {
         let mut router = Router::new();
 
         for (path, upstream) in self.exact_routes {
@@ -142,7 +145,7 @@ impl PathRouterBuilder {
             .map(|(p, u)| Ok((Regex::new(&p)?, u)))
             .collect::<Result<Vec<_>, regex::Error>>()?;
 
-        Ok(PathRouter {
+        Ok(HostRouter {
             router,
             regex_set,
             regex_routes,
@@ -153,10 +156,10 @@ impl PathRouterBuilder {
 /// Builder for the complete multi-hostname routing table.
 #[derive(Default)]
 pub struct RoutingTableBuilder {
-    exact_hosts: HashMap<String, PathRouterBuilder>,
+    exact_hosts: HashMap<String, HostRouterBuilder>,
     /// Keyed by suffix (e.g. `"example.com"` for the pattern `"*.example.com"`).
-    wildcard_hosts: HashMap<String, PathRouterBuilder>,
-    catchall: Option<PathRouterBuilder>,
+    wildcard_hosts: HashMap<String, HostRouterBuilder>,
+    catchall: Option<HostRouterBuilder>,
 }
 
 impl RoutingTableBuilder {
@@ -164,22 +167,22 @@ impl RoutingTableBuilder {
         Self::default()
     }
 
-    /// Returns the `PathRouterBuilder` for an exact hostname match.
-    pub fn exact_host(&mut self, hostname: &str) -> &mut PathRouterBuilder {
+    /// Returns the `HostRouterBuilder` for an exact hostname match.
+    pub fn exact_host(&mut self, hostname: &str) -> &mut HostRouterBuilder {
         self.exact_hosts.entry(hostname.to_string()).or_default()
     }
 
-    /// Returns the `PathRouterBuilder` for a wildcard hostname pattern.
+    /// Returns the `HostRouterBuilder` for a wildcard hostname pattern.
     ///
     /// `pattern` must be in `*.example.com` form; the `*.` prefix is stripped internally.
-    pub fn wildcard_host(&mut self, pattern: &str) -> &mut PathRouterBuilder {
+    pub fn wildcard_host(&mut self, pattern: &str) -> &mut HostRouterBuilder {
         let suffix = pattern.trim_start_matches("*.");
         self.wildcard_hosts.entry(suffix.to_string()).or_default()
     }
 
-    /// Returns the `PathRouterBuilder` for the catch-all domain (`*`).
-    pub fn catchall(&mut self) -> &mut PathRouterBuilder {
-        self.catchall.get_or_insert_with(PathRouterBuilder::default)
+    /// Returns the `HostRouterBuilder` for the catch-all domain (`*`).
+    pub fn catchall(&mut self) -> &mut HostRouterBuilder {
+        self.catchall.get_or_insert_with(HostRouterBuilder::default)
     }
 
     /// Compiles all registered routes into an immutable [`RoutingTable`].
@@ -190,7 +193,7 @@ impl RoutingTableBuilder {
             .map(|(h, b)| Ok((h, b.build()?)))
             .collect::<Result<HashMap<_, _>, RouterError>>()?;
 
-        let mut wildcard_hosts: Vec<(String, PathRouter)> = self
+        let mut wildcard_hosts: Vec<(String, HostRouter)> = self
             .wildcard_hosts
             .into_iter()
             .map(|(suffix, b)| Ok((suffix, b.build()?)))
@@ -198,7 +201,7 @@ impl RoutingTableBuilder {
         // Most specific (longest suffix) first — matches K8s Gateway API precedence.
         wildcard_hosts.sort_by_key(|e| Reverse(e.0.len()));
 
-        let catchall = self.catchall.map(PathRouterBuilder::build).transpose()?;
+        let catchall = self.catchall.map(HostRouterBuilder::build).transpose()?;
 
         Ok(RoutingTable {
             exact_hosts,
@@ -214,10 +217,10 @@ impl RoutingTableBuilder {
 /// exact match → wildcard (most specific first) → catch-all.
 #[derive(Default)]
 pub struct RoutingTable {
-    exact_hosts: HashMap<String, PathRouter>,
+    exact_hosts: HashMap<String, HostRouter>,
     /// Sorted most-specific (longest suffix) first.
-    wildcard_hosts: Vec<(String, PathRouter)>,
-    catchall: Option<PathRouter>,
+    wildcard_hosts: Vec<(String, HostRouter)>,
+    catchall: Option<HostRouter>,
 }
 
 impl RoutingTable {
