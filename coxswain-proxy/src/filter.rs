@@ -5,7 +5,7 @@ pub struct TrafficFilter;
 
 impl TrafficFilter {
     pub fn apply_request_filters(upstream_request: &mut RequestHeader) -> Result<()> {
-        upstream_request.insert_header("X-Proxy-Engine", format!("Coxswain/{}", env!("CARGO_PKG_VERSION")))?;
+        upstream_request.insert_header("X-Proxy-Engine", concat!("Coxswain/", env!("CARGO_PKG_VERSION")))?;
         Ok(())
     }
 }

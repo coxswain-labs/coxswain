@@ -1,2 +1,4 @@
-pub mod engine;
 pub mod filter;
+pub mod proxy;
+
+pub use proxy::{Proxy, RoutingEngine};

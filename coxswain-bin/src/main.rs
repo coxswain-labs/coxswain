@@ -3,7 +3,7 @@ use clap::{Parser, ValueEnum};
 use coxswain_controller::controller::Controller;
 use coxswain_controller::reconciler::ReconcilerService;
 use coxswain_core::routing::SharedRoutingTable;
-use coxswain_proxy::engine::RoutingEngine;
+use coxswain_proxy::RoutingEngine;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::services::background::background_service;
@@ -222,7 +222,7 @@ fn register_reconciler(server: &mut Server, routes: SharedRoutingTable) {
 }
 
 fn register_proxy(server: &mut Server, engine: Arc<RoutingEngine>, addr: SocketAddr) {
-    let proxy_logic = coxswain_proxy::engine::CoxswainProxy { engine };
+    let proxy_logic = coxswain_proxy::Proxy { engine };
     let mut proxy_service =
         http_proxy_service_with_name(&server.configuration, proxy_logic, "proxy");
     proxy_service.add_tcp(&addr.to_string());
