@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+const LEASE_NAME: &str = "coxswain-leader-lock";
+
 fn has_condition(conditions: Option<&[Condition]>, type_: &str) -> bool {
     conditions
         .map(|conds| conds.iter().any(|c| c.type_ == type_ && c.status == "True"))
@@ -43,6 +45,22 @@ fn http_route_programmed(route: &HTTPRoute, controller_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn make_condition(type_: &str, reason: &str, generation: i64, now: Time) -> Condition {
+    Condition {
+        type_: type_.to_string(),
+        status: "True".to_string(),
+        reason: reason.to_string(),
+        message: String::new(),
+        observed_generation: Some(generation),
+        last_transition_time: now,
+    }
+}
+
+/// Kubernetes watch loop responsible for leader election and writing status
+/// conditions back to `HTTPRoute` and `GatewayClass` resources.
+///
+/// Only the active leader patches resource status; standby replicas track
+/// the election result and skip all writes to avoid feedback loops.
 pub struct Controller {
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
@@ -78,7 +96,7 @@ impl Controller {
             &self.pod_namespace,
             LeaseLockParams {
                 holder_id: self.pod_name.clone(),
-                lease_name: "coxswain-leader-lock".to_string(),
+                lease_name: LEASE_NAME.to_string(),
                 lease_ttl: Duration::from_secs(15),
             },
         );
@@ -205,15 +223,7 @@ impl Controller {
 
     async fn accept_gateway_class(client: &Client, name: &str, generation: i64) {
         let api: Api<GatewayClass> = Api::all(client.clone());
-        let now = Time(k8s_openapi::jiff::Timestamp::now());
-        let condition = Condition {
-            type_: "Accepted".to_string(),
-            status: "True".to_string(),
-            reason: "Accepted".to_string(),
-            message: String::new(),
-            observed_generation: Some(generation),
-            last_transition_time: now,
-        };
+        let condition = make_condition("Accepted", "Accepted", generation, Time(k8s_openapi::jiff::Timestamp::now()));
         let patch = serde_json::json!({ "status": { "conditions": [condition] } });
         match api
             .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
@@ -239,22 +249,8 @@ impl Controller {
         let now = Time(k8s_openapi::jiff::Timestamp::now());
         let observed_gen = route.metadata.generation.unwrap_or(0);
 
-        let accepted = Condition {
-            type_: "Accepted".to_string(),
-            status: "True".to_string(),
-            reason: "Accepted".to_string(),
-            message: String::new(),
-            observed_generation: Some(observed_gen),
-            last_transition_time: now.clone(),
-        };
-        let programmed = Condition {
-            type_: "Programmed".to_string(),
-            status: "True".to_string(),
-            reason: "Programmed".to_string(),
-            message: String::new(),
-            observed_generation: Some(observed_gen),
-            last_transition_time: now,
-        };
+        let accepted = make_condition("Accepted", "Accepted", observed_gen, now.clone());
+        let programmed = make_condition("Programmed", "Programmed", observed_gen, now);
 
         let parents: Vec<HttpRouteStatusParents> = parent_refs
             .iter()
@@ -287,5 +283,91 @@ impl Controller {
 impl BackgroundService for Controller {
     async fn start(&self, shutdown: ShutdownWatch) {
         self.start_watcher_loop(shutdown).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassStatus};
+    use gateway_api::apis::standard::httproutes::{
+        HTTPRoute, HttpRouteStatus, HttpRouteStatusParents,
+    };
+
+    fn stub_condition(type_: &str, status: &str) -> Condition {
+        Condition {
+            type_: type_.to_string(),
+            status: status.to_string(),
+            reason: String::new(),
+            message: String::new(),
+            observed_generation: None,
+            last_transition_time: Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH),
+        }
+    }
+
+    #[test]
+    fn has_condition_returns_true_when_present_and_true() {
+        let conds = vec![stub_condition("Programmed", "True")];
+        assert!(has_condition(Some(&conds), "Programmed"));
+    }
+
+    #[test]
+    fn has_condition_returns_false_when_absent() {
+        let conds = vec![stub_condition("Accepted", "True")];
+        assert!(!has_condition(Some(&conds), "Programmed"));
+    }
+
+    #[test]
+    fn has_condition_returns_false_when_not_true() {
+        let conds = vec![stub_condition("Programmed", "False")];
+        assert!(!has_condition(Some(&conds), "Programmed"));
+    }
+
+    #[test]
+    fn gateway_class_accepted_when_condition_present() {
+        let gc = GatewayClass {
+            status: Some(GatewayClassStatus {
+                conditions: Some(vec![stub_condition("Accepted", "True")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(gateway_class_accepted(&gc));
+    }
+
+    #[test]
+    fn gateway_class_not_accepted_when_no_status() {
+        let gc = GatewayClass { status: None, ..Default::default() };
+        assert!(!gateway_class_accepted(&gc));
+    }
+
+    #[test]
+    fn http_route_programmed_for_matching_controller() {
+        let route = HTTPRoute {
+            status: Some(HttpRouteStatus {
+                parents: vec![HttpRouteStatusParents {
+                    controller_name: "my-controller".to_string(),
+                    conditions: vec![stub_condition("Programmed", "True")],
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(http_route_programmed(&route, "my-controller"));
+    }
+
+    #[test]
+    fn http_route_not_programmed_for_different_controller() {
+        let route = HTTPRoute {
+            status: Some(HttpRouteStatus {
+                parents: vec![HttpRouteStatusParents {
+                    controller_name: "other-controller".to_string(),
+                    conditions: vec![stub_condition("Programmed", "True")],
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(!http_route_programmed(&route, "my-controller"));
     }
 }

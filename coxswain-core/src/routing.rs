@@ -132,9 +132,16 @@ impl HostRouterBuilder {
         for (path, upstream) in self.prefix_routes {
             // Normalise: strip any trailing slash so "/api/" and "/api" are treated identically.
             let base = path.trim_end_matches('/');
-            // Two inserts: the bare path itself, and everything beneath it.
-            router.insert(base.to_string(), upstream.clone())?;
-            router.insert(format!("{base}/{{*rest}}"), upstream)?;
+            if base.is_empty() {
+                // Root prefix "/": matchit's {*rest} does not match an empty tail, so
+                // insert "/" explicitly for the root path itself.
+                router.insert("/".to_string(), upstream.clone())?;
+                router.insert("/{*rest}".to_string(), upstream)?;
+            } else {
+                // Two inserts: the bare path itself, and everything beneath it.
+                router.insert(base.to_string(), upstream.clone())?;
+                router.insert(format!("{base}/{{*rest}}"), upstream)?;
+            }
         }
 
         let patterns: Vec<&str> = self.regex_routes.iter().map(|(p, _)| p.as_str()).collect();

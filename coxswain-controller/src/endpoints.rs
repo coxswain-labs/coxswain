@@ -37,3 +37,79 @@ pub(crate) fn resolve(
     }
     addrs
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
+    use kube::api::ObjectMeta;
+    use kube::runtime::watcher;
+    use std::collections::BTreeMap;
+
+    fn make_slice(ns: &str, svc: &str, ip: &str, ready: Option<bool>) -> EndpointSlice {
+        let mut labels = BTreeMap::new();
+        labels.insert("kubernetes.io/service-name".to_string(), svc.to_string());
+        EndpointSlice {
+            metadata: ObjectMeta {
+                name: Some(format!("{svc}-slice")),
+                namespace: Some(ns.to_string()),
+                labels: Some(labels),
+                ..Default::default()
+            },
+            address_type: "IPv4".to_string(),
+            endpoints: vec![Endpoint {
+                addresses: vec![ip.to_string()],
+                conditions: Some(EndpointConditions {
+                    ready,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ports: None,
+        }
+    }
+
+    fn make_store(slices: Vec<EndpointSlice>) -> reflector::Store<EndpointSlice> {
+        let mut writer = reflector::store::Writer::<EndpointSlice>::default();
+        for slice in slices {
+            writer.apply_watcher_event(&watcher::Event::Apply(slice));
+        }
+        writer.as_reader()
+    }
+
+    #[test]
+    fn resolve_returns_ready_endpoints() {
+        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", Some(true))]);
+        let addrs = resolve("ns", "svc", 8080, &store);
+        assert_eq!(addrs, vec!["10.0.0.1:8080".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn resolve_skips_not_ready_endpoints() {
+        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", Some(false))]);
+        assert!(resolve("ns", "svc", 8080, &store).is_empty());
+    }
+
+    #[test]
+    fn resolve_includes_unknown_ready_endpoints() {
+        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", None)]);
+        assert_eq!(resolve("ns", "svc", 8080, &store).len(), 1);
+    }
+
+    #[test]
+    fn resolve_ignores_wrong_namespace() {
+        let store = make_store(vec![make_slice("other-ns", "svc", "10.0.0.1", Some(true))]);
+        assert!(resolve("ns", "svc", 8080, &store).is_empty());
+    }
+
+    #[test]
+    fn resolve_ignores_wrong_service() {
+        let store = make_store(vec![make_slice("ns", "other-svc", "10.0.0.1", Some(true))]);
+        assert!(resolve("ns", "svc", 8080, &store).is_empty());
+    }
+
+    #[test]
+    fn resolve_empty_store() {
+        assert!(resolve("ns", "svc", 8080, &make_store(vec![])).is_empty());
+    }
+}
