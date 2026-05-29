@@ -1,3 +1,3 @@
-pub mod gateway_api;
-pub mod ingress;
+pub(crate) mod gateway_api;
+pub(crate) mod ingress;
 pub mod watcher;

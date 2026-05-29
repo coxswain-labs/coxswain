@@ -10,11 +10,14 @@ name = "coxswain"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = { workspace = true }
 arc-swap = { workspace = true }
 coxswain-core = { workspace = true }
+coxswain-admin = { workspace = true }
 coxswain-controller = { workspace = true }
 coxswain-proxy = { workspace = true }
 clap = { workspace = true }
 pingora-core = { workspace = true }
 pingora-proxy = { workspace = true }
-tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

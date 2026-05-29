@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coxswain-controller
+  namespace: coxswain-system
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: coxswain-controller-role
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "pods", "secrets"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "ingressclasses"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses", "gateways", "httproutes"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses/status"]
+    verbs: ["patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: coxswain-controller-binding
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+subjects:
+  - kind: ServiceAccount
+    name: coxswain-controller
+    namespace: coxswain-system
+roleRef:
+  kind: ClusterRole
+  name: coxswain-controller-role
+  apiGroup: rbac.authorization.k8s.io

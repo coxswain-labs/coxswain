@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use matchit::Router;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackendPod {
@@ -21,7 +21,9 @@ pub struct RoutingTable {
 
 impl RoutingTable {
     pub fn new() -> Self {
-        Self { hosts: HashMap::new() }
+        Self {
+            hosts: HashMap::new(),
+        }
     }
 
     pub fn match_route(&self, host: &str, path: &str) -> Option<&RouteTarget> {
