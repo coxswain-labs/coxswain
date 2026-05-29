@@ -39,13 +39,15 @@ cargo run --bin coxswain -- --log-format console
 
 ## Architecture
 
-The workspace has five crates with a strict dependency order:
+The workspace has six crates under `crates/` with a strict dependency order:
 
 ```
 coxswain-bin
   ├── coxswain-controller
   │     └── coxswain-core
   ├── coxswain-proxy
+  │     └── coxswain-core
+  ├── coxswain-health
   │     └── coxswain-core
   └── coxswain-admin
         └── coxswain-core
@@ -95,7 +97,11 @@ Pingora-based reverse proxy. Reads routing decisions from `coxswain-core` and fo
 Key files:
 - `engine.rs` — `RoutingEngine` wraps `SharedRoutingTable` for reads on the hot path. `CoxswainProxy` implements `ProxyHttp`, calling `engine.route(host, path)` on every request.
 - `filter.rs` — `TrafficFilter`: injects the `X-Proxy-Engine: Coxswain-Pingora` header on upstream requests.
-- `health.rs` — `HealthService`: serves `/healthz` (always 200) and `/readyz` (200 once `synced`, 503 before).
+
+### `coxswain-health`
+Health endpoints served on a dedicated port, keeping liveness/readiness concerns out of the proxy hot path. `HealthService` implements Pingora's `Service` trait and handles:
+- `GET /healthz` — always 200; confirms the process is alive.
+- `GET /readyz` — 200 once `synced` flips true (initial LIST completed); 503 before.
 
 ### `coxswain-admin`
 Diagnostics and observability endpoints, served on a separate port.
