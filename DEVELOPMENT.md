@@ -70,6 +70,59 @@ kubectl get gatewayclass                   # should show "coxswain" accepted
 
 `synced` in `/status` flips to `true` once both Ingress and HTTPRoute watch streams complete their initial LIST. You will see `ingress initial sync complete` in the logs when this happens.
 
+## Testing routing with dev manifests
+
+The `deploy/dev/` directory contains lightweight test fixtures for exercising both routing paths without any application code.
+
+### Apply backends and routes
+
+```bash
+# Three echo servers (echo-a, echo-b, echo-c) — apply once
+kubectl apply -f deploy/dev/echo-backends.yaml
+
+# Gateway API routes (requires Gateway API CRDs from step 1)
+kubectl apply -f deploy/dev/httproute.yaml
+
+# Classic Ingress routes
+kubectl apply -f deploy/dev/ingress.yaml
+```
+
+### Test Gateway API routes
+
+```bash
+# echo.local — path-based routing, single backend per rule
+curl -H "Host: echo.local" http://localhost:8080/a          # hello from echo-a
+curl -H "Host: echo.local" http://localhost:8080/b          # hello from echo-b
+curl -H "Host: echo.local" http://localhost:8080/           # hello from echo-a (catchall)
+
+# split.local — both echo-a and echo-b are pooled into one upstream;
+# coxswain round-robins across all ready pod addresses from both services
+curl -H "Host: split.local" http://localhost:8080/          # hello from echo-a
+curl -H "Host: split.local" http://localhost:8080/          # hello from echo-b
+
+# *.wildcard.local — any subdomain matches
+curl -H "Host: foo.wildcard.local" http://localhost:8080/   # hello from echo-c
+curl -H "Host: bar.wildcard.local" http://localhost:8080/   # hello from echo-c
+```
+
+### Test classic Ingress routes
+
+```bash
+# ingress.local
+curl -H "Host: ingress.local" http://localhost:8080/a       # hello from echo-a
+curl -H "Host: ingress.local" http://localhost:8080/b       # hello from echo-b
+
+# ingress2.local — second Ingress resource
+curl -H "Host: ingress2.local" http://localhost:8080/c      # hello from echo-c
+curl -H "Host: ingress2.local" http://localhost:8080/       # hello from echo-a (catchall)
+```
+
+### Observe the routing table
+
+```bash
+curl -s http://localhost:8082/routes | jq .    # lists all active hostnames
+```
+
 ## Common commands
 
 ```bash

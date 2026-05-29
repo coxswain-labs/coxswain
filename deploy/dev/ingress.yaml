@@ -1,8 +1,12 @@
-# Ingress for testing the classic Ingress path.
+# Ingress resources for testing the classic Ingress path.
 #
-# Requests to ingress.local are routed by path prefix:
+# ingress.local  — path-based routing across two backends:
 #   /a  → echo-a
 #   /b  → echo-b
+#
+# ingress2.local — second Ingress resource (tests multi-Ingress reconciliation):
+#   /c  → echo-c
+#   /   → echo-a (catchall)
 #
 # Note: coxswain currently picks up all Ingress resources regardless of
 # ingressClassName, so no IngressClass resource is needed.
@@ -11,8 +15,10 @@
 #   kubectl apply -f deploy/dev/ingress.yaml
 #
 # Test (coxswain proxy on localhost:8080):
-#   curl -H "Host: ingress.local" http://localhost:8080/a    # hello from echo-a
-#   curl -H "Host: ingress.local" http://localhost:8080/b    # hello from echo-b
+#   curl -H "Host: ingress.local" http://localhost:8080/a      # hello from echo-a
+#   curl -H "Host: ingress.local" http://localhost:8080/b      # hello from echo-b
+#   curl -H "Host: ingress2.local" http://localhost:8080/c     # hello from echo-c
+#   curl -H "Host: ingress2.local" http://localhost:8080/      # hello from echo-a
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -36,5 +42,30 @@ spec:
             backend:
               service:
                 name: echo-b
+                port:
+                  number: 5678
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: echo-ingress-2
+  namespace: default
+spec:
+  rules:
+    - host: ingress2.local
+      http:
+        paths:
+          - path: /c
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-c
+                port:
+                  number: 5678
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
                 port:
                   number: 5678

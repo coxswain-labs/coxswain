@@ -1,17 +1,27 @@
-# Gateway + HTTPRoute for testing Gateway API path.
+# Gateway + HTTPRoute resources for testing Gateway API paths.
 #
-# Requests to echo.local are routed by path prefix:
+# echo.local  — path-based routing, single backend per rule:
 #   /a  → echo-a
 #   /b  → echo-b
 #   /   → echo-a (catchall rule)
+#
+# split.local — single rule pooling two backends; coxswain round-robins
+#               across all ready pod addresses from both services:
+#   /   → echo-a + echo-b (alternates on successive requests)
+#
+# *.wildcard.local — wildcard hostname; any subdomain routes to echo-c:
+#   /   → echo-c
 #
 # Apply:
 #   kubectl apply -f deploy/dev/httproute.yaml
 #
 # Test (coxswain proxy on localhost:8080):
-#   curl -H "Host: echo.local" http://localhost:8080/a    # hello from echo-a
-#   curl -H "Host: echo.local" http://localhost:8080/b    # hello from echo-b
-#   curl -H "Host: echo.local" http://localhost:8080/     # hello from echo-a
+#   curl -H "Host: echo.local" http://localhost:8080/a         # hello from echo-a
+#   curl -H "Host: echo.local" http://localhost:8080/b         # hello from echo-b
+#   curl -H "Host: echo.local" http://localhost:8080/          # hello from echo-a
+#   curl -H "Host: split.local" http://localhost:8080/         # alternates a/b
+#   curl -H "Host: split.local" http://localhost:8080/         # alternates a/b
+#   curl -H "Host: foo.wildcard.local" http://localhost:8080/  # hello from echo-c
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -55,4 +65,36 @@ spec:
           port: 5678
     - backendRefs:
         - name: echo-a
+          port: 5678
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: split-route
+  namespace: default
+spec:
+  parentRefs:
+    - name: coxswain-local
+  hostnames:
+    - "split.local"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 5678
+        - name: echo-b
+          port: 5678
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: wildcard-route
+  namespace: default
+spec:
+  parentRefs:
+    - name: coxswain-local
+  hostnames:
+    - "*.wildcard.local"
+  rules:
+    - backendRefs:
+        - name: echo-c
           port: 5678
