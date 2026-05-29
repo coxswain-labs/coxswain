@@ -68,7 +68,7 @@ Key files:
 - `Event::InitApply(obj)` — existing objects from the initial LIST phase (startup)
 - `Event::Apply(obj)` — subsequent watch-stream updates (creates/updates after sync)
 - `Event::Delete(obj)` — deletions
-- `Event::InitDone` — signals end of initial list; used to flip the `synced` flag
+- `Event::InitDone` — signals the end of an initial list; used to flip the `synced` flag
 
 Both `InitApply` and `Apply` must be handled identically for routing table updates.
 
