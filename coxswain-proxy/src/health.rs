@@ -20,23 +20,26 @@ impl ServeHttp for HealthService {
                 .status(200)
                 .header("content-type", "text/plain")
                 .body(b"ok\n".to_vec())
-                .unwrap(),
+                .expect("infallible: static response headers are valid"),
             "/readyz" => {
                 if self.synced.load(Ordering::Acquire) {
                     Response::builder()
                         .status(200)
                         .header("content-type", "text/plain")
                         .body(b"ok\n".to_vec())
-                        .unwrap()
+                        .expect("infallible: static response headers are valid")
                 } else {
                     Response::builder()
                         .status(503)
                         .header("content-type", "text/plain")
                         .body(b"not ready\n".to_vec())
-                        .unwrap()
+                        .expect("infallible: static response headers are valid")
                 }
             }
-            _ => Response::builder().status(404).body(Vec::new()).unwrap(),
+            _ => Response::builder()
+                .status(404)
+                .body(Vec::new())
+                .expect("infallible: static response headers are valid"),
         }
     }
 }

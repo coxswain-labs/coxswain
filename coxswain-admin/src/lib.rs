@@ -33,7 +33,10 @@ impl ServeHttp for AdminService {
             "/metrics" => metrics_response(),
             "/routes" => routes_response(&self.routes),
             "/status" => status_response(&self.synced, &self.leader, &self.routes),
-            _ => Response::builder().status(404).body(Vec::new()).unwrap(),
+            _ => Response::builder()
+                .status(404)
+                .body(Vec::new())
+                .expect("infallible: static response headers are valid"),
         }
     }
 }
@@ -43,13 +46,16 @@ fn metrics_response() -> Response<Vec<u8>> {
     let mut buffer = Vec::new();
     if let Err(e) = encoder.encode(&prometheus::gather(), &mut buffer) {
         tracing::warn!(error = %e, "Failed to encode Prometheus metrics");
-        return Response::builder().status(500).body(Vec::new()).unwrap();
+        return Response::builder()
+            .status(500)
+            .body(Vec::new())
+            .expect("infallible: static response headers are valid");
     }
     Response::builder()
         .status(200)
         .header("content-type", encoder.format_type())
         .body(buffer)
-        .unwrap()
+        .expect("infallible: static response headers are valid")
 }
 
 fn routes_response(routes: &Arc<ArcSwap<RoutingTable>>) -> Response<Vec<u8>> {
@@ -75,10 +81,11 @@ fn status_response(
     json_response(body)
 }
 
-fn json_response(body: String) -> Response<Vec<u8>> {
+fn json_response(mut body: String) -> Response<Vec<u8>> {
+    body.push('\n');
     Response::builder()
         .status(200)
         .header("content-type", "application/json")
-        .body(format!("{body}\n").into_bytes())
-        .unwrap()
+        .body(body.into_bytes())
+        .expect("infallible: static response headers are valid")
 }

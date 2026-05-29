@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-fn has_condition(conditions: Option<&Vec<Condition>>, type_: &str) -> bool {
+fn has_condition(conditions: Option<&[Condition]>, type_: &str) -> bool {
     conditions
         .map(|conds| conds.iter().any(|c| c.type_ == type_ && c.status == "True"))
         .unwrap_or(false)
@@ -30,7 +30,7 @@ fn has_condition(conditions: Option<&Vec<Condition>>, type_: &str) -> bool {
 
 fn gateway_class_accepted(gc: &GatewayClass) -> bool {
     has_condition(
-        gc.status.as_ref().and_then(|s| s.conditions.as_ref()),
+        gc.status.as_ref().and_then(|s| s.conditions.as_deref()),
         "Accepted",
     )
 }
@@ -42,7 +42,7 @@ fn httproute_programmed(route: &HTTPRoute, controller_name: &str) -> bool {
         .map(|s| {
             s.parents.iter().any(|p| {
                 p.controller_name == controller_name
-                    && has_condition(Some(&p.conditions), "Programmed")
+                    && has_condition(Some(p.conditions.as_slice()), "Programmed")
             })
         })
         .unwrap_or(false)
@@ -164,10 +164,7 @@ impl Controller {
                         Ok(watcher::Event::Apply(route) | watcher::Event::InitApply(route)) => {
                             // All replicas update the local data plane unconditionally.
                             let mut table = (**self.shared_routes.load()).clone();
-                            GatewayApiTranslator::translate(
-                                watcher::Event::Apply(route.clone()),
-                                &mut table,
-                            );
+                            GatewayApiTranslator::apply(&route, &mut table);
                             self.shared_routes.store(Arc::new(table));
                             // Only the leader writes status back to the API server.
                             if is_leader && !httproute_programmed(&route, &self.controller_name) {

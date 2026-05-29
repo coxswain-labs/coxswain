@@ -117,7 +117,12 @@ fn main() -> Result<()> {
         args.pod_namespace.clone(),
     );
     register_proxy(&mut server, routes.clone(), args.proxy_http_port);
-    register_health(&mut server, routes.clone(), synced.clone(), args.health_port);
+    register_health(
+        &mut server,
+        routes.clone(),
+        synced.clone(),
+        args.health_port,
+    );
     register_admin(&mut server, routes, synced, leader, args.admin_port);
 
     tracing::info!(
@@ -160,7 +165,14 @@ fn register_controller(
 ) {
     let controller = background_service(
         "controller",
-        Controller::new(routes, synced, leader, controller_name, pod_name, pod_namespace),
+        Controller::new(
+            routes,
+            synced,
+            leader,
+            controller_name,
+            pod_name,
+            pod_namespace,
+        ),
     );
     server.add_service(controller);
 }
@@ -185,7 +197,14 @@ fn register_admin(
     leader: Arc<AtomicBool>,
     port: u16,
 ) {
-    server.add_service(coxswain_admin::AdminService { synced, leader, routes }.into_service(port));
+    server.add_service(
+        coxswain_admin::AdminService {
+            synced,
+            leader,
+            routes,
+        }
+        .into_service(port),
+    );
 }
 
 fn register_proxy(server: &mut Server, routes: Arc<ArcSwap<RoutingTable>>, port: u16) {

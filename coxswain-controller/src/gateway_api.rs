@@ -5,16 +5,17 @@ use kube::runtime::watcher;
 pub struct GatewayApiTranslator;
 
 impl GatewayApiTranslator {
-    pub fn translate(event: watcher::Event<HTTPRoute>, _current_table: &mut RoutingTable) {
+    pub fn apply(route: &HTTPRoute, _table: &mut RoutingTable) {
+        tracing::info!(name = ?route.metadata.name, "Reconciling Gateway HTTPRoute");
+    }
+
+    pub fn translate(event: watcher::Event<HTTPRoute>, table: &mut RoutingTable) {
         match event {
             watcher::Event::Apply(route) | watcher::Event::InitApply(route) => {
-                println!("Reconciling Gateway HTTPRoute: {:?}", route.metadata.name);
+                Self::apply(&route, table);
             }
             watcher::Event::Delete(route) => {
-                println!(
-                    "Deleting Gateway HTTPRoute paths: {:?}",
-                    route.metadata.name
-                );
+                tracing::info!(name = ?route.metadata.name, "Deleting Gateway HTTPRoute paths");
             }
             _ => {}
         }
