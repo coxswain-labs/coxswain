@@ -109,7 +109,7 @@ Core routing engine, HTTP/1.1 proxy, round-robin LB, HTTPRoute + Ingress path/ho
 ---
 
 ### v0.2 — Multi-tenancy & Spec Correctness
-*Target: Month 1–2*
+*Target: Week 1–2*
 
 The most critical correctness gaps. Without these, Coxswain is unsafe in any shared cluster and fails Gateway API conformance on basic tests.
 
@@ -125,7 +125,7 @@ The most critical correctness gaps. Without these, Coxswain is unsafe in any sha
 ---
 
 ### v0.3 — TLS & WebSocket
-*Target: Month 2–3*
+*Target: Week 3–4*
 
 TLS is a launch blocker. WebSocket is the minimum protocol expansion needed to support real-time workloads.
 
@@ -138,7 +138,7 @@ TLS is a launch blocker. WebSocket is the minimum protocol expansion needed to s
 ---
 
 ### v0.4 — Traffic Management
-*Target: Month 3–5*
+*Target: Week 5–6*
 
 Full HTTPRoute filter compliance + the annotation layer for Ingress. This is the largest milestone by surface area.
 
@@ -153,7 +153,7 @@ Full HTTPRoute filter compliance + the annotation layer for Ingress. This is the
 ---
 
 ### v0.5 — Observability & Health
-*Target: Month 5–6*
+*Target: Week 7*
 
 Operators need signals before they trust any controller in production. This milestone gives them the three they care about most.
 
@@ -164,7 +164,7 @@ Operators need signals before they trust any controller in production. This mile
 ---
 
 ### v0.6 — Security & Policy
-*Target: Month 6–7*
+*Target: Week 8*
 
 Auth and rate limiting close the gap with production-grade controllers.
 
@@ -175,7 +175,7 @@ Auth and rate limiting close the gap with production-grade controllers.
 ---
 
 ### v0.7 — Distribution & Community Readiness
-*Target: Month 7–8*
+*Target: Week 9–10*
 
 The core is locked in. This milestone makes Coxswain installable and opens the door for community contributions.
 
@@ -191,7 +191,7 @@ The core is locked in. This milestone makes Coxswain installable and opens the d
 ---
 
 ### v0.8 — HTTP/2 & gRPC
-*Target: Month 8–9 — first community-contributed milestone*
+*Target: Week 11 — first community-contributed milestone*
 
 - [ ] HTTP/2 downstream (h2c), HTTP/1.1 upstream bridging — [#32](https://github.com/coxswain-labs/coxswain/issues/32) `SHOULD`
 - [ ] `GRPCRoute` + gRPC protocol support — [#33](https://github.com/coxswain-labs/coxswain/issues/33) `SHOULD`
@@ -199,7 +199,7 @@ The core is locked in. This milestone makes Coxswain installable and opens the d
 ---
 
 ### v1.0 — Conformance & GA
-*Target: Month 10–12*
+*Target: Week 12–14*
 
 The finish line: full Gateway API conformance suite passing, conformance badge, stable public API.
 
