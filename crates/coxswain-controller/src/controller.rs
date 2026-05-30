@@ -19,6 +19,37 @@ use std::time::Duration;
 
 const LEASE_NAME: &str = "coxswain-leader-lock";
 
+/// Configuration for the leader-election controller.
+///
+/// Validated on construction: `lease_renew_interval * 3` must not exceed `lease_ttl`,
+/// which keeps the renewal rate safely below the threshold where a live leader could
+/// be evicted by a standby.
+pub struct ControllerConfig {
+    pub controller_name: String,
+    pub pod_name: String,
+    pub pod_namespace: String,
+    pub lease_ttl: Duration,
+    pub lease_renew_interval: Duration,
+}
+
+impl ControllerConfig {
+    pub fn new(
+        controller_name: String,
+        pod_name: String,
+        pod_namespace: String,
+        lease_ttl: Duration,
+        lease_renew_interval: Duration,
+    ) -> Result<Self, String> {
+        if lease_renew_interval * 3 > lease_ttl {
+            return Err(format!(
+                "lease_renew_interval ({lease_renew_interval:?}) must be at most \
+                 1/3 of lease_ttl ({lease_ttl:?})"
+            ));
+        }
+        Ok(Self { controller_name, pod_name, pod_namespace, lease_ttl, lease_renew_interval })
+    }
+}
+
 fn has_condition(conditions: Option<&[Condition]>, type_: &str) -> bool {
     conditions
         .map(|conds| conds.iter().any(|c| c.type_ == type_ && c.status == "True"))
@@ -64,26 +95,12 @@ fn make_condition(type_: &str, reason: &str, generation: i64, now: Time) -> Cond
 pub struct Controller {
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
-    controller_name: String,
-    pod_name: String,
-    pod_namespace: String,
+    config: ControllerConfig,
 }
 
 impl Controller {
-    pub fn new(
-        synced: Arc<AtomicBool>,
-        leader: Arc<AtomicBool>,
-        controller_name: String,
-        pod_name: String,
-        pod_namespace: String,
-    ) -> Self {
-        Self {
-            synced,
-            leader,
-            controller_name,
-            pod_name,
-            pod_namespace,
-        }
+    pub fn new(synced: Arc<AtomicBool>, leader: Arc<AtomicBool>, config: ControllerConfig) -> Self {
+        Self { synced, leader, config }
     }
 
     async fn start_watcher_loop(&self, mut shutdown: ShutdownWatch) {
@@ -93,17 +110,17 @@ impl Controller {
 
         let lease_lock = LeaseLock::new(
             client.clone(),
-            &self.pod_namespace,
+            &self.config.pod_namespace,
             LeaseLockParams {
-                holder_id: self.pod_name.clone(),
+                holder_id: self.config.pod_name.clone(),
                 lease_name: LEASE_NAME.to_string(),
-                lease_ttl: Duration::from_secs(15),
+                lease_ttl: self.config.lease_ttl,
             },
         );
 
         // Acquire leadership before the event loop so that InitApply events
         // during the initial list are processed with the correct leader state.
-        let mut is_leader = Self::try_renew(&lease_lock, &self.pod_name).await;
+        let mut is_leader = Self::try_renew(&lease_lock, &self.config.pod_name).await;
         self.leader.store(is_leader, Ordering::Release);
 
         let route_watcher = watcher(
@@ -120,24 +137,23 @@ impl Controller {
         tokio::pin!(route_watcher);
         tokio::pin!(gateway_class_watcher);
 
-        // Renew every 5 seconds (≤ 1/3 of the 15s TTL).
         // interval_at delays the first tick so we don't double-acquire immediately.
         let mut renewal_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(5),
-            Duration::from_secs(5),
+            tokio::time::Instant::now() + self.config.lease_renew_interval,
+            self.config.lease_renew_interval,
         );
 
-        tracing::info!(pod = %self.pod_name, is_leader, "Watch streams active");
+        tracing::info!(pod = %self.config.pod_name, is_leader, "Watch streams active");
 
         loop {
             tokio::select! {
                 _ = renewal_interval.tick() => {
-                    let leading = Self::try_renew(&lease_lock, &self.pod_name).await;
+                    let leading = Self::try_renew(&lease_lock, &self.config.pod_name).await;
                     if leading != is_leader {
                         if leading {
-                            tracing::info!(pod = %self.pod_name, "Acquired leadership");
+                            tracing::info!(pod = %self.config.pod_name, "Acquired leadership");
                         } else {
-                            tracing::info!(pod = %self.pod_name, "Lost leadership");
+                            tracing::info!(pod = %self.config.pod_name, "Lost leadership");
                         }
                         is_leader = leading;
                         self.leader.store(is_leader, Ordering::Release);
@@ -152,11 +168,11 @@ impl Controller {
                         }
                         Ok(watcher::Event::Apply(route) | watcher::Event::InitApply(route)) => {
                             // Only the leader writes status back to the API server.
-                            if is_leader && !http_route_programmed(&route, &self.controller_name) {
+                            if is_leader && !http_route_programmed(&route, &self.config.controller_name) {
                                 Self::mark_http_route_programmed(
                                     &client,
                                     &route,
-                                    &self.controller_name,
+                                    &self.config.controller_name,
                                 )
                                 .await;
                             } else if !is_leader {
@@ -175,7 +191,7 @@ impl Controller {
                     match event {
                         Ok(watcher::Event::Apply(gc) | watcher::Event::InitApply(gc)) => {
                             let name = gc.metadata.name.clone().unwrap_or_default();
-                            if gc.spec.controller_name == self.controller_name {
+                            if gc.spec.controller_name == self.config.controller_name {
                                 if is_leader && !gateway_class_accepted(&gc) {
                                     let generation = gc.metadata.generation.unwrap_or(0);
                                     Self::accept_gateway_class(&client, &name, generation).await;
@@ -198,7 +214,7 @@ impl Controller {
                 _ = shutdown.changed() => {
                     if is_leader {
                         match lease_lock.step_down().await {
-                            Ok(()) => tracing::info!(pod = %self.pod_name, "Stepped down from leadership"),
+                            Ok(()) => tracing::info!(pod = %self.config.pod_name, "Stepped down from leadership"),
                             // Already lost the lease by the time we tried to release it — fine.
                             Err(kube_leader_election::Error::ReleaseLockWhenNotLeading { .. }) => {}
                             Err(e) => tracing::warn!(error = %e, "Failed to step down from leadership"),

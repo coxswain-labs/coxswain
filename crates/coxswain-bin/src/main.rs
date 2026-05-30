@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use coxswain_admin::AdminServer;
-use coxswain_controller::{Controller, Reconciler};
+use coxswain_controller::{Controller, ControllerConfig, Reconciler};
 use coxswain_core::routing::SharedRoutingTable;
 use coxswain_health::HealthServer;
 use coxswain_proxy::{Proxy, RoutingEngine};
@@ -114,6 +114,29 @@ pub struct ServeArgs {
     )]
     pub proxy_shutdown_timeout: Duration,
 
+    /// How long a leader lease stays valid without renewal.
+    ///
+    /// Determines how quickly a standby replica can take over after the leader dies.
+    /// Must be at least 3× `--leader-lease-renew-interval`.
+    #[arg(
+        long,
+        env = "COXSWAIN_LEADER_LEASE_TTL",
+        default_value = "15s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub leader_lease_ttl: Duration,
+
+    /// How often the active leader renews its lease.
+    ///
+    /// Must be at most 1/3 of `--leader-lease-ttl`.
+    #[arg(
+        long,
+        env = "COXSWAIN_LEADER_LEASE_RENEW_INTERVAL",
+        default_value = "5s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub leader_lease_renew_interval: Duration,
+
     /// Socket address to listen on for the admin, metrics, and diagnostics endpoints.
     #[arg(long, env = "COXSWAIN_ADMIN_ADDR", default_value = "0.0.0.0:8082")]
     pub admin_addr: SocketAddr,
@@ -131,6 +154,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let Commands::Serve(args) = cli.command;
 
+    let controller_config = ControllerConfig::new(
+        args.controller_name.clone(),
+        args.pod_name.clone(),
+        args.pod_namespace.clone(),
+        args.leader_lease_ttl,
+        args.leader_lease_renew_interval,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
     init_logger(args.log_format, &args.log_filter)?;
 
     tracing::info!(
@@ -145,14 +177,7 @@ fn main() -> Result<()> {
     let synced = build_flag();
     let leader = build_flag();
 
-    register_controller(
-        &mut server,
-        synced.clone(),
-        leader.clone(),
-        args.controller_name.clone(),
-        args.pod_name.clone(),
-        args.pod_namespace.clone(),
-    );
+    register_controller(&mut server, synced.clone(), leader.clone(), controller_config);
     register_reconciler(&mut server, routing_table.clone());
     register_proxy(&mut server, engine, args.proxy_addr);
     register_health(&mut server, synced.clone(), args.health_addr);
@@ -194,15 +219,9 @@ fn register_controller(
     server: &mut Server,
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
-    controller_name: String,
-    pod_name: String,
-    pod_namespace: String,
+    config: ControllerConfig,
 ) {
-    let controller = background_service(
-        "controller",
-        Controller::new(synced, leader, controller_name, pod_name, pod_namespace),
-    );
-    server.add_service(controller);
+    server.add_service(background_service("controller", Controller::new(synced, leader, config)));
 }
 
 fn register_health(server: &mut Server, synced: Arc<AtomicBool>, addr: SocketAddr) {
