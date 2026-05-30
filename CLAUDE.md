@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code when working with code in this repository.
 
+## GitHub Issue Workflow
+
+When working on a GitHub issue, always include a reference in every commit message:
+- Use `Refs #N` for partial work on an issue.
+- Use `Fixes #N` for the final commit that completes it (GitHub closes the issue automatically on push).
+
+When the user says an issue is done:
+1. Run `gh issue close N --repo coxswain-labs/coxswain`.
+2. Flip `[ ]` to `[x]` for that item in `ROADMAP.md`.
+3. Commit and push the `ROADMAP.md` change with `Refs #N` in the message.
+
 ## Project Overview
 
 **Coxswain** is a pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine. It watches Kubernetes `Ingress` and `Gateway API` resources and dynamically routes traffic without a full reload. Multiple replicas can run simultaneously using Kubernetes Lease-based leader election: all replicas maintain a hot data-plane routing table, but only the active leader writes status back to the API server.
