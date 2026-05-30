@@ -76,6 +76,31 @@
 
 ---
 
+## Implementation Order Guidelines
+
+**Milestone order is strict.** Each milestone builds on the previous one — do not start v0.3 before v0.2 is complete. Cross-milestone dependencies include:
+- v0.3 TLS issues depend on v0.2 Gateway infrastructure ([#2](https://github.com/coxswain-labs/coxswain/issues/2) must land before [#9](https://github.com/coxswain-labs/coxswain/issues/9)).
+- v0.4 `BackendTLSPolicy` ([#16](https://github.com/coxswain-labs/coxswain/issues/16)) depends on v0.3 TLS termination.
+- v0.8 gRPC ([#33](https://github.com/coxswain-labs/coxswain/issues/33)) depends on v0.8 HTTP/2 ([#32](https://github.com/coxswain-labs/coxswain/issues/32)).
+
+**Within each milestone, follow issue number order by default** with the exceptions below.
+
+### v0.2 — Multi-tenancy & Spec Correctness
+- Do [**#45**](https://github.com/coxswain-labs/coxswain/issues/45) (basic CI) first — before writing any feature code. Every subsequent commit is verified automatically.
+- Do [**#2**](https://github.com/coxswain-labs/coxswain/issues/2) (parentRef matching) before [**#5**](https://github.com/coxswain-labs/coxswain/issues/5) (Gateway status patching) — both need a `Gateway` reflector; build it once in #2 and reuse it in #5.
+- Do [**#7**](https://github.com/coxswain-labs/coxswain/issues/7) (advanced matching) last — it is the most architecturally impactful issue in the roadmap. It introduces a per-request predicate model into `coxswain-core` that every v0.4 feature (filters, timeouts, weighted refs) builds on. Get the design right before moving forward.
+
+### v0.3 — TLS & WebSocket
+- Do [**#8**](https://github.com/coxswain-labs/coxswain/issues/8) and [**#9**](https://github.com/coxswain-labs/coxswain/issues/9) (TLS termination for Ingress and Gateway API) before [**#10**](https://github.com/coxswain-labs/coxswain/issues/10) (hot reload) and [**#11**](https://github.com/coxswain-labs/coxswain/issues/11) (cert-manager) — the latter two are layered on top of the former two.
+
+### v0.4 — Traffic Management
+- Do [**#13**](https://github.com/coxswain-labs/coxswain/issues/13) (HTTPRoute filters) before [**#15**](https://github.com/coxswain-labs/coxswain/issues/15) (BackendLBPolicy) and [**#16**](https://github.com/coxswain-labs/coxswain/issues/16) (BackendTLSPolicy) — filters establish the per-route config model in `coxswain-core` that the policy attachments extend.
+
+### v0.8 — HTTP/2 & gRPC
+- Do [**#32**](https://github.com/coxswain-labs/coxswain/issues/32) (HTTP/2) before [**#33**](https://github.com/coxswain-labs/coxswain/issues/33) (gRPC) — gRPC is a hard protocol dependency on HTTP/2.
+
+---
+
 ## Milestones
 
 ### v0.1 — Current State *(done)*
@@ -181,31 +206,6 @@ The finish line: full Gateway API conformance suite passing, conformance badge, 
 - [ ] Full Gateway API conformance test suite — all applicable tests passing — [#34](https://github.com/coxswain-labs/coxswain/issues/34) `MUST`
 - [ ] Conformance badge + stable `coxswain-labs.dev/*` annotation API — [#35](https://github.com/coxswain-labs/coxswain/issues/35) `MUST`
 - [ ] Any remaining conformance gaps from v0.2–v0.8 `MUST`
-
----
-
-## Implementation Order Guidelines
-
-**Milestone order is strict.** Each milestone builds on the previous one — do not start v0.3 before v0.2 is complete. Cross-milestone dependencies include:
-- v0.3 TLS issues depend on v0.2 Gateway infrastructure ([#2](https://github.com/coxswain-labs/coxswain/issues/2) must land before [#9](https://github.com/coxswain-labs/coxswain/issues/9)).
-- v0.4 `BackendTLSPolicy` ([#16](https://github.com/coxswain-labs/coxswain/issues/16)) depends on v0.3 TLS termination.
-- v0.8 gRPC ([#33](https://github.com/coxswain-labs/coxswain/issues/33)) depends on v0.8 HTTP/2 ([#32](https://github.com/coxswain-labs/coxswain/issues/32)).
-
-**Within each milestone, follow issue number order by default** with the exceptions below.
-
-### v0.2 — Multi-tenancy & Spec Correctness
-- Do [**#45**](https://github.com/coxswain-labs/coxswain/issues/45) (basic CI) first — before writing any feature code. Every subsequent commit is verified automatically.
-- Do [**#2**](https://github.com/coxswain-labs/coxswain/issues/2) (parentRef matching) before [**#5**](https://github.com/coxswain-labs/coxswain/issues/5) (Gateway status patching) — both need a `Gateway` reflector; build it once in #2 and reuse it in #5.
-- Do [**#7**](https://github.com/coxswain-labs/coxswain/issues/7) (advanced matching) last — it is the most architecturally impactful issue in the roadmap. It introduces a per-request predicate model into `coxswain-core` that every v0.4 feature (filters, timeouts, weighted refs) builds on. Get the design right before moving forward.
-
-### v0.3 — TLS & WebSocket
-- Do [**#8**](https://github.com/coxswain-labs/coxswain/issues/8) and [**#9**](https://github.com/coxswain-labs/coxswain/issues/9) (TLS termination for Ingress and Gateway API) before [**#10**](https://github.com/coxswain-labs/coxswain/issues/10) (hot reload) and [**#11**](https://github.com/coxswain-labs/coxswain/issues/11) (cert-manager) — the latter two are layered on top of the former two.
-
-### v0.4 — Traffic Management
-- Do [**#13**](https://github.com/coxswain-labs/coxswain/issues/13) (HTTPRoute filters) before [**#15**](https://github.com/coxswain-labs/coxswain/issues/15) (BackendLBPolicy) and [**#16**](https://github.com/coxswain-labs/coxswain/issues/16) (BackendTLSPolicy) — filters establish the per-route config model in `coxswain-core` that the policy attachments extend.
-
-### v0.8 — HTTP/2 & gRPC
-- Do [**#32**](https://github.com/coxswain-labs/coxswain/issues/32) (HTTP/2) before [**#33**](https://github.com/coxswain-labs/coxswain/issues/33) (gRPC) — gRPC is a hard protocol dependency on HTTP/2.
 
 ---
 
