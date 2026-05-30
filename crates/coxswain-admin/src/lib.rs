@@ -10,13 +10,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub struct AdminService {
+pub struct AdminServer {
     pub synced: Arc<AtomicBool>,
     pub leader: Arc<AtomicBool>,
     pub routes: SharedRoutingTable,
 }
 
-impl AdminService {
+impl AdminServer {
     pub fn into_service(self, addr: SocketAddr) -> Service<HttpServer<Self>> {
         let mut http_server = HttpServer::new_app(self);
         http_server.add_module(ResponseCompressionBuilder::enable(7));
@@ -27,7 +27,7 @@ impl AdminService {
 }
 
 #[async_trait]
-impl ServeHttp for AdminService {
+impl ServeHttp for AdminServer {
     async fn response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
         match session.req_header().uri.path() {
             "/metrics" => metrics_response(),

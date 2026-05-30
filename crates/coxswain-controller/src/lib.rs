@@ -5,4 +5,4 @@ mod controller;
 mod reconciler;
 
 pub use controller::Controller;
-pub use reconciler::ReconcilerService;
+pub use reconciler::Reconciler;

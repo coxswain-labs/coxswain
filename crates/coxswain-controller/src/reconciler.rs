@@ -21,18 +21,18 @@ use tokio::task::JoinSet;
 /// `HTTPRoute`, `Ingress`, and `EndpointSlice`, and rebuilds the routing
 /// table whenever any of them change — with a 500 ms trailing-edge debounce
 /// to coalesce burst updates (e.g. rolling deploys).
-pub struct ReconcilerService {
+pub struct Reconciler {
     routes: SharedRoutingTable,
 }
 
-impl ReconcilerService {
+impl Reconciler {
     pub fn new(routes: SharedRoutingTable) -> Self {
         Self { routes }
     }
 }
 
 #[async_trait]
-impl BackgroundService for ReconcilerService {
+impl BackgroundService for Reconciler {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         let client = Client::try_default()
             .await

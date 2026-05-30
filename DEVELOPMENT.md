@@ -41,7 +41,7 @@ kubectl apply -f deploy/manifests/gateway-class.yaml
 ### 3. Run the binary
 
 ```bash
-cargo run --bin coxswain -- --log-format console
+cargo run --bin coxswain -- serve --log-format console
 ```
 
 `--log-format console` produces human-readable output instead of JSON. All ports bind on localhost at their defaults:

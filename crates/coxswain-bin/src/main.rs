@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use coxswain_controller::Controller;
-use coxswain_controller::ReconcilerService;
+use coxswain_admin::AdminServer;
+use coxswain_controller::{Controller, Reconciler};
 use coxswain_core::routing::SharedRoutingTable;
-use coxswain_proxy::RoutingEngine;
+use coxswain_health::HealthServer;
+use coxswain_proxy::{Proxy, RoutingEngine};
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::services::background::background_service;
+use pingora_core::services::listening::Service;
 use pingora_proxy::http_proxy_service_with_name;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,9 +28,22 @@ pub enum LogFormat {
 #[command(
     name = "coxswain",
     version,
-    about = "A Kubernetes Ingress & Gateway API Controller built on Pingora"
+    about = "A Kubernetes Ingress & Gateway API Controller built on Pingora",
+    arg_required_else_help = true
 )]
-pub struct Config {
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum Commands {
+    /// Start the controller and proxy.
+    Serve(ServeArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ServeArgs {
     /// GatewayClass `spec.controllerName` this instance claims.
     ///
     /// Must match exactly; resources belonging to other controllers are silently ignored.
@@ -113,7 +128,8 @@ pub struct Config {
 }
 
 fn main() -> Result<()> {
-    let args = Config::parse();
+    let cli = Cli::parse();
+    let Commands::Serve(args) = cli.command;
 
     init_logger(args.log_format, &args.log_filter)?;
 
@@ -153,7 +169,7 @@ fn main() -> Result<()> {
     server.run_forever();
 }
 
-fn build_server(args: &Config) -> Server {
+fn build_server(args: &ServeArgs) -> Server {
     let conf = ServerConf {
         threads: args.proxy_threads,
         grace_period_seconds: Some(args.proxy_shutdown_grace_period.as_secs()),
@@ -190,9 +206,7 @@ fn register_controller(
 }
 
 fn register_health(server: &mut Server, synced: Arc<AtomicBool>, addr: SocketAddr) {
-    use coxswain_health::HealthService;
-    use pingora_core::services::listening::Service;
-    let mut svc = Service::new("health".to_string(), HealthService { synced });
+    let mut svc = Service::new("health".to_string(), HealthServer { synced });
     svc.add_tcp(&addr.to_string());
     server.add_service(svc);
 }
@@ -204,25 +218,18 @@ fn register_admin(
     leader: Arc<AtomicBool>,
     addr: SocketAddr,
 ) {
-    server.add_service(
-        coxswain_admin::AdminService {
-            synced,
-            leader,
-            routes,
-        }
-        .into_service(addr),
-    );
+    server.add_service(AdminServer { synced, leader, routes }.into_service(addr));
 }
 
 fn register_reconciler(server: &mut Server, routes: SharedRoutingTable) {
     server.add_service(background_service(
         "reconciler",
-        ReconcilerService::new(routes),
+        Reconciler::new(routes),
     ));
 }
 
 fn register_proxy(server: &mut Server, engine: Arc<RoutingEngine>, addr: SocketAddr) {
-    let proxy_logic = coxswain_proxy::Proxy { engine };
+    let proxy_logic = Proxy { engine };
     let mut proxy_service =
         http_proxy_service_with_name(&server.configuration, proxy_logic, "proxy");
     proxy_service.add_tcp(&addr.to_string());

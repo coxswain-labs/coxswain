@@ -5,12 +5,12 @@ use pingora_core::protocols::http::ServerSession;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub struct HealthService {
+pub struct HealthServer {
     pub synced: Arc<AtomicBool>,
 }
 
 #[async_trait]
-impl ServeHttp for HealthService {
+impl ServeHttp for HealthServer {
     async fn response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
         match session.req_header().uri.path() {
             "/healthz" => Response::builder()
