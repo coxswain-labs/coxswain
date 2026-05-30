@@ -4,6 +4,12 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## GitHub Issue Workflow
 
+When the user says "start working on issue N":
+1. Run `gh issue view N --repo coxswain-labs/coxswain` to read the full issue description.
+2. Create and check out a branch named `issue-N` from `main`.
+3. Read all relevant source files before writing any code.
+4. Implement the issue per its acceptance criteria.
+
 When working on a GitHub issue, always include a reference in every commit message:
 - Use `Refs #N` for partial work on an issue.
 - Use `Fixes #N` for the final commit that completes it (GitHub closes the issue automatically on push).
