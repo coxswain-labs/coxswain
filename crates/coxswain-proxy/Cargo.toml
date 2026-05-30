@@ -8,6 +8,7 @@ description.workspace = true
 [dependencies]
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 http = { workspace = true }
 coxswain-core = { workspace = true }
 pingora = { workspace = true }

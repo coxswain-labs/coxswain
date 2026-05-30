@@ -316,6 +316,15 @@ impl RoutingTableBuilder {
 ///
 /// Host resolution follows K8s Gateway API precedence:
 /// exact match → wildcard (most specific first) → catch-all.
+/// Result of a two-level host+path routing lookup.
+pub enum RouteOutcome {
+    Found(Arc<Upstream>),
+    /// No entry for this hostname (host is not registered at this proxy).
+    NoHost,
+    /// Host is registered but no path rule matched.
+    NoPath,
+}
+
 #[derive(Default)]
 pub struct RoutingTable {
     exact_hosts: HashMap<String, HostRouter>,
@@ -338,6 +347,27 @@ impl RoutingTable {
             }
         }
         self.catchall.as_ref()?.route(path)
+    }
+
+    /// Like [`route`] but distinguishes "host not registered" from "path not matched".
+    pub fn find(&self, host: &str, path: &str) -> RouteOutcome {
+        let router = if let Some(r) = self.exact_hosts.get(host) {
+            r
+        } else if let Some((_, r)) = self
+            .wildcard_hosts
+            .iter()
+            .find(|(s, _)| wildcard_matches(host, s))
+        {
+            r
+        } else if let Some(r) = self.catchall.as_ref() {
+            r
+        } else {
+            return RouteOutcome::NoHost;
+        };
+        match router.route(path) {
+            Some(u) => RouteOutcome::Found(u),
+            None => RouteOutcome::NoPath,
+        }
     }
 
     /// Rules dropped due to host+path conflicts, in the order they were encountered.
