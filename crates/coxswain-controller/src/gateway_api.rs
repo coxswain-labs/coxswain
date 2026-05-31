@@ -1,5 +1,6 @@
 use crate::endpoints;
 use coxswain_core::ownership::parent_ref_owned;
+use coxswain_core::reference_grants;
 use coxswain_core::routing::{HostRouterBuilder, RoutingTableBuilder, Upstream};
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesMatchesPathType,
@@ -19,6 +20,7 @@ impl GatewayApiReconciler {
         route: &HTTPRoute,
         slices: &reflector::Store<EndpointSlice>,
         owned_gateways: &HashSet<(String, String)>,
+        grants: &HashSet<(String, String, Option<String>)>,
         builder: &mut RoutingTableBuilder,
     ) {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -78,7 +80,7 @@ impl GatewayApiReconciler {
                 _ => continue,
             };
 
-            let addrs = Self::resolve_upstream_addrs(backend_refs, route_ns, slices);
+            let addrs = Self::resolve_upstream_addrs(backend_refs, route_ns, slices, grants);
             if addrs.is_empty() {
                 tracing::warn!(
                     route = ?route.metadata.name,
@@ -138,12 +140,24 @@ impl GatewayApiReconciler {
         backend_refs: &[HttpRouteRulesBackendRefs],
         route_ns: &str,
         slices: &reflector::Store<EndpointSlice>,
+        grants: &HashSet<(String, String, Option<String>)>,
     ) -> Vec<SocketAddr> {
         backend_refs
             .iter()
             .filter_map(|b| b.port.map(|port| (b, port)))
             .flat_map(|(b, port)| {
                 let ns = b.namespace.as_deref().unwrap_or(route_ns);
+                if ns != route_ns
+                    && !reference_grants::backend_ref_allowed(route_ns, ns, &b.name, grants)
+                {
+                    tracing::warn!(
+                        route_ns,
+                        backend_ns = ns,
+                        backend_svc = %b.name,
+                        "Cross-namespace backendRef denied — no matching ReferenceGrant"
+                    );
+                    return vec![];
+                }
                 endpoints::resolve(ns, &b.name, port, slices)
             })
             .collect()
@@ -270,7 +284,7 @@ mod tests {
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/api").is_some());
@@ -290,7 +304,7 @@ mod tests {
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/api").is_some());
@@ -311,7 +325,7 @@ mod tests {
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/api/v1/users").is_some());
@@ -323,7 +337,7 @@ mod tests {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/").is_some());
@@ -335,7 +349,7 @@ mod tests {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/").is_some());
@@ -347,7 +361,7 @@ mod tests {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &["*.example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("api.example.com", "/").is_some());
@@ -359,7 +373,7 @@ mod tests {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &[], None, "svc");
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("any-host.example.com", "/").is_some());
@@ -371,7 +385,7 @@ mod tests {
         let store = slice_store(vec![]); // no slices → no endpoints
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/").is_none());
@@ -385,7 +399,7 @@ mod tests {
         let mut route = make_route("default", &["example.com"], None, "svc");
         route.spec.parent_refs = None;
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/").is_none());
@@ -397,7 +411,7 @@ mod tests {
         let mut route = make_route("default", &["example.com"], None, "svc");
         route.spec.parent_refs = Some(vec![]);
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/").is_none());
@@ -413,7 +427,7 @@ mod tests {
             ..Default::default()
         }]);
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/").is_none());
@@ -437,7 +451,7 @@ mod tests {
             },
         ]);
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/").is_some());
@@ -455,7 +469,7 @@ mod tests {
             ..Default::default()
         }]);
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &infra_owned, &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &infra_owned, &HashSet::new(), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/").is_some());
@@ -492,7 +506,113 @@ mod tests {
             ..Default::default()
         };
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &apps_owned, &mut builder);
+        GatewayApiReconciler::reconcile(&route, &store, &apps_owned, &HashSet::new(), &mut builder);
+        let table = builder.build().unwrap();
+
+        assert!(table.route("example.com", "/").is_some());
+    }
+
+    // --- ReferenceGrant tests ---
+
+    fn grants(
+        entries: &[(&str, &str, Option<&str>)],
+    ) -> HashSet<(String, String, Option<String>)> {
+        entries
+            .iter()
+            .map(|(f, t, n)| (f.to_string(), t.to_string(), n.map(str::to_string)))
+            .collect()
+    }
+
+    fn cross_ns_route(route_ns: &str, backend_ns: &str, svc: &str) -> HTTPRoute {
+        HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some(route_ns.to_string()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                parent_refs: default_parents(),
+                hostnames: Some(vec!["example.com".to_string()]),
+                rules: Some(vec![HttpRouteRules {
+                    backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                        name: svc.to_string(),
+                        port: Some(80),
+                        namespace: Some(backend_ns.to_string()),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cross_ns_ref_denied_without_grant() {
+        let store = slice_store(vec![make_slice("billing", "payments", "10.0.1.1")]);
+        let route = cross_ns_route("apps", "billing", "payments");
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &default_owned(),
+            &HashSet::new(),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+
+        assert!(table.route("example.com", "/").is_none());
+    }
+
+    #[test]
+    fn cross_ns_ref_permitted_with_wildcard_grant() {
+        let store = slice_store(vec![make_slice("billing", "payments", "10.0.1.1")]);
+        let route = cross_ns_route("apps", "billing", "payments");
+        let g = grants(&[("apps", "billing", None)]);
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &g, &mut builder);
+        let table = builder.build().unwrap();
+
+        assert!(table.route("example.com", "/").is_some());
+    }
+
+    #[test]
+    fn cross_ns_ref_permitted_with_specific_grant() {
+        let store = slice_store(vec![make_slice("billing", "payments", "10.0.1.1")]);
+        let route = cross_ns_route("apps", "billing", "payments");
+        let g = grants(&[("apps", "billing", Some("payments"))]);
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &g, &mut builder);
+        let table = builder.build().unwrap();
+
+        assert!(table.route("example.com", "/").is_some());
+    }
+
+    #[test]
+    fn cross_ns_specific_grant_denies_different_svc() {
+        let store = slice_store(vec![make_slice("billing", "other-svc", "10.0.1.2")]);
+        let route = cross_ns_route("apps", "billing", "other-svc");
+        let g = grants(&[("apps", "billing", Some("payments"))]);
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &g, &mut builder);
+        let table = builder.build().unwrap();
+
+        assert!(table.route("example.com", "/").is_none());
+    }
+
+    #[test]
+    fn same_ns_ref_unaffected_by_empty_grants() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let route = make_route("default", &["example.com"], None, "svc");
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &default_owned(),
+            &HashSet::new(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/").is_some());

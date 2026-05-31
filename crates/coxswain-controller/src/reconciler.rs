@@ -6,6 +6,7 @@ use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
+use gateway_api::apis::standard::referencegrants::ReferenceGrant;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::{
@@ -84,6 +85,7 @@ async fn spawn_tasks(
     let (gateway_reader, gateway_writer) = reflector::store::<Gateway>();
     let (gateway_class_reader, gateway_class_writer) = reflector::store::<GatewayClass>();
     let (slice_reader, slice_writer) = reflector::store::<EndpointSlice>();
+    let (grant_reader, grant_writer) = reflector::store::<ReferenceGrant>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
 
@@ -188,6 +190,7 @@ async fn spawn_tasks(
     // --- EndpointSlice reflector ---
     set.spawn({
         let notify = Arc::clone(&notify);
+        let client = client.clone();
         async move {
             let stream = reflector::reflector(
                 slice_writer,
@@ -202,6 +205,25 @@ async fn spawn_tasks(
                 match event {
                     Ok(_) => notify.notify_one(),
                     Err(e) => tracing::warn!(error = %e, "EndpointSlice reflector error"),
+                }
+            }
+        }
+    });
+
+    // --- ReferenceGrant reflector ---
+    set.spawn({
+        let notify = Arc::clone(&notify);
+        async move {
+            let stream = reflector::reflector(
+                grant_writer,
+                watcher(Api::<ReferenceGrant>::all(client), watcher::Config::default())
+                    .default_backoff(),
+            );
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(_) => notify.notify_one(),
+                    Err(e) => tracing::warn!(error = %e, "ReferenceGrant reflector error"),
                 }
             }
         }
@@ -229,6 +251,7 @@ async fn spawn_tasks(
                 &gateway_reader,
                 &gateway_class_reader,
                 &slice_reader,
+                &grant_reader,
                 &controller_name,
                 &owned_gateways,
                 &routes,
@@ -247,6 +270,7 @@ fn rebuild(
     gateway_store: &reflector::Store<Gateway>,
     gateway_class_store: &reflector::Store<GatewayClass>,
     slice_store: &reflector::Store<EndpointSlice>,
+    grant_store: &reflector::Store<ReferenceGrant>,
     controller_name: &str,
     owned_gateways_handle: &OwnedGateways,
     shared: &SharedRoutingTable,
@@ -284,6 +308,43 @@ fn rebuild(
     // Publish the owned-gateways snapshot so the controller can filter status writes.
     owned_gateways_handle.store(owned_gateways.clone());
 
+    // Flatten ReferenceGrant objects into a (from_ns, to_ns, Option<to_name>) set for
+    // O(1) cross-namespace backend-ref checks in GatewayApiReconciler. Only grants that
+    // permit HTTPRoute → Service cross-namespace refs are included.
+    let backend_grants: HashSet<(String, String, Option<String>)> = grant_store
+        .state()
+        .into_iter()
+        .filter_map(|grant| {
+            let to_ns = grant.metadata.namespace.clone()?;
+            Some((grant, to_ns))
+        })
+        .flat_map(|(grant, to_ns)| {
+            let from_entries: Vec<_> = grant
+                .spec
+                .from
+                .iter()
+                .filter(|f| {
+                    f.group == "gateway.networking.k8s.io" && f.kind == "HTTPRoute"
+                })
+                .map(|f| f.namespace.clone())
+                .collect();
+            let to_entries: Vec<_> = grant
+                .spec
+                .to
+                .iter()
+                .filter(|t| (t.group.is_empty() || t.group == "core") && t.kind == "Service")
+                .map(|t| t.name.clone())
+                .collect();
+            from_entries.into_iter().flat_map(move |from_ns| {
+                let to_ns = to_ns.clone();
+                to_entries
+                    .clone()
+                    .into_iter()
+                    .map(move |to_name| (from_ns.clone(), to_ns.clone(), to_name))
+            })
+        })
+        .collect();
+
     tracing::debug!(
         http_routes = routes.len(),
         ingresses = ingresses.len(),
@@ -293,7 +354,7 @@ fn rebuild(
     );
     let mut builder = RoutingTableBuilder::new();
     for route in &routes {
-        GatewayApiReconciler::reconcile(route, slice_store, &owned_gateways, &mut builder);
+        GatewayApiReconciler::reconcile(route, slice_store, &owned_gateways, &backend_grants, &mut builder);
     }
     for ingress in &ingresses {
         IngressReconciler::reconcile(ingress, slice_store, &owned_ingress_classes, &mut builder);
