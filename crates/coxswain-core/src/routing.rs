@@ -23,12 +23,10 @@ impl SharedRoutingTable {
         }
     }
 
-    /// Returns a snapshot of the current routing table.
     pub fn load(&self) -> Arc<RoutingTable> {
         self.inner.load_full()
     }
 
-    /// Atomically replaces the active routing table.
     pub fn store(&self, table: Arc<RoutingTable>) {
         self.inner.store(table);
     }
@@ -53,7 +51,6 @@ pub struct Upstream {
     /// Service identity in `"namespace/name"` form — used for logging only.
     pub name: String,
     endpoints: Vec<SocketAddr>,
-    /// Round-robin cursor. Incremented on every call to `next_endpoint`.
     index: AtomicUsize,
 }
 
@@ -66,7 +63,6 @@ impl Upstream {
         }
     }
 
-    /// Returns all endpoints in this upstream.
     pub fn endpoints(&self) -> &[SocketAddr] {
         &self.endpoints
     }
@@ -118,7 +114,6 @@ pub struct RouteConflict {
     pub rejected_upstream: String,
 }
 
-/// Compiled path-level router for a single virtual hostname.
 pub struct HostRouter {
     router: Router<Arc<Upstream>>,
     regex_set: RegexSet,
@@ -144,7 +139,6 @@ impl HostRouter {
     }
 }
 
-/// Builder for a single hostname's path-level routing rules.
 #[derive(Default)]
 pub struct HostRouterBuilder {
     exact_routes: Vec<(String, Arc<Upstream>)>,
@@ -252,7 +246,6 @@ impl HostRouterBuilder {
     }
 }
 
-/// Builder for the complete multi-hostname routing table.
 #[derive(Default)]
 pub struct RoutingTableBuilder {
     exact_hosts: HashMap<String, HostRouterBuilder>,
@@ -332,10 +325,6 @@ impl RoutingTableBuilder {
     }
 }
 
-/// Immutable compiled routing structure.
-///
-/// Host resolution follows K8s Gateway API precedence:
-/// exact match → wildcard (most specific first) → catch-all.
 /// Result of a two-level host+path routing lookup.
 pub enum RouteOutcome {
     Found(Arc<Upstream>),
@@ -345,6 +334,10 @@ pub enum RouteOutcome {
     NoPath,
 }
 
+/// Immutable compiled routing table.
+///
+/// Host resolution follows K8s Gateway API precedence:
+/// exact match → wildcard (most specific first) → catch-all.
 #[derive(Default)]
 pub struct RoutingTable {
     exact_hosts: HashMap<String, HostRouter>,
@@ -356,7 +349,6 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
-    /// Resolves `host` and `path` to an upstream.
     pub fn route(&self, host: &str, path: &str) -> Option<Arc<Upstream>> {
         if let Some(router) = self.exact_hosts.get(host) {
             return router.route(path);

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::filter::TrafficFilter;
 
-/// Wraps the active routing table for lock-free reads on the request hot path.
+/// Lock-free routing engine for the request hot path.
 pub struct RoutingEngine {
     table: SharedRoutingTable,
 }
@@ -19,7 +19,6 @@ impl RoutingEngine {
         Self { table }
     }
 
-    /// Resolves `host` and `path` to an upstream. Zero-allocation on the hot path.
     pub fn route(&self, host: &str, path: &str) -> Option<Arc<Upstream>> {
         self.table.load().route(host, path)
     }
@@ -40,11 +39,6 @@ impl ProxyHttp for Proxy {
 
     fn new_ctx(&self) -> Self::CTX {}
 
-    /// Phase 1 of the Pingora request lifecycle: select the upstream peer.
-    ///
-    /// Consults the routing table for the request's `Host` header and URI path.
-    /// Returns `ConnectNoRoute` if no route matches, or `InternalError` if the
-    /// matched upstream has no active endpoints.
     async fn upstream_peer(
         &self,
         session: &mut Session,
@@ -94,9 +88,6 @@ impl ProxyHttp for Proxy {
         )))
     }
 
-    /// Phase 2 of the Pingora request lifecycle: mutate the upstream request headers.
-    ///
-    /// Delegates to [`TrafficFilter`] which stamps the `X-Proxy-Engine` header.
     async fn upstream_request_filter(
         &self,
         _session: &mut Session,

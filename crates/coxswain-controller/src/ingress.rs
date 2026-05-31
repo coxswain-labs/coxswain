@@ -6,15 +6,11 @@ use kube::runtime::reflector;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Translates `Ingress` resources into routing table entries.
 pub struct IngressReconciler;
 
 impl IngressReconciler {
-    /// Translates one `Ingress` into routing table entries, resolving pod
-    /// addresses from the local `EndpointSlice` store. Never queries the API server.
-    ///
-    /// Skips the Ingress when it does not reference an owned IngressClass
-    /// (one whose `spec.controller` matches this controller's identity).
+    /// Skips the Ingress when it does not reference an owned IngressClass.
+    /// Never queries the API server.
     pub fn reconcile(
         ingress: &Ingress,
         slices: &reflector::Store<EndpointSlice>,

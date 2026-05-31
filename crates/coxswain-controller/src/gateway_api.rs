@@ -10,15 +10,11 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// Translates `HTTPRoute` resources into routing table entries.
 pub struct GatewayApiReconciler;
 
 impl GatewayApiReconciler {
-    /// Translates one `HTTPRoute` into routing table entries, resolving pod
-    /// addresses from the local `EndpointSlice` store. Never queries the API server.
-    ///
     /// Skips routes whose `spec.parentRefs` do not include at least one Gateway
-    /// managed by this controller (identified by the `owned_gateways` set).
+    /// managed by this controller. Never queries the API server.
     pub fn reconcile(
         route: &HTTPRoute,
         slices: &reflector::Store<EndpointSlice>,

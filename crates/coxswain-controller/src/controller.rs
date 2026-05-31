@@ -130,11 +130,8 @@ fn filter_owned_parent_refs(
         .collect()
 }
 
-/// Kubernetes watch loop responsible for leader election and writing status
-/// conditions back to `HTTPRoute` and `GatewayClass` resources.
-///
-/// Only the active leader patches resource status; standby replicas track
-/// the election result and skip all writes to avoid feedback loops.
+/// Kubernetes watch loop for leader election and writing status conditions
+/// back to `HTTPRoute` and `GatewayClass` resources.
 pub struct Controller {
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
@@ -222,7 +219,6 @@ impl Controller {
                         }
                         Ok(watcher::Event::Apply(route) | watcher::Event::InitApply(route)) => {
                             let owned = self.owned_gateways.load();
-                            // Only the leader writes status back to the API server.
                             if is_leader
                                 && !http_route_programmed(
                                     &route,
@@ -237,8 +233,6 @@ impl Controller {
                                     &owned,
                                 )
                                 .await;
-                            } else if !is_leader {
-                                tracing::debug!("Skipping status update: replica is standby");
                             }
                         }
                         Ok(_) => {}
@@ -257,8 +251,6 @@ impl Controller {
                                 if is_leader && !gateway_class_accepted(&gc) {
                                     let generation = gc.metadata.generation.unwrap_or(0);
                                     Self::accept_gateway_class(&client, &name, generation).await;
-                                } else if !is_leader {
-                                    tracing::debug!("Skipping status update: replica is standby");
                                 }
                             } else {
                                 tracing::debug!(
