@@ -103,6 +103,7 @@ The most critical correctness gaps. Without these, Coxswain is unsafe in any sha
 - [x] ~~`parentRef` matching for HTTPRoute — [#2](https://github.com/coxswain-labs/coxswain/issues/2) `MUST`~~
 - [x] ~~`ReferenceGrant` for cross-namespace backends — [#3](https://github.com/coxswain-labs/coxswain/issues/3) `MUST`~~
 - [x] ~~Namespace-scoped watch (wire up `--controller-watch-namespace`) — [#4](https://github.com/coxswain-labs/coxswain/issues/4) `MUST`~~
+- [ ] Multi-namespace watch (comma-separated list + label selector) — [#59](https://github.com/coxswain-labs/coxswain/issues/59) `SHOULD`
 - [ ] Gateway resource status patching — [#5](https://github.com/coxswain-labs/coxswain/issues/5) `MUST`
 - [ ] Ingress `.status.loadBalancer` patching — [#48](https://github.com/coxswain-labs/coxswain/issues/48) `MUST`
 - [ ] Default backend for Ingress — [#6](https://github.com/coxswain-labs/coxswain/issues/6) `MUST`
