@@ -67,7 +67,7 @@ All flags have environment variable equivalents. Most use a `COXSWAIN_*` prefix 
 | `--controller-name` | `COXSWAIN_CONTROLLER_NAME` | `coxswain-labs.dev/gateway-controller` | GatewayClass `spec.controllerName` to claim |
 | `--controller-watch-namespace` | `COXSWAIN_CONTROLLER_WATCH_NAMESPACE` | _(cluster-wide)_ | Restrict watch to a single namespace |
 | `--health-addr` | `COXSWAIN_HEALTH_ADDR` | `0.0.0.0:8081` | Liveness and readiness health endpoints address |
-| `--log-filter` | `COXSWAIN_LOG` | `info` | Log level; supports `RUST_LOG` directive syntax (e.g. `info,coxswain=debug`) |
+| `--log` | `COXSWAIN_LOG` | `info` | Log level; supports `RUST_LOG` directive syntax (e.g. `info,coxswain=debug`) |
 | `--log-format` | `COXSWAIN_LOG_FORMAT` | `json` | `json` (production) or `console` (local dev) |
 | `--pod-name` | `POD_NAME` | `coxswain-local` | Pod name used as the leader-election holder identity |
 | `--pod-namespace` | `POD_NAMESPACE` | `coxswain-system` | Pod namespace used to scope the leader-election Lease |

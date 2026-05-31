@@ -79,7 +79,7 @@ pub struct ServeArgs {
     /// Log verbosity level: `trace`, `debug`, `info`, `warn`, or `error`.
     ///
     /// Supports the `RUST_LOG` directive syntax for per-crate overrides (e.g. `info,coxswain=debug`).
-    #[arg(long, env = "COXSWAIN_LOG", default_value = "info")]
+    #[arg(long = "log", env = "COXSWAIN_LOG", default_value = "info")]
     pub log_filter: String,
 
     /// Worker threads per proxy service.
