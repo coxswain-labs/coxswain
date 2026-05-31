@@ -7,8 +7,9 @@ This file provides guidance to Claude Code when working with code in this reposi
 When the user says "start working on issue N":
 1. Run `gh issue view N --repo coxswain-labs/coxswain` to read the full issue description.
 2. Create and check out a branch named `issue-N` from `main`.
-3. Read all relevant source files before writing any code.
-4. Implement the issue per its acceptance criteria.
+3. In `ROADMAP.md`, change the corresponding checklist item from `- [ ]` to `- [x] ~~...~~` (tick the checkbox and wrap the description in strikethrough). Commit this change on the new branch with `Refs #N`.
+4. Read all relevant source files before writing any code.
+5. Implement the issue per its acceptance criteria.
 
 When working on a GitHub issue, always include a reference in every commit message:
 - Use `Refs #N` for partial work on an issue.
@@ -16,9 +17,8 @@ When working on a GitHub issue, always include a reference in every commit messa
 
 When the user says an issue is done:
 1. Run `gh issue close N --repo coxswain-labs/coxswain`.
-2. Flip `[ ]` to `[x]` for that item in `ROADMAP.md`.
-3. Commit and push the `ROADMAP.md` change with `Fixes #N` in the message.
-4. Merge the PR with `gh pr merge --squash --delete-branch`.
+2. Ensure the `ROADMAP.md` item is `- [x] ~~...~~` (tick + strikethrough). This should already be done from step 3 above; if not, do it now and commit with `Fixes #N`.
+3. Merge the PR with `gh pr merge --squash --delete-branch`.
 
 ## GitHub Milestones and Labels
 
