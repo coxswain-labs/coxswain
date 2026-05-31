@@ -10,6 +10,7 @@
 - `ReferenceGrant` support for cross-namespace backend refs
 - Namespace-scoped watch (`--controller-watch-namespace` is parsed but never wired)
 - Gateway resource reconciliation + status patching (watched but ignored today)
+- Ingress `.status.loadBalancer` patching (required by cert-manager and external-dns)
 - Default backend for Ingress (`spec.defaultBackend` not implemented)
 - Cross-namespace backend refs in HTTPRoute
 
@@ -23,7 +24,7 @@
 - Full HTTPRoute filter support: `URLRewrite`, `RequestRedirect`, `RequestHeaderModifier`, `ResponseHeaderModifier`
 - HTTPRoute header, method, and query parameter matching
 - HTTPRoute `timeouts` field (GA in Gateway API v1.1)
-- `BackendLBPolicy` (retry + timeout per backend)
+- `BackendLBPolicy` (session persistence + timeouts per backend)
 - `BackendTLSPolicy`
 - Weighted backend refs (`backendRefs[].weight`)
 - `coxswain-labs.dev/*` annotation namespace for Ingress (timeouts, retries, path rewriting)
@@ -31,6 +32,7 @@
 
 **Protocol**
 - WebSocket passthrough (upgrade handshake)
+- PROXY protocol v1/v2 support (client IP preservation behind cloud load balancers)
 
 **Observability**
 - Custom Prometheus metrics: requests/sec, latency (p50/p95/p99), error rate — all with per-route labels
@@ -38,6 +40,7 @@
 
 **Health & Reliability**
 - Passive backend health checking: track in-flight errors, temporarily remove failing endpoints
+- Endpoint drain: respect `conditions.serving` on EndpointSlice endpoints during rolling deploys
 
 **Security & Policy**
 - `SecurityPolicy` (Gateway API) for external auth (`ext_authz`)
@@ -46,7 +49,9 @@
 
 **Distribution & Community**
 - Dockerfile + published OCI image on a public registry
+- OCI image signing with cosign (Sigstore, keyless via GitHub Actions OIDC)
 - Helm chart with full configuration surface
+- PodDisruptionBudget and resource requests/limits in deployment manifests
 - GitHub Actions CI/CD pipeline (build, test, lint, release)
 - `ValidatingAdmissionPolicy` for annotation validation (K8s 1.30+)
 - Full Gateway API conformance test suite passing
@@ -67,7 +72,7 @@
 
 ### NICE TO HAVE *(future, community-driven)*
 
-- Session affinity / sticky sessions
+- Session affinity for Ingress (via `coxswain-labs.dev/session-affinity` annotation; Gateway API session affinity ships in v0.4 via `BackendLBPolicy`)
 - Response caching (HTTP cache semantics)
 - CORS built-in filter
 - IPv6 / dual-stack explicit handling
@@ -80,7 +85,6 @@
 
 **Milestone order is strict.** Each milestone builds on the previous one — do not start v0.3 before v0.2 is complete. Cross-milestone dependencies include:
 - v0.3 TLS issues depend on v0.2 Gateway infrastructure ([#2](https://github.com/coxswain-labs/coxswain/issues/2) must land before [#9](https://github.com/coxswain-labs/coxswain/issues/9)).
-- v0.4 `BackendTLSPolicy` ([#16](https://github.com/coxswain-labs/coxswain/issues/16)) depends on v0.3 TLS termination.
 - v0.8 gRPC ([#33](https://github.com/coxswain-labs/coxswain/issues/33)) depends on v0.8 HTTP/2 ([#32](https://github.com/coxswain-labs/coxswain/issues/32)).
 
 **Within each milestone, follow issue number order by default** with the exceptions below.
@@ -88,10 +92,12 @@
 ### v0.2 — Multi-tenancy & Spec Correctness
 - Do [**#45**](https://github.com/coxswain-labs/coxswain/issues/45) (basic CI) first — before writing any feature code. Every subsequent commit is verified automatically.
 - Do [**#2**](https://github.com/coxswain-labs/coxswain/issues/2) (parentRef matching) before [**#5**](https://github.com/coxswain-labs/coxswain/issues/5) (Gateway status patching) — both need a `Gateway` reflector; build it once in #2 and reuse it in #5.
+- Do [**#1**](https://github.com/coxswain-labs/coxswain/issues/1) (IngressClass filtering) before [**#48**](https://github.com/coxswain-labs/coxswain/issues/48) (Ingress status patching) — only managed Ingresses should receive status updates.
 - Do [**#7**](https://github.com/coxswain-labs/coxswain/issues/7) (advanced matching) last — it is the most architecturally impactful issue in the roadmap. It introduces a per-request predicate model into `coxswain-core` that every v0.4 feature (filters, timeouts, weighted refs) builds on. Get the design right before moving forward.
 
 ### v0.3 — TLS & WebSocket
 - Do [**#8**](https://github.com/coxswain-labs/coxswain/issues/8) and [**#9**](https://github.com/coxswain-labs/coxswain/issues/9) (TLS termination for Ingress and Gateway API) before [**#10**](https://github.com/coxswain-labs/coxswain/issues/10) (hot reload) and [**#11**](https://github.com/coxswain-labs/coxswain/issues/11) (cert-manager) — the latter two are layered on top of the former two.
+- [**#49**](https://github.com/coxswain-labs/coxswain/issues/49) (PROXY protocol) is independent of the TLS issues and can be done at any point in v0.3.
 
 ### v0.4 — Traffic Management
 - Do [**#13**](https://github.com/coxswain-labs/coxswain/issues/13) (HTTPRoute filters) before [**#15**](https://github.com/coxswain-labs/coxswain/issues/15) (BackendLBPolicy) and [**#16**](https://github.com/coxswain-labs/coxswain/issues/16) (BackendTLSPolicy) — filters establish the per-route config model in `coxswain-core` that the policy attachments extend.
@@ -119,6 +125,7 @@ The most critical correctness gaps. Without these, Coxswain is unsafe in any sha
 - [ ] `ReferenceGrant` for cross-namespace backends — [#3](https://github.com/coxswain-labs/coxswain/issues/3) `MUST`
 - [ ] Namespace-scoped watch (wire up `--controller-watch-namespace`) — [#4](https://github.com/coxswain-labs/coxswain/issues/4) `MUST`
 - [ ] Gateway resource status patching — [#5](https://github.com/coxswain-labs/coxswain/issues/5) `MUST`
+- [ ] Ingress `.status.loadBalancer` patching — [#48](https://github.com/coxswain-labs/coxswain/issues/48) `MUST`
 - [ ] Default backend for Ingress — [#6](https://github.com/coxswain-labs/coxswain/issues/6) `MUST`
 - [ ] HTTPRoute header, method, query matching — [#7](https://github.com/coxswain-labs/coxswain/issues/7) `MUST`
 
@@ -134,6 +141,7 @@ TLS is a launch blocker. WebSocket is the minimum protocol expansion needed to s
 - [ ] Secret watch + hot TLS reload — [#10](https://github.com/coxswain-labs/coxswain/issues/10) `MUST`
 - [ ] cert-manager integration (both APIs) — [#11](https://github.com/coxswain-labs/coxswain/issues/11) `MUST`
 - [ ] WebSocket upgrade passthrough — [#12](https://github.com/coxswain-labs/coxswain/issues/12) `MUST`
+- [ ] PROXY protocol v1/v2 support — [#49](https://github.com/coxswain-labs/coxswain/issues/49) `MUST`
 
 ---
 
@@ -144,7 +152,7 @@ Full HTTPRoute filter compliance + the annotation layer for Ingress. This is the
 
 - [ ] `URLRewrite`, `RequestRedirect`, `RequestHeaderModifier`, `ResponseHeaderModifier` filters — [#13](https://github.com/coxswain-labs/coxswain/issues/13) `MUST`
 - [ ] HTTPRoute `timeouts` field — [#14](https://github.com/coxswain-labs/coxswain/issues/14) `MUST`
-- [ ] `BackendLBPolicy` (retry + timeout per backend) — [#15](https://github.com/coxswain-labs/coxswain/issues/15) `MUST`
+- [ ] `BackendLBPolicy` (session persistence + timeouts per backend) — [#15](https://github.com/coxswain-labs/coxswain/issues/15) `MUST`
 - [ ] `BackendTLSPolicy` — [#16](https://github.com/coxswain-labs/coxswain/issues/16) `MUST`
 - [ ] Weighted backend refs — [#17](https://github.com/coxswain-labs/coxswain/issues/17) `MUST`
 - [ ] `coxswain-labs.dev/*` annotation namespace — [#18](https://github.com/coxswain-labs/coxswain/issues/18) `MUST`
@@ -160,6 +168,7 @@ Operators need signals before they trust any controller in production. This mile
 - [ ] Custom per-route Prometheus metrics (latency, rps, errors) — [#20](https://github.com/coxswain-labs/coxswain/issues/20) `MUST`
 - [ ] Structured per-request access logs — [#21](https://github.com/coxswain-labs/coxswain/issues/21) `MUST`
 - [ ] Passive backend health checking — [#22](https://github.com/coxswain-labs/coxswain/issues/22) `MUST`
+- [ ] Endpoint drain (`conditions.serving`) — [#50](https://github.com/coxswain-labs/coxswain/issues/50) `MUST`
 
 ---
 
@@ -181,7 +190,9 @@ The core is locked in. This milestone makes Coxswain installable and opens the d
 
 - [ ] Dockerfile + OCI image on public registry — [#26](https://github.com/coxswain-labs/coxswain/issues/26) `MUST`
 - [ ] Helm chart — [#27](https://github.com/coxswain-labs/coxswain/issues/27) `MUST`
+- [ ] PodDisruptionBudget + resource requests/limits — [#51](https://github.com/coxswain-labs/coxswain/issues/51) `MUST`
 - [ ] GitHub Actions release pipeline (OCI image, Helm chart, conformance) — [#28](https://github.com/coxswain-labs/coxswain/issues/28) `MUST`
+- [ ] Sign OCI images with cosign (Sigstore) — [#46](https://github.com/coxswain-labs/coxswain/issues/46) `MUST`
 - [ ] `ValidatingAdmissionPolicy` (K8s 1.30+) — [#29](https://github.com/coxswain-labs/coxswain/issues/29) `MUST`
 - [ ] Docs site (getting started, config reference, architecture) — [#30](https://github.com/coxswain-labs/coxswain/issues/30) `MUST`
 - [ ] Contributing guide + issue templates — [#31](https://github.com/coxswain-labs/coxswain/issues/31) `MUST`
