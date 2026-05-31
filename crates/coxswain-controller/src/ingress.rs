@@ -3,6 +3,7 @@ use coxswain_core::routing::{RoutingTableBuilder, Upstream};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::runtime::reflector;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Translates `Ingress` resources into routing table entries.
@@ -11,11 +12,39 @@ pub struct IngressReconciler;
 impl IngressReconciler {
     /// Translates one `Ingress` into routing table entries, resolving pod
     /// addresses from the local `EndpointSlice` store. Never queries the API server.
+    ///
+    /// Skips the Ingress when it does not reference an owned IngressClass
+    /// (one whose `spec.controller` matches this controller's identity).
     pub fn reconcile(
         ingress: &Ingress,
         slices: &reflector::Store<EndpointSlice>,
+        owned_classes: &HashSet<String>,
         builder: &mut RoutingTableBuilder,
     ) {
+        let claimed_class = ingress
+            .spec
+            .as_ref()
+            .and_then(|s| s.ingress_class_name.as_deref())
+            .or_else(|| {
+                ingress
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get("kubernetes.io/ingress.class").map(String::as_str))
+            });
+
+        match claimed_class {
+            None => {
+                tracing::debug!(name = ?ingress.metadata.name, "Skipping Ingress — no ingressClassName or annotation");
+                return;
+            }
+            Some(class) if !owned_classes.contains(class) => {
+                tracing::debug!(name = ?ingress.metadata.name, %class, "Skipping Ingress — class not owned by this controller");
+                return;
+            }
+            Some(_) => {}
+        }
+
         let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
         let rules = match ingress.spec.as_ref().and_then(|s| s.rules.as_deref()) {
             Some(r) if !r.is_empty() => r,
@@ -86,6 +115,10 @@ mod tests {
     use kube::runtime::{reflector, watcher};
     use std::collections::BTreeMap;
 
+    fn owned(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
     fn make_slice(ns: &str, svc: &str, ip: &str) -> EndpointSlice {
         let mut labels = BTreeMap::new();
         labels.insert("kubernetes.io/service-name".to_string(), svc.to_string());
@@ -123,14 +156,23 @@ mod tests {
         path: &str,
         path_type: &str,
         svc: &str,
+        class_name: Option<&str>,
+        annotation_class: Option<&str>,
     ) -> Ingress {
+        let annotations = annotation_class.map(|c| {
+            let mut m = BTreeMap::new();
+            m.insert("kubernetes.io/ingress.class".to_string(), c.to_string());
+            m
+        });
         Ingress {
             metadata: ObjectMeta {
                 name: Some("test-ingress".to_string()),
                 namespace: Some(ns.to_string()),
+                annotations,
                 ..Default::default()
             },
             spec: Some(IngressSpec {
+                ingress_class_name: class_name.map(str::to_string),
                 rules: Some(vec![IngressRule {
                     host: host.map(str::to_string),
                     http: Some(HTTPIngressRuleValue {
@@ -159,9 +201,17 @@ mod tests {
     #[test]
     fn reconcile_exact_path_type() {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let ingress = make_ingress("default", Some("example.com"), "/api", "Exact", "svc");
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/api",
+            "Exact",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &mut builder);
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/api").is_some());
@@ -171,9 +221,17 @@ mod tests {
     #[test]
     fn reconcile_prefix_path_type() {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let ingress = make_ingress("default", Some("example.com"), "/api", "Prefix", "svc");
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/api",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &mut builder);
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/api").is_some());
@@ -190,9 +248,11 @@ mod tests {
             "/api",
             "ImplementationSpecific",
             "svc",
+            Some("coxswain"),
+            None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &mut builder);
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/api").is_some());
@@ -202,9 +262,17 @@ mod tests {
     #[test]
     fn reconcile_exact_hostname() {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let ingress = make_ingress("default", Some("example.com"), "/", "Prefix", "svc");
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &mut builder);
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/").is_some());
@@ -214,9 +282,17 @@ mod tests {
     #[test]
     fn reconcile_wildcard_hostname() {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let ingress = make_ingress("default", Some("*.example.com"), "/", "Prefix", "svc");
+        let ingress = make_ingress(
+            "default",
+            Some("*.example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &mut builder);
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("api.example.com", "/").is_some());
@@ -226,9 +302,17 @@ mod tests {
     #[test]
     fn reconcile_no_host_goes_to_catchall() {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let ingress = make_ingress("default", None, "/", "Prefix", "svc");
+        let ingress = make_ingress(
+            "default",
+            None,
+            "/",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &mut builder);
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("any-host.example.com", "/").is_some());
@@ -238,11 +322,139 @@ mod tests {
     #[test]
     fn reconcile_skips_rule_with_no_endpoints() {
         let store = slice_store(vec![]); // no slices → no endpoints
-        let ingress = make_ingress("default", Some("example.com"), "/", "Prefix", "svc");
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &mut builder);
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
 
         assert!(table.route("example.com", "/").is_none());
+    }
+
+    #[test]
+    fn reconcile_matches_owned_class_name() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        assert!(builder.build().unwrap().route("example.com", "/").is_some());
+    }
+
+    #[test]
+    fn reconcile_skips_unowned_class_name() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            Some("nginx"),
+            None,
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        assert!(builder.build().unwrap().route("example.com", "/").is_none());
+    }
+
+    #[test]
+    fn reconcile_matches_via_legacy_annotation() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            None,
+            Some("coxswain"),
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        assert!(builder.build().unwrap().route("example.com", "/").is_some());
+    }
+
+    #[test]
+    fn reconcile_skips_unowned_legacy_annotation() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            None,
+            Some("nginx"),
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        assert!(builder.build().unwrap().route("example.com", "/").is_none());
+    }
+
+    #[test]
+    fn reconcile_skips_when_both_unset() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            None,
+            None,
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        assert!(builder.build().unwrap().route("example.com", "/").is_none());
+    }
+
+    #[test]
+    fn reconcile_skips_when_owned_set_empty() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&[]), &mut builder);
+        assert!(builder.build().unwrap().route("example.com", "/").is_none());
+    }
+
+    #[test]
+    fn reconcile_field_takes_precedence_over_annotation() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        // field = "coxswain" (owned), annotation = "nginx" (not owned) → should reconcile
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            Some("nginx"),
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        assert!(builder.build().unwrap().route("example.com", "/").is_some());
     }
 }

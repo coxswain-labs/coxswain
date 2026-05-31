@@ -1,0 +1,9 @@
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: coxswain
+  labels:
+    app.kubernetes.io/name: coxswain
+spec:
+  # Must match COXSWAIN_CONTROLLER_NAME in the deployment environment.
+  controller: coxswain-labs.dev/gateway-controller
