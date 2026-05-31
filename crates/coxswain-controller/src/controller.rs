@@ -1,5 +1,5 @@
-use crate::ownership::{self, OwnedGateways};
 use async_trait::async_trait;
+use coxswain_core::ownership::{self, OwnedGateways};
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::httproutes::{

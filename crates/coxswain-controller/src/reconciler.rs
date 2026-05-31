@@ -1,6 +1,6 @@
-use crate::ownership::OwnedGateways;
 use crate::{gateway_api::GatewayApiReconciler, ingress::IngressReconciler};
 use async_trait::async_trait;
+use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::{RoutingTableBuilder, SharedRoutingTable};
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;

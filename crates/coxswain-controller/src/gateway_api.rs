@@ -1,5 +1,5 @@
 use crate::endpoints;
-use crate::ownership::parent_ref_owned;
+use coxswain_core::ownership::parent_ref_owned;
 use coxswain_core::routing::{HostRouterBuilder, RoutingTableBuilder, Upstream};
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesMatchesPathType,
