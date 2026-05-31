@@ -1,8 +1,9 @@
 use async_trait::async_trait;
+use coxswain_core::ownership::{self, OwnedGateways};
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+    HTTPRoute, HttpRouteParentRefs, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::{
@@ -13,6 +14,7 @@ use kube::{
 use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -69,7 +71,12 @@ fn gateway_class_accepted(gc: &GatewayClass) -> bool {
     )
 }
 
-fn http_route_programmed(route: &HTTPRoute, controller_name: &str) -> bool {
+fn http_route_programmed(
+    route: &HTTPRoute,
+    controller_name: &str,
+    owned_gateways: &HashSet<(String, String)>,
+) -> bool {
+    let default_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     route
         .status
         .as_ref()
@@ -77,6 +84,14 @@ fn http_route_programmed(route: &HTTPRoute, controller_name: &str) -> bool {
             s.parents.iter().any(|p| {
                 p.controller_name == controller_name
                     && has_condition(Some(p.conditions.as_slice()), "Programmed")
+                    && ownership::parent_ref_owned(
+                        p.parent_ref.group.as_deref(),
+                        p.parent_ref.kind.as_deref(),
+                        p.parent_ref.namespace.as_deref(),
+                        &p.parent_ref.name,
+                        default_ns,
+                        owned_gateways,
+                    )
             })
         })
         .unwrap_or(false)
@@ -93,6 +108,28 @@ fn make_condition(type_: &str, reason: &str, generation: i64, now: Time) -> Cond
     }
 }
 
+/// Returns the subset of `parent_refs` that point to a Coxswain-managed Gateway.
+fn filter_owned_parent_refs(
+    parent_refs: &[HttpRouteParentRefs],
+    default_ns: &str,
+    owned_gateways: &HashSet<(String, String)>,
+) -> Vec<HttpRouteParentRefs> {
+    parent_refs
+        .iter()
+        .filter(|p| {
+            ownership::parent_ref_owned(
+                p.group.as_deref(),
+                p.kind.as_deref(),
+                p.namespace.as_deref(),
+                &p.name,
+                default_ns,
+                owned_gateways,
+            )
+        })
+        .cloned()
+        .collect()
+}
+
 /// Kubernetes watch loop responsible for leader election and writing status
 /// conditions back to `HTTPRoute` and `GatewayClass` resources.
 ///
@@ -101,14 +138,21 @@ fn make_condition(type_: &str, reason: &str, generation: i64, now: Time) -> Cond
 pub struct Controller {
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
+    owned_gateways: OwnedGateways,
     config: ControllerConfig,
 }
 
 impl Controller {
-    pub fn new(synced: Arc<AtomicBool>, leader: Arc<AtomicBool>, config: ControllerConfig) -> Self {
+    pub fn new(
+        synced: Arc<AtomicBool>,
+        leader: Arc<AtomicBool>,
+        owned_gateways: OwnedGateways,
+        config: ControllerConfig,
+    ) -> Self {
         Self {
             synced,
             leader,
+            owned_gateways,
             config,
         }
     }
@@ -177,12 +221,20 @@ impl Controller {
                             tracing::info!("HTTPRoute initial sync complete");
                         }
                         Ok(watcher::Event::Apply(route) | watcher::Event::InitApply(route)) => {
+                            let owned = self.owned_gateways.load();
                             // Only the leader writes status back to the API server.
-                            if is_leader && !http_route_programmed(&route, &self.config.controller_name) {
+                            if is_leader
+                                && !http_route_programmed(
+                                    &route,
+                                    &self.config.controller_name,
+                                    &owned,
+                                )
+                            {
                                 Self::mark_http_route_programmed(
                                     &client,
                                     &route,
                                     &self.config.controller_name,
+                                    &owned,
                                 )
                                 .await;
                             } else if !is_leader {
@@ -265,7 +317,12 @@ impl Controller {
         }
     }
 
-    async fn mark_http_route_programmed(client: &Client, route: &HTTPRoute, controller_name: &str) {
+    async fn mark_http_route_programmed(
+        client: &Client,
+        route: &HTTPRoute,
+        controller_name: &str,
+        owned_gateways: &HashSet<(String, String)>,
+    ) {
         let name = match route.metadata.name.as_deref() {
             Some(n) => n,
             None => return,
@@ -276,6 +333,12 @@ impl Controller {
             _ => return,
         };
 
+        let owned_refs = filter_owned_parent_refs(parent_refs, ns, owned_gateways);
+        if owned_refs.is_empty() {
+            tracing::debug!(name, ns, "Skipping status patch — no owned parentRefs");
+            return;
+        }
+
         let api: Api<HTTPRoute> = Api::namespaced(client.clone(), ns);
         let now = Time(k8s_openapi::jiff::Timestamp::now());
         let observed_gen = route.metadata.generation.unwrap_or(0);
@@ -283,7 +346,7 @@ impl Controller {
         let accepted = make_condition("Accepted", "Accepted", observed_gen, now.clone());
         let programmed = make_condition("Programmed", "Programmed", observed_gen, now);
 
-        let parents: Vec<HttpRouteStatusParents> = parent_refs
+        let parents: Vec<HttpRouteStatusParents> = owned_refs
             .iter()
             .map(|p| HttpRouteStatusParents {
                 controller_name: controller_name.to_string(),
@@ -322,7 +385,8 @@ mod tests {
     use super::*;
     use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassStatus};
     use gateway_api::apis::standard::httproutes::{
-        HTTPRoute, HttpRouteStatus, HttpRouteStatusParents,
+        HTTPRoute, HttpRouteParentRefs, HttpRouteStatus, HttpRouteStatusParents,
+        HttpRouteStatusParentsParentRef,
     };
 
     fn stub_condition(type_: &str, status: &str) -> Condition {
@@ -334,6 +398,13 @@ mod tests {
             observed_generation: None,
             last_transition_time: Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH),
         }
+    }
+
+    fn owned(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
+        pairs
+            .iter()
+            .map(|(ns, name)| (ns.to_string(), name.to_string()))
+            .collect()
     }
 
     #[test]
@@ -376,32 +447,124 @@ mod tests {
     }
 
     #[test]
-    fn http_route_programmed_for_matching_controller() {
+    fn http_route_programmed_for_matching_controller_and_owned_parent() {
+        let set = owned(&[("default", "gw")]);
         let route = HTTPRoute {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
             status: Some(HttpRouteStatus {
                 parents: vec![HttpRouteStatusParents {
                     controller_name: "my-controller".to_string(),
                     conditions: vec![stub_condition("Programmed", "True")],
+                    parent_ref: HttpRouteStatusParentsParentRef {
+                        name: "gw".to_string(),
+                        namespace: Some("default".to_string()),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }],
             }),
             ..Default::default()
         };
-        assert!(http_route_programmed(&route, "my-controller"));
+        assert!(http_route_programmed(&route, "my-controller", &set));
     }
 
     #[test]
     fn http_route_not_programmed_for_different_controller() {
+        let set = owned(&[("default", "gw")]);
         let route = HTTPRoute {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
             status: Some(HttpRouteStatus {
                 parents: vec![HttpRouteStatusParents {
                     controller_name: "other-controller".to_string(),
                     conditions: vec![stub_condition("Programmed", "True")],
+                    parent_ref: HttpRouteStatusParentsParentRef {
+                        name: "gw".to_string(),
+                        namespace: Some("default".to_string()),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }],
             }),
             ..Default::default()
         };
-        assert!(!http_route_programmed(&route, "my-controller"));
+        assert!(!http_route_programmed(&route, "my-controller", &set));
+    }
+
+    #[test]
+    fn http_route_not_programmed_when_parent_not_owned() {
+        let set = owned(&[("default", "gw")]);
+        let route = HTTPRoute {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            status: Some(HttpRouteStatus {
+                parents: vec![HttpRouteStatusParents {
+                    controller_name: "my-controller".to_string(),
+                    conditions: vec![stub_condition("Programmed", "True")],
+                    parent_ref: HttpRouteStatusParentsParentRef {
+                        name: "envoy-gateway".to_string(), // not in owned set
+                        namespace: Some("default".to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(!http_route_programmed(&route, "my-controller", &set));
+    }
+
+    // --- filter_owned_parent_refs tests ---
+
+    #[test]
+    fn filter_owned_parent_refs_keeps_owned_only() {
+        let set = owned(&[("default", "gw")]);
+        let refs = vec![
+            HttpRouteParentRefs {
+                name: "gw".to_string(),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            HttpRouteParentRefs {
+                name: "envoy-gw".to_string(),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+        ];
+        let filtered = filter_owned_parent_refs(&refs, "default", &set);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "gw");
+    }
+
+    #[test]
+    fn filter_owned_parent_refs_returns_empty_when_none_owned() {
+        let set = owned(&[("default", "gw")]);
+        let refs = vec![HttpRouteParentRefs {
+            name: "foreign-gw".to_string(),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        }];
+        let filtered = filter_owned_parent_refs(&refs, "default", &set);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn filter_owned_parent_refs_applies_default_namespace() {
+        // Gateway is in "apps" namespace; parentRef omits namespace field.
+        let set = owned(&[("apps", "gw")]);
+        let refs = vec![HttpRouteParentRefs {
+            name: "gw".to_string(),
+            namespace: None, // should default to the route's namespace "apps"
+            ..Default::default()
+        }];
+        let filtered = filter_owned_parent_refs(&refs, "apps", &set);
+        assert_eq!(filtered.len(), 1);
     }
 }

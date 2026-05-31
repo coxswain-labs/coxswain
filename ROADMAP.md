@@ -74,6 +74,9 @@
 
 - Session affinity for Ingress (via `coxswain-labs.dev/session-affinity` annotation; Gateway API session affinity ships in v0.4 via `BackendLBPolicy`)
 - Response caching (HTTP cache semantics)
+- Canary deployments (progressive `backendRefs[].weight` shifting with metrics-gated automation)
+- Traffic mirroring / shadow traffic (fire-and-forget parallel backend for safe rollout validation)
+- Blue/green orchestration (health-gated atomic cutover with automatic rollback)
 - CORS built-in filter
 - IPv6 / dual-stack explicit handling
 - Performance profiling endpoints on admin port (CPU flamegraph via `pprof-rs`, Tokio task metrics)
@@ -81,33 +84,9 @@
 
 ---
 
-## Implementation Order Guidelines
-
-**Milestone order is strict.** Each milestone builds on the previous one — do not start v0.3 before v0.2 is complete. Cross-milestone dependencies include:
-- v0.3 TLS issues depend on v0.2 Gateway infrastructure ([#2](https://github.com/coxswain-labs/coxswain/issues/2) must land before [#9](https://github.com/coxswain-labs/coxswain/issues/9)).
-- v0.8 gRPC ([#33](https://github.com/coxswain-labs/coxswain/issues/33)) depends on v0.8 HTTP/2 ([#32](https://github.com/coxswain-labs/coxswain/issues/32)).
-
-**Within each milestone, follow issue number order by default** with the exceptions below.
-
-### v0.2 — Multi-tenancy & Spec Correctness
-- Do [**#45**](https://github.com/coxswain-labs/coxswain/issues/45) (basic CI) first — before writing any feature code. Every subsequent commit is verified automatically.
-- Do [**#2**](https://github.com/coxswain-labs/coxswain/issues/2) (parentRef matching) before [**#5**](https://github.com/coxswain-labs/coxswain/issues/5) (Gateway status patching) — both need a `Gateway` reflector; build it once in #2 and reuse it in #5.
-- Do [**#1**](https://github.com/coxswain-labs/coxswain/issues/1) (IngressClass filtering) before [**#48**](https://github.com/coxswain-labs/coxswain/issues/48) (Ingress status patching) — only managed Ingresses should receive status updates.
-- Do [**#7**](https://github.com/coxswain-labs/coxswain/issues/7) (advanced matching) last — it is the most architecturally impactful issue in the roadmap. It introduces a per-request predicate model into `coxswain-core` that every v0.4 feature (filters, timeouts, weighted refs) builds on. Get the design right before moving forward.
-
-### v0.3 — TLS & WebSocket
-- Do [**#8**](https://github.com/coxswain-labs/coxswain/issues/8) and [**#9**](https://github.com/coxswain-labs/coxswain/issues/9) (TLS termination for Ingress and Gateway API) before [**#10**](https://github.com/coxswain-labs/coxswain/issues/10) (hot reload) and [**#11**](https://github.com/coxswain-labs/coxswain/issues/11) (cert-manager) — the latter two are layered on top of the former two.
-- [**#49**](https://github.com/coxswain-labs/coxswain/issues/49) (PROXY protocol) is independent of the TLS issues and can be done at any point in v0.3.
-
-### v0.4 — Traffic Management
-- Do [**#13**](https://github.com/coxswain-labs/coxswain/issues/13) (HTTPRoute filters) before [**#15**](https://github.com/coxswain-labs/coxswain/issues/15) (BackendLBPolicy) and [**#16**](https://github.com/coxswain-labs/coxswain/issues/16) (BackendTLSPolicy) — filters establish the per-route config model in `coxswain-core` that the policy attachments extend.
-
-### v0.8 — HTTP/2 & gRPC
-- Do [**#32**](https://github.com/coxswain-labs/coxswain/issues/32) (HTTP/2) before [**#33**](https://github.com/coxswain-labs/coxswain/issues/33) (gRPC) — gRPC is a hard protocol dependency on HTTP/2.
-
----
-
 ## Milestones
+
+**Milestone order is strict** — do not start a milestone before the previous one is complete. Within each milestone, items are listed in recommended implementation sequence.
 
 ### v0.1 — Current State *(done)*
 Core routing engine, HTTP/1.1 proxy, round-robin LB, HTTPRoute + Ingress path/host routing, leader election, health/readiness/metrics/routes/status endpoints, debounced reconciler.
@@ -121,7 +100,7 @@ The most critical correctness gaps. Without these, Coxswain is unsafe in any sha
 
 - [x] ~~Basic GitHub Actions CI (fmt, clippy, test) — [#45](https://github.com/coxswain-labs/coxswain/issues/45) `MUST`~~
 - [x] ~~IngressClass filtering — [#1](https://github.com/coxswain-labs/coxswain/issues/1) `MUST`~~
-- [ ] `parentRef` matching for HTTPRoute — [#2](https://github.com/coxswain-labs/coxswain/issues/2) `MUST`
+- [x] ~~`parentRef` matching for HTTPRoute — [#2](https://github.com/coxswain-labs/coxswain/issues/2) `MUST`~~
 - [ ] `ReferenceGrant` for cross-namespace backends — [#3](https://github.com/coxswain-labs/coxswain/issues/3) `MUST`
 - [ ] Namespace-scoped watch (wire up `--controller-watch-namespace`) — [#4](https://github.com/coxswain-labs/coxswain/issues/4) `MUST`
 - [ ] Gateway resource status patching — [#5](https://github.com/coxswain-labs/coxswain/issues/5) `MUST`
@@ -231,3 +210,6 @@ The finish line: full Gateway API conformance suite passing, conformance badge, 
 - [ ] IPv6 / dual-stack explicit handling — [#42](https://github.com/coxswain-labs/coxswain/issues/42) `NICE`
 - [ ] Performance profiling on admin port — [#43](https://github.com/coxswain-labs/coxswain/issues/43) `NICE`
 - [ ] Dry-run mode for controller — [#44](https://github.com/coxswain-labs/coxswain/issues/44) `NICE`
+- [ ] Canary deployments (progressive weight shifting) — [#53](https://github.com/coxswain-labs/coxswain/issues/53) `SHOULD`
+- [ ] Traffic mirroring / shadow traffic — [#54](https://github.com/coxswain-labs/coxswain/issues/54) `SHOULD`
+- [ ] Blue/green orchestration — [#55](https://github.com/coxswain-labs/coxswain/issues/55) `NICE`

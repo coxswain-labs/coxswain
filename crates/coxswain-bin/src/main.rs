@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use coxswain_admin::AdminServer;
 use coxswain_controller::{Controller, ControllerConfig, Reconciler};
+use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::SharedRoutingTable;
 use coxswain_health::HealthServer;
 use coxswain_proxy::{Proxy, RoutingEngine};
@@ -176,16 +177,19 @@ fn main() -> Result<()> {
     let engine = build_routing_engine(routing_table.clone());
     let synced = build_flag();
     let leader = build_flag();
+    let owned_gateways = OwnedGateways::new();
 
     register_controller(
         &mut server,
         synced.clone(),
         leader.clone(),
+        owned_gateways.clone(),
         controller_config,
     );
     register_reconciler(
         &mut server,
         routing_table.clone(),
+        owned_gateways,
         args.controller_name.clone(),
     );
     register_proxy(&mut server, engine, args.proxy_addr);
@@ -228,11 +232,12 @@ fn register_controller(
     server: &mut Server,
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
+    owned_gateways: OwnedGateways,
     config: ControllerConfig,
 ) {
     server.add_service(background_service(
         "controller",
-        Controller::new(synced, leader, config),
+        Controller::new(synced, leader, owned_gateways, config),
     ));
 }
 
@@ -259,10 +264,15 @@ fn register_admin(
     );
 }
 
-fn register_reconciler(server: &mut Server, routes: SharedRoutingTable, controller_name: String) {
+fn register_reconciler(
+    server: &mut Server,
+    routes: SharedRoutingTable,
+    owned_gateways: OwnedGateways,
+    controller_name: String,
+) {
     server.add_service(background_service(
         "reconciler",
-        Reconciler::new(routes, controller_name),
+        Reconciler::new(routes, owned_gateways, controller_name),
     ));
 }
 
