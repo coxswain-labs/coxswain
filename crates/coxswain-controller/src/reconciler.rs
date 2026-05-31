@@ -216,8 +216,11 @@ async fn spawn_tasks(
         async move {
             let stream = reflector::reflector(
                 grant_writer,
-                watcher(Api::<ReferenceGrant>::all(client), watcher::Config::default())
-                    .default_backoff(),
+                watcher(
+                    Api::<ReferenceGrant>::all(client),
+                    watcher::Config::default(),
+                )
+                .default_backoff(),
             );
             tokio::pin!(stream);
             while let Some(event) = stream.next().await {
@@ -323,9 +326,7 @@ fn rebuild(
                 .spec
                 .from
                 .iter()
-                .filter(|f| {
-                    f.group == "gateway.networking.k8s.io" && f.kind == "HTTPRoute"
-                })
+                .filter(|f| f.group == "gateway.networking.k8s.io" && f.kind == "HTTPRoute")
                 .map(|f| f.namespace.clone())
                 .collect();
             let to_entries: Vec<_> = grant
@@ -354,7 +355,13 @@ fn rebuild(
     );
     let mut builder = RoutingTableBuilder::new();
     for route in &routes {
-        GatewayApiReconciler::reconcile(route, slice_store, &owned_gateways, &backend_grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            route,
+            slice_store,
+            &owned_gateways,
+            &backend_grants,
+            &mut builder,
+        );
     }
     for ingress in &ingresses {
         IngressReconciler::reconcile(ingress, slice_store, &owned_ingress_classes, &mut builder);

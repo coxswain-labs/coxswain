@@ -65,7 +65,12 @@ mod tests {
 
     #[test]
     fn denied_on_empty_grants() {
-        assert!(!backend_ref_allowed("apps", "billing", "payments", &HashSet::new()));
+        assert!(!backend_ref_allowed(
+            "apps",
+            "billing",
+            "payments",
+            &HashSet::new()
+        ));
     }
 
     #[test]
