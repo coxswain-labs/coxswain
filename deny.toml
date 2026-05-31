@@ -12,7 +12,12 @@ allow = [
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = []
+ignore = [
+    # pingora-core 0.8 transitive deps — no upstream fix available
+    { id = "RUSTSEC-2024-0437", reason = "protobuf 2.x pulled by prometheus 0.13 via pingora-core; no upgrade path until Pingora updates" },
+    { id = "RUSTSEC-2025-0069", reason = "daemonize pulled by pingora-core; unmaintained but no replacement available" },
+    { id = "RUSTSEC-2024-0388", reason = "derivative pulled by pingora-core; unmaintained but no replacement available" },
+]
 
 [bans]
 multiple-versions = "warn"
