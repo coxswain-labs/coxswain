@@ -24,7 +24,7 @@
 - Full HTTPRoute filter support: `URLRewrite`, `RequestRedirect`, `RequestHeaderModifier`, `ResponseHeaderModifier`
 - HTTPRoute header, method, and query parameter matching
 - HTTPRoute `timeouts` field (GA in Gateway API v1.1)
-- `BackendLBPolicy` (session persistence + timeouts per backend) *(enterprise)*
+- `BackendLBPolicy` (session persistence + timeouts per backend)
 - `BackendTLSPolicy`
 - Weighted backend refs (`backendRefs[].weight`)
 - `coxswain-labs.dev/*` annotation namespace for Ingress (timeouts, retries, path rewriting)
@@ -42,7 +42,7 @@
 - Passive backend health checking: track in-flight errors, temporarily remove failing endpoints
 - Endpoint drain: respect `conditions.serving` on EndpointSlice endpoints during rolling deploys
 
-**Security & Policy** *(enterprise)*
+**Security & Policy**
 - `SecurityPolicy` (Gateway API) for external auth (`ext_authz`)
 - `ext_authz` annotation for Ingress
 - Per-route, per-client rate limiting (by IP, header, namespace) for both APIs
@@ -72,23 +72,15 @@
 
 ### NICE TO HAVE *(future, community-driven)*
 
-- Session affinity for Ingress (via `coxswain-labs.dev/session-affinity` annotation; Gateway API session affinity ships in v0.4 via `BackendLBPolicy`) *(enterprise)*
-- Response caching (HTTP cache semantics) *(enterprise)*
+- Session affinity for Ingress (via `coxswain-labs.dev/session-affinity` annotation; Gateway API session affinity ships in v0.4 via `BackendLBPolicy`)
+- Response caching (HTTP cache semantics)
 - Canary deployments (progressive `backendRefs[].weight` shifting with metrics-gated automation)
-- Traffic mirroring / shadow traffic (fire-and-forget parallel backend for safe rollout validation) *(enterprise)*
+- Traffic mirroring / shadow traffic (fire-and-forget parallel backend for safe rollout validation)
 - Blue/green orchestration (health-gated atomic cutover with automatic rollback)
 - CORS built-in filter
 - IPv6 / dual-stack explicit handling
 - Performance profiling endpoints on admin port (CPU flamegraph via `pprof-rs`, Tokio task metrics)
 - Dry-run mode for controller
-
----
-
-## Tier Split
-
-Features are labelled either `tier: oss` or `tier: enterprise` on GitHub. Items marked *(enterprise)* in this roadmap are enterprise-tier candidates — they follow the same milestone schedule but may ship in a separate distribution once the commercial model is decided. Everything else is Apache-2.0 OSS.
-
-The commercial model (open-core vs source-available vs hosted-only) is **not yet decided**. All tier assignments are reversible until enterprise code is actually written.
 
 ---
 
@@ -161,18 +153,13 @@ TLS is a launch blocker. WebSocket is the minimum protocol expansion needed to s
 
 Full HTTPRoute filter compliance + the annotation layer for Ingress. This is the largest milestone by surface area.
 
-**Core (OSS)**
-
 - [ ] `URLRewrite`, `RequestRedirect`, `RequestHeaderModifier`, `ResponseHeaderModifier` filters — [#13](https://github.com/coxswain-labs/coxswain/issues/13) `MUST`
 - [ ] HTTPRoute `timeouts` field — [#14](https://github.com/coxswain-labs/coxswain/issues/14) `MUST`
+- [ ] `BackendLBPolicy` (session persistence + timeouts per backend) — [#15](https://github.com/coxswain-labs/coxswain/issues/15) `MUST`
 - [ ] `BackendTLSPolicy` — [#16](https://github.com/coxswain-labs/coxswain/issues/16) `MUST`
 - [ ] Weighted backend refs — [#17](https://github.com/coxswain-labs/coxswain/issues/17) `MUST`
 - [ ] `coxswain-labs.dev/*` annotation namespace — [#18](https://github.com/coxswain-labs/coxswain/issues/18) `MUST`
 - [ ] Nginx-compatible annotation aliases — [#19](https://github.com/coxswain-labs/coxswain/issues/19) `MUST`
-
-**Enterprise**
-
-- [ ] `BackendLBPolicy` (session persistence + timeouts per backend) — [#15](https://github.com/coxswain-labs/coxswain/issues/15) `MUST`
 
 ---
 
@@ -191,9 +178,7 @@ Operators need signals before they trust any controller in production. This mile
 ### v0.6 — Security & Policy
 *Target: Week 8*
 
-Auth and rate limiting close the gap with production-grade controllers. All items in this milestone are enterprise-tier.
-
-**Enterprise**
+Auth and rate limiting close the gap with production-grade controllers.
 
 - [ ] `SecurityPolicy` (Gateway API ext_authz) — [#23](https://github.com/coxswain-labs/coxswain/issues/23) `MUST`
 - [ ] `ext_authz` annotation for Ingress — [#24](https://github.com/coxswain-labs/coxswain/issues/24) `MUST`
@@ -240,21 +225,15 @@ The finish line: full Gateway API conformance suite passing, conformance badge, 
 
 ### Post-v1.0 — Community Roadmap
 
-**Core (OSS)**
-
 - [ ] OpenTelemetry trace context propagation — [#36](https://github.com/coxswain-labs/coxswain/issues/36) `SHOULD`
 - [ ] Active backend health probing — [#37](https://github.com/coxswain-labs/coxswain/issues/37) `SHOULD`
 - [ ] `GatewayClass` `ParametersRef` support — [#38](https://github.com/coxswain-labs/coxswain/issues/38) `SHOULD`
+- [ ] Session affinity / sticky sessions — [#39](https://github.com/coxswain-labs/coxswain/issues/39) `NICE`
+- [ ] Response caching — [#40](https://github.com/coxswain-labs/coxswain/issues/40) `NICE`
 - [ ] CORS built-in filter — [#41](https://github.com/coxswain-labs/coxswain/issues/41) `NICE`
 - [ ] IPv6 / dual-stack explicit handling — [#42](https://github.com/coxswain-labs/coxswain/issues/42) `NICE`
 - [ ] Performance profiling on admin port — [#43](https://github.com/coxswain-labs/coxswain/issues/43) `NICE`
 - [ ] Dry-run mode for controller — [#44](https://github.com/coxswain-labs/coxswain/issues/44) `NICE`
-
 - [ ] Canary deployments (progressive weight shifting) — [#53](https://github.com/coxswain-labs/coxswain/issues/53) `SHOULD`
-- [ ] Blue/green orchestration — [#55](https://github.com/coxswain-labs/coxswain/issues/55) `NICE`
-
-**Enterprise**
-
-- [ ] Session affinity / sticky sessions — [#39](https://github.com/coxswain-labs/coxswain/issues/39) `NICE`
-- [ ] Response caching — [#40](https://github.com/coxswain-labs/coxswain/issues/40) `NICE`
 - [ ] Traffic mirroring / shadow traffic — [#54](https://github.com/coxswain-labs/coxswain/issues/54) `SHOULD`
+- [ ] Blue/green orchestration — [#55](https://github.com/coxswain-labs/coxswain/issues/55) `NICE`
