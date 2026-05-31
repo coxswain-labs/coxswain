@@ -183,7 +183,11 @@ fn main() -> Result<()> {
         leader.clone(),
         controller_config,
     );
-    register_reconciler(&mut server, routing_table.clone());
+    register_reconciler(
+        &mut server,
+        routing_table.clone(),
+        args.controller_name.clone(),
+    );
     register_proxy(&mut server, engine, args.proxy_addr);
     register_health(&mut server, synced.clone(), args.health_addr);
     register_admin(&mut server, routing_table, synced, leader, args.admin_addr);
@@ -255,8 +259,11 @@ fn register_admin(
     );
 }
 
-fn register_reconciler(server: &mut Server, routes: SharedRoutingTable) {
-    server.add_service(background_service("reconciler", Reconciler::new(routes)));
+fn register_reconciler(server: &mut Server, routes: SharedRoutingTable, controller_name: String) {
+    server.add_service(background_service(
+        "reconciler",
+        Reconciler::new(routes, controller_name),
+    ));
 }
 
 fn register_proxy(server: &mut Server, engine: Arc<RoutingEngine>, addr: SocketAddr) {

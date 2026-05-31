@@ -119,8 +119,8 @@ Core routing engine, HTTP/1.1 proxy, round-robin LB, HTTPRoute + Ingress path/ho
 
 The most critical correctness gaps. Without these, Coxswain is unsafe in any shared cluster and fails Gateway API conformance on basic tests.
 
-- [x] Basic GitHub Actions CI (fmt, clippy, test) — [#45](https://github.com/coxswain-labs/coxswain/issues/45) `MUST`
-- [ ] IngressClass filtering — [#1](https://github.com/coxswain-labs/coxswain/issues/1) `MUST`
+- [x] ~~Basic GitHub Actions CI (fmt, clippy, test) — [#45](https://github.com/coxswain-labs/coxswain/issues/45) `MUST`~~
+- [x] ~~IngressClass filtering — [#1](https://github.com/coxswain-labs/coxswain/issues/1) `MUST`~~
 - [ ] `parentRef` matching for HTTPRoute — [#2](https://github.com/coxswain-labs/coxswain/issues/2) `MUST`
 - [ ] `ReferenceGrant` for cross-namespace backends — [#3](https://github.com/coxswain-labs/coxswain/issues/3) `MUST`
 - [ ] Namespace-scoped watch (wire up `--controller-watch-namespace`) — [#4](https://github.com/coxswain-labs/coxswain/issues/4) `MUST`
