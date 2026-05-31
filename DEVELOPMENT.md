@@ -117,6 +117,29 @@ curl -H "Host: ingress2.local" http://localhost:8080/c      # hello from echo-c
 curl -H "Host: ingress2.local" http://localhost:8080/       # hello from echo-a (catchall)
 ```
 
+### Test cross-namespace routes (ReferenceGrant)
+
+Cross-namespace backend refs require a `ReferenceGrant` in the target namespace. The `cross-namespace.yaml` fixture creates an `echo-tenant` namespace with a backend, a `ReferenceGrant` permitting access from `default`, and an HTTPRoute in `default` referencing it.
+
+```bash
+kubectl apply -f deploy/dev/cross-namespace.yaml
+```
+
+```bash
+# Route resolves when the grant is present
+curl -H "Host: cross-ns.local" http://localhost:8080/   # hello from echo-d
+```
+
+Delete the grant to confirm enforcement:
+
+```bash
+kubectl delete referencegrant allow-httproute-from-default -n echo-tenant
+curl -H "Host: cross-ns.local" http://localhost:8080/   # 502 Bad Gateway
+
+# Restore
+kubectl apply -f deploy/dev/cross-namespace.yaml
+```
+
 ### Observe the routing table
 
 ```bash

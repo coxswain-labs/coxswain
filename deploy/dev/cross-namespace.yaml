@@ -1,0 +1,93 @@
+# Cross-namespace routing test fixtures.
+#
+# Demonstrates ReferenceGrant enforcement: an HTTPRoute in `default` referencing a
+# Service in a different namespace (`echo-tenant`) requires a ReferenceGrant in
+# `echo-tenant` permitting the cross-namespace ref. Without the grant, the backend
+# is denied and the route is inert.
+#
+# Apply:
+#   kubectl apply -f deploy/dev/cross-namespace.yaml
+#
+# Test (coxswain proxy on localhost:8080):
+#   curl -H "Host: cross-ns.local" http://localhost:8080/   # hello from echo-d
+#
+# Delete the grant to confirm denial:
+#   kubectl delete referencegrant allow-httproute-from-default -n echo-tenant
+#   curl -H "Host: cross-ns.local" http://localhost:8080/   # 502 Bad Gateway
+#
+# Restore the grant:
+#   kubectl apply -f deploy/dev/cross-namespace.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: echo-tenant
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-d
+  namespace: echo-tenant
+  labels:
+    app: echo-d
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-d
+  template:
+    metadata:
+      labels:
+        app: echo-d
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:0.2.3
+          args: ["-text=hello from echo-d", "-listen=:5678"]
+          ports:
+            - containerPort: 5678
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-d
+  namespace: echo-tenant
+spec:
+  selector:
+    app: echo-d
+  ports:
+    - port: 5678
+      targetPort: 5678
+---
+# ReferenceGrant in the *target* namespace (echo-tenant) permitting any HTTPRoute
+# in the `default` namespace to reference any Service in `echo-tenant`.
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata:
+  name: allow-httproute-from-default
+  namespace: echo-tenant
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: default
+  to:
+    - group: ""
+      kind: Service
+---
+# HTTPRoute in `default` with a cross-namespace backendRef into `echo-tenant`.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cross-ns-route
+  namespace: default
+spec:
+  parentRefs:
+    - name: coxswain-local
+  hostnames:
+    - "cross-ns.local"
+  rules:
+    - backendRefs:
+        - name: echo-d
+          namespace: echo-tenant
+          port: 5678
