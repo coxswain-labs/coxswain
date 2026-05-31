@@ -46,7 +46,13 @@ impl ControllerConfig {
                  1/3 of lease_ttl ({lease_ttl:?})"
             ));
         }
-        Ok(Self { controller_name, pod_name, pod_namespace, lease_ttl, lease_renew_interval })
+        Ok(Self {
+            controller_name,
+            pod_name,
+            pod_namespace,
+            lease_ttl,
+            lease_renew_interval,
+        })
     }
 }
 
@@ -100,7 +106,11 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(synced: Arc<AtomicBool>, leader: Arc<AtomicBool>, config: ControllerConfig) -> Self {
-        Self { synced, leader, config }
+        Self {
+            synced,
+            leader,
+            config,
+        }
     }
 
     async fn start_watcher_loop(&self, mut shutdown: ShutdownWatch) {
@@ -239,7 +249,12 @@ impl Controller {
 
     async fn accept_gateway_class(client: &Client, name: &str, generation: i64) {
         let api: Api<GatewayClass> = Api::all(client.clone());
-        let condition = make_condition("Accepted", "Accepted", generation, Time(k8s_openapi::jiff::Timestamp::now()));
+        let condition = make_condition(
+            "Accepted",
+            "Accepted",
+            generation,
+            Time(k8s_openapi::jiff::Timestamp::now()),
+        );
         let patch = serde_json::json!({ "status": { "conditions": [condition] } });
         match api
             .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
@@ -353,7 +368,10 @@ mod tests {
 
     #[test]
     fn gateway_class_not_accepted_when_no_status() {
-        let gc = GatewayClass { status: None, ..Default::default() };
+        let gc = GatewayClass {
+            status: None,
+            ..Default::default()
+        };
         assert!(!gateway_class_accepted(&gc));
     }
 

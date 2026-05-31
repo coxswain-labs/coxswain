@@ -1,0 +1,7 @@
+[advisories]
+# pingora-core 0.8 transitive deps — no upstream fix available
+ignore = [
+    "RUSTSEC-2024-0437", # protobuf 2.x via prometheus 0.13 via pingora-core
+    "RUSTSEC-2025-0069", # daemonize via pingora-core; unmaintained, no replacement
+    "RUSTSEC-2024-0388", # derivative via pingora-core; unmaintained, no replacement
+]

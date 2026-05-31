@@ -175,7 +175,11 @@ impl HostRouterBuilder {
 
         for (path, upstream) in self.exact_routes {
             match router.insert(path.clone(), Arc::clone(&upstream)) {
-                Ok(()) => route_info.push(RouteInfo { path, kind: RouteKind::Exact, upstream }),
+                Ok(()) => route_info.push(RouteInfo {
+                    path,
+                    kind: RouteKind::Exact,
+                    upstream,
+                }),
                 Err(_) => conflicts.push(RouteConflict {
                     host: host.to_string(),
                     path,
@@ -203,7 +207,11 @@ impl HostRouterBuilder {
                     // edge case (another rule claimed the exact wildcard path). Still mark active
                     // since the base path is routing.
                     let _ = router.insert(p2, Arc::clone(&upstream));
-                    route_info.push(RouteInfo { path, kind: RouteKind::Prefix, upstream });
+                    route_info.push(RouteInfo {
+                        path,
+                        kind: RouteKind::Prefix,
+                        upstream,
+                    });
                 }
                 Err(_) => {
                     // Base path already claimed by an earlier rule — skip the whole prefix.
@@ -223,12 +231,24 @@ impl HostRouterBuilder {
             .regex_routes
             .into_iter()
             .map(|(p, u)| {
-                route_info.push(RouteInfo { path: p.clone(), kind: RouteKind::Regex, upstream: Arc::clone(&u) });
+                route_info.push(RouteInfo {
+                    path: p.clone(),
+                    kind: RouteKind::Regex,
+                    upstream: Arc::clone(&u),
+                });
                 Ok((Regex::new(&p)?, u))
             })
             .collect::<Result<Vec<_>, regex::Error>>()?;
 
-        Ok((HostRouter { router, regex_set, regex_routes, route_info }, conflicts))
+        Ok((
+            HostRouter {
+                router,
+                regex_set,
+                regex_routes,
+                route_info,
+            },
+            conflicts,
+        ))
     }
 }
 

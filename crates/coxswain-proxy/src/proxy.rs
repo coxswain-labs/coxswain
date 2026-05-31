@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use coxswain_core::routing::{RouteOutcome, SharedRoutingTable, Upstream};
-use pingora_core::{ConnectionClosed, ErrorSource, HTTPStatus, ReadError, Result, WriteError};
 use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::{ConnectionClosed, ErrorSource, HTTPStatus, ReadError, Result, WriteError};
 use pingora_http::RequestHeader;
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::sync::Arc;

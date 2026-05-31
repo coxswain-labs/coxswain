@@ -117,7 +117,13 @@ mod tests {
         writer.as_reader()
     }
 
-    fn make_ingress(ns: &str, host: Option<&str>, path: &str, path_type: &str, svc: &str) -> Ingress {
+    fn make_ingress(
+        ns: &str,
+        host: Option<&str>,
+        path: &str,
+        path_type: &str,
+        svc: &str,
+    ) -> Ingress {
         Ingress {
             metadata: ObjectMeta {
                 name: Some("test-ingress".to_string()),
@@ -178,8 +184,13 @@ mod tests {
     #[test]
     fn reconcile_implementation_specific_maps_to_prefix() {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let ingress =
-            make_ingress("default", Some("example.com"), "/api", "ImplementationSpecific", "svc");
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/api",
+            "ImplementationSpecific",
+            "svc",
+        );
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &mut builder);
         let table = builder.build().unwrap();

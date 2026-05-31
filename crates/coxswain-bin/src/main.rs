@@ -177,7 +177,12 @@ fn main() -> Result<()> {
     let synced = build_flag();
     let leader = build_flag();
 
-    register_controller(&mut server, synced.clone(), leader.clone(), controller_config);
+    register_controller(
+        &mut server,
+        synced.clone(),
+        leader.clone(),
+        controller_config,
+    );
     register_reconciler(&mut server, routing_table.clone());
     register_proxy(&mut server, engine, args.proxy_addr);
     register_health(&mut server, synced.clone(), args.health_addr);
@@ -221,7 +226,10 @@ fn register_controller(
     leader: Arc<AtomicBool>,
     config: ControllerConfig,
 ) {
-    server.add_service(background_service("controller", Controller::new(synced, leader, config)));
+    server.add_service(background_service(
+        "controller",
+        Controller::new(synced, leader, config),
+    ));
 }
 
 fn register_health(server: &mut Server, synced: Arc<AtomicBool>, addr: SocketAddr) {
@@ -237,14 +245,18 @@ fn register_admin(
     leader: Arc<AtomicBool>,
     addr: SocketAddr,
 ) {
-    server.add_service(AdminServer { synced, leader, routes }.into_service(addr));
+    server.add_service(
+        AdminServer {
+            synced,
+            leader,
+            routes,
+        }
+        .into_service(addr),
+    );
 }
 
 fn register_reconciler(server: &mut Server, routes: SharedRoutingTable) {
-    server.add_service(background_service(
-        "reconciler",
-        Reconciler::new(routes),
-    ));
+    server.add_service(background_service("reconciler", Reconciler::new(routes)));
 }
 
 fn register_proxy(server: &mut Server, engine: Arc<RoutingEngine>, addr: SocketAddr) {
