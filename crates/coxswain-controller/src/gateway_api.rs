@@ -197,10 +197,7 @@ mod tests {
         }
     }
 
-    fn path_match(
-        type_: HttpRouteRulesMatchesPathType,
-        value: &str,
-    ) -> Vec<HttpRouteRulesMatches> {
+    fn path_match(type_: HttpRouteRulesMatchesPathType, value: &str) -> Vec<HttpRouteRulesMatches> {
         vec![HttpRouteRulesMatches {
             path: Some(HttpRouteRulesMatchesPath {
                 r#type: Some(type_),
@@ -233,7 +230,10 @@ mod tests {
         let route = make_route(
             "default",
             &["example.com"],
-            Some(path_match(HttpRouteRulesMatchesPathType::PathPrefix, "/api")),
+            Some(path_match(
+                HttpRouteRulesMatchesPathType::PathPrefix,
+                "/api",
+            )),
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();

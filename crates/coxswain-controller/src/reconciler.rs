@@ -149,7 +149,11 @@ fn rebuild(
 ) {
     let routes = route_store.state();
     let ingresses = ingress_store.state();
-    tracing::debug!(http_routes = routes.len(), ingresses = ingresses.len(), "Rebuilding routing table");
+    tracing::debug!(
+        http_routes = routes.len(),
+        ingresses = ingresses.len(),
+        "Rebuilding routing table"
+    );
     let mut builder = RoutingTableBuilder::new();
     for route in &routes {
         GatewayApiReconciler::reconcile(route, slice_store, &mut builder);
