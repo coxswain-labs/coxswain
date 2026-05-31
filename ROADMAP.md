@@ -74,9 +74,9 @@
 
 - Session affinity for Ingress (via `coxswain-labs.dev/session-affinity` annotation; Gateway API session affinity ships in v0.4 via `BackendLBPolicy`) *(enterprise)*
 - Response caching (HTTP cache semantics) *(enterprise)*
-- Canary deployments (progressive `backendRefs[].weight` shifting with metrics-gated automation) *(enterprise)*
+- Canary deployments (progressive `backendRefs[].weight` shifting with metrics-gated automation)
 - Traffic mirroring / shadow traffic (fire-and-forget parallel backend for safe rollout validation) *(enterprise)*
-- Blue/green orchestration (health-gated atomic cutover with automatic rollback) *(enterprise)*
+- Blue/green orchestration (health-gated atomic cutover with automatic rollback)
 - CORS built-in filter
 - IPv6 / dual-stack explicit handling
 - Performance profiling endpoints on admin port (CPU flamegraph via `pprof-rs`, Tokio task metrics)
@@ -250,10 +250,11 @@ The finish line: full Gateway API conformance suite passing, conformance badge, 
 - [ ] Performance profiling on admin port — [#43](https://github.com/coxswain-labs/coxswain/issues/43) `NICE`
 - [ ] Dry-run mode for controller — [#44](https://github.com/coxswain-labs/coxswain/issues/44) `NICE`
 
+- [ ] Canary deployments (progressive weight shifting) — [#53](https://github.com/coxswain-labs/coxswain/issues/53) `SHOULD`
+- [ ] Blue/green orchestration — [#55](https://github.com/coxswain-labs/coxswain/issues/55) `NICE`
+
 **Enterprise**
 
 - [ ] Session affinity / sticky sessions — [#39](https://github.com/coxswain-labs/coxswain/issues/39) `NICE`
 - [ ] Response caching — [#40](https://github.com/coxswain-labs/coxswain/issues/40) `NICE`
-- [ ] Canary deployments (progressive weight shifting) — [#53](https://github.com/coxswain-labs/coxswain/issues/53) `SHOULD`
 - [ ] Traffic mirroring / shadow traffic — [#54](https://github.com/coxswain-labs/coxswain/issues/54) `SHOULD`
-- [ ] Blue/green orchestration — [#55](https://github.com/coxswain-labs/coxswain/issues/55) `NICE`
