@@ -17,7 +17,14 @@ When working on a GitHub issue, always include a reference in every commit messa
 When the user says an issue is done:
 1. Run `gh issue close N --repo coxswain-labs/coxswain`.
 2. Flip `[ ]` to `[x]` for that item in `ROADMAP.md`.
-3. Commit and push the `ROADMAP.md` change with `Refs #N` in the message.
+3. Commit and push the `ROADMAP.md` change with `Fixes #N` in the message.
+4. Merge the PR with `gh pr merge --squash --delete-branch`.
+
+## GitHub Milestones and Labels
+
+GitHub milestones use plain version numbers only (`v0.2`, `v0.3`, …, `v1.0`, `post-v1.0`). Never use special characters like em dashes, colons, or `&` in milestone titles — they break GitHub's issue filter URL parser.
+
+The theme for each milestone lives in the description of the corresponding `milestone: vX.Y` label (e.g. `milestone: v0.2` has description "Multi-tenancy and Spec Correctness").
 
 ## Project Overview
 
