@@ -117,25 +117,25 @@ pub struct ServeArgs {
     /// How long a leader lease stays valid without renewal.
     ///
     /// Determines how quickly a standby replica can take over after the leader dies.
-    /// Must be at least 3× `--leader-lease-renew-interval`.
+    /// Must be at least 3× `--controller-lease-renew-interval`.
     #[arg(
         long,
         env = "COXSWAIN_CONTROLLER_LEASE_TTL",
         default_value = "15s",
         value_parser = humantime::parse_duration,
     )]
-    pub leader_lease_ttl: Duration,
+    pub controller_lease_ttl: Duration,
 
     /// How often the active leader renews its lease.
     ///
-    /// Must be at most 1/3 of `--leader-lease-ttl`.
+    /// Must be at most 1/3 of `--controller-lease-ttl`.
     #[arg(
         long,
         env = "COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL",
         default_value = "5s",
         value_parser = humantime::parse_duration,
     )]
-    pub leader_lease_renew_interval: Duration,
+    pub controller_lease_renew_interval: Duration,
 
     /// Socket address to listen on for the admin, metrics, and diagnostics endpoints.
     #[arg(long, env = "COXSWAIN_ADMIN_ADDR", default_value = "0.0.0.0:8082")]
@@ -158,8 +158,8 @@ fn main() -> Result<()> {
         args.controller_name.clone(),
         args.pod_name.clone(),
         args.pod_namespace.clone(),
-        args.leader_lease_ttl,
-        args.leader_lease_renew_interval,
+        args.controller_lease_ttl,
+        args.controller_lease_renew_interval,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
