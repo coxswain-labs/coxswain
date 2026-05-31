@@ -38,6 +38,8 @@ kubectl apply -f deploy/manifests/gateway-class.yaml
 
 > The RBAC grants are scoped to the `coxswain-controller` ServiceAccount inside the cluster. When running locally, your kubeconfig identity is used instead, which typically has cluster-admin on local distributions.
 
+> **Namespace-scoped install**: `deploy/manifests/rbac.yaml` contains a commented-out example showing how to replace the default ClusterRole with a namespaced Role + a residual ClusterRole (for GatewayClass/IngressClass only). Use this when running Coxswain with `COXSWAIN_CONTROLLER_WATCH_NAMESPACE=<ns>` to minimise RBAC surface.
+
 ### 3. Run the binary
 
 ```bash
