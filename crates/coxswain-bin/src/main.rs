@@ -161,6 +161,7 @@ fn main() -> Result<()> {
         args.pod_namespace.clone(),
         args.controller_lease_ttl,
         args.controller_lease_renew_interval,
+        args.controller_watch_namespace.clone(),
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -191,6 +192,7 @@ fn main() -> Result<()> {
         routing_table.clone(),
         owned_gateways,
         args.controller_name.clone(),
+        args.controller_watch_namespace.clone(),
     );
     register_proxy(&mut server, engine, args.proxy_addr);
     register_health(&mut server, synced.clone(), args.health_addr);
@@ -269,10 +271,11 @@ fn register_reconciler(
     routes: SharedRoutingTable,
     owned_gateways: OwnedGateways,
     controller_name: String,
+    watch_namespace: Option<String>,
 ) {
     server.add_service(background_service(
         "reconciler",
-        Reconciler::new(routes, owned_gateways, controller_name),
+        Reconciler::new(routes, owned_gateways, controller_name, watch_namespace),
     ));
 }
 

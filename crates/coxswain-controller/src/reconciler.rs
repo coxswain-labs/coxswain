@@ -31,6 +31,8 @@ pub struct Reconciler {
     routes: SharedRoutingTable,
     owned_gateways: OwnedGateways,
     controller_name: String,
+    /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
+    watch_namespace: Option<String>,
 }
 
 impl Reconciler {
@@ -38,12 +40,25 @@ impl Reconciler {
         routes: SharedRoutingTable,
         owned_gateways: OwnedGateways,
         controller_name: String,
+        watch_namespace: Option<String>,
     ) -> Self {
         Self {
             routes,
             owned_gateways,
             controller_name,
+            watch_namespace,
         }
+    }
+}
+
+fn scoped_api<T>(client: Client, ns: Option<&str>) -> Api<T>
+where
+    T: kube::Resource<Scope = kube::core::NamespaceResourceScope>,
+    T::DynamicType: Default,
+{
+    match ns {
+        Some(ns) => Api::namespaced(client, ns),
+        None => Api::all(client),
     }
 }
 
@@ -58,6 +73,7 @@ impl BackgroundService for Reconciler {
             self.routes.clone(),
             self.owned_gateways.clone(),
             self.controller_name.clone(),
+            self.watch_namespace.clone(),
         )
         .await;
         loop {
@@ -78,6 +94,7 @@ async fn spawn_tasks(
     routes: SharedRoutingTable,
     owned_gateways: OwnedGateways,
     controller_name: String,
+    watch_namespace: Option<String>,
 ) -> JoinSet<()> {
     let (route_reader, route_writer) = reflector::store::<HTTPRoute>();
     let (ingress_reader, ingress_writer) = reflector::store::<Ingress>();
@@ -93,11 +110,15 @@ async fn spawn_tasks(
     set.spawn({
         let notify = Arc::clone(&notify);
         let client = client.clone();
+        let ns = watch_namespace.clone();
         async move {
             let stream = reflector::reflector(
                 route_writer,
-                watcher(Api::<HTTPRoute>::all(client), watcher::Config::default())
-                    .default_backoff(),
+                watcher(
+                    scoped_api::<HTTPRoute>(client, ns.as_deref()),
+                    watcher::Config::default(),
+                )
+                .default_backoff(),
             );
             tokio::pin!(stream);
             while let Some(event) = stream.next().await {
@@ -113,10 +134,15 @@ async fn spawn_tasks(
     set.spawn({
         let notify = Arc::clone(&notify);
         let client = client.clone();
+        let ns = watch_namespace.clone();
         async move {
             let stream = reflector::reflector(
                 ingress_writer,
-                watcher(Api::<Ingress>::all(client), watcher::Config::default()).default_backoff(),
+                watcher(
+                    scoped_api::<Ingress>(client, ns.as_deref()),
+                    watcher::Config::default(),
+                )
+                .default_backoff(),
             );
             tokio::pin!(stream);
             while let Some(event) = stream.next().await {
@@ -152,10 +178,15 @@ async fn spawn_tasks(
     set.spawn({
         let notify = Arc::clone(&notify);
         let client = client.clone();
+        let ns = watch_namespace.clone();
         async move {
             let stream = reflector::reflector(
                 gateway_writer,
-                watcher(Api::<Gateway>::all(client), watcher::Config::default()).default_backoff(),
+                watcher(
+                    scoped_api::<Gateway>(client, ns.as_deref()),
+                    watcher::Config::default(),
+                )
+                .default_backoff(),
             );
             tokio::pin!(stream);
             while let Some(event) = stream.next().await {
@@ -191,11 +222,12 @@ async fn spawn_tasks(
     set.spawn({
         let notify = Arc::clone(&notify);
         let client = client.clone();
+        let ns = watch_namespace.clone();
         async move {
             let stream = reflector::reflector(
                 slice_writer,
                 watcher(
-                    Api::<EndpointSlice>::all(client),
+                    scoped_api::<EndpointSlice>(client, ns.as_deref()),
                     watcher::Config::default(),
                 )
                 .default_backoff(),
@@ -213,11 +245,12 @@ async fn spawn_tasks(
     // --- ReferenceGrant reflector ---
     set.spawn({
         let notify = Arc::clone(&notify);
+        let ns = watch_namespace;
         async move {
             let stream = reflector::reflector(
                 grant_writer,
                 watcher(
-                    Api::<ReferenceGrant>::all(client),
+                    scoped_api::<ReferenceGrant>(client, ns.as_deref()),
                     watcher::Config::default(),
                 )
                 .default_backoff(),

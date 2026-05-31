@@ -32,6 +32,8 @@ pub struct ControllerConfig {
     pub pod_namespace: String,
     pub lease_ttl: Duration,
     pub lease_renew_interval: Duration,
+    /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
+    pub watch_namespace: Option<String>,
 }
 
 impl ControllerConfig {
@@ -41,6 +43,7 @@ impl ControllerConfig {
         pod_namespace: String,
         lease_ttl: Duration,
         lease_renew_interval: Duration,
+        watch_namespace: Option<String>,
     ) -> Result<Self, String> {
         if lease_renew_interval * 3 > lease_ttl {
             return Err(format!(
@@ -54,7 +57,19 @@ impl ControllerConfig {
             pod_namespace,
             lease_ttl,
             lease_renew_interval,
+            watch_namespace,
         })
+    }
+}
+
+fn scoped_api<T>(client: Client, ns: Option<&str>) -> Api<T>
+where
+    T: kube::Resource<Scope = kube::core::NamespaceResourceScope>,
+    T::DynamicType: Default,
+{
+    match ns {
+        Some(ns) => Api::namespaced(client, ns),
+        None => Api::all(client),
     }
 }
 
@@ -175,7 +190,7 @@ impl Controller {
         self.leader.store(is_leader, Ordering::Release);
 
         let route_watcher = watcher(
-            Api::<HTTPRoute>::all(client.clone()),
+            scoped_api::<HTTPRoute>(client.clone(), self.config.watch_namespace.as_deref()),
             watcher::Config::default(),
         )
         .default_backoff();
