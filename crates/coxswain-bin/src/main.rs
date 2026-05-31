@@ -55,7 +55,7 @@ pub struct ServeArgs {
     pub controller_name: String,
 
     /// Kubernetes namespace to watch. Omit for cluster-wide scope.
-    #[arg(long, env = "COXSWAIN_WATCH_NAMESPACE")]
+    #[arg(long, env = "COXSWAIN_CONTROLLER_WATCH_NAMESPACE")]
     pub controller_watch_namespace: Option<String>,
 
     /// Name of this pod, used as the leader-election holder identity.
@@ -120,7 +120,7 @@ pub struct ServeArgs {
     /// Must be at least 3× `--leader-lease-renew-interval`.
     #[arg(
         long,
-        env = "COXSWAIN_LEADER_LEASE_TTL",
+        env = "COXSWAIN_CONTROLLER_LEASE_TTL",
         default_value = "15s",
         value_parser = humantime::parse_duration,
     )]
@@ -131,7 +131,7 @@ pub struct ServeArgs {
     /// Must be at most 1/3 of `--leader-lease-ttl`.
     #[arg(
         long,
-        env = "COXSWAIN_LEADER_LEASE_RENEW_INTERVAL",
+        env = "COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL",
         default_value = "5s",
         value_parser = humantime::parse_duration,
     )]
