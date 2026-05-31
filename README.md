@@ -57,19 +57,24 @@ kubectl apply -f deploy/manifests/deployment.yaml
 
 ## Configuration
 
-All flags have environment variable equivalents and are safe to configure via Kubernetes `env:` or `envFrom:`.
+All flags have environment variable equivalents. Most use a `COXSWAIN_*` prefix and are safe to set via Kubernetes `env:` or `envFrom:`. `POD_NAME` and `POD_NAMESPACE` are typically injected by the Kubernetes Downward API.
 
 | Flag | Env var | Default | Description |
 |------|---------|---------|-------------|
-| `--proxy-addr` | `COXSWAIN_PROXY_ADDR` | `0.0.0.0:8080` | Inbound HTTP proxy address |
-| `--health-addr` | `COXSWAIN_HEALTH_ADDR` | `0.0.0.0:8081` | Health endpoints address |
-| `--admin-addr` | `COXSWAIN_ADMIN_ADDR` | `0.0.0.0:8082` | Admin/metrics address |
+| `--admin-addr` | `COXSWAIN_ADMIN_ADDR` | `0.0.0.0:8082` | Admin, metrics, and diagnostics address |
+| `--controller-lease-renew-interval` | `COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL` | `5s` | How often the leader renews its lease; must be ≤ 1/3 of `--controller-lease-ttl` |
+| `--controller-lease-ttl` | `COXSWAIN_CONTROLLER_LEASE_TTL` | `15s` | How long a lease stays valid without renewal; must be ≥ 3× `--controller-lease-renew-interval` |
 | `--controller-name` | `COXSWAIN_CONTROLLER_NAME` | `coxswain-labs.dev/gateway-controller` | GatewayClass `spec.controllerName` to claim |
-| `--controller-watch-namespace` | `COXSWAIN_WATCH_NAMESPACE` | _(cluster-wide)_ | Restrict watch to a single namespace |
-| `--log-format` | `COXSWAIN_LOG_FORMAT` | `json` | `json` or `console` |
-| `--log` | `COXSWAIN_LOG` | `info` | Log level; supports `RUST_LOG` syntax |
-
-Run `coxswain --help` for the full list.
+| `--controller-watch-namespace` | `COXSWAIN_CONTROLLER_WATCH_NAMESPACE` | _(cluster-wide)_ | Restrict watch to a single namespace |
+| `--health-addr` | `COXSWAIN_HEALTH_ADDR` | `0.0.0.0:8081` | Liveness and readiness health endpoints address |
+| `--log-filter` | `COXSWAIN_LOG` | `info` | Log level; supports `RUST_LOG` directive syntax (e.g. `info,coxswain=debug`) |
+| `--log-format` | `COXSWAIN_LOG_FORMAT` | `json` | `json` (production) or `console` (local dev) |
+| `--pod-name` | `POD_NAME` | `coxswain-local` | Pod name used as the leader-election holder identity |
+| `--pod-namespace` | `POD_NAMESPACE` | `coxswain-system` | Pod namespace used to scope the leader-election Lease |
+| `--proxy-addr` | `COXSWAIN_PROXY_ADDR` | `0.0.0.0:8080` | Inbound HTTP proxy address |
+| `--proxy-shutdown-grace-period` | `COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD` | `30s` | Drain window after shutdown signal; connections are given this long to complete |
+| `--proxy-shutdown-timeout` | `COXSWAIN_PROXY_SHUTDOWN_TIMEOUT` | `5s` | Hard deadline for the final shutdown step after the grace period expires |
+| `--proxy-threads` | `COXSWAIN_PROXY_THREADS` | `2` | Worker threads per proxy service; set to CPU core count for maximum throughput |
 
 ## License
 
