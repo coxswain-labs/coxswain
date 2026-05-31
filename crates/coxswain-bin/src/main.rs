@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use coxswain_admin::AdminServer;
-use coxswain_controller::{Controller, ControllerConfig, OwnedGateways, Reconciler};
+use coxswain_controller::{Controller, ControllerConfig, Reconciler};
+use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::SharedRoutingTable;
 use coxswain_health::HealthServer;
 use coxswain_proxy::{Proxy, RoutingEngine};
