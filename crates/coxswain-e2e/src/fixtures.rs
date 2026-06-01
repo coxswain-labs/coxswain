@@ -34,6 +34,11 @@ pub const INGRESS_PATH_MATCHING: &str = concat!(
     "/fixtures/ingress/path_matching.yaml"
 );
 
+pub const INGRESS_DEFAULT_BACKEND: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/ingress/default_backend.yaml"
+);
+
 /// Apply a fixture YAML to `namespace`.
 ///
 /// Supports template substitutions: `TESTNS` is always replaced with `namespace`.

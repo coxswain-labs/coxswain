@@ -1,0 +1,30 @@
+# Ingress default backend fixture.
+# TESTNS is substituted with the test namespace at runtime.
+#
+# Routes:
+#   app.TESTNS.local /api  → echo-a  (explicit rule)
+#   app.TESTNS.local /*    → echo-b  (per-Ingress defaultBackend, path-miss)
+#   <any other host>       → echo-c  (controller-wide --ingress-default-backend)
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: echo-ingress
+spec:
+  ingressClassName: coxswain
+  defaultBackend:
+    service:
+      name: echo-b
+      port:
+        number: 3000
+  rules:
+    - host: app.TESTNS.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
