@@ -16,7 +16,7 @@ When working on a GitHub issue, always include a reference in every commit messa
 - Use `Refs #N` for partial work on an issue.
 - Use `Fixes #N` for the final commit that completes it (GitHub closes the issue automatically on push).
 
-When the user says an issue is done:
+When the user says "close the issue" or "an issue is done":
 1. Run `gh issue close N --repo coxswain-labs/coxswain`.
 2. Ensure the `ROADMAP.md` item is `- [x] ~~...~~` (tick + strikethrough). This should already be done from step 3 above; if not, do it now and commit with `Fixes #N`.
 3. Merge the PR with `gh pr merge --squash --delete-branch`.
