@@ -29,7 +29,7 @@ rules:
     verbs: ["get", "list", "watch"]
 
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses/status", "httproutes/status"]
+    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status"]
     verbs: ["patch", "update"]
 
 ---
@@ -152,7 +152,7 @@ roleRef:
 #     verbs: ["get", "list", "watch"]
 #
 #   - apiGroups: ["gateway.networking.k8s.io"]
-#     resources: ["httproutes/status"]
+#     resources: ["gateways/status", "httproutes/status"]
 #     verbs: ["patch", "update"]
 
 # --- RoleBinding for the namespaced Role ---

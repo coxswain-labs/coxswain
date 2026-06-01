@@ -1,4 +1,5 @@
 use anyhow::Context as _;
+use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::Api;
@@ -45,6 +46,30 @@ pub async fn wait_for_httproute_programmed(
     }
 }
 
+pub async fn wait_for_gateway_programmed(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<Gateway> = Api::namespaced(client.clone(), namespace);
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        if let Ok(gw) = api.get(name).await
+            && gateway_has_condition(&gw, "Accepted")
+            && gateway_has_condition(&gw, "Programmed")
+        {
+            return Ok(());
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for Gateway {namespace}/{name} to be Accepted and Programmed"
+            );
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Wait for the named Deployments in `namespace` to become Available.
 /// Covers the image-pull + pod-start time on a fresh cluster.
 pub async fn wait_for_backends(namespace: &str) -> anyhow::Result<()> {
@@ -84,6 +109,14 @@ pub async fn wait_for_route(
         }
         time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+fn gateway_has_condition(gw: &Gateway, type_: &str) -> bool {
+    gw.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .map(|conds| has_condition(conds, type_))
+        .unwrap_or(false)
 }
 
 fn route_has_condition(route: &HTTPRoute, type_: &str) -> bool {
