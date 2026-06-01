@@ -350,12 +350,17 @@ pub struct RoutingTable {
 
 impl RoutingTable {
     pub fn route(&self, host: &str, path: &str) -> Option<Arc<Upstream>> {
-        if let Some(router) = self.exact_hosts.get(host) {
-            return router.route(path);
-        }
-        for (suffix, router) in &self.wildcard_hosts {
-            if wildcard_matches(host, suffix) {
-                return router.route(path);
+        let host_router = if let Some(router) = self.exact_hosts.get(host) {
+            Some(router)
+        } else {
+            self.wildcard_hosts
+                .iter()
+                .find(|(s, _)| wildcard_matches(host, s))
+                .map(|(_, r)| r)
+        };
+        if let Some(router) = host_router {
+            if let Some(upstream) = router.route(path) {
+                return Some(upstream);
             }
         }
         self.catchall.as_ref()?.route(path)
@@ -484,6 +489,76 @@ mod tests {
         let table = b.build().unwrap();
         assert!(table.route("api.test.com", "/").is_some());
         assert!(table.route("test.com", "/").is_none());
+    }
+
+    #[test]
+    fn route_falls_through_to_catchall_on_exact_host_path_miss() {
+        let host_up = upstream("host", "10.0.0.1:80");
+        let catchall_up = upstream("catchall", "10.0.0.2:80");
+
+        let mut b = RoutingTableBuilder::new();
+        b.exact_host("example.com")
+            .add_prefix_route("/api", host_up);
+        b.catchall().add_prefix_route("/", catchall_up);
+
+        let table = b.build().unwrap();
+        assert_eq!(table.route("example.com", "/api/v1").unwrap().name, "host");
+        assert_eq!(
+            table.route("example.com", "/other").unwrap().name,
+            "catchall"
+        );
+    }
+
+    #[test]
+    fn route_falls_through_to_catchall_on_wildcard_host_path_miss() {
+        let host_up = upstream("host", "10.0.0.1:80");
+        let catchall_up = upstream("catchall", "10.0.0.2:80");
+
+        let mut b = RoutingTableBuilder::new();
+        b.wildcard_host("*.example.com")
+            .add_prefix_route("/api", host_up);
+        b.catchall().add_prefix_route("/", catchall_up);
+
+        let table = b.build().unwrap();
+        assert_eq!(
+            table.route("api.example.com", "/api/v1").unwrap().name,
+            "host"
+        );
+        assert_eq!(
+            table.route("api.example.com", "/other").unwrap().name,
+            "catchall"
+        );
+    }
+
+    #[test]
+    fn route_returns_none_when_neither_host_router_nor_catchall_match() {
+        let host_up = upstream("host", "10.0.0.1:80");
+
+        let mut b = RoutingTableBuilder::new();
+        b.exact_host("example.com")
+            .add_prefix_route("/api", host_up);
+
+        let table = b.build().unwrap();
+        assert!(table.route("example.com", "/other").is_none());
+        assert!(table.route("unknown.com", "/api").is_none());
+    }
+
+    #[test]
+    fn route_host_router_takes_precedence_over_catchall_for_same_path() {
+        let host_up = upstream("host", "10.0.0.1:80");
+        let catchall_up = upstream("catchall", "10.0.0.2:80");
+
+        let mut b = RoutingTableBuilder::new();
+        b.exact_host("example.com")
+            .add_prefix_route("/api", host_up);
+        b.catchall().add_prefix_route("/api", catchall_up);
+
+        let table = b.build().unwrap();
+        assert_eq!(table.route("example.com", "/api/v1").unwrap().name, "host");
+        assert_eq!(
+            table.route("other.com", "/api/v1").unwrap().name,
+            "catchall"
+        );
     }
 
     #[test]
