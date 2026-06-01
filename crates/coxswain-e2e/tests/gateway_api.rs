@@ -128,6 +128,22 @@ async fn cross_namespace_with_grant() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn gateway_status() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-status").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(GATEWAY_API_PATH_MATCHING, &ns.name, &[]).await?;
+
+    wait::wait_for_gateway_programmed(&h.client, "coxswain-test", &ns.name, Duration::from_secs(30))
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn cross_namespace_without_grant() -> anyhow::Result<()> {
     init_tracing();
     let h = Harness::start().await?;

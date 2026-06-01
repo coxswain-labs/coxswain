@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use coxswain_core::ownership::{self, OwnedGateways};
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
+use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteParentRefs, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
 };
@@ -83,6 +84,20 @@ fn gateway_class_accepted(gc: &GatewayClass) -> bool {
     has_condition(
         gc.status.as_ref().and_then(|s| s.conditions.as_deref()),
         "Accepted",
+    )
+}
+
+fn gateway_accepted(gw: &Gateway) -> bool {
+    has_condition(
+        gw.status.as_ref().and_then(|s| s.conditions.as_deref()),
+        "Accepted",
+    )
+}
+
+fn gateway_programmed(gw: &Gateway) -> bool {
+    has_condition(
+        gw.status.as_ref().and_then(|s| s.conditions.as_deref()),
+        "Programmed",
     )
 }
 
@@ -199,9 +214,21 @@ impl Controller {
             watcher::Config::default(),
         )
         .default_backoff();
+        let gateway_watcher = watcher(
+            scoped_api::<Gateway>(client.clone(), self.config.watch_namespace.as_deref()),
+            watcher::Config::default(),
+        )
+        .default_backoff();
 
         tokio::pin!(route_watcher);
         tokio::pin!(gateway_class_watcher);
+        tokio::pin!(gateway_watcher);
+
+        // Names of GatewayClass resources whose controllerName matches ours.
+        // Populated from the gateway_class_watcher arm so we can quickly decide
+        // whether an incoming Gateway event belongs to us without relying on the
+        // reconciler's debounced owned_gateways snapshot.
+        let mut owned_gateway_classes: HashSet<String> = HashSet::new();
 
         // interval_at delays the first tick so we don't double-acquire immediately.
         let mut renewal_interval = tokio::time::interval_at(
@@ -263,6 +290,7 @@ impl Controller {
                         Ok(watcher::Event::Apply(gc) | watcher::Event::InitApply(gc)) => {
                             let name = gc.metadata.name.clone().unwrap_or_default();
                             if gc.spec.controller_name == self.config.controller_name {
+                                owned_gateway_classes.insert(name.clone());
                                 if is_leader && !gateway_class_accepted(&gc) {
                                     let generation = gc.metadata.generation.unwrap_or(0);
                                     Self::accept_gateway_class(&client, &name, generation).await;
@@ -275,8 +303,41 @@ impl Controller {
                                 );
                             }
                         }
+                        Ok(watcher::Event::Delete(gc)) => {
+                            let name = gc.metadata.name.clone().unwrap_or_default();
+                            if gc.spec.controller_name == self.config.controller_name {
+                                owned_gateway_classes.remove(&name);
+                            }
+                        }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "GatewayClass watch error"),
+                    }
+                }
+
+                Some(event) = gateway_watcher.next() => {
+                    match event {
+                        Ok(watcher::Event::Apply(gw) | watcher::Event::InitApply(gw)) => {
+                            let class_name = gw.spec.gateway_class_name.as_str();
+                            if !owned_gateway_classes.contains(class_name) {
+                                tracing::debug!(
+                                    name = gw.metadata.name.as_deref().unwrap_or(""),
+                                    class_name,
+                                    "Ignoring Gateway — GatewayClass not managed by us"
+                                );
+                                continue;
+                            }
+                            if is_leader && !gateway_accepted(&gw) {
+                                Self::accept_gateway(&client, &gw).await;
+                            }
+                            if is_leader
+                                && self.synced.load(Ordering::Acquire)
+                                && !gateway_programmed(&gw)
+                            {
+                                Self::mark_gateway_programmed(&client, &gw).await;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "Gateway watch error"),
                     }
                 }
 
@@ -321,6 +382,54 @@ impl Controller {
         {
             Ok(_) => tracing::info!(name, "GatewayClass accepted"),
             Err(e) => tracing::warn!(name, error = %e, "Failed to patch GatewayClass status"),
+        }
+    }
+
+    async fn accept_gateway(client: &Client, gw: &Gateway) {
+        let name = match gw.metadata.name.as_deref() {
+            Some(n) => n,
+            None => return,
+        };
+        let ns = gw.metadata.namespace.as_deref().unwrap_or("default");
+        let generation = gw.metadata.generation.unwrap_or(0);
+        let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
+        let condition = make_condition(
+            "Accepted",
+            "Accepted",
+            generation,
+            Time(k8s_openapi::jiff::Timestamp::now()),
+        );
+        let patch = serde_json::json!({ "status": { "conditions": [condition] } });
+        match api
+            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => tracing::info!(name, ns, "Gateway accepted"),
+            Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Gateway status"),
+        }
+    }
+
+    async fn mark_gateway_programmed(client: &Client, gw: &Gateway) {
+        let name = match gw.metadata.name.as_deref() {
+            Some(n) => n,
+            None => return,
+        };
+        let ns = gw.metadata.namespace.as_deref().unwrap_or("default");
+        let generation = gw.metadata.generation.unwrap_or(0);
+        let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
+        let condition = make_condition(
+            "Programmed",
+            "Programmed",
+            generation,
+            Time(k8s_openapi::jiff::Timestamp::now()),
+        );
+        let patch = serde_json::json!({ "status": { "conditions": [condition] } });
+        match api
+            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => tracing::info!(name, ns, "Gateway programmed"),
+            Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Gateway programmed status"),
         }
     }
 
@@ -391,6 +500,7 @@ impl BackgroundService for Controller {
 mod tests {
     use super::*;
     use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassStatus};
+    use gateway_api::apis::standard::gateways::{Gateway, GatewayStatus};
     use gateway_api::apis::standard::httproutes::{
         HTTPRoute, HttpRouteParentRefs, HttpRouteStatus, HttpRouteStatusParents,
         HttpRouteStatusParentsParentRef,
@@ -573,5 +683,75 @@ mod tests {
         }];
         let filtered = filter_owned_parent_refs(&refs, "apps", &set);
         assert_eq!(filtered.len(), 1);
+    }
+
+    // --- gateway_accepted tests ---
+
+    #[test]
+    fn gateway_accepted_true_when_condition_present() {
+        let gw = Gateway {
+            status: Some(GatewayStatus {
+                conditions: Some(vec![stub_condition("Accepted", "True")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(gateway_accepted(&gw));
+    }
+
+    #[test]
+    fn gateway_accepted_false_when_no_status() {
+        let gw = Gateway {
+            status: None,
+            ..Default::default()
+        };
+        assert!(!gateway_accepted(&gw));
+    }
+
+    #[test]
+    fn gateway_accepted_false_when_status_is_false() {
+        let gw = Gateway {
+            status: Some(GatewayStatus {
+                conditions: Some(vec![stub_condition("Accepted", "False")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!gateway_accepted(&gw));
+    }
+
+    // --- gateway_programmed tests ---
+
+    #[test]
+    fn gateway_programmed_true_when_condition_present() {
+        let gw = Gateway {
+            status: Some(GatewayStatus {
+                conditions: Some(vec![stub_condition("Programmed", "True")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(gateway_programmed(&gw));
+    }
+
+    #[test]
+    fn gateway_programmed_false_when_absent() {
+        let gw = Gateway {
+            status: Some(GatewayStatus {
+                conditions: Some(vec![stub_condition("Accepted", "True")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!gateway_programmed(&gw));
+    }
+
+    #[test]
+    fn gateway_programmed_false_when_no_status() {
+        let gw = Gateway {
+            status: None,
+            ..Default::default()
+        };
+        assert!(!gateway_programmed(&gw));
     }
 }
