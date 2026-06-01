@@ -6,7 +6,7 @@ pub mod wait;
 
 use anyhow::Context as _;
 pub use bootstrap::bootstrap;
-pub use controller::ControllerProcess;
+pub use controller::{ControllerOptions, ControllerProcess};
 pub use http::HttpClient;
 pub use namespace::NamespaceGuard;
 
@@ -18,9 +18,13 @@ pub struct Harness {
 
 impl Harness {
     pub async fn start() -> anyhow::Result<Self> {
+        Self::start_with_options(ControllerOptions::default()).await
+    }
+
+    pub async fn start_with_options(opts: ControllerOptions) -> anyhow::Result<Self> {
         bootstrap().await.context("bootstrap")?;
         let client = kube::Client::try_default().await.context("kube client")?;
-        let controller = ControllerProcess::start()
+        let controller = ControllerProcess::start_with_options(opts)
             .await
             .context("spawn controller")?;
         wait::wait_for_ready(controller.health_addr, std::time::Duration::from_secs(30))

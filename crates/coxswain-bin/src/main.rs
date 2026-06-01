@@ -149,6 +149,18 @@ pub struct ServeArgs {
     /// Socket address to listen on for inbound HTTP traffic.
     #[arg(long, env = "COXSWAIN_PROXY_ADDR", default_value = "0.0.0.0:8080")]
     pub proxy_addr: SocketAddr,
+
+    /// External address written to every owned `Ingress.status.loadBalancer.ingress[0]`.
+    ///
+    /// Accepts either a bare IP (`203.0.113.1`) or a DNS hostname
+    /// (`coxswain.example.com`). IP values are written to `.ip`;
+    /// hostname values are written to `.hostname`.
+    ///
+    /// Required for cert-manager HTTP-01 challenge resolution and
+    /// external-dns DNS record creation. When omitted, Ingress status
+    /// is not patched (backward-compatible default).
+    #[arg(long, env = "COXSWAIN_INGRESS_STATUS_ADDRESS")]
+    pub ingress_status_address: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -162,6 +174,7 @@ fn main() -> Result<()> {
         args.controller_lease_ttl,
         args.controller_lease_renew_interval,
         args.controller_watch_namespace.clone(),
+        args.ingress_status_address.clone(),
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 

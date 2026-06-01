@@ -1,6 +1,6 @@
 use coxswain_e2e::{
     fixtures::{self, BACKENDS_ECHO, INGRESS_PATH_MATCHING},
-    harness::{Harness, NamespaceGuard, wait},
+    harness::{ControllerOptions, Harness, NamespaceGuard, wait},
 };
 use std::time::Duration;
 
@@ -8,6 +8,31 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("coxswain_e2e=debug,warn")
         .try_init();
+}
+
+#[tokio::test]
+async fn status_load_balancer_ip() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start_with_options(ControllerOptions {
+        ingress_status_address: Some("203.0.113.1".to_string()),
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-lb-status").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(INGRESS_PATH_MATCHING, &ns.name, &[]).await?;
+
+    wait::wait_for_ingress_lb_ip(
+        &h.client,
+        "echo-ingress",
+        &ns.name,
+        "203.0.113.1",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    Ok(())
 }
 
 #[tokio::test]
