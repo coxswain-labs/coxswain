@@ -99,13 +99,13 @@ Core routing engine, HTTP/1.1 proxy, round-robin LB, HTTPRoute + Ingress path/ho
 The most critical correctness gaps. Without these, Coxswain is unsafe in any shared cluster and fails Gateway API conformance on basic tests.
 
 - [x] ~~Basic GitHub Actions CI (fmt, clippy, test) — [#45](https://github.com/coxswain-labs/coxswain/issues/45) `MUST`~~
-- [ ] Cluster-backed integration test harness (`crates/coxswain-e2e`) — [#61](https://github.com/coxswain-labs/coxswain/issues/61) `SHOULD`
+- [x] ~~Cluster-backed integration test harness (`crates/coxswain-e2e`) — [#61](https://github.com/coxswain-labs/coxswain/issues/61) `SHOULD`~~
 - [x] ~~IngressClass filtering — [#1](https://github.com/coxswain-labs/coxswain/issues/1) `MUST`~~
 - [x] ~~`parentRef` matching for HTTPRoute — [#2](https://github.com/coxswain-labs/coxswain/issues/2) `MUST`~~
 - [x] ~~`ReferenceGrant` for cross-namespace backends — [#3](https://github.com/coxswain-labs/coxswain/issues/3) `MUST`~~
 - [x] ~~Namespace-scoped watch (wire up `--controller-watch-namespace`) — [#4](https://github.com/coxswain-labs/coxswain/issues/4) `MUST`~~
 - [ ] Multi-namespace watch (comma-separated list + label selector) — [#59](https://github.com/coxswain-labs/coxswain/issues/59) `SHOULD`
-- [ ] Gateway resource status patching — [#5](https://github.com/coxswain-labs/coxswain/issues/5) `MUST`
+- [x] ~~Gateway resource status patching — [#5](https://github.com/coxswain-labs/coxswain/issues/5) `MUST`~~
 - [ ] Ingress `.status.loadBalancer` patching — [#48](https://github.com/coxswain-labs/coxswain/issues/48) `MUST`
 - [ ] Default backend for Ingress — [#6](https://github.com/coxswain-labs/coxswain/issues/6) `MUST`
 - [ ] HTTPRoute header, method, query matching — [#7](https://github.com/coxswain-labs/coxswain/issues/7) `MUST`
