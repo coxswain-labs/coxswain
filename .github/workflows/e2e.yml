@@ -44,6 +44,12 @@ jobs:
         with:
           cluster_name: coxswain-e2e
 
+      - name: Route pod CIDR to kind node
+        run: |
+          KIND_NODE_IP=$(docker inspect coxswain-e2e-control-plane --format '{{ .NetworkSettings.IPAddress }}')
+          POD_CIDR=$(kubectl get node coxswain-e2e-control-plane -o jsonpath='{.spec.podCIDR}')
+          sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
+
       - name: Pre-pull echo backend image into kind
         run: |
           docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1

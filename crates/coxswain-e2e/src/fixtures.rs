@@ -47,10 +47,12 @@ pub async fn apply_fixture(
     let mut content =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
 
-    content = content.replace("TESTNS", namespace);
+    // Apply named var overrides first so callers can override TESTNS itself.
     for (key, val) in vars {
         content = content.replace(key, val);
     }
+    // Substitute any remaining TESTNS with the target namespace.
+    content = content.replace("TESTNS", namespace);
 
     let mut child = tokio::process::Command::new("kubectl")
         .args(["apply", "-n", namespace, "-f", "-"])

@@ -5,8 +5,23 @@ use tokio::process::Command;
 pub async fn bootstrap() -> anyhow::Result<()> {
     let root = workspace_root();
 
-    if !gateway_crds_installed().await {
-        tracing::info!("Gateway API CRDs absent, installing");
+    // Purge any namespaces left over from a previous interrupted run.
+    // --wait=false: don't block; the counter-based names ensure no collision with
+    // Terminating namespaces within the same run.
+    let _ = Command::new("kubectl")
+        .args([
+            "delete",
+            "ns",
+            "-l",
+            "coxswain-e2e=true",
+            "--ignore-not-found",
+            "--wait=false",
+        ])
+        .status()
+        .await;
+
+    if !gateway_v1_crds_installed().await {
+        tracing::info!("Gateway API CRDs absent or pre-v1, installing v1.5.1");
         kubectl_apply_url(
             "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml",
         )
@@ -26,19 +41,24 @@ pub async fn bootstrap() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn gateway_crds_installed() -> bool {
+/// Returns true only if ReferenceGrant is served at v1 (requires Gateway API >= v1.0.0 CRDs).
+/// We need v1 because the `gateway-api` Rust crate targets the v1 API group.
+async fn gateway_v1_crds_installed() -> bool {
     Command::new("kubectl")
         .args([
             "get",
             "crd",
-            "gateways.gateway.networking.k8s.io",
-            "--ignore-not-found",
+            "referencegrants.gateway.networking.k8s.io",
             "-o",
-            "name",
+            "jsonpath={.spec.versions[*].name}",
+            "--ignore-not-found",
         ])
         .output()
         .await
-        .map(|o| !o.stdout.is_empty())
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            out.split_whitespace().any(|v| v == "v1")
+        })
         .unwrap_or(false)
 }
 

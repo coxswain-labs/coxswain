@@ -14,8 +14,11 @@ pub struct NamespaceGuard {
 
 impl NamespaceGuard {
     pub async fn create(client: &Client, prefix: &str) -> anyhow::Result<Self> {
+        // Include the process ID so names are unique across test runs even when
+        // a previous run left namespaces in Terminating state.
+        let pid = std::process::id();
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let name = format!("{prefix}-{id}");
+        let name = format!("{prefix}-{pid}-{id}");
         let ns = Namespace {
             metadata: ObjectMeta {
                 name: Some(name.clone()),

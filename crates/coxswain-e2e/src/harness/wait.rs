@@ -75,8 +75,9 @@ pub async fn wait_for_route(
 ) -> anyhow::Result<crate::harness::http::EchoResponse> {
     let deadline = time::Instant::now() + timeout;
     loop {
-        if let Ok(resp) = http.get(host, path).await {
-            return Ok(resp);
+        match http.get(host, path).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => tracing::debug!(host, path, error = %e, "route not yet live"),
         }
         if time::Instant::now() >= deadline {
             anyhow::bail!("timed out waiting for route {host}{path} to become live");
