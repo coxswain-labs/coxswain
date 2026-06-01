@@ -19,9 +19,7 @@ pub struct Harness {
 impl Harness {
     pub async fn start() -> anyhow::Result<Self> {
         bootstrap().await.context("bootstrap")?;
-        let client = kube::Client::try_default()
-            .await
-            .context("kube client")?;
+        let client = kube::Client::try_default().await.context("kube client")?;
         let controller = ControllerProcess::start()
             .await
             .context("spawn controller")?;
@@ -29,7 +27,11 @@ impl Harness {
             .await
             .context("readyz timeout")?;
         let http = HttpClient::new(controller.proxy_addr);
-        Ok(Self { client, controller, http })
+        Ok(Self {
+            client,
+            controller,
+            http,
+        })
     }
 
     pub fn admin_url(&self, path: &str) -> String {

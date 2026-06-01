@@ -60,8 +60,7 @@ impl Drop for ControllerProcess {
 }
 
 fn free_addr() -> anyhow::Result<SocketAddr> {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
     let addr = listener.local_addr().context("local_addr")?;
     Ok(addr)
     // listener drops here, releasing the port; small race window is acceptable

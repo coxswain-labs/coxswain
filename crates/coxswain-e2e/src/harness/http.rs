@@ -48,12 +48,11 @@ impl HttpClient {
             .context("send request")?;
 
         let status = resp.status();
-        anyhow::ensure!(
-            status.is_success(),
-            "GET {host}{path} returned {status}"
-        );
+        anyhow::ensure!(status.is_success(), "GET {host}{path} returned {status}");
 
-        resp.json::<EchoResponse>().await.context("parse echo response")
+        resp.json::<EchoResponse>()
+            .await
+            .context("parse echo response")
     }
 
     pub async fn get_status(&self, host: &str, path: &str) -> anyhow::Result<u16> {

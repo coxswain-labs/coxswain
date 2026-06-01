@@ -19,9 +19,7 @@ impl NamespaceGuard {
         let ns = Namespace {
             metadata: ObjectMeta {
                 name: Some(name.clone()),
-                labels: Some(
-                    [("coxswain-e2e".to_string(), "true".to_string())].into(),
-                ),
+                labels: Some([("coxswain-e2e".to_string(), "true".to_string())].into()),
                 ..Default::default()
             },
             ..Default::default()

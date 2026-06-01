@@ -2,26 +2,37 @@ use anyhow::Context as _;
 use std::path::Path;
 use tokio::io::AsyncWriteExt as _;
 
-pub const BACKENDS_ECHO: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/backends/echo.yaml");
+pub const BACKENDS_ECHO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/backends/echo.yaml");
 
-pub const GATEWAY_API_PATH_MATCHING: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/gateway_api/path_matching.yaml");
+pub const GATEWAY_API_PATH_MATCHING: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/path_matching.yaml"
+);
 
-pub const GATEWAY_API_HOST_POOL: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/gateway_api/host_pool.yaml");
+pub const GATEWAY_API_HOST_POOL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/host_pool.yaml"
+);
 
-pub const GATEWAY_API_WILDCARD_HOST: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/gateway_api/wildcard_host.yaml");
+pub const GATEWAY_API_WILDCARD_HOST: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/wildcard_host.yaml"
+);
 
-pub const GATEWAY_API_CROSS_NAMESPACE_ROUTE: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/gateway_api/cross_namespace_route.yaml");
+pub const GATEWAY_API_CROSS_NAMESPACE_ROUTE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/cross_namespace_route.yaml"
+);
 
-pub const GATEWAY_API_CROSS_NAMESPACE_TENANT: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/gateway_api/cross_namespace_tenant.yaml");
+pub const GATEWAY_API_CROSS_NAMESPACE_TENANT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/cross_namespace_tenant.yaml"
+);
 
-pub const INGRESS_PATH_MATCHING: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/ingress/path_matching.yaml");
+pub const INGRESS_PATH_MATCHING: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/ingress/path_matching.yaml"
+);
 
 /// Apply a fixture YAML to `namespace`.
 ///
