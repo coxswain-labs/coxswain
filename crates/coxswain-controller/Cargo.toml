@@ -12,10 +12,12 @@ async-trait = { workspace = true }
 coxswain-core = { workspace = true }
 futures = { workspace = true }
 gateway-api = { workspace = true }
+http = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 kube-leader-election = { workspace = true }
 pingora-core = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

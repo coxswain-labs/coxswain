@@ -1,4 +1,5 @@
 use anyhow::Context as _;
+use reqwest::Method;
 use std::net::SocketAddr;
 
 #[derive(Debug, serde::Deserialize)]
@@ -37,33 +38,42 @@ impl HttpClient {
         Self { inner, proxy_addr }
     }
 
-    pub async fn get(&self, host: &str, path: &str) -> anyhow::Result<EchoResponse> {
+    /// Send an arbitrary request. `path` may include a `?query=...` suffix.
+    /// Returns `(status_code, Some(body))` when the response is JSON, or
+    /// `(status_code, None)` for non-2xx or non-JSON responses.
+    pub async fn request(
+        &self,
+        method: Method,
+        host: &str,
+        path: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> anyhow::Result<(u16, Option<EchoResponse>)> {
         let url = format!("http://{}{path}", self.proxy_addr);
-        let resp = self
-            .inner
-            .get(&url)
-            .header("Host", host)
-            .send()
-            .await
-            .context("send request")?;
+        let mut req = self.inner.request(method, &url).header("Host", host);
+        for (k, v) in extra_headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.send().await.context("send request")?;
+        let status = resp.status().as_u16();
+        if resp.status().is_success() {
+            let body = resp
+                .json::<EchoResponse>()
+                .await
+                .context("parse echo response")?;
+            Ok((status, Some(body)))
+        } else {
+            Ok((status, None))
+        }
+    }
 
-        let status = resp.status();
-        anyhow::ensure!(status.is_success(), "GET {host}{path} returned {status}");
-
-        resp.json::<EchoResponse>()
-            .await
-            .context("parse echo response")
+    pub async fn get(&self, host: &str, path: &str) -> anyhow::Result<EchoResponse> {
+        let (status, body) = self.request(Method::GET, host, path, &[]).await?;
+        anyhow::ensure!(body.is_some(), "GET {host}{path} returned {status}");
+        Ok(body.unwrap())
     }
 
     pub async fn get_status(&self, host: &str, path: &str) -> anyhow::Result<u16> {
-        let url = format!("http://{}{path}", self.proxy_addr);
-        let resp = self
-            .inner
-            .get(&url)
-            .header("Host", host)
-            .send()
-            .await
-            .context("send request")?;
-        Ok(resp.status().as_u16())
+        let (status, _) = self.request(Method::GET, host, path, &[]).await?;
+        Ok(status)
     }
 }

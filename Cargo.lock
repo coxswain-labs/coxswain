@@ -492,10 +492,12 @@ dependencies = [
  "coxswain-core",
  "futures",
  "gateway-api",
+ "http",
  "k8s-openapi",
  "kube",
  "kube-leader-election",
  "pingora-core",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
@@ -507,6 +509,8 @@ name = "coxswain-core"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "form_urlencoded",
+ "http",
  "matchit",
  "regex",
  "thiserror 2.0.18",

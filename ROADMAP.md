@@ -108,7 +108,7 @@ The most critical correctness gaps. Without these, Coxswain is unsafe in any sha
 - [x] ~~Gateway resource status patching — [#5](https://github.com/coxswain-labs/coxswain/issues/5) `MUST`~~
 - [x] ~~Ingress `.status.loadBalancer` patching — [#48](https://github.com/coxswain-labs/coxswain/issues/48) `MUST`~~
 - [x] ~~Default backend for Ingress — [#6](https://github.com/coxswain-labs/coxswain/issues/6) `MUST`~~
-- [ ] HTTPRoute header, method, query matching — [#7](https://github.com/coxswain-labs/coxswain/issues/7) `MUST`
+- [x] ~~HTTPRoute header, method, query matching — [#7](https://github.com/coxswain-labs/coxswain/issues/7) `MUST`~~
 
 ---
 

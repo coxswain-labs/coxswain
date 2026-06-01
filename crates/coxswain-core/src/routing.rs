@@ -1,4 +1,5 @@
 use arc_swap::ArcSwap;
+use http::{HeaderMap, HeaderName, Method};
 use matchit::Router;
 use regex::{Regex, RegexSet};
 use std::cmp::Reverse;
@@ -6,6 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::SystemTime;
 
 /// A cheaply-cloneable handle to the active routing table.
 ///
@@ -79,6 +81,155 @@ impl Upstream {
     }
 }
 
+/// How a value is compared in a predicate — used by header and query matchers.
+#[derive(Clone)]
+pub enum ValueMatch {
+    Exact(String),
+    Regex(Regex),
+}
+
+impl ValueMatch {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            ValueMatch::Exact(s) => s == value,
+            ValueMatch::Regex(r) => r.is_match(value),
+        }
+    }
+}
+
+/// Matches a single request header.
+///
+/// `name` is the canonical (lowercased) `HeaderName`, enabling O(1) lookup in
+/// `HeaderMap`. The comparison is against the header value string.
+#[derive(Clone)]
+pub struct HeaderPredicate {
+    pub name: HeaderName,
+    pub matcher: ValueMatch,
+}
+
+/// Matches a single query parameter by name and value.
+///
+/// Query parameter names are case-sensitive per RFC 3986.
+#[derive(Clone)]
+pub struct QueryPredicate {
+    pub name: String,
+    pub matcher: ValueMatch,
+}
+
+/// All predicates for a single `HTTPRouteMatch`.
+///
+/// Every predicate in this struct must pass for the match to succeed
+/// (AND semantics). Empty fields pass unconditionally.
+#[derive(Clone, Default)]
+pub struct MatchPredicates {
+    pub method: Option<Method>,
+    pub headers: Vec<HeaderPredicate>,
+    pub query: Vec<QueryPredicate>,
+}
+
+impl MatchPredicates {
+    pub fn is_empty(&self) -> bool {
+        self.method.is_none() && self.headers.is_empty() && self.query.is_empty()
+    }
+
+    fn matches(&self, ctx: &RequestContext<'_>) -> bool {
+        if let Some(m) = &self.method
+            && m != ctx.method
+        {
+            return false;
+        }
+        for h in &self.headers {
+            let matched = ctx
+                .headers
+                .get_all(&h.name)
+                .iter()
+                .any(|v| v.to_str().is_ok_and(|s| h.matcher.matches(s)));
+            if !matched {
+                return false;
+            }
+        }
+        if !self.query.is_empty() {
+            let query_str = ctx.query.unwrap_or("");
+            // Collect once per call so we don't re-parse for each predicate.
+            let pairs: Vec<(std::borrow::Cow<str>, std::borrow::Cow<str>)> =
+                form_urlencoded::parse(query_str.as_bytes()).collect();
+            for q in &self.query {
+                let found = pairs
+                    .iter()
+                    .any(|(k, v)| k.as_ref() == q.name && q.matcher.matches(v.as_ref()));
+                if !found {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// A single routing candidate: an upstream plus the predicates that must hold
+/// for this candidate to be selected, along with metadata for precedence ordering.
+pub struct RouteEntry {
+    pub upstream: Arc<Upstream>,
+    pub predicates: MatchPredicates,
+    /// Parent resource identity `"{namespace}/{name}"` — used for precedence tiebreaking.
+    pub route_id: String,
+    /// Creation timestamp — older routes win ties after predicate-count comparison.
+    /// `None` sorts last.
+    pub created_at: Option<SystemTime>,
+}
+
+impl RouteEntry {
+    /// Constructs an entry with no predicates (matches every request on the path).
+    pub fn path_only(
+        upstream: Arc<Upstream>,
+        route_id: String,
+        created_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            upstream,
+            predicates: MatchPredicates::default(),
+            route_id,
+            created_at,
+        }
+    }
+
+    pub fn new(
+        upstream: Arc<Upstream>,
+        predicates: MatchPredicates,
+        route_id: String,
+        created_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            upstream,
+            predicates,
+            route_id,
+            created_at,
+        }
+    }
+}
+
+/// Per-request context passed into the hot-path route lookup.
+///
+/// All fields are borrows from the live request — no allocations.
+pub struct RequestContext<'a> {
+    pub method: &'a Method,
+    pub headers: &'a HeaderMap,
+    /// Raw query string (the part after `?`), if present.
+    pub query: Option<&'a str>,
+}
+
+impl Default for RequestContext<'static> {
+    fn default() -> Self {
+        static EMPTY_HEADERS: std::sync::LazyLock<HeaderMap> =
+            std::sync::LazyLock::new(HeaderMap::new);
+        Self {
+            method: &Method::GET,
+            headers: &EMPTY_HEADERS,
+            query: None,
+        }
+    }
+}
+
 /// How a path rule was registered — for introspection only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteKind {
@@ -97,7 +248,7 @@ impl RouteKind {
     }
 }
 
-/// Snapshot of a single path rule, kept alongside the compiled router for inspection.
+/// Snapshot of a single path rule insertion, kept for inspection.
 pub struct RouteInfo {
     pub path: String,
     pub kind: RouteKind,
@@ -115,9 +266,9 @@ pub struct RouteConflict {
 }
 
 pub struct HostRouter {
-    router: Router<Arc<Upstream>>,
-    regex_set: RegexSet,
-    regex_routes: Vec<(Regex, Arc<Upstream>)>,
+    router: Router<Box<[Arc<RouteEntry>]>>,
+    regex_routes: Vec<(RegexSet, Box<[Arc<RouteEntry>]>)>,
+    has_query_predicates: bool,
     route_info: Vec<RouteInfo>,
 }
 
@@ -127,121 +278,202 @@ impl HostRouter {
         &self.route_info
     }
 
-    /// Resolves `path` to an upstream. Checks matchit first, then the regex fallback.
-    pub fn route(&self, path: &str) -> Option<Arc<Upstream>> {
+    /// Resolves `path` to an upstream, applying predicates from `ctx`.
+    ///
+    /// Checks matchit exact/prefix routes first, then the regex fallback.
+    /// Within each path slot, candidates are evaluated in specificity order;
+    /// the first candidate whose predicates all pass is returned.
+    pub fn route(&self, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<Upstream>> {
         if let Ok(m) = self.router.at(path) {
-            return Some(Arc::clone(m.value));
+            for entry in m.value.iter() {
+                if entry.predicates.matches(ctx) {
+                    return Some(Arc::clone(&entry.upstream));
+                }
+            }
         }
-        // RegexSet matches all patterns simultaneously; take only the first hit so
-        // insertion order acts as priority (earlier-added patterns win).
-        let idx = self.regex_set.matches(path).iter().next()?;
-        self.regex_routes.get(idx).map(|(_, u)| Arc::clone(u))
+        // Regex fallback: each slot holds its own RegexSet for a single pattern group;
+        // insertion order across patterns is preserved by Vec position.
+        for (set, entries) in &self.regex_routes {
+            if set.is_match(path) {
+                for entry in entries.iter() {
+                    if entry.predicates.matches(ctx) {
+                        return Some(Arc::clone(&entry.upstream));
+                    }
+                }
+            }
+        }
+        None
     }
+
+    /// Whether any registered route on this host uses query-parameter predicates.
+    ///
+    /// The proxy uses this to skip query-string parsing when it's unnecessary.
+    pub fn has_query_predicates(&self) -> bool {
+        self.has_query_predicates
+    }
+}
+
+/// Sort key for within-path specificity ordering per Gateway API rules.
+///
+/// Most specific first: most header matches, then most query matches, then oldest
+/// creation timestamp, then lexicographic route_id, then original insertion index.
+fn specificity_key(
+    entry: &Arc<RouteEntry>,
+    insertion_idx: usize,
+) -> (Reverse<usize>, Reverse<usize>, u128, String, usize) {
+    let ts = entry
+        .created_at
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(u128::MAX);
+    (
+        Reverse(entry.predicates.headers.len()),
+        Reverse(entry.predicates.query.len()),
+        ts,
+        entry.route_id.clone(),
+        insertion_idx,
+    )
+}
+
+/// Groups a flat list of `(path, entry)` pairs by path, preserving insertion order
+/// within each group for the insertion-index tiebreaker.
+type PathGroups = Vec<(String, Vec<(usize, Arc<RouteEntry>)>)>;
+
+fn group_by_path(routes: Vec<(String, Arc<RouteEntry>)>) -> PathGroups {
+    let mut groups: PathGroups = Vec::new();
+    for (global_idx, (path, entry)) in routes.into_iter().enumerate() {
+        if let Some(g) = groups.iter_mut().find(|(p, _)| p == &path) {
+            g.1.push((global_idx, entry));
+        } else {
+            groups.push((path, vec![(global_idx, entry)]));
+        }
+    }
+    groups
+}
+
+/// Sorts a group's entries by specificity and freezes them into a boxed slice.
+fn sort_and_freeze(entries: Vec<(usize, Arc<RouteEntry>)>) -> Box<[Arc<RouteEntry>]> {
+    let mut entries = entries;
+    entries.sort_by_key(|(idx, e)| specificity_key(e, *idx));
+    entries
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
 }
 
 #[derive(Default)]
 pub struct HostRouterBuilder {
-    exact_routes: Vec<(String, Arc<Upstream>)>,
-    prefix_routes: Vec<(String, Arc<Upstream>)>,
-    regex_routes: Vec<(String, Arc<Upstream>)>,
+    exact_routes: Vec<(String, Arc<RouteEntry>)>,
+    prefix_routes: Vec<(String, Arc<RouteEntry>)>,
+    regex_routes: Vec<(String, Arc<RouteEntry>)>,
 }
 
 impl HostRouterBuilder {
-    pub fn add_exact_route(&mut self, path: &str, upstream: Arc<Upstream>) -> &mut Self {
-        self.exact_routes.push((path.to_string(), upstream));
+    pub fn add_exact_route(&mut self, path: &str, entry: Arc<RouteEntry>) -> &mut Self {
+        self.exact_routes.push((path.to_string(), entry));
         self
     }
 
-    pub fn add_prefix_route(&mut self, path: &str, upstream: Arc<Upstream>) -> &mut Self {
-        self.prefix_routes.push((path.to_string(), upstream));
+    pub fn add_prefix_route(&mut self, path: &str, entry: Arc<RouteEntry>) -> &mut Self {
+        self.prefix_routes.push((path.to_string(), entry));
         self
     }
 
-    pub fn add_regex_route(&mut self, pattern: &str, upstream: Arc<Upstream>) -> &mut Self {
-        self.regex_routes.push((pattern.to_string(), upstream));
+    pub fn add_regex_route(&mut self, pattern: &str, entry: Arc<RouteEntry>) -> &mut Self {
+        self.regex_routes.push((pattern.to_string(), entry));
         self
     }
 
-    pub(crate) fn build(self, host: &str) -> Result<(HostRouter, Vec<RouteConflict>), RouterError> {
-        let mut router = Router::new();
+    pub(crate) fn build(
+        self,
+        _host: &str,
+    ) -> Result<(HostRouter, Vec<RouteConflict>), RouterError> {
+        let mut router: Router<Box<[Arc<RouteEntry>]>> = Router::new();
         let mut route_info: Vec<RouteInfo> = Vec::new();
-        let mut conflicts: Vec<RouteConflict> = Vec::new();
+        let mut has_query_predicates = false;
 
-        for (path, upstream) in self.exact_routes {
-            match router.insert(path.clone(), Arc::clone(&upstream)) {
-                Ok(()) => route_info.push(RouteInfo {
-                    path,
-                    kind: RouteKind::Exact,
-                    upstream,
-                }),
-                Err(_) => conflicts.push(RouteConflict {
-                    host: host.to_string(),
-                    path,
-                    kind: RouteKind::Exact,
-                    rejected_upstream: upstream.name.clone(),
-                }),
+        // Track whether any entry uses query predicates.
+        let check_query = |entries: &Vec<(usize, Arc<RouteEntry>)>| {
+            entries.iter().any(|(_, e)| !e.predicates.query.is_empty())
+        };
+
+        // ── Exact routes ──────────────────────────────────────────────────────
+        let exact_groups = group_by_path(self.exact_routes);
+        for (path, entries) in exact_groups {
+            if check_query(&entries) {
+                has_query_predicates = true;
             }
+            for (_, e) in &entries {
+                route_info.push(RouteInfo {
+                    path: path.clone(),
+                    kind: RouteKind::Exact,
+                    upstream: Arc::clone(&e.upstream),
+                });
+            }
+            let frozen = sort_and_freeze(entries);
+            // Inserting into a fresh router; unique patterns won't conflict.
+            router.insert(path, frozen)?;
         }
 
-        for (path, upstream) in self.prefix_routes {
-            // Normalise: strip any trailing slash so "/api/" and "/api" are treated identically.
+        // ── Prefix routes ─────────────────────────────────────────────────────
+        let prefix_groups = group_by_path(self.prefix_routes);
+        for (path, entries) in prefix_groups {
+            if check_query(&entries) {
+                has_query_predicates = true;
+            }
+            for (_, e) in &entries {
+                route_info.push(RouteInfo {
+                    path: path.clone(),
+                    kind: RouteKind::Prefix,
+                    upstream: Arc::clone(&e.upstream),
+                });
+            }
+            let frozen = sort_and_freeze(entries);
+
+            // Normalise: strip trailing slash so "/api/" and "/api" are identical.
             let base = path.trim_end_matches('/');
             let (p1, p2) = if base.is_empty() {
-                // Root prefix "/": matchit's {*rest} does not match an empty tail, so
-                // insert "/" explicitly for the root path itself.
                 ("/".to_string(), "/{*rest}".to_string())
             } else {
-                // Two inserts: the bare path itself, and everything beneath it.
                 (base.to_string(), format!("{base}/{{*rest}}"))
             };
-
-            match router.insert(p1, Arc::clone(&upstream)) {
-                Ok(()) => {
-                    // Base inserted; the wildcard should succeed too — any failure here is an
-                    // edge case (another rule claimed the exact wildcard path). Still mark active
-                    // since the base path is routing.
-                    let _ = router.insert(p2, Arc::clone(&upstream));
-                    route_info.push(RouteInfo {
-                        path,
-                        kind: RouteKind::Prefix,
-                        upstream,
-                    });
-                }
-                Err(_) => {
-                    // Base path already claimed by an earlier rule — skip the whole prefix.
-                    conflicts.push(RouteConflict {
-                        host: host.to_string(),
-                        path,
-                        kind: RouteKind::Prefix,
-                        rejected_upstream: upstream.name.clone(),
-                    });
-                }
-            }
+            // Insert base path; the wildcard insert may fail if a prior exact
+            // route claimed that pattern — tolerate the error silently.
+            router.insert(p1, frozen.clone())?;
+            let _ = router.insert(p2, frozen);
         }
 
-        let patterns: Vec<&str> = self.regex_routes.iter().map(|(p, _)| p.as_str()).collect();
-        let regex_set = RegexSet::new(&patterns)?;
-        let regex_routes = self
-            .regex_routes
-            .into_iter()
-            .map(|(p, u)| {
+        // ── Regex routes ──────────────────────────────────────────────────────
+        // Group by pattern so multiple entries for the same regex accumulate.
+        let regex_groups = group_by_path(self.regex_routes);
+        let mut compiled_regex_routes: Vec<(RegexSet, Box<[Arc<RouteEntry>]>)> = Vec::new();
+        for (pattern, entries) in regex_groups {
+            if check_query(&entries) {
+                has_query_predicates = true;
+            }
+            for (_, e) in &entries {
                 route_info.push(RouteInfo {
-                    path: p.clone(),
+                    path: pattern.clone(),
                     kind: RouteKind::Regex,
-                    upstream: Arc::clone(&u),
+                    upstream: Arc::clone(&e.upstream),
                 });
-                Ok((Regex::new(&p)?, u))
-            })
-            .collect::<Result<Vec<_>, regex::Error>>()?;
+            }
+            let set = RegexSet::new([&pattern])?;
+            // Validate each regex while we're at it (RegexSet already checked above).
+            let _ = Regex::new(&pattern)?;
+            let frozen = sort_and_freeze(entries);
+            compiled_regex_routes.push((set, frozen));
+        }
 
         Ok((
             HostRouter {
                 router,
-                regex_set,
-                regex_routes,
+                regex_routes: compiled_regex_routes,
+                has_query_predicates,
                 route_info,
             },
-            conflicts,
+            vec![], // no path-level conflicts in the predicate model
         ))
     }
 }
@@ -278,9 +510,6 @@ impl RoutingTableBuilder {
     }
 
     /// Compiles all registered routes into an immutable [`RoutingTable`].
-    ///
-    /// Conflicts (duplicate host+path claims) are resolved by first-writer wins; the losing rules
-    /// are collected in [`RoutingTable::conflicts`] rather than failing the whole build.
     pub fn build(self) -> Result<RoutingTable, RouterError> {
         let mut conflicts: Vec<RouteConflict> = Vec::new();
 
@@ -330,7 +559,7 @@ pub enum RouteOutcome {
     Found(Arc<Upstream>),
     /// No entry for this hostname (host is not registered at this proxy).
     NoHost,
-    /// Host is registered but no path rule matched.
+    /// Host is registered but no path rule matched (or path matched but predicates failed).
     NoPath,
 }
 
@@ -344,12 +573,12 @@ pub struct RoutingTable {
     /// Sorted most-specific (longest suffix) first.
     wildcard_hosts: Vec<(String, HostRouter)>,
     catchall: Option<HostRouter>,
-    /// Rules that were dropped because an earlier rule already claimed the same host+path slot.
+    /// Rules that were dropped due to un-insertable matchit patterns.
     conflicts: Vec<RouteConflict>,
 }
 
 impl RoutingTable {
-    pub fn route(&self, host: &str, path: &str) -> Option<Arc<Upstream>> {
+    pub fn route(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<Upstream>> {
         let host_router = if let Some(router) = self.exact_hosts.get(host) {
             Some(router)
         } else {
@@ -359,15 +588,15 @@ impl RoutingTable {
                 .map(|(_, r)| r)
         };
         if let Some(router) = host_router
-            && let Some(upstream) = router.route(path)
+            && let Some(upstream) = router.route(path, ctx)
         {
             return Some(upstream);
         }
-        self.catchall.as_ref()?.route(path)
+        self.catchall.as_ref()?.route(path, ctx)
     }
 
     /// Like [`route`] but distinguishes "host not registered" from "path not matched".
-    pub fn find(&self, host: &str, path: &str) -> RouteOutcome {
+    pub fn find(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> RouteOutcome {
         let router = if let Some(r) = self.exact_hosts.get(host) {
             r
         } else if let Some((_, r)) = self
@@ -381,13 +610,13 @@ impl RoutingTable {
         } else {
             return RouteOutcome::NoHost;
         };
-        match router.route(path) {
+        match router.route(path, ctx) {
             Some(u) => RouteOutcome::Found(u),
             None => RouteOutcome::NoPath,
         }
     }
 
-    /// Rules dropped due to host+path conflicts, in the order they were encountered.
+    /// Rules dropped due to un-insertable matchit patterns, in the order they were encountered.
     pub fn conflicts(&self) -> &[RouteConflict] {
         &self.conflicts
     }
@@ -444,18 +673,34 @@ mod tests {
         ))
     }
 
+    fn entry(us: Arc<Upstream>) -> Arc<RouteEntry> {
+        Arc::new(RouteEntry::path_only(us, "default/svc".to_string(), None))
+    }
+
+    fn ctx_get() -> RequestContext<'static> {
+        RequestContext::default()
+    }
+
     #[test]
     fn exact_host_beats_wildcard() {
         let exact_up = upstream("exact", "10.0.0.1:80");
         let wildcard_up = upstream("wildcard", "10.0.0.2:80");
 
         let mut b = RoutingTableBuilder::new();
-        b.exact_host("example.com").add_exact_route("/", exact_up);
-        b.wildcard_host("*.com").add_exact_route("/", wildcard_up);
+        b.exact_host("example.com")
+            .add_exact_route("/", entry(exact_up));
+        b.wildcard_host("*.com")
+            .add_exact_route("/", entry(wildcard_up));
 
         let table = b.build().unwrap();
-        assert_eq!(table.route("example.com", "/").unwrap().name, "exact");
-        assert_eq!(table.route("other.com", "/").unwrap().name, "wildcard");
+        assert_eq!(
+            table.route("example.com", "/", &ctx_get()).unwrap().name,
+            "exact"
+        );
+        assert_eq!(
+            table.route("other.com", "/", &ctx_get()).unwrap().name,
+            "wildcard"
+        );
     }
 
     #[test]
@@ -465,16 +710,22 @@ mod tests {
 
         let mut b = RoutingTableBuilder::new();
         let host = b.exact_host("example.com");
-        host.add_prefix_route("/api", api_up);
-        host.add_exact_route("/health", health_up);
+        host.add_prefix_route("/api", entry(api_up));
+        host.add_exact_route("/health", entry(health_up));
 
         let table = b.build().unwrap();
         assert_eq!(
-            table.route("example.com", "/api/users").unwrap().name,
+            table
+                .route("example.com", "/api/users", &ctx_get())
+                .unwrap()
+                .name,
             "api"
         );
         assert_eq!(
-            table.route("example.com", "/health").unwrap().name,
+            table
+                .route("example.com", "/health", &ctx_get())
+                .unwrap()
+                .name,
             "health"
         );
     }
@@ -484,11 +735,12 @@ mod tests {
         let up = upstream("svc", "10.0.0.1:80");
 
         let mut b = RoutingTableBuilder::new();
-        b.wildcard_host("*.test.com").add_exact_route("/", up);
+        b.wildcard_host("*.test.com")
+            .add_exact_route("/", entry(up));
 
         let table = b.build().unwrap();
-        assert!(table.route("api.test.com", "/").is_some());
-        assert!(table.route("test.com", "/").is_none());
+        assert!(table.route("api.test.com", "/", &ctx_get()).is_some());
+        assert!(table.route("test.com", "/", &ctx_get()).is_none());
     }
 
     #[test]
@@ -498,13 +750,22 @@ mod tests {
 
         let mut b = RoutingTableBuilder::new();
         b.exact_host("example.com")
-            .add_prefix_route("/api", host_up);
-        b.catchall().add_prefix_route("/", catchall_up);
+            .add_prefix_route("/api", entry(host_up));
+        b.catchall().add_prefix_route("/", entry(catchall_up));
 
         let table = b.build().unwrap();
-        assert_eq!(table.route("example.com", "/api/v1").unwrap().name, "host");
         assert_eq!(
-            table.route("example.com", "/other").unwrap().name,
+            table
+                .route("example.com", "/api/v1", &ctx_get())
+                .unwrap()
+                .name,
+            "host"
+        );
+        assert_eq!(
+            table
+                .route("example.com", "/other", &ctx_get())
+                .unwrap()
+                .name,
             "catchall"
         );
     }
@@ -516,16 +777,22 @@ mod tests {
 
         let mut b = RoutingTableBuilder::new();
         b.wildcard_host("*.example.com")
-            .add_prefix_route("/api", host_up);
-        b.catchall().add_prefix_route("/", catchall_up);
+            .add_prefix_route("/api", entry(host_up));
+        b.catchall().add_prefix_route("/", entry(catchall_up));
 
         let table = b.build().unwrap();
         assert_eq!(
-            table.route("api.example.com", "/api/v1").unwrap().name,
+            table
+                .route("api.example.com", "/api/v1", &ctx_get())
+                .unwrap()
+                .name,
             "host"
         );
         assert_eq!(
-            table.route("api.example.com", "/other").unwrap().name,
+            table
+                .route("api.example.com", "/other", &ctx_get())
+                .unwrap()
+                .name,
             "catchall"
         );
     }
@@ -536,11 +803,11 @@ mod tests {
 
         let mut b = RoutingTableBuilder::new();
         b.exact_host("example.com")
-            .add_prefix_route("/api", host_up);
+            .add_prefix_route("/api", entry(host_up));
 
         let table = b.build().unwrap();
-        assert!(table.route("example.com", "/other").is_none());
-        assert!(table.route("unknown.com", "/api").is_none());
+        assert!(table.route("example.com", "/other", &ctx_get()).is_none());
+        assert!(table.route("unknown.com", "/api", &ctx_get()).is_none());
     }
 
     #[test]
@@ -550,13 +817,22 @@ mod tests {
 
         let mut b = RoutingTableBuilder::new();
         b.exact_host("example.com")
-            .add_prefix_route("/api", host_up);
-        b.catchall().add_prefix_route("/api", catchall_up);
+            .add_prefix_route("/api", entry(host_up));
+        b.catchall().add_prefix_route("/api", entry(catchall_up));
 
         let table = b.build().unwrap();
-        assert_eq!(table.route("example.com", "/api/v1").unwrap().name, "host");
         assert_eq!(
-            table.route("other.com", "/api/v1").unwrap().name,
+            table
+                .route("example.com", "/api/v1", &ctx_get())
+                .unwrap()
+                .name,
+            "host"
+        );
+        assert_eq!(
+            table
+                .route("other.com", "/api/v1", &ctx_get())
+                .unwrap()
+                .name,
             "catchall"
         );
     }
@@ -574,5 +850,336 @@ mod tests {
             results,
             [addrs[0], addrs[1], addrs[2], addrs[0], addrs[1], addrs[2]]
         );
+    }
+
+    // ── Predicate tests ────────────────────────────────────────────────────────
+
+    fn headers_from(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        m
+    }
+
+    fn make_predicates(
+        method: Option<&str>,
+        headers: &[(&str, &str)], // (name, exact_value)
+        query: &[(&str, &str)],   // (name, exact_value)
+    ) -> MatchPredicates {
+        MatchPredicates {
+            method: method.map(|m| m.parse().unwrap()),
+            headers: headers
+                .iter()
+                .map(|(n, v)| HeaderPredicate {
+                    name: HeaderName::from_bytes(n.as_bytes()).unwrap(),
+                    matcher: ValueMatch::Exact(v.to_string()),
+                })
+                .collect(),
+            query: query
+                .iter()
+                .map(|(n, v)| QueryPredicate {
+                    name: n.to_string(),
+                    matcher: ValueMatch::Exact(v.to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn predicate_empty_matches_everything() {
+        let pred = MatchPredicates::default();
+        let headers = headers_from(&[]);
+        let ctx = RequestContext {
+            method: &Method::GET,
+            headers: &headers,
+            query: None,
+        };
+        assert!(pred.matches(&ctx));
+    }
+
+    #[test]
+    fn predicate_method_match() {
+        let pred = make_predicates(Some("POST"), &[], &[]);
+        let headers = headers_from(&[]);
+        let get = RequestContext {
+            method: &Method::GET,
+            headers: &headers,
+            query: None,
+        };
+        let post = RequestContext {
+            method: &Method::POST,
+            headers: &headers,
+            query: None,
+        };
+        assert!(!pred.matches(&get));
+        assert!(pred.matches(&post));
+    }
+
+    #[test]
+    fn predicate_header_exact_match() {
+        let pred = make_predicates(None, &[("x-tenant", "foo")], &[]);
+        let matching = headers_from(&[("x-tenant", "foo")]);
+        let wrong = headers_from(&[("x-tenant", "bar")]);
+        let absent = headers_from(&[]);
+        let ctx_m = RequestContext {
+            method: &Method::GET,
+            headers: &matching,
+            query: None,
+        };
+        let ctx_w = RequestContext {
+            method: &Method::GET,
+            headers: &wrong,
+            query: None,
+        };
+        let ctx_a = RequestContext {
+            method: &Method::GET,
+            headers: &absent,
+            query: None,
+        };
+        assert!(pred.matches(&ctx_m));
+        assert!(!pred.matches(&ctx_w));
+        assert!(!pred.matches(&ctx_a));
+    }
+
+    #[test]
+    fn predicate_header_regex_match() {
+        let pred = MatchPredicates {
+            method: None,
+            headers: vec![HeaderPredicate {
+                name: HeaderName::from_static("x-version"),
+                matcher: ValueMatch::Regex(Regex::new(r"^v\d+$").unwrap()),
+            }],
+            query: vec![],
+        };
+        let matching = headers_from(&[("x-version", "v42")]);
+        let wrong = headers_from(&[("x-version", "beta")]);
+        let ctx_m = RequestContext {
+            method: &Method::GET,
+            headers: &matching,
+            query: None,
+        };
+        let ctx_w = RequestContext {
+            method: &Method::GET,
+            headers: &wrong,
+            query: None,
+        };
+        assert!(pred.matches(&ctx_m));
+        assert!(!pred.matches(&ctx_w));
+    }
+
+    #[test]
+    fn predicate_query_exact_match() {
+        let pred = make_predicates(None, &[], &[("version", "v1")]);
+        let headers = headers_from(&[]);
+        let ctx_yes = RequestContext {
+            method: &Method::GET,
+            headers: &headers,
+            query: Some("version=v1&x=y"),
+        };
+        let ctx_no = RequestContext {
+            method: &Method::GET,
+            headers: &headers,
+            query: Some("version=v2"),
+        };
+        let ctx_absent = RequestContext {
+            method: &Method::GET,
+            headers: &headers,
+            query: None,
+        };
+        assert!(pred.matches(&ctx_yes));
+        assert!(!pred.matches(&ctx_no));
+        assert!(!pred.matches(&ctx_absent));
+    }
+
+    #[test]
+    fn predicate_query_regex_match() {
+        let pred = MatchPredicates {
+            method: None,
+            headers: vec![],
+            query: vec![QueryPredicate {
+                name: "env".to_string(),
+                matcher: ValueMatch::Regex(Regex::new(r"^(dev|staging)$").unwrap()),
+            }],
+        };
+        let headers = headers_from(&[]);
+        let ctx_dev = RequestContext {
+            method: &Method::GET,
+            headers: &headers,
+            query: Some("env=dev"),
+        };
+        let ctx_prod = RequestContext {
+            method: &Method::GET,
+            headers: &headers,
+            query: Some("env=prod"),
+        };
+        assert!(pred.matches(&ctx_dev));
+        assert!(!pred.matches(&ctx_prod));
+    }
+
+    #[test]
+    fn predicate_and_semantics() {
+        // Both method AND header must match.
+        let pred = make_predicates(Some("POST"), &[("x-tenant", "a")], &[]);
+        let headers_ok = headers_from(&[("x-tenant", "a")]);
+        let headers_wrong = headers_from(&[("x-tenant", "b")]);
+        let ctx_both = RequestContext {
+            method: &Method::POST,
+            headers: &headers_ok,
+            query: None,
+        };
+        let ctx_method_only = RequestContext {
+            method: &Method::POST,
+            headers: &headers_wrong,
+            query: None,
+        };
+        let ctx_header_only = RequestContext {
+            method: &Method::GET,
+            headers: &headers_ok,
+            query: None,
+        };
+        assert!(pred.matches(&ctx_both));
+        assert!(!pred.matches(&ctx_method_only));
+        assert!(!pred.matches(&ctx_header_only));
+    }
+
+    #[test]
+    fn header_lookup_is_case_insensitive() {
+        // Predicate stores lowercase HeaderName; request may have mixed case.
+        let pred = make_predicates(None, &[("x-tenant", "acme")], &[]);
+        // HTTP/1.1 allows any case; HeaderMap canonicalises to lowercase internally.
+        let headers = headers_from(&[("x-tenant", "acme")]);
+        let ctx = RequestContext {
+            method: &Method::GET,
+            headers: &headers,
+            query: None,
+        };
+        assert!(pred.matches(&ctx));
+    }
+
+    #[test]
+    fn specificity_ordering_more_headers_wins() {
+        // Two entries at the same path: one with a header predicate, one without.
+        // The one with more predicates should win when its predicate passes.
+        let specific_up = upstream("specific", "10.0.0.1:80");
+        let generic_up = upstream("generic", "10.0.0.2:80");
+
+        let pred = make_predicates(None, &[("x-tenant", "acme")], &[]);
+        let specific = Arc::new(RouteEntry::new(
+            Arc::clone(&specific_up),
+            pred,
+            "default/specific".to_string(),
+            None,
+        ));
+        let generic = Arc::new(RouteEntry::path_only(
+            Arc::clone(&generic_up),
+            "default/generic".to_string(),
+            None,
+        ));
+
+        let mut b = RoutingTableBuilder::new();
+        // Insert generic first, specific second — specificity sort should reorder.
+        let hb = b.exact_host("example.com");
+        hb.add_exact_route("/", Arc::clone(&generic));
+        hb.add_exact_route("/", Arc::clone(&specific));
+
+        let table = b.build().unwrap();
+        let headers_match = headers_from(&[("x-tenant", "acme")]);
+        let headers_no = headers_from(&[]);
+
+        let ctx_match = RequestContext {
+            method: &Method::GET,
+            headers: &headers_match,
+            query: None,
+        };
+        let ctx_no = RequestContext {
+            method: &Method::GET,
+            headers: &headers_no,
+            query: None,
+        };
+
+        // With matching header → specific wins (sorted first due to header count).
+        assert_eq!(
+            table.route("example.com", "/", &ctx_match).unwrap().name,
+            "specific"
+        );
+        // Without matching header → specific's predicate fails; falls through to generic.
+        assert_eq!(
+            table.route("example.com", "/", &ctx_no).unwrap().name,
+            "generic"
+        );
+    }
+
+    #[test]
+    fn timestamp_tiebreaker_older_wins() {
+        // Two entries with the same predicate count; older route wins.
+        let older_up = upstream("older", "10.0.0.1:80");
+        let newer_up = upstream("newer", "10.0.0.2:80");
+
+        let t_old = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let t_new = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2000);
+
+        let older = Arc::new(RouteEntry::path_only(
+            Arc::clone(&older_up),
+            "default/older".to_string(),
+            Some(t_old),
+        ));
+        let newer = Arc::new(RouteEntry::path_only(
+            Arc::clone(&newer_up),
+            "default/newer".to_string(),
+            Some(t_new),
+        ));
+
+        let mut b = RoutingTableBuilder::new();
+        let hb = b.exact_host("example.com");
+        // Insert newer first; sort should put older first.
+        hb.add_exact_route("/", Arc::clone(&newer));
+        hb.add_exact_route("/", Arc::clone(&older));
+
+        let table = b.build().unwrap();
+        assert_eq!(
+            table.route("example.com", "/", &ctx_get()).unwrap().name,
+            "older"
+        );
+    }
+
+    #[test]
+    fn or_semantics_across_multiple_entries() {
+        // Two entries at the same path with different header predicates:
+        // whichever predicate matches the request wins.
+        let up_a = upstream("a", "10.0.0.1:80");
+        let up_b = upstream("b", "10.0.0.2:80");
+
+        let pred_a = make_predicates(None, &[("x-tenant", "a")], &[]);
+        let pred_b = make_predicates(None, &[("x-tenant", "b")], &[]);
+
+        let entry_a = Arc::new(RouteEntry::new(up_a, pred_a, "default/a".to_string(), None));
+        let entry_b = Arc::new(RouteEntry::new(up_b, pred_b, "default/b".to_string(), None));
+
+        let mut b = RoutingTableBuilder::new();
+        let hb = b.exact_host("example.com");
+        hb.add_exact_route("/", Arc::clone(&entry_a));
+        hb.add_exact_route("/", Arc::clone(&entry_b));
+
+        let table = b.build().unwrap();
+
+        let hdrs_a = headers_from(&[("x-tenant", "a")]);
+        let hdrs_b = headers_from(&[("x-tenant", "b")]);
+        let ctx_a = RequestContext {
+            method: &Method::GET,
+            headers: &hdrs_a,
+            query: None,
+        };
+        let ctx_b = RequestContext {
+            method: &Method::GET,
+            headers: &hdrs_b,
+            query: None,
+        };
+
+        assert_eq!(table.route("example.com", "/", &ctx_a).unwrap().name, "a");
+        assert_eq!(table.route("example.com", "/", &ctx_b).unwrap().name, "b");
     }
 }

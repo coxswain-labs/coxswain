@@ -29,6 +29,26 @@ pub const GATEWAY_API_CROSS_NAMESPACE_TENANT: &str = concat!(
     "/fixtures/gateway_api/cross_namespace_tenant.yaml"
 );
 
+pub const GATEWAY_API_HEADER_MATCHING: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/header_matching.yaml"
+);
+
+pub const GATEWAY_API_METHOD_MATCHING: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/method_matching.yaml"
+);
+
+pub const GATEWAY_API_QUERY_PARAM_MATCHING: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/query_param_matching.yaml"
+);
+
+pub const GATEWAY_API_COMBINED_MATCHING: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/combined_matching.yaml"
+);
+
 pub const INGRESS_PATH_MATCHING: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/ingress/path_matching.yaml"
