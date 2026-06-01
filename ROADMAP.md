@@ -28,7 +28,7 @@ The most critical correctness gaps. Without these, Coxswain is unsafe in any sha
 
 TLS is a launch blocker. WebSocket is the minimum protocol expansion needed to support real-time workloads.
 
-- [ ] TLS termination for Ingress (`spec.tls`) — [#8](https://github.com/coxswain-labs/coxswain/issues/8) `MUST`
+- [x] ~~TLS termination for Ingress (`spec.tls`) — [#8](https://github.com/coxswain-labs/coxswain/issues/8) `MUST`~~
 - [ ] TLS termination for Gateway API (listeners) — [#9](https://github.com/coxswain-labs/coxswain/issues/9) `MUST`
 - [ ] Secret watch + hot TLS reload — [#10](https://github.com/coxswain-labs/coxswain/issues/10) `MUST`
 - [ ] cert-manager integration (both APIs) — [#11](https://github.com/coxswain-labs/coxswain/issues/11) `MUST`

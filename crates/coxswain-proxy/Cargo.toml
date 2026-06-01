@@ -12,8 +12,8 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 coxswain-core = { workspace = true }
-pingora = { workspace = true }
-pingora-core = { workspace = true }
+pingora = { workspace = true, features = ["boringssl"] }
+pingora-core = { workspace = true, features = ["boringssl"] }
 pingora-http = { workspace = true }
-pingora-proxy = { workspace = true }
+pingora-proxy = { workspace = true, features = ["boringssl"] }
 tracing = { workspace = true }

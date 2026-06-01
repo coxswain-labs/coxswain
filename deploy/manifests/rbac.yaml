@@ -99,8 +99,7 @@ roleRef:
 # the namespaced resources (Gateway, HTTPRoute, Ingress, ReferenceGrant,
 # EndpointSlice, Service, Endpoints) can be granted via a namespaced Role.
 #
-# Note: when TLS is implemented (v0.3, issue #10), add "secrets" to the
-# namespaced Role's core apiGroup rule below.
+# Secrets (kubernetes.io/tls type) are needed for TLS termination (#8).
 #
 # Steps:
 #   1. Replace the ClusterRole + ClusterRoleBinding above with the residual
@@ -144,7 +143,7 @@ roleRef:
 #     app.kubernetes.io/component: controller
 # rules:
 #   - apiGroups: [""]
-#     resources: ["services", "endpoints", "pods"]
+#     resources: ["services", "endpoints", "pods", "secrets"]
 #     verbs: ["get", "list", "watch"]
 #
 #   - apiGroups: ["networking.k8s.io"]

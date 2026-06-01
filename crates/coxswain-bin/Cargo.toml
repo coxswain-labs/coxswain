@@ -19,7 +19,7 @@ coxswain-health = { workspace = true }
 coxswain-proxy = { workspace = true }
 clap = { workspace = true }
 humantime = { workspace = true }
-pingora-core = { workspace = true }
-pingora-proxy = { workspace = true }
+pingora-core = { workspace = true, features = ["boringssl"] }
+pingora-proxy = { workspace = true, features = ["boringssl"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

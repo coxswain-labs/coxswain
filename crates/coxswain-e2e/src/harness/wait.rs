@@ -7,6 +7,28 @@ use kube::Api;
 use std::{net::SocketAddr, time::Duration};
 use tokio::time;
 
+pub async fn wait_for_https_route(
+    tls_addr: SocketAddr,
+    host: &str,
+    path: &str,
+    timeout: Duration,
+) -> anyhow::Result<crate::harness::http::EchoResponse> {
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        match crate::harness::http::https_get(host, path, tls_addr).await {
+            Ok((_, Some(body))) => return Ok(body),
+            Ok((status, None)) => {
+                tracing::debug!(host, path, status, "https route returned non-2xx")
+            }
+            Err(e) => tracing::debug!(host, path, error = %e, "https route not yet live"),
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for HTTPS route {host}{path} to become live");
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 pub async fn wait_for_ready(addr: SocketAddr, timeout: Duration) -> anyhow::Result<()> {
     let url = format!("http://{addr}/readyz");
     let client = reqwest::Client::builder()

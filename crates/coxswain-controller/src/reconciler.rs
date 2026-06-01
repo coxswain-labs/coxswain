@@ -2,11 +2,13 @@ use crate::{endpoints, gateway_api::GatewayApiReconciler, ingress::IngressReconc
 use async_trait::async_trait;
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, SharedRoutingTable, Upstream};
+use coxswain_core::tls::{SharedTlsStore, TlsStoreBuilder};
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
 use gateway_api::apis::standard::referencegrants::ReferenceGrant;
+use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::{
@@ -64,6 +66,7 @@ impl std::str::FromStr for IngressDefaultBackend {
 /// rolling deploys).
 pub struct Reconciler {
     routes: SharedRoutingTable,
+    tls: SharedTlsStore,
     owned_gateways: OwnedGateways,
     controller_name: String,
     /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
@@ -74,6 +77,7 @@ pub struct Reconciler {
 impl Reconciler {
     pub fn new(
         routes: SharedRoutingTable,
+        tls: SharedTlsStore,
         owned_gateways: OwnedGateways,
         controller_name: String,
         watch_namespace: Option<String>,
@@ -81,6 +85,7 @@ impl Reconciler {
     ) -> Self {
         Self {
             routes,
+            tls,
             owned_gateways,
             controller_name,
             watch_namespace,
@@ -109,6 +114,7 @@ impl BackgroundService for Reconciler {
         let mut set = spawn_tasks(
             client,
             self.routes.clone(),
+            self.tls.clone(),
             self.owned_gateways.clone(),
             self.controller_name.clone(),
             self.watch_namespace.clone(),
@@ -131,6 +137,7 @@ impl BackgroundService for Reconciler {
 async fn spawn_tasks(
     client: Client,
     routes: SharedRoutingTable,
+    tls: SharedTlsStore,
     owned_gateways: OwnedGateways,
     controller_name: String,
     watch_namespace: Option<String>,
@@ -143,6 +150,7 @@ async fn spawn_tasks(
     let (gateway_class_reader, gateway_class_writer) = reflector::store::<GatewayClass>();
     let (slice_reader, slice_writer) = reflector::store::<EndpointSlice>();
     let (grant_reader, grant_writer) = reflector::store::<ReferenceGrant>();
+    let (secret_reader, secret_writer) = reflector::store::<Secret>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
 
@@ -285,7 +293,8 @@ async fn spawn_tasks(
     // --- ReferenceGrant reflector ---
     set.spawn({
         let notify = Arc::clone(&notify);
-        let ns = watch_namespace;
+        let client = client.clone();
+        let ns = watch_namespace.clone();
         async move {
             let stream = reflector::reflector(
                 grant_writer,
@@ -300,6 +309,32 @@ async fn spawn_tasks(
                 match event {
                     Ok(_) => notify.notify_one(),
                     Err(e) => tracing::warn!(error = %e, "ReferenceGrant reflector error"),
+                }
+            }
+        }
+    });
+
+    // --- Secret reflector (TLS certs only) ---
+    //
+    // Field-selector scoped to `type=kubernetes.io/tls` to avoid pulling every
+    // Secret in the cluster into memory.
+    set.spawn({
+        let notify = Arc::clone(&notify);
+        let ns = watch_namespace;
+        async move {
+            let stream = reflector::reflector(
+                secret_writer,
+                watcher(
+                    scoped_api::<Secret>(client, ns.as_deref()),
+                    watcher::Config::default().fields("type=kubernetes.io/tls"),
+                )
+                .default_backoff(),
+            );
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(_) => notify.notify_one(),
+                    Err(e) => tracing::warn!(error = %e, "Secret reflector error"),
                 }
             }
         }
@@ -328,10 +363,12 @@ async fn spawn_tasks(
                 &gateway_class_reader,
                 &slice_reader,
                 &grant_reader,
+                &secret_reader,
                 &controller_name,
                 &owned_gateways,
                 ingress_default_backend.as_ref(),
                 &routes,
+                &tls,
             );
         }
     });
@@ -348,10 +385,12 @@ fn rebuild(
     gateway_class_store: &reflector::Store<GatewayClass>,
     slice_store: &reflector::Store<EndpointSlice>,
     grant_store: &reflector::Store<ReferenceGrant>,
+    secret_store: &reflector::Store<Secret>,
     controller_name: &str,
     owned_gateways_handle: &OwnedGateways,
     ingress_default_backend: Option<&IngressDefaultBackend>,
     shared: &SharedRoutingTable,
+    tls_shared: &SharedTlsStore,
 ) {
     let routes = route_store.state();
     let ingresses = ingress_store.state();
@@ -491,4 +530,18 @@ fn rebuild(
             tracing::error!(error = %e, "Routing table build failed — retaining previous table");
         }
     }
+
+    // Build and publish the TLS cert store independently of the route table.
+    let mut tls_builder = TlsStoreBuilder::new();
+    for ingress in &ingresses {
+        IngressReconciler::reconcile_tls(
+            ingress,
+            secret_store,
+            &owned_ingress_classes,
+            &mut tls_builder,
+        );
+    }
+    let tls_store = tls_builder.build();
+    tracing::debug!(certs = tls_store.cert_count(), "TLS cert store rebuilt");
+    tls_shared.store(Arc::new(tls_store));
 }

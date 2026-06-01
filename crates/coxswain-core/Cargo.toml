@@ -13,3 +13,4 @@ http             = { workspace = true }
 matchit          = { workspace = true }
 regex            = { workspace = true }
 thiserror        = { workspace = true }
+tracing          = { workspace = true }

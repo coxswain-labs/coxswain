@@ -11,9 +11,11 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 gateway-api.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
+rcgen = "0.13"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
