@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use coxswain_core::routing::{RouteOutcome, SharedRoutingTable, Upstream};
+use coxswain_core::routing::{RequestContext, RouteOutcome, SharedRoutingTable, Upstream};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{ConnectionClosed, ErrorSource, HTTPStatus, ReadError, Result, WriteError};
 use pingora_http::RequestHeader;
@@ -19,13 +19,14 @@ impl RoutingEngine {
         Self { table }
     }
 
-    pub fn route(&self, host: &str, path: &str) -> Option<Arc<Upstream>> {
-        self.table.load().route(host, path)
+    /// Like [`find`] but returns only the upstream, without host/path distinction.
+    pub fn route(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<Upstream>> {
+        self.table.load().route(host, path, ctx)
     }
 
-    /// Like [`route`] but distinguishes "host not registered" from "path not matched".
-    pub fn find(&self, host: &str, path: &str) -> RouteOutcome {
-        self.table.load().find(host, path)
+    /// Distinguishes "host not registered" from "path/predicate not matched".
+    pub fn find(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> RouteOutcome {
+        self.table.load().find(host, path, ctx)
     }
 }
 
@@ -60,8 +61,13 @@ impl ProxyHttp for Proxy {
             host_hdr.split(':').next().unwrap_or("")
         };
         let path = req_header.uri.path();
+        let ctx = RequestContext {
+            method: &req_header.method,
+            headers: &req_header.headers,
+            query: req_header.uri.query(),
+        };
 
-        let upstream = match self.engine.find(host, path) {
+        let upstream = match self.engine.find(host, path, &ctx) {
             RouteOutcome::Found(u) => u,
             RouteOutcome::NoHost => {
                 return Err(pingora_core::Error::explain(
@@ -141,14 +147,19 @@ impl ProxyHttp for Proxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coxswain_core::routing::{RoutingTableBuilder, SharedRoutingTable, Upstream};
+    use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, SharedRoutingTable, Upstream};
     use std::net::SocketAddr;
+    use std::sync::Arc;
 
     fn make_upstream(name: &str, addr: &str) -> Arc<Upstream> {
         Arc::new(Upstream::new(
             name.to_string(),
             vec![addr.parse::<SocketAddr>().unwrap()],
         ))
+    }
+
+    fn entry(us: Arc<Upstream>) -> Arc<RouteEntry> {
+        Arc::new(RouteEntry::path_only(us, "default/svc".to_string(), None))
     }
 
     fn engine_with_table(shared: SharedRoutingTable) -> RoutingEngine {
@@ -161,12 +172,13 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         builder
             .exact_host("example.com")
-            .add_prefix_route("/", upstream);
+            .add_prefix_route("/", entry(upstream));
         let shared = SharedRoutingTable::new();
         shared.store(Arc::new(builder.build().unwrap()));
 
         let engine = engine_with_table(shared);
-        let result = engine.route("example.com", "/api/users");
+        let ctx = RequestContext::default();
+        let result = engine.route("example.com", "/api/users", &ctx);
         assert!(result.is_some());
         assert_eq!(result.unwrap().name, "default/backend");
     }
@@ -177,18 +189,20 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         builder
             .exact_host("example.com")
-            .add_prefix_route("/", upstream);
+            .add_prefix_route("/", entry(upstream));
         let shared = SharedRoutingTable::new();
         shared.store(Arc::new(builder.build().unwrap()));
 
         let engine = engine_with_table(shared);
-        assert!(engine.route("other.com", "/").is_none());
+        let ctx = RequestContext::default();
+        assert!(engine.route("other.com", "/", &ctx).is_none());
     }
 
     #[test]
     fn route_returns_none_on_empty_table() {
         let engine = engine_with_table(SharedRoutingTable::new());
-        assert!(engine.route("example.com", "/").is_none());
+        let ctx = RequestContext::default();
+        assert!(engine.route("example.com", "/", &ctx).is_none());
     }
 
     #[test]
@@ -197,12 +211,13 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         builder
             .exact_host("example.com")
-            .add_exact_route("/", upstream);
+            .add_exact_route("/", entry(upstream));
         let shared = SharedRoutingTable::new();
         shared.store(Arc::new(builder.build().unwrap()));
 
         let engine = engine_with_table(shared);
-        let resolved = engine.route("example.com", "/");
+        let ctx = RequestContext::default();
+        let resolved = engine.route("example.com", "/", &ctx);
         assert!(resolved.is_some(), "route should resolve");
         assert!(
             resolved.unwrap().next_endpoint().is_none(),

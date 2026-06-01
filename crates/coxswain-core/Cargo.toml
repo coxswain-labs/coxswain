@@ -7,7 +7,9 @@ description.workspace = true
 license.workspace = true
 
 [dependencies]
-arc-swap  = { workspace = true }
-matchit   = { workspace = true }
-regex     = { workspace = true }
-thiserror = { workspace = true }
+arc-swap         = { workspace = true }
+form_urlencoded  = { workspace = true }
+http             = { workspace = true }
+matchit          = { workspace = true }
+regex            = { workspace = true }
+thiserror        = { workspace = true }

@@ -1,7 +1,7 @@
 use crate::{endpoints, gateway_api::GatewayApiReconciler, ingress::IngressReconciler};
 use async_trait::async_trait;
 use coxswain_core::ownership::OwnedGateways;
-use coxswain_core::routing::{RoutingTableBuilder, SharedRoutingTable, Upstream};
+use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, SharedRoutingTable, Upstream};
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
@@ -458,7 +458,12 @@ fn rebuild(
                 format!("{}/{}", db.namespace, db.name),
                 addrs,
             ));
-            builder.catchall().add_prefix_route("/", upstream);
+            let e = Arc::new(RouteEntry::path_only(
+                upstream,
+                format!("{}/{}", db.namespace, db.name),
+                None,
+            ));
+            builder.catchall().add_prefix_route("/", e);
         }
     }
 

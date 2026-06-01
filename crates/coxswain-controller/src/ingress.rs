@@ -1,10 +1,11 @@
 use crate::endpoints;
-use coxswain_core::routing::{RoutingTableBuilder, Upstream};
+use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, Upstream};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::runtime::reflector;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 pub struct IngressReconciler;
 
@@ -51,6 +52,14 @@ impl IngressReconciler {
         }
 
         let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
+        let ingress_name = ingress.metadata.name.as_deref().unwrap_or("unknown");
+        let route_id = format!("{ns}/{ingress_name}");
+        let created_at: Option<SystemTime> = ingress
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .and_then(|t| t.0.as_millisecond().try_into().ok())
+            .map(|ms: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms));
         let spec = ingress.spec.as_ref();
         let rules = spec.and_then(|s| s.rules.as_deref());
 
@@ -104,13 +113,18 @@ impl IngressReconciler {
                     Some(h) => builder.exact_host(h),
                 };
 
+                let e = Arc::new(RouteEntry::path_only(
+                    upstream,
+                    route_id.clone(),
+                    created_at,
+                ));
                 // "Prefix" and "ImplementationSpecific" both map to prefix matching.
                 match path_rule.path_type.as_str() {
                     "Exact" => {
-                        host_builder.add_exact_route(path, upstream);
+                        host_builder.add_exact_route(path, e);
                     }
                     _ => {
-                        host_builder.add_prefix_route(path, upstream);
+                        host_builder.add_prefix_route(path, e);
                     }
                 }
             }
@@ -140,7 +154,12 @@ impl IngressReconciler {
                         Some(h) if h.starts_with("*.") => builder.wildcard_host(h),
                         Some(h) => builder.exact_host(h),
                     };
-                    host_builder.add_prefix_route("/", Arc::clone(&upstream));
+                    let e = Arc::new(RouteEntry::path_only(
+                        Arc::clone(&upstream),
+                        route_id.clone(),
+                        created_at,
+                    ));
+                    host_builder.add_prefix_route("/", e);
                 }
             }
         }
@@ -150,7 +169,7 @@ impl IngressReconciler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coxswain_core::routing::RoutingTableBuilder;
+    use coxswain_core::routing::{RequestContext, RoutingTableBuilder};
     use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
     use k8s_openapi::api::networking::v1::{
         HTTPIngressPath, HTTPIngressRuleValue, IngressBackend, IngressRule, IngressServiceBackend,
@@ -335,13 +354,14 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route("example.com", "/api/v1").unwrap().name,
+            table.route("example.com", "/api/v1", &ctx).unwrap().name,
             "default/rule-svc"
         );
         assert_eq!(
-            table.route("example.com", "/other").unwrap().name,
+            table.route("example.com", "/other", &ctx).unwrap().name,
             "default/default-svc"
         );
     }
@@ -353,8 +373,9 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
-        assert!(table.route("any.host.com", "/").is_none());
+        assert!(table.route("any.host.com", "/", &ctx).is_none());
     }
 
     #[test]
@@ -373,9 +394,10 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/api").is_some());
-        assert!(table.route("example.com", "/other").is_none());
+        assert!(table.route("example.com", "/api", &ctx).is_some());
+        assert!(table.route("example.com", "/other", &ctx).is_none());
     }
 
     #[test]
@@ -394,13 +416,14 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route("api.example.com", "/api").unwrap().name,
+            table.route("api.example.com", "/api", &ctx).unwrap().name,
             "default/rule-svc"
         );
         assert_eq!(
-            table.route("api.example.com", "/other").unwrap().name,
+            table.route("api.example.com", "/other", &ctx).unwrap().name,
             "default/default-svc"
         );
     }
@@ -422,9 +445,10 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route("example.com", "/anything").unwrap().name,
+            table.route("example.com", "/anything", &ctx).unwrap().name,
             "default/rule-svc"
         );
     }
@@ -444,9 +468,10 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/api").is_some());
-        assert!(table.route("example.com", "/api/users").is_none());
+        assert!(table.route("example.com", "/api", &ctx).is_some());
+        assert!(table.route("example.com", "/api/users", &ctx).is_none());
     }
 
     #[test]
@@ -464,10 +489,11 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/api").is_some());
-        assert!(table.route("example.com", "/api/users").is_some());
-        assert!(table.route("example.com", "/other").is_none());
+        assert!(table.route("example.com", "/api", &ctx).is_some());
+        assert!(table.route("example.com", "/api/users", &ctx).is_some());
+        assert!(table.route("example.com", "/other", &ctx).is_none());
     }
 
     #[test]
@@ -485,9 +511,10 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/api").is_some());
-        assert!(table.route("example.com", "/api/v2").is_some());
+        assert!(table.route("example.com", "/api", &ctx).is_some());
+        assert!(table.route("example.com", "/api/v2", &ctx).is_some());
     }
 
     #[test]
@@ -505,9 +532,10 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/").is_some());
-        assert!(table.route("other.com", "/").is_none());
+        assert!(table.route("example.com", "/", &ctx).is_some());
+        assert!(table.route("other.com", "/", &ctx).is_none());
     }
 
     #[test]
@@ -525,9 +553,10 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
-        assert!(table.route("api.example.com", "/").is_some());
-        assert!(table.route("example.com", "/").is_none());
+        assert!(table.route("api.example.com", "/", &ctx).is_some());
+        assert!(table.route("example.com", "/", &ctx).is_none());
     }
 
     #[test]
@@ -545,9 +574,10 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
-        assert!(table.route("any-host.example.com", "/").is_some());
-        assert!(table.route("other.io", "/").is_some());
+        assert!(table.route("any-host.example.com", "/", &ctx).is_some());
+        assert!(table.route("other.io", "/", &ctx).is_some());
     }
 
     #[test]
@@ -565,8 +595,9 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/").is_none());
+        assert!(table.route("example.com", "/", &ctx).is_none());
     }
 
     #[test]
@@ -583,7 +614,13 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().unwrap().route("example.com", "/").is_some());
+        assert!(
+            builder
+                .build()
+                .unwrap()
+                .route("example.com", "/", &RequestContext::default())
+                .is_some()
+        );
     }
 
     #[test]
@@ -600,7 +637,13 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().unwrap().route("example.com", "/").is_none());
+        assert!(
+            builder
+                .build()
+                .unwrap()
+                .route("example.com", "/", &RequestContext::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -617,7 +660,13 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().unwrap().route("example.com", "/").is_some());
+        assert!(
+            builder
+                .build()
+                .unwrap()
+                .route("example.com", "/", &RequestContext::default())
+                .is_some()
+        );
     }
 
     #[test]
@@ -634,7 +683,13 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().unwrap().route("example.com", "/").is_none());
+        assert!(
+            builder
+                .build()
+                .unwrap()
+                .route("example.com", "/", &RequestContext::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -651,7 +706,13 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().unwrap().route("example.com", "/").is_none());
+        assert!(
+            builder
+                .build()
+                .unwrap()
+                .route("example.com", "/", &RequestContext::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -668,7 +729,13 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&[]), &mut builder);
-        assert!(builder.build().unwrap().route("example.com", "/").is_none());
+        assert!(
+            builder
+                .build()
+                .unwrap()
+                .route("example.com", "/", &RequestContext::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -686,6 +753,12 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().unwrap().route("example.com", "/").is_some());
+        assert!(
+            builder
+                .build()
+                .unwrap()
+                .route("example.com", "/", &RequestContext::default())
+                .is_some()
+        );
     }
 }

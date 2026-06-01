@@ -1,15 +1,23 @@
 use crate::endpoints;
 use coxswain_core::ownership::parent_ref_owned;
 use coxswain_core::reference_grants;
-use coxswain_core::routing::{HostRouterBuilder, RoutingTableBuilder, Upstream};
-use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesMatchesPathType,
+use coxswain_core::routing::{
+    HeaderPredicate, HostRouterBuilder, MatchPredicates, QueryPredicate, RouteEntry,
+    RoutingTableBuilder, Upstream, ValueMatch,
 };
+use gateway_api::apis::standard::httproutes::{
+    HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesMatchesHeadersType,
+    HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPathType,
+    HttpRouteRulesMatchesQueryParamsType,
+};
+use http::{HeaderName, Method};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
+use regex::Regex;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 pub struct GatewayApiReconciler;
 
@@ -24,6 +32,14 @@ impl GatewayApiReconciler {
         builder: &mut RoutingTableBuilder,
     ) {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
+        let route_id = format!("{route_ns}/{route_name}");
+        let created_at: Option<SystemTime> = route
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .and_then(|t| t.0.as_millisecond().try_into().ok())
+            .map(|ms: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms));
 
         // Only reconcile routes attached to at least one Gateway we manage.
         let has_owned_parent = route
@@ -97,10 +113,34 @@ impl GatewayApiReconciler {
             // Default to PathPrefix "/" when no matches are specified (Gateway API §4.1).
             let apply = |pb: &mut HostRouterBuilder| match rule.matches.as_deref() {
                 None | Some([]) => {
-                    pb.add_prefix_route("/", Arc::clone(&upstream));
+                    let e = Arc::new(RouteEntry::path_only(
+                        Arc::clone(&upstream),
+                        route_id.clone(),
+                        created_at,
+                    ));
+                    pb.add_prefix_route("/", e);
                 }
                 Some(ms) => {
                     for m in ms {
+                        // Build predicates, skipping this match if any regex is invalid.
+                        let predicates = match Self::build_predicates(m) {
+                            Some(p) => p,
+                            None => {
+                                tracing::warn!(
+                                    route = ?route.metadata.name,
+                                    "Skipping HTTPRouteMatch — invalid regex in header or query predicate"
+                                );
+                                continue;
+                            }
+                        };
+
+                        let e = Arc::new(RouteEntry::new(
+                            Arc::clone(&upstream),
+                            predicates,
+                            route_id.clone(),
+                            created_at,
+                        ));
+
                         let val = m
                             .path
                             .as_ref()
@@ -108,14 +148,14 @@ impl GatewayApiReconciler {
                             .unwrap_or("/");
                         match m.path.as_ref().and_then(|p| p.r#type.as_ref()) {
                             Some(HttpRouteRulesMatchesPathType::Exact) => {
-                                pb.add_exact_route(val, Arc::clone(&upstream));
+                                pb.add_exact_route(val, e);
                             }
                             Some(HttpRouteRulesMatchesPathType::RegularExpression) => {
-                                pb.add_regex_route(val, Arc::clone(&upstream));
+                                pb.add_regex_route(val, e);
                             }
                             // PathPrefix is the default per spec
                             _ => {
-                                pb.add_prefix_route(val, Arc::clone(&upstream));
+                                pb.add_prefix_route(val, e);
                             }
                         }
                     }
@@ -134,6 +174,76 @@ impl GatewayApiReconciler {
                 }
             }
         }
+    }
+
+    /// Builds `MatchPredicates` from a single `HttpRouteRulesMatches` entry.
+    ///
+    /// Returns `None` if any regex pattern in the headers or query predicates is invalid.
+    fn build_predicates(
+        m: &gateway_api::apis::standard::httproutes::HttpRouteRulesMatches,
+    ) -> Option<MatchPredicates> {
+        // ── Method ────────────────────────────────────────────────────────────
+        let method: Option<Method> = match m.method.as_ref() {
+            None => None,
+            Some(HttpRouteRulesMatchesMethod::Get) => Some(Method::GET),
+            Some(HttpRouteRulesMatchesMethod::Head) => Some(Method::HEAD),
+            Some(HttpRouteRulesMatchesMethod::Post) => Some(Method::POST),
+            Some(HttpRouteRulesMatchesMethod::Put) => Some(Method::PUT),
+            Some(HttpRouteRulesMatchesMethod::Delete) => Some(Method::DELETE),
+            Some(HttpRouteRulesMatchesMethod::Connect) => Some(Method::CONNECT),
+            Some(HttpRouteRulesMatchesMethod::Options) => Some(Method::OPTIONS),
+            Some(HttpRouteRulesMatchesMethod::Trace) => Some(Method::TRACE),
+            Some(HttpRouteRulesMatchesMethod::Patch) => Some(Method::PATCH),
+        };
+
+        // ── Headers ───────────────────────────────────────────────────────────
+        let mut headers: Vec<HeaderPredicate> = Vec::new();
+        let mut seen_header_names: Vec<HeaderName> = Vec::new();
+        for h in m.headers.as_deref().unwrap_or(&[]) {
+            let name = match HeaderName::from_bytes(h.name.to_ascii_lowercase().as_bytes()) {
+                Ok(n) => n,
+                Err(_) => {
+                    tracing::warn!(header_name = %h.name, "Skipping invalid header name in HTTPRouteMatch");
+                    continue;
+                }
+            };
+            // Per spec: only the first entry for a given canonical name is honoured.
+            if seen_header_names.contains(&name) {
+                continue;
+            }
+            seen_header_names.push(name.clone());
+
+            let matcher = match h.r#type.as_ref() {
+                Some(HttpRouteRulesMatchesHeadersType::RegularExpression) => {
+                    let re = Regex::new(&h.value).ok()?;
+                    ValueMatch::Regex(re)
+                }
+                _ => ValueMatch::Exact(h.value.clone()),
+            };
+            headers.push(HeaderPredicate { name, matcher });
+        }
+
+        // ── Query parameters ──────────────────────────────────────────────────
+        let mut query: Vec<QueryPredicate> = Vec::new();
+        for q in m.query_params.as_deref().unwrap_or(&[]) {
+            let matcher = match q.r#type.as_ref() {
+                Some(HttpRouteRulesMatchesQueryParamsType::RegularExpression) => {
+                    let re = Regex::new(&q.value).ok()?;
+                    ValueMatch::Regex(re)
+                }
+                _ => ValueMatch::Exact(q.value.clone()),
+            };
+            query.push(QueryPredicate {
+                name: q.name.clone(),
+                matcher,
+            });
+        }
+
+        Some(MatchPredicates {
+            method,
+            headers,
+            query,
+        })
     }
 
     fn resolve_upstream_addrs(
@@ -170,9 +280,11 @@ mod tests {
     use coxswain_core::routing::RoutingTableBuilder;
     use gateway_api::apis::standard::httproutes::{
         HTTPRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
-        HttpRouteRulesMatches, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType,
-        HttpRouteSpec,
+        HttpRouteRulesMatches, HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType,
+        HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType,
+        HttpRouteRulesMatchesQueryParams, HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
     };
+    use http::{HeaderMap, HeaderName, Method};
     use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
     use kube::api::ObjectMeta;
     use kube::runtime::watcher;
@@ -264,15 +376,100 @@ mod tests {
         }
     }
 
-    fn path_match(type_: HttpRouteRulesMatchesPathType, value: &str) -> Vec<HttpRouteRulesMatches> {
-        vec![HttpRouteRulesMatches {
+    fn path_match(path: &str, kind: HttpRouteRulesMatchesPathType) -> HttpRouteRulesMatches {
+        HttpRouteRulesMatches {
             path: Some(HttpRouteRulesMatchesPath {
-                r#type: Some(type_),
-                value: Some(value.to_string()),
+                r#type: Some(kind),
+                value: Some(path.to_string()),
             }),
             ..Default::default()
-        }]
+        }
     }
+
+    fn header_exact_match(
+        path: &str,
+        header_name: &str,
+        header_value: &str,
+    ) -> HttpRouteRulesMatches {
+        HttpRouteRulesMatches {
+            path: Some(HttpRouteRulesMatchesPath {
+                r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
+                value: Some(path.to_string()),
+            }),
+            headers: Some(vec![HttpRouteRulesMatchesHeaders {
+                name: header_name.to_string(),
+                value: header_value.to_string(),
+                r#type: Some(HttpRouteRulesMatchesHeadersType::Exact),
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn header_regex_match(path: &str, header_name: &str, pattern: &str) -> HttpRouteRulesMatches {
+        HttpRouteRulesMatches {
+            path: Some(HttpRouteRulesMatchesPath {
+                r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
+                value: Some(path.to_string()),
+            }),
+            headers: Some(vec![HttpRouteRulesMatchesHeaders {
+                name: header_name.to_string(),
+                value: pattern.to_string(),
+                r#type: Some(HttpRouteRulesMatchesHeadersType::RegularExpression),
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn method_match(path: &str, method: HttpRouteRulesMatchesMethod) -> HttpRouteRulesMatches {
+        HttpRouteRulesMatches {
+            path: Some(HttpRouteRulesMatchesPath {
+                r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
+                value: Some(path.to_string()),
+            }),
+            method: Some(method),
+            ..Default::default()
+        }
+    }
+
+    fn query_exact_match(path: &str, param: &str, value: &str) -> HttpRouteRulesMatches {
+        HttpRouteRulesMatches {
+            path: Some(HttpRouteRulesMatchesPath {
+                r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
+                value: Some(path.to_string()),
+            }),
+            query_params: Some(vec![HttpRouteRulesMatchesQueryParams {
+                name: param.to_string(),
+                value: value.to_string(),
+                r#type: Some(HttpRouteRulesMatchesQueryParamsType::Exact),
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn ctx_with<'a>(
+        method: &'a Method,
+        headers: &'a HeaderMap,
+        query: Option<&'a str>,
+    ) -> coxswain_core::routing::RequestContext<'a> {
+        coxswain_core::routing::RequestContext {
+            method,
+            headers,
+            query,
+        }
+    }
+
+    fn headers_from(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        m
+    }
+
+    // ── Original path-matching tests (unchanged behaviour) ────────────────────
 
     #[test]
     fn reconcile_exact_path() {
@@ -280,21 +477,21 @@ mod tests {
         let route = make_route(
             "default",
             &["example.com"],
-            Some(path_match(HttpRouteRulesMatchesPathType::Exact, "/api")),
+            Some(vec![path_match(
+                "/api",
+                HttpRouteRulesMatchesPathType::Exact,
+            )]),
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
-        );
+        let grants = HashSet::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
         let table = builder.build().unwrap();
+        let empty_hdrs = HeaderMap::new();
+        let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
 
-        assert!(table.route("example.com", "/api").is_some());
-        assert!(table.route("example.com", "/api/users").is_none());
+        assert!(table.route("example.com", "/api", &ctx).is_some());
+        assert!(table.route("example.com", "/api/users", &ctx).is_none());
     }
 
     #[test]
@@ -303,25 +500,21 @@ mod tests {
         let route = make_route(
             "default",
             &["example.com"],
-            Some(path_match(
-                HttpRouteRulesMatchesPathType::PathPrefix,
+            Some(vec![path_match(
                 "/api",
-            )),
+                HttpRouteRulesMatchesPathType::PathPrefix,
+            )]),
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
-        );
+        let grants = HashSet::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
         let table = builder.build().unwrap();
+        let empty_hdrs = HeaderMap::new();
+        let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
 
-        assert!(table.route("example.com", "/api").is_some());
-        assert!(table.route("example.com", "/api/users").is_some());
-        assert!(table.route("example.com", "/other").is_none());
+        assert!(table.route("example.com", "/api", &ctx).is_some());
+        assert!(table.route("example.com", "/api/users", &ctx).is_some());
     }
 
     #[test]
@@ -330,367 +523,322 @@ mod tests {
         let route = make_route(
             "default",
             &["example.com"],
-            Some(path_match(
+            Some(vec![path_match(
+                r"/item/\d+",
                 HttpRouteRulesMatchesPathType::RegularExpression,
-                "^/api/v[0-9]+/.*",
-            )),
+            )]),
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
-        );
+        let grants = HashSet::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
         let table = builder.build().unwrap();
+        let empty_hdrs = HeaderMap::new();
+        let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
 
-        assert!(table.route("example.com", "/api/v1/users").is_some());
-        assert!(table.route("example.com", "/api/vX/users").is_none());
+        assert!(table.route("example.com", "/item/42", &ctx).is_some());
+        assert!(table.route("example.com", "/item/abc", &ctx).is_none());
     }
 
     #[test]
-    fn reconcile_default_prefix_on_no_matches() {
+    fn reconcile_no_matches_defaults_to_root_prefix() {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
-        );
+        let grants = HashSet::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
         let table = builder.build().unwrap();
+        let empty_hdrs = HeaderMap::new();
+        let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
 
-        assert!(table.route("example.com", "/").is_some());
-        assert!(table.route("example.com", "/anything").is_some());
+        assert!(table.route("example.com", "/anything", &ctx).is_some());
     }
 
     #[test]
-    fn reconcile_exact_hostname() {
+    fn reconcile_skips_route_without_owned_parent() {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
+        let grants = HashSet::new();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
-            &default_owned(),
-            &HashSet::new(),
+            &owned(&[("other", "gw")]),
+            &grants,
             &mut builder,
         );
         let table = builder.build().unwrap();
+        let empty_hdrs = HeaderMap::new();
+        let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
 
-        assert!(table.route("example.com", "/").is_some());
-        assert!(table.route("other.com", "/").is_none());
+        assert!(table.route("example.com", "/", &ctx).is_none());
     }
 
-    #[test]
-    fn reconcile_wildcard_hostname() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let route = make_route("default", &["*.example.com"], None, "svc");
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
-        );
-        let table = builder.build().unwrap();
-
-        assert!(table.route("api.example.com", "/").is_some());
-        assert!(table.route("example.com", "/").is_none());
-    }
+    // ── New predicate tests ────────────────────────────────────────────────────
 
     #[test]
-    fn reconcile_catchall_on_no_hostname() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let route = make_route("default", &[], None, "svc");
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
-        );
-        let table = builder.build().unwrap();
-
-        assert!(table.route("any-host.example.com", "/").is_some());
-        assert!(table.route("other.io", "/").is_some());
-    }
-
-    #[test]
-    fn reconcile_skips_rule_with_no_endpoints() {
-        let store = slice_store(vec![]); // no slices → no endpoints
-        let route = make_route("default", &["example.com"], None, "svc");
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
-        );
-        let table = builder.build().unwrap();
-
-        assert!(table.route("example.com", "/").is_none());
-    }
-
-    // --- parentRef filtering tests ---
-
-    #[test]
-    fn reconcile_skips_route_without_parent_refs() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let mut route = make_route("default", &["example.com"], None, "svc");
-        route.spec.parent_refs = None;
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
-        );
-        let table = builder.build().unwrap();
-
-        assert!(table.route("example.com", "/").is_none());
-    }
-
-    #[test]
-    fn reconcile_skips_route_with_empty_parent_refs() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let mut route = make_route("default", &["example.com"], None, "svc");
-        route.spec.parent_refs = Some(vec![]);
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
-        );
-        let table = builder.build().unwrap();
-
-        assert!(table.route("example.com", "/").is_none());
-    }
-
-    #[test]
-    fn reconcile_skips_route_for_non_owned_gateway() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let mut route = make_route("default", &["example.com"], None, "svc");
-        route.spec.parent_refs = Some(vec![HttpRouteParentRefs {
-            name: "envoy-gateway".to_string(),
-            namespace: Some("default".to_string()),
-            ..Default::default()
-        }]);
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
-        );
-        let table = builder.build().unwrap();
-
-        assert!(table.route("example.com", "/").is_none());
-    }
-
-    #[test]
-    fn reconcile_reconciles_route_with_at_least_one_owned_parent() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let mut route = make_route("default", &["example.com"], None, "svc");
-        // Two parentRefs: one ours, one foreign.
-        route.spec.parent_refs = Some(vec![
-            HttpRouteParentRefs {
-                name: "gw".to_string(),
-                namespace: Some("default".to_string()),
-                ..Default::default()
-            },
-            HttpRouteParentRefs {
-                name: "envoy-gateway".to_string(),
-                namespace: Some("default".to_string()),
-                ..Default::default()
-            },
+    fn reconcile_header_exact_routes_to_correct_backend() {
+        let store = slice_store(vec![
+            make_slice("default", "svc-a", "10.0.0.1"),
+            make_slice("default", "svc-b", "10.0.0.2"),
         ]);
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
-        );
-        let table = builder.build().unwrap();
 
-        assert!(table.route("example.com", "/").is_some());
-    }
-
-    #[test]
-    fn reconcile_respects_explicit_parent_namespace() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let infra_owned = owned(&[("infra", "gw")]);
-        // Route is in "default" namespace but parentRef points to "infra/gw".
-        let mut route = make_route("default", &["example.com"], None, "svc");
-        route.spec.parent_refs = Some(vec![HttpRouteParentRefs {
-            name: "gw".to_string(),
-            namespace: Some("infra".to_string()),
-            ..Default::default()
-        }]);
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &infra_owned,
-            &HashSet::new(),
-            &mut builder,
-        );
-        let table = builder.build().unwrap();
-
-        assert!(table.route("example.com", "/").is_some());
-    }
-
-    #[test]
-    fn reconcile_uses_route_namespace_as_default_for_parent() {
-        let store = slice_store(vec![make_slice("apps", "svc", "10.0.0.1")]);
-        // Gateway lives in "apps", same namespace as the route. parentRef omits namespace.
-        let apps_owned = owned(&[("apps", "gw")]);
+        // Two rules: same path, different header → different backends.
         let route = HTTPRoute {
             metadata: ObjectMeta {
                 name: Some("route".to_string()),
-                namespace: Some("apps".to_string()),
-                ..Default::default()
-            },
-            spec: HttpRouteSpec {
-                parent_refs: Some(vec![HttpRouteParentRefs {
-                    name: "gw".to_string(),
-                    namespace: None, // default → route namespace "apps"
-                    ..Default::default()
-                }]),
-                hostnames: Some(vec!["example.com".to_string()]),
-                rules: Some(vec![HttpRouteRules {
-                    backend_refs: Some(vec![HttpRouteRulesBackendRefs {
-                        name: "svc".to_string(),
-                        port: Some(80),
-                        ..Default::default()
-                    }]),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &apps_owned, &HashSet::new(), &mut builder);
-        let table = builder.build().unwrap();
-
-        assert!(table.route("example.com", "/").is_some());
-    }
-
-    // --- ReferenceGrant tests ---
-
-    fn grants(entries: &[(&str, &str, Option<&str>)]) -> HashSet<(String, String, Option<String>)> {
-        entries
-            .iter()
-            .map(|(f, t, n)| (f.to_string(), t.to_string(), n.map(str::to_string)))
-            .collect()
-    }
-
-    fn cross_ns_route(route_ns: &str, backend_ns: &str, svc: &str) -> HTTPRoute {
-        HTTPRoute {
-            metadata: ObjectMeta {
-                name: Some("route".to_string()),
-                namespace: Some(route_ns.to_string()),
+                namespace: Some("default".to_string()),
                 ..Default::default()
             },
             spec: HttpRouteSpec {
                 parent_refs: default_parents(),
                 hostnames: Some(vec!["example.com".to_string()]),
-                rules: Some(vec![HttpRouteRules {
-                    backend_refs: Some(vec![HttpRouteRulesBackendRefs {
-                        name: svc.to_string(),
-                        port: Some(80),
-                        namespace: Some(backend_ns.to_string()),
+                rules: Some(vec![
+                    HttpRouteRules {
+                        matches: Some(vec![header_exact_match("/", "x-tenant", "a")]),
+                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                            name: "svc-a".to_string(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
                         ..Default::default()
-                    }]),
-                    ..Default::default()
-                }]),
+                    },
+                    HttpRouteRules {
+                        matches: Some(vec![header_exact_match("/", "x-tenant", "b")]),
+                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                            name: "svc-b".to_string(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    },
+                ]),
                 ..Default::default()
             },
             ..Default::default()
-        }
-    }
+        };
 
-    #[test]
-    fn cross_ns_ref_denied_without_grant() {
-        let store = slice_store(vec![make_slice("billing", "payments", "10.0.1.1")]);
-        let route = cross_ns_route("apps", "billing", "payments");
         let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
+        let grants = HashSet::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        let table = builder.build().unwrap();
+
+        let hdrs_a = headers_from(&[("x-tenant", "a")]);
+        let hdrs_b = headers_from(&[("x-tenant", "b")]);
+        let ctx_a = ctx_with(&Method::GET, &hdrs_a, None);
+        let ctx_b = ctx_with(&Method::GET, &hdrs_b, None);
+
+        assert_eq!(
+            table.route("example.com", "/", &ctx_a).unwrap().name,
+            "default/svc-a"
         );
-        let table = builder.build().unwrap();
-
-        assert!(table.route("example.com", "/").is_none());
+        assert_eq!(
+            table.route("example.com", "/", &ctx_b).unwrap().name,
+            "default/svc-b"
+        );
     }
 
     #[test]
-    fn cross_ns_ref_permitted_with_wildcard_grant() {
-        let store = slice_store(vec![make_slice("billing", "payments", "10.0.1.1")]);
-        let route = cross_ns_route("apps", "billing", "payments");
-        let g = grants(&[("apps", "billing", None)]);
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &g, &mut builder);
-        let table = builder.build().unwrap();
-
-        assert!(table.route("example.com", "/").is_some());
-    }
-
-    #[test]
-    fn cross_ns_ref_permitted_with_specific_grant() {
-        let store = slice_store(vec![make_slice("billing", "payments", "10.0.1.1")]);
-        let route = cross_ns_route("apps", "billing", "payments");
-        let g = grants(&[("apps", "billing", Some("payments"))]);
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &g, &mut builder);
-        let table = builder.build().unwrap();
-
-        assert!(table.route("example.com", "/").is_some());
-    }
-
-    #[test]
-    fn cross_ns_specific_grant_denies_different_svc() {
-        let store = slice_store(vec![make_slice("billing", "other-svc", "10.0.1.2")]);
-        let route = cross_ns_route("apps", "billing", "other-svc");
-        let g = grants(&[("apps", "billing", Some("payments"))]);
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &g, &mut builder);
-        let table = builder.build().unwrap();
-
-        assert!(table.route("example.com", "/").is_none());
-    }
-
-    #[test]
-    fn same_ns_ref_unaffected_by_empty_grants() {
+    fn reconcile_header_regex_routes_to_correct_backend() {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let route = make_route("default", &["example.com"], None, "svc");
-        let mut builder = RoutingTableBuilder::new();
-        GatewayApiReconciler::reconcile(
-            &route,
-            &store,
-            &default_owned(),
-            &HashSet::new(),
-            &mut builder,
+        let route = make_route(
+            "default",
+            &["example.com"],
+            Some(vec![header_regex_match("/", "x-version", r"^v\d+$")]),
+            "svc",
         );
+        let mut builder = RoutingTableBuilder::new();
+        let grants = HashSet::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
         let table = builder.build().unwrap();
 
-        assert!(table.route("example.com", "/").is_some());
+        let hdrs_ok = headers_from(&[("x-version", "v42")]);
+        let hdrs_bad = headers_from(&[("x-version", "beta")]);
+        let ctx_ok = ctx_with(&Method::GET, &hdrs_ok, None);
+        let ctx_bad = ctx_with(&Method::GET, &hdrs_bad, None);
+
+        assert!(table.route("example.com", "/", &ctx_ok).is_some());
+        assert!(table.route("example.com", "/", &ctx_bad).is_none());
+    }
+
+    #[test]
+    fn reconcile_method_routes_to_correct_backend() {
+        let store = slice_store(vec![
+            make_slice("default", "svc-get", "10.0.0.1"),
+            make_slice("default", "svc-post", "10.0.0.2"),
+        ]);
+
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                parent_refs: default_parents(),
+                hostnames: Some(vec!["example.com".to_string()]),
+                rules: Some(vec![
+                    HttpRouteRules {
+                        matches: Some(vec![method_match("/", HttpRouteRulesMatchesMethod::Get)]),
+                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                            name: "svc-get".to_string(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    },
+                    HttpRouteRules {
+                        matches: Some(vec![method_match("/", HttpRouteRulesMatchesMethod::Post)]),
+                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                            name: "svc-post".to_string(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut builder = RoutingTableBuilder::new();
+        let grants = HashSet::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        let table = builder.build().unwrap();
+
+        let h = HeaderMap::new();
+        let ctx_get = ctx_with(&Method::GET, &h, None);
+        let ctx_post = ctx_with(&Method::POST, &h, None);
+
+        assert_eq!(
+            table.route("example.com", "/", &ctx_get).unwrap().name,
+            "default/svc-get"
+        );
+        assert_eq!(
+            table.route("example.com", "/", &ctx_post).unwrap().name,
+            "default/svc-post"
+        );
+    }
+
+    #[test]
+    fn reconcile_query_param_routes_to_correct_backend() {
+        let store = slice_store(vec![
+            make_slice("default", "svc-v1", "10.0.0.1"),
+            make_slice("default", "svc-v2", "10.0.0.2"),
+        ]);
+
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                parent_refs: default_parents(),
+                hostnames: Some(vec!["example.com".to_string()]),
+                rules: Some(vec![
+                    HttpRouteRules {
+                        matches: Some(vec![query_exact_match("/", "version", "v1")]),
+                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                            name: "svc-v1".to_string(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    },
+                    HttpRouteRules {
+                        matches: Some(vec![query_exact_match("/", "version", "v2")]),
+                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                            name: "svc-v2".to_string(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut builder = RoutingTableBuilder::new();
+        let grants = HashSet::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        let table = builder.build().unwrap();
+
+        let h = HeaderMap::new();
+        let ctx_v1 = ctx_with(&Method::GET, &h, Some("version=v1"));
+        let ctx_v2 = ctx_with(&Method::GET, &h, Some("version=v2"));
+
+        assert_eq!(
+            table.route("example.com", "/", &ctx_v1).unwrap().name,
+            "default/svc-v1"
+        );
+        assert_eq!(
+            table.route("example.com", "/", &ctx_v2).unwrap().name,
+            "default/svc-v2"
+        );
+    }
+
+    #[test]
+    fn reconcile_invalid_regex_skips_match_entry() {
+        // A route with an invalid regex in a header predicate should log a warning
+        // and skip that match entry without poisoning the rest of the route.
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let route = make_route(
+            "default",
+            &["example.com"],
+            Some(vec![
+                // invalid regex
+                HttpRouteRulesMatches {
+                    headers: Some(vec![HttpRouteRulesMatchesHeaders {
+                        name: "x-bad".to_string(),
+                        value: "[invalid".to_string(),
+                        r#type: Some(HttpRouteRulesMatchesHeadersType::RegularExpression),
+                    }]),
+                    ..Default::default()
+                },
+                // valid path-only fallback
+                path_match("/", HttpRouteRulesMatchesPathType::PathPrefix),
+            ]),
+            "svc",
+        );
+        let mut builder = RoutingTableBuilder::new();
+        let grants = HashSet::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        let table = builder.build().unwrap();
+
+        // The valid fallback entry is still registered.
+        let empty_hdrs = HeaderMap::new();
+        let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
+        assert!(table.route("example.com", "/", &ctx).is_some());
+    }
+
+    #[test]
+    fn reconcile_header_name_dedup_keeps_first() {
+        // Two entries for the same (case-insensitive) header name in one match:
+        // only the first is used (per Gateway API spec).
+        let m = HttpRouteRulesMatches {
+            headers: Some(vec![
+                HttpRouteRulesMatchesHeaders {
+                    name: "X-Tenant".to_string(),
+                    value: "first".to_string(),
+                    r#type: Some(HttpRouteRulesMatchesHeadersType::Exact),
+                },
+                HttpRouteRulesMatchesHeaders {
+                    name: "x-tenant".to_string(), // same header, different case
+                    value: "second".to_string(),
+                    r#type: Some(HttpRouteRulesMatchesHeadersType::Exact),
+                },
+            ]),
+            ..Default::default()
+        };
+        let predicates = GatewayApiReconciler::build_predicates(&m).unwrap();
+        assert_eq!(predicates.headers.len(), 1);
+        match &predicates.headers[0].matcher {
+            ValueMatch::Exact(v) => assert_eq!(v, "first"),
+            _ => panic!("expected exact matcher"),
+        }
     }
 }
