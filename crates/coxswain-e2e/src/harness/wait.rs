@@ -1,6 +1,7 @@
 use anyhow::Context as _;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
+use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::Api;
 use std::{net::SocketAddr, time::Duration};
@@ -106,6 +107,37 @@ pub async fn wait_for_route(
         }
         if time::Instant::now() >= deadline {
             anyhow::bail!("timed out waiting for route {host}{path} to become live");
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+pub async fn wait_for_ingress_lb_ip(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    expected_ip: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<Ingress> = Api::namespaced(client.clone(), namespace);
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        if let Ok(ing) = api.get(name).await {
+            let current = ing
+                .status
+                .as_ref()
+                .and_then(|s| s.load_balancer.as_ref())
+                .and_then(|lb| lb.ingress.as_deref())
+                .and_then(|entries| entries.first())
+                .and_then(|e| e.ip.as_deref());
+            if current == Some(expected_ip) {
+                return Ok(());
+            }
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for Ingress {namespace}/{name} to have loadBalancer ip={expected_ip}"
+            );
         }
         time::sleep(Duration::from_millis(500)).await;
     }

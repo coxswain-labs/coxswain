@@ -106,7 +106,7 @@ The most critical correctness gaps. Without these, Coxswain is unsafe in any sha
 - [x] ~~Namespace-scoped watch (wire up `--controller-watch-namespace`) — [#4](https://github.com/coxswain-labs/coxswain/issues/4) `MUST`~~
 - [ ] Multi-namespace watch (comma-separated list + label selector) — [#59](https://github.com/coxswain-labs/coxswain/issues/59) `SHOULD`
 - [x] ~~Gateway resource status patching — [#5](https://github.com/coxswain-labs/coxswain/issues/5) `MUST`~~
-- [ ] Ingress `.status.loadBalancer` patching — [#48](https://github.com/coxswain-labs/coxswain/issues/48) `MUST`
+- [x] ~~Ingress `.status.loadBalancer` patching — [#48](https://github.com/coxswain-labs/coxswain/issues/48) `MUST`~~
 - [ ] Default backend for Ingress — [#6](https://github.com/coxswain-labs/coxswain/issues/6) `MUST`
 - [ ] HTTPRoute header, method, query matching — [#7](https://github.com/coxswain-labs/coxswain/issues/7) `MUST`
 

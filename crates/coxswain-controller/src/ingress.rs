@@ -8,6 +8,25 @@ use std::sync::Arc;
 
 pub struct IngressReconciler;
 
+/// Returns the IngressClass name claimed by `ingress`.
+///
+/// Checks `spec.ingressClassName` first; falls back to the legacy
+/// `kubernetes.io/ingress.class` annotation. Returns `None` when neither
+/// is set (opt-in semantics: unclassified Ingresses are ignored).
+pub fn claimed_ingress_class(ingress: &Ingress) -> Option<&str> {
+    ingress
+        .spec
+        .as_ref()
+        .and_then(|s| s.ingress_class_name.as_deref())
+        .or_else(|| {
+            ingress
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("kubernetes.io/ingress.class").map(String::as_str))
+        })
+}
+
 impl IngressReconciler {
     /// Skips the Ingress when it does not reference an owned IngressClass.
     /// Never queries the API server.
@@ -17,17 +36,7 @@ impl IngressReconciler {
         owned_classes: &HashSet<String>,
         builder: &mut RoutingTableBuilder,
     ) {
-        let claimed_class = ingress
-            .spec
-            .as_ref()
-            .and_then(|s| s.ingress_class_name.as_deref())
-            .or_else(|| {
-                ingress
-                    .metadata
-                    .annotations
-                    .as_ref()
-                    .and_then(|a| a.get("kubernetes.io/ingress.class").map(String::as_str))
-            });
+        let claimed_class = claimed_ingress_class(ingress);
 
         match claimed_class {
             None => {

@@ -6,6 +6,7 @@ use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteParentRefs, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
 };
+use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::{
     Client,
@@ -16,11 +17,21 @@ use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const LEASE_NAME: &str = "coxswain-leader-lock";
+
+/// The external address written to `Ingress.status.loadBalancer.ingress[0]`.
+///
+/// Parsed from `--ingress-status-address` at startup: if the value is a valid
+/// `IpAddr` it becomes `Ip`, otherwise it is treated as a DNS hostname.
+pub enum IngressStatusAddress {
+    Ip(IpAddr),
+    Hostname(String),
+}
 
 /// Configuration for the leader-election controller.
 ///
@@ -35,6 +46,9 @@ pub struct ControllerConfig {
     pub lease_renew_interval: Duration,
     /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
     pub watch_namespace: Option<String>,
+    /// When set, the leader writes this address to every owned
+    /// `Ingress.status.loadBalancer.ingress[0]` after each watch event.
+    pub ingress_status_address: Option<IngressStatusAddress>,
 }
 
 impl ControllerConfig {
@@ -45,6 +59,7 @@ impl ControllerConfig {
         lease_ttl: Duration,
         lease_renew_interval: Duration,
         watch_namespace: Option<String>,
+        ingress_status_address: Option<String>,
     ) -> Result<Self, String> {
         if lease_renew_interval * 3 > lease_ttl {
             return Err(format!(
@@ -52,6 +67,18 @@ impl ControllerConfig {
                  1/3 of lease_ttl ({lease_ttl:?})"
             ));
         }
+        let ingress_status_address = ingress_status_address
+            .map(|s| {
+                let s = s.trim().to_string();
+                if s.is_empty() {
+                    return Err("ingress_status_address must not be empty".to_string());
+                }
+                match s.parse::<IpAddr>() {
+                    Ok(ip) => Ok(IngressStatusAddress::Ip(ip)),
+                    Err(_) => Ok(IngressStatusAddress::Hostname(s)),
+                }
+            })
+            .transpose()?;
         Ok(Self {
             controller_name,
             pod_name,
@@ -59,8 +86,31 @@ impl ControllerConfig {
             lease_ttl,
             lease_renew_interval,
             watch_namespace,
+            ingress_status_address,
         })
     }
+}
+
+fn ingress_lb_already_matches(ingress: &Ingress, addr: &IngressStatusAddress) -> bool {
+    let entry = ingress
+        .status
+        .as_ref()
+        .and_then(|s| s.load_balancer.as_ref())
+        .and_then(|lb| lb.ingress.as_deref())
+        .and_then(|entries| entries.first());
+    match (entry, addr) {
+        (Some(e), IngressStatusAddress::Ip(ip)) => e.ip.as_deref() == Some(&ip.to_string()),
+        (Some(e), IngressStatusAddress::Hostname(h)) => e.hostname.as_deref() == Some(h.as_str()),
+        (None, _) => false,
+    }
+}
+
+fn build_ingress_status_patch(addr: &IngressStatusAddress) -> serde_json::Value {
+    let entry = match addr {
+        IngressStatusAddress::Ip(ip) => serde_json::json!({ "ip": ip.to_string() }),
+        IngressStatusAddress::Hostname(h) => serde_json::json!({ "hostname": h }),
+    };
+    serde_json::json!({ "status": { "loadBalancer": { "ingress": [entry] } } })
 }
 
 fn scoped_api<T>(client: Client, ns: Option<&str>) -> Api<T>
@@ -219,16 +269,33 @@ impl Controller {
             watcher::Config::default(),
         )
         .default_backoff();
+        let ingress_class_watcher = watcher(
+            Api::<k8s_openapi::api::networking::v1::IngressClass>::all(client.clone()),
+            watcher::Config::default(),
+        )
+        .default_backoff();
+        let ingress_watcher = watcher(
+            scoped_api::<Ingress>(client.clone(), self.config.watch_namespace.as_deref()),
+            watcher::Config::default(),
+        )
+        .default_backoff();
 
         tokio::pin!(route_watcher);
         tokio::pin!(gateway_class_watcher);
         tokio::pin!(gateway_watcher);
+        tokio::pin!(ingress_class_watcher);
+        tokio::pin!(ingress_watcher);
 
         // Names of GatewayClass resources whose controllerName matches ours.
         // Populated from the gateway_class_watcher arm so we can quickly decide
         // whether an incoming Gateway event belongs to us without relying on the
         // reconciler's debounced owned_gateways snapshot.
         let mut owned_gateway_classes: HashSet<String> = HashSet::new();
+
+        // Names of IngressClass resources whose spec.controller matches ours.
+        // Populated from the ingress_class_watcher arm; used to skip Ingress
+        // status patches for Ingresses not managed by this controller.
+        let mut owned_ingress_classes: HashSet<String> = HashSet::new();
 
         // interval_at delays the first tick so we don't double-acquire immediately.
         let mut renewal_interval = tokio::time::interval_at(
@@ -336,6 +403,43 @@ impl Controller {
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "Gateway watch error"),
+                    }
+                }
+
+                Some(event) = ingress_class_watcher.next() => {
+                    match event {
+                        Ok(watcher::Event::Apply(ic) | watcher::Event::InitApply(ic)) => {
+                            let name = ic.metadata.name.clone().unwrap_or_default();
+                            if ic.spec.as_ref().and_then(|s| s.controller.as_deref())
+                                == Some(self.config.controller_name.as_str())
+                            {
+                                owned_ingress_classes.insert(name);
+                            } else {
+                                owned_ingress_classes.remove(&name);
+                            }
+                        }
+                        Ok(watcher::Event::Delete(ic)) => {
+                            let name = ic.metadata.name.clone().unwrap_or_default();
+                            owned_ingress_classes.remove(&name);
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "IngressClass watch error"),
+                    }
+                }
+
+                Some(event) = ingress_watcher.next() => {
+                    if let Some(addr) = &self.config.ingress_status_address {
+                        match event {
+                            Ok(watcher::Event::Apply(ing) | watcher::Event::InitApply(ing)) => {
+                                let class = crate::ingress::claimed_ingress_class(&ing);
+                                let owned = class.is_some_and(|c| owned_ingress_classes.contains(c));
+                                if is_leader && owned && !ingress_lb_already_matches(&ing, addr) {
+                                    Self::patch_ingress_status(&client, &ing, addr).await;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "Ingress watch error"),
+                        }
                     }
                 }
 
@@ -466,6 +570,23 @@ impl Controller {
         {
             Ok(_) => tracing::info!(name, ns, "HTTPRoute programmed"),
             Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch HTTPRoute status"),
+        }
+    }
+
+    async fn patch_ingress_status(client: &Client, ingress: &Ingress, addr: &IngressStatusAddress) {
+        let name = match ingress.metadata.name.as_deref() {
+            Some(n) => n,
+            None => return,
+        };
+        let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
+        let api: Api<Ingress> = Api::namespaced(client.clone(), ns);
+        let patch = build_ingress_status_patch(addr);
+        match api
+            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => tracing::info!(name, ns, "Ingress loadBalancer status patched"),
+            Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Ingress status"),
         }
     }
 }
@@ -734,5 +855,153 @@ mod tests {
             ..Default::default()
         };
         assert!(!gateway_programmed(&gw));
+    }
+
+    // --- IngressStatusAddress helpers ---
+
+    use k8s_openapi::api::networking::v1::{
+        IngressLoadBalancerIngress, IngressLoadBalancerStatus, IngressStatus,
+    };
+
+    fn ingress_with_lb(ip: Option<&str>, hostname: Option<&str>) -> Ingress {
+        Ingress {
+            status: Some(IngressStatus {
+                load_balancer: Some(IngressLoadBalancerStatus {
+                    ingress: Some(vec![IngressLoadBalancerIngress {
+                        ip: ip.map(str::to_string),
+                        hostname: hostname.map(str::to_string),
+                        ..Default::default()
+                    }]),
+                }),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn patch_uses_ip_field_for_ip_address() {
+        let addr = IngressStatusAddress::Ip("203.0.113.1".parse().unwrap());
+        let patch = build_ingress_status_patch(&addr);
+        assert_eq!(
+            patch,
+            serde_json::json!({
+                "status": { "loadBalancer": { "ingress": [{ "ip": "203.0.113.1" }] } }
+            })
+        );
+    }
+
+    #[test]
+    fn patch_uses_hostname_field_for_hostname() {
+        let addr = IngressStatusAddress::Hostname("coxswain.example.com".into());
+        let patch = build_ingress_status_patch(&addr);
+        assert_eq!(
+            patch,
+            serde_json::json!({
+                "status": { "loadBalancer": { "ingress": [{ "hostname": "coxswain.example.com" }] } }
+            })
+        );
+    }
+
+    #[test]
+    fn lb_already_matches_returns_true_when_ip_equal() {
+        let ing = ingress_with_lb(Some("203.0.113.1"), None);
+        let addr = IngressStatusAddress::Ip("203.0.113.1".parse().unwrap());
+        assert!(ingress_lb_already_matches(&ing, &addr));
+    }
+
+    #[test]
+    fn lb_already_matches_returns_false_when_ip_differs() {
+        let ing = ingress_with_lb(Some("10.0.0.1"), None);
+        let addr = IngressStatusAddress::Ip("203.0.113.1".parse().unwrap());
+        assert!(!ingress_lb_already_matches(&ing, &addr));
+    }
+
+    #[test]
+    fn lb_already_matches_returns_true_when_hostname_equal() {
+        let ing = ingress_with_lb(None, Some("coxswain.example.com"));
+        let addr = IngressStatusAddress::Hostname("coxswain.example.com".into());
+        assert!(ingress_lb_already_matches(&ing, &addr));
+    }
+
+    #[test]
+    fn lb_already_matches_returns_false_when_hostname_differs() {
+        let ing = ingress_with_lb(None, Some("other.example.com"));
+        let addr = IngressStatusAddress::Hostname("coxswain.example.com".into());
+        assert!(!ingress_lb_already_matches(&ing, &addr));
+    }
+
+    #[test]
+    fn lb_already_matches_returns_false_when_status_empty() {
+        let ing = Ingress {
+            status: None,
+            ..Default::default()
+        };
+        let addr = IngressStatusAddress::Ip("203.0.113.1".parse().unwrap());
+        assert!(!ingress_lb_already_matches(&ing, &addr));
+    }
+
+    #[test]
+    fn controller_config_parses_ip_address() {
+        let cfg = ControllerConfig::new(
+            "ctrl".into(),
+            "pod".into(),
+            "ns".into(),
+            Duration::from_secs(15),
+            Duration::from_secs(5),
+            None,
+            Some("203.0.113.1".into()),
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg.ingress_status_address,
+            Some(IngressStatusAddress::Ip(_))
+        ));
+    }
+
+    #[test]
+    fn controller_config_parses_hostname() {
+        let cfg = ControllerConfig::new(
+            "ctrl".into(),
+            "pod".into(),
+            "ns".into(),
+            Duration::from_secs(15),
+            Duration::from_secs(5),
+            None,
+            Some("coxswain.example.com".into()),
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg.ingress_status_address,
+            Some(IngressStatusAddress::Hostname(_))
+        ));
+    }
+
+    #[test]
+    fn controller_config_rejects_empty_status_address() {
+        let result = ControllerConfig::new(
+            "ctrl".into(),
+            "pod".into(),
+            "ns".into(),
+            Duration::from_secs(15),
+            Duration::from_secs(5),
+            None,
+            Some("   ".into()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn controller_config_none_address_is_ok() {
+        let cfg = ControllerConfig::new(
+            "ctrl".into(),
+            "pod".into(),
+            "ns".into(),
+            Duration::from_secs(15),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(cfg.ingress_status_address.is_none());
     }
 }

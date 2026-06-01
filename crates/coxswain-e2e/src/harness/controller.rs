@@ -9,8 +9,19 @@ pub struct ControllerProcess {
     pub admin_addr: SocketAddr,
 }
 
+/// Optional parameters for `ControllerProcess::start_with_options`.
+#[derive(Default)]
+pub struct ControllerOptions {
+    /// When set, passed as `--ingress-status-address` to the controller.
+    pub ingress_status_address: Option<String>,
+}
+
 impl ControllerProcess {
     pub async fn start() -> anyhow::Result<Self> {
+        Self::start_with_options(ControllerOptions::default()).await
+    }
+
+    pub async fn start_with_options(opts: ControllerOptions) -> anyhow::Result<Self> {
         let proxy_addr = free_addr()?;
         let health_addr = free_addr()?;
         let admin_addr = free_addr()?;
@@ -21,26 +32,32 @@ impl ControllerProcess {
         let pod_name = format!("coxswain-e2e-{}", std::process::id());
 
         let binary = coxswain_bin()?;
+        let mut args = vec![
+            "serve".to_string(),
+            "--proxy-addr".to_string(),
+            proxy_addr.to_string(),
+            "--health-addr".to_string(),
+            health_addr.to_string(),
+            "--admin-addr".to_string(),
+            admin_addr.to_string(),
+            "--log-format".to_string(),
+            "console".to_string(),
+            "--pod-name".to_string(),
+            pod_name,
+            "--pod-namespace".to_string(),
+            "coxswain-system".to_string(),
+            "--controller-lease-ttl".to_string(),
+            "3s".to_string(),
+            "--controller-lease-renew-interval".to_string(),
+            "1s".to_string(),
+        ];
+        if let Some(addr) = opts.ingress_status_address {
+            args.push("--ingress-status-address".to_string());
+            args.push(addr);
+        }
+
         let child = Command::new(&binary)
-            .args([
-                "serve",
-                "--proxy-addr",
-                &proxy_addr.to_string(),
-                "--health-addr",
-                &health_addr.to_string(),
-                "--admin-addr",
-                &admin_addr.to_string(),
-                "--log-format",
-                "console",
-                "--pod-name",
-                &pod_name,
-                "--pod-namespace",
-                "coxswain-system",
-                "--controller-lease-ttl",
-                "3s",
-                "--controller-lease-renew-interval",
-                "1s",
-            ])
+            .args(&args)
             .spawn()
             .with_context(|| format!("spawn {}", binary.display()))?;
 
