@@ -51,10 +51,21 @@ impl IngressReconciler {
         }
 
         let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
-        let rules = match ingress.spec.as_ref().and_then(|s| s.rules.as_deref()) {
-            Some(r) if !r.is_empty() => r,
-            _ => return,
-        };
+        let spec = ingress.spec.as_ref();
+        let rules = spec.and_then(|s| s.rules.as_deref());
+
+        if rules.map_or(true, |r| r.is_empty()) {
+            if spec.and_then(|s| s.default_backend.as_ref()).is_some() {
+                tracing::warn!(
+                    name = ?ingress.metadata.name,
+                    "spec.defaultBackend is set but spec.rules is empty — \
+                     default backend is a no-op; use --ingress-default-backend \
+                     for a controller-wide fallback"
+                );
+            }
+            return;
+        }
+        let rules = rules.unwrap();
 
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
@@ -100,6 +111,37 @@ impl IngressReconciler {
                     }
                     _ => {
                         host_builder.add_prefix_route(path, upstream);
+                    }
+                }
+            }
+        }
+
+        // Install spec.defaultBackend as prefix "/" on each rule host so path-misses
+        // on those hosts fall to this backend. Per-rule routes win because they are
+        // inserted above; first-writer-wins semantics mean "/" is only claimed here
+        // if no rule already registered it.
+        if let Some(default_svc) = spec
+            .and_then(|s| s.default_backend.as_ref())
+            .and_then(|b| b.service.as_ref())
+        {
+            if let Some(port) = default_svc.port.as_ref().and_then(|p| p.number) {
+                let addrs = endpoints::resolve(ns, &default_svc.name, port, slices);
+                if addrs.is_empty() {
+                    tracing::warn!(
+                        ingress = ?ingress.metadata.name,
+                        svc = %default_svc.name,
+                        "No ready endpoints for defaultBackend — skipping"
+                    );
+                } else {
+                    let upstream =
+                        Arc::new(Upstream::new(format!("{ns}/{}", default_svc.name), addrs));
+                    for rule in rules {
+                        let host_builder = match rule.host.as_deref() {
+                            None => builder.catchall(),
+                            Some(h) if h.starts_with("*.") => builder.wildcard_host(h),
+                            Some(h) => builder.exact_host(h),
+                        };
+                        host_builder.add_prefix_route("/", Arc::clone(&upstream));
                     }
                 }
             }
@@ -201,6 +243,192 @@ mod tests {
             }),
             status: None,
         }
+    }
+
+    fn make_ingress_with_default(
+        ns: &str,
+        host: Option<&str>,
+        rule_path: &str,
+        rule_svc: &str,
+        default_svc: Option<&str>,
+    ) -> Ingress {
+        Ingress {
+            metadata: ObjectMeta {
+                name: Some("test-ingress".to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                ingress_class_name: Some("coxswain".to_string()),
+                rules: Some(vec![IngressRule {
+                    host: host.map(str::to_string),
+                    http: Some(HTTPIngressRuleValue {
+                        paths: vec![HTTPIngressPath {
+                            path: Some(rule_path.to_string()),
+                            path_type: "Prefix".to_string(),
+                            backend: IngressBackend {
+                                service: Some(IngressServiceBackend {
+                                    name: rule_svc.to_string(),
+                                    port: Some(ServiceBackendPort {
+                                        number: Some(80),
+                                        ..Default::default()
+                                    }),
+                                }),
+                                ..Default::default()
+                            },
+                        }],
+                    }),
+                }]),
+                default_backend: default_svc.map(|svc| IngressBackend {
+                    service: Some(IngressServiceBackend {
+                        name: svc.to_string(),
+                        port: Some(ServiceBackendPort {
+                            number: Some(80),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    fn make_default_only_ingress(ns: &str, default_svc: &str) -> Ingress {
+        Ingress {
+            metadata: ObjectMeta {
+                name: Some("test-ingress".to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                ingress_class_name: Some("coxswain".to_string()),
+                rules: None,
+                default_backend: Some(IngressBackend {
+                    service: Some(IngressServiceBackend {
+                        name: default_svc.to_string(),
+                        port: Some(ServiceBackendPort {
+                            number: Some(80),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_default_backend_catches_path_miss() {
+        let store = slice_store(vec![
+            make_slice("default", "rule-svc", "10.0.0.1"),
+            make_slice("default", "default-svc", "10.0.0.2"),
+        ]);
+        let ingress = make_ingress_with_default(
+            "default",
+            Some("example.com"),
+            "/api",
+            "rule-svc",
+            Some("default-svc"),
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+
+        assert_eq!(
+            table.route("example.com", "/api/v1").unwrap().name,
+            "default/rule-svc"
+        );
+        assert_eq!(
+            table.route("example.com", "/other").unwrap().name,
+            "default/default-svc"
+        );
+    }
+
+    #[test]
+    fn reconcile_default_backend_skipped_when_no_rules() {
+        let store = slice_store(vec![make_slice("default", "default-svc", "10.0.0.1")]);
+        let ingress = make_default_only_ingress("default", "default-svc");
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+
+        assert!(table.route("any.host.com", "/").is_none());
+    }
+
+    #[test]
+    fn reconcile_default_backend_skipped_when_no_endpoints() {
+        let store = slice_store(vec![
+            make_slice("default", "rule-svc", "10.0.0.1"),
+            // no slice for default-svc → no endpoints
+        ]);
+        let ingress = make_ingress_with_default(
+            "default",
+            Some("example.com"),
+            "/api",
+            "rule-svc",
+            Some("default-svc"),
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+
+        assert!(table.route("example.com", "/api").is_some());
+        assert!(table.route("example.com", "/other").is_none());
+    }
+
+    #[test]
+    fn reconcile_default_backend_on_wildcard_host() {
+        let store = slice_store(vec![
+            make_slice("default", "rule-svc", "10.0.0.1"),
+            make_slice("default", "default-svc", "10.0.0.2"),
+        ]);
+        let ingress = make_ingress_with_default(
+            "default",
+            Some("*.example.com"),
+            "/api",
+            "rule-svc",
+            Some("default-svc"),
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+
+        assert_eq!(
+            table.route("api.example.com", "/api").unwrap().name,
+            "default/rule-svc"
+        );
+        assert_eq!(
+            table.route("api.example.com", "/other").unwrap().name,
+            "default/default-svc"
+        );
+    }
+
+    #[test]
+    fn reconcile_rule_root_path_wins_over_default_backend() {
+        let store = slice_store(vec![
+            make_slice("default", "rule-svc", "10.0.0.1"),
+            make_slice("default", "default-svc", "10.0.0.2"),
+        ]);
+        // Rule already claims "/"; defaultBackend should not override it.
+        let ingress = make_ingress_with_default(
+            "default",
+            Some("example.com"),
+            "/",
+            "rule-svc",
+            Some("default-svc"),
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+
+        assert_eq!(
+            table.route("example.com", "/anything").unwrap().name,
+            "default/rule-svc"
+        );
     }
 
     #[test]
