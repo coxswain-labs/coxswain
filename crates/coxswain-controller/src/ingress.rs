@@ -54,7 +54,7 @@ impl IngressReconciler {
         let spec = ingress.spec.as_ref();
         let rules = spec.and_then(|s| s.rules.as_deref());
 
-        if rules.map_or(true, |r| r.is_empty()) {
+        if rules.is_none_or(|r| r.is_empty()) {
             if spec.and_then(|s| s.default_backend.as_ref()).is_some() {
                 tracing::warn!(
                     name = ?ingress.metadata.name,
@@ -123,26 +123,24 @@ impl IngressReconciler {
         if let Some(default_svc) = spec
             .and_then(|s| s.default_backend.as_ref())
             .and_then(|b| b.service.as_ref())
+            && let Some(port) = default_svc.port.as_ref().and_then(|p| p.number)
         {
-            if let Some(port) = default_svc.port.as_ref().and_then(|p| p.number) {
-                let addrs = endpoints::resolve(ns, &default_svc.name, port, slices);
-                if addrs.is_empty() {
-                    tracing::warn!(
-                        ingress = ?ingress.metadata.name,
-                        svc = %default_svc.name,
-                        "No ready endpoints for defaultBackend — skipping"
-                    );
-                } else {
-                    let upstream =
-                        Arc::new(Upstream::new(format!("{ns}/{}", default_svc.name), addrs));
-                    for rule in rules {
-                        let host_builder = match rule.host.as_deref() {
-                            None => builder.catchall(),
-                            Some(h) if h.starts_with("*.") => builder.wildcard_host(h),
-                            Some(h) => builder.exact_host(h),
-                        };
-                        host_builder.add_prefix_route("/", Arc::clone(&upstream));
-                    }
+            let addrs = endpoints::resolve(ns, &default_svc.name, port, slices);
+            if addrs.is_empty() {
+                tracing::warn!(
+                    ingress = ?ingress.metadata.name,
+                    svc = %default_svc.name,
+                    "No ready endpoints for defaultBackend — skipping"
+                );
+            } else {
+                let upstream = Arc::new(Upstream::new(format!("{ns}/{}", default_svc.name), addrs));
+                for rule in rules {
+                    let host_builder = match rule.host.as_deref() {
+                        None => builder.catchall(),
+                        Some(h) if h.starts_with("*.") => builder.wildcard_host(h),
+                        Some(h) => builder.exact_host(h),
+                    };
+                    host_builder.add_prefix_route("/", Arc::clone(&upstream));
                 }
             }
         }

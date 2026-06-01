@@ -5,4 +5,4 @@ pub(crate) mod ingress;
 mod reconciler;
 
 pub use controller::{Controller, ControllerConfig};
-pub use reconciler::Reconciler;
+pub use reconciler::{IngressDefaultBackend, Reconciler};

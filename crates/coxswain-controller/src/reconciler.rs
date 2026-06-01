@@ -1,7 +1,7 @@
-use crate::{gateway_api::GatewayApiReconciler, ingress::IngressReconciler};
+use crate::{endpoints, gateway_api::GatewayApiReconciler, ingress::IngressReconciler};
 use async_trait::async_trait;
 use coxswain_core::ownership::OwnedGateways;
-use coxswain_core::routing::{RoutingTableBuilder, SharedRoutingTable};
+use coxswain_core::routing::{RoutingTableBuilder, SharedRoutingTable, Upstream};
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
@@ -22,6 +22,41 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
+/// A parsed reference to the controller-wide ingress default backend service.
+/// Set via `--ingress-default-backend=<namespace>/<service>:<port>`.
+#[derive(Clone, Debug)]
+pub struct IngressDefaultBackend {
+    pub namespace: String,
+    pub name: String,
+    pub port: i32,
+}
+
+impl std::str::FromStr for IngressDefaultBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (ns_name, port_str) = s.rsplit_once(':').ok_or_else(|| {
+            format!("missing port in '{s}'; expected <namespace>/<service>:<port>")
+        })?;
+        let (namespace, name) = ns_name.split_once('/').ok_or_else(|| {
+            format!("missing namespace in '{s}'; expected <namespace>/<service>:<port>")
+        })?;
+        let port: i32 = port_str
+            .parse()
+            .map_err(|_| format!("invalid port '{port_str}'; expected an integer"))?;
+        if namespace.is_empty() || name.is_empty() {
+            return Err(format!(
+                "namespace and service name must not be empty in '{s}'"
+            ));
+        }
+        Ok(IngressDefaultBackend {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            port,
+        })
+    }
+}
+
 /// Pingora background service that maintains reflector-backed stores for
 /// `HTTPRoute`, `Ingress`, `IngressClass`, `Gateway`, `GatewayClass`, and
 /// `EndpointSlice`, and rebuilds the routing table whenever any of them change
@@ -33,6 +68,7 @@ pub struct Reconciler {
     controller_name: String,
     /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
     watch_namespace: Option<String>,
+    ingress_default_backend: Option<IngressDefaultBackend>,
 }
 
 impl Reconciler {
@@ -41,12 +77,14 @@ impl Reconciler {
         owned_gateways: OwnedGateways,
         controller_name: String,
         watch_namespace: Option<String>,
+        ingress_default_backend: Option<IngressDefaultBackend>,
     ) -> Self {
         Self {
             routes,
             owned_gateways,
             controller_name,
             watch_namespace,
+            ingress_default_backend,
         }
     }
 }
@@ -74,6 +112,7 @@ impl BackgroundService for Reconciler {
             self.owned_gateways.clone(),
             self.controller_name.clone(),
             self.watch_namespace.clone(),
+            self.ingress_default_backend.clone(),
         )
         .await;
         loop {
@@ -95,6 +134,7 @@ async fn spawn_tasks(
     owned_gateways: OwnedGateways,
     controller_name: String,
     watch_namespace: Option<String>,
+    ingress_default_backend: Option<IngressDefaultBackend>,
 ) -> JoinSet<()> {
     let (route_reader, route_writer) = reflector::store::<HTTPRoute>();
     let (ingress_reader, ingress_writer) = reflector::store::<Ingress>();
@@ -290,6 +330,7 @@ async fn spawn_tasks(
                 &grant_reader,
                 &controller_name,
                 &owned_gateways,
+                ingress_default_backend.as_ref(),
                 &routes,
             );
         }
@@ -309,6 +350,7 @@ fn rebuild(
     grant_store: &reflector::Store<ReferenceGrant>,
     controller_name: &str,
     owned_gateways_handle: &OwnedGateways,
+    ingress_default_backend: Option<&IngressDefaultBackend>,
     shared: &SharedRoutingTable,
 ) {
     let routes = route_store.state();
@@ -399,6 +441,27 @@ fn rebuild(
     for ingress in &ingresses {
         IngressReconciler::reconcile(ingress, slice_store, &owned_ingress_classes, &mut builder);
     }
+
+    // Install the controller-wide default backend on the global catchall. Thanks to
+    // the catchall fall-through in RoutingTable::route, this also serves path-misses
+    // on hosts that did not declare their own spec.defaultBackend. Per-Ingress defaults
+    // always win because they are installed on the host router (matched first).
+    if let Some(db) = ingress_default_backend {
+        let addrs = endpoints::resolve(&db.namespace, &db.name, db.port, slice_store);
+        if addrs.is_empty() {
+            tracing::warn!(
+                svc = %format!("{}/{}", db.namespace, db.name),
+                "No ready endpoints for --ingress-default-backend — skipping"
+            );
+        } else {
+            let upstream = Arc::new(Upstream::new(
+                format!("{}/{}", db.namespace, db.name),
+                addrs,
+            ));
+            builder.catchall().add_prefix_route("/", upstream);
+        }
+    }
+
     match builder.build() {
         Ok(table) => {
             for c in table.conflicts() {
