@@ -12,6 +12,9 @@ pub async fn bootstrap() -> anyhow::Result<()> {
         )
         .await
         .context("install Gateway API CRDs")?;
+        wait_for_crds_established()
+            .await
+            .context("Gateway API CRDs not established")?;
     }
 
     let manifests = root.join("deploy/manifests");
@@ -47,6 +50,26 @@ async fn kubectl_apply(path: &Path) -> anyhow::Result<()> {
         .await
         .context("kubectl")?;
     anyhow::ensure!(status.success(), "kubectl apply failed: {}", path.display());
+    Ok(())
+}
+
+async fn wait_for_crds_established() -> anyhow::Result<()> {
+    let status = Command::new("kubectl")
+        .args([
+            "wait",
+            "--for=condition=Established",
+            "--timeout=60s",
+            "crd/gateways.gateway.networking.k8s.io",
+            "crd/httproutes.gateway.networking.k8s.io",
+            "crd/referencegrants.gateway.networking.k8s.io",
+        ])
+        .status()
+        .await
+        .context("kubectl wait CRDs")?;
+    anyhow::ensure!(
+        status.success(),
+        "Gateway API CRDs not established within 60s"
+    );
     Ok(())
 }
 
