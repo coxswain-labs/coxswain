@@ -6,7 +6,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 When the user says "start working on issue N":
 1. Run `gh issue view N --repo coxswain-labs/coxswain` to read the full issue description and grill the user, if necessary.
-2. Create and check out a branch named `issue-N` from `main`.
+2. Sync local `main` with the remote before branching: `git checkout main && git pull --ff-only origin main`. Then create and check out a branch named `issue-N` from that updated `main`.
 3. In `ROADMAP.md`, change the corresponding checklist item from `- [ ]` to `- [x] ~~...~~` (tick the checkbox and wrap the description in strikethrough). Commit this change on the new branch with `Refs #N`.
 4. Read all relevant source files before writing any code.
 5. Implement the issue per its acceptance criteria.
