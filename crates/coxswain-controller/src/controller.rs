@@ -429,7 +429,9 @@ impl Controller {
             .await
         {
             Ok(_) => tracing::info!(name, ns, "Gateway programmed"),
-            Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Gateway programmed status"),
+            Err(e) => {
+                tracing::warn!(name, ns, error = %e, "Failed to patch Gateway programmed status")
+            }
         }
     }
 

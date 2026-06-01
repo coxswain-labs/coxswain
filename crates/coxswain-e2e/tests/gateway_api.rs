@@ -137,8 +137,13 @@ async fn gateway_status() -> anyhow::Result<()> {
     wait::wait_for_backends(&ns.name).await?;
     fixtures::apply_fixture(GATEWAY_API_PATH_MATCHING, &ns.name, &[]).await?;
 
-    wait::wait_for_gateway_programmed(&h.client, "coxswain-test", &ns.name, Duration::from_secs(30))
-        .await?;
+    wait::wait_for_gateway_programmed(
+        &h.client,
+        "coxswain-test",
+        &ns.name,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     Ok(())
 }
