@@ -17,6 +17,7 @@ async fn status_load_balancer_ip() -> anyhow::Result<()> {
     init_tracing();
     let h = Harness::start_with_options(ControllerOptions {
         ingress_status_address: Some("203.0.113.1".to_string()),
+        ..Default::default()
     })
     .await?;
     let ns = NamespaceGuard::create(&h.client, "ing-lb-status").await?;
