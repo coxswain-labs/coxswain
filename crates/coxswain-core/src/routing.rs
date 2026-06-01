@@ -358,10 +358,10 @@ impl RoutingTable {
                 .find(|(s, _)| wildcard_matches(host, s))
                 .map(|(_, r)| r)
         };
-        if let Some(router) = host_router {
-            if let Some(upstream) = router.route(path) {
-                return Some(upstream);
-            }
+        if let Some(router) = host_router
+            && let Some(upstream) = router.route(path)
+        {
+            return Some(upstream);
         }
         self.catchall.as_ref()?.route(path)
     }

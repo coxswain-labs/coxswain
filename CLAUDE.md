@@ -5,7 +5,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 ## GitHub Issue Workflow
 
 When the user says "start working on issue N":
-1. Run `gh issue view N --repo coxswain-labs/coxswain` to read the full issue description.
+1. Run `gh issue view N --repo coxswain-labs/coxswain` to read the full issue description and grill the user, if necessary.
 2. Create and check out a branch named `issue-N` from `main`.
 3. In `ROADMAP.md`, change the corresponding checklist item from `- [ ]` to `- [x] ~~...~~` (tick the checkbox and wrap the description in strikethrough). Commit this change on the new branch with `Refs #N`.
 4. Read all relevant source files before writing any code.
