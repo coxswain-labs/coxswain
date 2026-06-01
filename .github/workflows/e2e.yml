@@ -1,0 +1,84 @@
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'crates/**'
+      - 'deploy/manifests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/e2e.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'crates/**'
+      - 'deploy/manifests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/e2e.yml'
+
+name: E2E
+
+jobs:
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-e2e-
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: coxswain-e2e
+
+      - name: Route pod CIDR to kind node
+        run: |
+          # kind places nodes on a named "kind" network, not the default bridge.
+          KIND_NODE_IP=$(docker inspect coxswain-e2e-control-plane \
+            --format '{{ (index .NetworkSettings.Networks "kind").IPAddress }}')
+          # spec.podCIDR may not be populated; fall back to the kindnet default.
+          POD_CIDR=$(kubectl get node coxswain-e2e-control-plane \
+            -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
+          POD_CIDR=${POD_CIDR:-10.244.0.0/16}
+          echo "Routing $POD_CIDR via $KIND_NODE_IP"
+          sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
+
+      - name: Pre-pull echo backend image into kind
+        run: |
+          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
+          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1 --name coxswain-e2e
+
+      - name: Build coxswain binary
+        run: cargo build --bin coxswain
+
+      - name: Run e2e tests
+        run: |
+          cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
+          cargo test -p coxswain-e2e --test ingress -- --test-threads=1
+        env:
+          RUST_LOG: coxswain_e2e=debug,warn
+
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          echo "=== Namespaces ==="
+          kubectl get namespaces -l coxswain-e2e=true
+          echo "=== Events ==="
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50
+          echo "=== HTTPRoutes ==="
+          kubectl get httproutes -A
+          echo "=== Ingresses ==="
+          kubectl get ingresses -A

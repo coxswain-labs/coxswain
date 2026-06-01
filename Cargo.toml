@@ -6,6 +6,15 @@ members = [
     "crates/coxswain-controller",
     "crates/coxswain-proxy",
     "crates/coxswain-health",
+    "crates/coxswain-admin",
+    "crates/coxswain-e2e"
+]
+default-members = [
+    "crates/coxswain-bin",
+    "crates/coxswain-core",
+    "crates/coxswain-controller",
+    "crates/coxswain-proxy",
+    "crates/coxswain-health",
     "crates/coxswain-admin"
 ]
 
@@ -44,7 +53,9 @@ pingora-proxy = { version = "0.8" }
 prometheus = { version = "0.14" }
 regex = { version = "1.12"}
 serde = { version = "1", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = { version = "1.0" }
+tempfile = { version = "3" }
 thiserror = { version = "2.0" }
 tokio = { version = "1", features = ["full"] }
 tracing = { version = "0.1" }

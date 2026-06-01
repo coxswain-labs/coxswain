@@ -23,7 +23,7 @@ When developing locally, run the binary directly on your machine. It discovers t
 The Gateway API CRDs are not bundled with Kubernetes and must be installed once per cluster:
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
 ```
 
 ### 2. Apply the cluster manifests
@@ -136,7 +136,7 @@ Delete the grant to confirm enforcement:
 
 ```bash
 kubectl delete referencegrant allow-httproute-from-default -n echo-tenant
-curl -H "Host: cross-ns.local" http://localhost:8080/   # 502 Bad Gateway
+curl -H "Host: cross-ns.local" http://localhost:8080/   # 503 Service Unavailable
 
 # Restore
 kubectl apply -f deploy/dev/cross-namespace.yaml
@@ -182,6 +182,51 @@ cargo release minor --dry-run
 ```
 
 Shows exactly what would happen without making any changes.
+
+---
+
+## Integration tests
+
+The `crates/coxswain-e2e/` crate contains cluster-backed integration tests that run
+against any Kubernetes cluster pointed to by `~/.kube/config`.
+
+### Prerequisites
+
+Same as above: a running local cluster and `kubectl` in `$PATH`.
+
+### Run the suite
+
+```bash
+# Build the controller binary first (the harness locates it from the build output).
+cargo build --bin coxswain
+
+# Run all e2e tests (serial, ~1–2 min on first run while images are pulled).
+cargo test -p coxswain-e2e -- --test-threads=1
+```
+
+The harness bootstraps the cluster on first run (installs Gateway API CRDs, applies
+`deploy/manifests/`). Subsequent runs skip bootstrap in ~100 ms.
+
+### Verbose output
+
+```bash
+RUST_LOG=coxswain_e2e=debug,warn \
+  cargo test -p coxswain-e2e -- --test-threads=1 --nocapture
+```
+
+### Manual cleanup after interrupted run
+
+```bash
+kubectl delete ns -l coxswain-e2e=true
+```
+
+### Notes
+
+- `cargo test` (without `-p coxswain-e2e`) does **not** run these tests; they are
+  excluded from `default-members` to keep the normal unit-test loop fast.
+- CI runs the suite in a fresh `kind` cluster on every PR (see `.github/workflows/e2e.yml`).
+- Set `COXSWAIN_BIN=/path/to/binary` to point the harness at a specific binary instead
+  of using the default `target/debug/coxswain`.
 
 ---
 
