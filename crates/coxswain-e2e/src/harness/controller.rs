@@ -14,6 +14,9 @@ pub struct ControllerProcess {
 pub struct ControllerOptions {
     /// When set, passed as `--ingress-status-address` to the controller.
     pub ingress_status_address: Option<String>,
+    /// When set, passed as `--ingress-default-backend` to the controller.
+    /// Format: `<namespace>/<service>:<port>`.
+    pub ingress_default_backend: Option<String>,
 }
 
 impl ControllerProcess {
@@ -54,6 +57,10 @@ impl ControllerProcess {
         if let Some(addr) = opts.ingress_status_address {
             args.push("--ingress-status-address".to_string());
             args.push(addr);
+        }
+        if let Some(db) = opts.ingress_default_backend {
+            args.push("--ingress-default-backend".to_string());
+            args.push(db);
         }
 
         let child = Command::new(&binary)

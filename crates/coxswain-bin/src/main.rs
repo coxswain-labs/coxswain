@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use coxswain_admin::AdminServer;
-use coxswain_controller::{Controller, ControllerConfig, Reconciler};
+use coxswain_controller::{Controller, ControllerConfig, IngressDefaultBackend, Reconciler};
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::SharedRoutingTable;
 use coxswain_health::HealthServer;
@@ -161,6 +161,20 @@ pub struct ServeArgs {
     /// is not patched (backward-compatible default).
     #[arg(long, env = "COXSWAIN_INGRESS_STATUS_ADDRESS")]
     pub ingress_status_address: Option<String>,
+
+    /// Controller-wide default backend for Ingress traffic that does not match any rule.
+    ///
+    /// Format: `<namespace>/<service>:<port>` — e.g. `default/my-404-page:80`.
+    ///
+    /// When set, requests to hosts with no matching path (and requests to entirely
+    /// unknown hosts) are forwarded to this service. A per-Ingress `spec.defaultBackend`
+    /// always overrides this setting within that Ingress's rule hosts.
+    ///
+    /// The backing service is re-resolved on every routing-table rebuild; the default
+    /// disappears automatically if its endpoints become unavailable and reappears when
+    /// they recover.
+    #[arg(long, env = "COXSWAIN_INGRESS_DEFAULT_BACKEND")]
+    pub ingress_default_backend: Option<IngressDefaultBackend>,
 }
 
 fn main() -> Result<()> {
@@ -206,6 +220,7 @@ fn main() -> Result<()> {
         owned_gateways,
         args.controller_name.clone(),
         args.controller_watch_namespace.clone(),
+        args.ingress_default_backend,
     );
     register_proxy(&mut server, engine, args.proxy_addr);
     register_health(&mut server, synced.clone(), args.health_addr);
@@ -285,10 +300,17 @@ fn register_reconciler(
     owned_gateways: OwnedGateways,
     controller_name: String,
     watch_namespace: Option<String>,
+    ingress_default_backend: Option<IngressDefaultBackend>,
 ) {
     server.add_service(background_service(
         "reconciler",
-        Reconciler::new(routes, owned_gateways, controller_name, watch_namespace),
+        Reconciler::new(
+            routes,
+            owned_gateways,
+            controller_name,
+            watch_namespace,
+            ingress_default_backend,
+        ),
     ));
 }
 
