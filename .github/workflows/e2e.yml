@@ -46,9 +46,12 @@ jobs:
 
       - name: Route pod CIDR to kind node
         run: |
-          KIND_NODE_IP=$(docker inspect coxswain-e2e-control-plane --format '{{ .NetworkSettings.IPAddress }}')
-          # spec.podCIDR is not always populated; fall back to the kindnet default
-          POD_CIDR=$(kubectl get node coxswain-e2e-control-plane -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
+          # kind places nodes on a named "kind" network, not the default bridge.
+          KIND_NODE_IP=$(docker inspect coxswain-e2e-control-plane \
+            --format '{{ (index .NetworkSettings.Networks "kind").IPAddress }}')
+          # spec.podCIDR may not be populated; fall back to the kindnet default.
+          POD_CIDR=$(kubectl get node coxswain-e2e-control-plane \
+            -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
           POD_CIDR=${POD_CIDR:-10.244.0.0/16}
           echo "Routing $POD_CIDR via $KIND_NODE_IP"
           sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
