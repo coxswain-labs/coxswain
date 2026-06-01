@@ -10,6 +10,7 @@ When the user says "start working on issue N":
 3. In `ROADMAP.md`, change the corresponding checklist item from `- [ ]` to `- [x] ~~...~~` (tick the checkbox and wrap the description in strikethrough). Commit this change on the new branch with `Refs #N`.
 4. Read all relevant source files before writing any code.
 5. Implement the issue per its acceptance criteria.
+6. Add or update e2e tests in `crates/coxswain-e2e/` that cover the new behaviour. Every issue that changes routing, status conditions, or proxy behaviour must have at least one new scenario in `tests/gateway_api.rs` or `tests/ingress.rs`. Run `cargo test -p coxswain-e2e --test <file> -- --test-threads=1` locally before pushing.
 
 When working on a GitHub issue, always include a reference in every commit message:
 - Use `Refs #N` for partial work on an issue.
