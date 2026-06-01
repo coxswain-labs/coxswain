@@ -23,9 +23,9 @@ When the user says "close the issue" or "an issue is done":
 
 ## GitHub Milestones and Labels
 
-GitHub milestones use plain version numbers only (`v0.2`, `v0.3`, …, `v1.0`, `post-v1.0`). Never use special characters like em dashes, colons, or `&` in milestone titles — they break GitHub's issue filter URL parser.
+GitHub milestones use plain version numbers only (`v0.1`, `post-v0.1`; future milestones created on demand as scope is committed). Never use special characters like em dashes, colons, or `&` in milestone titles — they break GitHub's issue filter URL parser.
 
-The theme for each milestone lives in the description of the corresponding `milestone: vX.Y` label (e.g. `milestone: v0.2` has description "Multi-tenancy and Spec Correctness").
+The two active labels are `milestone: v0.1` and `milestone: post-v0.1`. Apply the matching label to every issue alongside its milestone assignment.
 
 ## Project Overview
 
