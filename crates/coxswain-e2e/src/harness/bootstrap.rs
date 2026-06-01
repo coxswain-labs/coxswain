@@ -8,7 +8,7 @@ pub async fn bootstrap() -> anyhow::Result<()> {
     if !gateway_crds_installed().await {
         tracing::info!("Gateway API CRDs absent, installing");
         kubectl_apply_url(
-            "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml",
+            "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml",
         )
         .await
         .context("install Gateway API CRDs")?;
