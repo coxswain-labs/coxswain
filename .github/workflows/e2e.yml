@@ -35,7 +35,9 @@ jobs:
         run: cargo build --bin coxswain
 
       - name: Run e2e tests
-        run: cargo test -p coxswain-e2e -- --test-threads=1
+        run: |
+          cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
+          cargo test -p coxswain-e2e --test ingress -- --test-threads=1
         env:
           RUST_LOG: coxswain_e2e=debug,warn
 

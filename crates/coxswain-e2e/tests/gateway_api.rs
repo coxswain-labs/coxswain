@@ -3,7 +3,7 @@ use coxswain_e2e::{
         self, BACKENDS_ECHO, GATEWAY_API_CROSS_NAMESPACE_ROUTE, GATEWAY_API_CROSS_NAMESPACE_TENANT,
         GATEWAY_API_HOST_POOL, GATEWAY_API_PATH_MATCHING, GATEWAY_API_WILDCARD_HOST,
     },
-    harness::{wait, Harness, NamespaceGuard},
+    harness::{Harness, NamespaceGuard, wait},
 };
 use std::time::Duration;
 
@@ -20,6 +20,7 @@ async fn path_matching() -> anyhow::Result<()> {
     let ns = NamespaceGuard::create(&h.client, "gw-path").await?;
 
     fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
     fixtures::apply_fixture(GATEWAY_API_PATH_MATCHING, &ns.name, &[]).await?;
 
     let host = format!("echo.{}.local", ns.name);
@@ -45,6 +46,7 @@ async fn host_pool() -> anyhow::Result<()> {
     let ns = NamespaceGuard::create(&h.client, "gw-pool").await?;
 
     fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
     fixtures::apply_fixture(GATEWAY_API_HOST_POOL, &ns.name, &[]).await?;
 
     let host = format!("pool.{}.local", ns.name);
@@ -79,12 +81,12 @@ async fn wildcard_host() -> anyhow::Result<()> {
     let ns = NamespaceGuard::create(&h.client, "gw-wildcard").await?;
 
     fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
     fixtures::apply_fixture(GATEWAY_API_WILDCARD_HOST, &ns.name, &[]).await?;
 
     // Any subdomain of *.wildcard.TESTNS.local should reach echo-c.
     let host = format!("foo.wildcard.{}.local", ns.name);
-    let resp =
-        wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-c");
 
     let host2 = format!("bar.wildcard.{}.local", ns.name);
@@ -108,6 +110,7 @@ async fn cross_namespace_with_grant() -> anyhow::Result<()> {
         &[("TESTNS", &ns.name)],
     )
     .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
 
     // Deploy the Gateway + HTTPRoute into the primary namespace.
     fixtures::apply_fixture(
@@ -118,8 +121,7 @@ async fn cross_namespace_with_grant() -> anyhow::Result<()> {
     .await?;
 
     let host = format!("cross-ns.{}.local", ns.name);
-    let resp =
-        wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-d");
 
     Ok(())
@@ -141,6 +143,7 @@ async fn cross_namespace_without_grant() -> anyhow::Result<()> {
         &[("TESTNS", &ns.name)],
     )
     .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
 
     // Delete the ReferenceGrant that was just applied.
     tokio::process::Command::new("kubectl")
@@ -164,12 +167,15 @@ async fn cross_namespace_without_grant() -> anyhow::Result<()> {
 
     let host = format!("cross-ns.{}.local", ns.name);
 
-    // Give the controller time to reconcile; without the grant the backend is
-    // unreachable, so requests should return 502.
+    // Give the controller time to reconcile; without the grant the host is
+    // never added to the routing table, so requests should return 503.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let status = h.http.get_status(&host, "/").await?;
-    assert_eq!(status, 502, "expected 502 without ReferenceGrant, got {status}");
+    assert_eq!(
+        status, 503,
+        "expected 503 without ReferenceGrant, got {status}"
+    );
 
     Ok(())
 }

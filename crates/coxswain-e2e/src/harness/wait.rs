@@ -33,18 +33,38 @@ pub async fn wait_for_httproute_programmed(
     let api: Api<HTTPRoute> = Api::namespaced(client.clone(), namespace);
     let deadline = time::Instant::now() + timeout;
     loop {
-        if let Ok(route) = api.get(name).await {
-            if route_has_condition(&route, "Programmed") {
-                return Ok(());
-            }
+        if let Ok(route) = api.get(name).await
+            && route_has_condition(&route, "Programmed")
+        {
+            return Ok(());
         }
         if time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for HTTPRoute {namespace}/{name} to be Programmed"
-            );
+            anyhow::bail!("timed out waiting for HTTPRoute {namespace}/{name} to be Programmed");
         }
         time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Wait for the named Deployments in `namespace` to become Available.
+/// Covers the image-pull + pod-start time on a fresh cluster.
+pub async fn wait_for_backends(namespace: &str) -> anyhow::Result<()> {
+    wait_for_deployments(namespace, &["echo-a", "echo-b", "echo-c"]).await
+}
+
+pub async fn wait_for_deployments(namespace: &str, names: &[&str]) -> anyhow::Result<()> {
+    let deployments: Vec<String> = names.iter().map(|n| format!("deployment/{n}")).collect();
+    let mut args = vec!["wait", "--for=condition=available", "--timeout=300s"];
+    for d in &deployments {
+        args.push(d.as_str());
+    }
+    args.extend(["-n", namespace]);
+    let status = tokio::process::Command::new("kubectl")
+        .args(&args)
+        .status()
+        .await
+        .context("kubectl wait deployments")?;
+    anyhow::ensure!(status.success(), "deployments not ready in {namespace}");
+    Ok(())
 }
 
 pub async fn wait_for_route(
@@ -55,9 +75,8 @@ pub async fn wait_for_route(
 ) -> anyhow::Result<crate::harness::http::EchoResponse> {
     let deadline = time::Instant::now() + timeout;
     loop {
-        match http.get(host, path).await {
-            Ok(resp) => return Ok(resp),
-            Err(_) => {}
+        if let Ok(resp) = http.get(host, path).await {
+            return Ok(resp);
         }
         if time::Instant::now() >= deadline {
             anyhow::bail!("timed out waiting for route {host}{path} to become live");

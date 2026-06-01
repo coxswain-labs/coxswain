@@ -1,6 +1,6 @@
 use coxswain_e2e::{
     fixtures::{self, BACKENDS_ECHO, INGRESS_PATH_MATCHING},
-    harness::{wait, Harness, NamespaceGuard},
+    harness::{Harness, NamespaceGuard, wait},
 };
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ async fn path_matching() -> anyhow::Result<()> {
     let ns = NamespaceGuard::create(&h.client, "ing-path").await?;
 
     fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
     fixtures::apply_fixture(INGRESS_PATH_MATCHING, &ns.name, &[]).await?;
 
     let host = format!("ingress.{}.local", ns.name);
