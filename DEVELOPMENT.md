@@ -23,7 +23,7 @@ When developing locally, run the binary directly on your machine. It discovers t
 The Gateway API CRDs are not bundled with Kubernetes and must be installed once per cluster:
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
 ```
 
 ### 2. Apply the cluster manifests
@@ -136,7 +136,7 @@ Delete the grant to confirm enforcement:
 
 ```bash
 kubectl delete referencegrant allow-httproute-from-default -n echo-tenant
-curl -H "Host: cross-ns.local" http://localhost:8080/   # 502 Bad Gateway
+curl -H "Host: cross-ns.local" http://localhost:8080/   # 503 Service Unavailable
 
 # Restore
 kubectl apply -f deploy/dev/cross-namespace.yaml
