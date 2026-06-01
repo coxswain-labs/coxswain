@@ -46,8 +46,8 @@ jobs:
 
       - name: Pre-pull echo backend image into kind
         run: |
-          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20240412-v1.1.0
-          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20240412-v1.1.0 --name coxswain-e2e
+          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
+          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1 --name coxswain-e2e
 
       - name: Build coxswain binary
         run: cargo build --bin coxswain

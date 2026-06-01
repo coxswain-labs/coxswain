@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
         - name: echo
-          image: gcr.io/k8s-staging-gateway-api/echo-basic:v20240412-v1.1.0
+          image: gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
           ports:
             - containerPort: 3000
           env:
