@@ -326,14 +326,12 @@ impl Controller {
                                 );
                                 continue;
                             }
-                            if is_leader && !gateway_accepted(&gw) {
-                                Self::accept_gateway(&client, &gw).await;
-                            }
-                            if is_leader
-                                && self.synced.load(Ordering::Acquire)
-                                && !gateway_programmed(&gw)
-                            {
-                                Self::mark_gateway_programmed(&client, &gw).await;
+                            let synced = self.synced.load(Ordering::Acquire);
+                            let needs_patch = is_leader
+                                && (!gateway_accepted(&gw)
+                                    || (synced && !gateway_programmed(&gw)));
+                            if needs_patch {
+                                Self::patch_gateway_status(&client, &gw, synced).await;
                             }
                         }
                         Ok(_) => {}
@@ -385,7 +383,10 @@ impl Controller {
         }
     }
 
-    async fn accept_gateway(client: &Client, gw: &Gateway) {
+    // Single patch call sets all Gateway conditions at once. A JSON merge patch
+    // replaces the entire conditions array, so splitting Accepted and Programmed
+    // into two calls would cause them to toggle in a watch-feedback loop.
+    async fn patch_gateway_status(client: &Client, gw: &Gateway, programmed: bool) {
         let name = match gw.metadata.name.as_deref() {
             Some(n) => n,
             None => return,
@@ -393,45 +394,23 @@ impl Controller {
         let ns = gw.metadata.namespace.as_deref().unwrap_or("default");
         let generation = gw.metadata.generation.unwrap_or(0);
         let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
-        let condition = make_condition(
+        let now = Time(k8s_openapi::jiff::Timestamp::now());
+        let mut conditions = vec![make_condition(
             "Accepted",
             "Accepted",
             generation,
-            Time(k8s_openapi::jiff::Timestamp::now()),
-        );
-        let patch = serde_json::json!({ "status": { "conditions": [condition] } });
-        match api
-            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await
-        {
-            Ok(_) => tracing::info!(name, ns, "Gateway accepted"),
-            Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Gateway status"),
+            now.clone(),
+        )];
+        if programmed {
+            conditions.push(make_condition("Programmed", "Programmed", generation, now));
         }
-    }
-
-    async fn mark_gateway_programmed(client: &Client, gw: &Gateway) {
-        let name = match gw.metadata.name.as_deref() {
-            Some(n) => n,
-            None => return,
-        };
-        let ns = gw.metadata.namespace.as_deref().unwrap_or("default");
-        let generation = gw.metadata.generation.unwrap_or(0);
-        let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
-        let condition = make_condition(
-            "Programmed",
-            "Programmed",
-            generation,
-            Time(k8s_openapi::jiff::Timestamp::now()),
-        );
-        let patch = serde_json::json!({ "status": { "conditions": [condition] } });
+        let patch = serde_json::json!({ "status": { "conditions": conditions } });
         match api
             .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await
         {
-            Ok(_) => tracing::info!(name, ns, "Gateway programmed"),
-            Err(e) => {
-                tracing::warn!(name, ns, error = %e, "Failed to patch Gateway programmed status")
-            }
+            Ok(_) => tracing::info!(name, ns, programmed, "Gateway status patched"),
+            Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Gateway status"),
         }
     }
 
