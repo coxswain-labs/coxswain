@@ -1,0 +1,52 @@
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+name: E2E
+
+jobs:
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-e2e-
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: coxswain-e2e
+
+      - name: Build coxswain binary
+        run: cargo build --bin coxswain
+
+      - name: Run e2e tests
+        run: cargo test -p coxswain-e2e -- --test-threads=1
+        env:
+          RUST_LOG: coxswain_e2e=debug,warn
+
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          echo "=== Namespaces ==="
+          kubectl get namespaces -l coxswain-e2e=true
+          echo "=== Events ==="
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50
+          echo "=== HTTPRoutes ==="
+          kubectl get httproutes -A
+          echo "=== Ingresses ==="
+          kubectl get ingresses -A

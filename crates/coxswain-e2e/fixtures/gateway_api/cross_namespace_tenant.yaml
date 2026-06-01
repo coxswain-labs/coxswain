@@ -1,0 +1,59 @@
+# Cross-namespace HTTPRoute fixture (tenant namespace side).
+# TESTNS  = primary namespace (source of HTTPRoute references)
+# TENANTNS = this namespace (applied with -n TENANTNS)
+#
+# Contains the backend (echo-d) and the ReferenceGrant permitting TESTNS to
+# reference Services in this namespace.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-d
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-d
+  template:
+    metadata:
+      labels:
+        app: echo-d
+    spec:
+      containers:
+        - name: echo
+          image: gcr.io/k8s-staging-gateway-api/echo-basic:v20240412-v1.1.0
+          ports:
+            - containerPort: 3000
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-d
+spec:
+  selector:
+    app: echo-d
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-httproute-from-TESTNS
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: TESTNS
+  to:
+    - group: ""
+      kind: Service

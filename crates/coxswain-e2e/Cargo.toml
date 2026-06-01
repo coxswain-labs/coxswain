@@ -1,0 +1,23 @@
+[package]
+name = "coxswain-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "coxswain_e2e"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+gateway-api.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,127 @@
+# Three echo backends for e2e tests.
+# Uses gcr.io/k8s-staging-gateway-api/echo-basic — same image as the upstream
+# Gateway API conformance suite. Returns JSON with path, host, method, headers,
+# and pod name (injected via Downward API).
+#
+# Applied per-test-namespace via apply_fixture(BACKENDS_ECHO, &ns.name, &[]).
+# Port 3000 matches the echo-basic container default.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-a
+  template:
+    metadata:
+      labels:
+        app: echo-a
+    spec:
+      containers:
+        - name: echo
+          image: gcr.io/k8s-staging-gateway-api/echo-basic:v20240412-v1.1.0
+          ports:
+            - containerPort: 3000
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-a
+spec:
+  selector:
+    app: echo-a
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-b
+  template:
+    metadata:
+      labels:
+        app: echo-b
+    spec:
+      containers:
+        - name: echo
+          image: gcr.io/k8s-staging-gateway-api/echo-basic:v20240412-v1.1.0
+          ports:
+            - containerPort: 3000
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-b
+spec:
+  selector:
+    app: echo-b
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-c
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-c
+  template:
+    metadata:
+      labels:
+        app: echo-c
+    spec:
+      containers:
+        - name: echo
+          image: gcr.io/k8s-staging-gateway-api/echo-basic:v20240412-v1.1.0
+          ports:
+            - containerPort: 3000
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-c
+spec:
+  selector:
+    app: echo-c
+  ports:
+    - port: 3000
+      targetPort: 3000

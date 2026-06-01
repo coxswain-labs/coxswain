@@ -1,0 +1,32 @@
+# Ingress path matching fixture.
+# Mirrors the ingress.local scenario from DEVELOPMENT.md.
+# TESTNS is substituted with the test namespace at runtime.
+#
+# Routes:
+#   ingress.TESTNS.local /a → echo-a
+#   ingress.TESTNS.local /b → echo-b
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: echo-ingress
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: ingress.TESTNS.local
+      http:
+        paths:
+          - path: /a
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
+          - path: /b
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-b
+                port:
+                  number: 3000

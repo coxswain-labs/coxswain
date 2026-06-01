@@ -1,0 +1,35 @@
+# Cross-namespace HTTPRoute fixture (primary namespace side).
+# TESTNS  = primary namespace (where the Gateway and HTTPRoute live)
+# TENANTNS = tenant namespace (where the backend Service lives)
+#
+# The backendRef crosses into TENANTNS; it only resolves when a ReferenceGrant
+# in TENANTNS permits the reference (see cross_namespace_tenant.yaml).
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: 8080
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cross-ns-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "cross-ns.TESTNS.local"
+  rules:
+    - backendRefs:
+        - name: echo-d
+          namespace: TENANTNS
+          port: 3000
