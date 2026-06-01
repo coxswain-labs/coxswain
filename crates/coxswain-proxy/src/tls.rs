@@ -22,13 +22,15 @@ impl SniCertSelector {
 #[async_trait]
 impl TlsAccept for SniCertSelector {
     async fn certificate_callback(&self, ssl: &mut TlsRef) {
-        let Some(sni) = ssl.servername(NameType::HOST_NAME) else {
+        // Clone immediately to drop the immutable borrow before the mutable
+        // ssl_use_certificate / ssl_use_private_key calls below.
+        let Some(sni) = ssl.servername(NameType::HOST_NAME).map(str::to_owned) else {
             tracing::debug!("TLS handshake with no SNI — no cert installed");
             return;
         };
 
         let store = self.tls.load();
-        let Some(cert) = store.find_cert(sni) else {
+        let Some(cert) = store.find_cert(&sni) else {
             tracing::debug!(sni, "No TLS cert for SNI — handshake will fail");
             return;
         };
