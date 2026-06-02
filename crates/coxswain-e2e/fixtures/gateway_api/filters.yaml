@@ -62,6 +62,7 @@ spec:
           port: 3000
 
     # Rule 3: RequestRedirect — 302 redirect to /filter/redirected (no upstream hit).
+    # Per Gateway API spec, RequestRedirect must not be combined with backendRefs.
     - matches:
         - path:
             type: Exact
@@ -73,9 +74,6 @@ spec:
             path:
               type: ReplaceFullPath
               replaceFullPath: /filter/redirected
-      backendRefs:
-        - name: echo-a
-          port: 3000
 
     # Rule 4: URLRewrite — rewrite /filter/old/* to /filter/new/* before forwarding.
     - matches:
