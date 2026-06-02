@@ -12,6 +12,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn init_tracing() {
+    // Install the rustls crypto provider once for the process. reqwest uses
+    // rustls internally, so this must happen before any client is created.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let _ = tracing_subscriber::fmt()
         .with_env_filter("coxswain_e2e=debug,warn")
         .try_init();
@@ -323,7 +326,8 @@ async fn proxy_protocol_http_v1_forwarded() -> anyhow::Result<()> {
     .await?;
 
     let echo: serde_json::Value = serde_json::from_str(&body)?;
-    let forwarded = echo["headers"]["forwarded"]
+    // echo-basic returns headers as Title-Case keys with array values.
+    let forwarded = echo["headers"]["Forwarded"][0]
         .as_str()
         .unwrap_or_default()
         .to_lowercase();
@@ -401,7 +405,8 @@ async fn proxy_protocol_https_v2_forwarded() -> anyhow::Result<()> {
     .await?;
 
     let echo: serde_json::Value = serde_json::from_str(&body)?;
-    let forwarded = echo["headers"]["forwarded"]
+    // echo-basic returns headers as Title-Case keys with array values.
+    let forwarded = echo["headers"]["Forwarded"][0]
         .as_str()
         .unwrap_or_default()
         .to_lowercase();
@@ -543,9 +548,6 @@ async fn try_tls_after_proxy_v2(
     let mut tcp = tokio::net::TcpStream::connect(tls_addr).await?;
     tcp.write_all(v2_header).await?;
     tcp.flush().await?;
-
-    // Ensure the process-level crypto provider is set (aws-lc-rs, consistent with reqwest).
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // TLS config that accepts any certificate (self-signed certs in tests).
     let config = ClientConfig::builder()
