@@ -32,6 +32,10 @@ pub async fn bootstrap() -> anyhow::Result<()> {
             .context("Gateway API CRDs not established")?;
     }
 
+    install_cert_manager_if_missing()
+        .await
+        .context("install cert-manager")?;
+
     let manifests = root.join("deploy/manifests");
     kubectl_apply(&manifests.join("namespace.yaml")).await?;
     kubectl_apply(&manifests.join("rbac.yaml")).await?;
@@ -39,6 +43,90 @@ pub async fn bootstrap() -> anyhow::Result<()> {
     kubectl_apply(&manifests.join("ingress-class.yaml")).await?;
 
     Ok(())
+}
+
+/// Install cert-manager v1.18.0 and a `coxswain-e2e-selfsigned` ClusterIssuer if not present.
+/// Idempotent: checks for the `certificates.cert-manager.io` CRD before applying.
+async fn install_cert_manager_if_missing() -> anyhow::Result<()> {
+    if cert_manager_installed().await {
+        return Ok(());
+    }
+
+    tracing::info!("cert-manager not found, installing v1.18.0");
+    kubectl_apply_url(
+        "https://github.com/cert-manager/cert-manager/releases/download/v1.18.0/cert-manager.yaml",
+    )
+    .await
+    .context("install cert-manager")?;
+
+    // Wait for all three cert-manager Deployments to be Available.
+    let status = Command::new("kubectl")
+        .args([
+            "wait",
+            "--for=condition=Available",
+            "--timeout=120s",
+            "deployment/cert-manager",
+            "deployment/cert-manager-webhook",
+            "deployment/cert-manager-cainjector",
+            "-n",
+            "cert-manager",
+        ])
+        .status()
+        .await
+        .context("kubectl wait cert-manager")?;
+    anyhow::ensure!(
+        status.success(),
+        "cert-manager deployments not ready within 120s"
+    );
+
+    // Create a SelfSigned ClusterIssuer for use by all e2e tests.
+    // `kubectl apply` is idempotent; safe to call on every subsequent bootstrap.
+    let issuer_yaml = r#"
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: coxswain-e2e-selfsigned
+spec:
+  selfSigned: {}
+"#;
+    let mut child = tokio::process::Command::new("kubectl")
+        .args(["apply", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("kubectl apply ClusterIssuer")?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        tokio::io::AsyncWriteExt::write_all(stdin, issuer_yaml.as_bytes())
+            .await
+            .context("write ClusterIssuer yaml")?;
+    }
+    drop(child.stdin.take());
+    let status = child
+        .wait()
+        .await
+        .context("kubectl apply ClusterIssuer wait")?;
+    anyhow::ensure!(status.success(), "kubectl apply ClusterIssuer failed");
+
+    Ok(())
+}
+
+/// Returns true if cert-manager CRDs are present at v1.
+async fn cert_manager_installed() -> bool {
+    Command::new("kubectl")
+        .args([
+            "get",
+            "crd",
+            "certificates.cert-manager.io",
+            "-o",
+            "jsonpath={.spec.versions[*].name}",
+            "--ignore-not-found",
+        ])
+        .output()
+        .await
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            out.split_whitespace().any(|v| v == "v1")
+        })
+        .unwrap_or(false)
 }
 
 /// Returns true only if ReferenceGrant is served at v1 (requires Gateway API >= v1.0.0 CRDs).
