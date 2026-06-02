@@ -7,6 +7,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::Api;
 use std::{net::SocketAddr, time::Duration};
 use tokio::time;
+use tokio_tungstenite::tungstenite;
 
 /// Poll HTTPS handshakes until the served leaf certificate DER differs from `old_der`.
 ///
@@ -169,6 +170,37 @@ pub async fn wait_for_deployments(namespace: &str, names: &[&str]) -> anyhow::Re
         .context("kubectl wait deployments")?;
     anyhow::ensure!(status.success(), "deployments not ready in {namespace}");
     Ok(())
+}
+
+/// Retry WebSocket handshakes against the proxy until one succeeds or `timeout` expires.
+///
+/// Uses a custom request so the TCP connection goes to `proxy_addr` while the `Host`
+/// header is set to `host` — the same split used by `HttpClient` for virtual hosting.
+pub async fn wait_for_ws_route(
+    proxy_addr: SocketAddr,
+    host: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let uri = format!("ws://{proxy_addr}/");
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        let req = tungstenite::http::Request::builder()
+            .uri(&uri)
+            .header("Host", host)
+            .body(())
+            .context("build WebSocket request")?;
+        match tokio_tungstenite::connect_async(req).await {
+            Ok((mut stream, _)) => {
+                let _ = stream.close(None).await;
+                return Ok(());
+            }
+            Err(e) => tracing::debug!(host, error = %e, "ws route not yet live"),
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for WebSocket route on {host}");
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 pub async fn wait_for_route(

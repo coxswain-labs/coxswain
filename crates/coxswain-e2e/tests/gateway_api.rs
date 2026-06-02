@@ -1,14 +1,16 @@
 use coxswain_e2e::{
     fixtures::{
-        self, BACKENDS_ECHO, GATEWAY_API_CERT_MANAGER, GATEWAY_API_COMBINED_MATCHING,
-        GATEWAY_API_CROSS_NAMESPACE_ROUTE, GATEWAY_API_CROSS_NAMESPACE_TENANT,
-        GATEWAY_API_HEADER_MATCHING, GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING,
-        GATEWAY_API_PATH_MATCHING, GATEWAY_API_QUERY_PARAM_MATCHING,
+        self, BACKENDS_ECHO, BACKENDS_WEBSOCKET_ECHO, GATEWAY_API_CERT_MANAGER,
+        GATEWAY_API_COMBINED_MATCHING, GATEWAY_API_CROSS_NAMESPACE_ROUTE,
+        GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_HEADER_MATCHING, GATEWAY_API_HOST_POOL,
+        GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PATH_MATCHING, GATEWAY_API_QUERY_PARAM_MATCHING,
         GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS, GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
-        GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WILDCARD_HOST,
+        GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WEBSOCKET,
+        GATEWAY_API_WILDCARD_HOST,
     },
     harness::{GeneratedCert, Harness, NamespaceGuard, http, wait},
 };
+use futures::{SinkExt as _, StreamExt as _};
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Api;
@@ -16,6 +18,7 @@ use kube::api::PostParams;
 use reqwest::Method;
 use std::collections::BTreeMap;
 use std::time::Duration;
+use tokio_tungstenite::tungstenite::Message;
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -663,5 +666,49 @@ async fn cert_manager_gateway_provisioning() -> anyhow::Result<()> {
     let resp = wait::wait_for_https_route(h.tls_addr, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
+    Ok(())
+}
+
+/// Verifies that WebSocket upgrade requests are proxied end-to-end through Coxswain:
+/// 1. Deploy a WebSocket echo server (jmalloc/echo-server).
+/// 2. Route ws.TESTNS.local → ws-echo via an HTTPRoute.
+/// 3. Connect via WebSocket through the proxy (Host header set for virtual hosting).
+/// 4. Send a text frame and assert the same frame echoes back.
+#[tokio::test]
+async fn websocket_passthrough() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-ws").await?;
+
+    fixtures::apply_fixture(BACKENDS_WEBSOCKET_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_deployments(&ns.name, &["ws-echo"]).await?;
+    fixtures::apply_fixture(GATEWAY_API_WEBSOCKET, &ns.name, &[]).await?;
+
+    let host = format!("ws.{}.local", ns.name);
+
+    // Poll until the proxy returns a 101 for this virtual host.
+    wait::wait_for_ws_route(h.controller.proxy_addr, &host, Duration::from_secs(60)).await?;
+
+    // Open a fresh WebSocket connection and verify the echo round-trip.
+    let uri = format!("ws://{}/", h.controller.proxy_addr);
+    let req = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(&uri)
+        .header("Host", &host)
+        .body(())
+        .expect("build WebSocket request");
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+
+    ws.send(Message::Text("ping".into())).await?;
+    let reply = ws
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("WebSocket stream closed before echo"))??;
+    assert_eq!(
+        reply,
+        Message::Text("ping".into()),
+        "expected echo of 'ping'"
+    );
+
+    ws.close(None).await?;
     Ok(())
 }

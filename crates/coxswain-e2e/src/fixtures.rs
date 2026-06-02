@@ -4,6 +4,11 @@ use tokio::io::AsyncWriteExt as _;
 
 pub const BACKENDS_ECHO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/backends/echo.yaml");
 
+pub const BACKENDS_WEBSOCKET_ECHO: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/websocket_echo.yaml"
+);
+
 pub const GATEWAY_API_PATH_MATCHING: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/gateway_api/path_matching.yaml"
@@ -92,6 +97,11 @@ pub const INGRESS_CERT_MANAGER: &str = concat!(
 pub const GATEWAY_API_CERT_MANAGER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/gateway_api/cert_manager.yaml"
+);
+
+pub const GATEWAY_API_WEBSOCKET: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/websocket.yaml"
 );
 
 /// Apply a fixture YAML to `namespace`.

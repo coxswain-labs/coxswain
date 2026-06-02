@@ -1,0 +1,36 @@
+# WebSocket echo backend for e2e tests.
+# Uses jmalloc/echo-server which echoes every WebSocket frame back to the sender verbatim.
+# Port 8080 is the default for jmalloc/echo-server.
+#
+# Applied per-test-namespace via apply_fixture(BACKENDS_WEBSOCKET_ECHO, &ns.name, &[]).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ws-echo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ws-echo
+  template:
+    metadata:
+      labels:
+        app: ws-echo
+    spec:
+      containers:
+        - name: ws-echo
+          image: jmalloc/echo-server:latest
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ws-echo
+spec:
+  selector:
+    app: ws-echo
+  ports:
+    - port: 8080
+      targetPort: 8080
