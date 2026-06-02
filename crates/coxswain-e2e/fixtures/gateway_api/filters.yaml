@@ -1,0 +1,100 @@
+# HTTPRoute filter fixture — exercises all four core filter types.
+# TESTNS is substituted with the test namespace at runtime.
+#
+# Routes:
+#   PathPrefix /filter/req-header  → echo-a  (RequestHeaderModifier: set X-Test-Set=injected)
+#   PathPrefix /filter/resp-header → echo-a  (ResponseHeaderModifier: add X-Test-Response=coxswain)
+#   Exact /filter/redirect         → echo-a  (RequestRedirect: 302 → /filter/redirected)
+#   PathPrefix /filter/old         → echo-a  (URLRewrite: replacePrefixMatch /filter/new)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: 8080
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: echo-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "echo.TESTNS.local"
+  rules:
+    # Rule 1: RequestHeaderModifier — injects X-Test-Set before forwarding to echo-a.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /filter/req-header
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Test-Set
+                value: injected
+      backendRefs:
+        - name: echo-a
+          port: 3000
+
+    # Rule 2: ResponseHeaderModifier — adds X-Test-Response to the client response.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /filter/resp-header
+      filters:
+        - type: ResponseHeaderModifier
+          responseHeaderModifier:
+            add:
+              - name: X-Test-Response
+                value: coxswain
+      backendRefs:
+        - name: echo-a
+          port: 3000
+
+    # Rule 3: RequestRedirect — 302 redirect to /filter/redirected (no upstream hit).
+    # Per Gateway API spec, RequestRedirect must not be combined with backendRefs.
+    - matches:
+        - path:
+            type: Exact
+            value: /filter/redirect
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            statusCode: 302
+            path:
+              type: ReplaceFullPath
+              replaceFullPath: /filter/redirected
+
+    # Rule 4: URLRewrite — rewrite /filter/old/* to /filter/new/* before forwarding.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /filter/old
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /filter/new
+      backendRefs:
+        - name: echo-a
+          port: 3000
+
+    # Probe rule — used by wait_for_route to detect when the HTTPRoute is live.
+    - matches:
+        - path:
+            type: Exact
+            value: /filter/probe
+      backendRefs:
+        - name: echo-a
+          port: 3000
