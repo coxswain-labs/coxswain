@@ -40,7 +40,7 @@ TLS is a launch blocker. WebSocket is the minimum protocol expansion needed to s
 Full HTTPRoute filter compliance + the annotation layer for Ingress.
 
 - [x] ~~`URLRewrite`, `RequestRedirect`, `RequestHeaderModifier`, `ResponseHeaderModifier` filters — [#13](https://github.com/coxswain-labs/coxswain/issues/13) `MUST`~~
-- [ ] HTTPRoute `timeouts` field — [#14](https://github.com/coxswain-labs/coxswain/issues/14) `MUST`
+- [x] ~~HTTPRoute `timeouts` field — [#14](https://github.com/coxswain-labs/coxswain/issues/14) `MUST`~~
 - [ ] `BackendLBPolicy` (session persistence + timeouts per backend) — [#15](https://github.com/coxswain-labs/coxswain/issues/15) `MUST`
 - [ ] `BackendTLSPolicy` — [#16](https://github.com/coxswain-labs/coxswain/issues/16) `MUST`
 - [ ] Weighted backend refs — [#17](https://github.com/coxswain-labs/coxswain/issues/17) `MUST`

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// How a path is modified by `URLRewrite` or `RequestRedirect`.
 #[derive(Clone, Debug)]
@@ -52,6 +52,15 @@ pub enum FilterAction {
         hostname: Option<String>,
         path: Option<PathModifier>,
     },
+}
+
+/// Per-rule timeout configuration parsed from `HTTPRouteRule.timeouts`.
+#[derive(Clone, Debug, Default)]
+pub struct RouteTimeouts {
+    /// Total request timeout (client → proxy → upstream → proxy → client). 504 on expiry.
+    pub request: Option<Duration>,
+    /// Upstream-only timeout (proxy → upstream response). 502 on expiry.
+    pub backend_request: Option<Duration>,
 }
 
 /// A cheaply-cloneable handle to the active routing table.
@@ -217,6 +226,7 @@ pub struct RouteEntry {
     pub upstream: Arc<Upstream>,
     pub predicates: MatchPredicates,
     pub filters: Arc<[FilterAction]>,
+    pub timeouts: RouteTimeouts,
     /// Parent resource identity `"{namespace}/{name}"` — used for precedence tiebreaking.
     pub route_id: String,
     /// Creation timestamp — older routes win ties after predicate-count comparison.
@@ -225,7 +235,7 @@ pub struct RouteEntry {
 }
 
 impl RouteEntry {
-    /// Constructs an entry with no predicates and no filters.
+    /// Constructs an entry with no predicates, no filters, and no timeouts.
     pub fn path_only(
         upstream: Arc<Upstream>,
         route_id: String,
@@ -235,12 +245,13 @@ impl RouteEntry {
             upstream,
             predicates: MatchPredicates::default(),
             filters: Arc::from([]),
+            timeouts: RouteTimeouts::default(),
             route_id,
             created_at,
         }
     }
 
-    /// Constructs an entry with predicates and no filters.
+    /// Constructs an entry with predicates but no filters and no timeouts.
     pub fn new(
         upstream: Arc<Upstream>,
         predicates: MatchPredicates,
@@ -251,16 +262,18 @@ impl RouteEntry {
             upstream,
             predicates,
             filters: Arc::from([]),
+            timeouts: RouteTimeouts::default(),
             route_id,
             created_at,
         }
     }
 
-    /// Constructs an entry with predicates and filters.
+    /// Constructs an entry with predicates, filters, and per-rule timeouts.
     pub fn with_filters(
         upstream: Arc<Upstream>,
         predicates: MatchPredicates,
         filters: Vec<FilterAction>,
+        timeouts: RouteTimeouts,
         route_id: String,
         created_at: Option<SystemTime>,
     ) -> Self {
@@ -268,6 +281,7 @@ impl RouteEntry {
             upstream,
             predicates,
             filters: Arc::from(filters.into_boxed_slice()),
+            timeouts,
             route_id,
             created_at,
         }
@@ -344,7 +358,7 @@ impl HostRouter {
         &self.route_info
     }
 
-    /// Resolves `path` to an upstream and its filters, applying predicates from `ctx`.
+    /// Resolves `path` to an upstream, filters, and timeouts, applying predicates from `ctx`.
     ///
     /// Checks matchit exact/prefix routes first, then the regex fallback.
     /// Within each path slot, candidates are evaluated in specificity order;
@@ -353,11 +367,15 @@ impl HostRouter {
         &self,
         path: &str,
         ctx: &RequestContext<'_>,
-    ) -> Option<(Arc<Upstream>, Arc<[FilterAction]>)> {
+    ) -> Option<(Arc<Upstream>, Arc<[FilterAction]>, RouteTimeouts)> {
         if let Ok(m) = self.router.at(path) {
             for entry in m.value.iter() {
                 if entry.predicates.matches(ctx) {
-                    return Some((Arc::clone(&entry.upstream), Arc::clone(&entry.filters)));
+                    return Some((
+                        Arc::clone(&entry.upstream),
+                        Arc::clone(&entry.filters),
+                        entry.timeouts.clone(),
+                    ));
                 }
             }
         }
@@ -367,7 +385,11 @@ impl HostRouter {
             if set.is_match(path) {
                 for entry in entries.iter() {
                     if entry.predicates.matches(ctx) {
-                        return Some((Arc::clone(&entry.upstream), Arc::clone(&entry.filters)));
+                        return Some((
+                            Arc::clone(&entry.upstream),
+                            Arc::clone(&entry.filters),
+                            entry.timeouts.clone(),
+                        ));
                     }
                 }
             }
@@ -626,7 +648,7 @@ impl RoutingTableBuilder {
 
 /// Result of a two-level host+path routing lookup.
 pub enum RouteOutcome {
-    Found(Arc<Upstream>, Arc<[FilterAction]>),
+    Found(Arc<Upstream>, Arc<[FilterAction]>, RouteTimeouts),
     /// No entry for this hostname (host is not registered at this proxy).
     NoHost,
     /// Host is registered but no path rule matched (or path matched but predicates failed).
@@ -648,10 +670,10 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
-    /// Routes to an upstream, discarding filter information.
+    /// Routes to an upstream, discarding filter and timeout information.
     ///
     /// Convenience for tests and admin introspection. The proxy hot path should
-    /// use [`find`] to also receive the filter list.
+    /// use [`find`] to also receive the filter list and timeouts.
     pub fn route(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<Upstream>> {
         let host_router = if let Some(router) = self.exact_hosts.get(host) {
             Some(router)
@@ -662,15 +684,15 @@ impl RoutingTable {
                 .map(|(_, r)| r)
         };
         if let Some(router) = host_router
-            && let Some((upstream, _)) = router.route(path, ctx)
+            && let Some((upstream, _, _)) = router.route(path, ctx)
         {
             return Some(upstream);
         }
-        self.catchall.as_ref()?.route(path, ctx).map(|(u, _)| u)
+        self.catchall.as_ref()?.route(path, ctx).map(|(u, _, _)| u)
     }
 
     /// Like [`route`] but distinguishes "host not registered" from "path not matched",
-    /// and returns the filter list alongside the upstream.
+    /// and returns filters and timeouts alongside the upstream.
     pub fn find(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> RouteOutcome {
         let router = if let Some(r) = self.exact_hosts.get(host) {
             r
@@ -686,7 +708,7 @@ impl RoutingTable {
             return RouteOutcome::NoHost;
         };
         match router.route(path, ctx) {
-            Some((u, f)) => RouteOutcome::Found(u, f),
+            Some((u, f, t)) => RouteOutcome::Found(u, f, t),
             None => RouteOutcome::NoPath,
         }
     }
@@ -1256,5 +1278,34 @@ mod tests {
 
         assert_eq!(table.route("example.com", "/", &ctx_a).unwrap().name, "a");
         assert_eq!(table.route("example.com", "/", &ctx_b).unwrap().name, "b");
+    }
+
+    #[test]
+    fn find_returns_timeouts_from_route_entry() {
+        let up = upstream("svc", "10.0.0.1:80");
+        let timeouts = RouteTimeouts {
+            request: Some(std::time::Duration::from_secs(10)),
+            backend_request: Some(std::time::Duration::from_secs(2)),
+        };
+        let e = Arc::new(RouteEntry::with_filters(
+            up,
+            MatchPredicates::default(),
+            vec![],
+            timeouts.clone(),
+            "default/svc".to_string(),
+            None,
+        ));
+
+        let mut b = RoutingTableBuilder::new();
+        b.exact_host("example.com").add_prefix_route("/", e);
+        let table = b.build().unwrap();
+
+        match table.find("example.com", "/foo", &ctx_get()) {
+            RouteOutcome::Found(_, _, t) => {
+                assert_eq!(t.request, timeouts.request);
+                assert_eq!(t.backend_request, timeouts.backend_request);
+            }
+            _ => panic!("expected Found"),
+        }
     }
 }

@@ -1,15 +1,20 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use coxswain_core::routing::{
-    FilterAction, PathModifier, RequestContext, RouteOutcome, SharedRoutingTable, Upstream,
+    FilterAction, PathModifier, RequestContext, RouteOutcome, RouteTimeouts, SharedRoutingTable,
+    Upstream,
 };
 use http::header;
 use pingora_core::upstreams::peer::HttpPeer;
-use pingora_core::{ConnectionClosed, ErrorSource, HTTPStatus, ReadError, Result, WriteError};
+use pingora_core::{
+    ConnectionClosed, ErrorSource, HTTPStatus, ReadError, ReadTimedout, Result, WriteError,
+    WriteTimedout,
+};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::filter::TrafficFilter;
 
@@ -31,6 +36,7 @@ tokio::task_local! {
 pub struct ResolvedRoute {
     pub upstream: Arc<Upstream>,
     pub filters: Arc<[FilterAction]>,
+    pub timeouts: RouteTimeouts,
     pub original_host: String,
     pub original_path: String,
 }
@@ -41,6 +47,13 @@ pub struct ProxyCtx {
     pub real_client_addr: Option<SocketAddr>,
     pub real_client_proto: Option<&'static str>,
     pub resolved: Option<ResolvedRoute>,
+    /// Absolute deadline for the total request (from `timeouts.request`). 504 if exceeded.
+    pub request_deadline: Option<Instant>,
+    /// True when the effective read_timeout was derived from `timeouts.request` (not
+    /// `timeouts.backendRequest`). Set in `upstream_peer`; consulted in `fail_to_proxy` to
+    /// distinguish 504 (request budget) from 502 (backend budget) without relying on wall-clock
+    /// comparisons that can race against OS timer granularity.
+    pub request_timeout_is_controlling: bool,
 }
 
 /// Lock-free routing engine for the request hot path.
@@ -66,6 +79,8 @@ impl RoutingEngine {
 
 pub struct Proxy {
     pub engine: Arc<RoutingEngine>,
+    /// Global fallback timeouts used when a matched route has no per-rule timeouts set.
+    pub default_timeouts: RouteTimeouts,
 }
 
 /// Extract the bare hostname from a request (strips port suffix, prefers URI host over Host header).
@@ -150,6 +165,8 @@ impl ProxyHttp for Proxy {
                 real_client_addr: Some(info.real_addr),
                 real_client_proto: Some(info.proto),
                 resolved: None,
+                request_deadline: None,
+                request_timeout_is_controlling: false,
             })
             .unwrap_or_default()
     }
@@ -172,8 +189,8 @@ impl ProxyHttp for Proxy {
             query: query.as_deref(),
         };
 
-        let (upstream, filters) = match self.engine.find(&host, &path, &route_ctx) {
-            RouteOutcome::Found(u, f) => (u, f),
+        let (upstream, filters, route_timeouts) = match self.engine.find(&host, &path, &route_ctx) {
+            RouteOutcome::Found(u, f, t) => (u, f, t),
             RouteOutcome::NoHost => {
                 return Err(pingora_core::Error::explain(
                     HTTPStatus(503),
@@ -187,6 +204,17 @@ impl ProxyHttp for Proxy {
                 ));
             }
         };
+
+        // Merge per-route timeouts with global defaults (per-route wins).
+        let timeouts = RouteTimeouts {
+            request: route_timeouts.request.or(self.default_timeouts.request),
+            backend_request: route_timeouts
+                .backend_request
+                .or(self.default_timeouts.backend_request),
+        };
+
+        // Record the request deadline so upstream_peer and fail_to_proxy can use it.
+        ctx.request_deadline = timeouts.request.map(|d| Instant::now() + d);
 
         // Check for a RequestRedirect filter — if present, send the 3xx and short-circuit.
         for f in filters.iter() {
@@ -226,6 +254,7 @@ impl ProxyHttp for Proxy {
         ctx.resolved = Some(ResolvedRoute {
             upstream,
             filters,
+            timeouts,
             original_host: host,
             original_path: path,
         });
@@ -244,6 +273,16 @@ impl ProxyHttp for Proxy {
             )
         })?;
 
+        // If a total request deadline has already passed, fail fast with 504.
+        if let Some(deadline) = ctx.request_deadline
+            && Instant::now() >= deadline
+        {
+            return Err(pingora_core::Error::explain(
+                HTTPStatus(504),
+                "request timeout exceeded before upstream connection",
+            ));
+        }
+
         let addr = resolved.upstream.next_endpoint().ok_or_else(|| {
             pingora_core::Error::explain(HTTPStatus(503), "upstream has no active endpoints")
         })?;
@@ -251,7 +290,45 @@ impl ProxyHttp for Proxy {
         // Use the (potentially rewritten) host from UrlRewrite hostname, or the original host.
         let sni_host = resolved.original_host.clone();
 
-        Ok(Box::new(HttpPeer::new(addr.to_string(), false, sni_host)))
+        let mut peer = HttpPeer::new(addr.to_string(), false, sni_host);
+
+        // Apply per-route timeout settings.
+        // backendRequest controls the upstream read (and connect) phase → 502 on expiry.
+        // request controls the total budget; we use the remaining time as read_timeout so
+        // that an expiry can be detected in fail_to_proxy and mapped to 504.
+        let remaining_request = ctx
+            .request_deadline
+            .and_then(|d| d.checked_duration_since(Instant::now()));
+        let backend_timeout = resolved.timeouts.backend_request;
+
+        // Determine which timeout is the binding constraint and set the flag that
+        // fail_to_proxy will use to pick 504 vs 502.  Doing this here (at peer-creation
+        // time) avoids a racy Instant::now() >= deadline comparison in fail_to_proxy,
+        // which can yield the wrong answer when the OS timer fires a few µs early.
+        let read_timeout = match (backend_timeout, remaining_request) {
+            (Some(bt), Some(rem)) => {
+                // Whichever is smaller fires; record which one controls.
+                ctx.request_timeout_is_controlling = rem <= bt;
+                Some(bt.min(rem))
+            }
+            (Some(bt), None) => {
+                ctx.request_timeout_is_controlling = false;
+                Some(bt)
+            }
+            (None, Some(rem)) => {
+                ctx.request_timeout_is_controlling = true;
+                Some(rem)
+            }
+            (None, None) => None,
+        };
+        if let Some(t) = read_timeout {
+            peer.options.read_timeout = Some(t);
+        }
+        if let Some(t) = backend_timeout {
+            peer.options.connection_timeout = Some(t);
+        }
+
+        Ok(Box::new(peer))
     }
 
     async fn upstream_request_filter(
@@ -303,13 +380,17 @@ impl ProxyHttp for Proxy {
         &self,
         session: &mut Session,
         e: &pingora_core::Error,
-        _ctx: &mut ProxyCtx,
+        ctx: &mut ProxyCtx,
     ) -> FailToProxy
     where
         Self::CTX: Send + Sync,
     {
         let code = match e.etype() {
             HTTPStatus(code) => *code,
+            // A read/write timeout where the request budget was the binding constraint → 504.
+            // We use the flag set in upstream_peer rather than a wall-clock comparison to
+            // avoid races with OS timer granularity (timers can fire a few µs early).
+            ReadTimedout | WriteTimedout if ctx.request_timeout_is_controlling => 504,
             _ => match e.esource() {
                 ErrorSource::Upstream => 502,
                 ErrorSource::Downstream => match e.etype() {
@@ -547,6 +628,7 @@ mod tests {
             upstream,
             Default::default(),
             filters,
+            Default::default(),
             "default/svc".to_string(),
             None,
         ));
@@ -560,7 +642,7 @@ mod tests {
         let engine = engine_with_table(shared);
         let ctx = RequestContext::default();
         match engine.find("example.com", "/test", &ctx) {
-            RouteOutcome::Found(_, filters) => {
+            RouteOutcome::Found(_, filters, _) => {
                 assert_eq!(filters.len(), 1);
                 assert!(matches!(
                     &filters[0],

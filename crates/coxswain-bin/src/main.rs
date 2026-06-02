@@ -4,6 +4,7 @@ use coxswain_admin::AdminServer;
 use coxswain_controller::tls::SharedGatewayListenerHealth;
 use coxswain_controller::{Controller, ControllerConfig, IngressDefaultBackend, Reconciler};
 use coxswain_core::ownership::OwnedGateways;
+use coxswain_core::routing::RouteTimeouts;
 use coxswain_core::routing::SharedRoutingTable;
 use coxswain_core::tls::SharedTlsStore;
 use coxswain_health::HealthServer;
@@ -211,6 +212,30 @@ pub struct ServeArgs {
     /// Example: `10.0.0.0/8,172.16.0.0/12,127.0.0.1/32`
     #[arg(long, env = "COXSWAIN_PROXY_TRUSTED_SOURCES", value_delimiter = ',')]
     pub proxy_trusted_sources: Vec<IpNet>,
+
+    /// Global default for the total request timeout (client → proxy → upstream → client).
+    ///
+    /// Applied to routes that do not set `HTTPRouteRule.timeouts.request`. A route-level
+    /// setting always overrides this value.
+    /// Accepts human-readable durations: `30s`, `1m`, `1m30s`. Omit to disable.
+    #[arg(
+        long,
+        env = "COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT",
+        value_parser = humantime::parse_duration,
+    )]
+    pub proxy_default_request_timeout: Option<Duration>,
+
+    /// Global default for the upstream-only (backend) request timeout.
+    ///
+    /// Applied to routes that do not set `HTTPRouteRule.timeouts.backendRequest`. A
+    /// route-level setting always overrides this value.
+    /// Accepts human-readable durations: `10s`, `500ms`. Omit to disable.
+    #[arg(
+        long,
+        env = "COXSWAIN_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT",
+        value_parser = humantime::parse_duration,
+    )]
+    pub proxy_default_backend_request_timeout: Option<Duration>,
 }
 
 fn main() -> Result<()> {
@@ -269,6 +294,11 @@ fn main() -> Result<()> {
         ),
     ));
 
+    let default_timeouts = RouteTimeouts {
+        request: args.proxy_default_request_timeout,
+        backend_request: args.proxy_default_backend_request_timeout,
+    };
+
     if args.proxy_accept_proxy_protocol {
         if args.proxy_trusted_sources.is_empty() {
             tracing::warn!(
@@ -277,7 +307,13 @@ fn main() -> Result<()> {
             );
         }
         let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
-        let proxy = Arc::new(http_proxy(&server.configuration, Proxy { engine }));
+        let proxy = Arc::new(http_proxy(
+            &server.configuration,
+            Proxy {
+                engine,
+                default_timeouts: default_timeouts.clone(),
+            },
+        ));
         let trusted = Arc::new(TrustedSources::new(args.proxy_trusted_sources.clone()));
         let sni_selector = SniCertSelector::new(tls_store);
         let acceptor = ProxyAcceptor::new(
@@ -292,8 +328,14 @@ fn main() -> Result<()> {
     } else {
         server.add_service({
             let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
-            let mut svc =
-                http_proxy_service_with_name(&server.configuration, Proxy { engine }, "proxy");
+            let mut svc = http_proxy_service_with_name(
+                &server.configuration,
+                Proxy {
+                    engine,
+                    default_timeouts,
+                },
+                "proxy",
+            );
             svc.add_tcp(&args.proxy_addr.to_string());
             let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
                 Box::new(SniCertSelector::new(tls_store));

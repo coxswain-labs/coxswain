@@ -1,12 +1,13 @@
 use coxswain_e2e::{
     fixtures::{
-        self, BACKENDS_ECHO, BACKENDS_WEBSOCKET_ECHO, GATEWAY_API_CERT_MANAGER,
+        self, BACKENDS_ECHO, BACKENDS_SLOW_ECHO, BACKENDS_WEBSOCKET_ECHO, GATEWAY_API_CERT_MANAGER,
         GATEWAY_API_COMBINED_MATCHING, GATEWAY_API_CROSS_NAMESPACE_ROUTE,
         GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_FILTERS, GATEWAY_API_HEADER_MATCHING,
         GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PATH_MATCHING,
-        GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS,
-        GATEWAY_API_TLS_CROSS_NAMESPACE_GW, GATEWAY_API_TLS_GATEWAY_NO_CERTS,
-        GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WEBSOCKET, GATEWAY_API_WILDCARD_HOST,
+        GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_TIMEOUTS,
+        GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS, GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
+        GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WEBSOCKET,
+        GATEWAY_API_WILDCARD_HOST,
     },
     harness::{GeneratedCert, Harness, NamespaceGuard, http, wait},
 };
@@ -797,6 +798,70 @@ async fn filters() -> anyhow::Result<()> {
     assert_eq!(
         echo_path, "/filter/new/resource",
         "URLRewrite: expected rewritten path /filter/new/resource, got {echo_path:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn timeouts_request_returns_504() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-timeouts-req").await?;
+
+    fixtures::apply_fixture(BACKENDS_SLOW_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
+    fixtures::apply_fixture(GATEWAY_API_TIMEOUTS, &ns.name, &[]).await?;
+
+    let host = format!("timeout.{}.local", ns.name);
+
+    // Wait until the route is programmed (normal path must be routable first).
+    // We use /backend-timeout for the initial wait since /request-timeout always fails.
+    wait::wait_for_route_status(
+        &h.http,
+        &host,
+        "/backend-timeout",
+        502,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let status = h.http.get_status(&host, "/request-timeout").await?;
+    assert_eq!(
+        status, 504,
+        "expected 504 from request timeout, got {status}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn timeouts_backend_request_returns_502() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-timeouts-be").await?;
+
+    fixtures::apply_fixture(BACKENDS_SLOW_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
+    fixtures::apply_fixture(GATEWAY_API_TIMEOUTS, &ns.name, &[]).await?;
+
+    let host = format!("timeout.{}.local", ns.name);
+
+    // Wait until the route is registered. Both rules time out so we cannot use
+    // wait_for_route; instead we poll until the 502 appears.
+    wait::wait_for_route_status(
+        &h.http,
+        &host,
+        "/backend-timeout",
+        502,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let status = h.http.get_status(&host, "/backend-timeout").await?;
+    assert_eq!(
+        status, 502,
+        "expected 502 from backend request timeout, got {status}"
     );
 
     Ok(())

@@ -229,6 +229,29 @@ pub async fn wait_for_route(
     }
 }
 
+/// Poll until `host`+`path` returns `expected_status`. Useful for routes where
+/// the expected response is an error code (e.g. 502 from a timeout route).
+pub async fn wait_for_route_status(
+    http: &crate::harness::HttpClient,
+    host: &str,
+    path: &str,
+    expected_status: u16,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        match http.get_status(host, path).await {
+            Ok(status) if status == expected_status => return Ok(()),
+            Ok(status) => tracing::debug!(host, path, status, expected_status, "wrong status"),
+            Err(e) => tracing::debug!(host, path, error = %e, "request failed"),
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for {host}{path} to return {expected_status}");
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 pub async fn wait_for_ingress_lb_ip(
     client: &kube::Client,
     name: &str,
