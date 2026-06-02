@@ -11,6 +11,7 @@ When the user says "start working on issue N":
 4. In `ROADMAP.md`, change the corresponding checklist item from `- [ ]` to `- [x] ~~...~~` (tick the checkbox and wrap the description in strikethrough). Commit this change on the new branch with `Refs #N`.
 5. Implement the issue per its acceptance criteria.
 6. Add or update e2e tests in `crates/coxswain-e2e/` that cover the new behaviour. Every issue that changes routing, status conditions, or proxy behaviour must have at least one new scenario in `tests/gateway_api.rs` or `tests/ingress.rs`. Run `cargo test -p coxswain-e2e --test <file> -- --test-threads=1` locally before pushing.
+7. If the issue implements a Gateway API conformance feature (check the issue body for a **Feature flags** line), add the corresponding `features.SupportXxx` constant(s) to `opts.SupportedFeatures` in `conformance/main_test.go`. Include a comment referencing the issue number. Run `go vet ./...` in `conformance/` to confirm the constant names are valid.
 
 When working on a GitHub issue, always include a reference in every commit message:
 - Use `Refs #N` for partial work on an issue.
@@ -61,6 +62,18 @@ cargo fmt
 
 # Run the binary (local dev)
 cargo run --bin coxswain -- --log-format console
+
+# Verify conformance test file compiles (no live cluster needed)
+cd conformance && go vet ./...
+
+# Run the Gateway API conformance suite (requires a live cluster with coxswain running)
+cd conformance && go test -v -timeout 30m -run TestConformance \
+  -args \
+  --organization=coxswain-labs \
+  --project=coxswain \
+  --url=https://github.com/coxswain-labs/coxswain \
+  --implementation-version=$(git describe --tags --always) \
+  --report-output=reports/local-report.yaml
 ```
 
 ## Architecture
