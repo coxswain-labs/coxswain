@@ -7,13 +7,14 @@ use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::SharedRoutingTable;
 use coxswain_core::tls::SharedTlsStore;
 use coxswain_health::HealthServer;
-use coxswain_proxy::{Proxy, RoutingEngine, SniCertSelector};
+use coxswain_proxy::{Proxy, ProxyAcceptor, RoutingEngine, SniCertSelector, TrustedSources};
+use ipnet::IpNet;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::services::background::background_service;
 use pingora_core::services::listening::Service;
-use pingora_proxy::http_proxy_service_with_name;
+use pingora_proxy::{http_proxy, http_proxy_service_with_name};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -185,6 +186,31 @@ pub struct ServeArgs {
     /// they recover.
     #[arg(long, env = "COXSWAIN_INGRESS_DEFAULT_BACKEND")]
     pub ingress_default_backend: Option<IngressDefaultBackend>,
+
+    /// Enable HAProxy PROXY protocol v1/v2 on the proxy listeners.
+    ///
+    /// When set, every accepted connection MUST carry a valid PROXY header.
+    /// Connections from sources not listed in `--proxy-trusted-sources` are
+    /// dropped immediately. Connections that omit or malform the header are
+    /// also dropped (strict mode).
+    ///
+    /// The real client address is propagated upstream via the RFC 7239
+    /// `Forwarded` header.
+    #[arg(
+        long,
+        env = "COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL",
+        default_value_t = false
+    )]
+    pub proxy_accept_proxy_protocol: bool,
+
+    /// Comma-separated list of CIDR ranges that are permitted to send PROXY headers.
+    ///
+    /// Only meaningful when `--proxy-accept-proxy-protocol` is set. Connections
+    /// from addresses outside this list are rejected at the TCP level.
+    ///
+    /// Example: `10.0.0.0/8,172.16.0.0/12,127.0.0.1/32`
+    #[arg(long, env = "COXSWAIN_PROXY_TRUSTED_SOURCES", value_delimiter = ',')]
+    pub proxy_trusted_sources: Vec<IpNet>,
 }
 
 fn main() -> Result<()> {
@@ -243,18 +269,40 @@ fn main() -> Result<()> {
         ),
     ));
 
-    server.add_service({
+    if args.proxy_accept_proxy_protocol {
+        if args.proxy_trusted_sources.is_empty() {
+            tracing::warn!(
+                "--proxy-accept-proxy-protocol is set but --proxy-trusted-sources is empty; \
+                 all connections will be rejected"
+            );
+        }
         let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
-        let mut svc =
-            http_proxy_service_with_name(&server.configuration, Proxy { engine }, "proxy");
-        svc.add_tcp(&args.proxy_addr.to_string());
-        let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
-            Box::new(SniCertSelector::new(tls_store));
-        let tls_settings =
-            TlsSettings::with_callbacks(callbacks).expect("TlsSettings::with_callbacks");
-        svc.add_tls_with_settings(&args.proxy_tls_addr.to_string(), None, tls_settings);
-        svc
-    });
+        let proxy = Arc::new(http_proxy(&server.configuration, Proxy { engine }));
+        let trusted = Arc::new(TrustedSources::new(args.proxy_trusted_sources.clone()));
+        let sni_selector = SniCertSelector::new(tls_store);
+        let acceptor = ProxyAcceptor::new(
+            proxy,
+            args.proxy_addr,
+            args.proxy_tls_addr,
+            trusted,
+            sni_selector,
+        )
+        .expect("build ProxyAcceptor");
+        server.add_service(acceptor);
+    } else {
+        server.add_service({
+            let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
+            let mut svc =
+                http_proxy_service_with_name(&server.configuration, Proxy { engine }, "proxy");
+            svc.add_tcp(&args.proxy_addr.to_string());
+            let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
+                Box::new(SniCertSelector::new(tls_store));
+            let tls_settings =
+                TlsSettings::with_callbacks(callbacks).expect("TlsSettings::with_callbacks");
+            svc.add_tls_with_settings(&args.proxy_tls_addr.to_string(), None, tls_settings);
+            svc
+        });
+    }
 
     server.add_service({
         let mut svc = Service::new(

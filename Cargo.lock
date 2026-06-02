@@ -541,6 +541,7 @@ dependencies = [
  "coxswain-health",
  "coxswain-proxy",
  "humantime",
+ "ipnet",
  "pingora-core",
  "pingora-proxy",
  "tracing",
@@ -594,10 +595,12 @@ dependencies = [
  "kube",
  "rcgen",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
@@ -616,15 +619,18 @@ dependencies = [
 name = "coxswain-proxy"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "async-trait",
  "bytes",
  "coxswain-core",
  "http",
+ "ipnet",
  "pingora",
  "pingora-core",
  "pingora-http",
  "pingora-proxy",
+ "tokio",
  "tracing",
 ]
 

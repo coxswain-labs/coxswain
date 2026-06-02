@@ -33,7 +33,7 @@ TLS is a launch blocker. WebSocket is the minimum protocol expansion needed to s
 - [x] ~~Secret watch + hot TLS reload — [#10](https://github.com/coxswain-labs/coxswain/issues/10) `MUST`~~
 - [x] ~~cert-manager integration (both APIs) — [#11](https://github.com/coxswain-labs/coxswain/issues/11) `MUST`~~
 - [x] ~~WebSocket upgrade passthrough — [#12](https://github.com/coxswain-labs/coxswain/issues/12) `MUST`~~
-- [ ] PROXY protocol v1/v2 support — [#49](https://github.com/coxswain-labs/coxswain/issues/49) `MUST`
+- [x] ~~PROXY protocol v1/v2 support — [#49](https://github.com/coxswain-labs/coxswain/issues/49) `MUST`~~
 
 #### Traffic Management
 

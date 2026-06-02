@@ -5,9 +5,31 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{ConnectionClosed, ErrorSource, HTTPStatus, ReadError, Result, WriteError};
 use pingora_http::RequestHeader;
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::filter::TrafficFilter;
+
+/// Per-connection info seeded by the PROXY protocol accept loop.
+#[derive(Clone)]
+pub(crate) struct ConnectionInfo {
+    pub real_addr: SocketAddr,
+    pub proto: &'static str,
+}
+
+tokio::task_local! {
+    /// Set by the PROXY protocol accept loop before calling process_new_http.
+    /// Consumed by Proxy::new_ctx so that every request on the connection carries
+    /// the real client address and protocol.
+    pub(crate) static CONN_INFO: ConnectionInfo;
+}
+
+/// Per-request context carrying the real client address extracted from the PROXY header.
+#[derive(Default)]
+pub struct ProxyCtx {
+    pub real_client_addr: Option<SocketAddr>,
+    pub real_client_proto: Option<&'static str>,
+}
 
 /// Lock-free routing engine for the request hot path.
 pub struct RoutingEngine {
@@ -36,14 +58,21 @@ pub struct Proxy {
 
 #[async_trait]
 impl ProxyHttp for Proxy {
-    type CTX = ();
+    type CTX = ProxyCtx;
 
-    fn new_ctx(&self) -> Self::CTX {}
+    fn new_ctx(&self) -> Self::CTX {
+        CONN_INFO
+            .try_with(|info| ProxyCtx {
+                real_client_addr: Some(info.real_addr),
+                real_client_proto: Some(info.proto),
+            })
+            .unwrap_or_default()
+    }
 
     async fn upstream_peer(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        _ctx: &mut ProxyCtx,
     ) -> Result<Box<HttpPeer>> {
         let req_header = session.req_header();
         // HTTP/1.1 clients send origin-form requests (e.g. `GET /a HTTP/1.1`), so
@@ -98,9 +127,9 @@ impl ProxyHttp for Proxy {
         &self,
         _session: &mut Session,
         upstream_request: &mut RequestHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut ProxyCtx,
     ) -> Result<()> {
-        TrafficFilter::apply_request_filters(upstream_request)
+        TrafficFilter::apply_request_filters(upstream_request, ctx)
     }
 
     /// Send a plain-text error body instead of Pingora's default empty response.
@@ -111,7 +140,7 @@ impl ProxyHttp for Proxy {
         &self,
         session: &mut Session,
         e: &pingora_core::Error,
-        _ctx: &mut Self::CTX,
+        _ctx: &mut ProxyCtx,
     ) -> FailToProxy
     where
         Self::CTX: Send + Sync,

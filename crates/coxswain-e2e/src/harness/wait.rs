@@ -187,6 +187,13 @@ pub async fn wait_for_ws_route(
         let req = tungstenite::http::Request::builder()
             .uri(&uri)
             .header("Host", host)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tungstenite::handshake::client::generate_key(),
+            )
             .body(())
             .context("build WebSocket request")?;
         match tokio_tungstenite::connect_async(req).await {

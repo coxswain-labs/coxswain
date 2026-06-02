@@ -18,6 +18,10 @@ pub struct ControllerOptions {
     /// When set, passed as `--ingress-default-backend` to the controller.
     /// Format: `<namespace>/<service>:<port>`.
     pub ingress_default_backend: Option<String>,
+    /// When true, passes `--proxy-accept-proxy-protocol` to the controller.
+    pub proxy_accept_proxy_protocol: bool,
+    /// CIDR ranges passed to `--proxy-trusted-sources` (comma-separated).
+    pub proxy_trusted_sources: Vec<String>,
 }
 
 impl ControllerProcess {
@@ -65,6 +69,13 @@ impl ControllerProcess {
         if let Some(db) = opts.ingress_default_backend {
             args.push("--ingress-default-backend".to_string());
             args.push(db);
+        }
+        if opts.proxy_accept_proxy_protocol {
+            args.push("--proxy-accept-proxy-protocol".to_string());
+        }
+        if !opts.proxy_trusted_sources.is_empty() {
+            args.push("--proxy-trusted-sources".to_string());
+            args.push(opts.proxy_trusted_sources.join(","));
         }
 
         let child = Command::new(&binary)

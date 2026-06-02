@@ -10,7 +10,7 @@ use coxswain_e2e::{
     },
     harness::{GeneratedCert, Harness, NamespaceGuard, http, wait},
 };
-use futures::{SinkExt as _, StreamExt as _};
+use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Api;
@@ -694,19 +694,29 @@ async fn websocket_passthrough() -> anyhow::Result<()> {
     let req = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(&uri)
         .header("Host", &host)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header(
+            "Sec-WebSocket-Key",
+            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+        )
         .body(())
         .expect("build WebSocket request");
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
 
-    ws.send(Message::Text("ping".into())).await?;
-    let reply = ws
+    // jmalloc/echo-server sends a greeting frame on connect; assert it arrives.
+    let greeting = ws
         .next()
         .await
-        .ok_or_else(|| anyhow::anyhow!("WebSocket stream closed before echo"))??;
-    assert_eq!(
-        reply,
-        Message::Text("ping".into()),
-        "expected echo of 'ping'"
+        .ok_or_else(|| anyhow::anyhow!("WebSocket stream closed before greeting"))??;
+    let text = match greeting {
+        Message::Text(t) => t,
+        other => anyhow::bail!("expected text greeting, got {other:?}"),
+    };
+    anyhow::ensure!(
+        text.contains("Request served by"),
+        "unexpected greeting: {text}"
     );
 
     ws.close(None).await?;
