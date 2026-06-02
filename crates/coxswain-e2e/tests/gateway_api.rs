@@ -741,10 +741,11 @@ async fn filters() -> anyhow::Result<()> {
     // ── RequestHeaderModifier ────────────────────────────────────────────────
     // The echo backend reflects request headers in the response body JSON.
     let resp = h.http.get(&host, "/filter/req-header").await?;
+    // echo-basic returns headers as Title-Case keys with JSON array values.
     let injected = resp
         .headers
-        .get("x-test-set")
-        .and_then(|v| v.as_str())
+        .get("X-Test-Set")
+        .and_then(|v| v[0].as_str())
         .unwrap_or("");
     assert_eq!(
         injected, "injected",

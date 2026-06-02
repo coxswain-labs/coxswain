@@ -95,26 +95,40 @@ impl GatewayApiReconciler {
         );
 
         for rule in rules {
-            let backend_refs = match rule.backend_refs.as_deref() {
-                Some(b) if !b.is_empty() => b,
-                _ => continue,
-            };
-
-            let addrs = Self::resolve_upstream_addrs(backend_refs, route_ns, slices, grants);
-            if addrs.is_empty() {
-                tracing::warn!(
-                    route = ?route.metadata.name,
-                    "No ready endpoints for rule — skipping"
-                );
-                continue;
-            }
-
-            let upstream = Arc::new(Upstream::new(
-                format!("{route_ns}/{}", backend_refs[0].name),
-                addrs,
-            ));
-
             let rule_filters = rule.filters.as_deref().unwrap_or(&[]);
+
+            // Rules with RequestRedirect are terminal: the proxy short-circuits before
+            // upstream_peer() is called, so no real backend is needed. Use a sentinel
+            // upstream with no endpoints; the redirect fires first and it is never used.
+            let has_redirect = rule_filters
+                .iter()
+                .any(|f| matches!(f.r#type, HttpRouteRulesFiltersType::RequestRedirect));
+
+            let upstream = if has_redirect {
+                Arc::new(Upstream::new(
+                    format!("{route_ns}/redirect-sentinel"),
+                    vec![],
+                ))
+            } else {
+                let backend_refs = match rule.backend_refs.as_deref() {
+                    Some(b) if !b.is_empty() => b,
+                    _ => continue,
+                };
+
+                let addrs = Self::resolve_upstream_addrs(backend_refs, route_ns, slices, grants);
+                if addrs.is_empty() {
+                    tracing::warn!(
+                        route = ?route.metadata.name,
+                        "No ready endpoints for rule — skipping"
+                    );
+                    continue;
+                }
+
+                Arc::new(Upstream::new(
+                    format!("{route_ns}/{}", backend_refs[0].name),
+                    addrs,
+                ))
+            };
 
             // Default to PathPrefix "/" when no matches are specified (Gateway API §4.1).
             let apply = |pb: &mut HostRouterBuilder| match rule.matches.as_deref() {
