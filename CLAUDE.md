@@ -72,7 +72,7 @@ cd conformance && go test -v -timeout 30m -run TestConformance \
   --organization=coxswain-labs \
   --project=coxswain \
   --url=https://github.com/coxswain-labs/coxswain \
-  --implementation-version=$(git describe --tags --always) \
+  --version=$(git describe --tags --always) \
   --report-output=reports/local-report.yaml
 ```
 
