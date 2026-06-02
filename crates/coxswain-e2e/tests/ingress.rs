@@ -12,9 +12,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn init_tracing() {
-    // Install the rustls crypto provider once for the process. reqwest uses
-    // rustls internally, so this must happen before any client is created.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let _ = tracing_subscriber::fmt()
         .with_env_filter("coxswain_e2e=debug,warn")
         .try_init();
@@ -618,7 +615,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
+        rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
