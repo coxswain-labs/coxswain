@@ -1,3 +1,4 @@
+use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth};
 use crate::{endpoints, gateway_api::GatewayApiReconciler, ingress::IngressReconciler};
 use async_trait::async_trait;
 use coxswain_core::ownership::OwnedGateways;
@@ -18,7 +19,7 @@ use kube::{
 };
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -67,6 +68,7 @@ impl std::str::FromStr for IngressDefaultBackend {
 pub struct Reconciler {
     routes: SharedRoutingTable,
     tls: SharedTlsStore,
+    tls_health: SharedGatewayListenerHealth,
     owned_gateways: OwnedGateways,
     controller_name: String,
     /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
@@ -78,6 +80,7 @@ impl Reconciler {
     pub fn new(
         routes: SharedRoutingTable,
         tls: SharedTlsStore,
+        tls_health: SharedGatewayListenerHealth,
         owned_gateways: OwnedGateways,
         controller_name: String,
         watch_namespace: Option<String>,
@@ -86,12 +89,19 @@ impl Reconciler {
         Self {
             routes,
             tls,
+            tls_health,
             owned_gateways,
             controller_name,
             watch_namespace,
             ingress_default_backend,
         }
     }
+}
+
+struct ReconcilerConfig {
+    controller_name: String,
+    watch_namespace: Option<String>,
+    ingress_default_backend: Option<IngressDefaultBackend>,
 }
 
 fn scoped_api<T>(client: Client, ns: Option<&str>) -> Api<T>
@@ -111,14 +121,18 @@ impl BackgroundService for Reconciler {
         let client = Client::try_default()
             .await
             .expect("K8s client for reconciler");
+        let config = ReconcilerConfig {
+            controller_name: self.controller_name.clone(),
+            watch_namespace: self.watch_namespace.clone(),
+            ingress_default_backend: self.ingress_default_backend.clone(),
+        };
         let mut set = spawn_tasks(
             client,
             self.routes.clone(),
             self.tls.clone(),
+            self.tls_health.clone(),
             self.owned_gateways.clone(),
-            self.controller_name.clone(),
-            self.watch_namespace.clone(),
-            self.ingress_default_backend.clone(),
+            config,
         )
         .await;
         loop {
@@ -138,11 +152,15 @@ async fn spawn_tasks(
     client: Client,
     routes: SharedRoutingTable,
     tls: SharedTlsStore,
+    tls_health: SharedGatewayListenerHealth,
     owned_gateways: OwnedGateways,
-    controller_name: String,
-    watch_namespace: Option<String>,
-    ingress_default_backend: Option<IngressDefaultBackend>,
+    config: ReconcilerConfig,
 ) -> JoinSet<()> {
+    let ReconcilerConfig {
+        controller_name,
+        watch_namespace,
+        ingress_default_backend,
+    } = config;
     let (route_reader, route_writer) = reflector::store::<HTTPRoute>();
     let (ingress_reader, ingress_writer) = reflector::store::<Ingress>();
     let (class_reader, class_writer) = reflector::store::<IngressClass>();
@@ -369,6 +387,7 @@ async fn spawn_tasks(
                 ingress_default_backend.as_ref(),
                 &routes,
                 &tls,
+                &tls_health,
             );
         }
     });
@@ -391,6 +410,7 @@ fn rebuild(
     ingress_default_backend: Option<&IngressDefaultBackend>,
     shared: &SharedRoutingTable,
     tls_shared: &SharedTlsStore,
+    tls_health_shared: &SharedGatewayListenerHealth,
 ) {
     let routes = route_store.state();
     let ingresses = ingress_store.state();
@@ -425,12 +445,12 @@ fn rebuild(
     // Publish the owned-gateways snapshot so the controller can filter status writes.
     owned_gateways_handle.store(owned_gateways.clone());
 
-    // Flatten ReferenceGrant objects into a (from_ns, to_ns, Option<to_name>) set for
-    // O(1) cross-namespace backend-ref checks in GatewayApiReconciler. Only grants that
-    // permit HTTPRoute → Service cross-namespace refs are included.
-    let backend_grants: HashSet<(String, String, Option<String>)> = grant_store
-        .state()
-        .into_iter()
+    // Flatten ReferenceGrant objects into two sets for O(1) cross-namespace ref checks:
+    //   backend_grants: HTTPRoute → Service  (used by GatewayApiReconciler::reconcile)
+    //   cert_grants:    Gateway   → Secret   (used by GatewayApiReconciler::reconcile_tls)
+    let grants: Vec<_> = grant_store.state();
+    let backend_grants: HashSet<(String, String, Option<String>)> = grants
+        .iter()
         .filter_map(|grant| {
             let to_ns = grant.metadata.namespace.clone()?;
             Some((grant, to_ns))
@@ -448,6 +468,36 @@ fn rebuild(
                 .to
                 .iter()
                 .filter(|t| (t.group.is_empty() || t.group == "core") && t.kind == "Service")
+                .map(|t| t.name.clone())
+                .collect();
+            from_entries.into_iter().flat_map(move |from_ns| {
+                let to_ns = to_ns.clone();
+                to_entries
+                    .clone()
+                    .into_iter()
+                    .map(move |to_name| (from_ns.clone(), to_ns.clone(), to_name))
+            })
+        })
+        .collect();
+    let cert_grants: HashSet<(String, String, Option<String>)> = grants
+        .iter()
+        .filter_map(|grant| {
+            let to_ns = grant.metadata.namespace.clone()?;
+            Some((grant, to_ns))
+        })
+        .flat_map(|(grant, to_ns)| {
+            let from_entries: Vec<_> = grant
+                .spec
+                .from
+                .iter()
+                .filter(|f| f.group == "gateway.networking.k8s.io" && f.kind == "Gateway")
+                .map(|f| f.namespace.clone())
+                .collect();
+            let to_entries: Vec<_> = grant
+                .spec
+                .to
+                .iter()
+                .filter(|t| (t.group.is_empty() || t.group == "core") && t.kind == "Secret")
                 .map(|t| t.name.clone())
                 .collect();
             from_entries.into_iter().flat_map(move |from_ns| {
@@ -541,7 +591,24 @@ fn rebuild(
             &mut tls_builder,
         );
     }
+
+    // Gateway API TLS pass: walk every owned Gateway and register listener certs.
+    let mut gateway_tls_health: HashMap<(String, String), GatewayListenerHealth> = HashMap::new();
+    for gw in gateway_store.state() {
+        if !owned_gateway_classes.contains(&gw.spec.gateway_class_name) {
+            continue;
+        }
+        let ns = gw.metadata.namespace.clone().unwrap_or_default();
+        let name = gw.metadata.name.clone().unwrap_or_default();
+        let health =
+            GatewayApiReconciler::reconcile_tls(&gw, secret_store, &cert_grants, &mut tls_builder);
+        gateway_tls_health.insert((ns, name), health);
+    }
+
     let tls_store = tls_builder.build();
     tracing::debug!(certs = tls_store.cert_count(), "TLS cert store rebuilt");
     tls_shared.store(Arc::new(tls_store));
+
+    // Publish per-gateway listener health and wake the controller to re-evaluate statuses.
+    tls_health_shared.store_and_notify(gateway_tls_health);
 }

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use coxswain_admin::AdminServer;
+use coxswain_controller::tls::SharedGatewayListenerHealth;
 use coxswain_controller::{Controller, ControllerConfig, IngressDefaultBackend, Reconciler};
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::SharedRoutingTable;
@@ -210,38 +211,70 @@ fn main() -> Result<()> {
     );
 
     let mut server = build_server(&args);
+
     let routing_table = SharedRoutingTable::new();
     let tls_store = SharedTlsStore::new();
-    let engine = build_routing_engine(routing_table.clone());
-    let synced = build_flag();
-    let leader = build_flag();
+    let gateway_tls_health = SharedGatewayListenerHealth::new();
+    let synced = Arc::new(AtomicBool::new(false));
+    let leader = Arc::new(AtomicBool::new(false));
     let owned_gateways = OwnedGateways::new();
 
-    register_controller(
-        &mut server,
-        synced.clone(),
-        leader.clone(),
-        owned_gateways.clone(),
-        controller_config,
+    server.add_service(background_service(
+        "controller",
+        Controller::new(
+            synced.clone(),
+            leader.clone(),
+            owned_gateways.clone(),
+            gateway_tls_health.clone(),
+            controller_config,
+        ),
+    ));
+
+    server.add_service(background_service(
+        "reconciler",
+        Reconciler::new(
+            routing_table.clone(),
+            tls_store.clone(),
+            gateway_tls_health,
+            owned_gateways,
+            args.controller_name.clone(),
+            args.controller_watch_namespace.clone(),
+            args.ingress_default_backend,
+        ),
+    ));
+
+    server.add_service({
+        let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
+        let mut svc =
+            http_proxy_service_with_name(&server.configuration, Proxy { engine }, "proxy");
+        svc.add_tcp(&args.proxy_addr.to_string());
+        let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
+            Box::new(SniCertSelector::new(tls_store));
+        let tls_settings =
+            TlsSettings::with_callbacks(callbacks).expect("TlsSettings::with_callbacks");
+        svc.add_tls_with_settings(&args.proxy_tls_addr.to_string(), None, tls_settings);
+        svc
+    });
+
+    server.add_service({
+        let mut svc = Service::new(
+            "health".to_string(),
+            HealthServer {
+                synced: synced.clone(),
+            },
+        );
+        svc.add_tcp(&args.health_addr.to_string());
+        svc
+    });
+
+    server.add_service(
+        AdminServer {
+            synced,
+            leader,
+            routes: routing_table,
+        }
+        .into_service(args.admin_addr),
     );
-    register_reconciler(
-        &mut server,
-        routing_table.clone(),
-        tls_store.clone(),
-        owned_gateways,
-        args.controller_name.clone(),
-        args.controller_watch_namespace.clone(),
-        args.ingress_default_backend,
-    );
-    register_proxy(
-        &mut server,
-        engine,
-        tls_store,
-        args.proxy_addr,
-        args.proxy_tls_addr,
-    );
-    register_health(&mut server, synced.clone(), args.health_addr);
-    register_admin(&mut server, routing_table, synced, leader, args.admin_addr);
 
     tracing::info!(
         proxy_addr = %args.proxy_addr,
@@ -266,91 +299,6 @@ fn build_server(args: &ServeArgs) -> Server {
     let mut server = Server::new_with_opt_and_conf(Some(Opt::default()), conf);
     server.bootstrap();
     server
-}
-
-fn build_routing_engine(table: SharedRoutingTable) -> Arc<RoutingEngine> {
-    Arc::new(RoutingEngine::new(table))
-}
-
-fn build_flag() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
-}
-
-fn register_controller(
-    server: &mut Server,
-    synced: Arc<AtomicBool>,
-    leader: Arc<AtomicBool>,
-    owned_gateways: OwnedGateways,
-    config: ControllerConfig,
-) {
-    server.add_service(background_service(
-        "controller",
-        Controller::new(synced, leader, owned_gateways, config),
-    ));
-}
-
-fn register_health(server: &mut Server, synced: Arc<AtomicBool>, addr: SocketAddr) {
-    let mut svc = Service::new("health".to_string(), HealthServer { synced });
-    svc.add_tcp(&addr.to_string());
-    server.add_service(svc);
-}
-
-fn register_admin(
-    server: &mut Server,
-    routes: SharedRoutingTable,
-    synced: Arc<AtomicBool>,
-    leader: Arc<AtomicBool>,
-    addr: SocketAddr,
-) {
-    server.add_service(
-        AdminServer {
-            synced,
-            leader,
-            routes,
-        }
-        .into_service(addr),
-    );
-}
-
-fn register_reconciler(
-    server: &mut Server,
-    routes: SharedRoutingTable,
-    tls: SharedTlsStore,
-    owned_gateways: OwnedGateways,
-    controller_name: String,
-    watch_namespace: Option<String>,
-    ingress_default_backend: Option<IngressDefaultBackend>,
-) {
-    server.add_service(background_service(
-        "reconciler",
-        Reconciler::new(
-            routes,
-            tls,
-            owned_gateways,
-            controller_name,
-            watch_namespace,
-            ingress_default_backend,
-        ),
-    ));
-}
-
-fn register_proxy(
-    server: &mut Server,
-    engine: Arc<RoutingEngine>,
-    tls: SharedTlsStore,
-    addr: SocketAddr,
-    tls_addr: SocketAddr,
-) {
-    let proxy_logic = Proxy { engine };
-    let mut proxy_service =
-        http_proxy_service_with_name(&server.configuration, proxy_logic, "proxy");
-    proxy_service.add_tcp(&addr.to_string());
-
-    let selector: pingora_core::listeners::TlsAcceptCallbacks = Box::new(SniCertSelector::new(tls));
-    let tls_settings = TlsSettings::with_callbacks(selector).expect("TlsSettings::with_callbacks");
-    proxy_service.add_tls_with_settings(&tls_addr.to_string(), None, tls_settings);
-
-    server.add_service(proxy_service);
 }
 
 fn init_logger(format: LogFormat, log_filter: &str) -> Result<()> {

@@ -1,0 +1,43 @@
+# Gateway API TLS cross-namespace fixture (Gateway namespace side).
+# The Gateway references a Secret in CERTS_NS, authorised by a ReferenceGrant
+# in tls_cross_namespace_certs.yaml.
+# Placeholders replaced at test runtime:
+#   TESTNS           - primary namespace (Gateway + HTTPRoute live here)
+#   CERTS_NS         - namespace that holds the Secret and ReferenceGrant
+#   LISTENER_HOSTNAME - hostname for the HTTPS listener
+#   SECRET_NAME      - name of the Secret in CERTS_NS
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-tls-xns
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: "LISTENER_HOSTNAME"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: SECRET_NAME
+            namespace: CERTS_NS
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: tls-xns-route
+spec:
+  parentRefs:
+    - name: coxswain-tls-xns
+  hostnames:
+    - "LISTENER_HOSTNAME"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000
