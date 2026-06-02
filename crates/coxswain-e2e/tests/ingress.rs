@@ -107,7 +107,9 @@ async fn path_matching() -> anyhow::Result<()> {
     let resp = wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
-    let resp = h.http.get(&host, "/b").await?;
+    // /b shares the same ingress as /a, so a short deadline is enough; use
+    // wait_for_route rather than a bare get() to tolerate transient timeouts.
+    let resp = wait::wait_for_route(&h.http, &host, "/b", Duration::from_secs(15)).await?;
     resp.assert_backend("echo-b");
 
     Ok(())
