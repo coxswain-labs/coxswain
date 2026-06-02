@@ -1,8 +1,9 @@
 use coxswain_e2e::{
     fixtures::{
-        self, BACKENDS_ECHO, GATEWAY_API_COMBINED_MATCHING, GATEWAY_API_CROSS_NAMESPACE_ROUTE,
-        GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_HEADER_MATCHING, GATEWAY_API_HOST_POOL,
-        GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PATH_MATCHING, GATEWAY_API_QUERY_PARAM_MATCHING,
+        self, BACKENDS_ECHO, GATEWAY_API_CERT_MANAGER, GATEWAY_API_COMBINED_MATCHING,
+        GATEWAY_API_CROSS_NAMESPACE_ROUTE, GATEWAY_API_CROSS_NAMESPACE_TENANT,
+        GATEWAY_API_HEADER_MATCHING, GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING,
+        GATEWAY_API_PATH_MATCHING, GATEWAY_API_QUERY_PARAM_MATCHING,
         GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS, GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
         GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WILDCARD_HOST,
     },
@@ -626,6 +627,41 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
         "expected response from listener B after rotation"
     );
     resp_b.1.unwrap().assert_backend("echo-b");
+
+    Ok(())
+}
+
+/// Verifies cert-manager automatic certificate provisioning for Gateway API:
+/// 1. Apply a Gateway with cert-manager.io/cluster-issuer annotation.
+/// 2. cert-manager (using the coxswain-e2e-selfsigned ClusterIssuer) provisions
+///    the kubernetes.io/tls Secret named in the listener's certificateRefs[0].
+/// 3. Coxswain picks up the Secret via its Secret watch and serves TLS.
+/// 4. HTTPS request succeeds and routes to the expected backend.
+#[tokio::test]
+async fn cert_manager_gateway_provisioning() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-cert-mgr").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("tls-cm.{}.local", ns.name);
+    let secret_name = "cert-manager-tls";
+
+    fixtures::apply_fixture(
+        GATEWAY_API_CERT_MANAGER,
+        &ns.name,
+        &[("LISTENER_HOSTNAME", &host), ("SECRET_NAME", secret_name)],
+    )
+    .await?;
+
+    // Wait for cert-manager to issue the certificate and populate the Secret.
+    wait::wait_for_tls_secret(&h.client, secret_name, &ns.name, Duration::from_secs(120)).await?;
+
+    // Coxswain picks up the Secret via its Secret watch; wait for HTTPS to become live.
+    let resp = wait::wait_for_https_route(h.tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
 
     Ok(())
 }

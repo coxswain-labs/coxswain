@@ -1,6 +1,7 @@
 use anyhow::Context as _;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
+use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::Api;
@@ -111,6 +112,37 @@ pub async fn wait_for_gateway_programmed(
         if time::Instant::now() >= deadline {
             anyhow::bail!(
                 "timed out waiting for Gateway {namespace}/{name} to be Accepted and Programmed"
+            );
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Poll until a `kubernetes.io/tls` Secret with non-empty `tls.crt` data exists.
+/// Used by cert-manager tests to wait for certificate issuance before testing TLS.
+pub async fn wait_for_tls_secret(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        if let Ok(secret) = api.get(name).await {
+            let is_tls = secret.type_.as_deref() == Some("kubernetes.io/tls");
+            let has_cert = secret
+                .data
+                .as_ref()
+                .and_then(|d| d.get("tls.crt"))
+                .is_some_and(|b| !b.0.is_empty());
+            if is_tls && has_cert {
+                return Ok(());
+            }
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for kubernetes.io/tls Secret {namespace}/{name} to be populated"
             );
         }
         time::sleep(Duration::from_millis(500)).await;

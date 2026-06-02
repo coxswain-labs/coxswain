@@ -17,6 +17,8 @@ metadata:
     app.kubernetes.io/component: controller
 rules:
   - apiGroups: [""]
+    # secrets: covers kubernetes.io/tls Secrets for TLS termination (#8, #9),
+    # including those provisioned automatically by cert-manager (#11).
     resources: ["services", "endpoints", "pods", "secrets"]
     verbs: ["get", "list", "watch"]
 

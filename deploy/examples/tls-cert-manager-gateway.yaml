@@ -1,0 +1,105 @@
+# TLS termination for Gateway API using cert-manager automatic certificate provisioning.
+#
+# cert-manager's Gateway API integration (stable since v1.16) watches Gateway resources
+# and uses the cert-manager.io/cluster-issuer annotation to mint a kubernetes.io/tls
+# Secret for each HTTPS listener.  Coxswain picks up that Secret automatically via its
+# Secret watch and serves TLS without any restart.
+#
+# Prerequisites:
+#   - cert-manager >= v1.16 installed in the cluster (https://cert-manager.io)
+#     Older versions require --feature-gates=ExperimentalGatewayAPISupport=true on the
+#     cert-manager controller deployment.
+#   - Gateway API CRDs installed (v1 or later).
+#   - A ClusterIssuer or Issuer configured (see below for a self-signed example).
+#
+# Apply:
+#   kubectl apply -f deploy/examples/tls-cert-manager-gateway.yaml
+#
+# Verify (adjust the address to your Coxswain TLS proxy):
+#   kubectl wait secret example-com-gateway-tls --for=jsonpath='{.type}'=kubernetes.io/tls --timeout=60s
+#   curl --resolve example.com:8443:127.0.0.1 -k https://example.com:8443/
+
+# ---------------------------------------------------------------------------
+# Self-signed ClusterIssuer (suitable for demos and development)
+# ---------------------------------------------------------------------------
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned
+spec:
+  selfSigned: {}
+
+# ---------------------------------------------------------------------------
+# Production ACME (Let's Encrypt) ClusterIssuer — uncomment and customise.
+#
+# apiVersion: cert-manager.io/v1
+# kind: ClusterIssuer
+# metadata:
+#   name: letsencrypt-prod
+# spec:
+#   acme:
+#     server: https://acme-v02.api.letsencrypt.org/directory
+#     email: you@example.com
+#     privateKeySecretRef:
+#       name: letsencrypt-prod-account-key
+#     solvers:
+#       - http01:
+#           ingress:
+#             ingressClassName: coxswain
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Gateway — cert-manager provisions example-com-gateway-tls automatically.
+#
+# How it works:
+#   1. cert-manager detects the cert-manager.io/cluster-issuer annotation.
+#   2. It creates a Certificate object targeting the secretName in each HTTPS
+#      listener's certificateRefs[0].name.
+#   3. Once issued, it creates/updates the kubernetes.io/tls Secret.
+#   4. Coxswain's Secret watch fires, triggers a routing-table rebuild, and
+#      starts serving the new cert — no restart required.
+# ---------------------------------------------------------------------------
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: example-com-gateway
+  namespace: default
+  annotations:
+    # cert-manager reads this annotation and creates a Certificate for each
+    # HTTPS listener, targeting the secretName in certificateRefs[0].
+    # Replace "selfsigned" with "letsencrypt-prod" for a real certificate.
+    cert-manager.io/cluster-issuer: selfsigned
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: "example.com"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            # cert-manager will create/renew this Secret.
+            name: example-com-gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: example-com-route
+  namespace: default
+spec:
+  parentRefs:
+    - name: example-com-gateway
+  hostnames:
+    - "example.com"
+  rules:
+    - backendRefs:
+        - name: my-service
+          port: 80

@@ -84,6 +84,16 @@ pub const INGRESS_TLS_TERMINATION: &str = concat!(
     "/fixtures/ingress/tls_termination.yaml"
 );
 
+pub const INGRESS_CERT_MANAGER: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/ingress/cert_manager.yaml"
+);
+
+pub const GATEWAY_API_CERT_MANAGER: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/cert_manager.yaml"
+);
+
 /// Apply a fixture YAML to `namespace`.
 ///
 /// Supports template substitutions: `TESTNS` is always replaced with `namespace`.
