@@ -3,11 +3,17 @@ use coxswain_e2e::{
         self, BACKENDS_ECHO, GATEWAY_API_COMBINED_MATCHING, GATEWAY_API_CROSS_NAMESPACE_ROUTE,
         GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_HEADER_MATCHING, GATEWAY_API_HOST_POOL,
         GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PATH_MATCHING, GATEWAY_API_QUERY_PARAM_MATCHING,
-        GATEWAY_API_WILDCARD_HOST,
+        GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS, GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
+        GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WILDCARD_HOST,
     },
-    harness::{Harness, NamespaceGuard, wait},
+    harness::{GeneratedCert, Harness, NamespaceGuard, http, wait},
 };
+use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::Api;
+use kube::api::PostParams;
 use reqwest::Method;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 fn init_tracing() {
@@ -346,6 +352,193 @@ async fn cross_namespace_without_grant() -> anyhow::Result<()> {
         status, 503,
         "expected 503 without ReferenceGrant, got {status}"
     );
+
+    Ok(())
+}
+
+/// Gateway API TLS termination with SNI selection:
+/// - Two HTTPS listeners, each backed by a distinct self-signed cert.
+/// - Each SNI routes to the correct backend.
+/// - Unknown SNI fails the TLS handshake.
+#[tokio::test]
+async fn tls_termination_with_sni() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-tls-sni").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host_a = format!("tls-a.{}.local", ns.name);
+    let host_b = format!("tls-b.{}.local", ns.name);
+    let cert_a = GeneratedCert::for_host(&host_a);
+    let cert_b = GeneratedCert::for_host(&host_b);
+
+    fixtures::apply_fixture(
+        GATEWAY_API_TLS_TERMINATION,
+        &ns.name,
+        &[
+            ("LISTENER_A_HOSTNAME", &host_a),
+            ("LISTENER_B_HOSTNAME", &host_b),
+            ("SECRET_A_NAME", "cert-a"),
+            ("SECRET_B_NAME", "cert-b"),
+            ("TLS_CRT_A_B64", &cert_a.cert_b64()),
+            ("TLS_KEY_A_B64", &cert_a.key_b64()),
+            ("TLS_CRT_B_B64", &cert_b.cert_b64()),
+            ("TLS_KEY_B_B64", &cert_b.key_b64()),
+        ],
+    )
+    .await?;
+
+    let resp_a =
+        wait::wait_for_https_route(h.tls_addr, &host_a, "/", Duration::from_secs(60)).await?;
+    resp_a.assert_backend("echo-a");
+
+    let resp_b =
+        wait::wait_for_https_route(h.tls_addr, &host_b, "/", Duration::from_secs(60)).await?;
+    resp_b.assert_backend("echo-b");
+
+    // Unknown SNI must cause a TLS handshake failure (no cert installed).
+    let unknown = format!("unknown.{}.local", ns.name);
+    let result = http::https_get(&unknown, "/", h.tls_addr).await;
+    assert!(
+        result.is_err(),
+        "expected TLS error for unknown SNI, got: {result:?}"
+    );
+
+    Ok(())
+}
+
+/// Gateway with an HTTPS listener referencing a non-existent Secret must have
+/// `Programmed=False` with `reason=ListenersNotValid`. Once the Secret is
+/// created the condition must flip to `Programmed=True`.
+#[tokio::test]
+async fn tls_missing_secret_marks_gateway_not_programmed() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-tls-missing").await?;
+
+    let host = format!("tls-missing.{}.local", ns.name);
+    let secret_name = "cert-missing";
+
+    // Apply a Gateway with an HTTPS listener whose Secret does not exist yet.
+    fixtures::apply_fixture(
+        GATEWAY_API_TLS_GATEWAY_NO_CERTS,
+        &ns.name,
+        &[("LISTENER_HOSTNAME", &host), ("SECRET_NAME", secret_name)],
+    )
+    .await?;
+
+    // Controller must mark the Gateway as not programmed within 30 s.
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-tls-no-cert",
+        &ns.name,
+        "Programmed",
+        "False",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    // Per-listener ResolvedRefs must also be False.
+    wait::wait_for_gateway_listener_condition(
+        &h.client,
+        "coxswain-tls-no-cert",
+        &ns.name,
+        "https",
+        "ResolvedRefs",
+        "False",
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    // Now create the Secret — the controller should recover.
+    let cert = GeneratedCert::for_host(&host);
+    let secrets_api: Api<Secret> = Api::namespaced(h.client.clone(), &ns.name);
+    secrets_api
+        .create(
+            &PostParams::default(),
+            &Secret {
+                metadata: ObjectMeta {
+                    name: Some(secret_name.to_string()),
+                    ..Default::default()
+                },
+                type_: Some("kubernetes.io/tls".to_string()),
+                data: Some({
+                    let mut m = BTreeMap::new();
+                    m.insert(
+                        "tls.crt".to_string(),
+                        k8s_openapi::ByteString(cert.cert_pem.as_bytes().to_vec()),
+                    );
+                    m.insert(
+                        "tls.key".to_string(),
+                        k8s_openapi::ByteString(cert.key_pem.as_bytes().to_vec()),
+                    );
+                    m
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    // After the Secret is available the Gateway must flip to Programmed=True.
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-tls-no-cert",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Gateway in one namespace references a Secret in a separate namespace,
+/// permitted by a ReferenceGrant. HTTPS must work end-to-end.
+#[tokio::test]
+async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-tls-xns").await?;
+    let certs_ns = NamespaceGuard::create(&h.client, "gw-tls-xns-certs").await?;
+
+    // Deploy backend in the primary namespace.
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("tls-xns.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&host);
+    let secret_name = "xns-cert";
+
+    // Deploy Secret + ReferenceGrant into the certs namespace.
+    fixtures::apply_fixture(
+        GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS,
+        &certs_ns.name,
+        &[
+            ("TESTNS", &ns.name),
+            ("SECRET_NAME", secret_name),
+            ("TLS_CRT_B64", &cert.cert_b64()),
+            ("TLS_KEY_B64", &cert.key_b64()),
+        ],
+    )
+    .await?;
+
+    // Deploy Gateway + HTTPRoute into the primary namespace.
+    fixtures::apply_fixture(
+        GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
+        &ns.name,
+        &[
+            ("CERTS_NS", &certs_ns.name),
+            ("LISTENER_HOSTNAME", &host),
+            ("SECRET_NAME", secret_name),
+        ],
+    )
+    .await?;
+
+    let resp = wait::wait_for_https_route(h.tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
 
     Ok(())
 }

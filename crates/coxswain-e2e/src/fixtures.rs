@@ -49,6 +49,26 @@ pub const GATEWAY_API_COMBINED_MATCHING: &str = concat!(
     "/fixtures/gateway_api/combined_matching.yaml"
 );
 
+pub const GATEWAY_API_TLS_TERMINATION: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/tls_termination.yaml"
+);
+
+pub const GATEWAY_API_TLS_GATEWAY_NO_CERTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/tls_gateway_no_certs.yaml"
+);
+
+pub const GATEWAY_API_TLS_CROSS_NAMESPACE_GW: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/tls_cross_namespace_gw.yaml"
+);
+
+pub const GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/tls_cross_namespace_certs.yaml"
+);
+
 pub const INGRESS_PATH_MATCHING: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/ingress/path_matching.yaml"

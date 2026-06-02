@@ -1,0 +1,31 @@
+# Gateway API TLS cross-namespace fixture (certs namespace side).
+# Contains the kubernetes.io/tls Secret and the ReferenceGrant that permits
+# the Gateway in TESTNS to reference it.
+# Placeholders replaced at test runtime:
+#   TESTNS      - namespace of the Gateway that references this Secret
+#   CERTS_NS    - this namespace (applied with -n CERTS_NS)
+#   SECRET_NAME - name of the Secret
+#   TLS_CRT_B64 - base64-encoded PEM certificate
+#   TLS_KEY_B64 - base64-encoded PEM private key
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: SECRET_NAME
+type: kubernetes.io/tls
+data:
+  tls.crt: TLS_CRT_B64
+  tls.key: TLS_KEY_B64
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-gateway-from-TESTNS
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      namespace: TESTNS
+  to:
+    - group: ""
+      kind: Secret

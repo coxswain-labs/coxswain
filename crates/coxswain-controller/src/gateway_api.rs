@@ -1,20 +1,24 @@
 use crate::endpoints;
+use crate::tls::{GatewayListenerHealth, ListenerTlsOutcome, load_tls_cert};
 use coxswain_core::ownership::parent_ref_owned;
 use coxswain_core::reference_grants;
 use coxswain_core::routing::{
     HeaderPredicate, HostRouterBuilder, MatchPredicates, QueryPredicate, RouteEntry,
     RoutingTableBuilder, Upstream, ValueMatch,
 };
+use coxswain_core::tls::TlsStoreBuilder;
+use gateway_api::apis::standard::gateways::{Gateway, GatewayListenersTlsMode};
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesMatchesHeadersType,
     HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPathType,
     HttpRouteRulesMatchesQueryParamsType,
 };
 use http::{HeaderName, Method};
+use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -171,6 +175,121 @@ impl GatewayApiReconciler {
                     } else {
                         apply(builder.exact_host(h));
                     }
+                }
+            }
+        }
+    }
+
+    /// Walks `gateway.spec.listeners`, resolves TLS certificates for HTTPS
+    /// listeners, and registers them in `builder`. Returns a per-listener health
+    /// map so the controller can set accurate Gateway status conditions.
+    ///
+    /// Only `protocol: HTTPS` with `tls.mode: Terminate` (the default) is handled.
+    /// `Passthrough` is recorded as `Invalid`. Non-HTTPS listeners are `NotApplicable`.
+    /// Cross-namespace `certificateRefs` require a matching entry in `cert_grants`.
+    pub fn reconcile_tls(
+        gateway: &Gateway,
+        secrets: &reflector::Store<Secret>,
+        cert_grants: &HashSet<(String, String, Option<String>)>,
+        builder: &mut TlsStoreBuilder,
+    ) -> GatewayListenerHealth {
+        let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
+        let gw_name = gateway.metadata.name.as_deref().unwrap_or("unknown");
+        let mut by_listener: BTreeMap<String, ListenerTlsOutcome> = BTreeMap::new();
+
+        for listener in &gateway.spec.listeners {
+            let outcome = if listener.protocol != "HTTPS" {
+                ListenerTlsOutcome::NotApplicable
+            } else {
+                Self::resolve_listener_tls(gw_ns, gw_name, listener, secrets, cert_grants, builder)
+            };
+            by_listener.insert(listener.name.clone(), outcome);
+        }
+
+        GatewayListenerHealth { by_listener }
+    }
+
+    fn resolve_listener_tls(
+        gw_ns: &str,
+        gw_name: &str,
+        listener: &gateway_api::apis::standard::gateways::GatewayListeners,
+        secrets: &reflector::Store<Secret>,
+        cert_grants: &HashSet<(String, String, Option<String>)>,
+        builder: &mut TlsStoreBuilder,
+    ) -> ListenerTlsOutcome {
+        let tls = match &listener.tls {
+            Some(t) => t,
+            None => {
+                return ListenerTlsOutcome::InvalidCertificateRef {
+                    message: "HTTPS listener has no tls configuration".to_string(),
+                };
+            }
+        };
+
+        if matches!(tls.mode, Some(GatewayListenersTlsMode::Passthrough)) {
+            return ListenerTlsOutcome::Invalid {
+                message: "tls.mode: Passthrough is not supported; use Terminate".to_string(),
+            };
+        }
+
+        let hostname = match listener.hostname.as_deref().filter(|h| !h.is_empty()) {
+            Some(h) => h,
+            None => {
+                return ListenerTlsOutcome::Invalid {
+                    message: "listener.hostname is required for HTTPS listeners".to_string(),
+                };
+            }
+        };
+
+        let refs = tls.certificate_refs.as_deref().unwrap_or(&[]);
+        if refs.is_empty() {
+            return ListenerTlsOutcome::InvalidCertificateRef {
+                message: "tls.certificateRefs is empty".to_string(),
+            };
+        }
+
+        let cert_ref = &refs[0];
+        let ref_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
+
+        if ref_ns != gw_ns
+            && !reference_grants::backend_ref_allowed(gw_ns, ref_ns, &cert_ref.name, cert_grants)
+        {
+            tracing::warn!(
+                gateway = %format!("{gw_ns}/{gw_name}"),
+                listener = %listener.name,
+                secret = %format!("{ref_ns}/{}", cert_ref.name),
+                "Cross-namespace certificateRef denied — no matching ReferenceGrant"
+            );
+            return ListenerTlsOutcome::RefNotPermitted {
+                message: format!(
+                    "cross-namespace Secret {ref_ns}/{} requires a ReferenceGrant",
+                    cert_ref.name
+                ),
+            };
+        }
+
+        match load_tls_cert(ref_ns, &cert_ref.name, secrets) {
+            Ok(cert) => {
+                builder.add_cert(hostname, Arc::new(cert));
+                tracing::debug!(
+                    gateway = %format!("{gw_ns}/{gw_name}"),
+                    listener = %listener.name,
+                    secret = %format!("{ref_ns}/{}", cert_ref.name),
+                    hostname,
+                    "Gateway TLS cert installed"
+                );
+                ListenerTlsOutcome::Resolved
+            }
+            Err(e) => {
+                tracing::warn!(
+                    gateway = %format!("{gw_ns}/{gw_name}"),
+                    listener = %listener.name,
+                    secret = %format!("{ref_ns}/{}", cert_ref.name),
+                    error = %e,
+                    "Gateway TLS Secret unusable — listener skipped"
+                );
+                ListenerTlsOutcome::InvalidCertificateRef {
+                    message: e.to_string(),
                 }
             }
         }

@@ -1,0 +1,89 @@
+# Gateway API TLS termination fixture with two HTTPS listeners.
+# Placeholders replaced at test runtime:
+#   TESTNS              - test namespace
+#   LISTENER_A_HOSTNAME - hostname for listener A
+#   LISTENER_B_HOSTNAME - hostname for listener B
+#   SECRET_A_NAME       - kubernetes.io/tls Secret name for listener A
+#   SECRET_B_NAME       - kubernetes.io/tls Secret name for listener B
+#   TLS_CRT_A_B64       - base64-encoded PEM cert for listener A
+#   TLS_KEY_A_B64       - base64-encoded PEM key for listener A
+#   TLS_CRT_B_B64       - base64-encoded PEM cert for listener B
+#   TLS_KEY_B_B64       - base64-encoded PEM key for listener B
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: SECRET_A_NAME
+type: kubernetes.io/tls
+data:
+  tls.crt: TLS_CRT_A_B64
+  tls.key: TLS_KEY_A_B64
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: SECRET_B_NAME
+type: kubernetes.io/tls
+data:
+  tls.crt: TLS_CRT_B_B64
+  tls.key: TLS_KEY_B_B64
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-tls-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: https-a
+      port: 443
+      protocol: HTTPS
+      hostname: "LISTENER_A_HOSTNAME"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: SECRET_A_NAME
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https-b
+      port: 443
+      protocol: HTTPS
+      hostname: "LISTENER_B_HOSTNAME"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: SECRET_B_NAME
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: tls-route-a
+spec:
+  parentRefs:
+    - name: coxswain-tls-test
+  hostnames:
+    - "LISTENER_A_HOSTNAME"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: tls-route-b
+spec:
+  parentRefs:
+    - name: coxswain-tls-test
+  hostnames:
+    - "LISTENER_B_HOSTNAME"
+  rules:
+    - backendRefs:
+        - name: echo-b
+          port: 3000

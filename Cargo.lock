@@ -551,6 +551,7 @@ dependencies = [
 name = "coxswain-controller"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "coxswain-core",
  "futures",

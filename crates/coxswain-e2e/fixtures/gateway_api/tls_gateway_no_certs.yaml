@@ -1,0 +1,26 @@
+# Gateway API TLS fixture without the Secret resource, used to test
+# "missing Secret → Gateway Programmed=False" behaviour.
+# Placeholders replaced at test runtime:
+#   TESTNS           - test namespace
+#   LISTENER_HOSTNAME - hostname for the HTTPS listener
+#   SECRET_NAME      - name of the Secret that does NOT exist yet
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-tls-no-cert
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: "LISTENER_HOSTNAME"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: SECRET_NAME
+      allowedRoutes:
+        namespaces:
+          from: Same

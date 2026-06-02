@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use coxswain_admin::AdminServer;
+use coxswain_controller::tls::SharedGatewayListenerHealth;
 use coxswain_controller::{Controller, ControllerConfig, IngressDefaultBackend, Reconciler};
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::SharedRoutingTable;
@@ -212,6 +213,7 @@ fn main() -> Result<()> {
     let mut server = build_server(&args);
     let routing_table = SharedRoutingTable::new();
     let tls_store = SharedTlsStore::new();
+    let gateway_tls_health = SharedGatewayListenerHealth::new();
     let engine = build_routing_engine(routing_table.clone());
     let synced = build_flag();
     let leader = build_flag();
@@ -222,16 +224,20 @@ fn main() -> Result<()> {
         synced.clone(),
         leader.clone(),
         owned_gateways.clone(),
+        gateway_tls_health.clone(),
         controller_config,
     );
     register_reconciler(
         &mut server,
-        routing_table.clone(),
-        tls_store.clone(),
-        owned_gateways,
-        args.controller_name.clone(),
-        args.controller_watch_namespace.clone(),
-        args.ingress_default_backend,
+        Reconciler::new(
+            routing_table.clone(),
+            tls_store.clone(),
+            gateway_tls_health,
+            owned_gateways,
+            args.controller_name.clone(),
+            args.controller_watch_namespace.clone(),
+            args.ingress_default_backend,
+        ),
     );
     register_proxy(
         &mut server,
@@ -281,11 +287,12 @@ fn register_controller(
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
     owned_gateways: OwnedGateways,
+    tls_health: SharedGatewayListenerHealth,
     config: ControllerConfig,
 ) {
     server.add_service(background_service(
         "controller",
-        Controller::new(synced, leader, owned_gateways, config),
+        Controller::new(synced, leader, owned_gateways, tls_health, config),
     ));
 }
 
@@ -312,26 +319,8 @@ fn register_admin(
     );
 }
 
-fn register_reconciler(
-    server: &mut Server,
-    routes: SharedRoutingTable,
-    tls: SharedTlsStore,
-    owned_gateways: OwnedGateways,
-    controller_name: String,
-    watch_namespace: Option<String>,
-    ingress_default_backend: Option<IngressDefaultBackend>,
-) {
-    server.add_service(background_service(
-        "reconciler",
-        Reconciler::new(
-            routes,
-            tls,
-            owned_gateways,
-            controller_name,
-            watch_namespace,
-            ingress_default_backend,
-        ),
-    ));
+fn register_reconciler(server: &mut Server, reconciler: Reconciler) {
+    server.add_service(background_service("reconciler", reconciler));
 }
 
 fn register_proxy(

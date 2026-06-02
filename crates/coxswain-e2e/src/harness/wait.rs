@@ -165,6 +165,75 @@ pub async fn wait_for_ingress_lb_ip(
     }
 }
 
+/// Poll until the named Gateway has a top-level condition with the given type
+/// and status value (e.g. `"True"` or `"False"`).
+pub async fn wait_for_gateway_condition(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    type_: &str,
+    status: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<Gateway> = Api::namespaced(client.clone(), namespace);
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        if let Ok(gw) = api.get(name).await {
+            let found = gw
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_deref())
+                .map(|conds| condition_matches(conds, type_, status))
+                .unwrap_or(false);
+            if found {
+                return Ok(());
+            }
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for Gateway {namespace}/{name} to have condition {type_}={status}"
+            );
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Poll until the named Gateway's per-listener status has a condition with the
+/// given type and status value for the specified listener.
+pub async fn wait_for_gateway_listener_condition(
+    client: &kube::Client,
+    gw_name: &str,
+    namespace: &str,
+    listener_name: &str,
+    type_: &str,
+    status: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<Gateway> = Api::namespaced(client.clone(), namespace);
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        if let Ok(gw) = api.get(gw_name).await {
+            let found = gw
+                .status
+                .as_ref()
+                .and_then(|s| s.listeners.as_deref())
+                .and_then(|listeners| listeners.iter().find(|l| l.name == listener_name))
+                .map(|l| condition_matches(l.conditions.as_slice(), type_, status))
+                .unwrap_or(false);
+            if found {
+                return Ok(());
+            }
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for Gateway {namespace}/{gw_name} listener \
+                 '{listener_name}' to have condition {type_}={status}"
+            );
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 fn gateway_has_condition(gw: &Gateway, type_: &str) -> bool {
     gw.status
         .as_ref()
@@ -186,7 +255,11 @@ fn route_has_condition(route: &HTTPRoute, type_: &str) -> bool {
 }
 
 fn has_condition(conditions: &[Condition], type_: &str) -> bool {
+    condition_matches(conditions, type_, "True")
+}
+
+fn condition_matches(conditions: &[Condition], type_: &str, status: &str) -> bool {
     conditions
         .iter()
-        .any(|c| c.type_ == type_ && c.status == "True")
+        .any(|c| c.type_ == type_ && c.status == status)
 }
