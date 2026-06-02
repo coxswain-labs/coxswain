@@ -45,42 +45,41 @@ pub async fn bootstrap() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Install cert-manager v1.18.0 and a `coxswain-e2e-selfsigned` ClusterIssuer if not present.
-/// Idempotent: checks for the `certificates.cert-manager.io` CRD before applying.
+/// Install cert-manager v1.18.0 if not already present, then ensure the
+/// `coxswain-e2e-selfsigned` ClusterIssuer exists.  Both steps are idempotent
+/// via `kubectl apply`.
 async fn install_cert_manager_if_missing() -> anyhow::Result<()> {
-    if cert_manager_installed().await {
-        return Ok(());
+    if !cert_manager_installed().await {
+        tracing::info!("cert-manager not found, installing v1.18.0");
+        kubectl_apply_url(
+            "https://github.com/cert-manager/cert-manager/releases/download/v1.18.0/cert-manager.yaml",
+        )
+        .await
+        .context("install cert-manager")?;
+
+        // Wait for all three cert-manager Deployments to be Available.
+        let status = Command::new("kubectl")
+            .args([
+                "wait",
+                "--for=condition=Available",
+                "--timeout=120s",
+                "deployment/cert-manager",
+                "deployment/cert-manager-webhook",
+                "deployment/cert-manager-cainjector",
+                "-n",
+                "cert-manager",
+            ])
+            .status()
+            .await
+            .context("kubectl wait cert-manager")?;
+        anyhow::ensure!(
+            status.success(),
+            "cert-manager deployments not ready within 120s"
+        );
     }
 
-    tracing::info!("cert-manager not found, installing v1.18.0");
-    kubectl_apply_url(
-        "https://github.com/cert-manager/cert-manager/releases/download/v1.18.0/cert-manager.yaml",
-    )
-    .await
-    .context("install cert-manager")?;
-
-    // Wait for all three cert-manager Deployments to be Available.
-    let status = Command::new("kubectl")
-        .args([
-            "wait",
-            "--for=condition=Available",
-            "--timeout=120s",
-            "deployment/cert-manager",
-            "deployment/cert-manager-webhook",
-            "deployment/cert-manager-cainjector",
-            "-n",
-            "cert-manager",
-        ])
-        .status()
-        .await
-        .context("kubectl wait cert-manager")?;
-    anyhow::ensure!(
-        status.success(),
-        "cert-manager deployments not ready within 120s"
-    );
-
-    // Create a SelfSigned ClusterIssuer for use by all e2e tests.
-    // `kubectl apply` is idempotent; safe to call on every subsequent bootstrap.
+    // Always apply the ClusterIssuer — `kubectl apply` is idempotent so this is
+    // safe on subsequent bootstrap calls when cert-manager was already installed.
     let issuer_yaml = r#"
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
