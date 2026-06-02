@@ -78,6 +78,35 @@ impl HttpClient {
     }
 }
 
+/// Make a single HTTPS GET and return the peer's leaf certificate as DER bytes.
+///
+/// Requires `reqwest` built with `rustls-tls` (already the case in this crate).
+/// Returns `Err` if the handshake fails or no peer certificate is presented.
+pub async fn https_peer_leaf_der(
+    host: &str,
+    path: &str,
+    tls_addr: SocketAddr,
+) -> anyhow::Result<Vec<u8>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .resolve(host, tls_addr)
+        .tls_info(true)
+        .build()
+        .context("build https client for tls_info")?;
+
+    let url = format!("https://{}:{}{path}", host, tls_addr.port());
+    let resp = client.get(&url).send().await.context("https GET")?;
+    let tls_info = resp
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .context("no TLS info on response")?;
+    tls_info
+        .peer_certificate()
+        .context("no peer certificate in TLS info")
+        .map(|der| der.to_vec())
+}
+
 /// Make a single HTTPS GET, routing `host` to `tls_addr` and skipping cert validation.
 /// Returns `(status, Some(body))` on a 2xx JSON response, `(status, None)` otherwise.
 /// Returns `Err` if the TLS handshake fails (e.g., unknown SNI).
