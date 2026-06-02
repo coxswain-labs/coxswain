@@ -1,0 +1,43 @@
+# cert-manager Gateway API TLS fixture.
+# cert-manager watches this Gateway and provisions a kubernetes.io/tls Secret
+# named SECRET_NAME using the coxswain-e2e-selfsigned ClusterIssuer.
+# Placeholders replaced at test runtime:
+#   TESTNS            - test namespace
+#   LISTENER_HOSTNAME - hostname for the HTTPS listener and HTTPRoute
+#   SECRET_NAME       - name of the kubernetes.io/tls Secret cert-manager will create
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-cert-manager-test
+  annotations:
+    cert-manager.io/cluster-issuer: coxswain-e2e-selfsigned
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: "LISTENER_HOSTNAME"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: SECRET_NAME
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cert-manager-route
+spec:
+  parentRefs:
+    - name: coxswain-cert-manager-test
+  hostnames:
+    - "LISTENER_HOSTNAME"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000

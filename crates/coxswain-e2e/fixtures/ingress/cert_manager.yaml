@@ -1,0 +1,33 @@
+# cert-manager Ingress TLS fixture.
+# cert-manager watches this Ingress and provisions a kubernetes.io/tls Secret
+# named SECRET_NAME using the coxswain-e2e-selfsigned ClusterIssuer.
+# Placeholders replaced at test runtime:
+#   TESTNS       - test namespace
+#   INGRESS_NAME - name of the Ingress resource
+#   TLS_HOST     - hostname in spec.tls.hosts and spec.rules[0].host
+#   SECRET_NAME  - name of the kubernetes.io/tls Secret cert-manager will create
+#   BACKEND_NAME - backend Service name (must already exist)
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: INGRESS_NAME
+  annotations:
+    cert-manager.io/cluster-issuer: coxswain-e2e-selfsigned
+spec:
+  ingressClassName: coxswain
+  tls:
+    - hosts:
+        - TLS_HOST
+      secretName: SECRET_NAME
+  rules:
+    - host: TLS_HOST
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: BACKEND_NAME
+                port:
+                  number: 3000

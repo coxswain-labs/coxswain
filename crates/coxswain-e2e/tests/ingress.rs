@@ -1,6 +1,6 @@
 use coxswain_e2e::{
     fixtures::{
-        self, BACKENDS_ECHO, INGRESS_DEFAULT_BACKEND, INGRESS_PATH_MATCHING,
+        self, BACKENDS_ECHO, INGRESS_CERT_MANAGER, INGRESS_DEFAULT_BACKEND, INGRESS_PATH_MATCHING,
         INGRESS_TLS_TERMINATION,
     },
     harness::{
@@ -238,6 +238,46 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
         "expected a successful response after cert rotation"
     );
     resp.1.unwrap().assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// Verifies cert-manager automatic certificate provisioning for Ingress:
+/// 1. Apply an Ingress with cert-manager.io/cluster-issuer annotation.
+/// 2. cert-manager (using the coxswain-e2e-selfsigned ClusterIssuer) provisions
+///    the kubernetes.io/tls Secret named in spec.tls[].secretName.
+/// 3. Coxswain picks up the Secret via its Secret watch and serves TLS.
+/// 4. HTTPS request succeeds and routes to the expected backend.
+#[tokio::test]
+async fn cert_manager_ingress_provisioning() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-cert-mgr").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("tls-cm.{}.local", ns.name);
+    let secret_name = "cert-manager-tls";
+
+    fixtures::apply_fixture(
+        INGRESS_CERT_MANAGER,
+        &ns.name,
+        &[
+            ("INGRESS_NAME", "cm-ingress"),
+            ("TLS_HOST", &host),
+            ("SECRET_NAME", secret_name),
+            ("BACKEND_NAME", "echo-a"),
+        ],
+    )
+    .await?;
+
+    // Wait for cert-manager to issue the certificate and populate the Secret.
+    wait::wait_for_tls_secret(&h.client, secret_name, &ns.name, Duration::from_secs(120)).await?;
+
+    // Coxswain picks up the Secret via its Secret watch; wait for HTTPS to become live.
+    let resp = wait::wait_for_https_route(h.tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
 
     Ok(())
 }
