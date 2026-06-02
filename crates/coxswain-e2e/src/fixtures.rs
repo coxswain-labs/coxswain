@@ -109,6 +109,11 @@ pub const GATEWAY_API_FILTERS: &str = concat!(
     "/fixtures/gateway_api/filters.yaml"
 );
 
+pub const GATEWAY_API_TIMEOUTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/timeouts.yaml"
+);
+
 /// Apply a fixture YAML to `namespace`.
 ///
 /// Supports template substitutions: `TESTNS` is always replaced with `namespace`.

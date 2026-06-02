@@ -4,14 +4,14 @@ use coxswain_core::ownership::parent_ref_owned;
 use coxswain_core::reference_grants;
 use coxswain_core::routing::{
     FilterAction, HeaderMod, HeaderPredicate, HostRouterBuilder, MatchPredicates, PathModifier,
-    QueryPredicate, RouteEntry, RoutingTableBuilder, Upstream, ValueMatch,
+    QueryPredicate, RouteEntry, RouteTimeouts, RoutingTableBuilder, Upstream, ValueMatch,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use gateway_api::apis::standard::gateways::{Gateway, GatewayListenersTlsMode};
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesFiltersType,
     HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPathType,
-    HttpRouteRulesMatchesQueryParamsType,
+    HttpRouteRulesMatchesQueryParamsType, HttpRouteRulesTimeouts,
 };
 use http::{HeaderName, Method};
 use k8s_openapi::api::core::v1::Secret;
@@ -22,6 +22,70 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
+
+/// Parse a Gateway API GEP-2257 duration string (Go `time.ParseDuration` format).
+///
+/// Supported units: `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`. Values may be compounded
+/// without spaces (`"1h30m"`). Returns `None` for zero (`"0s"`, `"0"`) or invalid input.
+fn parse_gateway_duration(s: &str) -> Option<std::time::Duration> {
+    if s.is_empty() || s == "0" {
+        return None;
+    }
+    let mut total = std::time::Duration::ZERO;
+    let mut remaining = s;
+    while !remaining.is_empty() {
+        // Consume the numeric part (digits + optional single decimal point).
+        let num_end = remaining
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(remaining.len());
+        if num_end == 0 {
+            tracing::warn!(raw = s, "Skipping invalid Gateway API duration string");
+            return None;
+        }
+        let num: f64 = match remaining[..num_end].parse() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(raw = s, "Skipping invalid Gateway API duration string");
+                return None;
+            }
+        };
+        remaining = &remaining[num_end..];
+        // Consume the unit part.
+        let unit_end = remaining
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(remaining.len());
+        let unit = &remaining[..unit_end];
+        remaining = &remaining[unit_end..];
+        let unit_dur = match unit {
+            "ns" => std::time::Duration::from_nanos(num as u64),
+            "us" | "µs" => std::time::Duration::from_micros(num as u64),
+            "ms" => std::time::Duration::from_millis(num as u64),
+            "s" => std::time::Duration::from_secs_f64(num),
+            "m" => std::time::Duration::from_secs_f64(num * 60.0),
+            "h" => std::time::Duration::from_secs_f64(num * 3600.0),
+            _ => {
+                tracing::warn!(
+                    raw = s,
+                    unit,
+                    "Skipping unsupported unit in Gateway API duration string"
+                );
+                return None;
+            }
+        };
+        total += unit_dur;
+    }
+    if total.is_zero() { None } else { Some(total) }
+}
+
+fn parse_rule_timeouts(t: &HttpRouteRulesTimeouts) -> RouteTimeouts {
+    RouteTimeouts {
+        request: t.request.as_deref().and_then(parse_gateway_duration),
+        backend_request: t
+            .backend_request
+            .as_deref()
+            .and_then(parse_gateway_duration),
+    }
+}
 
 pub struct GatewayApiReconciler;
 
@@ -96,6 +160,11 @@ impl GatewayApiReconciler {
 
         for rule in rules {
             let rule_filters = rule.filters.as_deref().unwrap_or(&[]);
+            let rule_timeouts = rule
+                .timeouts
+                .as_ref()
+                .map(parse_rule_timeouts)
+                .unwrap_or_default();
 
             // Rules with RequestRedirect are terminal: the proxy short-circuits before
             // upstream_peer() is called, so no real backend is needed. Use a sentinel
@@ -138,6 +207,7 @@ impl GatewayApiReconciler {
                         Arc::clone(&upstream),
                         MatchPredicates::default(),
                         filters,
+                        rule_timeouts.clone(),
                         route_id.clone(),
                         created_at,
                     ));
@@ -173,6 +243,7 @@ impl GatewayApiReconciler {
                             Arc::clone(&upstream),
                             predicates,
                             filters,
+                            rule_timeouts.clone(),
                             route_id.clone(),
                             created_at,
                         ));
@@ -1203,7 +1274,7 @@ mod tests {
         let empty_hdrs = http::HeaderMap::new();
         let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
         match table.find(host, path, &ctx) {
-            RouteOutcome::Found(_, f) => f,
+            RouteOutcome::Found(_, f, _) => f,
             _ => panic!("expected Found"),
         }
     }
@@ -1382,5 +1453,108 @@ mod tests {
             }
             _ => panic!("expected UrlRewrite with ReplacePrefixMatch"),
         }
+    }
+
+    // ── Timeout tests ────────────────────────────────────────────────────────────
+
+    use std::time::Duration;
+
+    fn find_timeouts(
+        table: &coxswain_core::routing::RoutingTable,
+        host: &str,
+        path: &str,
+    ) -> coxswain_core::routing::RouteTimeouts {
+        let empty_hdrs = http::HeaderMap::new();
+        let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
+        match table.find(host, path, &ctx) {
+            RouteOutcome::Found(_, _, t) => t,
+            _ => panic!("expected Found"),
+        }
+    }
+
+    #[test]
+    fn parse_gateway_duration_parses_common_values() {
+        assert_eq!(
+            super::parse_gateway_duration("10s"),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            super::parse_gateway_duration("500ms"),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            super::parse_gateway_duration("1m"),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            super::parse_gateway_duration("2h45m"),
+            Some(Duration::from_secs(2 * 3600 + 45 * 60))
+        );
+    }
+
+    #[test]
+    fn parse_gateway_duration_zero_returns_none() {
+        assert_eq!(super::parse_gateway_duration("0s"), None);
+        assert_eq!(super::parse_gateway_duration("0"), None);
+        assert_eq!(super::parse_gateway_duration(""), None);
+    }
+
+    #[test]
+    fn parse_gateway_duration_invalid_returns_none() {
+        assert_eq!(super::parse_gateway_duration("10x"), None);
+        assert_eq!(super::parse_gateway_duration("abc"), None);
+    }
+
+    #[test]
+    fn reconcile_timeouts_stored_and_round_trip() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: gateway_api::apis::standard::httproutes::HttpRouteSpec {
+                parent_refs: default_parents(),
+                hostnames: Some(vec!["example.com".to_string()]),
+                rules: Some(vec![
+                    gateway_api::apis::standard::httproutes::HttpRouteRules {
+                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                            name: "svc".to_string(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        timeouts: Some(HttpRouteRulesTimeouts {
+                            request: Some("10s".to_string()),
+                            backend_request: Some("2s".to_string()),
+                        }),
+                        ..Default::default()
+                    },
+                ]),
+            },
+            ..Default::default()
+        };
+
+        let mut builder = RoutingTableBuilder::new();
+        let grants = HashSet::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        let table = builder.build().unwrap();
+        let t = find_timeouts(&table, "example.com", "/");
+        assert_eq!(t.request, Some(Duration::from_secs(10)));
+        assert_eq!(t.backend_request, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn reconcile_timeouts_missing_field_falls_back_to_none() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let route = make_route("default", &["example.com"], None, "svc");
+        let mut builder = RoutingTableBuilder::new();
+        let grants = HashSet::new();
+        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        let table = builder.build().unwrap();
+        let t = find_timeouts(&table, "example.com", "/");
+        assert!(t.request.is_none());
+        assert!(t.backend_request.is_none());
     }
 }
