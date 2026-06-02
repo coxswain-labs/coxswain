@@ -682,7 +682,6 @@ mod tests {
                         namespace: Some("default".to_string()),
                         ..Default::default()
                     },
-                    ..Default::default()
                 }],
             }),
             ..Default::default()
@@ -707,7 +706,6 @@ mod tests {
                         namespace: Some("default".to_string()),
                         ..Default::default()
                     },
-                    ..Default::default()
                 }],
             }),
             ..Default::default()
@@ -732,7 +730,6 @@ mod tests {
                         namespace: Some("default".to_string()),
                         ..Default::default()
                     },
-                    ..Default::default()
                 }],
             }),
             ..Default::default()
