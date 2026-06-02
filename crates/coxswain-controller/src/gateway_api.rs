@@ -330,14 +330,12 @@ impl GatewayApiReconciler {
             };
         }
 
-        let hostname = match listener.hostname.as_deref().filter(|h| !h.is_empty()) {
-            Some(h) => h,
-            None => {
-                return ListenerTlsOutcome::Invalid {
-                    message: "listener.hostname is required for HTTPS listeners".to_string(),
-                };
-            }
-        };
+        // Empty/absent hostname means "match any SNI" — stored as the default cert.
+        let hostname = listener
+            .hostname
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .unwrap_or("");
 
         let refs = tls.certificate_refs.as_deref().unwrap_or(&[]);
         if refs.is_empty() {

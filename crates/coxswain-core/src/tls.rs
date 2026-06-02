@@ -39,23 +39,30 @@ pub struct TlsStore {
     exact: HashMap<String, Arc<TlsCert>>,
     /// Sorted most-specific (longest suffix) first.
     wildcard: Vec<(String, Arc<TlsCert>)>,
+    /// Fallback cert for listeners with no hostname restriction (Gateway API allows
+    /// HTTPS listeners without a `hostname` — they match any SNI).
+    default: Option<Arc<TlsCert>>,
 }
 
 impl TlsStore {
-    /// SNI cert lookup: exact host wins over wildcard.
+    /// SNI cert lookup: exact host wins over wildcard, wildcard over default.
     /// Returns `None` when no cert matches — the caller should fail the handshake.
     pub fn find_cert(&self, sni: &str) -> Option<Arc<TlsCert>> {
         if let Some(cert) = self.exact.get(sni) {
             return Some(Arc::clone(cert));
         }
-        self.wildcard
+        if let Some((_, cert)) = self
+            .wildcard
             .iter()
             .find(|(suffix, _)| wildcard_matches(sni, suffix))
-            .map(|(_, cert)| Arc::clone(cert))
+        {
+            return Some(Arc::clone(cert));
+        }
+        self.default.as_ref().map(Arc::clone)
     }
 
     pub fn cert_count(&self) -> usize {
-        self.exact.len() + self.wildcard.len()
+        self.exact.len() + self.wildcard.len() + self.default.is_some() as usize
     }
 }
 
@@ -77,6 +84,7 @@ pub struct TlsStoreBuilder {
     exact: HashMap<String, Arc<TlsCert>>,
     /// Keyed by suffix (e.g. `"example.com"` for the pattern `"*.example.com"`).
     wildcard: HashMap<String, Arc<TlsCert>>,
+    default: Option<Arc<TlsCert>>,
 }
 
 impl TlsStoreBuilder {
@@ -88,14 +96,11 @@ impl TlsStoreBuilder {
     ///
     /// - `*.suffix` → wildcard bucket (suffix stored without `*.` prefix).
     /// - Exact hostname → exact bucket.
-    /// - `""` or `"*"` → ignored with a warning (TLS needs an SNI hostname).
+    /// - `""` or `"*"` → default fallback (served when no exact/wildcard matches the SNI).
     /// - Duplicate host → last-writer-wins with a warning.
     pub fn add_cert(&mut self, host_pattern: &str, cert: Arc<TlsCert>) {
         if host_pattern.is_empty() || host_pattern == "*" {
-            tracing::warn!(
-                host = %host_pattern,
-                "TLS cert ignored for catchall host pattern (TLS requires an SNI hostname)"
-            );
+            self.default = Some(cert);
             return;
         }
         if let Some(suffix) = host_pattern.strip_prefix("*.") {
@@ -121,6 +126,7 @@ impl TlsStoreBuilder {
         TlsStore {
             exact: self.exact,
             wildcard,
+            default: self.default,
         }
     }
 }
@@ -205,12 +211,27 @@ mod tests {
     }
 
     #[test]
-    fn catchall_host_ignored() {
+    fn catchall_host_becomes_default() {
         let mut b = TlsStoreBuilder::new();
         b.add_cert("", cert("ns/s1"));
-        b.add_cert("*", cert("ns/s2"));
+        b.add_cert("*", cert("ns/s2")); // last writer wins
         let store = b.build();
-        assert_eq!(store.cert_count(), 0);
+        assert_eq!(store.cert_count(), 1);
+        // Default is served for any SNI that has no exact/wildcard match.
+        assert_eq!(
+            store.find_cert("anything.example.com").unwrap().source,
+            "ns/s2"
+        );
+    }
+
+    #[test]
+    fn default_cert_is_fallback_only() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("example.com", cert("exact"));
+        b.add_cert("", cert("default"));
+        let store = b.build();
+        assert_eq!(store.find_cert("example.com").unwrap().source, "exact");
+        assert_eq!(store.find_cert("other.com").unwrap().source, "default");
     }
 
     #[test]
