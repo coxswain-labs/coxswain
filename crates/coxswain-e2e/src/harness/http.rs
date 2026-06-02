@@ -76,6 +76,34 @@ impl HttpClient {
         let (status, _) = self.request(Method::GET, host, path, &[]).await?;
         Ok(status)
     }
+
+    /// Send a GET and return the response status, response headers, and optional body.
+    pub async fn get_full(
+        &self,
+        host: &str,
+        path: &str,
+    ) -> anyhow::Result<(u16, reqwest::header::HeaderMap, Option<EchoResponse>)> {
+        let url = format!("http://{}{path}", self.proxy_addr);
+        let resp = self
+            .inner
+            .get(&url)
+            .header("Host", host)
+            .send()
+            .await
+            .context("send request")?;
+        let status = resp.status().as_u16();
+        let resp_headers = resp.headers().clone();
+        let body = if resp.status().is_success() {
+            Some(
+                resp.json::<EchoResponse>()
+                    .await
+                    .context("parse echo response")?,
+            )
+        } else {
+            None
+        };
+        Ok((status, resp_headers, body))
+    }
 }
 
 /// Make a single HTTPS GET and return the peer's leaf certificate as DER bytes.

@@ -9,6 +9,51 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
+/// How a path is modified by `URLRewrite` or `RequestRedirect`.
+#[derive(Clone, Debug)]
+pub enum PathModifier {
+    ReplaceFullPath(String),
+    /// Replace `prefix` with `replacement` in the matched request path.
+    ReplacePrefixMatch {
+        prefix: String,
+        replacement: String,
+    },
+}
+
+/// Header add/set/remove operations applied as a unit.
+#[derive(Clone, Debug, Default)]
+pub struct HeaderMod {
+    /// Headers appended to any existing values.
+    pub add: Vec<(String, String)>,
+    /// Headers overwritten (set).
+    pub set: Vec<(String, String)>,
+    /// Header names removed entirely.
+    pub remove: Vec<String>,
+}
+
+/// A filter action evaluated per-request on the proxy hot path.
+#[derive(Clone, Debug)]
+pub enum FilterAction {
+    /// Modify request headers before forwarding upstream.
+    RequestHeaderModifier(HeaderMod),
+    /// Modify response headers before returning to the client.
+    ResponseHeaderModifier(HeaderMod),
+    /// Return a 3xx redirect without connecting to the upstream.
+    RequestRedirect {
+        scheme: Option<String>,
+        hostname: Option<String>,
+        port: Option<u16>,
+        /// HTTP status code (default 302).
+        status_code: u16,
+        path: Option<PathModifier>,
+    },
+    /// Rewrite the upstream request host and/or path (client-visible URL is unchanged).
+    UrlRewrite {
+        hostname: Option<String>,
+        path: Option<PathModifier>,
+    },
+}
+
 /// A cheaply-cloneable handle to the active routing table.
 ///
 /// Backed by `ArcSwap` for lock-free atomic swaps; the storage type is an
@@ -171,6 +216,7 @@ impl MatchPredicates {
 pub struct RouteEntry {
     pub upstream: Arc<Upstream>,
     pub predicates: MatchPredicates,
+    pub filters: Arc<[FilterAction]>,
     /// Parent resource identity `"{namespace}/{name}"` — used for precedence tiebreaking.
     pub route_id: String,
     /// Creation timestamp — older routes win ties after predicate-count comparison.
@@ -179,7 +225,7 @@ pub struct RouteEntry {
 }
 
 impl RouteEntry {
-    /// Constructs an entry with no predicates (matches every request on the path).
+    /// Constructs an entry with no predicates and no filters.
     pub fn path_only(
         upstream: Arc<Upstream>,
         route_id: String,
@@ -188,11 +234,13 @@ impl RouteEntry {
         Self {
             upstream,
             predicates: MatchPredicates::default(),
+            filters: Arc::from([]),
             route_id,
             created_at,
         }
     }
 
+    /// Constructs an entry with predicates and no filters.
     pub fn new(
         upstream: Arc<Upstream>,
         predicates: MatchPredicates,
@@ -202,6 +250,24 @@ impl RouteEntry {
         Self {
             upstream,
             predicates,
+            filters: Arc::from([]),
+            route_id,
+            created_at,
+        }
+    }
+
+    /// Constructs an entry with predicates and filters.
+    pub fn with_filters(
+        upstream: Arc<Upstream>,
+        predicates: MatchPredicates,
+        filters: Vec<FilterAction>,
+        route_id: String,
+        created_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            upstream,
+            predicates,
+            filters: Arc::from(filters.into_boxed_slice()),
             route_id,
             created_at,
         }
@@ -278,16 +344,20 @@ impl HostRouter {
         &self.route_info
     }
 
-    /// Resolves `path` to an upstream, applying predicates from `ctx`.
+    /// Resolves `path` to an upstream and its filters, applying predicates from `ctx`.
     ///
     /// Checks matchit exact/prefix routes first, then the regex fallback.
     /// Within each path slot, candidates are evaluated in specificity order;
     /// the first candidate whose predicates all pass is returned.
-    pub fn route(&self, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<Upstream>> {
+    pub fn route(
+        &self,
+        path: &str,
+        ctx: &RequestContext<'_>,
+    ) -> Option<(Arc<Upstream>, Arc<[FilterAction]>)> {
         if let Ok(m) = self.router.at(path) {
             for entry in m.value.iter() {
                 if entry.predicates.matches(ctx) {
-                    return Some(Arc::clone(&entry.upstream));
+                    return Some((Arc::clone(&entry.upstream), Arc::clone(&entry.filters)));
                 }
             }
         }
@@ -297,7 +367,7 @@ impl HostRouter {
             if set.is_match(path) {
                 for entry in entries.iter() {
                     if entry.predicates.matches(ctx) {
-                        return Some(Arc::clone(&entry.upstream));
+                        return Some((Arc::clone(&entry.upstream), Arc::clone(&entry.filters)));
                     }
                 }
             }
@@ -556,7 +626,7 @@ impl RoutingTableBuilder {
 
 /// Result of a two-level host+path routing lookup.
 pub enum RouteOutcome {
-    Found(Arc<Upstream>),
+    Found(Arc<Upstream>, Arc<[FilterAction]>),
     /// No entry for this hostname (host is not registered at this proxy).
     NoHost,
     /// Host is registered but no path rule matched (or path matched but predicates failed).
@@ -578,6 +648,10 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
+    /// Routes to an upstream, discarding filter information.
+    ///
+    /// Convenience for tests and admin introspection. The proxy hot path should
+    /// use [`find`] to also receive the filter list.
     pub fn route(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<Upstream>> {
         let host_router = if let Some(router) = self.exact_hosts.get(host) {
             Some(router)
@@ -588,14 +662,15 @@ impl RoutingTable {
                 .map(|(_, r)| r)
         };
         if let Some(router) = host_router
-            && let Some(upstream) = router.route(path, ctx)
+            && let Some((upstream, _)) = router.route(path, ctx)
         {
             return Some(upstream);
         }
-        self.catchall.as_ref()?.route(path, ctx)
+        self.catchall.as_ref()?.route(path, ctx).map(|(u, _)| u)
     }
 
-    /// Like [`route`] but distinguishes "host not registered" from "path not matched".
+    /// Like [`route`] but distinguishes "host not registered" from "path not matched",
+    /// and returns the filter list alongside the upstream.
     pub fn find(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> RouteOutcome {
         let router = if let Some(r) = self.exact_hosts.get(host) {
             r
@@ -611,7 +686,7 @@ impl RoutingTable {
             return RouteOutcome::NoHost;
         };
         match router.route(path, ctx) {
-            Some(u) => RouteOutcome::Found(u),
+            Some((u, f)) => RouteOutcome::Found(u, f),
             None => RouteOutcome::NoPath,
         }
     }

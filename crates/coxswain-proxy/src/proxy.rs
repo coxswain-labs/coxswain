@@ -1,9 +1,12 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use coxswain_core::routing::{RequestContext, RouteOutcome, SharedRoutingTable, Upstream};
+use coxswain_core::routing::{
+    FilterAction, PathModifier, RequestContext, RouteOutcome, SharedRoutingTable, Upstream,
+};
+use http::header;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{ConnectionClosed, ErrorSource, HTTPStatus, ReadError, Result, WriteError};
-use pingora_http::RequestHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,11 +27,20 @@ tokio::task_local! {
     pub(crate) static CONN_INFO: ConnectionInfo;
 }
 
+/// Routing result cached from `request_filter` for use in later hooks.
+pub struct ResolvedRoute {
+    pub upstream: Arc<Upstream>,
+    pub filters: Arc<[FilterAction]>,
+    pub original_host: String,
+    pub original_path: String,
+}
+
 /// Per-request context carrying the real client address extracted from the PROXY header.
 #[derive(Default)]
 pub struct ProxyCtx {
     pub real_client_addr: Option<SocketAddr>,
     pub real_client_proto: Option<&'static str>,
+    pub resolved: Option<ResolvedRoute>,
 }
 
 /// Lock-free routing engine for the request hot path.
@@ -56,6 +68,78 @@ pub struct Proxy {
     pub engine: Arc<RoutingEngine>,
 }
 
+/// Extract the bare hostname from a request (strips port suffix, prefers URI host over Host header).
+fn extract_host<'a>(req: &'a RequestHeader, host_hdr: &'a mut String) -> &'a str {
+    if let Some(h) = req.uri.host() {
+        return h;
+    }
+    *host_hdr = req
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    host_hdr.split(':').next().unwrap_or("")
+}
+
+/// Request-context fields needed to build a redirect `Location` URL.
+struct RedirectOrigin<'a> {
+    scheme: &'a str,
+    host: &'a str,
+    path: &'a str,
+    query: Option<&'a str>,
+}
+
+/// Build the `Location` URL for a `RequestRedirect` filter.
+fn build_redirect_location(
+    filter_scheme: Option<&str>,
+    filter_hostname: Option<&str>,
+    filter_port: Option<u16>,
+    path_modifier: Option<&PathModifier>,
+    origin: &RedirectOrigin<'_>,
+) -> String {
+    let eff_scheme = filter_scheme.unwrap_or(origin.scheme);
+    let eff_host = filter_hostname.unwrap_or(origin.host);
+
+    let new_path = match path_modifier {
+        None => origin.path.to_string(),
+        Some(PathModifier::ReplaceFullPath(p)) => p.clone(),
+        Some(PathModifier::ReplacePrefixMatch {
+            prefix,
+            replacement,
+        }) => {
+            let prefix_trimmed = prefix.trim_end_matches('/');
+            let suffix = &origin.path[prefix_trimmed.len().min(origin.path.len())..];
+            let rep = replacement.trim_end_matches('/');
+            if suffix.is_empty() || suffix == "/" {
+                rep.to_string()
+            } else {
+                format!("{rep}{suffix}")
+            }
+        }
+    };
+
+    let path_and_query = match origin.query {
+        Some(q) => format!("{new_path}?{q}"),
+        None => new_path,
+    };
+
+    // Omit default ports per Gateway API spec.
+    let omit_port = filter_port.is_none()
+        || (eff_scheme == "http" && filter_port == Some(80))
+        || (eff_scheme == "https" && filter_port == Some(443));
+
+    if omit_port {
+        format!("{eff_scheme}://{eff_host}{path_and_query}")
+    } else {
+        format!(
+            "{eff_scheme}://{}:{}{path_and_query}",
+            eff_host,
+            filter_port.unwrap()
+        )
+    }
+}
+
 #[async_trait]
 impl ProxyHttp for Proxy {
     type CTX = ProxyCtx;
@@ -65,39 +149,31 @@ impl ProxyHttp for Proxy {
             .try_with(|info| ProxyCtx {
                 real_client_addr: Some(info.real_addr),
                 real_client_proto: Some(info.proto),
+                resolved: None,
             })
             .unwrap_or_default()
     }
 
-    async fn upstream_peer(
-        &self,
-        session: &mut Session,
-        _ctx: &mut ProxyCtx,
-    ) -> Result<Box<HttpPeer>> {
-        let req_header = session.req_header();
-        // HTTP/1.1 clients send origin-form requests (e.g. `GET /a HTTP/1.1`), so
-        // uri.host() is always None — the hostname lives in the Host header instead.
-        let host_hdr;
-        let host = if let Some(h) = req_header.uri.host() {
-            h
-        } else {
-            host_hdr = req_header
-                .headers
-                .get(http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            // Strip port suffix (e.g. "example.com:8080" → "example.com")
-            host_hdr.split(':').next().unwrap_or("")
-        };
-        let path = req_header.uri.path();
-        let ctx = RequestContext {
-            method: &req_header.method,
-            headers: &req_header.headers,
-            query: req_header.uri.query(),
+    /// Perform routing early so `RequestRedirect` filters can short-circuit
+    /// before an upstream connection is attempted.
+    async fn request_filter(&self, session: &mut Session, ctx: &mut ProxyCtx) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let req = session.req_header();
+        let mut host_buf = String::new();
+        let host = extract_host(req, &mut host_buf).to_string();
+        let path = req.uri.path().to_string();
+        let query = req.uri.query().map(str::to_string);
+
+        let route_ctx = RequestContext {
+            method: &req.method,
+            headers: &req.headers,
+            query: query.as_deref(),
         };
 
-        let upstream = match self.engine.find(host, path, &ctx) {
-            RouteOutcome::Found(u) => u,
+        let (upstream, filters) = match self.engine.find(&host, &path, &route_ctx) {
+            RouteOutcome::Found(u, f) => (u, f),
             RouteOutcome::NoHost => {
                 return Err(pingora_core::Error::explain(
                     HTTPStatus(503),
@@ -112,15 +188,70 @@ impl ProxyHttp for Proxy {
             }
         };
 
-        let addr = upstream.next_endpoint().ok_or_else(|| {
+        // Check for a RequestRedirect filter — if present, send the 3xx and short-circuit.
+        for f in filters.iter() {
+            if let FilterAction::RequestRedirect {
+                scheme,
+                hostname,
+                port,
+                status_code,
+                path: path_mod,
+            } = f
+            {
+                // Default scheme to "http"; TLS-terminated requests would need
+                // scheme passed from the accept layer, which we don't thread through yet.
+                let origin = RedirectOrigin {
+                    scheme: "http",
+                    host: &host,
+                    path: &path,
+                    query: query.as_deref(),
+                };
+                let location = build_redirect_location(
+                    scheme.as_deref(),
+                    hostname.as_deref(),
+                    *port,
+                    path_mod.as_ref(),
+                    &origin,
+                );
+                let mut resp = ResponseHeader::build(*status_code, Some(2))?;
+                resp.insert_header(header::LOCATION, location)?;
+                session
+                    .write_response_header(Box::new(resp), true)
+                    .await
+                    .unwrap_or_else(|e| tracing::error!("failed to write redirect response: {e}"));
+                return Ok(true);
+            }
+        }
+
+        ctx.resolved = Some(ResolvedRoute {
+            upstream,
+            filters,
+            original_host: host,
+            original_path: path,
+        });
+        Ok(false)
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        ctx: &mut ProxyCtx,
+    ) -> Result<Box<HttpPeer>> {
+        let resolved = ctx.resolved.as_ref().ok_or_else(|| {
+            pingora_core::Error::explain(
+                HTTPStatus(500),
+                "routing not resolved before upstream_peer",
+            )
+        })?;
+
+        let addr = resolved.upstream.next_endpoint().ok_or_else(|| {
             pingora_core::Error::explain(HTTPStatus(503), "upstream has no active endpoints")
         })?;
 
-        Ok(Box::new(HttpPeer::new(
-            addr.to_string(),
-            false,
-            host.to_string(),
-        )))
+        // Use the (potentially rewritten) host from UrlRewrite hostname, or the original host.
+        let sni_host = resolved.original_host.clone();
+
+        Ok(Box::new(HttpPeer::new(addr.to_string(), false, sni_host)))
     }
 
     async fn upstream_request_filter(
@@ -129,7 +260,39 @@ impl ProxyHttp for Proxy {
         upstream_request: &mut RequestHeader,
         ctx: &mut ProxyCtx,
     ) -> Result<()> {
-        TrafficFilter::apply_request_filters(upstream_request, ctx)
+        let (filters, original_host, original_path) = ctx
+            .resolved
+            .as_ref()
+            .map(|r| {
+                (
+                    r.filters.as_ref(),
+                    r.original_host.as_str(),
+                    r.original_path.as_str(),
+                )
+            })
+            .unwrap_or((&[], "", ""));
+        TrafficFilter::apply_request_filters(
+            upstream_request,
+            filters,
+            original_host,
+            original_path,
+            ctx,
+        )
+    }
+
+    async fn upstream_response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut ProxyCtx,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(resolved) = &ctx.resolved {
+            TrafficFilter::apply_response_filters(upstream_response, &resolved.filters);
+        }
+        Ok(())
     }
 
     /// Send a plain-text error body instead of Pingora's default empty response.
@@ -252,5 +415,159 @@ mod tests {
             resolved.unwrap().next_endpoint().is_none(),
             "empty upstream yields no endpoint"
         );
+    }
+
+    // ── build_redirect_location tests ─────────────────────────────────────────
+
+    fn origin(
+        scheme: &'static str,
+        host: &'static str,
+        path: &'static str,
+        query: Option<&'static str>,
+    ) -> RedirectOrigin<'static> {
+        RedirectOrigin {
+            scheme,
+            host,
+            path,
+            query,
+        }
+    }
+
+    #[test]
+    fn redirect_location_no_overrides_returns_original() {
+        let loc = build_redirect_location(
+            None,
+            None,
+            None,
+            None,
+            &origin("http", "example.com", "/foo", None),
+        );
+        assert_eq!(loc, "http://example.com/foo");
+    }
+
+    #[test]
+    fn redirect_location_scheme_override() {
+        let loc = build_redirect_location(
+            Some("https"),
+            None,
+            None,
+            None,
+            &origin("http", "example.com", "/foo", None),
+        );
+        assert_eq!(loc, "https://example.com/foo");
+    }
+
+    #[test]
+    fn redirect_location_hostname_override() {
+        let loc = build_redirect_location(
+            None,
+            Some("new.example.com"),
+            None,
+            None,
+            &origin("http", "old.example.com", "/bar", None),
+        );
+        assert_eq!(loc, "http://new.example.com/bar");
+    }
+
+    #[test]
+    fn redirect_location_preserves_query() {
+        let loc = build_redirect_location(
+            None,
+            None,
+            None,
+            None,
+            &origin("http", "example.com", "/x", Some("k=v")),
+        );
+        assert_eq!(loc, "http://example.com/x?k=v");
+    }
+
+    #[test]
+    fn redirect_location_non_default_port_included() {
+        let loc = build_redirect_location(
+            None,
+            None,
+            Some(8080),
+            None,
+            &origin("http", "example.com", "/", None),
+        );
+        assert_eq!(loc, "http://example.com:8080/");
+    }
+
+    #[test]
+    fn redirect_location_default_http_port_omitted() {
+        let loc = build_redirect_location(
+            Some("http"),
+            None,
+            Some(80),
+            None,
+            &origin("http", "example.com", "/", None),
+        );
+        assert_eq!(loc, "http://example.com/");
+    }
+
+    #[test]
+    fn redirect_location_replace_full_path() {
+        let pm = PathModifier::ReplaceFullPath("/new".to_string());
+        let loc = build_redirect_location(
+            None,
+            None,
+            None,
+            Some(&pm),
+            &origin("http", "example.com", "/old/path", None),
+        );
+        assert_eq!(loc, "http://example.com/new");
+    }
+
+    #[test]
+    fn redirect_location_replace_prefix() {
+        let pm = PathModifier::ReplacePrefixMatch {
+            prefix: "/api".to_string(),
+            replacement: "/v2".to_string(),
+        };
+        let loc = build_redirect_location(
+            None,
+            None,
+            None,
+            Some(&pm),
+            &origin("http", "example.com", "/api/users", None),
+        );
+        assert_eq!(loc, "http://example.com/v2/users");
+    }
+
+    #[test]
+    fn find_returns_filters_alongside_upstream() {
+        use coxswain_core::routing::{FilterAction, HeaderMod, RouteOutcome};
+
+        let upstream = make_upstream("default/backend", "10.0.0.1:8080");
+        let filters = vec![FilterAction::RequestHeaderModifier(HeaderMod {
+            set: vec![("x-env".to_string(), "test".to_string())],
+            ..Default::default()
+        })];
+        let entry = Arc::new(RouteEntry::with_filters(
+            upstream,
+            Default::default(),
+            filters,
+            "default/svc".to_string(),
+            None,
+        ));
+        let mut builder = RoutingTableBuilder::new();
+        builder
+            .exact_host("example.com")
+            .add_prefix_route("/", entry);
+        let shared = SharedRoutingTable::new();
+        shared.store(Arc::new(builder.build().unwrap()));
+
+        let engine = engine_with_table(shared);
+        let ctx = RequestContext::default();
+        match engine.find("example.com", "/test", &ctx) {
+            RouteOutcome::Found(_, filters) => {
+                assert_eq!(filters.len(), 1);
+                assert!(matches!(
+                    &filters[0],
+                    FilterAction::RequestHeaderModifier(_)
+                ));
+            }
+            _ => panic!("expected Found"),
+        }
     }
 }

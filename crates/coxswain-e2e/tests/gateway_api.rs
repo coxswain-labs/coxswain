@@ -2,11 +2,11 @@ use coxswain_e2e::{
     fixtures::{
         self, BACKENDS_ECHO, BACKENDS_WEBSOCKET_ECHO, GATEWAY_API_CERT_MANAGER,
         GATEWAY_API_COMBINED_MATCHING, GATEWAY_API_CROSS_NAMESPACE_ROUTE,
-        GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_HEADER_MATCHING, GATEWAY_API_HOST_POOL,
-        GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PATH_MATCHING, GATEWAY_API_QUERY_PARAM_MATCHING,
-        GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS, GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
-        GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WEBSOCKET,
-        GATEWAY_API_WILDCARD_HOST,
+        GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_FILTERS, GATEWAY_API_HEADER_MATCHING,
+        GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PATH_MATCHING,
+        GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS,
+        GATEWAY_API_TLS_CROSS_NAMESPACE_GW, GATEWAY_API_TLS_GATEWAY_NO_CERTS,
+        GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WEBSOCKET, GATEWAY_API_WILDCARD_HOST,
     },
     harness::{GeneratedCert, Harness, NamespaceGuard, http, wait},
 };
@@ -720,5 +720,83 @@ async fn websocket_passthrough() -> anyhow::Result<()> {
     );
 
     ws.close(None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn filters() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-filters").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(GATEWAY_API_FILTERS, &ns.name, &[]).await?;
+
+    let host = format!("echo.{}.local", ns.name);
+
+    // Wait for the HTTPRoute to become live using the dedicated probe path.
+    wait::wait_for_route(&h.http, &host, "/filter/probe", Duration::from_secs(60)).await?;
+
+    // ── RequestHeaderModifier ────────────────────────────────────────────────
+    // The echo backend reflects request headers in the response body JSON.
+    let resp = h.http.get(&host, "/filter/req-header").await?;
+    let injected = resp
+        .headers
+        .get("x-test-set")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        injected, "injected",
+        "RequestHeaderModifier: expected X-Test-Set=injected in echo body, got {injected:?}"
+    );
+
+    // ── ResponseHeaderModifier ───────────────────────────────────────────────
+    let (status, resp_headers, _) = h.http.get_full(&host, "/filter/resp-header").await?;
+    assert_eq!(status, 200, "ResponseHeaderModifier: expected 200");
+    let hdr_val = resp_headers
+        .get("x-test-response")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        hdr_val, "coxswain",
+        "ResponseHeaderModifier: expected X-Test-Response=coxswain in response headers"
+    );
+
+    // ── RequestRedirect ──────────────────────────────────────────────────────
+    // The redirect client follows redirects by default; disable that to see the 302.
+    let url = format!("http://{}{}", h.http.proxy_addr, "/filter/redirect");
+    let redirect_resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .get(&url)
+        .header("Host", &host)
+        .send()
+        .await?;
+    assert_eq!(
+        redirect_resp.status().as_u16(),
+        302,
+        "RequestRedirect: expected 302"
+    );
+    let location = redirect_resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        location.ends_with("/filter/redirected"),
+        "RequestRedirect: expected Location ending in /filter/redirected, got {location:?}"
+    );
+
+    // ── URLRewrite ───────────────────────────────────────────────────────────
+    // The echo backend returns the path it received; we expect the rewritten path.
+    let resp = h.http.get(&host, "/filter/old/resource").await?;
+    let echo_path = resp.path.as_deref().unwrap_or("");
+    assert_eq!(
+        echo_path, "/filter/new/resource",
+        "URLRewrite: expected rewritten path /filter/new/resource, got {echo_path:?}"
+    );
+
     Ok(())
 }

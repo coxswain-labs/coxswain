@@ -3,14 +3,14 @@ use crate::tls::{GatewayListenerHealth, ListenerTlsOutcome, load_tls_cert};
 use coxswain_core::ownership::parent_ref_owned;
 use coxswain_core::reference_grants;
 use coxswain_core::routing::{
-    HeaderPredicate, HostRouterBuilder, MatchPredicates, QueryPredicate, RouteEntry,
-    RoutingTableBuilder, Upstream, ValueMatch,
+    FilterAction, HeaderMod, HeaderPredicate, HostRouterBuilder, MatchPredicates, PathModifier,
+    QueryPredicate, RouteEntry, RoutingTableBuilder, Upstream, ValueMatch,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use gateway_api::apis::standard::gateways::{Gateway, GatewayListenersTlsMode};
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesMatchesHeadersType,
-    HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPathType,
+    HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesFiltersType,
+    HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPathType,
     HttpRouteRulesMatchesQueryParamsType,
 };
 use http::{HeaderName, Method};
@@ -114,11 +114,16 @@ impl GatewayApiReconciler {
                 addrs,
             ));
 
+            let rule_filters = rule.filters.as_deref().unwrap_or(&[]);
+
             // Default to PathPrefix "/" when no matches are specified (Gateway API §4.1).
             let apply = |pb: &mut HostRouterBuilder| match rule.matches.as_deref() {
                 None | Some([]) => {
-                    let e = Arc::new(RouteEntry::path_only(
+                    let filters = Self::build_filters(rule_filters, "/", false);
+                    let e = Arc::new(RouteEntry::with_filters(
                         Arc::clone(&upstream),
+                        MatchPredicates::default(),
+                        filters,
                         route_id.clone(),
                         created_at,
                     ));
@@ -138,18 +143,26 @@ impl GatewayApiReconciler {
                             }
                         };
 
-                        let e = Arc::new(RouteEntry::new(
-                            Arc::clone(&upstream),
-                            predicates,
-                            route_id.clone(),
-                            created_at,
-                        ));
-
                         let val = m
                             .path
                             .as_ref()
                             .and_then(|p| p.value.as_deref())
                             .unwrap_or("/");
+
+                        let is_prefix = matches!(
+                            m.path.as_ref().and_then(|p| p.r#type.as_ref()),
+                            None | Some(HttpRouteRulesMatchesPathType::PathPrefix)
+                        );
+                        let filters = Self::build_filters(rule_filters, val, is_prefix);
+
+                        let e = Arc::new(RouteEntry::with_filters(
+                            Arc::clone(&upstream),
+                            predicates,
+                            filters,
+                            route_id.clone(),
+                            created_at,
+                        ));
+
                         match m.path.as_ref().and_then(|p| p.r#type.as_ref()) {
                             Some(HttpRouteRulesMatchesPathType::Exact) => {
                                 pb.add_exact_route(val, e);
@@ -291,6 +304,173 @@ impl GatewayApiReconciler {
                 ListenerTlsOutcome::InvalidCertificateRef {
                     message: e.to_string(),
                 }
+            }
+        }
+    }
+
+    /// Translates `HTTPRouteFilter` entries into `FilterAction` values.
+    ///
+    /// `matched_prefix` is the path pattern for this match rule (used for
+    /// `ReplacePrefixMatch`). `is_prefix_match` signals whether the path type is
+    /// `PathPrefix`; if it is not, a `ReplacePrefixMatch` path modifier is invalid
+    /// per spec and will be skipped with a warning.
+    fn build_filters(
+        filters: &[HttpRouteRulesFilters],
+        matched_prefix: &str,
+        is_prefix_match: bool,
+    ) -> Vec<FilterAction> {
+        let mut out = Vec::new();
+        for f in filters {
+            match f.r#type {
+                HttpRouteRulesFiltersType::RequestHeaderModifier => {
+                    let Some(m) = &f.request_header_modifier else {
+                        tracing::warn!(
+                            "Skipping RequestHeaderModifier filter — payload is missing"
+                        );
+                        continue;
+                    };
+                    out.push(FilterAction::RequestHeaderModifier(HeaderMod {
+                        add: m
+                            .add
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(|h| (h.name.clone(), h.value.clone()))
+                            .collect(),
+                        set: m
+                            .set
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(|h| (h.name.clone(), h.value.clone()))
+                            .collect(),
+                        remove: m.remove.clone().unwrap_or_default(),
+                    }));
+                }
+                HttpRouteRulesFiltersType::ResponseHeaderModifier => {
+                    let Some(m) = &f.response_header_modifier else {
+                        tracing::warn!(
+                            "Skipping ResponseHeaderModifier filter — payload is missing"
+                        );
+                        continue;
+                    };
+                    out.push(FilterAction::ResponseHeaderModifier(HeaderMod {
+                        add: m
+                            .add
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(|h| (h.name.clone(), h.value.clone()))
+                            .collect(),
+                        set: m
+                            .set
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(|h| (h.name.clone(), h.value.clone()))
+                            .collect(),
+                        remove: m.remove.clone().unwrap_or_default(),
+                    }));
+                }
+                HttpRouteRulesFiltersType::RequestRedirect => {
+                    let Some(r) = &f.request_redirect else {
+                        tracing::warn!("Skipping RequestRedirect filter — payload is missing");
+                        continue;
+                    };
+                    let path = Self::parse_redirect_path(&r.path, matched_prefix, is_prefix_match);
+                    let scheme = r.scheme.as_ref().map(|s| {
+                        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirectScheme;
+                        match s {
+                            HttpRouteRulesFiltersRequestRedirectScheme::Http => "http".to_string(),
+                            HttpRouteRulesFiltersRequestRedirectScheme::Https => {
+                                "https".to_string()
+                            }
+                        }
+                    });
+                    let status_code = r.status_code.unwrap_or(302) as u16;
+                    out.push(FilterAction::RequestRedirect {
+                        scheme,
+                        hostname: r.hostname.clone(),
+                        port: r.port.map(|p| p as u16),
+                        status_code,
+                        path,
+                    });
+                }
+                HttpRouteRulesFiltersType::UrlRewrite => {
+                    let Some(rw) = &f.url_rewrite else {
+                        tracing::warn!("Skipping URLRewrite filter — payload is missing");
+                        continue;
+                    };
+                    let path = rw.path.as_ref().and_then(|p| {
+                        Self::parse_url_rewrite_path(p, matched_prefix, is_prefix_match)
+                    });
+                    out.push(FilterAction::UrlRewrite {
+                        hostname: rw.hostname.clone(),
+                        path,
+                    });
+                }
+                HttpRouteRulesFiltersType::RequestMirror
+                | HttpRouteRulesFiltersType::ExtensionRef
+                | HttpRouteRulesFiltersType::Cors => {
+                    tracing::warn!(
+                        filter_type = ?f.r#type,
+                        "Skipping unsupported HTTPRouteFilter type"
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    fn parse_redirect_path(
+        path: &Option<
+            gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirectPath,
+        >,
+        matched_prefix: &str,
+        is_prefix_match: bool,
+    ) -> Option<PathModifier> {
+        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirectPathType;
+        let p = path.as_ref()?;
+        match p.r#type {
+            HttpRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath => Some(
+                PathModifier::ReplaceFullPath(p.replace_full_path.clone().unwrap_or_default()),
+            ),
+            HttpRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch => {
+                if !is_prefix_match {
+                    tracing::warn!(
+                        "ReplacePrefixMatch path modifier used with non-prefix match — skipping path modifier"
+                    );
+                    return None;
+                }
+                Some(PathModifier::ReplacePrefixMatch {
+                    prefix: matched_prefix.to_string(),
+                    replacement: p.replace_prefix_match.clone().unwrap_or_default(),
+                })
+            }
+        }
+    }
+
+    fn parse_url_rewrite_path(
+        path: &gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersUrlRewritePath,
+        matched_prefix: &str,
+        is_prefix_match: bool,
+    ) -> Option<PathModifier> {
+        use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersUrlRewritePathType;
+        match path.r#type {
+            HttpRouteRulesFiltersUrlRewritePathType::ReplaceFullPath => Some(
+                PathModifier::ReplaceFullPath(path.replace_full_path.clone().unwrap_or_default()),
+            ),
+            HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch => {
+                if !is_prefix_match {
+                    tracing::warn!(
+                        "ReplacePrefixMatch path modifier used with non-prefix match — skipping path modifier"
+                    );
+                    return None;
+                }
+                Some(PathModifier::ReplacePrefixMatch {
+                    prefix: matched_prefix.to_string(),
+                    replacement: path.replace_prefix_match.clone().unwrap_or_default(),
+                })
             }
         }
     }
@@ -954,6 +1134,239 @@ mod tests {
         match &predicates.headers[0].matcher {
             ValueMatch::Exact(v) => assert_eq!(v, "first"),
             _ => panic!("expected exact matcher"),
+        }
+    }
+
+    // ── Filter tests ────────────────────────────────────────────────────────────
+
+    use coxswain_core::routing::{FilterAction, PathModifier, RouteOutcome};
+    use gateway_api::apis::standard::httproutes::{
+        HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
+        HttpRouteRulesFiltersRequestHeaderModifierSet, HttpRouteRulesFiltersRequestRedirect,
+        HttpRouteRulesFiltersResponseHeaderModifier,
+        HttpRouteRulesFiltersResponseHeaderModifierAdd, HttpRouteRulesFiltersType,
+        HttpRouteRulesFiltersUrlRewrite, HttpRouteRulesFiltersUrlRewritePath,
+        HttpRouteRulesFiltersUrlRewritePathType,
+    };
+
+    fn make_route_with_filters(
+        ns: &str,
+        hostname: &str,
+        path: &str,
+        path_type: HttpRouteRulesMatchesPathType,
+        svc: &str,
+        filters: Vec<HttpRouteRulesFilters>,
+    ) -> HTTPRoute {
+        HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                parent_refs: default_parents(),
+                hostnames: Some(vec![hostname.to_string()]),
+                rules: Some(vec![HttpRouteRules {
+                    backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                        name: svc.to_string(),
+                        port: Some(80),
+                        ..Default::default()
+                    }]),
+                    matches: Some(vec![path_match(path, path_type)]),
+                    filters: Some(filters),
+                    ..Default::default()
+                }]),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn find_filters(
+        table: &coxswain_core::routing::RoutingTable,
+        host: &str,
+        path: &str,
+    ) -> std::sync::Arc<[FilterAction]> {
+        let empty_hdrs = http::HeaderMap::new();
+        let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
+        match table.find(host, path, &ctx) {
+            RouteOutcome::Found(_, f) => f,
+            _ => panic!("expected Found"),
+        }
+    }
+
+    #[test]
+    fn reconcile_request_header_modifier_stored() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let route = make_route_with_filters(
+            "default",
+            "example.com",
+            "/",
+            HttpRouteRulesMatchesPathType::PathPrefix,
+            "svc",
+            vec![HttpRouteRulesFilters {
+                r#type: HttpRouteRulesFiltersType::RequestHeaderModifier,
+                request_header_modifier: Some(HttpRouteRulesFiltersRequestHeaderModifier {
+                    set: Some(vec![HttpRouteRulesFiltersRequestHeaderModifierSet {
+                        name: "X-Env".to_string(),
+                        value: "prod".to_string(),
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        );
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &default_owned(),
+            &HashSet::new(),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let filters = find_filters(&table, "example.com", "/");
+        assert_eq!(filters.len(), 1);
+        match &filters[0] {
+            FilterAction::RequestHeaderModifier(m) => {
+                assert_eq!(m.set, vec![("X-Env".to_string(), "prod".to_string())]);
+            }
+            _ => panic!("expected RequestHeaderModifier"),
+        }
+    }
+
+    #[test]
+    fn reconcile_response_header_modifier_stored() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let route = make_route_with_filters(
+            "default",
+            "example.com",
+            "/",
+            HttpRouteRulesMatchesPathType::PathPrefix,
+            "svc",
+            vec![HttpRouteRulesFilters {
+                r#type: HttpRouteRulesFiltersType::ResponseHeaderModifier,
+                response_header_modifier: Some(HttpRouteRulesFiltersResponseHeaderModifier {
+                    add: Some(vec![HttpRouteRulesFiltersResponseHeaderModifierAdd {
+                        name: "X-Served-By".to_string(),
+                        value: "coxswain".to_string(),
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        );
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &default_owned(),
+            &HashSet::new(),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let filters = find_filters(&table, "example.com", "/");
+        assert_eq!(filters.len(), 1);
+        match &filters[0] {
+            FilterAction::ResponseHeaderModifier(m) => {
+                assert_eq!(
+                    m.add,
+                    vec![("X-Served-By".to_string(), "coxswain".to_string())]
+                );
+            }
+            _ => panic!("expected ResponseHeaderModifier"),
+        }
+    }
+
+    #[test]
+    fn reconcile_request_redirect_stored() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let route = make_route_with_filters(
+            "default",
+            "example.com",
+            "/old",
+            HttpRouteRulesMatchesPathType::PathPrefix,
+            "svc",
+            vec![HttpRouteRulesFilters {
+                r#type: HttpRouteRulesFiltersType::RequestRedirect,
+                request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                    hostname: Some("new.example.com".to_string()),
+                    status_code: Some(301),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        );
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &default_owned(),
+            &HashSet::new(),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let filters = find_filters(&table, "example.com", "/old");
+        assert_eq!(filters.len(), 1);
+        match &filters[0] {
+            FilterAction::RequestRedirect {
+                hostname,
+                status_code,
+                ..
+            } => {
+                assert_eq!(hostname.as_deref(), Some("new.example.com"));
+                assert_eq!(*status_code, 301);
+            }
+            _ => panic!("expected RequestRedirect"),
+        }
+    }
+
+    #[test]
+    fn reconcile_url_rewrite_replace_prefix_stored() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let route = make_route_with_filters(
+            "default",
+            "example.com",
+            "/api",
+            HttpRouteRulesMatchesPathType::PathPrefix,
+            "svc",
+            vec![HttpRouteRulesFilters {
+                r#type: HttpRouteRulesFiltersType::UrlRewrite,
+                url_rewrite: Some(HttpRouteRulesFiltersUrlRewrite {
+                    path: Some(HttpRouteRulesFiltersUrlRewritePath {
+                        r#type: HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+                        replace_prefix_match: Some("/v3".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        );
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &default_owned(),
+            &HashSet::new(),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let filters = find_filters(&table, "example.com", "/api/users");
+        assert_eq!(filters.len(), 1);
+        match &filters[0] {
+            FilterAction::UrlRewrite {
+                hostname,
+                path:
+                    Some(PathModifier::ReplacePrefixMatch {
+                        prefix,
+                        replacement,
+                    }),
+            } => {
+                assert!(hostname.is_none());
+                assert_eq!(prefix, "/api");
+                assert_eq!(replacement, "/v3");
+            }
+            _ => panic!("expected UrlRewrite with ReplacePrefixMatch"),
         }
     }
 }
