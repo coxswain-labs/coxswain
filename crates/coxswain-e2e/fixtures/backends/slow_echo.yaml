@@ -2,8 +2,11 @@
 # Accepts TCP connections on port 3000 but never sends any HTTP response,
 # so Pingora's upstream read_timeout fires deterministically.
 #
-# Uses busybox nc (netcat) in a restart loop: each connection accepted by nc
-# holds the socket open with no writes, triggering the proxy's read timeout.
+# Uses busybox nc with -lk (persistent server) and -e /bin/sleep 30:
+# each accepted connection is handed off to "sleep 30", which keeps the socket
+# open for 30 s without writing any data.  This prevents the early-EOF that the
+# plain "nc -l | while true" loop produces (nc closes its write side as soon as
+# its stdin hits EOF, giving Pingora a ConnectionClosed instead of ReadTimedout).
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -25,7 +28,7 @@ spec:
           command:
             - /bin/sh
             - -c
-            - "while true; do nc -l -p 3000; done"
+            - "nc -lk -p 3000 -e /bin/sleep 30"
           ports:
             - containerPort: 3000
 ---
