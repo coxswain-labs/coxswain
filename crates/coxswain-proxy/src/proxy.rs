@@ -49,6 +49,11 @@ pub struct ProxyCtx {
     pub resolved: Option<ResolvedRoute>,
     /// Absolute deadline for the total request (from `timeouts.request`). 504 if exceeded.
     pub request_deadline: Option<Instant>,
+    /// True when the effective read_timeout was derived from `timeouts.request` (not
+    /// `timeouts.backendRequest`). Set in `upstream_peer`; consulted in `fail_to_proxy` to
+    /// distinguish 504 (request budget) from 502 (backend budget) without relying on wall-clock
+    /// comparisons that can race against OS timer granularity.
+    pub request_timeout_is_controlling: bool,
 }
 
 /// Lock-free routing engine for the request hot path.
@@ -161,6 +166,7 @@ impl ProxyHttp for Proxy {
                 real_client_proto: Some(info.proto),
                 resolved: None,
                 request_deadline: None,
+                request_timeout_is_controlling: false,
             })
             .unwrap_or_default()
     }
@@ -295,10 +301,24 @@ impl ProxyHttp for Proxy {
             .and_then(|d| d.checked_duration_since(Instant::now()));
         let backend_timeout = resolved.timeouts.backend_request;
 
+        // Determine which timeout is the binding constraint and set the flag that
+        // fail_to_proxy will use to pick 504 vs 502.  Doing this here (at peer-creation
+        // time) avoids a racy Instant::now() >= deadline comparison in fail_to_proxy,
+        // which can yield the wrong answer when the OS timer fires a few µs early.
         let read_timeout = match (backend_timeout, remaining_request) {
-            (Some(bt), Some(rem)) => Some(bt.min(rem)),
-            (Some(bt), None) => Some(bt),
-            (None, Some(rem)) => Some(rem),
+            (Some(bt), Some(rem)) => {
+                // Whichever is smaller fires; record which one controls.
+                ctx.request_timeout_is_controlling = rem <= bt;
+                Some(bt.min(rem))
+            }
+            (Some(bt), None) => {
+                ctx.request_timeout_is_controlling = false;
+                Some(bt)
+            }
+            (None, Some(rem)) => {
+                ctx.request_timeout_is_controlling = true;
+                Some(rem)
+            }
             (None, None) => None,
         };
         if let Some(t) = read_timeout {
@@ -365,16 +385,12 @@ impl ProxyHttp for Proxy {
     where
         Self::CTX: Send + Sync,
     {
-        let is_timeout = matches!(e.etype(), ReadTimedout | WriteTimedout);
-        let deadline_exceeded = ctx
-            .request_deadline
-            .map(|d| Instant::now() >= d)
-            .unwrap_or(false);
-
         let code = match e.etype() {
             HTTPStatus(code) => *code,
-            // A read/write timeout that exhausted the total request budget → 504.
-            ReadTimedout | WriteTimedout if is_timeout && deadline_exceeded => 504,
+            // A read/write timeout where the request budget was the binding constraint → 504.
+            // We use the flag set in upstream_peer rather than a wall-clock comparison to
+            // avoid races with OS timer granularity (timers can fire a few µs early).
+            ReadTimedout | WriteTimedout if ctx.request_timeout_is_controlling => 504,
             _ => match e.esource() {
                 ErrorSource::Upstream => 502,
                 ErrorSource::Downstream => match e.etype() {
