@@ -27,11 +27,12 @@ use std::time::Duration;
 
 const LEASE_NAME: &str = "coxswain-leader-lock";
 
-/// The external address written to `Ingress.status.loadBalancer.ingress[0]`.
+/// The external address written to `Ingress.status.loadBalancer.ingress[0]`
+/// and `Gateway.status.addresses[0]`.
 ///
-/// Parsed from `--ingress-status-address` at startup: if the value is a valid
+/// Parsed from `--status-address` at startup: if the value is a valid
 /// `IpAddr` it becomes `Ip`, otherwise it is treated as a DNS hostname.
-pub enum IngressStatusAddress {
+pub enum StatusAddress {
     Ip(IpAddr),
     Hostname(String),
 }
@@ -52,7 +53,7 @@ pub struct ControllerConfig {
     /// When set, the leader writes this address to every owned
     /// `Ingress.status.loadBalancer.ingress[0]` and `Gateway.status.addresses[0]`
     /// after each watch event.
-    pub ingress_status_address: Option<IngressStatusAddress>,
+    pub status_address: Option<StatusAddress>,
 }
 
 impl ControllerConfig {
@@ -63,7 +64,7 @@ impl ControllerConfig {
         lease_ttl: Duration,
         lease_renew_interval: Duration,
         watch_namespace: Option<String>,
-        ingress_status_address: Option<String>,
+        status_address: Option<String>,
     ) -> Result<Self, String> {
         if lease_renew_interval * 3 > lease_ttl {
             return Err(format!(
@@ -71,15 +72,15 @@ impl ControllerConfig {
                  1/3 of lease_ttl ({lease_ttl:?})"
             ));
         }
-        let ingress_status_address = ingress_status_address
+        let status_address = status_address
             .map(|s| {
                 let s = s.trim().to_string();
                 if s.is_empty() {
-                    return Err("ingress_status_address must not be empty".to_string());
+                    return Err("status_address must not be empty".to_string());
                 }
                 match s.parse::<IpAddr>() {
-                    Ok(ip) => Ok(IngressStatusAddress::Ip(ip)),
-                    Err(_) => Ok(IngressStatusAddress::Hostname(s)),
+                    Ok(ip) => Ok(StatusAddress::Ip(ip)),
+                    Err(_) => Ok(StatusAddress::Hostname(s)),
                 }
             })
             .transpose()?;
@@ -90,12 +91,12 @@ impl ControllerConfig {
             lease_ttl,
             lease_renew_interval,
             watch_namespace,
-            ingress_status_address,
+            status_address,
         })
     }
 }
 
-fn ingress_lb_already_matches(ingress: &Ingress, addr: &IngressStatusAddress) -> bool {
+fn ingress_lb_already_matches(ingress: &Ingress, addr: &StatusAddress) -> bool {
     let entry = ingress
         .status
         .as_ref()
@@ -103,16 +104,16 @@ fn ingress_lb_already_matches(ingress: &Ingress, addr: &IngressStatusAddress) ->
         .and_then(|lb| lb.ingress.as_deref())
         .and_then(|entries| entries.first());
     match (entry, addr) {
-        (Some(e), IngressStatusAddress::Ip(ip)) => e.ip.as_deref() == Some(&ip.to_string()),
-        (Some(e), IngressStatusAddress::Hostname(h)) => e.hostname.as_deref() == Some(h.as_str()),
+        (Some(e), StatusAddress::Ip(ip)) => e.ip.as_deref() == Some(&ip.to_string()),
+        (Some(e), StatusAddress::Hostname(h)) => e.hostname.as_deref() == Some(h.as_str()),
         (None, _) => false,
     }
 }
 
-fn build_ingress_status_patch(addr: &IngressStatusAddress) -> serde_json::Value {
+fn build_ingress_status_patch(addr: &StatusAddress) -> serde_json::Value {
     let entry = match addr {
-        IngressStatusAddress::Ip(ip) => serde_json::json!({ "ip": ip.to_string() }),
-        IngressStatusAddress::Hostname(h) => serde_json::json!({ "hostname": h }),
+        StatusAddress::Ip(ip) => serde_json::json!({ "ip": ip.to_string() }),
+        StatusAddress::Hostname(h) => serde_json::json!({ "hostname": h }),
     };
     serde_json::json!({ "status": { "loadBalancer": { "ingress": [entry] } } })
 }
@@ -474,13 +475,13 @@ impl Controller {
                                     .cloned()
                                     .unwrap_or_default();
                                 if gateway_needs_status_patch(&gw, &health) {
-                                    Self::patch_gateway_status(&client, &gw, &health, self.config.ingress_status_address.as_ref()).await;
+                                    Self::patch_gateway_status(&client, &gw, &health, self.config.status_address.as_ref()).await;
                                 }
                             } else if is_leader && !gateway_accepted(&gw) {
                                 // Before synced: only ensure Accepted is set; defer Programmed.
                                 let empty_health = GatewayListenerHealth::default();
                                 if gateway_needs_status_patch(&gw, &empty_health) {
-                                    Self::patch_gateway_status(&client, &gw, &empty_health, self.config.ingress_status_address.as_ref()).await;
+                                    Self::patch_gateway_status(&client, &gw, &empty_health, self.config.status_address.as_ref()).await;
                                 }
                             }
                         }
@@ -508,7 +509,7 @@ impl Controller {
                             .cloned()
                             .unwrap_or_default();
                         if gateway_needs_status_patch(gw, &health) {
-                            Self::patch_gateway_status(&client, gw, &health, self.config.ingress_status_address.as_ref()).await;
+                            Self::patch_gateway_status(&client, gw, &health, self.config.status_address.as_ref()).await;
                         }
                     }
                 }
@@ -535,7 +536,7 @@ impl Controller {
                 }
 
                 Some(event) = ingress_watcher.next() => {
-                    if let Some(addr) = &self.config.ingress_status_address {
+                    if let Some(addr) = &self.config.status_address {
                         match event {
                             Ok(watcher::Event::Apply(ing) | watcher::Event::InitApply(ing)) => {
                                 let class = crate::ingress::claimed_ingress_class(&ing);
@@ -603,7 +604,7 @@ impl Controller {
         client: &Client,
         gw: &Gateway,
         health: &GatewayListenerHealth,
-        addr: Option<&IngressStatusAddress>,
+        addr: Option<&StatusAddress>,
     ) {
         let name = match gw.metadata.name.as_deref() {
             Some(n) => n,
@@ -629,7 +630,7 @@ impl Controller {
         health: &GatewayListenerHealth,
         generation: i64,
         now: &Time,
-        addr: Option<&IngressStatusAddress>,
+        addr: Option<&StatusAddress>,
     ) -> serde_json::Value {
         let programmed = health.is_fully_programmed();
         let (prog_status, prog_reason, prog_message) = if programmed {
@@ -715,8 +716,8 @@ impl Controller {
         });
         if let Some(addr) = addr {
             let (type_str, value_str) = match addr {
-                IngressStatusAddress::Ip(ip) => ("IPAddress", ip.to_string()),
-                IngressStatusAddress::Hostname(h) => ("Hostname", h.clone()),
+                StatusAddress::Ip(ip) => ("IPAddress", ip.to_string()),
+                StatusAddress::Hostname(h) => ("Hostname", h.clone()),
             };
             patch["status"]["addresses"] = serde_json::json!([{
                 "type": type_str,
@@ -788,7 +789,7 @@ impl Controller {
         }
     }
 
-    async fn patch_ingress_status(client: &Client, ingress: &Ingress, addr: &IngressStatusAddress) {
+    async fn patch_ingress_status(client: &Client, ingress: &Ingress, addr: &StatusAddress) {
         let name = match ingress.metadata.name.as_deref() {
             Some(n) => n,
             None => return,
@@ -1069,7 +1070,7 @@ mod tests {
         assert!(!gateway_programmed(&gw));
     }
 
-    // --- IngressStatusAddress helpers ---
+    // --- StatusAddress helpers ---
 
     use k8s_openapi::api::networking::v1::{
         IngressLoadBalancerIngress, IngressLoadBalancerStatus, IngressStatus,
@@ -1092,7 +1093,7 @@ mod tests {
 
     #[test]
     fn patch_uses_ip_field_for_ip_address() {
-        let addr = IngressStatusAddress::Ip("203.0.113.1".parse().unwrap());
+        let addr = StatusAddress::Ip("203.0.113.1".parse().unwrap());
         let patch = build_ingress_status_patch(&addr);
         assert_eq!(
             patch,
@@ -1104,7 +1105,7 @@ mod tests {
 
     #[test]
     fn patch_uses_hostname_field_for_hostname() {
-        let addr = IngressStatusAddress::Hostname("coxswain.example.com".into());
+        let addr = StatusAddress::Hostname("coxswain.example.com".into());
         let patch = build_ingress_status_patch(&addr);
         assert_eq!(
             patch,
@@ -1117,28 +1118,28 @@ mod tests {
     #[test]
     fn lb_already_matches_returns_true_when_ip_equal() {
         let ing = ingress_with_lb(Some("203.0.113.1"), None);
-        let addr = IngressStatusAddress::Ip("203.0.113.1".parse().unwrap());
+        let addr = StatusAddress::Ip("203.0.113.1".parse().unwrap());
         assert!(ingress_lb_already_matches(&ing, &addr));
     }
 
     #[test]
     fn lb_already_matches_returns_false_when_ip_differs() {
         let ing = ingress_with_lb(Some("10.0.0.1"), None);
-        let addr = IngressStatusAddress::Ip("203.0.113.1".parse().unwrap());
+        let addr = StatusAddress::Ip("203.0.113.1".parse().unwrap());
         assert!(!ingress_lb_already_matches(&ing, &addr));
     }
 
     #[test]
     fn lb_already_matches_returns_true_when_hostname_equal() {
         let ing = ingress_with_lb(None, Some("coxswain.example.com"));
-        let addr = IngressStatusAddress::Hostname("coxswain.example.com".into());
+        let addr = StatusAddress::Hostname("coxswain.example.com".into());
         assert!(ingress_lb_already_matches(&ing, &addr));
     }
 
     #[test]
     fn lb_already_matches_returns_false_when_hostname_differs() {
         let ing = ingress_with_lb(None, Some("other.example.com"));
-        let addr = IngressStatusAddress::Hostname("coxswain.example.com".into());
+        let addr = StatusAddress::Hostname("coxswain.example.com".into());
         assert!(!ingress_lb_already_matches(&ing, &addr));
     }
 
@@ -1148,7 +1149,7 @@ mod tests {
             status: None,
             ..Default::default()
         };
-        let addr = IngressStatusAddress::Ip("203.0.113.1".parse().unwrap());
+        let addr = StatusAddress::Ip("203.0.113.1".parse().unwrap());
         assert!(!ingress_lb_already_matches(&ing, &addr));
     }
 
@@ -1164,10 +1165,7 @@ mod tests {
             Some("203.0.113.1".into()),
         )
         .unwrap();
-        assert!(matches!(
-            cfg.ingress_status_address,
-            Some(IngressStatusAddress::Ip(_))
-        ));
+        assert!(matches!(cfg.status_address, Some(StatusAddress::Ip(_))));
     }
 
     #[test]
@@ -1183,8 +1181,8 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            cfg.ingress_status_address,
-            Some(IngressStatusAddress::Hostname(_))
+            cfg.status_address,
+            Some(StatusAddress::Hostname(_))
         ));
     }
 
@@ -1214,6 +1212,6 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(cfg.ingress_status_address.is_none());
+        assert!(cfg.status_address.is_none());
     }
 }

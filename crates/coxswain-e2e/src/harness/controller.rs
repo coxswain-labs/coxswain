@@ -13,8 +13,8 @@ pub struct ControllerProcess {
 /// Optional parameters for `ControllerProcess::start_with_options`.
 #[derive(Default)]
 pub struct ControllerOptions {
-    /// When set, passed as `--ingress-status-address` to the controller.
-    pub ingress_status_address: Option<String>,
+    /// When set, passed as `--status-address` to the controller.
+    pub status_address: Option<String>,
     /// When set, passed as `--ingress-default-backend` to the controller.
     /// Format: `<namespace>/<service>:<port>`.
     pub ingress_default_backend: Option<String>,
@@ -62,8 +62,8 @@ impl ControllerProcess {
             "--controller-lease-renew-interval".to_string(),
             "1s".to_string(),
         ];
-        if let Some(addr) = opts.ingress_status_address {
-            args.push("--ingress-status-address".to_string());
+        if let Some(addr) = opts.status_address {
+            args.push("--status-address".to_string());
             args.push(addr);
         }
         if let Some(db) = opts.ingress_default_backend {

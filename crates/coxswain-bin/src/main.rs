@@ -162,17 +162,18 @@ pub struct ServeArgs {
     #[arg(long, env = "COXSWAIN_PROXY_TLS_ADDR", default_value = "0.0.0.0:8443")]
     pub proxy_tls_addr: SocketAddr,
 
-    /// External address written to every owned `Ingress.status.loadBalancer.ingress[0]`.
+    /// External address written to every owned `Ingress.status.loadBalancer.ingress[0]`
+    /// and `Gateway.status.addresses[0]`.
     ///
     /// Accepts either a bare IP (`203.0.113.1`) or a DNS hostname
     /// (`coxswain.example.com`). IP values are written to `.ip`;
     /// hostname values are written to `.hostname`.
     ///
     /// Required for cert-manager HTTP-01 challenge resolution and
-    /// external-dns DNS record creation. When omitted, Ingress status
-    /// is not patched (backward-compatible default).
-    #[arg(long, env = "COXSWAIN_INGRESS_STATUS_ADDRESS")]
-    pub ingress_status_address: Option<String>,
+    /// external-dns DNS record creation. When omitted, status is
+    /// not patched (backward-compatible default).
+    #[arg(long, env = "COXSWAIN_STATUS_ADDRESS")]
+    pub status_address: Option<String>,
 
     /// Controller-wide default backend for Ingress traffic that does not match any rule.
     ///
@@ -249,7 +250,7 @@ fn main() -> Result<()> {
         args.controller_lease_ttl,
         args.controller_lease_renew_interval,
         args.controller_watch_namespace.clone(),
-        args.ingress_status_address.clone(),
+        args.status_address.clone(),
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 

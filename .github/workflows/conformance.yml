@@ -83,7 +83,7 @@ jobs:
             --proxy-tls-addr 0.0.0.0:443 \
             --health-addr 0.0.0.0:8081 \
             --admin-addr 0.0.0.0:8082 \
-            --ingress-status-address 127.0.0.1 \
+            --status-address 127.0.0.1 \
             --pod-name coxswain-conformance \
             --pod-namespace coxswain-system \
             --controller-lease-ttl 15s \
