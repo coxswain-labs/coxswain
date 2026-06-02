@@ -21,6 +21,10 @@ use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
 fn init_tracing() {
+    // Install aws-lc-rs as the process-level rustls crypto provider before any
+    // reqwest client is created. Required when both aws-lc-rs and ring end up
+    // compiled in via feature unification across workspace deps.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let _ = tracing_subscriber::fmt()
         .with_env_filter("coxswain_e2e=debug,warn")
         .try_init();
