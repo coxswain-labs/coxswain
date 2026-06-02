@@ -1,0 +1,41 @@
+# A "black-hole" backend for timeout e2e tests.
+# Accepts TCP connections on port 3000 but never sends any HTTP response,
+# so Pingora's upstream read_timeout fires deterministically.
+#
+# Uses busybox nc (netcat) in a restart loop: each connection accepted by nc
+# holds the socket open with no writes, triggering the proxy's read timeout.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slow-echo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slow-echo
+  template:
+    metadata:
+      labels:
+        app: slow-echo
+    spec:
+      containers:
+        - name: slow-echo
+          image: busybox:1.37
+          command:
+            - /bin/sh
+            - -c
+            - "while true; do nc -l -p 3000; done"
+          ports:
+            - containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slow-echo
+spec:
+  selector:
+    app: slow-echo
+  ports:
+    - port: 3000
+      targetPort: 3000

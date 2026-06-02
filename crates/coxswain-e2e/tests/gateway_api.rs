@@ -1,6 +1,6 @@
 use coxswain_e2e::{
     fixtures::{
-        self, BACKENDS_ECHO, BACKENDS_WEBSOCKET_ECHO, GATEWAY_API_CERT_MANAGER,
+        self, BACKENDS_ECHO, BACKENDS_SLOW_ECHO, BACKENDS_WEBSOCKET_ECHO, GATEWAY_API_CERT_MANAGER,
         GATEWAY_API_COMBINED_MATCHING, GATEWAY_API_CROSS_NAMESPACE_ROUTE,
         GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_FILTERS, GATEWAY_API_HEADER_MATCHING,
         GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PATH_MATCHING,
@@ -809,8 +809,8 @@ async fn timeouts_request_returns_504() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-timeouts-req").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
-    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(BACKENDS_SLOW_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
     fixtures::apply_fixture(GATEWAY_API_TIMEOUTS, &ns.name, &[]).await?;
 
     let host = format!("timeout.{}.local", ns.name);
@@ -841,8 +841,8 @@ async fn timeouts_backend_request_returns_502() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-timeouts-be").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
-    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(BACKENDS_SLOW_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
     fixtures::apply_fixture(GATEWAY_API_TIMEOUTS, &ns.name, &[]).await?;
 
     let host = format!("timeout.{}.local", ns.name);

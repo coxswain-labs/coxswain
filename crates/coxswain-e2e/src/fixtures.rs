@@ -9,6 +9,11 @@ pub const BACKENDS_WEBSOCKET_ECHO: &str = concat!(
     "/fixtures/backends/websocket_echo.yaml"
 );
 
+pub const BACKENDS_SLOW_ECHO: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/slow_echo.yaml"
+);
+
 pub const GATEWAY_API_PATH_MATCHING: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/gateway_api/path_matching.yaml"
