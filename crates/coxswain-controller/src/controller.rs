@@ -50,7 +50,8 @@ pub struct ControllerConfig {
     /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
     pub watch_namespace: Option<String>,
     /// When set, the leader writes this address to every owned
-    /// `Ingress.status.loadBalancer.ingress[0]` after each watch event.
+    /// `Ingress.status.loadBalancer.ingress[0]` and `Gateway.status.addresses[0]`
+    /// after each watch event.
     pub ingress_status_address: Option<IngressStatusAddress>,
 }
 
@@ -473,13 +474,13 @@ impl Controller {
                                     .cloned()
                                     .unwrap_or_default();
                                 if gateway_needs_status_patch(&gw, &health) {
-                                    Self::patch_gateway_status(&client, &gw, &health).await;
+                                    Self::patch_gateway_status(&client, &gw, &health, self.config.ingress_status_address.as_ref()).await;
                                 }
                             } else if is_leader && !gateway_accepted(&gw) {
                                 // Before synced: only ensure Accepted is set; defer Programmed.
                                 let empty_health = GatewayListenerHealth::default();
                                 if gateway_needs_status_patch(&gw, &empty_health) {
-                                    Self::patch_gateway_status(&client, &gw, &empty_health).await;
+                                    Self::patch_gateway_status(&client, &gw, &empty_health, self.config.ingress_status_address.as_ref()).await;
                                 }
                             }
                         }
@@ -507,7 +508,7 @@ impl Controller {
                             .cloned()
                             .unwrap_or_default();
                         if gateway_needs_status_patch(gw, &health) {
-                            Self::patch_gateway_status(&client, gw, &health).await;
+                            Self::patch_gateway_status(&client, gw, &health, self.config.ingress_status_address.as_ref()).await;
                         }
                     }
                 }
@@ -595,10 +596,15 @@ impl Controller {
         }
     }
 
-    // Single patch call sets all Gateway conditions and listener statuses at once.
+    // Single patch call sets all Gateway conditions, listener statuses, and addresses at once.
     // A JSON merge patch replaces the entire conditions array, so splitting calls
     // would cause conditions to toggle in a watch-feedback loop.
-    async fn patch_gateway_status(client: &Client, gw: &Gateway, health: &GatewayListenerHealth) {
+    async fn patch_gateway_status(
+        client: &Client,
+        gw: &Gateway,
+        health: &GatewayListenerHealth,
+        addr: Option<&IngressStatusAddress>,
+    ) {
         let name = match gw.metadata.name.as_deref() {
             Some(n) => n,
             None => return,
@@ -607,7 +613,7 @@ impl Controller {
         let generation = gw.metadata.generation.unwrap_or(0);
         let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
         let now = Time(k8s_openapi::jiff::Timestamp::now());
-        let patch = Self::build_gateway_status_patch(gw, health, generation, &now);
+        let patch = Self::build_gateway_status_patch(gw, health, generation, &now, addr);
         let programmed = health.is_fully_programmed();
         match api
             .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
@@ -623,6 +629,7 @@ impl Controller {
         health: &GatewayListenerHealth,
         generation: i64,
         now: &Time,
+        addr: Option<&IngressStatusAddress>,
     ) -> serde_json::Value {
         let programmed = health.is_fully_programmed();
         let (prog_status, prog_reason, prog_message) = if programmed {
@@ -700,12 +707,23 @@ impl Controller {
             })
             .collect();
 
-        serde_json::json!({
+        let mut patch = serde_json::json!({
             "status": {
                 "conditions": conditions,
                 "listeners": listener_statuses,
             }
-        })
+        });
+        if let Some(addr) = addr {
+            let (type_str, value_str) = match addr {
+                IngressStatusAddress::Ip(ip) => ("IPAddress", ip.to_string()),
+                IngressStatusAddress::Hostname(h) => ("Hostname", h.clone()),
+            };
+            patch["status"]["addresses"] = serde_json::json!([{
+                "type": type_str,
+                "value": value_str,
+            }]);
+        }
+        patch
     }
 
     async fn mark_http_route_programmed(
