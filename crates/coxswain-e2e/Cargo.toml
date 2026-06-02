@@ -26,4 +26,4 @@ tokio-rustls = "0.26"
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls = { version = "0.23" }

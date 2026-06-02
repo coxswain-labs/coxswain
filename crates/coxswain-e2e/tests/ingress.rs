@@ -438,12 +438,16 @@ async fn proxy_protocol_strict_drop() -> anyhow::Result<()> {
     tcp.flush().await?;
 
     // The controller should close the connection before sending any HTTP response.
+    // Accept both clean EOF (n == 0) and a TCP RST (ConnectionReset / ConnectionAborted).
     let mut buf = vec![0u8; 256];
-    let n = tcp.read(&mut buf).await?;
-    assert_eq!(
-        n, 0,
-        "expected connection closed (EOF) on missing PROXY header, got {n} bytes"
-    );
+    match tcp.read(&mut buf).await {
+        Ok(0) => {}
+        Ok(n) => panic!("expected connection closed on missing PROXY header, got {n} bytes"),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::ConnectionReset
+                || e.kind() == std::io::ErrorKind::ConnectionAborted => {}
+        Err(e) => return Err(e.into()),
+    }
 
     Ok(())
 }
@@ -540,6 +544,9 @@ async fn try_tls_after_proxy_v2(
     tcp.write_all(v2_header).await?;
     tcp.flush().await?;
 
+    // Ensure the process-level crypto provider is set (aws-lc-rs, consistent with reqwest).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // TLS config that accepts any certificate (self-signed certs in tests).
     let config = ClientConfig::builder()
         .dangerous()
@@ -607,7 +614,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
