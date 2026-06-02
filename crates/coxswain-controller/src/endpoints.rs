@@ -1,15 +1,45 @@
+use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::runtime::reflector;
 use std::net::{IpAddr, SocketAddr};
 
+/// Looks up `svc` in the Service store and returns the pod-facing target port
+/// for the given service port number. Returns `None` if the Service is not in
+/// the store, the port is not found, or the targetPort is a named string
+/// (named ports require pod spec inspection, which we don't do).
+fn target_port(
+    ns: &str,
+    svc: &str,
+    service_port: i32,
+    services: &reflector::Store<Service>,
+) -> Option<i32> {
+    let key = reflector::ObjectRef::<Service>::new(svc).within(ns);
+    let service = services.get(&key)?;
+    let ports = service.spec.as_ref()?.ports.as_deref()?;
+    for sp in ports {
+        if sp.port == service_port {
+            return match sp.target_port.as_ref()? {
+                IntOrString::Int(tp) => Some(*tp),
+                IntOrString::String(_) => None, // named port, fall back to caller
+            };
+        }
+    }
+    None
+}
+
 /// Scans the local `EndpointSlice` store for ready pod addresses backing
-/// `svc` in `ns` on `port`. Never queries the API server.
+/// `svc` in `ns` on `port`. When the Service is in the store and its port
+/// has a numeric `targetPort`, the pod port is resolved correctly even when
+/// it differs from the service port. Never queries the API server.
 pub(crate) fn resolve(
     ns: &str,
     svc: &str,
     port: i32,
     slices: &reflector::Store<EndpointSlice>,
+    services: &reflector::Store<Service>,
 ) -> Vec<SocketAddr> {
+    let pod_port = target_port(ns, svc, port, services).unwrap_or(port);
     let mut addrs = Vec::new();
     for slice in slices.state() {
         if slice.metadata.namespace.as_deref() != Some(ns) {
@@ -30,19 +60,28 @@ pub(crate) fn resolve(
             }
             for addr in &ep.addresses {
                 if let Ok(ip) = addr.parse::<IpAddr>() {
-                    addrs.push(SocketAddr::new(ip, port as u16));
+                    addrs.push(SocketAddr::new(ip, pod_port as u16));
                 }
             }
         }
     }
-    tracing::debug!(ns, svc, port, count = addrs.len(), "Resolved endpoints");
+    tracing::debug!(
+        ns,
+        svc,
+        service_port = port,
+        pod_port,
+        count = addrs.len(),
+        "Resolved endpoints"
+    );
     addrs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
     use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
     use kube::api::ObjectMeta;
     use kube::runtime::watcher;
     use std::collections::BTreeMap;
@@ -78,39 +117,88 @@ mod tests {
         writer.as_reader()
     }
 
+    fn make_service(ns: &str, name: &str, service_port: i32, target_port: i32) -> Service {
+        Service {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                ports: Some(vec![ServicePort {
+                    port: service_port,
+                    target_port: Some(IntOrString::Int(target_port)),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn make_svc_store(services: Vec<Service>) -> reflector::Store<Service> {
+        let mut writer = reflector::store::Writer::<Service>::default();
+        for svc in services {
+            writer.apply_watcher_event(&watcher::Event::Apply(svc));
+        }
+        writer.as_reader()
+    }
+
+    fn empty_svc_store() -> reflector::Store<Service> {
+        make_svc_store(vec![])
+    }
+
     #[test]
     fn resolve_returns_ready_endpoints() {
         let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", Some(true))]);
-        let addrs = resolve("ns", "svc", 8080, &store);
+        let addrs = resolve("ns", "svc", 8080, &store, &empty_svc_store());
         assert_eq!(addrs, vec!["10.0.0.1:8080".parse::<SocketAddr>().unwrap()]);
     }
 
     #[test]
     fn resolve_skips_not_ready_endpoints() {
         let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", Some(false))]);
-        assert!(resolve("ns", "svc", 8080, &store).is_empty());
+        assert!(resolve("ns", "svc", 8080, &store, &empty_svc_store()).is_empty());
     }
 
     #[test]
     fn resolve_includes_unknown_ready_endpoints() {
         let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", None)]);
-        assert_eq!(resolve("ns", "svc", 8080, &store).len(), 1);
+        assert_eq!(
+            resolve("ns", "svc", 8080, &store, &empty_svc_store()).len(),
+            1
+        );
     }
 
     #[test]
     fn resolve_ignores_wrong_namespace() {
         let store = make_store(vec![make_slice("other-ns", "svc", "10.0.0.1", Some(true))]);
-        assert!(resolve("ns", "svc", 8080, &store).is_empty());
+        assert!(resolve("ns", "svc", 8080, &store, &empty_svc_store()).is_empty());
     }
 
     #[test]
     fn resolve_ignores_wrong_service() {
         let store = make_store(vec![make_slice("ns", "other-svc", "10.0.0.1", Some(true))]);
-        assert!(resolve("ns", "svc", 8080, &store).is_empty());
+        assert!(resolve("ns", "svc", 8080, &store, &empty_svc_store()).is_empty());
     }
 
     #[test]
     fn resolve_empty_store() {
-        assert!(resolve("ns", "svc", 8080, &make_store(vec![])).is_empty());
+        assert!(resolve("ns", "svc", 8080, &make_store(vec![]), &empty_svc_store()).is_empty());
+    }
+
+    #[test]
+    fn resolve_uses_target_port_when_service_port_differs() {
+        let slices = make_store(vec![make_slice("ns", "svc", "10.0.0.1", Some(true))]);
+        let svcs = make_svc_store(vec![make_service("ns", "svc", 8082, 3000)]);
+        let addrs = resolve("ns", "svc", 8082, &slices, &svcs);
+        assert_eq!(addrs, vec!["10.0.0.1:3000".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_service_port_when_service_missing() {
+        let slices = make_store(vec![make_slice("ns", "svc", "10.0.0.1", Some(true))]);
+        let addrs = resolve("ns", "svc", 8082, &slices, &empty_svc_store());
+        assert_eq!(addrs, vec!["10.0.0.1:8082".parse::<SocketAddr>().unwrap()]);
     }
 }

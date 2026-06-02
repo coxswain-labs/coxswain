@@ -2,7 +2,7 @@ use crate::endpoints;
 use crate::tls::load_tls_cert;
 use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, Upstream};
 use coxswain_core::tls::TlsStoreBuilder;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::runtime::reflector;
@@ -37,6 +37,7 @@ impl IngressReconciler {
     pub fn reconcile(
         ingress: &Ingress,
         slices: &reflector::Store<EndpointSlice>,
+        services: &reflector::Store<Service>,
         owned_classes: &HashSet<String>,
         builder: &mut RoutingTableBuilder,
     ) {
@@ -97,7 +98,7 @@ impl IngressReconciler {
                     None => continue,
                 };
 
-                let addrs = endpoints::resolve(ns, &svc.name, port, slices);
+                let addrs = endpoints::resolve(ns, &svc.name, port, slices, services);
                 if addrs.is_empty() {
                     tracing::warn!(
                         ingress = ?ingress.metadata.name,
@@ -142,7 +143,7 @@ impl IngressReconciler {
             .and_then(|b| b.service.as_ref())
             && let Some(port) = default_svc.port.as_ref().and_then(|p| p.number)
         {
-            let addrs = endpoints::resolve(ns, &default_svc.name, port, slices);
+            let addrs = endpoints::resolve(ns, &default_svc.name, port, slices, services);
             if addrs.is_empty() {
                 tracing::warn!(
                     ingress = ?ingress.metadata.name,
@@ -234,7 +235,7 @@ mod tests {
     use coxswain_core::routing::{RequestContext, RoutingTableBuilder};
     use coxswain_core::tls::TlsStoreBuilder;
     use k8s_openapi::ByteString;
-    use k8s_openapi::api::core::v1::Secret;
+    use k8s_openapi::api::core::v1::{Secret, Service};
     use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
     use k8s_openapi::api::networking::v1::{
         HTTPIngressPath, HTTPIngressRuleValue, IngressBackend, IngressRule, IngressServiceBackend,
@@ -246,6 +247,10 @@ mod tests {
 
     fn owned(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn empty_svc_store() -> reflector::Store<Service> {
+        reflector::store::Writer::<Service>::default().as_reader()
     }
 
     fn make_slice(ns: &str, svc: &str, ip: &str) -> EndpointSlice {
@@ -417,7 +422,13 @@ mod tests {
             Some("default-svc"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -436,7 +447,13 @@ mod tests {
         let store = slice_store(vec![make_slice("default", "default-svc", "10.0.0.1")]);
         let ingress = make_default_only_ingress("default", "default-svc");
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -457,7 +474,13 @@ mod tests {
             Some("default-svc"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -479,7 +502,13 @@ mod tests {
             Some("default-svc"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -508,7 +537,13 @@ mod tests {
             Some("default-svc"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -531,7 +566,13 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -552,7 +593,13 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -574,7 +621,13 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -595,7 +648,13 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -616,7 +675,13 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -637,7 +702,13 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -658,7 +729,13 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
@@ -678,7 +755,13 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         assert!(
             builder
                 .build()
@@ -701,7 +784,13 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         assert!(
             builder
                 .build()
@@ -724,7 +813,13 @@ mod tests {
             Some("coxswain"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         assert!(
             builder
                 .build()
@@ -747,7 +842,13 @@ mod tests {
             Some("nginx"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         assert!(
             builder
                 .build()
@@ -770,7 +871,13 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         assert!(
             builder
                 .build()
@@ -793,7 +900,13 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&[]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&[]),
+            &mut builder,
+        );
         assert!(
             builder
                 .build()
@@ -817,7 +930,13 @@ mod tests {
             Some("nginx"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(&ingress, &store, &owned(&["coxswain"]), &mut builder);
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
         assert!(
             builder
                 .build()
@@ -1010,6 +1129,7 @@ mod tests {
         IngressReconciler::reconcile(
             &ingress,
             &slice_st,
+            &empty_svc_store(),
             &owned(&["coxswain"]),
             &mut route_builder,
         );

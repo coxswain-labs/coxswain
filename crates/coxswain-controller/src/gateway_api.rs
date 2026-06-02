@@ -14,7 +14,7 @@ use gateway_api::apis::standard::httproutes::{
     HttpRouteRulesMatchesQueryParamsType, HttpRouteRulesTimeouts,
 };
 use http::{HeaderName, Method};
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use regex::Regex;
@@ -95,6 +95,7 @@ impl GatewayApiReconciler {
     pub fn reconcile(
         route: &HTTPRoute,
         slices: &reflector::Store<EndpointSlice>,
+        services: &reflector::Store<Service>,
         owned_gateways: &HashSet<(String, String)>,
         grants: &HashSet<(String, String, Option<String>)>,
         builder: &mut RoutingTableBuilder,
@@ -184,7 +185,8 @@ impl GatewayApiReconciler {
                     _ => continue,
                 };
 
-                let addrs = Self::resolve_upstream_addrs(backend_refs, route_ns, slices, grants);
+                let addrs =
+                    Self::resolve_upstream_addrs(backend_refs, route_ns, slices, services, grants);
                 if addrs.is_empty() {
                     tracing::warn!(
                         route = ?route.metadata.name,
@@ -304,7 +306,10 @@ impl GatewayApiReconciler {
             by_listener.insert(listener.name.clone(), outcome);
         }
 
-        GatewayListenerHealth { by_listener }
+        GatewayListenerHealth {
+            by_listener,
+            ..Default::default()
+        }
     }
 
     fn resolve_listener_tls(
@@ -632,6 +637,7 @@ impl GatewayApiReconciler {
         backend_refs: &[HttpRouteRulesBackendRefs],
         route_ns: &str,
         slices: &reflector::Store<EndpointSlice>,
+        services: &reflector::Store<Service>,
         grants: &HashSet<(String, String, Option<String>)>,
     ) -> Vec<SocketAddr> {
         backend_refs
@@ -650,7 +656,7 @@ impl GatewayApiReconciler {
                     );
                     return vec![];
                 }
-                endpoints::resolve(ns, &b.name, port, slices)
+                endpoints::resolve(ns, &b.name, port, slices, services)
             })
             .collect()
     }
@@ -701,6 +707,10 @@ mod tests {
             writer.apply_watcher_event(&watcher::Event::Apply(slice));
         }
         writer.as_reader()
+    }
+
+    fn empty_svc_store() -> reflector::Store<Service> {
+        reflector::store::Writer::<Service>::default().as_reader()
     }
 
     fn owned(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
@@ -866,7 +876,14 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let empty_hdrs = HeaderMap::new();
         let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
@@ -889,7 +906,14 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let empty_hdrs = HeaderMap::new();
         let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
@@ -912,7 +936,14 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let empty_hdrs = HeaderMap::new();
         let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
@@ -927,7 +958,14 @@ mod tests {
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let empty_hdrs = HeaderMap::new();
         let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
@@ -944,6 +982,7 @@ mod tests {
         GatewayApiReconciler::reconcile(
             &route,
             &store,
+            &empty_svc_store(),
             &owned(&[("other", "gw")]),
             &grants,
             &mut builder,
@@ -1000,7 +1039,14 @@ mod tests {
 
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &mut builder,
+        );
         let table = builder.build().unwrap();
 
         let hdrs_a = headers_from(&[("x-tenant", "a")]);
@@ -1029,7 +1075,14 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &mut builder,
+        );
         let table = builder.build().unwrap();
 
         let hdrs_ok = headers_from(&[("x-version", "v42")]);
@@ -1083,7 +1136,14 @@ mod tests {
 
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &mut builder,
+        );
         let table = builder.build().unwrap();
 
         let h = HeaderMap::new();
@@ -1142,7 +1202,14 @@ mod tests {
 
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &mut builder,
+        );
         let table = builder.build().unwrap();
 
         let h = HeaderMap::new();
@@ -1184,7 +1251,14 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &mut builder,
+        );
         let table = builder.build().unwrap();
 
         // The valid fallback entry is still registered.
@@ -1302,6 +1376,7 @@ mod tests {
         GatewayApiReconciler::reconcile(
             &route,
             &store,
+            &empty_svc_store(),
             &default_owned(),
             &HashSet::new(),
             &mut builder,
@@ -1342,6 +1417,7 @@ mod tests {
         GatewayApiReconciler::reconcile(
             &route,
             &store,
+            &empty_svc_store(),
             &default_owned(),
             &HashSet::new(),
             &mut builder,
@@ -1383,6 +1459,7 @@ mod tests {
         GatewayApiReconciler::reconcile(
             &route,
             &store,
+            &empty_svc_store(),
             &default_owned(),
             &HashSet::new(),
             &mut builder,
@@ -1429,6 +1506,7 @@ mod tests {
         GatewayApiReconciler::reconcile(
             &route,
             &store,
+            &empty_svc_store(),
             &default_owned(),
             &HashSet::new(),
             &mut builder,
@@ -1536,7 +1614,14 @@ mod tests {
 
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let t = find_timeouts(&table, "example.com", "/");
         assert_eq!(t.request, Some(Duration::from_secs(10)));
@@ -1549,7 +1634,14 @@ mod tests {
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let t = find_timeouts(&table, "example.com", "/");
         assert!(t.request.is_none());

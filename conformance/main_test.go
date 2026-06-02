@@ -16,13 +16,13 @@ import (
 //	--organization=coxswain-labs
 //	--project=coxswain
 //	--url=https://github.com/coxswain-labs/coxswain
-//	--implementation-version=<git-describe>
+//	--version=<git-describe>
 //	--report-output=reports/<file>.yaml
 //
 // The cluster must have:
 //   - Gateway API CRDs installed
 //   - GatewayClass "coxswain" created
-//   - Coxswain running with --ingress-status-address set to the reachable proxy IP
+//   - Coxswain running with --status-address set to the reachable proxy IP
 func TestConformance(t *testing.T) {
 	opts := conformance.DefaultOptions(t)
 	opts.GatewayClassName = "coxswain"
@@ -49,7 +49,7 @@ func TestConformance(t *testing.T) {
 		// Extended: timeouts (#14)
 		features.SupportHTTPRouteRequestTimeout,
 		features.SupportHTTPRouteBackendTimeout,
-		// Extended: protocol (#12)
+		// Extended: websocket (#15 dependency, port mapping fix)
 		features.SupportHTTPRouteBackendProtocolWebSocket,
 	)
 

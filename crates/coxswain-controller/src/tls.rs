@@ -73,6 +73,9 @@ impl ListenerTlsOutcome {
 #[derive(Clone, Debug, Default)]
 pub struct GatewayListenerHealth {
     pub by_listener: BTreeMap<String, ListenerTlsOutcome>,
+    /// Number of routes successfully attached to each listener, keyed by listener name.
+    /// Populated by the reconciler's route-counting pass after the TLS walk.
+    pub attached_routes: BTreeMap<String, i32>,
 }
 
 impl GatewayListenerHealth {

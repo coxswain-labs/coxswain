@@ -4,7 +4,7 @@ use coxswain_core::ownership::{self, OwnedGateways};
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{
-    Gateway, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
+    Gateway, GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteParentRefs, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
@@ -136,10 +136,18 @@ fn has_condition(conditions: Option<&[Condition]>, type_: &str) -> bool {
 }
 
 fn gateway_class_accepted(gc: &GatewayClass) -> bool {
-    has_condition(
-        gc.status.as_ref().and_then(|s| s.conditions.as_deref()),
-        "Accepted",
-    )
+    let generation = gc.metadata.generation.unwrap_or(0);
+    gc.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .map(|conds| {
+            conds.iter().any(|c| {
+                c.type_ == "Accepted"
+                    && c.status == "True"
+                    && c.observed_generation.unwrap_or(0) >= generation
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn gateway_accepted(gw: &Gateway) -> bool {
@@ -185,17 +193,27 @@ fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerHealth) -> b
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
     for listener in &gw.spec.listeners {
-        let desired_healthy = health
-            .by_listener
-            .get(&listener.name)
-            .map(|o| o.is_healthy())
-            .unwrap_or(true);
-        let current_resolved = current_listeners
-            .iter()
-            .find(|sl| sl.name == listener.name)
+        let (has_invalid_kinds, _) = listener_route_kind_info(listener);
+        let desired_healthy = !has_invalid_kinds
+            && health
+                .by_listener
+                .get(&listener.name)
+                .map(|o| o.is_healthy())
+                .unwrap_or(true);
+        let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);
+        let current_resolved = current_listener
             .map(|sl| has_condition(Some(sl.conditions.as_slice()), "ResolvedRefs"))
             .unwrap_or(false);
         if desired_healthy != current_resolved {
+            return true;
+        }
+        let desired_attached = health
+            .attached_routes
+            .get(&listener.name)
+            .copied()
+            .unwrap_or(0);
+        let current_attached = current_listener.map(|sl| sl.attached_routes).unwrap_or(0);
+        if desired_attached != current_attached {
             return true;
         }
     }
@@ -266,6 +284,50 @@ fn filter_owned_parent_refs(
         })
         .cloned()
         .collect()
+}
+
+/// Returns `(has_any_invalid, supported_kinds)` for a listener's `allowedRoutes.kinds`.
+///
+/// - `has_any_invalid`: true if any listed kind is not supported by this controller.
+///   When true, `ResolvedRefs: False, reason: InvalidRouteKinds` must be set.
+/// - `supported_kinds`: intersection of the listed kinds with what we support (currently
+///   only `HTTPRoute`). Empty list when all listed kinds are unsupported. When
+///   `allowedRoutes.kinds` is absent or empty, returns `[HTTPRoute]` with `has_any_invalid=false`.
+fn listener_route_kind_info(
+    listener: &GatewayListeners,
+) -> (bool, Vec<GatewayStatusListenersSupportedKinds>) {
+    const HTTP_ROUTE_GROUP: &str = "gateway.networking.k8s.io";
+    let http_route_kind = || GatewayStatusListenersSupportedKinds {
+        group: Some(HTTP_ROUTE_GROUP.to_string()),
+        kind: "HTTPRoute".to_string(),
+    };
+    let allowed = match listener
+        .allowed_routes
+        .as_ref()
+        .and_then(|ar| ar.kinds.as_deref())
+    {
+        Some(k) if !k.is_empty() => k,
+        _ => return (false, vec![http_route_kind()]),
+    };
+    let mut has_invalid = false;
+    let mut includes_http_route = false;
+    for k in allowed {
+        let is_http_route = k.kind == "HTTPRoute"
+            && k.group
+                .as_deref()
+                .map_or(true, |g| g.is_empty() || g == HTTP_ROUTE_GROUP);
+        if is_http_route {
+            includes_http_route = true;
+        } else {
+            has_invalid = true;
+        }
+    }
+    let supported = if includes_http_route {
+        vec![http_route_kind()]
+    } else {
+        vec![]
+    };
+    (has_invalid, supported)
 }
 
 /// Kubernetes watch loop for leader election and writing status conditions
@@ -665,8 +727,15 @@ impl Controller {
                     .get(&l.name)
                     .cloned()
                     .unwrap_or(ListenerTlsOutcome::NotApplicable);
+                let (has_invalid_kinds, supported_kinds_list) = listener_route_kind_info(l);
                 let (resolved_refs_status, resolved_refs_reason, resolved_refs_msg) =
-                    if outcome.is_healthy() {
+                    if has_invalid_kinds {
+                        (
+                            "False",
+                            "InvalidRouteKinds",
+                            "One or more specified route kinds are not supported by this implementation",
+                        )
+                    } else if outcome.is_healthy() {
                         ("True", "ResolvedRefs", "")
                     } else {
                         ("False", outcome.reason(), outcome.message())
@@ -677,6 +746,15 @@ impl Controller {
                     } else {
                         ("False", outcome.reason(), outcome.message())
                     };
+                let attached = health.attached_routes.get(&l.name).copied().unwrap_or(0);
+                tracing::debug!(
+                    listener = %l.name,
+                    resolved_refs = resolved_refs_status,
+                    programmed = listener_prog_status,
+                    attached_routes = attached,
+                    supported_kinds = supported_kinds_list.len(),
+                    "Listener status"
+                );
                 let listener_conditions = vec![
                     make_condition("Accepted", "True", "Accepted", "", generation, now.clone()),
                     make_condition(
@@ -698,11 +776,8 @@ impl Controller {
                 ];
                 GatewayStatusListeners {
                     name: l.name.clone(),
-                    attached_routes: 0,
-                    supported_kinds: Some(vec![GatewayStatusListenersSupportedKinds {
-                        group: Some("gateway.networking.k8s.io".to_string()),
-                        kind: "HTTPRoute".to_string(),
-                    }]),
+                    attached_routes: attached,
+                    supported_kinds: Some(supported_kinds_list),
                     conditions: listener_conditions,
                 }
             })

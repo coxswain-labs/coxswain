@@ -9,7 +9,7 @@ use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
 use gateway_api::apis::standard::referencegrants::ReferenceGrant;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::{
@@ -169,6 +169,7 @@ async fn spawn_tasks(
     let (slice_reader, slice_writer) = reflector::store::<EndpointSlice>();
     let (grant_reader, grant_writer) = reflector::store::<ReferenceGrant>();
     let (secret_reader, secret_writer) = reflector::store::<Secret>();
+    let (service_reader, service_writer) = reflector::store::<Service>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
 
@@ -338,12 +339,13 @@ async fn spawn_tasks(
     // Secret in the cluster into memory.
     set.spawn({
         let notify = Arc::clone(&notify);
-        let ns = watch_namespace;
+        let ns = watch_namespace.clone();
+        let client_secret = client.clone();
         async move {
             let stream = reflector::reflector(
                 secret_writer,
                 watcher(
-                    scoped_api::<Secret>(client, ns.as_deref()),
+                    scoped_api::<Secret>(client_secret, ns.as_deref()),
                     watcher::Config::default().fields("type=kubernetes.io/tls"),
                 )
                 .default_backoff(),
@@ -353,6 +355,31 @@ async fn spawn_tasks(
                 match event {
                     Ok(_) => notify.notify_one(),
                     Err(e) => tracing::warn!(error = %e, "Secret reflector error"),
+                }
+            }
+        }
+    });
+
+    // --- Service reflector ---
+    //
+    // Used to resolve targetPort for backends where servicePort ≠ targetPort.
+    set.spawn({
+        let notify = Arc::clone(&notify);
+        let ns = watch_namespace;
+        async move {
+            let stream = reflector::reflector(
+                service_writer,
+                watcher(
+                    scoped_api::<Service>(client, ns.as_deref()),
+                    watcher::Config::default(),
+                )
+                .default_backoff(),
+            );
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(_) => notify.notify_one(),
+                    Err(e) => tracing::warn!(error = %e, "Service reflector error"),
                 }
             }
         }
@@ -380,6 +407,7 @@ async fn spawn_tasks(
                 &gateway_reader,
                 &gateway_class_reader,
                 &slice_reader,
+                &service_reader,
                 &grant_reader,
                 &secret_reader,
                 &controller_name,
@@ -403,6 +431,7 @@ fn rebuild(
     gateway_store: &reflector::Store<Gateway>,
     gateway_class_store: &reflector::Store<GatewayClass>,
     slice_store: &reflector::Store<EndpointSlice>,
+    service_store: &reflector::Store<Service>,
     grant_store: &reflector::Store<ReferenceGrant>,
     secret_store: &reflector::Store<Secret>,
     controller_name: &str,
@@ -522,13 +551,20 @@ fn rebuild(
         GatewayApiReconciler::reconcile(
             route,
             slice_store,
+            service_store,
             &owned_gateways,
             &backend_grants,
             &mut builder,
         );
     }
     for ingress in &ingresses {
-        IngressReconciler::reconcile(ingress, slice_store, &owned_ingress_classes, &mut builder);
+        IngressReconciler::reconcile(
+            ingress,
+            slice_store,
+            service_store,
+            &owned_ingress_classes,
+            &mut builder,
+        );
     }
 
     // Install the controller-wide default backend on the global catchall. Thanks to
@@ -536,7 +572,8 @@ fn rebuild(
     // on hosts that did not declare their own spec.defaultBackend. Per-Ingress defaults
     // always win because they are installed on the host router (matched first).
     if let Some(db) = ingress_default_backend {
-        let addrs = endpoints::resolve(&db.namespace, &db.name, db.port, slice_store);
+        let addrs =
+            endpoints::resolve(&db.namespace, &db.name, db.port, slice_store, service_store);
         if addrs.is_empty() {
             tracing::warn!(
                 svc = %format!("{}/{}", db.namespace, db.name),
@@ -613,6 +650,32 @@ fn rebuild(
         tls_shared.store(Arc::new(tls_store));
     } else {
         tracing::trace!(certs, "TLS cert store unchanged, skip swap");
+    }
+
+    // Count attached routes per gateway per listener.
+    // A route is counted if it has a parentRef pointing to an owned gateway.
+    // If sectionName is set, the count is added to that specific listener.
+    // If sectionName is absent, the count is spread across all listeners of the gateway.
+    for route in &routes {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        for pr in route.spec.parent_refs.as_deref().unwrap_or(&[]) {
+            let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
+            let gw_name = pr.name.as_str();
+            let key = (gw_ns.to_string(), gw_name.to_string());
+            if !owned_gateways.contains(&key) {
+                continue;
+            }
+            if let Some(health) = gateway_tls_health.get_mut(&key) {
+                if let Some(sn) = pr.section_name.as_deref() {
+                    *health.attached_routes.entry(sn.to_string()).or_insert(0) += 1;
+                } else {
+                    let listeners: Vec<String> = health.by_listener.keys().cloned().collect();
+                    for ln in listeners {
+                        *health.attached_routes.entry(ln).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
     }
 
     // Publish per-gateway listener health and wake the controller to re-evaluate statuses.
