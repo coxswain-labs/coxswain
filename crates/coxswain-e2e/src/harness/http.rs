@@ -26,7 +26,7 @@ impl EchoResponse {
 
 pub struct HttpClient {
     inner: reqwest::Client,
-    proxy_addr: SocketAddr,
+    pub proxy_addr: SocketAddr,
 }
 
 impl HttpClient {
