@@ -175,3 +175,69 @@ async fn tls_termination_with_sni() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Verifies that rotating a `kubernetes.io/tls` Secret causes the new certificate to be
+/// served for subsequent TLS connections without a process restart:
+/// 1. Apply an Ingress with `cert_old` — wait for it to be live and capture the leaf DER.
+/// 2. Re-apply the same fixture with `cert_new` (same Secret name, different PEM data).
+/// 3. Poll new handshakes until the served leaf DER changes — assert it matches `cert_new`.
+/// 4. Assert that routing still works on the new certificate.
+#[tokio::test]
+async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-tls-rotate").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("tls-rotate.{}.local", ns.name);
+    let cert_old = GeneratedCert::for_host(&host);
+    let cert_new = GeneratedCert::for_host(&host);
+
+    // Deploy with the original cert.
+    fixtures::apply_fixture(
+        INGRESS_TLS_TERMINATION,
+        &ns.name,
+        &[
+            ("INGRESS_NAME", "ingress-rotate"),
+            ("SECRET_NAME", "cert-rotate"),
+            ("TLS_HOST", &host),
+            ("BACKEND_NAME", "echo-a"),
+            ("TLS_CRT_B64", &cert_old.cert_b64()),
+            ("TLS_KEY_B64", &cert_old.key_b64()),
+        ],
+    )
+    .await?;
+
+    wait::wait_for_https_route(h.tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    let old_der = http::https_peer_leaf_der(&host, "/", h.tls_addr).await?;
+
+    // Rotate: re-apply the same fixture with new PEM bytes. kubectl apply patches the Secret.
+    fixtures::apply_fixture(
+        INGRESS_TLS_TERMINATION,
+        &ns.name,
+        &[
+            ("INGRESS_NAME", "ingress-rotate"),
+            ("SECRET_NAME", "cert-rotate"),
+            ("TLS_HOST", &host),
+            ("BACKEND_NAME", "echo-a"),
+            ("TLS_CRT_B64", &cert_new.cert_b64()),
+            ("TLS_KEY_B64", &cert_new.key_b64()),
+        ],
+    )
+    .await?;
+
+    // Poll until the new leaf is served — covers debounce window + reflector propagation.
+    wait::wait_for_tls_cert_rotation(h.tls_addr, &host, &old_der, Duration::from_secs(15)).await?;
+
+    // Backend routing must still work after the swap.
+    let resp = http::https_get(&host, "/", h.tls_addr).await?;
+    assert!(
+        resp.1.is_some(),
+        "expected a successful response after cert rotation"
+    );
+    resp.1.unwrap().assert_backend("echo-a");
+
+    Ok(())
+}

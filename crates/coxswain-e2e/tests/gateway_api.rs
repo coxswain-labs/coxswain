@@ -542,3 +542,90 @@ async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Verifies that rotating a `kubernetes.io/tls` Secret referenced by a Gateway listener
+/// causes the new certificate to be served without a process restart:
+/// 1. Apply a Gateway with two HTTPS listeners and capture the leaf DER for listener A.
+/// 2. Re-apply the same fixture with new PEM data for Secret A only.
+/// 3. Poll until listener A's served leaf DER changes — listener B must remain unchanged.
+/// 4. Assert routing still works on both listeners after the swap.
+#[tokio::test]
+async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-tls-rotate").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host_a = format!("tls-rot-a.{}.local", ns.name);
+    let host_b = format!("tls-rot-b.{}.local", ns.name);
+    let cert_a_old = GeneratedCert::for_host(&host_a);
+    let cert_a_new = GeneratedCert::for_host(&host_a);
+    let cert_b = GeneratedCert::for_host(&host_b);
+
+    // Deploy with original certs.
+    fixtures::apply_fixture(
+        GATEWAY_API_TLS_TERMINATION,
+        &ns.name,
+        &[
+            ("LISTENER_A_HOSTNAME", &host_a),
+            ("LISTENER_B_HOSTNAME", &host_b),
+            ("SECRET_A_NAME", "cert-rotate-a"),
+            ("SECRET_B_NAME", "cert-rotate-b"),
+            ("TLS_CRT_A_B64", &cert_a_old.cert_b64()),
+            ("TLS_KEY_A_B64", &cert_a_old.key_b64()),
+            ("TLS_CRT_B_B64", &cert_b.cert_b64()),
+            ("TLS_KEY_B_B64", &cert_b.key_b64()),
+        ],
+    )
+    .await?;
+
+    wait::wait_for_https_route(h.tls_addr, &host_a, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_https_route(h.tls_addr, &host_b, "/", Duration::from_secs(60)).await?;
+
+    let old_der_a = http::https_peer_leaf_der(&host_a, "/", h.tls_addr).await?;
+    let old_der_b = http::https_peer_leaf_der(&host_b, "/", h.tls_addr).await?;
+
+    // Rotate only Secret A; Secret B data is unchanged.
+    fixtures::apply_fixture(
+        GATEWAY_API_TLS_TERMINATION,
+        &ns.name,
+        &[
+            ("LISTENER_A_HOSTNAME", &host_a),
+            ("LISTENER_B_HOSTNAME", &host_b),
+            ("SECRET_A_NAME", "cert-rotate-a"),
+            ("SECRET_B_NAME", "cert-rotate-b"),
+            ("TLS_CRT_A_B64", &cert_a_new.cert_b64()),
+            ("TLS_KEY_A_B64", &cert_a_new.key_b64()),
+            ("TLS_CRT_B_B64", &cert_b.cert_b64()),
+            ("TLS_KEY_B_B64", &cert_b.key_b64()),
+        ],
+    )
+    .await?;
+
+    // Listener A must pick up the new cert.
+    wait::wait_for_tls_cert_rotation(h.tls_addr, &host_a, &old_der_a, Duration::from_secs(15))
+        .await?;
+
+    // Listener B must still serve the original cert (no spurious swap).
+    let new_der_b = http::https_peer_leaf_der(&host_b, "/", h.tls_addr).await?;
+    assert_eq!(old_der_b, new_der_b, "listener B cert must not change");
+
+    // Both listeners must still route correctly.
+    let resp_a = http::https_get(&host_a, "/", h.tls_addr).await?;
+    assert!(
+        resp_a.1.is_some(),
+        "expected response from listener A after rotation"
+    );
+    resp_a.1.unwrap().assert_backend("echo-a");
+
+    let resp_b = http::https_get(&host_b, "/", h.tls_addr).await?;
+    assert!(
+        resp_b.1.is_some(),
+        "expected response from listener B after rotation"
+    );
+    resp_b.1.unwrap().assert_backend("echo-b");
+
+    Ok(())
+}

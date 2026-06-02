@@ -606,8 +606,14 @@ fn rebuild(
     }
 
     let tls_store = tls_builder.build();
-    tracing::debug!(certs = tls_store.cert_count(), "TLS cert store rebuilt");
-    tls_shared.store(Arc::new(tls_store));
+    let certs = tls_store.cert_count();
+    let current = tls_shared.load();
+    if *current != tls_store {
+        tracing::debug!(certs, "TLS cert store swapped");
+        tls_shared.store(Arc::new(tls_store));
+    } else {
+        tracing::trace!(certs, "TLS cert store unchanged, skip swap");
+    }
 
     // Publish per-gateway listener health and wake the controller to re-evaluate statuses.
     tls_health_shared.store_and_notify(gateway_tls_health);

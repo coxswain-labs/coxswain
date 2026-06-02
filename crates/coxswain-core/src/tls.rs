@@ -7,6 +7,7 @@ use std::sync::Arc;
 ///
 /// Validation happens once in the controller before insertion; the proxy re-parses
 /// on each SNI handshake (cheap relative to the handshake itself).
+#[derive(Debug)]
 pub struct TlsCert {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
@@ -24,8 +25,16 @@ impl TlsCert {
     }
 }
 
+/// PEM bytes only; `source` is diagnostic and excluded so a cert moving between owners
+/// does not trigger an unnecessary `ArcSwap` store.
+impl PartialEq for TlsCert {
+    fn eq(&self, other: &Self) -> bool {
+        self.cert_pem == other.cert_pem && self.key_pem == other.key_pem
+    }
+}
+
 /// Immutable snapshot of all TLS certs indexed by host pattern.
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct TlsStore {
     exact: HashMap<String, Arc<TlsCert>>,
     /// Sorted most-specific (longest suffix) first.
@@ -220,6 +229,42 @@ mod tests {
         b.add_cert("*.example.com", cert("second"));
         let store = b.build();
         assert_eq!(store.find_cert("api.example.com").unwrap().source, "second");
+    }
+
+    #[test]
+    fn equal_stores_same_pem_different_source() {
+        let mut b1 = TlsStoreBuilder::new();
+        b1.add_cert("example.com", cert("ns/s1"));
+        b1.add_cert("*.api.example.com", cert("ns/s2"));
+
+        // Source strings differ — should still be equal because PEM bytes match.
+        let mut b2 = TlsStoreBuilder::new();
+        b2.add_cert("example.com", cert("ns/different-source"));
+        b2.add_cert("*.api.example.com", cert("ns/s2"));
+
+        assert_eq!(b1.build(), b2.build());
+    }
+
+    #[test]
+    fn different_cert_bytes_not_equal() {
+        let cert_a = Arc::new(TlsCert::new(
+            b"cert-a".to_vec(),
+            b"key".to_vec(),
+            "ns/s1".to_string(),
+        ));
+        let cert_b = Arc::new(TlsCert::new(
+            b"cert-b".to_vec(),
+            b"key".to_vec(),
+            "ns/s1".to_string(),
+        ));
+
+        let mut b1 = TlsStoreBuilder::new();
+        b1.add_cert("example.com", cert_a);
+
+        let mut b2 = TlsStoreBuilder::new();
+        b2.add_cert("example.com", cert_b);
+
+        assert_ne!(b1.build(), b2.build());
     }
 
     #[test]

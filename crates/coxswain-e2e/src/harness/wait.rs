@@ -7,6 +7,30 @@ use kube::Api;
 use std::{net::SocketAddr, time::Duration};
 use tokio::time;
 
+/// Poll HTTPS handshakes until the served leaf certificate DER differs from `old_der`.
+///
+/// Covers the full propagation path: reflector → debounce (500 ms) → rebuild → `ArcSwap` store
+/// → SNI callback on next handshake. The 10 s deadline surfaces regressions in any stage.
+pub async fn wait_for_tls_cert_rotation(
+    tls_addr: SocketAddr,
+    host: &str,
+    old_der: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        match crate::harness::http::https_peer_leaf_der(host, "/", tls_addr).await {
+            Ok(new_der) if new_der != old_der => return Ok(new_der),
+            Ok(_) => tracing::debug!(host, "TLS leaf unchanged, waiting for rotation"),
+            Err(e) => tracing::debug!(host, error = %e, "could not read TLS peer cert"),
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for TLS cert rotation on {host}");
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 pub async fn wait_for_https_route(
     tls_addr: SocketAddr,
     host: &str,
