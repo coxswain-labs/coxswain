@@ -109,6 +109,7 @@ jobs:
             --organization=coxswain-labs \
             --project=coxswain \
             --url=https://github.com/coxswain-labs/coxswain \
+            --version=$(git describe --tags --always --dirty) \
             --report-output="${REPORT_FILE}" \
             --cleanup-base-resources=true
           echo "report_file=${REPORT_FILE}" >> "$GITHUB_OUTPUT"
