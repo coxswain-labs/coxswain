@@ -78,12 +78,15 @@ jobs:
       - name: Start coxswain proxy
         run: |
           # Run on standard ports 80/443 so the conformance suite's Gateway listeners resolve.
-          sudo ./target/debug/coxswain serve \
+          # KUBECONFIG must be passed explicitly because sudo runs as root, which would
+          # look at /root/.kube/config — kind writes the config under the runner's home.
+          sudo KUBECONFIG="$HOME/.kube/config" ./target/debug/coxswain serve \
             --proxy-addr 0.0.0.0:80 \
             --proxy-tls-addr 0.0.0.0:443 \
             --health-addr 0.0.0.0:8081 \
             --admin-addr 0.0.0.0:8082 \
             --status-address 127.0.0.1 \
+            --log-format console \
             --pod-name coxswain-conformance \
             --pod-namespace coxswain-system \
             --controller-lease-ttl 15s \
