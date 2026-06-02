@@ -47,10 +47,10 @@ k8s-openapi = { version = "0.27", features = ["latest"] }
 kube = { version = "3.1", features = ["runtime", "derive", "client"] }
 kube-leader-election = { version = "0.43" }
 matchit = { version = "0.9" }
-pingora = { version = "0.8" }
-pingora-core = { version = "0.8" }
+pingora = { version = "0.8", default-features = false }
+pingora-core = { version = "0.8", default-features = false }
 pingora-http = { version = "0.8" }
-pingora-proxy = { version = "0.8" }
+pingora-proxy = { version = "0.8", default-features = false }
 prometheus = { version = "0.14" }
 regex = { version = "1.12"}
 serde = { version = "1", features = ["derive"] }

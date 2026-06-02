@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod controller;
 pub mod http;
 pub mod namespace;
+pub mod tls;
 pub mod wait;
 
 use anyhow::Context as _;
@@ -9,11 +10,13 @@ pub use bootstrap::bootstrap;
 pub use controller::{ControllerOptions, ControllerProcess};
 pub use http::HttpClient;
 pub use namespace::NamespaceGuard;
+pub use tls::GeneratedCert;
 
 pub struct Harness {
     pub client: kube::Client,
     pub controller: ControllerProcess,
     pub http: HttpClient,
+    pub tls_addr: std::net::SocketAddr,
 }
 
 impl Harness {
@@ -31,10 +34,12 @@ impl Harness {
             .await
             .context("readyz timeout")?;
         let http = HttpClient::new(controller.proxy_addr);
+        let tls_addr = controller.tls_addr;
         Ok(Self {
             client,
             controller,
             http,
+            tls_addr,
         })
     }
 

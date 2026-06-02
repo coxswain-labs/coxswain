@@ -77,3 +77,32 @@ impl HttpClient {
         Ok(status)
     }
 }
+
+/// Make a single HTTPS GET, routing `host` to `tls_addr` and skipping cert validation.
+/// Returns `(status, Some(body))` on a 2xx JSON response, `(status, None)` otherwise.
+/// Returns `Err` if the TLS handshake fails (e.g., unknown SNI).
+pub async fn https_get(
+    host: &str,
+    path: &str,
+    tls_addr: SocketAddr,
+) -> anyhow::Result<(u16, Option<EchoResponse>)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .resolve(host, tls_addr)
+        .build()
+        .context("build https client")?;
+
+    let url = format!("https://{}:{}{path}", host, tls_addr.port());
+    let resp = client.get(&url).send().await.context("https GET")?;
+    let status = resp.status().as_u16();
+    if resp.status().is_success() {
+        let body = resp
+            .json::<EchoResponse>()
+            .await
+            .context("parse echo response")?;
+        Ok((status, Some(body)))
+    } else {
+        Ok((status, None))
+    }
+}

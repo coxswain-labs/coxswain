@@ -1,0 +1,237 @@
+use arc_swap::ArcSwap;
+use std::cmp::Reverse;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Raw PEM bytes for a single TLS cert/key pair sourced from a `kubernetes.io/tls` Secret.
+///
+/// Validation happens once in the controller before insertion; the proxy re-parses
+/// on each SNI handshake (cheap relative to the handshake itself).
+pub struct TlsCert {
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+    /// `"namespace/secret-name"` — for log messages only.
+    pub source: String,
+}
+
+impl TlsCert {
+    pub fn new(cert_pem: Vec<u8>, key_pem: Vec<u8>, source: String) -> Self {
+        Self {
+            cert_pem,
+            key_pem,
+            source,
+        }
+    }
+}
+
+/// Immutable snapshot of all TLS certs indexed by host pattern.
+#[derive(Default)]
+pub struct TlsStore {
+    exact: HashMap<String, Arc<TlsCert>>,
+    /// Sorted most-specific (longest suffix) first.
+    wildcard: Vec<(String, Arc<TlsCert>)>,
+}
+
+impl TlsStore {
+    /// SNI cert lookup: exact host wins over wildcard.
+    /// Returns `None` when no cert matches — the caller should fail the handshake.
+    pub fn find_cert(&self, sni: &str) -> Option<Arc<TlsCert>> {
+        if let Some(cert) = self.exact.get(sni) {
+            return Some(Arc::clone(cert));
+        }
+        self.wildcard
+            .iter()
+            .find(|(suffix, _)| wildcard_matches(sni, suffix))
+            .map(|(_, cert)| Arc::clone(cert))
+    }
+
+    pub fn cert_count(&self) -> usize {
+        self.exact.len() + self.wildcard.len()
+    }
+}
+
+/// Returns true when `sni` matches the wildcard pattern `*.{suffix}`.
+/// Requires exactly one label before the suffix: `foo.example.com` matches
+/// suffix `example.com`, but `example.com` and `a.b.example.com` do not.
+fn wildcard_matches(sni: &str, suffix: &str) -> bool {
+    if let Some(rest) = sni.strip_suffix(suffix)
+        && let Some(label) = rest.strip_suffix('.')
+    {
+        return !label.is_empty() && !label.contains('.');
+    }
+    false
+}
+
+/// Builder for [`TlsStore`]. Not thread-safe; used only inside the debounced rebuild.
+#[derive(Default)]
+pub struct TlsStoreBuilder {
+    exact: HashMap<String, Arc<TlsCert>>,
+    /// Keyed by suffix (e.g. `"example.com"` for the pattern `"*.example.com"`).
+    wildcard: HashMap<String, Arc<TlsCert>>,
+}
+
+impl TlsStoreBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a cert for `host_pattern`.
+    ///
+    /// - `*.suffix` → wildcard bucket (suffix stored without `*.` prefix).
+    /// - Exact hostname → exact bucket.
+    /// - `""` or `"*"` → ignored with a warning (TLS needs an SNI hostname).
+    /// - Duplicate host → last-writer-wins with a warning.
+    pub fn add_cert(&mut self, host_pattern: &str, cert: Arc<TlsCert>) {
+        if host_pattern.is_empty() || host_pattern == "*" {
+            tracing::warn!(
+                host = %host_pattern,
+                "TLS cert ignored for catchall host pattern (TLS requires an SNI hostname)"
+            );
+            return;
+        }
+        if let Some(suffix) = host_pattern.strip_prefix("*.") {
+            if let Some(prev) = self.wildcard.insert(suffix.to_string(), cert) {
+                tracing::warn!(
+                    host = %host_pattern,
+                    previous_source = %prev.source,
+                    "TLS cert overwritten by a later Ingress"
+                );
+            }
+        } else if let Some(prev) = self.exact.insert(host_pattern.to_string(), cert) {
+            tracing::warn!(
+                host = %host_pattern,
+                previous_source = %prev.source,
+                "TLS cert overwritten by a later Ingress"
+            );
+        }
+    }
+
+    pub fn build(self) -> TlsStore {
+        let mut wildcard: Vec<(String, Arc<TlsCert>)> = self.wildcard.into_iter().collect();
+        wildcard.sort_by_key(|(suffix, _)| Reverse(suffix.len()));
+        TlsStore {
+            exact: self.exact,
+            wildcard,
+        }
+    }
+}
+
+/// A cheaply-cloneable handle to the active TLS cert store.
+///
+/// Parallel to [`crate::routing::SharedRoutingTable`] — certs and routes have
+/// separate lifecycles (cert-manager rotates certs independently of route edits)
+/// and are swapped independently.
+#[derive(Clone)]
+pub struct SharedTlsStore {
+    inner: Arc<ArcSwap<TlsStore>>,
+}
+
+impl SharedTlsStore {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(TlsStore::default())),
+        }
+    }
+
+    pub fn load(&self) -> Arc<TlsStore> {
+        self.inner.load_full()
+    }
+
+    pub fn store(&self, store: Arc<TlsStore>) {
+        self.inner.store(store);
+    }
+}
+
+impl Default for SharedTlsStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cert(source: &str) -> Arc<TlsCert> {
+        Arc::new(TlsCert::new(
+            b"cert".to_vec(),
+            b"key".to_vec(),
+            source.to_string(),
+        ))
+    }
+
+    #[test]
+    fn exact_host_lookup() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("example.com", cert("ns/s1"));
+        let store = b.build();
+        assert!(store.find_cert("example.com").is_some());
+        assert!(store.find_cert("other.com").is_none());
+    }
+
+    #[test]
+    fn wildcard_host_lookup() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("*.example.com", cert("ns/s1"));
+        let store = b.build();
+        assert!(store.find_cert("api.example.com").is_some());
+        assert!(store.find_cert("example.com").is_none());
+        assert!(store.find_cert("a.b.example.com").is_none());
+    }
+
+    #[test]
+    fn exact_beats_wildcard_on_sni() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("api.example.com", cert("exact"));
+        b.add_cert("*.example.com", cert("wildcard"));
+        let store = b.build();
+        let found = store.find_cert("api.example.com").unwrap();
+        assert_eq!(found.source, "exact");
+    }
+
+    #[test]
+    fn no_match_returns_none() {
+        let store = TlsStoreBuilder::new().build();
+        assert!(store.find_cert("example.com").is_none());
+    }
+
+    #[test]
+    fn catchall_host_ignored() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("", cert("ns/s1"));
+        b.add_cert("*", cert("ns/s2"));
+        let store = b.build();
+        assert_eq!(store.cert_count(), 0);
+    }
+
+    #[test]
+    fn last_writer_wins_on_duplicate_exact_host() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("example.com", cert("first"));
+        b.add_cert("example.com", cert("second"));
+        let store = b.build();
+        assert_eq!(store.find_cert("example.com").unwrap().source, "second");
+    }
+
+    #[test]
+    fn last_writer_wins_on_duplicate_wildcard() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("*.example.com", cert("first"));
+        b.add_cert("*.example.com", cert("second"));
+        let store = b.build();
+        assert_eq!(store.find_cert("api.example.com").unwrap().source, "second");
+    }
+
+    #[test]
+    fn wildcard_sorted_longest_suffix_first() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("*.example.com", cert("short"));
+        b.add_cert("*.api.example.com", cert("long"));
+        let store = b.build();
+        assert_eq!(
+            store.find_cert("v1.api.example.com").unwrap().source,
+            "long"
+        );
+        assert_eq!(store.find_cert("web.example.com").unwrap().source, "short");
+    }
+}

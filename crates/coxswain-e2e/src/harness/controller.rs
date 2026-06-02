@@ -5,6 +5,7 @@ use tokio::process::{Child, Command};
 pub struct ControllerProcess {
     child: Child,
     pub proxy_addr: SocketAddr,
+    pub tls_addr: SocketAddr,
     pub health_addr: SocketAddr,
     pub admin_addr: SocketAddr,
 }
@@ -26,6 +27,7 @@ impl ControllerProcess {
 
     pub async fn start_with_options(opts: ControllerOptions) -> anyhow::Result<Self> {
         let proxy_addr = free_addr()?;
+        let tls_addr = free_addr()?;
         let health_addr = free_addr()?;
         let admin_addr = free_addr()?;
 
@@ -39,6 +41,8 @@ impl ControllerProcess {
             "serve".to_string(),
             "--proxy-addr".to_string(),
             proxy_addr.to_string(),
+            "--proxy-tls-addr".to_string(),
+            tls_addr.to_string(),
             "--health-addr".to_string(),
             health_addr.to_string(),
             "--admin-addr".to_string(),
@@ -71,6 +75,7 @@ impl ControllerProcess {
         Ok(Self {
             child,
             proxy_addr,
+            tls_addr,
             health_addr,
             admin_addr,
         })

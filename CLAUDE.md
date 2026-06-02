@@ -6,7 +6,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 When the user says "start working on issue N":
 1. Run `gh issue view N --repo coxswain-labs/coxswain` to read the full issue description and grill the user, if necessary.
-2. Create and check out a branch named `issue-N` from `main`.
+2. Sync local `main` with the remote before branching: `git checkout main && git pull --ff-only origin main`. Then create and check out a branch named `issue-N` from that updated `main`.
 3. In `ROADMAP.md`, change the corresponding checklist item from `- [ ]` to `- [x] ~~...~~` (tick the checkbox and wrap the description in strikethrough). Commit this change on the new branch with `Refs #N`.
 4. Read all relevant source files before writing any code.
 5. Implement the issue per its acceptance criteria.
@@ -23,9 +23,9 @@ When the user says "close the issue" or "an issue is done":
 
 ## GitHub Milestones and Labels
 
-GitHub milestones use plain version numbers only (`v0.2`, `v0.3`, …, `v1.0`, `post-v1.0`). Never use special characters like em dashes, colons, or `&` in milestone titles — they break GitHub's issue filter URL parser.
+GitHub milestones use plain version numbers only (`v0.1`, `post-v0.1`; future milestones created on demand as scope is committed). Never use special characters like em dashes, colons, or `&` in milestone titles — they break GitHub's issue filter URL parser.
 
-The theme for each milestone lives in the description of the corresponding `milestone: vX.Y` label (e.g. `milestone: v0.2` has description "Multi-tenancy and Spec Correctness").
+The two active labels are `milestone: v0.1` and `milestone: post-v0.1`. Apply the matching label to every issue alongside its milestone assignment.
 
 ## Project Overview
 

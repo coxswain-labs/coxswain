@@ -4,8 +4,10 @@ use coxswain_admin::AdminServer;
 use coxswain_controller::{Controller, ControllerConfig, IngressDefaultBackend, Reconciler};
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::SharedRoutingTable;
+use coxswain_core::tls::SharedTlsStore;
 use coxswain_health::HealthServer;
-use coxswain_proxy::{Proxy, RoutingEngine};
+use coxswain_proxy::{Proxy, RoutingEngine, SniCertSelector};
+use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::services::background::background_service;
@@ -150,6 +152,13 @@ pub struct ServeArgs {
     #[arg(long, env = "COXSWAIN_PROXY_ADDR", default_value = "0.0.0.0:8080")]
     pub proxy_addr: SocketAddr,
 
+    /// Socket address to listen on for inbound HTTPS traffic.
+    ///
+    /// SNI selects the certificate from each Ingress's `spec.tls` block.
+    /// The listener is always bound; handshakes with no matching SNI fail cleanly.
+    #[arg(long, env = "COXSWAIN_PROXY_TLS_ADDR", default_value = "0.0.0.0:8443")]
+    pub proxy_tls_addr: SocketAddr,
+
     /// External address written to every owned `Ingress.status.loadBalancer.ingress[0]`.
     ///
     /// Accepts either a bare IP (`203.0.113.1`) or a DNS hostname
@@ -202,6 +211,7 @@ fn main() -> Result<()> {
 
     let mut server = build_server(&args);
     let routing_table = SharedRoutingTable::new();
+    let tls_store = SharedTlsStore::new();
     let engine = build_routing_engine(routing_table.clone());
     let synced = build_flag();
     let leader = build_flag();
@@ -217,17 +227,25 @@ fn main() -> Result<()> {
     register_reconciler(
         &mut server,
         routing_table.clone(),
+        tls_store.clone(),
         owned_gateways,
         args.controller_name.clone(),
         args.controller_watch_namespace.clone(),
         args.ingress_default_backend,
     );
-    register_proxy(&mut server, engine, args.proxy_addr);
+    register_proxy(
+        &mut server,
+        engine,
+        tls_store,
+        args.proxy_addr,
+        args.proxy_tls_addr,
+    );
     register_health(&mut server, synced.clone(), args.health_addr);
     register_admin(&mut server, routing_table, synced, leader, args.admin_addr);
 
     tracing::info!(
         proxy_addr = %args.proxy_addr,
+        proxy_tls_addr = %args.proxy_tls_addr,
         health_addr = %args.health_addr,
         admin_addr = %args.admin_addr,
         proxy_shutdown_grace_period = ?args.proxy_shutdown_grace_period,
@@ -297,6 +315,7 @@ fn register_admin(
 fn register_reconciler(
     server: &mut Server,
     routes: SharedRoutingTable,
+    tls: SharedTlsStore,
     owned_gateways: OwnedGateways,
     controller_name: String,
     watch_namespace: Option<String>,
@@ -306,6 +325,7 @@ fn register_reconciler(
         "reconciler",
         Reconciler::new(
             routes,
+            tls,
             owned_gateways,
             controller_name,
             watch_namespace,
@@ -314,11 +334,22 @@ fn register_reconciler(
     ));
 }
 
-fn register_proxy(server: &mut Server, engine: Arc<RoutingEngine>, addr: SocketAddr) {
+fn register_proxy(
+    server: &mut Server,
+    engine: Arc<RoutingEngine>,
+    tls: SharedTlsStore,
+    addr: SocketAddr,
+    tls_addr: SocketAddr,
+) {
     let proxy_logic = Proxy { engine };
     let mut proxy_service =
         http_proxy_service_with_name(&server.configuration, proxy_logic, "proxy");
     proxy_service.add_tcp(&addr.to_string());
+
+    let selector: pingora_core::listeners::TlsAcceptCallbacks = Box::new(SniCertSelector::new(tls));
+    let tls_settings = TlsSettings::with_callbacks(selector).expect("TlsSettings::with_callbacks");
+    proxy_service.add_tls_with_settings(&tls_addr.to_string(), None, tls_settings);
+
     server.add_service(proxy_service);
 }
 
