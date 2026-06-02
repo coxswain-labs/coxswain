@@ -14,6 +14,50 @@ Any local distribution works:
 - [k3d](https://k3d.io/)
 - etc.
 
+## macOS: BoringSSL build setup
+
+Coxswain's proxy crate uses Pingora with the `boringssl` feature, which compiles BoringSSL
+from source via `boring-sys`. This requires `cmake` and `go` (for the BoringSSL build) and
+the correct `libclang` (for the `bindgen`-generated FFI bindings).
+
+### First-time build requirements
+
+```bash
+brew install cmake go
+```
+
+### macOS 26+ libclang issue
+
+On macOS 26 (Tahoe) the system `libclang` in CommandLineTools ships with the macOS 26 SDK.
+A change in that SDK's `cdefs.h` causes `bindgen 0.72` to panic:
+
+```
+assertion `left == right` failed: "arm64-apple-darwin" "aarch64-apple-darwin"
+  left: 4
+ right: 8
+```
+
+**Fix:** install Xcode 16.x alongside the macOS 26 beta toolchain, then tell `bindgen`
+to use Xcode 16's `libclang` and the macOS 15 SDK it ships with.
+
+```bash
+xcodes install 16.3          # or download from https://xcodereleases.com/
+```
+
+Then copy the provided Cargo config template to your local (gitignored) override:
+
+```bash
+cp .cargo/config.toml.example .cargo/config.toml
+```
+
+Edit `.cargo/config.toml` if your Xcode path or SDK version differs from the defaults
+in the template. After that, `cargo build` and `cargo check` work without any extra
+environment variables.
+
+This file is gitignored — the paths are machine-local.
+
+---
+
 ## Local development (no Docker required)
 
 When developing locally, run the binary directly on your machine. It discovers the cluster via `~/.kube/config` and talks to Kubernetes without needing to be inside a pod.

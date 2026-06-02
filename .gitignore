@@ -3,3 +3,4 @@
 .idea/
 .wip/
 /target
+.cargo/config.toml

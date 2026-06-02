@@ -1,0 +1,21 @@
+# Copy this file to .cargo/config.toml and adjust the paths for your machine.
+# .cargo/config.toml is gitignored — edits here are local only.
+#
+# --- macOS: BoringSSL / boring-sys build fix ---
+#
+# boring-sys uses bindgen to generate FFI bindings. On macOS 26+ (Sequoia AI),
+# bindgen picks up the system libclang from CommandLineTools, which ships the
+# macOS 26 SDK. That SDK changed how arm64 targets are handled, causing bindgen
+# to panic: "arm64-apple-darwin" vs "aarch64-apple-darwin" pointer-width mismatch.
+#
+# Fix: point bindgen at the Xcode 16.x libclang and its matching SDK instead.
+# Install Xcode 16 from https://xcodereleases.com/ (or via `xcodes install 16.3`),
+# then fill in the paths below.
+#
+# Adjust the SDK version (MacOSX15.4.sdk) to whatever ships with your Xcode 16.x.
+
+# force = true overrides any value already set in the shell environment.
+[env]
+LIBCLANG_PATH = { value = "/Applications/Xcode-16.3.0.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib", force = true }
+DEVELOPER_DIR  = { value = "/Applications/Xcode-16.3.0.app/Contents/Developer", force = true }
+SDKROOT        = { value = "/Applications/Xcode-16.3.0.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.4.sdk", force = true }
