@@ -42,6 +42,11 @@ coxswain-bin
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for the full local dev setup, including how to run against a local cluster with echo backends.
 
+### TLS with cert-manager
+
+Coxswain integrates with cert-manager out of the box for both Ingress and Gateway API.
+See [docs/tls-cert-manager.md](docs/tls-cert-manager.md) for a step-by-step guide and ready-to-apply example manifests.
+
 ### In-cluster deployment
 
 ```bash

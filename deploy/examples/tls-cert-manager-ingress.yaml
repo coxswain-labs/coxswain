@@ -1,0 +1,87 @@
+# TLS termination for Ingress using cert-manager automatic certificate provisioning.
+#
+# cert-manager watches Ingress resources and uses the cert-manager.io/cluster-issuer
+# (or cert-manager.io/issuer) annotation to mint a kubernetes.io/tls Secret.
+# Coxswain picks up that Secret automatically via its Secret watch and serves TLS
+# without any restart.
+#
+# Prerequisites:
+#   - cert-manager >= v1.14 installed in the cluster (https://cert-manager.io)
+#   - A ClusterIssuer or Issuer configured (see below for a self-signed example)
+#
+# Apply:
+#   kubectl apply -f deploy/examples/tls-cert-manager-ingress.yaml
+#
+# Verify (adjust the address to your Coxswain proxy):
+#   kubectl wait secret example-com-tls --for=jsonpath='{.type}'=kubernetes.io/tls --timeout=60s
+#   curl --resolve example.com:8443:127.0.0.1 -k https://example.com:8443/
+
+# ---------------------------------------------------------------------------
+# Self-signed ClusterIssuer (suitable for demos and development)
+# ---------------------------------------------------------------------------
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned
+spec:
+  selfSigned: {}
+
+# ---------------------------------------------------------------------------
+# Production ACME (Let's Encrypt) ClusterIssuer — uncomment and customise.
+#
+# Requires:
+#   - A public domain name with DNS pointing at your cluster's ingress IP.
+#   - Coxswain listening on port 80 (cert-manager uses HTTP-01 by default).
+#     Coxswain serves the ACME HTTP-01 challenge path automatically because
+#     cert-manager temporarily annotates the Ingress with the solver rule.
+#
+# apiVersion: cert-manager.io/v1
+# kind: ClusterIssuer
+# metadata:
+#   name: letsencrypt-prod
+# spec:
+#   acme:
+#     server: https://acme-v02.api.letsencrypt.org/directory
+#     email: you@example.com
+#     privateKeySecretRef:
+#       name: letsencrypt-prod-account-key
+#     solvers:
+#       - http01:
+#           ingress:
+#             ingressClassName: coxswain
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Ingress — cert-manager provisions example-com-tls automatically
+# ---------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example-com
+  namespace: default
+  annotations:
+    # cert-manager reads this annotation and creates a Certificate that targets
+    # the secretName below.  Replace "selfsigned" with "letsencrypt-prod" for
+    # a real certificate.
+    cert-manager.io/cluster-issuer: selfsigned
+spec:
+  ingressClassName: coxswain
+  tls:
+    - hosts:
+        - example.com
+      # cert-manager will create/renew this Secret.  Coxswain watches all
+      # kubernetes.io/tls Secrets and hot-reloads TLS without a restart.
+      secretName: example-com-tls
+  rules:
+    - host: example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-service
+                port:
+                  number: 80
