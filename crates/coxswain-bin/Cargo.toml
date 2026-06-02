@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 coxswain-core = { workspace = true }
+ipnet = { workspace = true }
 coxswain-admin = { workspace = true }
 coxswain-controller = { workspace = true }
 coxswain-health = { workspace = true }

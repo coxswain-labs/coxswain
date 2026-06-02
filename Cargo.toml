@@ -34,6 +34,7 @@ coxswain-health = { path = "./crates/coxswain-health" }
 coxswain-proxy = { path = "./crates/coxswain-proxy" }
 
 anyhow = { version = "1.0" }
+ipnet = { version = "2" }
 form_urlencoded = { version = "1.2" }
 arc-swap = { version = "1.9" }
 bytes = { version = "1" }
