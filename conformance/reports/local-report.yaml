@@ -1,5 +1,5 @@
 apiVersion: gateway.networking.k8s.io/v1
-date: "2026-06-03T12:08:57+01:00"
+date: "2026-06-03T12:37:10+01:00"
 gatewayAPIChannel: standard
 gatewayAPIVersion: v1.5.1
 implementation:
@@ -8,7 +8,7 @@ implementation:
   organization: coxswain-labs
   project: coxswain
   url: https://github.com/coxswain-labs/coxswain
-  version: 79c95b3
+  version: 703935b
 kind: ConformanceReport
 mode: default
 profiles:
@@ -24,11 +24,17 @@ profiles:
     result: success
     statistics:
       Failed: 0
-      Passed: 2
+      Passed: 8
       Skipped: 0
     supportedFeatures:
+    - HTTPRouteHostRewrite
     - HTTPRouteMethodMatching
+    - HTTPRoutePathRedirect
+    - HTTPRoutePathRewrite
+    - HTTPRoutePortRedirect
     - HTTPRouteQueryParamMatching
+    - HTTPRouteResponseHeaderModification
+    - HTTPRouteSchemeRedirect
     unsupportedFeatures:
     - BackendTLSPolicy
     - BackendTLSPolicySANValidation
@@ -50,18 +56,12 @@ profiles:
     - HTTPRouteBackendTimeout
     - HTTPRouteCORS
     - HTTPRouteDestinationPortMatching
-    - HTTPRouteHostRewrite
     - HTTPRouteNamedRouteRule
     - HTTPRouteParentRefPort
-    - HTTPRoutePathRedirect
-    - HTTPRoutePathRewrite
-    - HTTPRoutePortRedirect
     - HTTPRouteRequestMirror
     - HTTPRouteRequestMultipleMirrors
     - HTTPRouteRequestPercentageMirror
     - HTTPRouteRequestTimeout
-    - HTTPRouteResponseHeaderModification
-    - HTTPRouteSchemeRedirect
     - ListenerSet
   name: GATEWAY-HTTP
   summary: Core tests failed with 1 test failures. Extended tests succeeded.
