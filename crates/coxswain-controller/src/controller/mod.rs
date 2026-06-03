@@ -27,15 +27,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod conditions;
 mod config;
+mod gateway_class_status;
 mod gateway_status;
 mod ingress_status;
 
 pub use config::{ControllerConfig, StatusAddress};
 
 use conditions::{
-    filter_owned_parent_refs, gateway_accepted, gateway_class_accepted, http_route_programmed,
-    make_condition,
+    filter_owned_parent_refs, gateway_accepted, http_route_programmed, make_condition,
 };
+use gateway_class_status::{build_gateway_class_status_patch, gateway_class_needs_status_patch};
 use gateway_status::{build_gateway_status_patch, gateway_needs_status_patch};
 use ingress_status::{build_ingress_status_patch, ingress_lb_already_matches};
 
@@ -217,9 +218,9 @@ impl Controller {
                             let name = gc.metadata.name.clone().unwrap_or_default();
                             if gc.spec.controller_name == self.config.controller_name {
                                 owned_gateway_classes.insert(name.clone());
-                                if is_leader && !gateway_class_accepted(&gc) {
+                                if is_leader && gateway_class_needs_status_patch(&gc) {
                                     let generation = gc.metadata.generation.unwrap_or(0);
-                                    Self::accept_gateway_class(&client, &name, generation).await;
+                                    Self::patch_gateway_class_status(&client, &name, generation).await;
                                 }
                             } else {
                                 tracing::debug!(
@@ -387,22 +388,15 @@ impl Controller {
         }
     }
 
-    async fn accept_gateway_class(client: &Client, name: &str, generation: i64) {
+    async fn patch_gateway_class_status(client: &Client, name: &str, generation: i64) {
         let api: Api<GatewayClass> = Api::all(client.clone());
-        let condition = make_condition(
-            "Accepted",
-            "True",
-            "Accepted",
-            "",
-            generation,
-            Time(k8s_openapi::jiff::Timestamp::now()),
-        );
-        let patch = serde_json::json!({ "status": { "conditions": [condition] } });
+        let now = Time(k8s_openapi::jiff::Timestamp::now());
+        let patch = build_gateway_class_status_patch(generation, &now);
         match api
             .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await
         {
-            Ok(_) => tracing::info!(name, "GatewayClass accepted"),
+            Ok(_) => tracing::info!(name, "GatewayClass status patched"),
             Err(e) => tracing::warn!(name, error = %e, "Failed to patch GatewayClass status"),
         }
     }

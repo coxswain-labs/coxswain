@@ -163,6 +163,34 @@ async fn gateway_status() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn gatewayclass_supported_features() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+
+    let feats = wait::wait_for_gatewayclass_supported_features(
+        &h.client,
+        "coxswain",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    assert!(
+        !feats.is_empty(),
+        "GatewayClass coxswain must have non-empty status.supportedFeatures"
+    );
+    assert!(
+        feats.contains(&"Gateway".to_string()),
+        "must advertise core Gateway feature; got: {feats:?}"
+    );
+    assert!(
+        feats.contains(&"HTTPRoute".to_string()),
+        "must advertise core HTTPRoute feature; got: {feats:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn header_matching() -> anyhow::Result<()> {
     init_tracing();
     let h = Harness::start().await?;

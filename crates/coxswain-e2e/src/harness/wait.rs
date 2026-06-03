@@ -1,4 +1,5 @@
 use anyhow::Context as _;
+use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
 use k8s_openapi::api::core::v1::Secret;
@@ -71,6 +72,34 @@ pub async fn wait_for_ready(addr: SocketAddr, timeout: Duration) -> anyhow::Resu
             anyhow::bail!("timed out waiting for readyz at {addr}");
         }
         time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+pub async fn wait_for_gatewayclass_supported_features(
+    client: &kube::Client,
+    name: &str,
+    timeout: Duration,
+) -> anyhow::Result<Vec<String>> {
+    let api: Api<GatewayClass> = Api::all(client.clone());
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        if let Ok(gc) = api.get(name).await {
+            let feats: Vec<String> = gc
+                .status
+                .as_ref()
+                .and_then(|s| s.supported_features.as_deref())
+                .map(|fs| fs.iter().map(|f| f.name.clone()).collect())
+                .unwrap_or_default();
+            if !feats.is_empty() {
+                return Ok(feats);
+            }
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for GatewayClass {name} to have status.supportedFeatures"
+            );
+        }
+        time::sleep(Duration::from_millis(500)).await;
     }
 }
 
