@@ -7,8 +7,8 @@ use coxswain_core::routing::{
 use http::header;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{
-    ConnectionClosed, ErrorSource, HTTPStatus, ReadError, ReadTimedout, Result, WriteError,
-    WriteTimedout,
+    ConnectTimedout, ConnectionClosed, ErrorSource, HTTPStatus, ReadError, ReadTimedout, Result,
+    WriteError, WriteTimedout,
 };
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
@@ -51,9 +51,13 @@ pub struct ProxyCtx {
     pub request_deadline: Option<Instant>,
     /// True when the effective read_timeout was derived from `timeouts.request` (not
     /// `timeouts.backendRequest`). Set in `upstream_peer`; consulted in `fail_to_proxy` to
-    /// distinguish 504 (request budget) from 502 (backend budget) without relying on wall-clock
-    /// comparisons that can race against OS timer granularity.
+    /// distinguish 504 from upstream errors without relying on wall-clock comparisons that can
+    /// race against OS timer granularity.
     pub request_timeout_is_controlling: bool,
+    /// True when a `backendRequest` timeout was applied to this peer. Used in `fail_to_proxy` to
+    /// map ConnectTimedout and ReadTimedout/WriteTimedout to 504 (Gateway API spec requires 504
+    /// for both request and backendRequest timeout expiry).
+    pub backend_request_timeout_active: bool,
 }
 
 /// Lock-free routing engine for the request hot path.
@@ -172,6 +176,7 @@ impl ProxyHttp for Proxy {
                 resolved: None,
                 request_deadline: None,
                 request_timeout_is_controlling: false,
+                backend_request_timeout_active: false,
             })
             .unwrap_or_default()
     }
@@ -339,6 +344,7 @@ impl ProxyHttp for Proxy {
         }
         if let Some(t) = backend_timeout {
             peer.options.connection_timeout = Some(t);
+            ctx.backend_request_timeout_active = true;
         }
 
         Ok(Box::new(peer))
@@ -400,10 +406,15 @@ impl ProxyHttp for Proxy {
     {
         let code = match e.etype() {
             HTTPStatus(code) => *code,
-            // A read/write timeout where the request budget was the binding constraint → 504.
-            // We use the flag set in upstream_peer rather than a wall-clock comparison to
+            // Gateway API spec requires 504 when either `request` or `backendRequest` timeout
+            // fires.  We use flags set in upstream_peer rather than wall-clock comparisons to
             // avoid races with OS timer granularity (timers can fire a few µs early).
-            ReadTimedout | WriteTimedout if ctx.request_timeout_is_controlling => 504,
+            ReadTimedout | WriteTimedout
+                if ctx.request_timeout_is_controlling || ctx.backend_request_timeout_active =>
+            {
+                504
+            }
+            ConnectTimedout if ctx.backend_request_timeout_active => 504,
             _ => match e.esource() {
                 ErrorSource::Upstream => 502,
                 ErrorSource::Downstream => match e.etype() {

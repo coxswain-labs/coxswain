@@ -84,6 +84,9 @@ pub struct GatewayListenerHealth {
     /// Whether each listener allows routes from any namespace (true) or only
     /// from the same namespace as the Gateway (false, the default per spec).
     pub listener_allows_all_namespaces: BTreeMap<String, bool>,
+    /// Port number for each listener, keyed by listener name.
+    /// Used to validate parentRef.port against listener ports.
+    pub listener_ports: BTreeMap<String, u16>,
 }
 
 impl GatewayListenerHealth {}

@@ -232,6 +232,50 @@ impl GatewayApiReconciler {
             }
         }
 
+        // Listener isolation: drop any effective hostname E that another, more-specific listener
+        // in the same gateway would claim exclusively, so routes don't leak across listener
+        // boundaries.
+        //
+        // "Claims exclusively" has different semantics for wildcard vs concrete hostnames:
+        //   - Concrete E (no `*.`): another listener L' claims it if L' is more specific than
+        //     our L and hostname_matches(E, H_L') — i.e. any request for E would prefer L'.
+        //   - Wildcard E (`*.X`): another listener L' claims ALL of E only if L' has the exact
+        //     same wildcard pattern H_L' == E.  A more-specific exact listener (e.g. `foo.X`)
+        //     only claims one host out of the wildcard set, so it does NOT dominate the wildcard.
+        if !listener_hostnames.is_empty() {
+            eff_set.retain(|e| {
+                // Isolation only applies when the parentRef names a specific listener (sectionName
+                // present).  A route without sectionName attaches to all matching listeners and
+                // the hostname intersection already handles scoping correctly.
+                !parent_refs.iter().any(|pr| {
+                    let our_sn = match pr.section_name.as_deref() {
+                        Some(sn) if !sn.is_empty() => sn,
+                        _ => return false, // no sectionName → skip isolation for this parentRef
+                    };
+                    let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
+                    let gw_name = pr.name.as_str();
+                    let our_spec = listener_hostnames
+                        .get(&(gw_ns.to_string(), gw_name.to_string(), our_sn.to_string()))
+                        .map(|h| listener_specificity(h))
+                        .unwrap_or(0);
+                    let e_is_wildcard = e.starts_with("*.");
+                    listener_hostnames.iter().any(|((ns, gw, ln), h_other)| {
+                        ns == gw_ns
+                            && gw == gw_name
+                            && ln.as_str() != our_sn
+                            && listener_specificity(h_other) > our_spec
+                            && if e_is_wildcard {
+                                // Wildcard E is dominated only by an identical wildcard listener.
+                                h_other == e
+                            } else {
+                                // Concrete E is dominated by any more-specific listener that covers it.
+                                hostname_matches(e, h_other)
+                            }
+                    })
+                })
+            });
+        }
+
         let effective_hostnames: Vec<String> = eff_set.into_iter().collect();
 
         tracing::debug!(
@@ -394,6 +438,7 @@ impl GatewayApiReconciler {
         let mut by_listener: BTreeMap<String, ListenerTlsOutcome> = BTreeMap::new();
         let mut listener_hostnames: BTreeMap<String, String> = BTreeMap::new();
         let mut listener_allows_all_namespaces: BTreeMap<String, bool> = BTreeMap::new();
+        let mut listener_ports: BTreeMap<String, u16> = BTreeMap::new();
 
         for listener in &gateway.spec.listeners {
             let outcome = if listener.protocol != "HTTPS" {
@@ -412,12 +457,14 @@ impl GatewayApiReconciler {
             by_listener.insert(listener.name.clone(), outcome);
             listener_hostnames.insert(listener.name.clone(), hostname);
             listener_allows_all_namespaces.insert(listener.name.clone(), allows_all);
+            listener_ports.insert(listener.name.clone(), listener.port as u16);
         }
 
         GatewayListenerHealth {
             by_listener,
             listener_hostnames,
             listener_allows_all_namespaces,
+            listener_ports,
             ..Default::default()
         }
     }
@@ -799,8 +846,8 @@ impl GatewayApiReconciler {
         slice_store: &reflector::Store<EndpointSlice>,
         service_store: &reflector::Store<Service>,
     ) -> HttpRouteHealthMap {
-        // (listener_name, hostname, allows_all_ns)
-        type ListenerInfo = Vec<(String, String, bool)>;
+        // (listener_name, hostname, allows_all_ns, port)
+        type ListenerInfo = Vec<(String, String, bool, u16)>;
         // Build listener info map: (gw_ns, gw_name) → ListenerInfo
         // allows_all_ns = true when allowedRoutes.namespaces.from is All or Selector (not Same).
         let gw_listeners: HashMap<(String, String), ListenerInfo> = gateways
@@ -811,7 +858,7 @@ impl GatewayApiReconciler {
                 if !owned_gateways.contains(&(ns.clone(), name.clone())) {
                     return None;
                 }
-                let listeners: Vec<(String, String, bool)> = gw
+                let listeners: Vec<(String, String, bool, u16)> = gw
                     .spec
                     .listeners
                     .iter()
@@ -829,6 +876,7 @@ impl GatewayApiReconciler {
                             l.name.clone(),
                             l.hostname.as_deref().unwrap_or("").to_string(),
                             allows_all,
+                            l.port as u16,
                         )
                     })
                     .collect();
@@ -877,10 +925,10 @@ impl GatewayApiReconciler {
                             ls.iter().collect()
                         } else {
                             ls.iter()
-                                .filter(|(n, _, _)| n.as_str() == section)
+                                .filter(|(n, _, _, _)| n.as_str() == section)
                                 .collect()
                         };
-                        !relevant.is_empty() && relevant.iter().all(|(_, _, allows)| !allows)
+                        !relevant.is_empty() && relevant.iter().all(|(_, _, allows, _)| !allows)
                     });
                     if blocked {
                         map.insert(
@@ -896,19 +944,27 @@ impl GatewayApiReconciler {
                     }
                 }
 
-                // Strip allows_all bool for hostname-intersection check.
-                let listeners_hn: HashMap<(String, String), Vec<(String, String)>> =
-                    std::iter::once((
-                        gw_key.clone(),
-                        gw_listeners
-                            .get(&gw_key)
-                            .map(|ls| ls.iter().map(|(n, h, _)| (n.clone(), h.clone())).collect())
-                            .unwrap_or_default(),
-                    ))
-                    .collect();
+                // Strip allows_all bool, keep port for port-matching check.
+                let listeners_hn: ListenerHnMap = std::iter::once((
+                    gw_key.clone(),
+                    gw_listeners
+                        .get(&gw_key)
+                        .map(|ls| {
+                            ls.iter()
+                                .map(|(n, h, _, p)| (n.clone(), h.clone(), *p))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ))
+                .collect();
 
-                let (accepted, accepted_reason) =
-                    compute_accepted(&route_hostnames, &section, &gw_key, &listeners_hn);
+                let (accepted, accepted_reason) = compute_accepted(
+                    &route_hostnames,
+                    &section,
+                    pr.port.map(|p| p as u16),
+                    &gw_key,
+                    &listeners_hn,
+                );
 
                 let (resolved_refs, resolved_refs_reason) = if accepted {
                     check_backend_refs(route, route_ns, backend_grants, service_store, slice_store)
@@ -932,28 +988,41 @@ impl GatewayApiReconciler {
     }
 }
 
-/// Returns `(accepted, reason)` for one (route, parent) pair based on listener hostname matching.
+/// `(listener_name, hostname, port)` stripped of the `allows_all` flag; passed to
+/// `compute_accepted` where cross-namespace checks are already done.
+type ListenerHnEntry = (String, String, u16);
+type ListenerHnMap = HashMap<(String, String), Vec<ListenerHnEntry>>;
+
+/// Returns `(accepted, reason)` for one (route, parent) pair based on listener hostname and port
+/// matching.
 fn compute_accepted(
     route_hostnames: &[&str],
     section_name: &str,
+    port: Option<u16>,
     gw_key: &(String, String),
-    gw_listeners: &HashMap<(String, String), Vec<(String, String)>>,
+    gw_listeners: &ListenerHnMap,
 ) -> (bool, &'static str) {
     let Some(listeners) = gw_listeners.get(gw_key) else {
         return (true, "Accepted");
     };
 
     if !section_name.is_empty() {
-        let matching: Vec<&(String, String)> = listeners
+        let matching: Vec<&(String, String, u16)> = listeners
             .iter()
-            .filter(|(n, _)| n == section_name)
+            .filter(|(n, _, _)| n == section_name)
             .collect();
         if matching.is_empty() {
             return (false, "NoMatchingParent");
         }
+        // parentRef.port must match the named listener's port when specified.
+        if let Some(p) = port
+            && !matching.iter().any(|(_, _, lp)| *lp == p)
+        {
+            return (false, "NoMatchingParent");
+        }
         let intersects = matching
             .iter()
-            .any(|(_, hn)| hostnames_intersect(route_hostnames, hn));
+            .any(|(_, hn, _)| hostnames_intersect(route_hostnames, hn));
         return if intersects {
             (true, "Accepted")
         } else {
@@ -961,13 +1030,36 @@ fn compute_accepted(
         };
     }
 
-    let intersects = listeners
+    // No sectionName: filter candidate listeners by port first (if specified).
+    let port_filtered: Vec<&(String, String, u16)> = if let Some(p) = port {
+        listeners.iter().filter(|(_, _, lp)| *lp == p).collect()
+    } else {
+        listeners.iter().collect()
+    };
+
+    if port.is_some() && port_filtered.is_empty() {
+        return (false, "NoMatchingParent");
+    }
+
+    let intersects = port_filtered
         .iter()
-        .any(|(_, hn)| hostnames_intersect(route_hostnames, hn));
+        .any(|(_, hn, _)| hostnames_intersect(route_hostnames, hn));
     if intersects {
         (true, "Accepted")
     } else {
         (false, "NoMatchingListenerHostname")
+    }
+}
+
+/// Listener isolation priority: exact hostname > wildcard (longer = more specific) > empty.
+/// Returns a numeric rank: 0 = empty, wildcard length, usize::MAX = exact.
+fn listener_specificity(hostname: &str) -> usize {
+    if hostname.is_empty() {
+        0
+    } else if hostname.starts_with("*.") {
+        hostname.len()
+    } else {
+        usize::MAX
     }
 }
 
@@ -2051,6 +2143,117 @@ mod tests {
         let t = find_timeouts(&table, "example.com", "/");
         assert_eq!(t.request, Some(Duration::from_secs(10)));
         assert_eq!(t.backend_request, Some(Duration::from_secs(2)));
+    }
+
+    // ── Listener isolation tests ──────────────────────────────────────────────────
+
+    fn make_listener_hostnames(
+        gw_ns: &str,
+        gw_name: &str,
+        listeners: &[(&str, &str)],
+    ) -> HashMap<(String, String, String), String> {
+        listeners
+            .iter()
+            .map(|(ln, h)| {
+                (
+                    (gw_ns.to_string(), gw_name.to_string(), ln.to_string()),
+                    h.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn listener_isolation_empty_listener_route_not_accessible_via_more_specific_listener() {
+        // Route attached to empty-hostname listener with spec.hostnames containing *.example.com.
+        // The gateway also has a *.example.com listener, which owns that hostname space.
+        // The route should only be registered under bar.com (the non-dominated hostname).
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let route = make_route_with_hostnames_and_parent(
+            "default",
+            &["bar.com", "*.example.com"],
+            "gw",
+            Some("empty-listener"),
+        );
+        let listeners = make_listener_hostnames(
+            "default",
+            "gw",
+            &[
+                ("empty-listener", ""),
+                ("specific-listener", "*.example.com"),
+            ],
+        );
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &HashSet::new(),
+            &listeners,
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        // bar.com is not dominated by any other listener → accessible
+        assert!(
+            table.route("bar.com", "/", &ctx_get()).is_some(),
+            "bar.com should be routable"
+        );
+        // *.example.com is dominated by the specific listener → NOT accessible via bar.example.com
+        assert!(
+            table.route("bar.example.com", "/", &ctx_get()).is_none(),
+            "bar.example.com should not leak from the empty-hostname listener"
+        );
+    }
+
+    fn make_route_with_hostnames_and_parent(
+        ns: &str,
+        hostnames: &[&str],
+        gw_name: &str,
+        section_name: Option<&str>,
+    ) -> HTTPRoute {
+        use gateway_api::apis::standard::httproutes::HttpRouteSpec;
+        HTTPRoute {
+            metadata: kube::api::ObjectMeta {
+                name: Some("test-route".to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                parent_refs: Some(vec![HttpRouteParentRefs {
+                    name: gw_name.to_string(),
+                    namespace: Some(ns.to_string()),
+                    section_name: section_name.map(str::to_string),
+                    ..Default::default()
+                }]),
+                hostnames: Some(hostnames.iter().map(|h| h.to_string()).collect()),
+                rules: Some(vec![make_simple_rule("svc")]),
+            },
+            status: None,
+        }
+    }
+
+    fn make_simple_rule(svc: &str) -> gateway_api::apis::standard::httproutes::HttpRouteRules {
+        use gateway_api::apis::standard::httproutes::{HttpRouteRules, HttpRouteRulesBackendRefs};
+        HttpRouteRules {
+            backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                name: svc.to_string(),
+                port: Some(8080),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn ctx_get() -> coxswain_core::routing::RequestContext<'static> {
+        static METHOD: std::sync::LazyLock<Method> = std::sync::LazyLock::new(|| Method::GET);
+        static HDRS: std::sync::LazyLock<http::HeaderMap> =
+            std::sync::LazyLock::new(http::HeaderMap::new);
+        coxswain_core::routing::RequestContext {
+            method: &METHOD,
+            headers: &HDRS,
+            query: None,
+        }
     }
 
     #[test]

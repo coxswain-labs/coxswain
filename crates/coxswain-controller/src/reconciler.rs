@@ -709,6 +709,7 @@ fn rebuild(
                 continue;
             }
             if let Some(health) = gateway_tls_health.get_mut(&key) {
+                let pr_port = pr.port.map(|p| p as u16);
                 if let Some(sn) = pr.section_name.as_deref() {
                     let allows_all = health
                         .listener_allows_all_namespaces
@@ -717,6 +718,12 @@ fn rebuild(
                         .unwrap_or(false);
                     // Skip cross-namespace routes when the listener restricts to Same.
                     if gw_ns != route_ns && !allows_all {
+                        continue;
+                    }
+                    // parentRef.port must match the named listener's port when specified.
+                    if let Some(port) = pr_port
+                        && health.listener_ports.get(sn).copied().unwrap_or(0) != port
+                    {
                         continue;
                     }
                     if let Some(listener_hn) = health.listener_hostnames.get(sn)
@@ -728,13 +735,19 @@ fn rebuild(
                     let listeners: Vec<(String, String, bool)> = health
                         .listener_hostnames
                         .iter()
-                        .map(|(n, hn)| {
+                        .filter_map(|(n, hn)| {
+                            // Filter by parentRef.port when specified.
+                            if let Some(p) = pr_port
+                                && health.listener_ports.get(n).copied().unwrap_or(0) != p
+                            {
+                                return None;
+                            }
                             let allows = health
                                 .listener_allows_all_namespaces
                                 .get(n)
                                 .copied()
                                 .unwrap_or(false);
-                            (n.clone(), hn.clone(), allows)
+                            Some((n.clone(), hn.clone(), allows))
                         })
                         .collect();
                     for (ln, listener_hn, allows_all) in listeners {

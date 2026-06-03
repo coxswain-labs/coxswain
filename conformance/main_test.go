@@ -47,9 +47,23 @@ func TestConformance(t *testing.T) {
 		features.SupportHTTPRoutePathRedirect,
 		features.SupportHTTPRouteHostRewrite,
 		features.SupportHTTPRoutePathRewrite,
-// 		// Extended: timeouts (#14)
-// 		features.SupportHTTPRouteRequestTimeout,
-// 		features.SupportHTTPRouteBackendTimeout,
+		// Extended: timeouts (#14)
+		features.SupportHTTPRouteRequestTimeout,
+		features.SupportHTTPRouteBackendTimeout,
+		// Extended: redirect status codes (#34)
+		features.SupportHTTPRoute303RedirectStatusCode,
+		features.SupportHTTPRoute307RedirectStatusCode,
+		features.SupportHTTPRoute308RedirectStatusCode,
+		// Extended: named route rules (#34)
+		features.SupportHTTPRouteNamedRouteRule,
+		// Extended: HTTP listener isolation (#34)
+		features.SupportGatewayHTTPListenerIsolation,
+		// Extended: port 8080 listener (#34)
+		features.SupportGatewayPort8080,
+		// Extended: empty Gateway address value (#34)
+		features.SupportGatewayAddressEmpty,
+		// Extended: parentRef port mismatch → NoMatchingParent (#34)
+		features.SupportHTTPRouteDestinationPortMatching,
 // 		// Extended: websocket (#15 dependency, port mapping fix)
 // 		features.SupportHTTPRouteBackendProtocolWebSocket,
 	)
