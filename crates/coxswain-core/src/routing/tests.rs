@@ -2,6 +2,7 @@ use super::*;
 use http::{HeaderMap, HeaderName, Method};
 use regex::Regex;
 use std::net::SocketAddr;
+use std::time::SystemTime;
 
 fn upstream(name: &str, addr: &str) -> Arc<Upstream> {
     Arc::new(Upstream::new(
