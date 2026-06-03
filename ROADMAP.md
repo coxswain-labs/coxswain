@@ -23,10 +23,10 @@ The most critical correctness gaps. Without these, Coxswain is unsafe in any sha
 - [x] ~~Ingress `.status.loadBalancer` patching — [#48](https://github.com/coxswain-labs/coxswain/issues/48) `MUST`~~
 - [x] ~~Default backend for Ingress — [#6](https://github.com/coxswain-labs/coxswain/issues/6) `MUST`~~
 - [x] ~~HTTPRoute header, method, query matching — [#7](https://github.com/coxswain-labs/coxswain/issues/7) `MUST`~~
-- [ ] Honor `parentRef.port` in HTTPRoute (GEP-957) — [#82](https://github.com/coxswain-labs/coxswain/issues/82) `MUST`
-- [ ] Support `HTTPRouteRule.name` — named route rules (GEP-995) — [#83](https://github.com/coxswain-labs/coxswain/issues/83) `MUST`
-- [ ] Gateway HTTP listener isolation: per-port route scoping — [#84](https://github.com/coxswain-labs/coxswain/issues/84) `MUST`
-- [ ] Per-listener Gateway status (`status.listeners`) — [#63](https://github.com/coxswain-labs/coxswain/issues/63) `SHOULD`
+- [ ] Honor `parentRef.port` in HTTPRoute (GEP-957) — [#82](https://github.com/coxswain-labs/coxswain/issues/82) `MUST` _(controller validation done; traffic routing blocked by #71 — see post-v0.1)_
+- [x] ~~Support `HTTPRouteRule.name` — named route rules (GEP-995) — [#83](https://github.com/coxswain-labs/coxswain/issues/83) `MUST`~~
+- [x] ~~Gateway HTTP listener isolation: per-port route scoping — [#84](https://github.com/coxswain-labs/coxswain/issues/84) `MUST`~~
+- [x] ~~Per-listener Gateway status (`status.listeners`) — [#63](https://github.com/coxswain-labs/coxswain/issues/63) `SHOULD`~~
 - [ ] Fix `gateway_needs_status_patch` `observedGeneration` comparison (GEP-1364) — [#89](https://github.com/coxswain-labs/coxswain/issues/89) `SHOULD`
 - [ ] Populate `GatewayClass.status.supportedFeatures` (GEP-2162) — [#91](https://github.com/coxswain-labs/coxswain/issues/91) `MUST`
 
@@ -49,7 +49,7 @@ Full HTTPRoute filter compliance + the annotation layer for Ingress.
 
 - [x] ~~`URLRewrite`, `RequestRedirect`, `RequestHeaderModifier`, `ResponseHeaderModifier` filters (GEP-726, GEP-1323) — [#13](https://github.com/coxswain-labs/coxswain/issues/13) `MUST`~~
 - [x] ~~HTTPRoute `timeouts` field (GEP-1742) — [#14](https://github.com/coxswain-labs/coxswain/issues/14) `MUST`~~
-- [ ] Non-default redirect status codes in `RequestRedirect` (303, 307, 308) — [#81](https://github.com/coxswain-labs/coxswain/issues/81) `SHOULD`
+- [x] ~~Non-default redirect status codes in `RequestRedirect` (303, 307, 308) — [#81](https://github.com/coxswain-labs/coxswain/issues/81) `SHOULD`~~
 - [ ] `BackendLBPolicy` (session persistence + timeouts per backend, GEP-1619) — [#15](https://github.com/coxswain-labs/coxswain/issues/15) `MUST`
 - [ ] `BackendTLSPolicy` (GEP-1897) — [#16](https://github.com/coxswain-labs/coxswain/issues/16) `MUST`
 - [ ] Weighted backend refs (`backendRefs[].weight`) — [#17](https://github.com/coxswain-labs/coxswain/issues/17) `MUST`
@@ -105,17 +105,43 @@ The final gate: all applicable Gateway API conformance tests passing, badge publ
 #### MUST
 
 - [ ] HTTP/2 downstream (h2 ALPN + h2c) — [#32](https://github.com/coxswain-labs/coxswain/issues/32)
-- [ ] Honor `listener.port` for per-port TLS/HTTP bind sockets — [#71](https://github.com/coxswain-labs/coxswain/issues/71)
+- [ ] Honor `listener.port` for per-port TLS/HTTP bind sockets — [#71](https://github.com/coxswain-labs/coxswain/issues/71) _(see note below)_
 - [ ] Multi-certificate SNI per listener (GEP-851) — [#72](https://github.com/coxswain-labs/coxswain/issues/72)
 - [ ] Frontend client certificate validation / mTLS at Gateway listeners (GEP-91) — [#86](https://github.com/coxswain-labs/coxswain/issues/86)
 - [ ] Backend client certificate / mTLS to upstream pods (GEP-3155) — [#87](https://github.com/coxswain-labs/coxswain/issues/87)
 - [ ] HTTPRoute retry policy (GEP-1731) — [#85](https://github.com/coxswain-labs/coxswain/issues/85)
 - [ ] ListenerSet resource support (GEP-1713) — [#93](https://github.com/coxswain-labs/coxswain/issues/93)
 
+> **Port binding note (#71 / #82).** Coxswain today starts with a fixed set of Pingora
+> listeners created at process startup: one plain-HTTP socket and one TLS socket, on
+> whatever ports `--http-port` and `--https-port` select (default 80/443). Every
+> `Gateway` object that Coxswain manages is served by those two sockets, regardless of
+> what `spec.listeners[].port` says. This is fine for the common case (one Gateway, ports
+> 80/443) but breaks two Gateway API conformance features:
+>
+> - **`SupportHTTPRouteParentRefPort`** — a route may set `parentRef.port` to declare
+>   which listener it targets. The controller already validates this (a port that matches
+>   no listener returns `NoMatchingParent`), but a conformance test also sends HTTP
+>   traffic to a gateway on port 8080 and expects it to land on the right backend.
+>   That traffic test fails today because nothing is listening on 8080.
+>
+> - **`SupportHTTPRouteDestinationPortMatching`** — covered: the controller correctly
+>   returns `NoMatchingParent` when `parentRef.port` matches no listener, so this
+>   status-only test passes without multi-port binding.
+>
+> Fixing #71 requires Pingora to open one `ServerApp` per unique listener port derived
+> from the live set of `Gateway` objects, and to reconcile those sockets when Gateways
+> are added or removed. Pingora does not support adding listeners to a running server
+> without a restart; the viable approach is a hot-reload: maintain a child process (or
+> use Pingora's built-in upgrade mechanism) and re-exec when the port set changes.
+> Alternatively, bind to every port that a `GatewayClass` is expected to serve and
+> configure this statically, which is simpler but requires operator discipline.
+> Once #71 is done, #82 can be closed and `SupportHTTPRouteParentRefPort` declared.
+
 #### SHOULD
 
 - [ ] `GRPCRoute` + gRPC protocol support (GEP-1016) — [#33](https://github.com/coxswain-labs/coxswain/issues/33)
-- [ ] Per-listener `attachedRoutes` count in `Gateway.status.listeners[]` — [#73](https://github.com/coxswain-labs/coxswain/issues/73)
+- [x] ~~Per-listener `attachedRoutes` count in `Gateway.status.listeners[]` — [#73](https://github.com/coxswain-labs/coxswain/issues/73)~~
 - [ ] Implementation-specific extension filters via `ExtensionRef` — [#77](https://github.com/coxswain-labs/coxswain/issues/77)
 - [ ] OpenTelemetry trace context propagation — [#36](https://github.com/coxswain-labs/coxswain/issues/36)
 - [ ] Active backend health probing — [#37](https://github.com/coxswain-labs/coxswain/issues/37)
