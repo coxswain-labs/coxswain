@@ -124,6 +124,35 @@ where
     }
 }
 
+fn spawn_reflector<T>(
+    set: &mut JoinSet<()>,
+    writer: reflector::store::Writer<T>,
+    api: Api<T>,
+    config: watcher::Config,
+    notify: Arc<Notify>,
+    label: &'static str,
+) where
+    T: kube::Resource
+        + serde::de::DeserializeOwned
+        + Clone
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+    T::DynamicType: Default + Clone + std::hash::Hash + Eq + Send + Sync + 'static,
+{
+    set.spawn(async move {
+        let stream = reflector::reflector(writer, watcher(api, config).default_backoff());
+        tokio::pin!(stream);
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(_) => notify.notify_one(),
+                Err(e) => tracing::warn!(error = %e, "{label} reflector error"),
+            }
+        }
+    });
+}
+
 #[async_trait]
 impl BackgroundService for Reconciler {
     async fn start(&self, mut shutdown: ShutdownWatch) {
@@ -183,218 +212,82 @@ async fn spawn_tasks(
     let (service_reader, service_writer) = reflector::store::<Service>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
+    let ns = watch_namespace.as_deref();
 
-    // --- HTTPRoute reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        let ns = watch_namespace.clone();
-        async move {
-            let stream = reflector::reflector(
-                route_writer,
-                watcher(
-                    scoped_api::<HTTPRoute>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "HTTPRoute reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- Ingress reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        let ns = watch_namespace.clone();
-        async move {
-            let stream = reflector::reflector(
-                ingress_writer,
-                watcher(
-                    scoped_api::<Ingress>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "Ingress reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- IngressClass reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        async move {
-            let stream = reflector::reflector(
-                class_writer,
-                watcher(Api::<IngressClass>::all(client), watcher::Config::default())
-                    .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "IngressClass reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- Gateway reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        let ns = watch_namespace.clone();
-        async move {
-            let stream = reflector::reflector(
-                gateway_writer,
-                watcher(
-                    scoped_api::<Gateway>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "Gateway reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- GatewayClass reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        async move {
-            let stream = reflector::reflector(
-                gateway_class_writer,
-                watcher(Api::<GatewayClass>::all(client), watcher::Config::default())
-                    .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "GatewayClass reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- EndpointSlice reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        let ns = watch_namespace.clone();
-        async move {
-            let stream = reflector::reflector(
-                slice_writer,
-                watcher(
-                    scoped_api::<EndpointSlice>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "EndpointSlice reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- ReferenceGrant reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        let ns = watch_namespace.clone();
-        async move {
-            let stream = reflector::reflector(
-                grant_writer,
-                watcher(
-                    scoped_api::<ReferenceGrant>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "ReferenceGrant reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- Secret reflector (TLS certs only) ---
-    //
-    // Field-selector scoped to `type=kubernetes.io/tls` to avoid pulling every
-    // Secret in the cluster into memory.
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let ns = watch_namespace.clone();
-        let client_secret = client.clone();
-        async move {
-            let stream = reflector::reflector(
-                secret_writer,
-                watcher(
-                    scoped_api::<Secret>(client_secret, ns.as_deref()),
-                    watcher::Config::default().fields("type=kubernetes.io/tls"),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "Secret reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- Service reflector ---
-    //
+    spawn_reflector(
+        &mut set,
+        route_writer,
+        scoped_api::<HTTPRoute>(client.clone(), ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "HTTPRoute",
+    );
+    spawn_reflector(
+        &mut set,
+        ingress_writer,
+        scoped_api::<Ingress>(client.clone(), ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "Ingress",
+    );
+    spawn_reflector(
+        &mut set,
+        class_writer,
+        Api::<IngressClass>::all(client.clone()),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "IngressClass",
+    );
+    spawn_reflector(
+        &mut set,
+        gateway_writer,
+        scoped_api::<Gateway>(client.clone(), ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "Gateway",
+    );
+    spawn_reflector(
+        &mut set,
+        gateway_class_writer,
+        Api::<GatewayClass>::all(client.clone()),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "GatewayClass",
+    );
+    spawn_reflector(
+        &mut set,
+        slice_writer,
+        scoped_api::<EndpointSlice>(client.clone(), ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "EndpointSlice",
+    );
+    spawn_reflector(
+        &mut set,
+        grant_writer,
+        scoped_api::<ReferenceGrant>(client.clone(), ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "ReferenceGrant",
+    );
+    // Field-selector scoped to `type=kubernetes.io/tls` to avoid pulling every Secret into memory.
+    spawn_reflector(
+        &mut set,
+        secret_writer,
+        scoped_api::<Secret>(client.clone(), ns),
+        watcher::Config::default().fields("type=kubernetes.io/tls"),
+        Arc::clone(&notify),
+        "Secret",
+    );
     // Used to resolve targetPort for backends where servicePort ≠ targetPort.
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let ns = watch_namespace;
-        async move {
-            let stream = reflector::reflector(
-                service_writer,
-                watcher(
-                    scoped_api::<Service>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "Service reflector error"),
-                }
-            }
-        }
-    });
+    spawn_reflector(
+        &mut set,
+        service_writer,
+        scoped_api::<Service>(client, ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "Service",
+    );
 
     // --- Trailing-edge debounce + rebuild ---
     //
