@@ -30,6 +30,95 @@ pub struct Proxy {
     pub default_timeouts: RouteTimeouts,
 }
 
+/// Merge per-route timeouts with global defaults; per-route wins when set.
+fn merge_timeouts(route: &RouteTimeouts, default: &RouteTimeouts) -> RouteTimeouts {
+    RouteTimeouts {
+        request: route.request.or(default.request),
+        backend_request: route.backend_request.or(default.backend_request),
+    }
+}
+
+/// Resolves a pre-computed `RouteOutcome` into its components.
+///
+/// Returns `Some(...)` on success, or `None` when `RouteOutcome::Error` was
+/// handled by writing an error response directly to `session`.
+async fn resolve_outcome(
+    session: &mut Session,
+    host: &str,
+    path: &str,
+    outcome: RouteOutcome,
+) -> Result<
+    Option<(
+        Arc<coxswain_core::routing::Upstream>,
+        Arc<[FilterAction]>,
+        RouteTimeouts,
+    )>,
+> {
+    match outcome {
+        RouteOutcome::Found(u, f, t) => Ok(Some((u, f, t))),
+        RouteOutcome::Error(status) => {
+            let resp = ResponseHeader::build(status, Some(0))?;
+            session
+                .write_response_header(Box::new(resp), true)
+                .await
+                .unwrap_or_else(|e| tracing::error!("failed to write error response: {e}"));
+            Ok(None)
+        }
+        RouteOutcome::NoHost => Err(pingora_core::Error::explain(
+            HTTPStatus(404),
+            format!("no route for host {host}"),
+        )),
+        RouteOutcome::NoPath => Err(pingora_core::Error::explain(
+            HTTPStatus(404),
+            format!("no route for path {path} on host {host}"),
+        )),
+    }
+}
+
+/// If `filters` contains a `RequestRedirect`, build the `Location` header,
+/// write the 3xx response, and return `true`. Returns `false` otherwise.
+async fn try_redirect(
+    session: &mut Session,
+    filters: &[FilterAction],
+    proto: &str,
+    host: &str,
+    path: &str,
+    query: Option<&str>,
+) -> Result<bool> {
+    for f in filters {
+        if let FilterAction::RequestRedirect {
+            scheme,
+            hostname,
+            port,
+            status_code,
+            path: path_mod,
+        } = f
+        {
+            let origin = RedirectOrigin {
+                scheme: proto,
+                host,
+                path,
+                query,
+            };
+            let location = build_redirect_location(
+                scheme.as_deref(),
+                hostname.as_deref(),
+                *port,
+                path_mod.as_ref(),
+                &origin,
+            );
+            let mut resp = ResponseHeader::build(*status_code, Some(2))?;
+            resp.insert_header(header::LOCATION, location)?;
+            session
+                .write_response_header(Box::new(resp), true)
+                .await
+                .unwrap_or_else(|e| tracing::error!("failed to write redirect response: {e}"));
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[async_trait]
 impl ProxyHttp for Proxy {
     type CTX = ProxyCtx;
@@ -58,81 +147,28 @@ impl ProxyHttp for Proxy {
         let host = extract_host(req, &mut host_buf).to_string();
         let path = req.uri.path().to_string();
         let query = req.uri.query().map(str::to_string);
+        let proto = ctx.real_client_proto.unwrap_or("http");
 
-        let route_ctx = RequestContext {
-            method: &req.method,
-            headers: &req.headers,
-            query: query.as_deref(),
+        let outcome = {
+            let route_ctx = RequestContext {
+                method: &req.method,
+                headers: &req.headers,
+                query: query.as_deref(),
+            };
+            self.engine.find(&host, &path, &route_ctx)
+        }; // route_ctx (and req borrow) drops here
+
+        let Some((upstream, filters, route_timeouts)) =
+            resolve_outcome(session, &host, &path, outcome).await?
+        else {
+            return Ok(true);
         };
 
-        let (upstream, filters, route_timeouts) = match self.engine.find(&host, &path, &route_ctx) {
-            RouteOutcome::Found(u, f, t) => (u, f, t),
-            RouteOutcome::Error(status) => {
-                let resp = ResponseHeader::build(status, Some(0))?;
-                session
-                    .write_response_header(Box::new(resp), true)
-                    .await
-                    .unwrap_or_else(|e| tracing::error!("failed to write error response: {e}"));
-                return Ok(true);
-            }
-            RouteOutcome::NoHost => {
-                return Err(pingora_core::Error::explain(
-                    HTTPStatus(404),
-                    format!("no route for host {host}"),
-                ));
-            }
-            RouteOutcome::NoPath => {
-                return Err(pingora_core::Error::explain(
-                    HTTPStatus(404),
-                    format!("no route for path {path} on host {host}"),
-                ));
-            }
-        };
-
-        // Merge per-route timeouts with global defaults (per-route wins).
-        let timeouts = RouteTimeouts {
-            request: route_timeouts.request.or(self.default_timeouts.request),
-            backend_request: route_timeouts
-                .backend_request
-                .or(self.default_timeouts.backend_request),
-        };
-
-        // Record the request deadline so upstream_peer and fail_to_proxy can use it.
+        let timeouts = merge_timeouts(&route_timeouts, &self.default_timeouts);
         ctx.request_deadline = timeouts.request.map(|d| Instant::now() + d);
 
-        // Check for a RequestRedirect filter — if present, send the 3xx and short-circuit.
-        for f in filters.iter() {
-            if let FilterAction::RequestRedirect {
-                scheme,
-                hostname,
-                port,
-                status_code,
-                path: path_mod,
-            } = f
-            {
-                // Default scheme to "http"; TLS-terminated requests would need
-                // scheme passed from the accept layer, which we don't thread through yet.
-                let origin = RedirectOrigin {
-                    scheme: "http",
-                    host: &host,
-                    path: &path,
-                    query: query.as_deref(),
-                };
-                let location = build_redirect_location(
-                    scheme.as_deref(),
-                    hostname.as_deref(),
-                    *port,
-                    path_mod.as_ref(),
-                    &origin,
-                );
-                let mut resp = ResponseHeader::build(*status_code, Some(2))?;
-                resp.insert_header(header::LOCATION, location)?;
-                session
-                    .write_response_header(Box::new(resp), true)
-                    .await
-                    .unwrap_or_else(|e| tracing::error!("failed to write redirect response: {e}"));
-                return Ok(true);
-            }
+        if try_redirect(session, &filters, proto, &host, &path, query.as_deref()).await? {
+            return Ok(true);
         }
 
         ctx.resolved = Some(ResolvedRoute {

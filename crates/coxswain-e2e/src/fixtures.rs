@@ -119,6 +119,11 @@ pub const GATEWAY_API_TIMEOUTS: &str = concat!(
     "/fixtures/gateway_api/timeouts.yaml"
 );
 
+pub const GATEWAY_API_TLS_REDIRECT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/tls_redirect.yaml"
+);
+
 /// Apply a fixture YAML to `namespace`.
 ///
 /// Supports template substitutions: `TESTNS` is always replaced with `namespace`.

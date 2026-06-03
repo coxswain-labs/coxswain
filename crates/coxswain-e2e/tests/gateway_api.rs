@@ -6,8 +6,8 @@ use coxswain_e2e::{
         GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PATH_MATCHING,
         GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_TIMEOUTS,
         GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS, GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
-        GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WEBSOCKET,
-        GATEWAY_API_WILDCARD_HOST,
+        GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_REDIRECT, GATEWAY_API_TLS_TERMINATION,
+        GATEWAY_API_WEBSOCKET, GATEWAY_API_WILDCARD_HOST,
     },
     harness::{GeneratedCert, Harness, NamespaceGuard, http, wait},
 };
@@ -862,6 +862,71 @@ async fn timeouts_backend_request_returns_502() -> anyhow::Result<()> {
     assert_eq!(
         status, 502,
         "expected 502 from backend request timeout, got {status}"
+    );
+
+    Ok(())
+}
+
+/// An HTTPS listener with a RequestRedirect filter must produce a `Location` header
+/// that uses the `https://` scheme, not the hardcoded `http://` that existed before
+/// the redirect-scheme fix.
+#[tokio::test]
+async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-tls-redirect").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("tls-redirect.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&host);
+    let secret_name = "cert-tls-redirect";
+
+    fixtures::apply_fixture(
+        GATEWAY_API_TLS_REDIRECT,
+        &ns.name,
+        &[
+            ("LISTENER_HOST", &host),
+            ("SECRET_NAME", secret_name),
+            ("TLS_CRT_B64", &cert.cert_b64()),
+            ("TLS_KEY_B64", &cert.key_b64()),
+        ],
+    )
+    .await?;
+
+    // Wait until the probe path is reachable over HTTPS (confirms TLS is set up and
+    // the route is programmed).
+    wait::wait_for_https_route(
+        h.tls_addr,
+        &host,
+        "/tls-redirect/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Hit the redirect path without following redirects so we can inspect Location.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(&host, h.tls_addr)
+        .build()?;
+
+    let url = format!("https://{}:{}/tls-redirect", host, h.tls_addr.port());
+    let resp = client.get(&url).send().await?;
+
+    assert_eq!(resp.status().as_u16(), 302, "expected 302 redirect");
+
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    assert!(
+        location.starts_with("https://"),
+        "expected Location to start with https://, got {location:?}"
     );
 
     Ok(())

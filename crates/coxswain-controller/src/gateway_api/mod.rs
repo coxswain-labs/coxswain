@@ -500,6 +500,7 @@ fn compute_effective_hostnames(
 }
 
 /// Installs one HTTPRoute rule into a `HostRouterBuilder`.
+#[allow(clippy::too_many_arguments)]
 fn apply_rule(
     pb: &mut HostRouterBuilder,
     rule: &gateway_api::apis::standard::httproutes::HttpRouteRules,
