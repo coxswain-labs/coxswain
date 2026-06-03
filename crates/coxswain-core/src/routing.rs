@@ -232,6 +232,9 @@ pub struct RouteEntry {
     /// Creation timestamp — older routes win ties after predicate-count comparison.
     /// `None` sorts last.
     pub created_at: Option<SystemTime>,
+    /// When `Some`, the proxy returns this status code immediately without contacting upstream.
+    /// Used for routes with invalid/missing/forbidden backend refs (Gateway API §4.3.4).
+    pub error_status: Option<u16>,
 }
 
 impl RouteEntry {
@@ -248,6 +251,7 @@ impl RouteEntry {
             timeouts: RouteTimeouts::default(),
             route_id,
             created_at,
+            error_status: None,
         }
     }
 
@@ -265,6 +269,7 @@ impl RouteEntry {
             timeouts: RouteTimeouts::default(),
             route_id,
             created_at,
+            error_status: None,
         }
     }
 
@@ -284,6 +289,7 @@ impl RouteEntry {
             timeouts,
             route_id,
             created_at,
+            error_status: None,
         }
     }
 }
@@ -363,11 +369,7 @@ impl HostRouter {
     /// Checks matchit exact/prefix routes first, then the regex fallback.
     /// Within each path slot, candidates are evaluated in specificity order;
     /// the first candidate whose predicates all pass is returned.
-    pub fn route(
-        &self,
-        path: &str,
-        ctx: &RequestContext<'_>,
-    ) -> Option<(Arc<Upstream>, Arc<[FilterAction]>, RouteTimeouts)> {
+    pub fn route(&self, path: &str, ctx: &RequestContext<'_>) -> Option<RouteMatch> {
         if let Ok(m) = self.router.at(path) {
             for entry in m.value.iter() {
                 if entry.predicates.matches(ctx) {
@@ -375,6 +377,7 @@ impl HostRouter {
                         Arc::clone(&entry.upstream),
                         Arc::clone(&entry.filters),
                         entry.timeouts.clone(),
+                        entry.error_status,
                     ));
                 }
             }
@@ -389,6 +392,7 @@ impl HostRouter {
                             Arc::clone(&entry.upstream),
                             Arc::clone(&entry.filters),
                             entry.timeouts.clone(),
+                            entry.error_status,
                         ));
                     }
                 }
@@ -407,18 +411,28 @@ impl HostRouter {
 
 /// Sort key for within-path specificity ordering per Gateway API rules.
 ///
-/// Most specific first: most header matches, then most query matches, then oldest
-/// creation timestamp, then lexicographic route_id, then original insertion index.
+/// Priority: method match > header matches > query matches > oldest timestamp.
+/// Method presence outranks header count because the spec defines method matching
+/// at a higher precedence tier than header matching.
 fn specificity_key(
     entry: &Arc<RouteEntry>,
     insertion_idx: usize,
-) -> (Reverse<usize>, Reverse<usize>, u128, String, usize) {
+) -> (
+    Reverse<usize>,
+    Reverse<usize>,
+    Reverse<usize>,
+    u128,
+    String,
+    usize,
+) {
+    let has_method = entry.predicates.method.is_some() as usize;
     let ts = entry
         .created_at
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_millis())
         .unwrap_or(u128::MAX);
     (
+        Reverse(has_method),
         Reverse(entry.predicates.headers.len()),
         Reverse(entry.predicates.query.len()),
         ts,
@@ -523,17 +537,24 @@ impl HostRouterBuilder {
             }
             let frozen = sort_and_freeze(entries);
 
-            // Normalise: strip trailing slash so "/api/" and "/api" are identical.
+            // Gateway API prefix semantics:
+            //   "/foo"  matches /foo, /foo/, /foo/anything
+            //   "/foo/" matches /foo/, /foo/anything (NOT /foo)
+            //   "/"     matches everything
+            // matchit 0.9.2 does not route "/v2/" to "/v2/{*rest}" — we must
+            // insert "/v2/" explicitly to bridge the gap.
+            let had_trailing_slash = path.ends_with('/');
             let base = path.trim_end_matches('/');
-            let (p1, p2) = if base.is_empty() {
-                ("/".to_string(), "/{*rest}".to_string())
+            if base.is_empty() {
+                let _ = router.insert("/", frozen.clone());
+                let _ = router.insert("/{*rest}", frozen);
             } else {
-                (base.to_string(), format!("{base}/{{*rest}}"))
-            };
-            // Insert base path; the wildcard insert may fail if a prior exact
-            // route claimed that pattern — tolerate the error silently.
-            router.insert(p1, frozen.clone())?;
-            let _ = router.insert(p2, frozen);
+                if !had_trailing_slash {
+                    let _ = router.insert(base, frozen.clone());
+                }
+                let _ = router.insert(format!("{base}/"), frozen.clone());
+                let _ = router.insert(format!("{base}/{{*rest}}"), frozen);
+            }
         }
 
         // ── Regex routes ──────────────────────────────────────────────────────
@@ -646,9 +667,19 @@ impl RoutingTableBuilder {
     }
 }
 
+/// Return type of `HostRouter::route`: upstream + filters + timeouts + optional error status.
+type RouteMatch = (
+    Arc<Upstream>,
+    Arc<[FilterAction]>,
+    RouteTimeouts,
+    Option<u16>,
+);
+
 /// Result of a two-level host+path routing lookup.
 pub enum RouteOutcome {
     Found(Arc<Upstream>, Arc<[FilterAction]>, RouteTimeouts),
+    /// Route matched but backend is invalid/missing/forbidden — return this status immediately.
+    Error(u16),
     /// No entry for this hostname (host is not registered at this proxy).
     NoHost,
     /// Host is registered but no path rule matched (or path matched but predicates failed).
@@ -684,11 +715,14 @@ impl RoutingTable {
                 .map(|(_, r)| r)
         };
         if let Some(router) = host_router
-            && let Some((upstream, _, _)) = router.route(path, ctx)
+            && let Some((upstream, _, _, _)) = router.route(path, ctx)
         {
             return Some(upstream);
         }
-        self.catchall.as_ref()?.route(path, ctx).map(|(u, _, _)| u)
+        self.catchall
+            .as_ref()?
+            .route(path, ctx)
+            .map(|(u, _, _, _)| u)
     }
 
     /// Like [`route`] but distinguishes "host not registered" from "path not matched",
@@ -708,7 +742,8 @@ impl RoutingTable {
             return RouteOutcome::NoHost;
         };
         match router.route(path, ctx) {
-            Some((u, f, t)) => RouteOutcome::Found(u, f, t),
+            Some((_, _, _, Some(status))) => RouteOutcome::Error(status),
+            Some((u, f, t, None)) => RouteOutcome::Found(u, f, t),
             None => RouteOutcome::NoPath,
         }
     }

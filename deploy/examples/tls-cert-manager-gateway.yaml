@@ -17,7 +17,7 @@
 #
 # Verify (adjust the address to your Coxswain TLS proxy):
 #   kubectl wait secret example-com-gateway-tls --for=jsonpath='{.type}'=kubernetes.io/tls --timeout=60s
-#   curl --resolve example.com:8443:127.0.0.1 -k https://example.com:8443/
+#   curl --resolve example.com:443:127.0.0.1 -k https://example.com/
 
 # ---------------------------------------------------------------------------
 # Self-signed ClusterIssuer (suitable for demos and development)

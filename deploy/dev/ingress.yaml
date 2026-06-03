@@ -14,11 +14,11 @@
 # Apply:
 #   kubectl apply -f deploy/dev/ingress.yaml
 #
-# Test (coxswain proxy on localhost:8080):
-#   curl -H "Host: ingress.local" http://localhost:8080/a      # hello from echo-a
-#   curl -H "Host: ingress.local" http://localhost:8080/b      # hello from echo-b
-#   curl -H "Host: ingress2.local" http://localhost:8080/c     # hello from echo-c
-#   curl -H "Host: ingress2.local" http://localhost:8080/      # hello from echo-a
+# Test (coxswain proxy on localhost:80):
+#   curl -H "Host: ingress.local" http://localhost/a      # hello from echo-a
+#   curl -H "Host: ingress.local" http://localhost/b      # hello from echo-b
+#   curl -H "Host: ingress2.local" http://localhost/c     # hello from echo-c
+#   curl -H "Host: ingress2.local" http://localhost/      # hello from echo-a
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

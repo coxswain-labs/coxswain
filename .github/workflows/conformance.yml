@@ -1,0 +1,128 @@
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+name: Conformance
+
+jobs:
+  conformance:
+    name: gateway-api-conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-conformance-
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: conformance/go.mod
+          cache-dependency-path: conformance/go.sum
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: coxswain-conformance
+
+      - name: Route pod CIDR to kind node
+        run: |
+          KIND_NODE_IP=$(docker inspect coxswain-conformance-control-plane \
+            --format '{{ (index .NetworkSettings.Networks "kind").IPAddress }}')
+          POD_CIDR=$(kubectl get node coxswain-conformance-control-plane \
+            -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
+          POD_CIDR=${POD_CIDR:-10.244.0.0/16}
+          echo "Routing $POD_CIDR via $KIND_NODE_IP"
+          sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
+
+      - name: Pre-pull conformance backend images into kind
+        run: |
+          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
+          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1 \
+            --name coxswain-conformance
+
+      - name: Build coxswain binary
+        run: cargo build --bin coxswain
+
+      - name: Bootstrap cluster (CRDs, RBAC, GatewayClass)
+        run: |
+          # Gateway API CRDs
+          kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
+          # Coxswain system namespace, RBAC, and GatewayClass
+          kubectl apply -f deploy/manifests/namespace.yaml
+          kubectl apply -f deploy/manifests/rbac.yaml
+          kubectl apply -f deploy/manifests/gateway-class.yaml
+          # Wait for CRDs to be established
+          kubectl wait --for=condition=Established crd/gatewayclasses.gateway.networking.k8s.io --timeout=60s
+          kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io --timeout=60s
+
+      - name: Start coxswain proxy
+        run: |
+          # Run on standard ports 80/443 so the conformance suite's Gateway listeners resolve.
+          # KUBECONFIG must be passed explicitly because sudo runs as root, which would
+          # look at /root/.kube/config — kind writes the config under the runner's home.
+          sudo KUBECONFIG="$HOME/.kube/config" ./target/debug/coxswain serve \
+            --proxy-addr 0.0.0.0:80 \
+            --proxy-tls-addr 0.0.0.0:443 \
+            --health-addr 0.0.0.0:8081 \
+            --admin-addr 0.0.0.0:8082 \
+            --status-address 127.0.0.1 \
+            --log-format console \
+            --pod-name coxswain-conformance \
+            --pod-namespace coxswain-system \
+            --controller-lease-ttl 15s \
+            --controller-lease-renew-interval 5s \
+            &
+          # Wait for readyz
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8081/readyz && break
+            sleep 2
+          done
+
+      - name: Run Gateway API conformance suite
+        id: conformance
+        run: |
+          cd conformance
+          go mod tidy
+          REPORT_FILE="reports/standard-$(git describe --tags --always --dirty)-report.yaml"
+          go test -v -timeout 55m -run TestConformance \
+            -args \
+            --organization=coxswain-labs \
+            --project=coxswain \
+            --url=https://github.com/coxswain-labs/coxswain \
+            --version=$(git describe --tags --always --dirty) \
+            --report-output="${REPORT_FILE}" \
+            --cleanup-base-resources=true
+          echo "report_file=${REPORT_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload conformance report as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-report
+          path: conformance/reports/
+          if-no-files-found: ignore
+
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          echo "=== Namespaces ==="
+          kubectl get namespaces
+          echo "=== Events (last 50) ==="
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50
+          echo "=== Gateways ==="
+          kubectl get gateways -A -o wide
+          echo "=== HTTPRoutes ==="
+          kubectl get httproutes -A

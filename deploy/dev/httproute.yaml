@@ -15,13 +15,13 @@
 # Apply:
 #   kubectl apply -f deploy/dev/httproute.yaml
 #
-# Test (coxswain proxy on localhost:8080):
-#   curl -H "Host: echo.local" http://localhost:8080/a         # hello from echo-a
-#   curl -H "Host: echo.local" http://localhost:8080/b         # hello from echo-b
-#   curl -H "Host: echo.local" http://localhost:8080/          # hello from echo-a
-#   curl -H "Host: split.local" http://localhost:8080/         # alternates a/b
-#   curl -H "Host: split.local" http://localhost:8080/         # alternates a/b
-#   curl -H "Host: foo.wildcard.local" http://localhost:8080/  # hello from echo-c
+# Test (coxswain proxy on localhost:80):
+#   curl -H "Host: echo.local" http://localhost/a         # hello from echo-a
+#   curl -H "Host: echo.local" http://localhost/b         # hello from echo-b
+#   curl -H "Host: echo.local" http://localhost/          # hello from echo-a
+#   curl -H "Host: split.local" http://localhost/         # alternates a/b
+#   curl -H "Host: split.local" http://localhost/         # alternates a/b
+#   curl -H "Host: foo.wildcard.local" http://localhost/  # hello from echo-c
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -32,7 +32,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: 8080
+      port: 80
       protocol: HTTP
       allowedRoutes:
         namespaces:

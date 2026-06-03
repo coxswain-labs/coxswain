@@ -143,10 +143,15 @@ fn rewrite_path(req: &mut RequestHeader, modifier: &PathModifier, original_path:
             if original_path == prefix_trimmed || original_path.starts_with(prefix_trimmed) {
                 let suffix = &original_path[prefix_trimmed.len()..];
                 let rep = replacement.trim_end_matches('/');
-                if suffix.is_empty() || suffix == "/" {
-                    rep.to_string()
-                } else {
-                    format!("{rep}{suffix}")
+                match suffix {
+                    "" | "/" => {
+                        if rep.is_empty() {
+                            "/".to_string()
+                        } else {
+                            rep.to_string()
+                        }
+                    }
+                    s => format!("{rep}{s}"),
                 }
             } else {
                 original_path.to_string()
@@ -295,5 +300,29 @@ mod tests {
         };
         rewrite_path(&mut r, &pm, "/api/");
         assert_eq!(r.uri.path(), "/v3");
+    }
+
+    #[test]
+    fn url_rewrite_prefix_match_strip_to_root() {
+        // Exact path match with replacement "/" must yield "/" not ""
+        let mut r = RequestHeader::build("GET", b"/strip-prefix", None).unwrap();
+        let pm = PathModifier::ReplacePrefixMatch {
+            prefix: "/strip-prefix".to_string(),
+            replacement: "/".to_string(),
+        };
+        rewrite_path(&mut r, &pm, "/strip-prefix");
+        assert_eq!(r.uri.path(), "/");
+    }
+
+    #[test]
+    fn url_rewrite_prefix_match_strip_to_root_with_suffix() {
+        // Path with suffix after stripped prefix: /strip-prefix/foo -> /foo
+        let mut r = RequestHeader::build("GET", b"/strip-prefix/foo", None).unwrap();
+        let pm = PathModifier::ReplacePrefixMatch {
+            prefix: "/strip-prefix".to_string(),
+            replacement: "/".to_string(),
+        };
+        rewrite_path(&mut r, &pm, "/strip-prefix/foo");
+        assert_eq!(r.uri.path(), "/foo");
     }
 }

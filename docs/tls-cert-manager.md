@@ -141,10 +141,10 @@ Then test the TLS endpoint (adjust the address and port for your cluster):
 
 ```bash
 # With curl, ignoring self-signed cert warnings (-k):
-curl --resolve example.com:8443:127.0.0.1 -k https://example.com:8443/
+curl --resolve example.com:443:127.0.0.1 -k https://example.com/
 
 # Inspect the served certificate:
-openssl s_client -connect 127.0.0.1:8443 -servername example.com -brief
+openssl s_client -connect 127.0.0.1:443 -servername example.com -brief
 ```
 
 ## Troubleshooting

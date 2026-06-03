@@ -1,5 +1,7 @@
 use crate::endpoints;
-use crate::tls::{GatewayListenerHealth, ListenerTlsOutcome, load_tls_cert};
+use crate::tls::{
+    GatewayListenerHealth, HttpRouteHealthMap, ListenerTlsOutcome, RouteParentHealth, load_tls_cert,
+};
 use coxswain_core::ownership::parent_ref_owned;
 use coxswain_core::reference_grants;
 use coxswain_core::routing::{
@@ -7,18 +9,20 @@ use coxswain_core::routing::{
     QueryPredicate, RouteEntry, RouteTimeouts, RoutingTableBuilder, Upstream, ValueMatch,
 };
 use coxswain_core::tls::TlsStoreBuilder;
-use gateway_api::apis::standard::gateways::{Gateway, GatewayListenersTlsMode};
+use gateway_api::apis::standard::gateways::{
+    Gateway, GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode,
+};
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesFiltersType,
     HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPathType,
     HttpRouteRulesMatchesQueryParamsType, HttpRouteRulesTimeouts,
 };
 use http::{HeaderName, Method};
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use regex::Regex;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -92,11 +96,16 @@ pub struct GatewayApiReconciler;
 impl GatewayApiReconciler {
     /// Skips routes whose `spec.parentRefs` do not include at least one Gateway
     /// managed by this controller. Never queries the API server.
+    ///
+    /// `listener_hostnames` maps `(gw_ns, gw_name, listener_name) → hostname` and is
+    /// used to scope routes without `spec.hostnames` to their listener's hostname.
     pub fn reconcile(
         route: &HTTPRoute,
         slices: &reflector::Store<EndpointSlice>,
+        services: &reflector::Store<Service>,
         owned_gateways: &HashSet<(String, String)>,
         grants: &HashSet<(String, String, Option<String>)>,
+        listener_hostnames: &HashMap<(String, String, String), String>,
         builder: &mut RoutingTableBuilder,
     ) {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -141,7 +150,7 @@ impl GatewayApiReconciler {
             _ => return,
         };
 
-        let hostnames: Vec<&str> = route
+        let route_hostnames: Vec<&str> = route
             .spec
             .hostnames
             .as_deref()
@@ -150,11 +159,131 @@ impl GatewayApiReconciler {
             .map(String::as_str)
             .collect();
 
+        // Effective hostnames = union over all parentRef listeners of:
+        //   - listener hostname empty + route hostnames empty → catchall
+        //   - listener hostname empty + route has hostnames → all route hostnames
+        //   - listener has hostname + route hostnames empty → listener hostname
+        //   - listener has hostname + route has hostnames → intersection
+        // When listener_hostnames map is empty (tests) fall back to old behavior.
+        let mut use_catchall = false;
+        let mut eff_set: HashSet<String> = HashSet::new();
+        let parent_refs = route.spec.parent_refs.as_deref().unwrap_or(&[]);
+
+        if listener_hostnames.is_empty() {
+            // No listener info: tests or misconfigured — use original behavior
+            if route_hostnames.is_empty() {
+                use_catchall = true;
+            } else {
+                eff_set.extend(route_hostnames.iter().map(|h| h.to_string()));
+            }
+        } else {
+            for pr in parent_refs {
+                let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
+                let gw_name = pr.name.as_str();
+
+                // Collect listener hostnames for this parentRef (specific or all).
+                let l_hosts: Vec<&str> = if let Some(sn) = pr.section_name.as_deref() {
+                    let key = (gw_ns.to_string(), gw_name.to_string(), sn.to_string());
+                    listener_hostnames
+                        .get(&key)
+                        .map(|h| h.as_str())
+                        .into_iter()
+                        .collect()
+                } else {
+                    listener_hostnames
+                        .iter()
+                        .filter(|((ns, n, _), _)| ns == gw_ns && n == gw_name)
+                        .map(|(_, h)| h.as_str())
+                        .collect()
+                };
+
+                if l_hosts.is_empty() {
+                    // Listener not in map (not our gateway) — skip
+                    continue;
+                }
+
+                for lh in l_hosts {
+                    if lh.is_empty() {
+                        // Listener accepts any hostname
+                        if route_hostnames.is_empty() {
+                            use_catchall = true;
+                        } else {
+                            eff_set.extend(route_hostnames.iter().map(|h| h.to_string()));
+                        }
+                    } else if route_hostnames.is_empty() {
+                        // Inherit the listener's hostname
+                        eff_set.insert(lh.to_string());
+                    } else {
+                        // Intersection: the effective hostname is the more specific of the two.
+                        // If the route has a wildcard (*.foo.com) and the listener has a specific
+                        // hostname (bar.foo.com), the intersection is bar.foo.com (GEP-719).
+                        for rh in &route_hostnames {
+                            if hostname_matches(rh, lh) {
+                                let effective = if rh.starts_with("*.") && !lh.starts_with("*.") {
+                                    lh.to_string()
+                                } else {
+                                    rh.to_string()
+                                };
+                                eff_set.insert(effective);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Listener isolation: drop any effective hostname E that another, more-specific listener
+        // in the same gateway would claim exclusively, so routes don't leak across listener
+        // boundaries.
+        //
+        // "Claims exclusively" has different semantics for wildcard vs concrete hostnames:
+        //   - Concrete E (no `*.`): another listener L' claims it if L' is more specific than
+        //     our L and hostname_matches(E, H_L') — i.e. any request for E would prefer L'.
+        //   - Wildcard E (`*.X`): another listener L' claims ALL of E only if L' has the exact
+        //     same wildcard pattern H_L' == E.  A more-specific exact listener (e.g. `foo.X`)
+        //     only claims one host out of the wildcard set, so it does NOT dominate the wildcard.
+        if !listener_hostnames.is_empty() {
+            eff_set.retain(|e| {
+                // Isolation only applies when the parentRef names a specific listener (sectionName
+                // present).  A route without sectionName attaches to all matching listeners and
+                // the hostname intersection already handles scoping correctly.
+                !parent_refs.iter().any(|pr| {
+                    let our_sn = match pr.section_name.as_deref() {
+                        Some(sn) if !sn.is_empty() => sn,
+                        _ => return false, // no sectionName → skip isolation for this parentRef
+                    };
+                    let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
+                    let gw_name = pr.name.as_str();
+                    let our_spec = listener_hostnames
+                        .get(&(gw_ns.to_string(), gw_name.to_string(), our_sn.to_string()))
+                        .map(|h| listener_specificity(h))
+                        .unwrap_or(0);
+                    let e_is_wildcard = e.starts_with("*.");
+                    listener_hostnames.iter().any(|((ns, gw, ln), h_other)| {
+                        ns == gw_ns
+                            && gw == gw_name
+                            && ln.as_str() != our_sn
+                            && listener_specificity(h_other) > our_spec
+                            && if e_is_wildcard {
+                                // Wildcard E is dominated only by an identical wildcard listener.
+                                h_other == e
+                            } else {
+                                // Concrete E is dominated by any more-specific listener that covers it.
+                                hostname_matches(e, h_other)
+                            }
+                    })
+                })
+            });
+        }
+
+        let effective_hostnames: Vec<String> = eff_set.into_iter().collect();
+
         tracing::debug!(
             name = ?route.metadata.name,
             ns = route_ns,
             rules = rules.len(),
-            hostnames = hostnames.len(),
+            effective_hostnames = effective_hostnames.len(),
+            catchall = use_catchall,
             "Reconciling HTTPRoute"
         );
 
@@ -173,45 +302,56 @@ impl GatewayApiReconciler {
                 .iter()
                 .any(|f| matches!(f.r#type, HttpRouteRulesFiltersType::RequestRedirect));
 
-            let upstream = if has_redirect {
-                Arc::new(Upstream::new(
-                    format!("{route_ns}/redirect-sentinel"),
-                    vec![],
-                ))
+            let (upstream, error_status) = if has_redirect {
+                (
+                    Arc::new(Upstream::new(
+                        format!("{route_ns}/redirect-sentinel"),
+                        vec![],
+                    )),
+                    None,
+                )
             } else {
                 let backend_refs = match rule.backend_refs.as_deref() {
                     Some(b) if !b.is_empty() => b,
                     _ => continue,
                 };
 
-                let addrs = Self::resolve_upstream_addrs(backend_refs, route_ns, slices, grants);
+                let addrs =
+                    Self::resolve_upstream_addrs(backend_refs, route_ns, slices, services, grants);
                 if addrs.is_empty() {
                     tracing::warn!(
                         route = ?route.metadata.name,
-                        "No ready endpoints for rule — skipping"
+                        "No ready endpoints for rule — installing error route (500)"
                     );
-                    continue;
+                    (
+                        Arc::new(Upstream::new(format!("{route_ns}/error-sentinel"), vec![])),
+                        Some(500u16),
+                    )
+                } else {
+                    (
+                        Arc::new(Upstream::new(
+                            format!("{route_ns}/{}", backend_refs[0].name),
+                            addrs,
+                        )),
+                        None,
+                    )
                 }
-
-                Arc::new(Upstream::new(
-                    format!("{route_ns}/{}", backend_refs[0].name),
-                    addrs,
-                ))
             };
 
             // Default to PathPrefix "/" when no matches are specified (Gateway API §4.1).
             let apply = |pb: &mut HostRouterBuilder| match rule.matches.as_deref() {
                 None | Some([]) => {
                     let filters = Self::build_filters(rule_filters, "/", false);
-                    let e = Arc::new(RouteEntry::with_filters(
+                    let mut e = RouteEntry::with_filters(
                         Arc::clone(&upstream),
                         MatchPredicates::default(),
                         filters,
                         rule_timeouts.clone(),
                         route_id.clone(),
                         created_at,
-                    ));
-                    pb.add_prefix_route("/", e);
+                    );
+                    e.error_status = error_status;
+                    pb.add_prefix_route("/", Arc::new(e));
                 }
                 Some(ms) => {
                     for m in ms {
@@ -239,42 +379,44 @@ impl GatewayApiReconciler {
                         );
                         let filters = Self::build_filters(rule_filters, val, is_prefix);
 
-                        let e = Arc::new(RouteEntry::with_filters(
+                        let mut e = RouteEntry::with_filters(
                             Arc::clone(&upstream),
                             predicates,
                             filters,
                             rule_timeouts.clone(),
                             route_id.clone(),
                             created_at,
-                        ));
+                        );
+                        e.error_status = error_status;
 
                         match m.path.as_ref().and_then(|p| p.r#type.as_ref()) {
                             Some(HttpRouteRulesMatchesPathType::Exact) => {
-                                pb.add_exact_route(val, e);
+                                pb.add_exact_route(val, Arc::new(e));
                             }
                             Some(HttpRouteRulesMatchesPathType::RegularExpression) => {
-                                pb.add_regex_route(val, e);
+                                pb.add_regex_route(val, Arc::new(e));
                             }
                             // PathPrefix is the default per spec
                             _ => {
-                                pb.add_prefix_route(val, e);
+                                pb.add_prefix_route(val, Arc::new(e));
                             }
                         }
                     }
                 }
             };
 
-            if hostnames.is_empty() {
+            if use_catchall {
                 apply(builder.catchall());
-            } else {
-                for h in &hostnames {
-                    if h.starts_with("*.") {
-                        apply(builder.wildcard_host(h));
-                    } else {
-                        apply(builder.exact_host(h));
-                    }
+            }
+            for h in &effective_hostnames {
+                if h.starts_with("*.") {
+                    apply(builder.wildcard_host(h));
+                } else {
+                    apply(builder.exact_host(h));
                 }
             }
+            // If use_catchall=false AND effective_hostnames is empty, the route has no
+            // matching listener hostnames — skip (not admitted to the routing table).
         }
     }
 
@@ -294,6 +436,9 @@ impl GatewayApiReconciler {
         let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
         let gw_name = gateway.metadata.name.as_deref().unwrap_or("unknown");
         let mut by_listener: BTreeMap<String, ListenerTlsOutcome> = BTreeMap::new();
+        let mut listener_hostnames: BTreeMap<String, String> = BTreeMap::new();
+        let mut listener_allows_all_namespaces: BTreeMap<String, bool> = BTreeMap::new();
+        let mut listener_ports: BTreeMap<String, u16> = BTreeMap::new();
 
         for listener in &gateway.spec.listeners {
             let outcome = if listener.protocol != "HTTPS" {
@@ -301,10 +446,27 @@ impl GatewayApiReconciler {
             } else {
                 Self::resolve_listener_tls(gw_ns, gw_name, listener, secrets, cert_grants, builder)
             };
+            let hostname = listener.hostname.as_deref().unwrap_or("").to_string();
+            let allows_all = listener
+                .allowed_routes
+                .as_ref()
+                .and_then(|ar| ar.namespaces.as_ref())
+                .and_then(|ns| ns.from.as_ref())
+                .map(|f| !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same))
+                .unwrap_or(false); // default per spec is Same
             by_listener.insert(listener.name.clone(), outcome);
+            listener_hostnames.insert(listener.name.clone(), hostname);
+            listener_allows_all_namespaces.insert(listener.name.clone(), allows_all);
+            listener_ports.insert(listener.name.clone(), listener.port as u16);
         }
 
-        GatewayListenerHealth { by_listener }
+        GatewayListenerHealth {
+            by_listener,
+            listener_hostnames,
+            listener_allows_all_namespaces,
+            listener_ports,
+            ..Default::default()
+        }
     }
 
     fn resolve_listener_tls(
@@ -330,14 +492,12 @@ impl GatewayApiReconciler {
             };
         }
 
-        let hostname = match listener.hostname.as_deref().filter(|h| !h.is_empty()) {
-            Some(h) => h,
-            None => {
-                return ListenerTlsOutcome::Invalid {
-                    message: "listener.hostname is required for HTTPS listeners".to_string(),
-                };
-            }
-        };
+        // Empty/absent hostname means "match any SNI" — stored as the default cert.
+        let hostname = listener
+            .hostname
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .unwrap_or("");
 
         let refs = tls.certificate_refs.as_deref().unwrap_or(&[]);
         if refs.is_empty() {
@@ -347,6 +507,18 @@ impl GatewayApiReconciler {
         }
 
         let cert_ref = &refs[0];
+
+        // Only core/Secret (empty group, "core", or absent) is supported.
+        let ref_kind = cert_ref.kind.as_deref().unwrap_or("Secret");
+        let ref_group = cert_ref.group.as_deref().unwrap_or("");
+        if ref_kind != "Secret" || (!ref_group.is_empty() && ref_group != "core") {
+            return ListenerTlsOutcome::InvalidCertificateRef {
+                message: format!(
+                    "unsupported certificateRef {ref_group}/{ref_kind}: only core/Secret is supported"
+                ),
+            };
+        }
+
         let ref_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
 
         if ref_ns != gw_ns
@@ -634,12 +806,18 @@ impl GatewayApiReconciler {
         backend_refs: &[HttpRouteRulesBackendRefs],
         route_ns: &str,
         slices: &reflector::Store<EndpointSlice>,
+        services: &reflector::Store<Service>,
         grants: &HashSet<(String, String, Option<String>)>,
     ) -> Vec<SocketAddr> {
         backend_refs
             .iter()
             .filter_map(|b| b.port.map(|port| (b, port)))
             .flat_map(|(b, port)| {
+                let b_kind = b.kind.as_deref().unwrap_or("Service");
+                let b_group = b.group.as_deref().unwrap_or("");
+                if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
+                    return vec![];
+                }
                 let ns = b.namespace.as_deref().unwrap_or(route_ns);
                 if ns != route_ns
                     && !reference_grants::backend_ref_allowed(route_ns, ns, &b.name, grants)
@@ -652,10 +830,333 @@ impl GatewayApiReconciler {
                     );
                     return vec![];
                 }
-                endpoints::resolve(ns, &b.name, port, slices)
+                endpoints::resolve(ns, &b.name, port, slices, services)
             })
             .collect()
     }
+
+    /// Computes `Accepted` and `ResolvedRefs` health for every (route, parent) pair
+    /// that references an owned gateway. Called during the reconciler's rebuild so the
+    /// controller can write accurate HTTPRoute status conditions.
+    pub fn compute_route_health(
+        routes: &[Arc<HTTPRoute>],
+        gateways: &[Arc<Gateway>],
+        owned_gateways: &HashSet<(String, String)>,
+        backend_grants: &HashSet<(String, String, Option<String>)>,
+        slice_store: &reflector::Store<EndpointSlice>,
+        service_store: &reflector::Store<Service>,
+    ) -> HttpRouteHealthMap {
+        // (listener_name, hostname, allows_all_ns, port)
+        type ListenerInfo = Vec<(String, String, bool, u16)>;
+        // Build listener info map: (gw_ns, gw_name) → ListenerInfo
+        // allows_all_ns = true when allowedRoutes.namespaces.from is All or Selector (not Same).
+        let gw_listeners: HashMap<(String, String), ListenerInfo> = gateways
+            .iter()
+            .filter_map(|gw| {
+                let ns = gw.metadata.namespace.as_deref()?.to_string();
+                let name = gw.metadata.name.as_deref()?.to_string();
+                if !owned_gateways.contains(&(ns.clone(), name.clone())) {
+                    return None;
+                }
+                let listeners: Vec<(String, String, bool, u16)> = gw
+                    .spec
+                    .listeners
+                    .iter()
+                    .map(|l| {
+                        let allows_all = l
+                            .allowed_routes
+                            .as_ref()
+                            .and_then(|ar| ar.namespaces.as_ref())
+                            .and_then(|ns| ns.from.as_ref())
+                            .map(|f| {
+                                !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same)
+                            })
+                            .unwrap_or(false);
+                        (
+                            l.name.clone(),
+                            l.hostname.as_deref().unwrap_or("").to_string(),
+                            allows_all,
+                            l.port as u16,
+                        )
+                    })
+                    .collect();
+                Some(((ns, name), listeners))
+            })
+            .collect();
+
+        let mut map = HttpRouteHealthMap::new();
+
+        for route in routes {
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+            let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
+            let route_hostnames: Vec<&str> = route
+                .spec
+                .hostnames
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(String::as_str)
+                .collect();
+
+            for pr in route.spec.parent_refs.as_deref().unwrap_or(&[]) {
+                let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
+                let gw_name = pr.name.as_str();
+                let gw_key = (gw_ns.to_string(), gw_name.to_string());
+
+                if !owned_gateways.contains(&gw_key) {
+                    continue;
+                }
+
+                let section = pr.section_name.as_deref().unwrap_or("").to_string();
+                let health_key = (
+                    route_ns.to_string(),
+                    route_name.to_string(),
+                    gw_ns.to_string(),
+                    gw_name.to_string(),
+                    section.clone(),
+                );
+
+                // Cross-namespace check: reject routes whose namespace is not allowed by the
+                // listener. Default per spec is Same (only same namespace); must be All or
+                // Selector to permit cross-namespace parentRefs.
+                if gw_ns != route_ns {
+                    let blocked = gw_listeners.get(&gw_key).is_some_and(|ls| {
+                        let relevant: Vec<_> = if section.is_empty() {
+                            ls.iter().collect()
+                        } else {
+                            ls.iter()
+                                .filter(|(n, _, _, _)| n.as_str() == section)
+                                .collect()
+                        };
+                        !relevant.is_empty() && relevant.iter().all(|(_, _, allows, _)| !allows)
+                    });
+                    if blocked {
+                        map.insert(
+                            health_key,
+                            RouteParentHealth {
+                                accepted: false,
+                                accepted_reason: "NotAllowedByListeners",
+                                resolved_refs: true,
+                                resolved_refs_reason: "ResolvedRefs",
+                            },
+                        );
+                        continue;
+                    }
+                }
+
+                // Strip allows_all bool, keep port for port-matching check.
+                let listeners_hn: ListenerHnMap = std::iter::once((
+                    gw_key.clone(),
+                    gw_listeners
+                        .get(&gw_key)
+                        .map(|ls| {
+                            ls.iter()
+                                .map(|(n, h, _, p)| (n.clone(), h.clone(), *p))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ))
+                .collect();
+
+                let (accepted, accepted_reason) = compute_accepted(
+                    &route_hostnames,
+                    &section,
+                    pr.port.map(|p| p as u16),
+                    &gw_key,
+                    &listeners_hn,
+                );
+
+                let (resolved_refs, resolved_refs_reason) = if accepted {
+                    check_backend_refs(route, route_ns, backend_grants, service_store, slice_store)
+                } else {
+                    (true, "ResolvedRefs")
+                };
+
+                map.insert(
+                    health_key,
+                    RouteParentHealth {
+                        resolved_refs,
+                        resolved_refs_reason,
+                        accepted,
+                        accepted_reason,
+                    },
+                );
+            }
+        }
+
+        map
+    }
+}
+
+/// `(listener_name, hostname, port)` stripped of the `allows_all` flag; passed to
+/// `compute_accepted` where cross-namespace checks are already done.
+type ListenerHnEntry = (String, String, u16);
+type ListenerHnMap = HashMap<(String, String), Vec<ListenerHnEntry>>;
+
+/// Returns `(accepted, reason)` for one (route, parent) pair based on listener hostname and port
+/// matching.
+fn compute_accepted(
+    route_hostnames: &[&str],
+    section_name: &str,
+    port: Option<u16>,
+    gw_key: &(String, String),
+    gw_listeners: &ListenerHnMap,
+) -> (bool, &'static str) {
+    let Some(listeners) = gw_listeners.get(gw_key) else {
+        return (true, "Accepted");
+    };
+
+    if !section_name.is_empty() {
+        let matching: Vec<&(String, String, u16)> = listeners
+            .iter()
+            .filter(|(n, _, _)| n == section_name)
+            .collect();
+        if matching.is_empty() {
+            return (false, "NoMatchingParent");
+        }
+        // parentRef.port must match the named listener's port when specified.
+        if let Some(p) = port
+            && !matching.iter().any(|(_, _, lp)| *lp == p)
+        {
+            return (false, "NoMatchingParent");
+        }
+        let intersects = matching
+            .iter()
+            .any(|(_, hn, _)| hostnames_intersect(route_hostnames, hn));
+        return if intersects {
+            (true, "Accepted")
+        } else {
+            (false, "NoMatchingListenerHostname")
+        };
+    }
+
+    // No sectionName: filter candidate listeners by port first (if specified).
+    let port_filtered: Vec<&(String, String, u16)> = if let Some(p) = port {
+        listeners.iter().filter(|(_, _, lp)| *lp == p).collect()
+    } else {
+        listeners.iter().collect()
+    };
+
+    if port.is_some() && port_filtered.is_empty() {
+        return (false, "NoMatchingParent");
+    }
+
+    let intersects = port_filtered
+        .iter()
+        .any(|(_, hn, _)| hostnames_intersect(route_hostnames, hn));
+    if intersects {
+        (true, "Accepted")
+    } else {
+        (false, "NoMatchingListenerHostname")
+    }
+}
+
+/// Listener isolation priority: exact hostname > wildcard (longer = more specific) > empty.
+/// Returns a numeric rank: 0 = empty, wildcard length, usize::MAX = exact.
+fn listener_specificity(hostname: &str) -> usize {
+    if hostname.is_empty() {
+        0
+    } else if hostname.starts_with("*.") {
+        hostname.len()
+    } else {
+        usize::MAX
+    }
+}
+
+/// Returns true when `route_hostnames` and `listener_hostname` have at least one
+/// hostname in common, according to Gateway API intersection semantics:
+/// - Listener hostname `""` (absent) matches any route hostname.
+/// - Route with no hostnames matches any listener hostname.
+/// - Wildcard patterns (`*.example.com`) expand to match labels one level deep.
+pub(crate) fn hostnames_intersect(route_hostnames: &[&str], listener_hostname: &str) -> bool {
+    if listener_hostname.is_empty() {
+        return true;
+    }
+    if route_hostnames.is_empty() {
+        return true;
+    }
+    route_hostnames
+        .iter()
+        .any(|rh| hostname_matches(rh, listener_hostname))
+}
+
+fn hostname_matches(route_host: &str, listener_host: &str) -> bool {
+    if route_host == listener_host {
+        return true;
+    }
+    // Route wildcard `*.X` matches listener `Y.X` (single label prefix).
+    // Require that the prefix ends with a dot so "*.bar.com" does NOT match "foobar.com"
+    // (where "bar.com" appears as a substring but not a domain label boundary).
+    if let Some(suffix) = route_host.strip_prefix("*.")
+        && let Some(prefix) = listener_host.strip_suffix(suffix)
+        && let Some(prefix) = prefix.strip_suffix('.')
+        && !prefix.is_empty()
+        && !prefix.contains('.')
+    {
+        return true;
+    }
+    // Listener wildcard `*.X` matches route `Y.X` (any depth — Gateway API GEP-719).
+    // Same dot-boundary requirement: "*.wildcard.io" must NOT match "anotherwildcard.io".
+    if let Some(suffix) = listener_host.strip_prefix("*.")
+        && let Some(prefix) = route_host.strip_suffix(suffix)
+        && let Some(prefix) = prefix.strip_suffix('.')
+        && !prefix.is_empty()
+    {
+        return true;
+    }
+    false
+}
+
+/// Checks all backend refs in a route for validity.
+/// Returns `(resolved_refs, reason)` — `resolved_refs=true` means all backends valid.
+fn check_backend_refs(
+    route: &HTTPRoute,
+    route_ns: &str,
+    backend_grants: &HashSet<(String, String, Option<String>)>,
+    service_store: &reflector::Store<Service>,
+    slice_store: &reflector::Store<EndpointSlice>,
+) -> (bool, &'static str) {
+    let _ = slice_store; // not used for existence check; kept for API symmetry
+    for rule in route.spec.rules.as_deref().unwrap_or(&[]) {
+        // Rules with RequestRedirect don't need backends
+        let has_redirect = rule
+            .filters
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|f| matches!(f.r#type, HttpRouteRulesFiltersType::RequestRedirect));
+        if has_redirect {
+            continue;
+        }
+
+        for b in rule.backend_refs.as_deref().unwrap_or(&[]) {
+            let b_kind = b.kind.as_deref().unwrap_or("Service");
+            let b_group = b.group.as_deref().unwrap_or("");
+
+            // Unsupported kind/group
+            if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
+                return (false, "InvalidKind");
+            }
+
+            let b_ns = b.namespace.as_deref().unwrap_or(route_ns);
+
+            // Cross-namespace ref requires a ReferenceGrant
+            if b_ns != route_ns
+                && !reference_grants::backend_ref_allowed(route_ns, b_ns, &b.name, backend_grants)
+            {
+                return (false, "RefNotPermitted");
+            }
+
+            // Service must exist in the store
+            if b.port.is_some() {
+                let svc_key = reflector::ObjectRef::<Service>::new(&b.name).within(b_ns);
+                if service_store.get(&svc_key).is_none() {
+                    return (false, "BackendNotFound");
+                }
+            }
+        }
+    }
+    (true, "ResolvedRefs")
 }
 
 #[cfg(test)]
@@ -705,6 +1206,10 @@ mod tests {
         writer.as_reader()
     }
 
+    fn empty_svc_store() -> reflector::Store<Service> {
+        reflector::store::Writer::<Service>::default().as_reader()
+    }
+
     fn owned(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
         pairs
             .iter()
@@ -715,6 +1220,11 @@ mod tests {
     /// Default owned set used by tests that exercise routing logic (not filtering).
     fn default_owned() -> HashSet<(String, String)> {
         owned(&[("default", "gw")])
+    }
+
+    /// Empty listener-hostname map for tests that don't exercise hostname scoping.
+    fn no_listeners() -> HashMap<(String, String, String), String> {
+        HashMap::new()
     }
 
     /// Default parent refs pointing to the Gateway in `default_owned`.
@@ -868,7 +1378,15 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &no_listeners(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let empty_hdrs = HeaderMap::new();
         let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
@@ -891,7 +1409,15 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &no_listeners(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let empty_hdrs = HeaderMap::new();
         let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
@@ -914,7 +1440,15 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &no_listeners(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let empty_hdrs = HeaderMap::new();
         let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
@@ -929,7 +1463,15 @@ mod tests {
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &no_listeners(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let empty_hdrs = HeaderMap::new();
         let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
@@ -946,8 +1488,10 @@ mod tests {
         GatewayApiReconciler::reconcile(
             &route,
             &store,
+            &empty_svc_store(),
             &owned(&[("other", "gw")]),
             &grants,
+            &no_listeners(),
             &mut builder,
         );
         let table = builder.build().unwrap();
@@ -1002,7 +1546,15 @@ mod tests {
 
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &no_listeners(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
 
         let hdrs_a = headers_from(&[("x-tenant", "a")]);
@@ -1031,7 +1583,15 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &no_listeners(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
 
         let hdrs_ok = headers_from(&[("x-version", "v42")]);
@@ -1085,7 +1645,15 @@ mod tests {
 
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &no_listeners(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
 
         let h = HeaderMap::new();
@@ -1144,7 +1712,15 @@ mod tests {
 
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &no_listeners(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
 
         let h = HeaderMap::new();
@@ -1186,7 +1762,15 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &no_listeners(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
 
         // The valid fallback entry is still registered.
@@ -1304,8 +1888,10 @@ mod tests {
         GatewayApiReconciler::reconcile(
             &route,
             &store,
+            &empty_svc_store(),
             &default_owned(),
             &HashSet::new(),
+            &no_listeners(),
             &mut builder,
         );
         let table = builder.build().unwrap();
@@ -1344,8 +1930,10 @@ mod tests {
         GatewayApiReconciler::reconcile(
             &route,
             &store,
+            &empty_svc_store(),
             &default_owned(),
             &HashSet::new(),
+            &no_listeners(),
             &mut builder,
         );
         let table = builder.build().unwrap();
@@ -1385,8 +1973,10 @@ mod tests {
         GatewayApiReconciler::reconcile(
             &route,
             &store,
+            &empty_svc_store(),
             &default_owned(),
             &HashSet::new(),
+            &no_listeners(),
             &mut builder,
         );
         let table = builder.build().unwrap();
@@ -1431,8 +2021,10 @@ mod tests {
         GatewayApiReconciler::reconcile(
             &route,
             &store,
+            &empty_svc_store(),
             &default_owned(),
             &HashSet::new(),
+            &no_listeners(),
             &mut builder,
         );
         let table = builder.build().unwrap();
@@ -1538,11 +2130,130 @@ mod tests {
 
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &no_listeners(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let t = find_timeouts(&table, "example.com", "/");
         assert_eq!(t.request, Some(Duration::from_secs(10)));
         assert_eq!(t.backend_request, Some(Duration::from_secs(2)));
+    }
+
+    // ── Listener isolation tests ──────────────────────────────────────────────────
+
+    fn make_listener_hostnames(
+        gw_ns: &str,
+        gw_name: &str,
+        listeners: &[(&str, &str)],
+    ) -> HashMap<(String, String, String), String> {
+        listeners
+            .iter()
+            .map(|(ln, h)| {
+                (
+                    (gw_ns.to_string(), gw_name.to_string(), ln.to_string()),
+                    h.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn listener_isolation_empty_listener_route_not_accessible_via_more_specific_listener() {
+        // Route attached to empty-hostname listener with spec.hostnames containing *.example.com.
+        // The gateway also has a *.example.com listener, which owns that hostname space.
+        // The route should only be registered under bar.com (the non-dominated hostname).
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let route = make_route_with_hostnames_and_parent(
+            "default",
+            &["bar.com", "*.example.com"],
+            "gw",
+            Some("empty-listener"),
+        );
+        let listeners = make_listener_hostnames(
+            "default",
+            "gw",
+            &[
+                ("empty-listener", ""),
+                ("specific-listener", "*.example.com"),
+            ],
+        );
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &HashSet::new(),
+            &listeners,
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        // bar.com is not dominated by any other listener → accessible
+        assert!(
+            table.route("bar.com", "/", &ctx_get()).is_some(),
+            "bar.com should be routable"
+        );
+        // *.example.com is dominated by the specific listener → NOT accessible via bar.example.com
+        assert!(
+            table.route("bar.example.com", "/", &ctx_get()).is_none(),
+            "bar.example.com should not leak from the empty-hostname listener"
+        );
+    }
+
+    fn make_route_with_hostnames_and_parent(
+        ns: &str,
+        hostnames: &[&str],
+        gw_name: &str,
+        section_name: Option<&str>,
+    ) -> HTTPRoute {
+        use gateway_api::apis::standard::httproutes::HttpRouteSpec;
+        HTTPRoute {
+            metadata: kube::api::ObjectMeta {
+                name: Some("test-route".to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                parent_refs: Some(vec![HttpRouteParentRefs {
+                    name: gw_name.to_string(),
+                    namespace: Some(ns.to_string()),
+                    section_name: section_name.map(str::to_string),
+                    ..Default::default()
+                }]),
+                hostnames: Some(hostnames.iter().map(|h| h.to_string()).collect()),
+                rules: Some(vec![make_simple_rule("svc")]),
+            },
+            status: None,
+        }
+    }
+
+    fn make_simple_rule(svc: &str) -> gateway_api::apis::standard::httproutes::HttpRouteRules {
+        use gateway_api::apis::standard::httproutes::{HttpRouteRules, HttpRouteRulesBackendRefs};
+        HttpRouteRules {
+            backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                name: svc.to_string(),
+                port: Some(8080),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn ctx_get() -> coxswain_core::routing::RequestContext<'static> {
+        static METHOD: std::sync::LazyLock<Method> = std::sync::LazyLock::new(|| Method::GET);
+        static HDRS: std::sync::LazyLock<http::HeaderMap> =
+            std::sync::LazyLock::new(http::HeaderMap::new);
+        coxswain_core::routing::RequestContext {
+            method: &METHOD,
+            headers: &HDRS,
+            query: None,
+        }
     }
 
     #[test]
@@ -1551,7 +2262,15 @@ mod tests {
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
-        GatewayApiReconciler::reconcile(&route, &store, &default_owned(), &grants, &mut builder);
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &grants,
+            &no_listeners(),
+            &mut builder,
+        );
         let table = builder.build().unwrap();
         let t = find_timeouts(&table, "example.com", "/");
         assert!(t.request.is_none());

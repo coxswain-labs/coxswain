@@ -30,7 +30,10 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
-              containerPort: 8080
+              containerPort: 80
+              protocol: TCP
+            - name: https
+              containerPort: 443
               protocol: TCP
             - name: health
               containerPort: 8081
@@ -51,8 +54,6 @@ spec:
               value: "info,coxswain_proxy=debug"
             - name: COXSWAIN_LOG_FORMAT
               value: "json"
-            - name: COXSWAIN_PROXY_ADDR
-              value: "0.0.0.0:8080"
             - name: COXSWAIN_PROXY_THREADS
               value: "2"
             - name: COXSWAIN_HEALTH_ADDR
@@ -77,6 +78,7 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+              add: ["NET_BIND_SERVICE"]
           resources:
             requests:
               cpu: 100m
