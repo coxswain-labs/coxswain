@@ -1,5 +1,5 @@
 apiVersion: gateway.networking.k8s.io/v1
-date: "2026-06-03T11:18:23+01:00"
+date: "2026-06-03T12:08:57+01:00"
 gatewayAPIChannel: standard
 gatewayAPIVersion: v1.5.1
 implementation:
@@ -8,7 +8,7 @@ implementation:
   organization: coxswain-labs
   project: coxswain
   url: https://github.com/coxswain-labs/coxswain
-  version: 2c31f7a
+  version: 79c95b3
 kind: ConformanceReport
 mode: default
 profiles:
@@ -20,5 +20,48 @@ profiles:
       Failed: 1
       Passed: 32
       Skipped: 0
+  extended:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 2
+      Skipped: 0
+    supportedFeatures:
+    - HTTPRouteMethodMatching
+    - HTTPRouteQueryParamMatching
+    unsupportedFeatures:
+    - BackendTLSPolicy
+    - BackendTLSPolicySANValidation
+    - GatewayAddressEmpty
+    - GatewayBackendClientCertificate
+    - GatewayFrontendClientCertificateValidation
+    - GatewayFrontendClientCertificateValidationInsecureFallback
+    - GatewayHTTPListenerIsolation
+    - GatewayHTTPSListenerDetectMisdirectedRequests
+    - GatewayInfrastructurePropagation
+    - GatewayPort8080
+    - GatewayStaticAddresses
+    - HTTPRoute303RedirectStatusCode
+    - HTTPRoute307RedirectStatusCode
+    - HTTPRoute308RedirectStatusCode
+    - HTTPRouteBackendProtocolH2C
+    - HTTPRouteBackendProtocolWebSocket
+    - HTTPRouteBackendRequestHeaderModification
+    - HTTPRouteBackendTimeout
+    - HTTPRouteCORS
+    - HTTPRouteDestinationPortMatching
+    - HTTPRouteHostRewrite
+    - HTTPRouteNamedRouteRule
+    - HTTPRouteParentRefPort
+    - HTTPRoutePathRedirect
+    - HTTPRoutePathRewrite
+    - HTTPRoutePortRedirect
+    - HTTPRouteRequestMirror
+    - HTTPRouteRequestMultipleMirrors
+    - HTTPRouteRequestPercentageMirror
+    - HTTPRouteRequestTimeout
+    - HTTPRouteResponseHeaderModification
+    - HTTPRouteSchemeRedirect
+    - ListenerSet
   name: GATEWAY-HTTP
-  summary: Core tests failed with 1 test failures.
+  summary: Core tests failed with 1 test failures. Extended tests succeeded.

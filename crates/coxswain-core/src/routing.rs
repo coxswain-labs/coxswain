@@ -411,18 +411,28 @@ impl HostRouter {
 
 /// Sort key for within-path specificity ordering per Gateway API rules.
 ///
-/// Most specific first: most header matches, then most query matches, then oldest
-/// creation timestamp, then lexicographic route_id, then original insertion index.
+/// Priority: method match > header matches > query matches > oldest timestamp.
+/// Method presence outranks header count because the spec defines method matching
+/// at a higher precedence tier than header matching.
 fn specificity_key(
     entry: &Arc<RouteEntry>,
     insertion_idx: usize,
-) -> (Reverse<usize>, Reverse<usize>, u128, String, usize) {
+) -> (
+    Reverse<usize>,
+    Reverse<usize>,
+    Reverse<usize>,
+    u128,
+    String,
+    usize,
+) {
+    let has_method = entry.predicates.method.is_some() as usize;
     let ts = entry
         .created_at
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_millis())
         .unwrap_or(u128::MAX);
     (
+        Reverse(has_method),
         Reverse(entry.predicates.headers.len()),
         Reverse(entry.predicates.query.len()),
         ts,
