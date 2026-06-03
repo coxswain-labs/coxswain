@@ -1,0 +1,24 @@
+apiVersion: gateway.networking.k8s.io/v1
+date: "2026-06-03T11:18:23+01:00"
+gatewayAPIChannel: standard
+gatewayAPIVersion: v1.5.1
+implementation:
+  contact:
+  - ""
+  organization: coxswain-labs
+  project: coxswain
+  url: https://github.com/coxswain-labs/coxswain
+  version: 2c31f7a
+kind: ConformanceReport
+mode: default
+profiles:
+- core:
+    failedTests:
+    - HTTPRouteWeight
+    result: failure
+    statistics:
+      Failed: 1
+      Passed: 32
+      Skipped: 0
+  name: GATEWAY-HTTP
+  summary: Core tests failed with 1 test failures.

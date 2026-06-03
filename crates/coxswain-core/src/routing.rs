@@ -527,17 +527,24 @@ impl HostRouterBuilder {
             }
             let frozen = sort_and_freeze(entries);
 
-            // Normalise: strip trailing slash so "/api/" and "/api" are identical.
+            // Gateway API prefix semantics:
+            //   "/foo"  matches /foo, /foo/, /foo/anything
+            //   "/foo/" matches /foo/, /foo/anything (NOT /foo)
+            //   "/"     matches everything
+            // matchit 0.9.2 does not route "/v2/" to "/v2/{*rest}" — we must
+            // insert "/v2/" explicitly to bridge the gap.
+            let had_trailing_slash = path.ends_with('/');
             let base = path.trim_end_matches('/');
-            let (p1, p2) = if base.is_empty() {
-                ("/".to_string(), "/{*rest}".to_string())
+            if base.is_empty() {
+                let _ = router.insert("/", frozen.clone());
+                let _ = router.insert("/{*rest}", frozen);
             } else {
-                (base.to_string(), format!("{base}/{{*rest}}"))
-            };
-            // Insert base path; the wildcard insert may fail if a prior exact
-            // route claimed that pattern — tolerate the error silently.
-            router.insert(p1, frozen.clone())?;
-            let _ = router.insert(p2, frozen);
+                if !had_trailing_slash {
+                    let _ = router.insert(base, frozen.clone());
+                }
+                let _ = router.insert(format!("{base}/"), frozen.clone());
+                let _ = router.insert(format!("{base}/{{*rest}}"), frozen);
+            }
         }
 
         // ── Regex routes ──────────────────────────────────────────────────────

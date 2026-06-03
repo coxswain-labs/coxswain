@@ -1,4 +1,5 @@
-use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth};
+use crate::gateway_api::hostnames_intersect;
+use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth};
 use crate::{endpoints, gateway_api::GatewayApiReconciler, ingress::IngressReconciler};
 use async_trait::async_trait;
 use coxswain_core::ownership::OwnedGateways;
@@ -69,6 +70,7 @@ pub struct Reconciler {
     routes: SharedRoutingTable,
     tls: SharedTlsStore,
     tls_health: SharedGatewayListenerHealth,
+    route_health: SharedHttpRouteHealth,
     owned_gateways: OwnedGateways,
     controller_name: String,
     /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
@@ -90,11 +92,18 @@ impl Reconciler {
             routes,
             tls,
             tls_health,
+            route_health: SharedHttpRouteHealth::new(),
             owned_gateways,
             controller_name,
             watch_namespace,
             ingress_default_backend,
         }
+    }
+
+    /// Returns the shared route health handle so other services (e.g. the Controller)
+    /// can subscribe to updates published by this reconciler.
+    pub fn route_health(&self) -> SharedHttpRouteHealth {
+        self.route_health.clone()
     }
 }
 
@@ -131,6 +140,7 @@ impl BackgroundService for Reconciler {
             self.routes.clone(),
             self.tls.clone(),
             self.tls_health.clone(),
+            self.route_health.clone(),
             self.owned_gateways.clone(),
             config,
         )
@@ -153,6 +163,7 @@ async fn spawn_tasks(
     routes: SharedRoutingTable,
     tls: SharedTlsStore,
     tls_health: SharedGatewayListenerHealth,
+    route_health: SharedHttpRouteHealth,
     owned_gateways: OwnedGateways,
     config: ReconcilerConfig,
 ) -> JoinSet<()> {
@@ -416,6 +427,7 @@ async fn spawn_tasks(
                 &routes,
                 &tls,
                 &tls_health,
+                &route_health,
             );
         }
     });
@@ -440,6 +452,7 @@ fn rebuild(
     shared: &SharedRoutingTable,
     tls_shared: &SharedTlsStore,
     tls_health_shared: &SharedGatewayListenerHealth,
+    route_health_shared: &SharedHttpRouteHealth,
 ) {
     let routes = route_store.state();
     let ingresses = ingress_store.state();
@@ -546,6 +559,28 @@ fn rebuild(
         owned_gateways = owned_gateways.len(),
         "Rebuilding routing table"
     );
+    // Precompute (gw_ns, gw_name, listener_name) → hostname so reconcile() can scope
+    // routes without spec.hostnames to their parent listener's hostname.
+    let listener_hostname_map: HashMap<(String, String, String), String> = gateway_store
+        .state()
+        .into_iter()
+        .filter(|g| owned_gateway_classes.contains(&g.spec.gateway_class_name))
+        .flat_map(|g| {
+            let ns = g.metadata.namespace.clone().unwrap_or_default();
+            let name = g.metadata.name.clone().unwrap_or_default();
+            g.spec
+                .listeners
+                .iter()
+                .map(|l| {
+                    (
+                        (ns.clone(), name.clone(), l.name.clone()),
+                        l.hostname.clone().unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
     let mut builder = RoutingTableBuilder::new();
     for route in &routes {
         GatewayApiReconciler::reconcile(
@@ -554,6 +589,7 @@ fn rebuild(
             service_store,
             &owned_gateways,
             &backend_grants,
+            &listener_hostname_map,
             &mut builder,
         );
     }
@@ -652,12 +688,19 @@ fn rebuild(
         tracing::trace!(certs, "TLS cert store unchanged, skip swap");
     }
 
-    // Count attached routes per gateway per listener.
-    // A route is counted if it has a parentRef pointing to an owned gateway.
-    // If sectionName is set, the count is added to that specific listener.
-    // If sectionName is absent, the count is spread across all listeners of the gateway.
+    // Count attached routes per gateway per listener, filtering by hostname intersection.
+    // Only routes whose hostnames intersect with the listener's hostname restriction are counted.
     for route in &routes {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let route_hostnames: Vec<&str> = route
+            .spec
+            .hostnames
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(String::as_str)
+            .collect();
+
         for pr in route.spec.parent_refs.as_deref().unwrap_or(&[]) {
             let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
             let gw_name = pr.name.as_str();
@@ -667,11 +710,40 @@ fn rebuild(
             }
             if let Some(health) = gateway_tls_health.get_mut(&key) {
                 if let Some(sn) = pr.section_name.as_deref() {
-                    *health.attached_routes.entry(sn.to_string()).or_insert(0) += 1;
+                    let allows_all = health
+                        .listener_allows_all_namespaces
+                        .get(sn)
+                        .copied()
+                        .unwrap_or(false);
+                    // Skip cross-namespace routes when the listener restricts to Same.
+                    if gw_ns != route_ns && !allows_all {
+                        continue;
+                    }
+                    if let Some(listener_hn) = health.listener_hostnames.get(sn)
+                        && hostnames_intersect(&route_hostnames, listener_hn)
+                    {
+                        *health.attached_routes.entry(sn.to_string()).or_insert(0) += 1;
+                    }
                 } else {
-                    let listeners: Vec<String> = health.by_listener.keys().cloned().collect();
-                    for ln in listeners {
-                        *health.attached_routes.entry(ln).or_insert(0) += 1;
+                    let listeners: Vec<(String, String, bool)> = health
+                        .listener_hostnames
+                        .iter()
+                        .map(|(n, hn)| {
+                            let allows = health
+                                .listener_allows_all_namespaces
+                                .get(n)
+                                .copied()
+                                .unwrap_or(false);
+                            (n.clone(), hn.clone(), allows)
+                        })
+                        .collect();
+                    for (ln, listener_hn, allows_all) in listeners {
+                        if gw_ns != route_ns && !allows_all {
+                            continue;
+                        }
+                        if hostnames_intersect(&route_hostnames, &listener_hn) {
+                            *health.attached_routes.entry(ln).or_insert(0) += 1;
+                        }
                     }
                 }
             }
@@ -680,4 +752,16 @@ fn rebuild(
 
     // Publish per-gateway listener health and wake the controller to re-evaluate statuses.
     tls_health_shared.store_and_notify(gateway_tls_health);
+
+    // Compute and publish per-(route, parent) health for HTTPRoute status conditions.
+    let gateways = gateway_store.state();
+    let route_health_map = GatewayApiReconciler::compute_route_health(
+        &routes,
+        &gateways,
+        &owned_gateways,
+        &backend_grants,
+        slice_store,
+        service_store,
+    );
+    route_health_shared.store_and_notify(route_health_map);
 }

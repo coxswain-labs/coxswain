@@ -201,8 +201,8 @@ impl ProxyHttp for Proxy {
             }
             RouteOutcome::NoHost => {
                 return Err(pingora_core::Error::explain(
-                    HTTPStatus(503),
-                    format!("no backend for host {host}"),
+                    HTTPStatus(404),
+                    format!("no route for host {host}"),
                 ));
             }
             RouteOutcome::NoPath => {

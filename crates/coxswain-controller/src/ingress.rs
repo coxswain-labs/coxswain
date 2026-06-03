@@ -960,8 +960,18 @@ mod tests {
 
     fn make_tls_secret(ns: &str, name: &str) -> Secret {
         let mut data = BTreeMap::new();
-        data.insert("tls.crt".to_string(), ByteString(b"CERT".to_vec()));
-        data.insert("tls.key".to_string(), ByteString(b"KEY".to_vec()));
+        data.insert(
+            "tls.crt".to_string(),
+            ByteString(
+                b"-----BEGIN CERTIFICATE-----\nMIIBIjANBg==\n-----END CERTIFICATE-----\n".to_vec(),
+            ),
+        );
+        data.insert(
+            "tls.key".to_string(),
+            ByteString(
+                b"-----BEGIN PRIVATE KEY-----\nMIIBIjANBg==\n-----END PRIVATE KEY-----\n".to_vec(),
+            ),
+        );
         Secret {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),

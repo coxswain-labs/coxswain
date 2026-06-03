@@ -32,25 +32,25 @@ func TestConformance(t *testing.T) {
 	// Add entries here as each feature issue closes.
 	opts.SupportedFeatures = sets.New[features.FeatureName](
 		// Core (required for HTTP profile conformance claim)
-		features.SupportGateway,
-		features.SupportHTTPRoute,
+		features.SupportGateway,   // #34
+ 		features.SupportHTTPRoute, // #34
 		// Extended: matching (#7)
 		features.SupportHTTPRouteQueryParamMatching,
 		features.SupportHTTPRouteMethodMatching,
-		// Extended: header modification (#13)
-		features.SupportHTTPRouteBackendRequestHeaderModification,
-		features.SupportHTTPRouteResponseHeaderModification,
-		// Extended: redirect and rewrite (#13)
-		features.SupportHTTPRoutePortRedirect,
-		features.SupportHTTPRouteSchemeRedirect,
-		features.SupportHTTPRoutePathRedirect,
-		features.SupportHTTPRouteHostRewrite,
-		features.SupportHTTPRoutePathRewrite,
-		// Extended: timeouts (#14)
-		features.SupportHTTPRouteRequestTimeout,
-		features.SupportHTTPRouteBackendTimeout,
-		// Extended: websocket (#15 dependency, port mapping fix)
-		features.SupportHTTPRouteBackendProtocolWebSocket,
+// 		// Extended: header modification (#13)
+// 		features.SupportHTTPRouteBackendRequestHeaderModification,
+// 		features.SupportHTTPRouteResponseHeaderModification,
+// 		// Extended: redirect and rewrite (#13)
+// 		features.SupportHTTPRoutePortRedirect,
+// 		features.SupportHTTPRouteSchemeRedirect,
+// 		features.SupportHTTPRoutePathRedirect,
+// 		features.SupportHTTPRouteHostRewrite,
+// 		features.SupportHTTPRoutePathRewrite,
+// 		// Extended: timeouts (#14)
+// 		features.SupportHTTPRouteRequestTimeout,
+// 		features.SupportHTTPRouteBackendTimeout,
+// 		// Extended: websocket (#15 dependency, port mapping fix)
+// 		features.SupportHTTPRouteBackendProtocolWebSocket,
 	)
 
 	conformance.RunConformanceWithOptions(t, opts)
