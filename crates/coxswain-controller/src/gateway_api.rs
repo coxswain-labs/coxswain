@@ -174,11 +174,14 @@ impl GatewayApiReconciler {
                 .iter()
                 .any(|f| matches!(f.r#type, HttpRouteRulesFiltersType::RequestRedirect));
 
-            let upstream = if has_redirect {
-                Arc::new(Upstream::new(
-                    format!("{route_ns}/redirect-sentinel"),
-                    vec![],
-                ))
+            let (upstream, error_status) = if has_redirect {
+                (
+                    Arc::new(Upstream::new(
+                        format!("{route_ns}/redirect-sentinel"),
+                        vec![],
+                    )),
+                    None,
+                )
             } else {
                 let backend_refs = match rule.backend_refs.as_deref() {
                     Some(b) if !b.is_empty() => b,
@@ -190,30 +193,37 @@ impl GatewayApiReconciler {
                 if addrs.is_empty() {
                     tracing::warn!(
                         route = ?route.metadata.name,
-                        "No ready endpoints for rule — skipping"
+                        "No ready endpoints for rule — installing error route (500)"
                     );
-                    continue;
+                    (
+                        Arc::new(Upstream::new(format!("{route_ns}/error-sentinel"), vec![])),
+                        Some(500u16),
+                    )
+                } else {
+                    (
+                        Arc::new(Upstream::new(
+                            format!("{route_ns}/{}", backend_refs[0].name),
+                            addrs,
+                        )),
+                        None,
+                    )
                 }
-
-                Arc::new(Upstream::new(
-                    format!("{route_ns}/{}", backend_refs[0].name),
-                    addrs,
-                ))
             };
 
             // Default to PathPrefix "/" when no matches are specified (Gateway API §4.1).
             let apply = |pb: &mut HostRouterBuilder| match rule.matches.as_deref() {
                 None | Some([]) => {
                     let filters = Self::build_filters(rule_filters, "/", false);
-                    let e = Arc::new(RouteEntry::with_filters(
+                    let mut e = RouteEntry::with_filters(
                         Arc::clone(&upstream),
                         MatchPredicates::default(),
                         filters,
                         rule_timeouts.clone(),
                         route_id.clone(),
                         created_at,
-                    ));
-                    pb.add_prefix_route("/", e);
+                    );
+                    e.error_status = error_status;
+                    pb.add_prefix_route("/", Arc::new(e));
                 }
                 Some(ms) => {
                     for m in ms {
@@ -241,25 +251,26 @@ impl GatewayApiReconciler {
                         );
                         let filters = Self::build_filters(rule_filters, val, is_prefix);
 
-                        let e = Arc::new(RouteEntry::with_filters(
+                        let mut e = RouteEntry::with_filters(
                             Arc::clone(&upstream),
                             predicates,
                             filters,
                             rule_timeouts.clone(),
                             route_id.clone(),
                             created_at,
-                        ));
+                        );
+                        e.error_status = error_status;
 
                         match m.path.as_ref().and_then(|p| p.r#type.as_ref()) {
                             Some(HttpRouteRulesMatchesPathType::Exact) => {
-                                pb.add_exact_route(val, e);
+                                pb.add_exact_route(val, Arc::new(e));
                             }
                             Some(HttpRouteRulesMatchesPathType::RegularExpression) => {
-                                pb.add_regex_route(val, e);
+                                pb.add_regex_route(val, Arc::new(e));
                             }
                             // PathPrefix is the default per spec
                             _ => {
-                                pb.add_prefix_route(val, e);
+                                pb.add_prefix_route(val, Arc::new(e));
                             }
                         }
                     }

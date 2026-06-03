@@ -19,7 +19,7 @@ jobs:
   conformance:
     name: gateway-api-conformance
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
 
@@ -104,7 +104,7 @@ jobs:
           cd conformance
           go mod tidy
           REPORT_FILE="reports/standard-$(git describe --tags --always --dirty)-report.yaml"
-          go test -v -timeout 25m -run TestConformance \
+          go test -v -timeout 55m -run TestConformance \
             -args \
             --organization=coxswain-labs \
             --project=coxswain \

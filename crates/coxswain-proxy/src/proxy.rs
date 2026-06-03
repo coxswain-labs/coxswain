@@ -191,6 +191,14 @@ impl ProxyHttp for Proxy {
 
         let (upstream, filters, route_timeouts) = match self.engine.find(&host, &path, &route_ctx) {
             RouteOutcome::Found(u, f, t) => (u, f, t),
+            RouteOutcome::Error(status) => {
+                let resp = ResponseHeader::build(status, Some(0))?;
+                session
+                    .write_response_header(Box::new(resp), true)
+                    .await
+                    .unwrap_or_else(|e| tracing::error!("failed to write error response: {e}"));
+                return Ok(true);
+            }
             RouteOutcome::NoHost => {
                 return Err(pingora_core::Error::explain(
                     HTTPStatus(503),

@@ -232,6 +232,9 @@ pub struct RouteEntry {
     /// Creation timestamp — older routes win ties after predicate-count comparison.
     /// `None` sorts last.
     pub created_at: Option<SystemTime>,
+    /// When `Some`, the proxy returns this status code immediately without contacting upstream.
+    /// Used for routes with invalid/missing/forbidden backend refs (Gateway API §4.3.4).
+    pub error_status: Option<u16>,
 }
 
 impl RouteEntry {
@@ -248,6 +251,7 @@ impl RouteEntry {
             timeouts: RouteTimeouts::default(),
             route_id,
             created_at,
+            error_status: None,
         }
     }
 
@@ -265,6 +269,7 @@ impl RouteEntry {
             timeouts: RouteTimeouts::default(),
             route_id,
             created_at,
+            error_status: None,
         }
     }
 
@@ -284,6 +289,7 @@ impl RouteEntry {
             timeouts,
             route_id,
             created_at,
+            error_status: None,
         }
     }
 }
@@ -363,11 +369,7 @@ impl HostRouter {
     /// Checks matchit exact/prefix routes first, then the regex fallback.
     /// Within each path slot, candidates are evaluated in specificity order;
     /// the first candidate whose predicates all pass is returned.
-    pub fn route(
-        &self,
-        path: &str,
-        ctx: &RequestContext<'_>,
-    ) -> Option<(Arc<Upstream>, Arc<[FilterAction]>, RouteTimeouts)> {
+    pub fn route(&self, path: &str, ctx: &RequestContext<'_>) -> Option<RouteMatch> {
         if let Ok(m) = self.router.at(path) {
             for entry in m.value.iter() {
                 if entry.predicates.matches(ctx) {
@@ -375,6 +377,7 @@ impl HostRouter {
                         Arc::clone(&entry.upstream),
                         Arc::clone(&entry.filters),
                         entry.timeouts.clone(),
+                        entry.error_status,
                     ));
                 }
             }
@@ -389,6 +392,7 @@ impl HostRouter {
                             Arc::clone(&entry.upstream),
                             Arc::clone(&entry.filters),
                             entry.timeouts.clone(),
+                            entry.error_status,
                         ));
                     }
                 }
@@ -646,9 +650,19 @@ impl RoutingTableBuilder {
     }
 }
 
+/// Return type of `HostRouter::route`: upstream + filters + timeouts + optional error status.
+type RouteMatch = (
+    Arc<Upstream>,
+    Arc<[FilterAction]>,
+    RouteTimeouts,
+    Option<u16>,
+);
+
 /// Result of a two-level host+path routing lookup.
 pub enum RouteOutcome {
     Found(Arc<Upstream>, Arc<[FilterAction]>, RouteTimeouts),
+    /// Route matched but backend is invalid/missing/forbidden — return this status immediately.
+    Error(u16),
     /// No entry for this hostname (host is not registered at this proxy).
     NoHost,
     /// Host is registered but no path rule matched (or path matched but predicates failed).
@@ -684,11 +698,14 @@ impl RoutingTable {
                 .map(|(_, r)| r)
         };
         if let Some(router) = host_router
-            && let Some((upstream, _, _)) = router.route(path, ctx)
+            && let Some((upstream, _, _, _)) = router.route(path, ctx)
         {
             return Some(upstream);
         }
-        self.catchall.as_ref()?.route(path, ctx).map(|(u, _, _)| u)
+        self.catchall
+            .as_ref()?
+            .route(path, ctx)
+            .map(|(u, _, _, _)| u)
     }
 
     /// Like [`route`] but distinguishes "host not registered" from "path not matched",
@@ -708,7 +725,8 @@ impl RoutingTable {
             return RouteOutcome::NoHost;
         };
         match router.route(path, ctx) {
-            Some((u, f, t)) => RouteOutcome::Found(u, f, t),
+            Some((_, _, _, Some(status))) => RouteOutcome::Error(status),
+            Some((u, f, t, None)) => RouteOutcome::Found(u, f, t),
             None => RouteOutcome::NoPath,
         }
     }

@@ -315,7 +315,7 @@ fn listener_route_kind_info(
         let is_http_route = k.kind == "HTTPRoute"
             && k.group
                 .as_deref()
-                .map_or(true, |g| g.is_empty() || g == HTTP_ROUTE_GROUP);
+                .is_none_or(|g| g.is_empty() || g == HTTP_ROUTE_GROUP);
         if is_http_route {
             includes_http_route = true;
         } else {

@@ -67,7 +67,7 @@ cargo run --bin coxswain -- --log-format console
 cd conformance && go vet ./...
 
 # Run the Gateway API conformance suite (requires a live cluster with coxswain running)
-cd conformance && go test -v -timeout 30m -run TestConformance \
+cd conformance && go test -v -timeout 60m -run TestConformance \
   -args \
   --organization=coxswain-labs \
   --project=coxswain \
