@@ -1,4 +1,5 @@
 use super::*;
+use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::RoutingTableBuilder;
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
@@ -47,20 +48,20 @@ fn empty_svc_store() -> reflector::Store<Service> {
     reflector::store::Writer::<Service>::default().as_reader()
 }
 
-fn owned(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
+fn owned(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {
     pairs
         .iter()
-        .map(|(ns, name)| (ns.to_string(), name.to_string()))
+        .map(|(ns, name)| ObjectKey::new(*ns, *name))
         .collect()
 }
 
 /// Default owned set used by tests that exercise routing logic (not filtering).
-fn default_owned() -> HashSet<(String, String)> {
+fn default_owned() -> HashSet<ObjectKey> {
     owned(&[("default", "gw")])
 }
 
 /// Empty listener-hostname map for tests that don't exercise hostname scoping.
-fn no_listeners() -> HashMap<(String, String, String), String> {
+fn no_listeners() -> HashMap<ListenerKey, String> {
     HashMap::new()
 }
 
@@ -979,15 +980,10 @@ fn make_listener_hostnames(
     gw_ns: &str,
     gw_name: &str,
     listeners: &[(&str, &str)],
-) -> HashMap<(String, String, String), String> {
+) -> HashMap<ListenerKey, String> {
     listeners
         .iter()
-        .map(|(ln, h)| {
-            (
-                (gw_ns.to_string(), gw_name.to_string(), ln.to_string()),
-                h.to_string(),
-            )
-        })
+        .map(|(ln, h)| (ListenerKey::new(gw_ns, gw_name, *ln), h.to_string()))
         .collect()
 }
 

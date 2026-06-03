@@ -1,9 +1,10 @@
+use crate::keys::RouteParentKey;
 use crate::tls::{
     GatewayListenerHealth, HttpRouteHealthMap, RouteParentHealth, SharedGatewayListenerHealth,
     SharedHttpRouteHealth,
 };
 use async_trait::async_trait;
-use coxswain_core::ownership::OwnedGateways;
+use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
@@ -139,11 +140,11 @@ impl Controller {
         // Names of IngressClass resources whose spec.controller matches ours.
         let mut owned_ingress_classes: HashSet<String> = HashSet::new();
 
-        // Local cache of known Gateway objects, keyed by (namespace, name).
-        let mut known_gateways: HashMap<(String, String), Gateway> = HashMap::new();
+        // Local cache of known Gateway objects.
+        let mut known_gateways: HashMap<ObjectKey, Gateway> = HashMap::new();
 
-        // Local cache of known HTTPRoute objects, keyed by (namespace, name).
-        let mut known_routes: HashMap<(String, String), HTTPRoute> = HashMap::new();
+        // Local cache of known HTTPRoute objects.
+        let mut known_routes: HashMap<ObjectKey, HTTPRoute> = HashMap::new();
 
         // interval_at delays the first tick so we don't double-acquire immediately.
         let mut renewal_interval = tokio::time::interval_at(
@@ -177,7 +178,7 @@ impl Controller {
                         Ok(watcher::Event::Apply(route) | watcher::Event::InitApply(route)) => {
                             let ns = route.metadata.namespace.clone().unwrap_or_default();
                             let name = route.metadata.name.clone().unwrap_or_default();
-                            known_routes.insert((ns, name), route.clone());
+                            known_routes.insert(ObjectKey::new(ns, name), route.clone());
                             let owned = self.owned_gateways.load();
                             if is_leader
                                 && !http_route_programmed(
@@ -200,7 +201,7 @@ impl Controller {
                         Ok(watcher::Event::Delete(route)) => {
                             let ns = route.metadata.namespace.clone().unwrap_or_default();
                             let name = route.metadata.name.clone().unwrap_or_default();
-                            known_routes.remove(&(ns, name));
+                            known_routes.remove(&ObjectKey::new(ns, name));
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(
@@ -253,12 +254,12 @@ impl Controller {
                             }
                             let ns = gw.metadata.namespace.clone().unwrap_or_default();
                             let name = gw.metadata.name.clone().unwrap_or_default();
-                            known_gateways.insert((ns, name), gw.clone());
+                            known_gateways.insert(ObjectKey::new(ns, name), gw.clone());
 
                             let synced = self.synced.load(Ordering::Acquire);
                             if is_leader && synced {
                                 let health_map = self.tls_health.load();
-                                let key = (
+                                let key = ObjectKey::new(
                                     gw.metadata.namespace.clone().unwrap_or_default(),
                                     gw.metadata.name.clone().unwrap_or_default(),
                                 );
@@ -280,7 +281,7 @@ impl Controller {
                         Ok(watcher::Event::Delete(gw)) => {
                             let ns = gw.metadata.namespace.clone().unwrap_or_default();
                             let name = gw.metadata.name.clone().unwrap_or_default();
-                            known_gateways.remove(&(ns, name));
+                            known_gateways.remove(&ObjectKey::new(ns, name));
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "Gateway watch error"),
@@ -292,12 +293,12 @@ impl Controller {
                         continue;
                     }
                     let health_map = self.tls_health.load();
-                    for ((ns, name), gw) in &known_gateways {
+                    for (key, gw) in &known_gateways {
                         if !owned_gateway_classes.contains(&gw.spec.gateway_class_name) {
                             continue;
                         }
                         let health = health_map
-                            .get(&(ns.clone(), name.clone()))
+                            .get(key)
                             .cloned()
                             .unwrap_or_default();
                         if gateway_needs_status_patch(gw, &health) {
@@ -437,7 +438,7 @@ impl Controller {
         client: &Client,
         route: &HTTPRoute,
         controller_name: &str,
-        owned_gateways: &HashSet<(String, String)>,
+        owned_gateways: &HashSet<ObjectKey>,
         route_health: &HttpRouteHealthMap,
     ) {
         let name = match route.metadata.name.as_deref() {
@@ -466,13 +467,7 @@ impl Controller {
             .map(|p| {
                 let gw_ns = p.namespace.as_deref().unwrap_or(ns);
                 let section = p.section_name.as_deref().unwrap_or("").to_string();
-                let health_key = (
-                    ns.to_string(),
-                    name.to_string(),
-                    gw_ns.to_string(),
-                    p.name.clone(),
-                    section,
-                );
+                let health_key = RouteParentKey::new(ns, name, gw_ns, &p.name, section);
                 let health = route_health.get(&health_key).unwrap_or(&default_health);
 
                 let (acc_status, acc_reason) = if health.accepted {
@@ -595,10 +590,10 @@ mod tests {
         }
     }
 
-    fn owned(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
+    fn owned(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {
         pairs
             .iter()
-            .map(|(ns, name)| (ns.to_string(), name.to_string()))
+            .map(|(ns, name)| ObjectKey::new(*ns, *name))
             .collect()
     }
 

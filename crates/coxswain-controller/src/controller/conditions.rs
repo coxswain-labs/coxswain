@@ -1,4 +1,4 @@
-use coxswain_core::ownership;
+use coxswain_core::ownership::{self, ObjectKey};
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::{HTTPRoute, HttpRouteParentRefs};
@@ -64,7 +64,7 @@ pub(super) fn gateway_programmed(gw: &Gateway) -> bool {
 pub(super) fn http_route_programmed(
     route: &HTTPRoute,
     controller_name: &str,
-    owned_gateways: &HashSet<(String, String)>,
+    owned_gateways: &HashSet<ObjectKey>,
 ) -> bool {
     let default_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     let expected_gen = route.metadata.generation.unwrap_or(0);
@@ -99,7 +99,7 @@ pub(super) fn http_route_programmed(
 pub(super) fn filter_owned_parent_refs(
     parent_refs: &[HttpRouteParentRefs],
     default_ns: &str,
-    owned_gateways: &HashSet<(String, String)>,
+    owned_gateways: &HashSet<ObjectKey>,
 ) -> Vec<HttpRouteParentRefs> {
     parent_refs
         .iter()

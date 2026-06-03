@@ -9,6 +9,9 @@ publish = false
 name = "coxswain_e2e"
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 futures.workspace = true

@@ -1,6 +1,8 @@
 use crate::gateway_api::hostnames::hostnames_intersect;
+use crate::keys::RouteParentKey;
 use crate::tls::{HttpRouteHealthMap, RouteParentHealth};
-use coxswain_core::reference_grants;
+use coxswain_core::ownership::ObjectKey;
+use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use gateway_api::apis::standard::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom};
 use gateway_api::apis::standard::httproutes::{HTTPRoute, HttpRouteRulesFiltersType};
 use k8s_openapi::api::core::v1::Service;
@@ -8,10 +10,22 @@ use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// `(listener_name, hostname, port)` stripped of the `allows_all` flag; passed to
-/// `compute_accepted` where cross-namespace checks are already done.
-type ListenerHnEntry = (String, String, u16);
-type ListenerHnMap = HashMap<(String, String), Vec<ListenerHnEntry>>;
+struct ListenerEntry {
+    name: String,
+    hostname: String,
+    allows_all: bool,
+    port: u16,
+}
+
+/// `(listener_name, hostname, port)` — used by `compute_accepted` once cross-namespace
+/// checks are already resolved.
+struct ListenerHnEntry {
+    name: String,
+    hostname: String,
+    port: u16,
+}
+
+type ListenerHnMap = HashMap<ObjectKey, Vec<ListenerHnEntry>>;
 
 /// Computes `Accepted` and `ResolvedRefs` health for every (route, parent) pair
 /// that references an owned gateway. Called during the reconciler's rebuild so the
@@ -19,23 +33,21 @@ type ListenerHnMap = HashMap<(String, String), Vec<ListenerHnEntry>>;
 pub(super) fn compute_route_health(
     routes: &[Arc<HTTPRoute>],
     gateways: &[Arc<Gateway>],
-    owned_gateways: &HashSet<(String, String)>,
-    backend_grants: &HashSet<(String, String, Option<String>)>,
+    owned_gateways: &HashSet<ObjectKey>,
+    backend_grants: &HashSet<ReferenceGrantKey>,
     service_store: &reflector::Store<Service>,
 ) -> HttpRouteHealthMap {
-    // (listener_name, hostname, allows_all_ns, port)
-    type ListenerInfo = Vec<(String, String, bool, u16)>;
-    // Build listener info map: (gw_ns, gw_name) → ListenerInfo
-    // allows_all_ns = true when allowedRoutes.namespaces.from is All or Selector (not Same).
-    let gw_listeners: HashMap<(String, String), ListenerInfo> = gateways
+    // Build listener info map: ObjectKey(gw_ns, gw_name) → Vec<ListenerEntry>
+    let gw_listeners: HashMap<ObjectKey, Vec<ListenerEntry>> = gateways
         .iter()
         .filter_map(|gw| {
             let ns = gw.metadata.namespace.as_deref()?.to_string();
             let name = gw.metadata.name.as_deref()?.to_string();
-            if !owned_gateways.contains(&(ns.clone(), name.clone())) {
+            let key = ObjectKey::new(&ns, &name);
+            if !owned_gateways.contains(&key) {
                 return None;
             }
-            let listeners: Vec<(String, String, bool, u16)> = gw
+            let listeners = gw
                 .spec
                 .listeners
                 .iter()
@@ -47,15 +59,15 @@ pub(super) fn compute_route_health(
                         .and_then(|ns| ns.from.as_ref())
                         .map(|f| !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same))
                         .unwrap_or(false);
-                    (
-                        l.name.clone(),
-                        l.hostname.as_deref().unwrap_or("").to_string(),
+                    ListenerEntry {
+                        name: l.name.clone(),
+                        hostname: l.hostname.as_deref().unwrap_or("").to_string(),
                         allows_all,
-                        l.port as u16,
-                    )
+                        port: l.port as u16,
+                    }
                 })
                 .collect();
-            Some(((ns, name), listeners))
+            Some((key, listeners))
         })
         .collect();
 
@@ -76,20 +88,15 @@ pub(super) fn compute_route_health(
         for pr in route.spec.parent_refs.as_deref().unwrap_or(&[]) {
             let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
             let gw_name = pr.name.as_str();
-            let gw_key = (gw_ns.to_string(), gw_name.to_string());
+            let gw_key = ObjectKey::new(gw_ns, gw_name);
 
             if !owned_gateways.contains(&gw_key) {
                 continue;
             }
 
             let section = pr.section_name.as_deref().unwrap_or("").to_string();
-            let health_key = (
-                route_ns.to_string(),
-                route_name.to_string(),
-                gw_ns.to_string(),
-                gw_name.to_string(),
-                section.clone(),
-            );
+            let health_key =
+                RouteParentKey::new(route_ns, route_name, gw_ns, gw_name, section.clone());
 
             // Cross-namespace check: reject routes whose namespace is not allowed by the
             // listener. Default per spec is Same (only same namespace); must be All or
@@ -99,11 +106,9 @@ pub(super) fn compute_route_health(
                     let relevant: Vec<_> = if section.is_empty() {
                         ls.iter().collect()
                     } else {
-                        ls.iter()
-                            .filter(|(n, _, _, _)| n.as_str() == section)
-                            .collect()
+                        ls.iter().filter(|l| l.name.as_str() == section).collect()
                     };
-                    !relevant.is_empty() && relevant.iter().all(|(_, _, allows, _)| !allows)
+                    !relevant.is_empty() && relevant.iter().all(|l| !l.allows_all)
                 });
                 if blocked {
                     map.insert(
@@ -119,14 +124,18 @@ pub(super) fn compute_route_health(
                 }
             }
 
-            // Strip allows_all bool, keep port for port-matching check.
+            // Strip allows_all, keep name/hostname/port for compute_accepted.
             let listeners_hn: ListenerHnMap = std::iter::once((
                 gw_key.clone(),
                 gw_listeners
                     .get(&gw_key)
                     .map(|ls| {
                         ls.iter()
-                            .map(|(n, h, _, p)| (n.clone(), h.clone(), *p))
+                            .map(|l| ListenerHnEntry {
+                                name: l.name.clone(),
+                                hostname: l.hostname.clone(),
+                                port: l.port,
+                            })
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -168,7 +177,7 @@ fn compute_accepted(
     route_hostnames: &[&str],
     section_name: &str,
     port: Option<u16>,
-    gw_key: &(String, String),
+    gw_key: &ObjectKey,
     gw_listeners: &ListenerHnMap,
 ) -> (bool, &'static str) {
     let Some(listeners) = gw_listeners.get(gw_key) else {
@@ -176,22 +185,21 @@ fn compute_accepted(
     };
 
     if !section_name.is_empty() {
-        let matching: Vec<&(String, String, u16)> = listeners
+        let matching: Vec<&ListenerHnEntry> = listeners
             .iter()
-            .filter(|(n, _, _)| n == section_name)
+            .filter(|l| l.name == section_name)
             .collect();
         if matching.is_empty() {
             return (false, "NoMatchingParent");
         }
-        // parentRef.port must match the named listener's port when specified.
         if let Some(p) = port
-            && !matching.iter().any(|(_, _, lp)| *lp == p)
+            && !matching.iter().any(|l| l.port == p)
         {
             return (false, "NoMatchingParent");
         }
         let intersects = matching
             .iter()
-            .any(|(_, hn, _)| hostnames_intersect(route_hostnames, hn));
+            .any(|l| hostnames_intersect(route_hostnames, &l.hostname));
         return if intersects {
             (true, "Accepted")
         } else {
@@ -199,9 +207,8 @@ fn compute_accepted(
         };
     }
 
-    // No sectionName: filter candidate listeners by port first (if specified).
-    let port_filtered: Vec<&(String, String, u16)> = if let Some(p) = port {
-        listeners.iter().filter(|(_, _, lp)| *lp == p).collect()
+    let port_filtered: Vec<&ListenerHnEntry> = if let Some(p) = port {
+        listeners.iter().filter(|l| l.port == p).collect()
     } else {
         listeners.iter().collect()
     };
@@ -212,7 +219,7 @@ fn compute_accepted(
 
     let intersects = port_filtered
         .iter()
-        .any(|(_, hn, _)| hostnames_intersect(route_hostnames, hn));
+        .any(|l| hostnames_intersect(route_hostnames, &l.hostname));
     if intersects {
         (true, "Accepted")
     } else {
@@ -225,11 +232,10 @@ fn compute_accepted(
 pub(super) fn check_backend_refs(
     route: &HTTPRoute,
     route_ns: &str,
-    backend_grants: &HashSet<(String, String, Option<String>)>,
+    backend_grants: &HashSet<ReferenceGrantKey>,
     service_store: &reflector::Store<Service>,
 ) -> (bool, &'static str) {
     for rule in route.spec.rules.as_deref().unwrap_or(&[]) {
-        // Rules with RequestRedirect don't need backends
         let has_redirect = rule
             .filters
             .as_deref()
@@ -244,21 +250,18 @@ pub(super) fn check_backend_refs(
             let b_kind = b.kind.as_deref().unwrap_or("Service");
             let b_group = b.group.as_deref().unwrap_or("");
 
-            // Unsupported kind/group
             if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
                 return (false, "InvalidKind");
             }
 
             let b_ns = b.namespace.as_deref().unwrap_or(route_ns);
 
-            // Cross-namespace ref requires a ReferenceGrant
             if b_ns != route_ns
                 && !reference_grants::backend_ref_allowed(route_ns, b_ns, &b.name, backend_grants)
             {
                 return (false, "RefNotPermitted");
             }
 
-            // Service must exist in the store
             if b.port.is_some() {
                 let svc_key = reflector::ObjectRef::<Service>::new(&b.name).within(b_ns);
                 if service_store.get(&svc_key).is_none() {

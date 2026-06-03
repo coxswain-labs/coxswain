@@ -6,6 +6,9 @@ authors.workspace = true
 description.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 arc-swap = { workspace = true }
 tracing = { workspace = true }

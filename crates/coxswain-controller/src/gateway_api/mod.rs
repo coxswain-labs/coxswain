@@ -1,8 +1,9 @@
 use crate::endpoints;
+use crate::keys::ListenerKey;
 use crate::tls::{GatewayListenerHealth, HttpRouteHealthMap, ListenerTlsOutcome, load_tls_cert};
 use crate::translate::metadata_created_at;
-use coxswain_core::ownership::parent_ref_owned;
-use coxswain_core::reference_grants;
+use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
+use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     HostRouterBuilder, MatchPredicates, RouteEntry, RoutingTableBuilder, Upstream,
 };
@@ -43,9 +44,9 @@ impl GatewayApiReconciler {
         route: &HTTPRoute,
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
-        owned_gateways: &HashSet<(String, String)>,
-        grants: &HashSet<(String, String, Option<String>)>,
-        listener_hostnames: &HashMap<(String, String, String), String>,
+        owned_gateways: &HashSet<ObjectKey>,
+        grants: &HashSet<ReferenceGrantKey>,
+        listener_hostnames: &HashMap<ListenerKey, String>,
         builder: &mut RoutingTableBuilder,
     ) {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -199,7 +200,7 @@ impl GatewayApiReconciler {
     pub fn reconcile_tls(
         gateway: &Gateway,
         secrets: &reflector::Store<Secret>,
-        cert_grants: &HashSet<(String, String, Option<String>)>,
+        cert_grants: &HashSet<ReferenceGrantKey>,
         builder: &mut TlsStoreBuilder,
     ) -> GatewayListenerHealth {
         let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
@@ -243,7 +244,7 @@ impl GatewayApiReconciler {
         gw_name: &str,
         listener: &gateway_api::apis::standard::gateways::GatewayListeners,
         secrets: &reflector::Store<Secret>,
-        cert_grants: &HashSet<(String, String, Option<String>)>,
+        cert_grants: &HashSet<ReferenceGrantKey>,
         builder: &mut TlsStoreBuilder,
     ) -> ListenerTlsOutcome {
         let tls = match &listener.tls {
@@ -339,7 +340,7 @@ impl GatewayApiReconciler {
         route_ns: &str,
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
-        grants: &HashSet<(String, String, Option<String>)>,
+        grants: &HashSet<ReferenceGrantKey>,
     ) -> Vec<SocketAddr> {
         backend_refs
             .iter()
@@ -370,8 +371,8 @@ impl GatewayApiReconciler {
     pub fn compute_route_health(
         routes: &[Arc<HTTPRoute>],
         gateways: &[Arc<Gateway>],
-        owned_gateways: &HashSet<(String, String)>,
-        backend_grants: &HashSet<(String, String, Option<String>)>,
+        owned_gateways: &HashSet<ObjectKey>,
+        backend_grants: &HashSet<ReferenceGrantKey>,
         service_store: &reflector::Store<Service>,
     ) -> HttpRouteHealthMap {
         status::compute_route_health(
@@ -391,7 +392,7 @@ fn compute_effective_hostnames(
     route_hostnames: &[&str],
     parent_refs: &[gateway_api::apis::standard::httproutes::HttpRouteParentRefs],
     route_ns: &str,
-    listener_hostnames: &HashMap<(String, String, String), String>,
+    listener_hostnames: &HashMap<ListenerKey, String>,
 ) -> (bool, Vec<String>) {
     let mut use_catchall = false;
     let mut eff_set: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -410,7 +411,7 @@ fn compute_effective_hostnames(
 
             // Collect listener hostnames for this parentRef (specific or all).
             let l_hosts: Vec<&str> = if let Some(sn) = pr.section_name.as_deref() {
-                let key = (gw_ns.to_string(), gw_name.to_string(), sn.to_string());
+                let key = ListenerKey::new(gw_ns, gw_name, sn);
                 listener_hostnames
                     .get(&key)
                     .map(|h| h.as_str())
@@ -419,7 +420,7 @@ fn compute_effective_hostnames(
             } else {
                 listener_hostnames
                     .iter()
-                    .filter(|((ns, n, _), _)| ns == gw_ns && n == gw_name)
+                    .filter(|(k, _)| k.gw_ns == gw_ns && k.gw_name == gw_name)
                     .map(|(_, h)| h.as_str())
                     .collect()
             };
@@ -475,14 +476,14 @@ fn compute_effective_hostnames(
                 let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
                 let gw_name = pr.name.as_str();
                 let our_spec = listener_hostnames
-                    .get(&(gw_ns.to_string(), gw_name.to_string(), our_sn.to_string()))
+                    .get(&ListenerKey::new(gw_ns, gw_name, our_sn))
                     .map(|h| hostnames::listener_specificity(h))
                     .unwrap_or(0);
                 let e_is_wildcard = e.starts_with("*.");
-                listener_hostnames.iter().any(|((ns, gw, ln), h_other)| {
-                    ns == gw_ns
-                        && gw == gw_name
-                        && ln.as_str() != our_sn
+                listener_hostnames.iter().any(|(k, h_other)| {
+                    k.gw_ns == gw_ns
+                        && k.gw_name == gw_name
+                        && k.listener.as_str() != our_sn
                         && hostnames::listener_specificity(h_other) > our_spec
                         && if e_is_wildcard {
                             // Wildcard E is dominated only by an identical wildcard listener.

@@ -1,8 +1,10 @@
 use crate::gateway_api::hostnames_intersect;
+use crate::keys::ListenerKey;
 use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth};
 use crate::{endpoints, gateway_api::GatewayApiReconciler, ingress::IngressReconciler};
 use async_trait::async_trait;
-use coxswain_core::ownership::OwnedGateways;
+use coxswain_core::ownership::{ObjectKey, OwnedGateways};
+use coxswain_core::reference_grants::ReferenceGrantKey;
 use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, SharedRoutingTable, Upstream};
 use coxswain_core::tls::{SharedTlsStore, TlsStoreBuilder};
 use futures::StreamExt;
@@ -414,7 +416,7 @@ fn compute_ownership(
     gateway_store: &reflector::Store<Gateway>,
     controller_name: &str,
     owned_gateways_handle: &OwnedGateways,
-) -> (HashSet<String>, HashSet<String>, HashSet<(String, String)>) {
+) -> (HashSet<String>, HashSet<String>, HashSet<ObjectKey>) {
     let owned_ingress_classes: HashSet<String> = class_store
         .state()
         .into_iter()
@@ -431,14 +433,14 @@ fn compute_ownership(
         .filter_map(|gc| gc.metadata.name.clone())
         .collect();
 
-    let owned_gateways: HashSet<(String, String)> = gateway_store
+    let owned_gateways: HashSet<ObjectKey> = gateway_store
         .state()
         .into_iter()
         .filter(|g| owned_gateway_classes.contains(&g.spec.gateway_class_name))
         .filter_map(|g| {
             let ns = g.metadata.namespace.clone()?;
             let name = g.metadata.name.clone()?;
-            Some((ns, name))
+            Some(ObjectKey::new(ns, name))
         })
         .collect();
 
@@ -446,7 +448,7 @@ fn compute_ownership(
     (owned_ingress_classes, owned_gateway_classes, owned_gateways)
 }
 
-type GrantSet = HashSet<(String, String, Option<String>)>;
+type GrantSet = HashSet<ReferenceGrantKey>;
 
 /// Flatten `ReferenceGrant` objects into two O(1) sets for cross-namespace ref checks:
 /// - `backend_grants`: HTTPRoute → Service (used by `GatewayApiReconciler::reconcile`)
@@ -479,7 +481,12 @@ fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
                     to_entries
                         .clone()
                         .into_iter()
-                        .map(move |to_name| (from_ns.clone(), to_ns.clone(), to_name))
+                        .map(move |to_name| match to_name {
+                            Some(name) => {
+                                ReferenceGrantKey::specific(from_ns.clone(), to_ns.clone(), name)
+                            }
+                            None => ReferenceGrantKey::wildcard(from_ns.clone(), to_ns.clone()),
+                        })
                 })
             })
             .collect()
@@ -496,7 +503,7 @@ fn build_routes(
     routes: &[Arc<HTTPRoute>],
     ingresses: &[Arc<Ingress>],
     owned_ingress_classes: &HashSet<String>,
-    owned_gateways: &HashSet<(String, String)>,
+    owned_gateways: &HashSet<ObjectKey>,
     backend_grants: &GrantSet,
     gateway_store: &reflector::Store<Gateway>,
     owned_gateway_classes: &HashSet<String>,
@@ -505,9 +512,9 @@ fn build_routes(
     ingress_default_backend: Option<&IngressDefaultBackend>,
     shared: &SharedRoutingTable,
 ) {
-    // Precompute (gw_ns, gw_name, listener_name) → hostname so reconcile() can scope
-    // routes without spec.hostnames to their parent listener's hostname.
-    let listener_hostname_map: HashMap<(String, String, String), String> = gateway_store
+    // Precompute ListenerKey → hostname so reconcile() can scope routes without
+    // spec.hostnames to their parent listener's hostname.
+    let listener_hostname_map: HashMap<ListenerKey, String> = gateway_store
         .state()
         .into_iter()
         .filter(|g| owned_gateway_classes.contains(&g.spec.gateway_class_name))
@@ -519,7 +526,7 @@ fn build_routes(
                 .iter()
                 .map(|l| {
                     (
-                        (ns.clone(), name.clone(), l.name.clone()),
+                        ListenerKey::new(ns.clone(), name.clone(), l.name.clone()),
                         l.hostname.clone().unwrap_or_default(),
                     )
                 })
@@ -610,7 +617,7 @@ fn build_tls(
     cert_grants: &GrantSet,
     secret_store: &reflector::Store<Secret>,
     tls_shared: &SharedTlsStore,
-) -> HashMap<(String, String), GatewayListenerHealth> {
+) -> HashMap<ObjectKey, GatewayListenerHealth> {
     let mut tls_builder = TlsStoreBuilder::new();
     for ingress in ingresses {
         IngressReconciler::reconcile_tls(
@@ -621,7 +628,7 @@ fn build_tls(
         );
     }
 
-    let mut gateway_tls_health: HashMap<(String, String), GatewayListenerHealth> = HashMap::new();
+    let mut gateway_tls_health: HashMap<ObjectKey, GatewayListenerHealth> = HashMap::new();
     for gw in gateway_store.state() {
         if !owned_gateway_classes.contains(&gw.spec.gateway_class_name) {
             continue;
@@ -630,7 +637,7 @@ fn build_tls(
         let name = gw.metadata.name.clone().unwrap_or_default();
         let health =
             GatewayApiReconciler::reconcile_tls(&gw, secret_store, cert_grants, &mut tls_builder);
-        gateway_tls_health.insert((ns, name), health);
+        gateway_tls_health.insert(ObjectKey::new(ns, name), health);
     }
 
     let tls_store = tls_builder.build();
@@ -650,8 +657,8 @@ fn build_tls(
 /// intersects with the route's hostnames. Only owned gateways are counted.
 fn count_attached_routes(
     routes: &[Arc<HTTPRoute>],
-    owned_gateways: &HashSet<(String, String)>,
-    gateway_tls_health: &mut HashMap<(String, String), GatewayListenerHealth>,
+    owned_gateways: &HashSet<ObjectKey>,
+    gateway_tls_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
 ) {
     for route in routes {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -667,7 +674,7 @@ fn count_attached_routes(
         for pr in route.spec.parent_refs.as_deref().unwrap_or(&[]) {
             let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
             let gw_name = pr.name.as_str();
-            let key = (gw_ns.to_string(), gw_name.to_string());
+            let key = ObjectKey::new(gw_ns, gw_name);
             if !owned_gateways.contains(&key) {
                 continue;
             }

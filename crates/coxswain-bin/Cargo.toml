@@ -10,6 +10,9 @@ license.workspace = true
 name = "coxswain"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = { workspace = true }
 coxswain-core = { workspace = true }
