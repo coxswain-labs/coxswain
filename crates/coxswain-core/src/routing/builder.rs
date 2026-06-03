@@ -36,6 +36,17 @@ impl RoutingTableBuilder {
         self.catchall.get_or_insert_with(HostRouterBuilder::default)
     }
 
+    /// Dispatches to `exact_host`, `wildcard_host`, or `catchall` based on `host`.
+    ///
+    /// `None` → catchall, `Some("*.foo.com")` → wildcard, `Some("foo.com")` → exact.
+    pub fn host_for(&mut self, host: Option<&str>) -> &mut HostRouterBuilder {
+        match host {
+            None => self.catchall(),
+            Some(h) if h.starts_with("*.") => self.wildcard_host(h),
+            Some(h) => self.exact_host(h),
+        }
+    }
+
     /// Compiles all registered routes into an immutable [`RoutingTable`].
     pub fn build(self) -> Result<RoutingTable, RouterError> {
         let mut conflicts: Vec<RouteConflict> = Vec::new();

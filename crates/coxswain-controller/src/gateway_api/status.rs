@@ -4,7 +4,6 @@ use coxswain_core::reference_grants;
 use gateway_api::apis::standard::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom};
 use gateway_api::apis::standard::httproutes::{HTTPRoute, HttpRouteRulesFiltersType};
 use k8s_openapi::api::core::v1::Service;
-use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -22,7 +21,6 @@ pub(super) fn compute_route_health(
     gateways: &[Arc<Gateway>],
     owned_gateways: &HashSet<(String, String)>,
     backend_grants: &HashSet<(String, String, Option<String>)>,
-    slice_store: &reflector::Store<EndpointSlice>,
     service_store: &reflector::Store<Service>,
 ) -> HttpRouteHealthMap {
     // (listener_name, hostname, allows_all_ns, port)
@@ -144,7 +142,7 @@ pub(super) fn compute_route_health(
             );
 
             let (resolved_refs, resolved_refs_reason) = if accepted {
-                check_backend_refs(route, route_ns, backend_grants, service_store, slice_store)
+                check_backend_refs(route, route_ns, backend_grants, service_store)
             } else {
                 (true, "ResolvedRefs")
             };
@@ -229,7 +227,6 @@ pub(super) fn check_backend_refs(
     route_ns: &str,
     backend_grants: &HashSet<(String, String, Option<String>)>,
     service_store: &reflector::Store<Service>,
-    _slice_store: &reflector::Store<EndpointSlice>,
 ) -> (bool, &'static str) {
     for rule in route.spec.rules.as_deref().unwrap_or(&[]) {
         // Rules with RequestRedirect don't need backends

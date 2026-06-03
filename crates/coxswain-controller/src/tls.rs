@@ -42,21 +42,11 @@ impl ListenerTlsOutcome {
         matches!(self, Self::NotApplicable | Self::Resolved)
     }
 
-    pub(crate) fn ref_not_permitted_reason() -> &'static str {
-        "RefNotPermitted"
-    }
-    pub(crate) fn invalid_cert_reason() -> &'static str {
-        "InvalidCertificateRef"
-    }
-    pub(crate) fn invalid_reason() -> &'static str {
-        "Invalid"
-    }
-
     pub(crate) fn reason(&self) -> &'static str {
         match self {
-            Self::RefNotPermitted { .. } => Self::ref_not_permitted_reason(),
-            Self::InvalidCertificateRef { .. } => Self::invalid_cert_reason(),
-            Self::Invalid { .. } => Self::invalid_reason(),
+            Self::RefNotPermitted { .. } => "RefNotPermitted",
+            Self::InvalidCertificateRef { .. } => "InvalidCertificateRef",
+            Self::Invalid { .. } => "Invalid",
             Self::NotApplicable | Self::Resolved => "Resolved",
         }
     }
@@ -88,8 +78,6 @@ pub struct GatewayListenerHealth {
     /// Used to validate parentRef.port against listener ports.
     pub listener_ports: BTreeMap<String, u16>,
 }
-
-impl GatewayListenerHealth {}
 
 struct GatewayListenerHealthInner {
     map: ArcSwap<HashMap<(String, String), GatewayListenerHealth>>,

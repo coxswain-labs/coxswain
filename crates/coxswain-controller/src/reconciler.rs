@@ -666,7 +666,6 @@ fn rebuild(
         &gateways,
         &owned_gateways,
         &backend_grants,
-        slice_store,
         service_store,
     );
     route_health_shared.store_and_notify(route_health_map);

@@ -1,5 +1,6 @@
 use crate::endpoints;
 use crate::tls::{GatewayListenerHealth, HttpRouteHealthMap, ListenerTlsOutcome, load_tls_cert};
+use crate::translate::metadata_created_at;
 use coxswain_core::ownership::parent_ref_owned;
 use coxswain_core::reference_grants;
 use coxswain_core::routing::{
@@ -50,12 +51,7 @@ impl GatewayApiReconciler {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
         let route_id = format!("{route_ns}/{route_name}");
-        let created_at: Option<SystemTime> = route
-            .metadata
-            .creation_timestamp
-            .as_ref()
-            .and_then(|t| t.0.as_millisecond().try_into().ok())
-            .map(|ms: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms));
+        let created_at = metadata_created_at(&route.metadata);
 
         // Only reconcile routes attached to at least one Gateway we manage.
         let has_owned_parent = route
@@ -376,7 +372,6 @@ impl GatewayApiReconciler {
         gateways: &[Arc<Gateway>],
         owned_gateways: &HashSet<(String, String)>,
         backend_grants: &HashSet<(String, String, Option<String>)>,
-        slice_store: &reflector::Store<EndpointSlice>,
         service_store: &reflector::Store<Service>,
     ) -> HttpRouteHealthMap {
         status::compute_route_health(
@@ -384,7 +379,6 @@ impl GatewayApiReconciler {
             gateways,
             owned_gateways,
             backend_grants,
-            slice_store,
             service_store,
         )
     }

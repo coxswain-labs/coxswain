@@ -24,24 +24,27 @@ pub(super) fn make_condition(
 }
 
 pub(super) fn has_condition(conditions: Option<&[Condition]>, type_: &str) -> bool {
+    has_condition_at_gen(conditions, type_, 0)
+}
+
+fn has_condition_at_gen(conditions: Option<&[Condition]>, type_: &str, min_gen: i64) -> bool {
     conditions
-        .map(|conds| conds.iter().any(|c| c.type_ == type_ && c.status == "True"))
+        .map(|conds| {
+            conds.iter().any(|c| {
+                c.type_ == type_
+                    && c.status == "True"
+                    && c.observed_generation.unwrap_or(0) >= min_gen
+            })
+        })
         .unwrap_or(false)
 }
 
 pub(super) fn gateway_class_accepted(gc: &GatewayClass) -> bool {
-    let generation = gc.metadata.generation.unwrap_or(0);
-    gc.status
-        .as_ref()
-        .and_then(|s| s.conditions.as_deref())
-        .map(|conds| {
-            conds.iter().any(|c| {
-                c.type_ == "Accepted"
-                    && c.status == "True"
-                    && c.observed_generation.unwrap_or(0) >= generation
-            })
-        })
-        .unwrap_or(false)
+    has_condition_at_gen(
+        gc.status.as_ref().and_then(|s| s.conditions.as_deref()),
+        "Accepted",
+        gc.metadata.generation.unwrap_or(0),
+    )
 }
 
 pub(super) fn gateway_accepted(gw: &Gateway) -> bool {
