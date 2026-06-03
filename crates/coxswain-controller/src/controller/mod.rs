@@ -1,19 +1,17 @@
 use crate::tls::{
-    GatewayListenerHealth, HttpRouteHealthMap, ListenerTlsOutcome, RouteParentHealth,
-    SharedGatewayListenerHealth, SharedHttpRouteHealth,
+    GatewayListenerHealth, HttpRouteHealthMap, RouteParentHealth, SharedGatewayListenerHealth,
+    SharedHttpRouteHealth,
 };
 use async_trait::async_trait;
-use coxswain_core::ownership::{self, OwnedGateways};
+use coxswain_core::ownership::OwnedGateways;
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
-use gateway_api::apis::standard::gateways::{
-    Gateway, GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
-};
+use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteParentRefs, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+    HTTPRoute, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
 };
 use k8s_openapi::api::networking::v1::Ingress;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
     Client,
     api::{Api, Patch, PatchParams},
@@ -23,103 +21,24 @@ use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+
+mod conditions;
+mod config;
+mod gateway_status;
+mod ingress_status;
+
+pub use config::{ControllerConfig, StatusAddress};
+
+use conditions::{
+    filter_owned_parent_refs, gateway_accepted, gateway_class_accepted, http_route_programmed,
+    make_condition,
+};
+use gateway_status::{build_gateway_status_patch, gateway_needs_status_patch};
+use ingress_status::{build_ingress_status_patch, ingress_lb_already_matches};
 
 const LEASE_NAME: &str = "coxswain-leader-lock";
-
-/// The external address written to `Ingress.status.loadBalancer.ingress[0]`
-/// and `Gateway.status.addresses[0]`.
-///
-/// Parsed from `--status-address` at startup: if the value is a valid
-/// `IpAddr` it becomes `Ip`, otherwise it is treated as a DNS hostname.
-pub enum StatusAddress {
-    Ip(IpAddr),
-    Hostname(String),
-}
-
-/// Configuration for the leader-election controller.
-///
-/// Validated on construction: `lease_renew_interval * 3` must not exceed `lease_ttl`,
-/// which keeps the renewal rate safely below the threshold where a live leader could
-/// be evicted by a standby.
-pub struct ControllerConfig {
-    pub controller_name: String,
-    pub pod_name: String,
-    pub pod_namespace: String,
-    pub lease_ttl: Duration,
-    pub lease_renew_interval: Duration,
-    /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
-    pub watch_namespace: Option<String>,
-    /// When set, the leader writes this address to every owned
-    /// `Ingress.status.loadBalancer.ingress[0]` and `Gateway.status.addresses[0]`
-    /// after each watch event.
-    pub status_address: Option<StatusAddress>,
-}
-
-impl ControllerConfig {
-    pub fn new(
-        controller_name: String,
-        pod_name: String,
-        pod_namespace: String,
-        lease_ttl: Duration,
-        lease_renew_interval: Duration,
-        watch_namespace: Option<String>,
-        status_address: Option<String>,
-    ) -> Result<Self, String> {
-        if lease_renew_interval * 3 > lease_ttl {
-            return Err(format!(
-                "lease_renew_interval ({lease_renew_interval:?}) must be at most \
-                 1/3 of lease_ttl ({lease_ttl:?})"
-            ));
-        }
-        let status_address = status_address
-            .map(|s| {
-                let s = s.trim().to_string();
-                if s.is_empty() {
-                    return Err("status_address must not be empty".to_string());
-                }
-                match s.parse::<IpAddr>() {
-                    Ok(ip) => Ok(StatusAddress::Ip(ip)),
-                    Err(_) => Ok(StatusAddress::Hostname(s)),
-                }
-            })
-            .transpose()?;
-        Ok(Self {
-            controller_name,
-            pod_name,
-            pod_namespace,
-            lease_ttl,
-            lease_renew_interval,
-            watch_namespace,
-            status_address,
-        })
-    }
-}
-
-fn ingress_lb_already_matches(ingress: &Ingress, addr: &StatusAddress) -> bool {
-    let entry = ingress
-        .status
-        .as_ref()
-        .and_then(|s| s.load_balancer.as_ref())
-        .and_then(|lb| lb.ingress.as_deref())
-        .and_then(|entries| entries.first());
-    match (entry, addr) {
-        (Some(e), StatusAddress::Ip(ip)) => e.ip.as_deref() == Some(&ip.to_string()),
-        (Some(e), StatusAddress::Hostname(h)) => e.hostname.as_deref() == Some(h.as_str()),
-        (None, _) => false,
-    }
-}
-
-fn build_ingress_status_patch(addr: &StatusAddress) -> serde_json::Value {
-    let entry = match addr {
-        StatusAddress::Ip(ip) => serde_json::json!({ "ip": ip.to_string() }),
-        StatusAddress::Hostname(h) => serde_json::json!({ "hostname": h }),
-    };
-    serde_json::json!({ "status": { "loadBalancer": { "ingress": [entry] } } })
-}
 
 fn scoped_api<T>(client: Client, ns: Option<&str>) -> Api<T>
 where
@@ -130,214 +49,6 @@ where
         Some(ns) => Api::namespaced(client, ns),
         None => Api::all(client),
     }
-}
-
-fn has_condition(conditions: Option<&[Condition]>, type_: &str) -> bool {
-    conditions
-        .map(|conds| conds.iter().any(|c| c.type_ == type_ && c.status == "True"))
-        .unwrap_or(false)
-}
-
-fn gateway_class_accepted(gc: &GatewayClass) -> bool {
-    let generation = gc.metadata.generation.unwrap_or(0);
-    gc.status
-        .as_ref()
-        .and_then(|s| s.conditions.as_deref())
-        .map(|conds| {
-            conds.iter().any(|c| {
-                c.type_ == "Accepted"
-                    && c.status == "True"
-                    && c.observed_generation.unwrap_or(0) >= generation
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn gateway_accepted(gw: &Gateway) -> bool {
-    has_condition(
-        gw.status.as_ref().and_then(|s| s.conditions.as_deref()),
-        "Accepted",
-    )
-}
-
-fn gateway_programmed(gw: &Gateway) -> bool {
-    has_condition(
-        gw.status.as_ref().and_then(|s| s.conditions.as_deref()),
-        "Programmed",
-    )
-}
-
-/// Returns true when the Gateway's current status does not yet reflect the desired
-/// state computed from `health`. Prevents redundant patches and watch-feedback loops.
-fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerHealth) -> bool {
-    if !gateway_accepted(gw) {
-        return true;
-    }
-    // Gateway-level Programmed is always True once accepted.
-    if !gateway_programmed(gw) {
-        return true;
-    }
-    // Check per-listener count matches spec.
-    let current_listener_count = gw
-        .status
-        .as_ref()
-        .and_then(|s| s.listeners.as_deref())
-        .map(|l| l.len())
-        .unwrap_or(0);
-    if current_listener_count != gw.spec.listeners.len() {
-        return true;
-    }
-    // Check each listener's ResolvedRefs condition matches desired health.
-    let current_listeners = gw
-        .status
-        .as_ref()
-        .and_then(|s| s.listeners.as_ref())
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
-    for listener in &gw.spec.listeners {
-        let (has_invalid_kinds, _) = listener_route_kind_info(listener);
-        let desired_healthy = !has_invalid_kinds
-            && health
-                .by_listener
-                .get(&listener.name)
-                .map(|o| o.is_healthy())
-                .unwrap_or(true);
-        let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);
-        let current_resolved = current_listener
-            .map(|sl| has_condition(Some(sl.conditions.as_slice()), "ResolvedRefs"))
-            .unwrap_or(false);
-        if desired_healthy != current_resolved {
-            return true;
-        }
-        let desired_attached = health
-            .attached_routes
-            .get(&listener.name)
-            .copied()
-            .unwrap_or(0);
-        let current_attached = current_listener.map(|sl| sl.attached_routes).unwrap_or(0);
-        if desired_attached != current_attached {
-            return true;
-        }
-    }
-    false
-}
-
-fn http_route_programmed(
-    route: &HTTPRoute,
-    controller_name: &str,
-    owned_gateways: &HashSet<(String, String)>,
-) -> bool {
-    let default_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-    let expected_gen = route.metadata.generation.unwrap_or(0);
-    route
-        .status
-        .as_ref()
-        .map(|s| {
-            s.parents.iter().any(|p| {
-                p.controller_name == controller_name
-                    && p.conditions.iter().any(|c| {
-                        c.type_ == "Programmed"
-                            && c.observed_generation.unwrap_or(0) >= expected_gen
-                    })
-                    && p.conditions.iter().any(|c| {
-                        c.type_ == "ResolvedRefs"
-                            && c.observed_generation.unwrap_or(0) >= expected_gen
-                    })
-                    && ownership::parent_ref_owned(
-                        p.parent_ref.group.as_deref(),
-                        p.parent_ref.kind.as_deref(),
-                        p.parent_ref.namespace.as_deref(),
-                        &p.parent_ref.name,
-                        default_ns,
-                        owned_gateways,
-                    )
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn make_condition(
-    type_: &str,
-    status: &str,
-    reason: &str,
-    message: &str,
-    generation: i64,
-    now: Time,
-) -> Condition {
-    Condition {
-        type_: type_.to_string(),
-        status: status.to_string(),
-        reason: reason.to_string(),
-        message: message.to_string(),
-        observed_generation: Some(generation),
-        last_transition_time: now,
-    }
-}
-
-/// Returns the subset of `parent_refs` that point to a Coxswain-managed Gateway.
-fn filter_owned_parent_refs(
-    parent_refs: &[HttpRouteParentRefs],
-    default_ns: &str,
-    owned_gateways: &HashSet<(String, String)>,
-) -> Vec<HttpRouteParentRefs> {
-    parent_refs
-        .iter()
-        .filter(|p| {
-            ownership::parent_ref_owned(
-                p.group.as_deref(),
-                p.kind.as_deref(),
-                p.namespace.as_deref(),
-                &p.name,
-                default_ns,
-                owned_gateways,
-            )
-        })
-        .cloned()
-        .collect()
-}
-
-/// Returns `(has_any_invalid, supported_kinds)` for a listener's `allowedRoutes.kinds`.
-///
-/// - `has_any_invalid`: true if any listed kind is not supported by this controller.
-///   When true, `ResolvedRefs: False, reason: InvalidRouteKinds` must be set.
-/// - `supported_kinds`: intersection of the listed kinds with what we support (currently
-///   only `HTTPRoute`). Empty list when all listed kinds are unsupported. When
-///   `allowedRoutes.kinds` is absent or empty, returns `[HTTPRoute]` with `has_any_invalid=false`.
-fn listener_route_kind_info(
-    listener: &GatewayListeners,
-) -> (bool, Vec<GatewayStatusListenersSupportedKinds>) {
-    const HTTP_ROUTE_GROUP: &str = "gateway.networking.k8s.io";
-    let http_route_kind = || GatewayStatusListenersSupportedKinds {
-        group: Some(HTTP_ROUTE_GROUP.to_string()),
-        kind: "HTTPRoute".to_string(),
-    };
-    let allowed = match listener
-        .allowed_routes
-        .as_ref()
-        .and_then(|ar| ar.kinds.as_deref())
-    {
-        Some(k) if !k.is_empty() => k,
-        _ => return (false, vec![http_route_kind()]),
-    };
-    let mut has_invalid = false;
-    let mut includes_http_route = false;
-    for k in allowed {
-        let is_http_route = k.kind == "HTTPRoute"
-            && k.group
-                .as_deref()
-                .is_none_or(|g| g.is_empty() || g == HTTP_ROUTE_GROUP);
-        if is_http_route {
-            includes_http_route = true;
-        } else {
-            has_invalid = true;
-        }
-    }
-    let supported = if includes_http_route {
-        vec![http_route_kind()]
-    } else {
-        vec![]
-    };
-    (has_invalid, supported)
 }
 
 /// Kubernetes watch loop for leader election and writing status conditions
@@ -423,24 +134,15 @@ impl Controller {
         tokio::pin!(ingress_watcher);
 
         // Names of GatewayClass resources whose controllerName matches ours.
-        // Populated from the gateway_class_watcher arm so we can quickly decide
-        // whether an incoming Gateway event belongs to us without relying on the
-        // reconciler's debounced owned_gateways snapshot.
         let mut owned_gateway_classes: HashSet<String> = HashSet::new();
 
         // Names of IngressClass resources whose spec.controller matches ours.
-        // Populated from the ingress_class_watcher arm; used to skip Ingress
-        // status patches for Ingresses not managed by this controller.
         let mut owned_ingress_classes: HashSet<String> = HashSet::new();
 
         // Local cache of known Gateway objects, keyed by (namespace, name).
-        // Updated on Apply/InitApply/Delete events so the status_recompute arm
-        // can iterate all managed Gateways without needing a separate reflector store.
         let mut known_gateways: HashMap<(String, String), Gateway> = HashMap::new();
 
         // Local cache of known HTTPRoute objects, keyed by (namespace, name).
-        // Updated on Apply/InitApply/Delete events so the route_health.notified() arm
-        // can re-patch routes when backend health changes after the initial patch.
         let mut known_routes: HashMap<(String, String), HTTPRoute> = HashMap::new();
 
         // interval_at delays the first tick so we don't double-acquire immediately.
@@ -663,7 +365,6 @@ impl Controller {
                     if is_leader {
                         match lease_lock.step_down().await {
                             Ok(()) => tracing::info!(pod = %self.config.pod_name, "Stepped down from leadership"),
-                            // Already lost the lease by the time we tried to release it — fine.
                             Err(kube_leader_election::Error::ReleaseLockWhenNotLeading { .. }) => {}
                             Err(e) => tracing::warn!(error = %e, "Failed to step down from leadership"),
                         }
@@ -722,7 +423,7 @@ impl Controller {
         let generation = gw.metadata.generation.unwrap_or(0);
         let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
         let now = Time(k8s_openapi::jiff::Timestamp::now());
-        let patch = Self::build_gateway_status_patch(gw, health, generation, &now, addr);
+        let patch = build_gateway_status_patch(gw, health, generation, &now, addr);
         match api
             .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await
@@ -730,118 +431,6 @@ impl Controller {
             Ok(_) => tracing::info!(name, ns, "Gateway status patched"),
             Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Gateway status"),
         }
-    }
-
-    fn build_gateway_status_patch(
-        gw: &Gateway,
-        health: &GatewayListenerHealth,
-        generation: i64,
-        now: &Time,
-        addr: Option<&StatusAddress>,
-    ) -> serde_json::Value {
-        // Gateway-level Programmed is always True once the controller has processed the
-        // Gateway. Per-listener conditions (ListenerConditionProgrammed, ResolvedRefs)
-        // express individual listener health. This matches what the conformance suite
-        // expects: the setup waits for Programmed=True on all Gateways, including ones
-        // with invalid TLS refs, and the per-listener tests check listener conditions.
-        let (prog_status, prog_reason, prog_message) = ("True", "Programmed", "");
-
-        let conditions = vec![
-            make_condition("Accepted", "True", "Accepted", "", generation, now.clone()),
-            make_condition(
-                "Programmed",
-                prog_status,
-                prog_reason,
-                prog_message,
-                generation,
-                now.clone(),
-            ),
-        ];
-
-        // Build per-listener status entries.
-        let listener_statuses: Vec<GatewayStatusListeners> = gw
-            .spec
-            .listeners
-            .iter()
-            .map(|l| {
-                let outcome = health
-                    .by_listener
-                    .get(&l.name)
-                    .cloned()
-                    .unwrap_or(ListenerTlsOutcome::NotApplicable);
-                let (has_invalid_kinds, supported_kinds_list) = listener_route_kind_info(l);
-                let (resolved_refs_status, resolved_refs_reason, resolved_refs_msg) =
-                    if has_invalid_kinds {
-                        (
-                            "False",
-                            "InvalidRouteKinds",
-                            "One or more specified route kinds are not supported by this implementation",
-                        )
-                    } else if outcome.is_healthy() {
-                        ("True", "ResolvedRefs", "")
-                    } else {
-                        ("False", outcome.reason(), outcome.message())
-                    };
-                let (listener_prog_status, listener_prog_reason, listener_prog_msg) =
-                    if outcome.is_healthy() {
-                        ("True", "Programmed", "")
-                    } else {
-                        ("False", outcome.reason(), outcome.message())
-                    };
-                let attached = health.attached_routes.get(&l.name).copied().unwrap_or(0);
-                tracing::debug!(
-                    listener = %l.name,
-                    resolved_refs = resolved_refs_status,
-                    programmed = listener_prog_status,
-                    attached_routes = attached,
-                    supported_kinds = supported_kinds_list.len(),
-                    "Listener status"
-                );
-                let listener_conditions = vec![
-                    make_condition("Accepted", "True", "Accepted", "", generation, now.clone()),
-                    make_condition(
-                        "ResolvedRefs",
-                        resolved_refs_status,
-                        resolved_refs_reason,
-                        resolved_refs_msg,
-                        generation,
-                        now.clone(),
-                    ),
-                    make_condition(
-                        "Programmed",
-                        listener_prog_status,
-                        listener_prog_reason,
-                        listener_prog_msg,
-                        generation,
-                        now.clone(),
-                    ),
-                ];
-                GatewayStatusListeners {
-                    name: l.name.clone(),
-                    attached_routes: attached,
-                    supported_kinds: Some(supported_kinds_list),
-                    conditions: listener_conditions,
-                }
-            })
-            .collect();
-
-        let mut patch = serde_json::json!({
-            "status": {
-                "conditions": conditions,
-                "listeners": listener_statuses,
-            }
-        });
-        if let Some(addr) = addr {
-            let (type_str, value_str) = match addr {
-                StatusAddress::Ip(ip) => ("IPAddress", ip.to_string()),
-                StatusAddress::Hostname(h) => ("Hostname", h.clone()),
-            };
-            patch["status"]["addresses"] = serde_json::json!([{
-                "type": type_str,
-                "value": value_str,
-            }]);
-        }
-        patch
     }
 
     async fn mark_http_route_programmed(
@@ -979,6 +568,11 @@ impl BackgroundService for Controller {
 
 #[cfg(test)]
 mod tests {
+    use super::conditions::{
+        gateway_accepted, gateway_class_accepted, gateway_programmed, has_condition,
+        http_route_programmed,
+    };
+    use super::ingress_status::{build_ingress_status_patch, ingress_lb_already_matches};
     use super::*;
     use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassStatus};
     use gateway_api::apis::standard::gateways::{Gateway, GatewayStatus};
@@ -987,8 +581,11 @@ mod tests {
         HttpRouteStatusParentsParentRef,
     };
 
-    fn stub_condition(type_: &str, status: &str) -> Condition {
-        Condition {
+    fn stub_condition(
+        type_: &str,
+        status: &str,
+    ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
             type_: type_.to_string(),
             status: status.to_string(),
             reason: String::new(),
@@ -1108,7 +705,7 @@ mod tests {
                     controller_name: "my-controller".to_string(),
                     conditions: vec![stub_condition("Programmed", "True")],
                     parent_ref: HttpRouteStatusParentsParentRef {
-                        name: "envoy-gateway".to_string(), // not in owned set
+                        name: "envoy-gateway".to_string(),
                         namespace: Some("default".to_string()),
                         ..Default::default()
                     },
@@ -1118,8 +715,6 @@ mod tests {
         };
         assert!(!http_route_programmed(&route, "my-controller", &set));
     }
-
-    // --- filter_owned_parent_refs tests ---
 
     #[test]
     fn filter_owned_parent_refs_keeps_owned_only() {
@@ -1155,18 +750,15 @@ mod tests {
 
     #[test]
     fn filter_owned_parent_refs_applies_default_namespace() {
-        // Gateway is in "apps" namespace; parentRef omits namespace field.
         let set = owned(&[("apps", "gw")]);
         let refs = vec![HttpRouteParentRefs {
             name: "gw".to_string(),
-            namespace: None, // should default to the route's namespace "apps"
+            namespace: None,
             ..Default::default()
         }];
         let filtered = filter_owned_parent_refs(&refs, "apps", &set);
         assert_eq!(filtered.len(), 1);
     }
-
-    // --- gateway_accepted tests ---
 
     #[test]
     fn gateway_accepted_true_when_condition_present() {
@@ -1201,8 +793,6 @@ mod tests {
         assert!(!gateway_accepted(&gw));
     }
 
-    // --- gateway_programmed tests ---
-
     #[test]
     fn gateway_programmed_true_when_condition_present() {
         let gw = Gateway {
@@ -1235,8 +825,6 @@ mod tests {
         };
         assert!(!gateway_programmed(&gw));
     }
-
-    // --- StatusAddress helpers ---
 
     use k8s_openapi::api::networking::v1::{
         IngressLoadBalancerIngress, IngressLoadBalancerStatus, IngressStatus,
@@ -1321,6 +909,7 @@ mod tests {
 
     #[test]
     fn controller_config_parses_ip_address() {
+        use std::time::Duration;
         let cfg = ControllerConfig::new(
             "ctrl".into(),
             "pod".into(),
@@ -1336,6 +925,7 @@ mod tests {
 
     #[test]
     fn controller_config_parses_hostname() {
+        use std::time::Duration;
         let cfg = ControllerConfig::new(
             "ctrl".into(),
             "pod".into(),
@@ -1354,6 +944,7 @@ mod tests {
 
     #[test]
     fn controller_config_rejects_empty_status_address() {
+        use std::time::Duration;
         let result = ControllerConfig::new(
             "ctrl".into(),
             "pod".into(),
@@ -1368,6 +959,7 @@ mod tests {
 
     #[test]
     fn controller_config_none_address_is_ok() {
+        use std::time::Duration;
         let cfg = ControllerConfig::new(
             "ctrl".into(),
             "pod".into(),
