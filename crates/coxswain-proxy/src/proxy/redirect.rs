@@ -37,25 +37,7 @@ pub(super) fn build_redirect_location(
 
     let new_path = match path_modifier {
         None => origin.path.to_string(),
-        Some(PathModifier::ReplaceFullPath(p)) => p.clone(),
-        Some(PathModifier::ReplacePrefixMatch {
-            prefix,
-            replacement,
-        }) => {
-            let prefix_trimmed = prefix.trim_end_matches('/');
-            let suffix = &origin.path[prefix_trimmed.len().min(origin.path.len())..];
-            let rep = replacement.trim_end_matches('/');
-            match suffix {
-                "" | "/" => {
-                    if rep.is_empty() {
-                        "/".to_string()
-                    } else {
-                        rep.to_string()
-                    }
-                }
-                s => format!("{rep}{s}"),
-            }
-        }
+        Some(pm) => pm.apply(origin.path),
     };
 
     let path_and_query = match origin.query {

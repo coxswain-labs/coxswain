@@ -15,6 +15,41 @@ pub enum PathModifier {
     },
 }
 
+impl PathModifier {
+    /// Apply this modifier to `path` and return the resulting path string.
+    ///
+    /// For `ReplacePrefixMatch`, returns `path` unchanged if it does not start
+    /// with the prefix (should not happen in practice since routing only selects
+    /// routes whose prefix matched, but avoids a panic on edge cases).
+    pub fn apply(&self, path: &str) -> String {
+        match self {
+            PathModifier::ReplaceFullPath(p) => p.clone(),
+            PathModifier::ReplacePrefixMatch {
+                prefix,
+                replacement,
+            } => {
+                let prefix_trimmed = prefix.trim_end_matches('/');
+                if path == prefix_trimmed || path.starts_with(prefix_trimmed) {
+                    let suffix = &path[prefix_trimmed.len()..];
+                    let rep = replacement.trim_end_matches('/');
+                    match suffix {
+                        "" | "/" => {
+                            if rep.is_empty() {
+                                "/".to_string()
+                            } else {
+                                rep.to_string()
+                            }
+                        }
+                        s => format!("{rep}{s}"),
+                    }
+                } else {
+                    path.to_string()
+                }
+            }
+        }
+    }
+}
+
 /// Header add/set/remove operations applied as a unit.
 #[derive(Clone, Debug, Default)]
 pub struct HeaderMod {
