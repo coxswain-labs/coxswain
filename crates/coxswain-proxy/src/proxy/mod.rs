@@ -147,7 +147,16 @@ impl ProxyHttp for Proxy {
         let host = extract_host(req, &mut host_buf).to_string();
         let path = req.uri.path().to_string();
         let query = req.uri.query().map(str::to_string);
-        let proto = ctx.real_client_proto.unwrap_or("http");
+        // PROXY-protocol path sets real_client_proto directly; standard Pingora TLS path
+        // does not set CONN_INFO, so fall back to inspecting the session's TLS digest.
+        let proto = ctx.real_client_proto.unwrap_or_else(|| {
+            let is_tls = session
+                .as_downstream()
+                .digest()
+                .and_then(|d| d.ssl_digest.as_ref())
+                .is_some();
+            if is_tls { "https" } else { "http" }
+        });
 
         let outcome = {
             let route_ctx = RequestContext {
@@ -308,15 +317,15 @@ impl ProxyHttp for Proxy {
     {
         let code = match e.etype() {
             HTTPStatus(code) => *code,
-            // Gateway API spec requires 504 when either `request` or `backendRequest` timeout
-            // fires.  We use flags set in upstream_peer rather than wall-clock comparisons to
-            // avoid races with OS timer granularity (timers can fire a few µs early).
+            // request/backendRequest read timeouts → 504 (Gateway API spec, GEP-1742).
+            // Connect failure while backendRequest active → 502 (upstream unreachable).
+            // Flags set in upstream_peer avoid races with OS timer granularity.
             ReadTimedout | WriteTimedout
                 if ctx.request_timeout_is_controlling || ctx.backend_request_timeout_active =>
             {
                 504
             }
-            ConnectTimedout if ctx.backend_request_timeout_active => 504,
+            ConnectTimedout if ctx.backend_request_timeout_active => 502,
             _ => match e.esource() {
                 ErrorSource::Upstream => 502,
                 ErrorSource::Downstream => match e.etype() {

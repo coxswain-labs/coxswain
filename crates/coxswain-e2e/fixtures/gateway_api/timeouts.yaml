@@ -1,13 +1,13 @@
 # HTTPRoute timeouts fixture.
-# Exercises timeouts.request (504) and timeouts.backendRequest (502).
+# Exercises timeouts.request and timeouts.backendRequest (both yield 504 on read timeout).
 # TESTNS is substituted with the test namespace at runtime.
 #
 # Depends on the slow-echo backend (accepts TCP but never sends HTTP data),
 # which makes the proxy's upstream read timeout fire deterministically.
 #
 # Routes:
-#   /request-timeout   → 500ms total request budget  → 504 Gateway Timeout
-#   /backend-timeout   → 500ms backend request budget → 502 Bad Gateway
+#   /request-timeout   → 500ms total request budget        → 504 Gateway Timeout
+#   /backend-timeout   → 500ms backend request read budget → 504 Gateway Timeout
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
