@@ -1,9 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use coxswain_core::routing::{
-    FilterAction, PathModifier, RequestContext, RouteOutcome, RouteTimeouts, SharedRoutingTable,
-    Upstream,
-};
+use coxswain_core::routing::{FilterAction, RequestContext, RouteOutcome, RouteTimeouts};
 use http::header;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{
@@ -12,156 +9,25 @@ use pingora_core::{
 };
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::filter::TrafficFilter;
 
-/// Per-connection info seeded by the PROXY protocol accept loop.
-#[derive(Clone)]
-pub(crate) struct ConnectionInfo {
-    pub real_addr: SocketAddr,
-    pub proto: &'static str,
-}
+mod ctx;
+mod engine;
+mod redirect;
 
-tokio::task_local! {
-    /// Set by the PROXY protocol accept loop before calling process_new_http.
-    /// Consumed by Proxy::new_ctx so that every request on the connection carries
-    /// the real client address and protocol.
-    pub(crate) static CONN_INFO: ConnectionInfo;
-}
+pub(crate) use ctx::{CONN_INFO, ConnectionInfo};
+pub use ctx::{ProxyCtx, ResolvedRoute};
+pub use engine::RoutingEngine;
 
-/// Routing result cached from `request_filter` for use in later hooks.
-pub struct ResolvedRoute {
-    pub upstream: Arc<Upstream>,
-    pub filters: Arc<[FilterAction]>,
-    pub timeouts: RouteTimeouts,
-    pub original_host: String,
-    pub original_path: String,
-}
-
-/// Per-request context carrying the real client address extracted from the PROXY header.
-#[derive(Default)]
-pub struct ProxyCtx {
-    pub real_client_addr: Option<SocketAddr>,
-    pub real_client_proto: Option<&'static str>,
-    pub resolved: Option<ResolvedRoute>,
-    /// Absolute deadline for the total request (from `timeouts.request`). 504 if exceeded.
-    pub request_deadline: Option<Instant>,
-    /// True when the effective read_timeout was derived from `timeouts.request` (not
-    /// `timeouts.backendRequest`). Set in `upstream_peer`; consulted in `fail_to_proxy` to
-    /// distinguish 504 from upstream errors without relying on wall-clock comparisons that can
-    /// race against OS timer granularity.
-    pub request_timeout_is_controlling: bool,
-    /// True when a `backendRequest` timeout was applied to this peer. Used in `fail_to_proxy` to
-    /// map ConnectTimedout and ReadTimedout/WriteTimedout to 504 (Gateway API spec requires 504
-    /// for both request and backendRequest timeout expiry).
-    pub backend_request_timeout_active: bool,
-}
-
-/// Lock-free routing engine for the request hot path.
-pub struct RoutingEngine {
-    table: SharedRoutingTable,
-}
-
-impl RoutingEngine {
-    pub fn new(table: SharedRoutingTable) -> Self {
-        Self { table }
-    }
-
-    /// Like [`find`] but returns only the upstream, without host/path distinction.
-    pub fn route(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<Upstream>> {
-        self.table.load().route(host, path, ctx)
-    }
-
-    /// Distinguishes "host not registered" from "path/predicate not matched".
-    pub fn find(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> RouteOutcome {
-        self.table.load().find(host, path, ctx)
-    }
-}
+use redirect::{RedirectOrigin, build_redirect_location, extract_host};
 
 pub struct Proxy {
     pub engine: Arc<RoutingEngine>,
     /// Global fallback timeouts used when a matched route has no per-rule timeouts set.
     pub default_timeouts: RouteTimeouts,
-}
-
-/// Extract the bare hostname from a request (strips port suffix, prefers URI host over Host header).
-fn extract_host<'a>(req: &'a RequestHeader, host_hdr: &'a mut String) -> &'a str {
-    if let Some(h) = req.uri.host() {
-        return h;
-    }
-    *host_hdr = req
-        .headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    host_hdr.split(':').next().unwrap_or("")
-}
-
-/// Request-context fields needed to build a redirect `Location` URL.
-struct RedirectOrigin<'a> {
-    scheme: &'a str,
-    host: &'a str,
-    path: &'a str,
-    query: Option<&'a str>,
-}
-
-/// Build the `Location` URL for a `RequestRedirect` filter.
-fn build_redirect_location(
-    filter_scheme: Option<&str>,
-    filter_hostname: Option<&str>,
-    filter_port: Option<u16>,
-    path_modifier: Option<&PathModifier>,
-    origin: &RedirectOrigin<'_>,
-) -> String {
-    let eff_scheme = filter_scheme.unwrap_or(origin.scheme);
-    let eff_host = filter_hostname.unwrap_or(origin.host);
-
-    let new_path = match path_modifier {
-        None => origin.path.to_string(),
-        Some(PathModifier::ReplaceFullPath(p)) => p.clone(),
-        Some(PathModifier::ReplacePrefixMatch {
-            prefix,
-            replacement,
-        }) => {
-            let prefix_trimmed = prefix.trim_end_matches('/');
-            let suffix = &origin.path[prefix_trimmed.len().min(origin.path.len())..];
-            let rep = replacement.trim_end_matches('/');
-            match suffix {
-                "" | "/" => {
-                    if rep.is_empty() {
-                        "/".to_string()
-                    } else {
-                        rep.to_string()
-                    }
-                }
-                s => format!("{rep}{s}"),
-            }
-        }
-    };
-
-    let path_and_query = match origin.query {
-        Some(q) => format!("{new_path}?{q}"),
-        None => new_path,
-    };
-
-    // Omit default ports per Gateway API spec.
-    let omit_port = filter_port.is_none()
-        || (eff_scheme == "http" && filter_port == Some(80))
-        || (eff_scheme == "https" && filter_port == Some(443));
-
-    if omit_port {
-        format!("{eff_scheme}://{eff_host}{path_and_query}")
-    } else {
-        format!(
-            "{eff_scheme}://{}:{}{path_and_query}",
-            eff_host,
-            filter_port.unwrap()
-        )
-    }
 }
 
 #[async_trait]
@@ -443,8 +309,12 @@ impl ProxyHttp for Proxy {
 
 #[cfg(test)]
 mod tests {
+    use super::redirect::{RedirectOrigin, build_redirect_location};
     use super::*;
-    use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, SharedRoutingTable, Upstream};
+    use coxswain_core::routing::{
+        FilterAction, HeaderMod, PathModifier, RouteEntry, RouteOutcome, RoutingTableBuilder,
+        SharedRoutingTable, Upstream,
+    };
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -521,8 +391,6 @@ mod tests {
             "empty upstream yields no endpoint"
         );
     }
-
-    // ── build_redirect_location tests ─────────────────────────────────────────
 
     fn origin(
         scheme: &'static str,
@@ -641,8 +509,6 @@ mod tests {
 
     #[test]
     fn find_returns_filters_alongside_upstream() {
-        use coxswain_core::routing::{FilterAction, HeaderMod, RouteOutcome};
-
         let upstream = make_upstream("default/backend", "10.0.0.1:8080");
         let filters = vec![FilterAction::RequestHeaderModifier(HeaderMod {
             set: vec![("x-env".to_string(), "test".to_string())],
