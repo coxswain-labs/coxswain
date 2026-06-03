@@ -6,8 +6,8 @@ use coxswain_e2e::{
         GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PATH_MATCHING,
         GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_TIMEOUTS,
         GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS, GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
-        GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WEBSOCKET,
-        GATEWAY_API_WILDCARD_HOST,
+        GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_REDIRECT, GATEWAY_API_TLS_TERMINATION,
+        GATEWAY_API_WEBSOCKET, GATEWAY_API_WILDCARD_HOST,
     },
     harness::{GeneratedCert, Harness, NamespaceGuard, http, wait},
 };
@@ -64,7 +64,7 @@ async fn host_pool() -> anyhow::Result<()> {
     fixtures::apply_fixture(GATEWAY_API_HOST_POOL, &ns.name, &[]).await?;
 
     let host = format!("pool.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
 
     // Round-robin across echo-a and echo-b — collect enough responses to see both.
     let mut saw_a = false;
@@ -173,7 +173,7 @@ async fn header_matching() -> anyhow::Result<()> {
     fixtures::apply_fixture(GATEWAY_API_HEADER_MATCHING, &ns.name, &[]).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
 
     // Exact header match → echo-a
     let (status, body) = h
@@ -212,7 +212,7 @@ async fn method_matching() -> anyhow::Result<()> {
     fixtures::apply_fixture(GATEWAY_API_METHOD_MATCHING, &ns.name, &[]).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
 
     // GET → echo-a
     let (status, body) = h.http.request(Method::GET, &host, "/method", &[]).await?;
@@ -238,7 +238,7 @@ async fn query_param_matching() -> anyhow::Result<()> {
     fixtures::apply_fixture(GATEWAY_API_QUERY_PARAM_MATCHING, &ns.name, &[]).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
 
     // Exact query param match → echo-a
     let (status, body) = h
@@ -277,7 +277,7 @@ async fn combined_matching() -> anyhow::Result<()> {
     fixtures::apply_fixture(GATEWAY_API_COMBINED_MATCHING, &ns.name, &[]).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
 
     // AND semantics: GET + X-Env: prod → echo-a
     let (status, body) = h
@@ -348,14 +348,14 @@ async fn cross_namespace_without_grant() -> anyhow::Result<()> {
 
     let host = format!("cross-ns.{}.local", ns.name);
 
-    // Give the controller time to reconcile; without the grant the host is
-    // never added to the routing table, so requests should return 503.
+    // Give the controller time to reconcile; without the grant the backend
+    // cannot be resolved so an error-sentinel route is installed, returning 500.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let status = h.http.get_status(&host, "/").await?;
     assert_eq!(
-        status, 503,
-        "expected 503 without ReferenceGrant, got {status}"
+        status, 500,
+        "expected 500 without ReferenceGrant, got {status}"
     );
 
     Ok(())
@@ -415,8 +415,11 @@ async fn tls_termination_with_sni() -> anyhow::Result<()> {
 }
 
 /// Gateway with an HTTPS listener referencing a non-existent Secret must have
-/// `Programmed=False` with `reason=ListenersNotValid`. Once the Secret is
-/// created the condition must flip to `Programmed=True`.
+/// the `https` listener's `ResolvedRefs` and `Programmed` conditions set to
+/// `False`. Once the Secret is created both listener conditions must flip to
+/// `True`. The gateway-level `Programmed` condition remains `True` throughout
+/// (the controller always sets it to True; per-listener conditions express
+/// individual listener health).
 #[tokio::test]
 async fn tls_missing_secret_marks_gateway_not_programmed() -> anyhow::Result<()> {
     init_tracing();
@@ -434,24 +437,25 @@ async fn tls_missing_secret_marks_gateway_not_programmed() -> anyhow::Result<()>
     )
     .await?;
 
-    // Controller must mark the Gateway as not programmed within 30 s.
-    wait::wait_for_gateway_condition(
-        &h.client,
-        "coxswain-tls-no-cert",
-        &ns.name,
-        "Programmed",
-        "False",
-        Duration::from_secs(30),
-    )
-    .await?;
-
-    // Per-listener ResolvedRefs must also be False.
+    // Per-listener ResolvedRefs must be False when the Secret is missing.
     wait::wait_for_gateway_listener_condition(
         &h.client,
         "coxswain-tls-no-cert",
         &ns.name,
         "https",
         "ResolvedRefs",
+        "False",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    // Per-listener Programmed must also be False.
+    wait::wait_for_gateway_listener_condition(
+        &h.client,
+        "coxswain-tls-no-cert",
+        &ns.name,
+        "https",
+        "Programmed",
         "False",
         Duration::from_secs(10),
     )
@@ -486,11 +490,12 @@ async fn tls_missing_secret_marks_gateway_not_programmed() -> anyhow::Result<()>
         )
         .await?;
 
-    // After the Secret is available the Gateway must flip to Programmed=True.
-    wait::wait_for_gateway_condition(
+    // After the Secret is available the listener must flip to Programmed=True.
+    wait::wait_for_gateway_listener_condition(
         &h.client,
         "coxswain-tls-no-cert",
         &ns.name,
+        "https",
         "Programmed",
         "True",
         Duration::from_secs(30),
@@ -815,13 +820,13 @@ async fn timeouts_request_returns_504() -> anyhow::Result<()> {
 
     let host = format!("timeout.{}.local", ns.name);
 
-    // Wait until the route is programmed (normal path must be routable first).
-    // We use /backend-timeout for the initial wait since /request-timeout always fails.
+    // Wait until the route is programmed. /request-timeout always returns 504 so we
+    // can't use it as a readiness probe; use /backend-timeout (also 504) instead.
     wait::wait_for_route_status(
         &h.http,
         &host,
         "/backend-timeout",
-        502,
+        504,
         Duration::from_secs(60),
     )
     .await?;
@@ -836,7 +841,7 @@ async fn timeouts_request_returns_504() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn timeouts_backend_request_returns_502() -> anyhow::Result<()> {
+async fn timeouts_backend_request_returns_504() -> anyhow::Result<()> {
     init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-timeouts-be").await?;
@@ -848,20 +853,85 @@ async fn timeouts_backend_request_returns_502() -> anyhow::Result<()> {
     let host = format!("timeout.{}.local", ns.name);
 
     // Wait until the route is registered. Both rules time out so we cannot use
-    // wait_for_route; instead we poll until the 502 appears.
+    // wait_for_route; instead we poll until the 504 appears.
     wait::wait_for_route_status(
         &h.http,
         &host,
         "/backend-timeout",
-        502,
+        504,
         Duration::from_secs(60),
     )
     .await?;
 
     let status = h.http.get_status(&host, "/backend-timeout").await?;
     assert_eq!(
-        status, 502,
-        "expected 502 from backend request timeout, got {status}"
+        status, 504,
+        "expected 504 from backend request timeout, got {status}"
+    );
+
+    Ok(())
+}
+
+/// An HTTPS listener with a RequestRedirect filter must produce a `Location` header
+/// that uses the `https://` scheme, not the hardcoded `http://` that existed before
+/// the redirect-scheme fix.
+#[tokio::test]
+async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-tls-redirect").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("tls-redirect.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&host);
+    let secret_name = "cert-tls-redirect";
+
+    fixtures::apply_fixture(
+        GATEWAY_API_TLS_REDIRECT,
+        &ns.name,
+        &[
+            ("LISTENER_HOST", &host),
+            ("SECRET_NAME", secret_name),
+            ("TLS_CRT_B64", &cert.cert_b64()),
+            ("TLS_KEY_B64", &cert.key_b64()),
+        ],
+    )
+    .await?;
+
+    // Wait until the probe path is reachable over HTTPS (confirms TLS is set up and
+    // the route is programmed).
+    wait::wait_for_https_route(
+        h.tls_addr,
+        &host,
+        "/tls-redirect/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Hit the redirect path without following redirects so we can inspect Location.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(&host, h.tls_addr)
+        .build()?;
+
+    let url = format!("https://{}:{}/tls-redirect", host, h.tls_addr.port());
+    let resp = client.get(&url).send().await?;
+
+    assert_eq!(resp.status().as_u16(), 302, "expected 302 redirect");
+
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    assert!(
+        location.starts_with("https://"),
+        "expected Location to start with https://, got {location:?}"
     );
 
     Ok(())

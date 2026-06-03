@@ -1,4 +1,6 @@
+use crate::keys::RouteParentKey;
 use arc_swap::ArcSwap;
+use coxswain_core::ownership::ObjectKey;
 use coxswain_core::tls::TlsCert;
 use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::reflector;
@@ -42,21 +44,11 @@ impl ListenerTlsOutcome {
         matches!(self, Self::NotApplicable | Self::Resolved)
     }
 
-    pub(crate) fn ref_not_permitted_reason() -> &'static str {
-        "RefNotPermitted"
-    }
-    pub(crate) fn invalid_cert_reason() -> &'static str {
-        "InvalidCertificateRef"
-    }
-    pub(crate) fn invalid_reason() -> &'static str {
-        "Invalid"
-    }
-
     pub(crate) fn reason(&self) -> &'static str {
         match self {
-            Self::RefNotPermitted { .. } => Self::ref_not_permitted_reason(),
-            Self::InvalidCertificateRef { .. } => Self::invalid_cert_reason(),
-            Self::Invalid { .. } => Self::invalid_reason(),
+            Self::RefNotPermitted { .. } => "RefNotPermitted",
+            Self::InvalidCertificateRef { .. } => "InvalidCertificateRef",
+            Self::Invalid { .. } => "Invalid",
             Self::NotApplicable | Self::Resolved => "Resolved",
         }
     }
@@ -89,10 +81,8 @@ pub struct GatewayListenerHealth {
     pub listener_ports: BTreeMap<String, u16>,
 }
 
-impl GatewayListenerHealth {}
-
 struct GatewayListenerHealthInner {
-    map: ArcSwap<HashMap<(String, String), GatewayListenerHealth>>,
+    map: ArcSwap<HashMap<ObjectKey, GatewayListenerHealth>>,
     notify: Notify,
 }
 
@@ -116,12 +106,12 @@ impl SharedGatewayListenerHealth {
         }))
     }
 
-    pub fn load(&self) -> arc_swap::Guard<Arc<HashMap<(String, String), GatewayListenerHealth>>> {
+    pub fn load(&self) -> arc_swap::Guard<Arc<HashMap<ObjectKey, GatewayListenerHealth>>> {
         self.0.map.load()
     }
 
     /// Store a new health map and wake any `notified()` waiters.
-    pub fn store_and_notify(&self, map: HashMap<(String, String), GatewayListenerHealth>) {
+    pub fn store_and_notify(&self, map: HashMap<ObjectKey, GatewayListenerHealth>) {
         self.0.map.store(Arc::new(map));
         self.0.notify.notify_one();
     }
@@ -157,8 +147,7 @@ impl Default for RouteParentHealth {
     }
 }
 
-/// Key: (route_ns, route_name, parent_ns, parent_name, section_name_or_empty)
-pub type HttpRouteHealthMap = HashMap<(String, String, String, String, String), RouteParentHealth>;
+pub type HttpRouteHealthMap = HashMap<RouteParentKey, RouteParentHealth>;
 
 struct SharedHttpRouteHealthInner {
     map: ArcSwap<HttpRouteHealthMap>,

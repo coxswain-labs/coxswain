@@ -29,6 +29,14 @@ spec:
   hostnames:
     - "pool.TESTNS.local"
   rules:
+    # Probe rule — used by wait_for_route to detect when the HTTPRoute is live.
+    - matches:
+        - path:
+            type: Exact
+            value: /probe
+      backendRefs:
+        - name: echo-a
+          port: 3000
     - backendRefs:
         - name: echo-a
           port: 3000

@@ -1,8 +1,10 @@
 use crate::gateway_api::hostnames_intersect;
+use crate::keys::ListenerKey;
 use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth};
 use crate::{endpoints, gateway_api::GatewayApiReconciler, ingress::IngressReconciler};
 use async_trait::async_trait;
-use coxswain_core::ownership::OwnedGateways;
+use coxswain_core::ownership::{ObjectKey, OwnedGateways};
+use coxswain_core::reference_grants::ReferenceGrantKey;
 use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, SharedRoutingTable, Upstream};
 use coxswain_core::tls::{SharedTlsStore, TlsStoreBuilder};
 use futures::StreamExt;
@@ -124,6 +126,35 @@ where
     }
 }
 
+fn spawn_reflector<T>(
+    set: &mut JoinSet<()>,
+    writer: reflector::store::Writer<T>,
+    api: Api<T>,
+    config: watcher::Config,
+    notify: Arc<Notify>,
+    label: &'static str,
+) where
+    T: kube::Resource
+        + serde::de::DeserializeOwned
+        + Clone
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+    T::DynamicType: Default + Clone + std::hash::Hash + Eq + Send + Sync + 'static,
+{
+    set.spawn(async move {
+        let stream = reflector::reflector(writer, watcher(api, config).default_backoff());
+        tokio::pin!(stream);
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(_) => notify.notify_one(),
+                Err(e) => tracing::warn!(error = %e, "{label} reflector error"),
+            }
+        }
+    });
+}
+
 #[async_trait]
 impl BackgroundService for Reconciler {
     async fn start(&self, mut shutdown: ShutdownWatch) {
@@ -183,218 +214,82 @@ async fn spawn_tasks(
     let (service_reader, service_writer) = reflector::store::<Service>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
+    let ns = watch_namespace.as_deref();
 
-    // --- HTTPRoute reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        let ns = watch_namespace.clone();
-        async move {
-            let stream = reflector::reflector(
-                route_writer,
-                watcher(
-                    scoped_api::<HTTPRoute>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "HTTPRoute reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- Ingress reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        let ns = watch_namespace.clone();
-        async move {
-            let stream = reflector::reflector(
-                ingress_writer,
-                watcher(
-                    scoped_api::<Ingress>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "Ingress reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- IngressClass reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        async move {
-            let stream = reflector::reflector(
-                class_writer,
-                watcher(Api::<IngressClass>::all(client), watcher::Config::default())
-                    .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "IngressClass reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- Gateway reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        let ns = watch_namespace.clone();
-        async move {
-            let stream = reflector::reflector(
-                gateway_writer,
-                watcher(
-                    scoped_api::<Gateway>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "Gateway reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- GatewayClass reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        async move {
-            let stream = reflector::reflector(
-                gateway_class_writer,
-                watcher(Api::<GatewayClass>::all(client), watcher::Config::default())
-                    .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "GatewayClass reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- EndpointSlice reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        let ns = watch_namespace.clone();
-        async move {
-            let stream = reflector::reflector(
-                slice_writer,
-                watcher(
-                    scoped_api::<EndpointSlice>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "EndpointSlice reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- ReferenceGrant reflector ---
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let client = client.clone();
-        let ns = watch_namespace.clone();
-        async move {
-            let stream = reflector::reflector(
-                grant_writer,
-                watcher(
-                    scoped_api::<ReferenceGrant>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "ReferenceGrant reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- Secret reflector (TLS certs only) ---
-    //
-    // Field-selector scoped to `type=kubernetes.io/tls` to avoid pulling every
-    // Secret in the cluster into memory.
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let ns = watch_namespace.clone();
-        let client_secret = client.clone();
-        async move {
-            let stream = reflector::reflector(
-                secret_writer,
-                watcher(
-                    scoped_api::<Secret>(client_secret, ns.as_deref()),
-                    watcher::Config::default().fields("type=kubernetes.io/tls"),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "Secret reflector error"),
-                }
-            }
-        }
-    });
-
-    // --- Service reflector ---
-    //
+    spawn_reflector(
+        &mut set,
+        route_writer,
+        scoped_api::<HTTPRoute>(client.clone(), ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "HTTPRoute",
+    );
+    spawn_reflector(
+        &mut set,
+        ingress_writer,
+        scoped_api::<Ingress>(client.clone(), ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "Ingress",
+    );
+    spawn_reflector(
+        &mut set,
+        class_writer,
+        Api::<IngressClass>::all(client.clone()),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "IngressClass",
+    );
+    spawn_reflector(
+        &mut set,
+        gateway_writer,
+        scoped_api::<Gateway>(client.clone(), ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "Gateway",
+    );
+    spawn_reflector(
+        &mut set,
+        gateway_class_writer,
+        Api::<GatewayClass>::all(client.clone()),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "GatewayClass",
+    );
+    spawn_reflector(
+        &mut set,
+        slice_writer,
+        scoped_api::<EndpointSlice>(client.clone(), ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "EndpointSlice",
+    );
+    spawn_reflector(
+        &mut set,
+        grant_writer,
+        scoped_api::<ReferenceGrant>(client.clone(), ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "ReferenceGrant",
+    );
+    // Field-selector scoped to `type=kubernetes.io/tls` to avoid pulling every Secret into memory.
+    spawn_reflector(
+        &mut set,
+        secret_writer,
+        scoped_api::<Secret>(client.clone(), ns),
+        watcher::Config::default().fields("type=kubernetes.io/tls"),
+        Arc::clone(&notify),
+        "Secret",
+    );
     // Used to resolve targetPort for backends where servicePort ≠ targetPort.
-    set.spawn({
-        let notify = Arc::clone(&notify);
-        let ns = watch_namespace;
-        async move {
-            let stream = reflector::reflector(
-                service_writer,
-                watcher(
-                    scoped_api::<Service>(client, ns.as_deref()),
-                    watcher::Config::default(),
-                )
-                .default_backoff(),
-            );
-            tokio::pin!(stream);
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(_) => notify.notify_one(),
-                    Err(e) => tracing::warn!(error = %e, "Service reflector error"),
-                }
-            }
-        }
-    });
+    spawn_reflector(
+        &mut set,
+        service_writer,
+        scoped_api::<Service>(client, ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "Service",
+    );
 
     // --- Trailing-edge debounce + rebuild ---
     //
@@ -457,6 +352,71 @@ fn rebuild(
     let routes = route_store.state();
     let ingresses = ingress_store.state();
 
+    let (owned_ingress_classes, owned_gateway_classes, owned_gateways) = compute_ownership(
+        class_store,
+        gateway_class_store,
+        gateway_store,
+        controller_name,
+        owned_gateways_handle,
+    );
+
+    let (backend_grants, cert_grants) = flatten_grants(&grant_store.state());
+
+    tracing::debug!(
+        http_routes = routes.len(),
+        ingresses = ingresses.len(),
+        owned_ingress_classes = owned_ingress_classes.len(),
+        owned_gateways = owned_gateways.len(),
+        "Rebuilding routing table"
+    );
+
+    build_routes(
+        &routes,
+        &ingresses,
+        &owned_ingress_classes,
+        &owned_gateways,
+        &backend_grants,
+        gateway_store,
+        &owned_gateway_classes,
+        slice_store,
+        service_store,
+        ingress_default_backend,
+        shared,
+    );
+
+    let mut gateway_tls_health = build_tls(
+        &ingresses,
+        gateway_store,
+        &owned_gateway_classes,
+        &owned_ingress_classes,
+        &cert_grants,
+        secret_store,
+        tls_shared,
+    );
+
+    count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
+    tls_health_shared.store_and_notify(gateway_tls_health);
+
+    let gateways = gateway_store.state();
+    let route_health_map = GatewayApiReconciler::compute_route_health(
+        &routes,
+        &gateways,
+        &owned_gateways,
+        &backend_grants,
+        service_store,
+    );
+    route_health_shared.store_and_notify(route_health_map);
+}
+
+/// Compute which IngressClasses, GatewayClasses, and Gateways are owned by this controller.
+/// Publishes the owned-gateways snapshot to `owned_gateways_handle` as a side effect.
+fn compute_ownership(
+    class_store: &reflector::Store<IngressClass>,
+    gateway_class_store: &reflector::Store<GatewayClass>,
+    gateway_store: &reflector::Store<Gateway>,
+    controller_name: &str,
+    owned_gateways_handle: &OwnedGateways,
+) -> (HashSet<String>, HashSet<String>, HashSet<ObjectKey>) {
     let owned_ingress_classes: HashSet<String> = class_store
         .state()
         .into_iter()
@@ -473,95 +433,88 @@ fn rebuild(
         .filter_map(|gc| gc.metadata.name.clone())
         .collect();
 
-    let owned_gateways: HashSet<(String, String)> = gateway_store
+    let owned_gateways: HashSet<ObjectKey> = gateway_store
         .state()
         .into_iter()
         .filter(|g| owned_gateway_classes.contains(&g.spec.gateway_class_name))
         .filter_map(|g| {
             let ns = g.metadata.namespace.clone()?;
             let name = g.metadata.name.clone()?;
-            Some((ns, name))
+            Some(ObjectKey::new(ns, name))
         })
         .collect();
 
-    // Publish the owned-gateways snapshot so the controller can filter status writes.
-    owned_gateways_handle.store(owned_gateways.clone());
+    owned_gateways_handle.store(Arc::new(owned_gateways.clone()));
+    (owned_ingress_classes, owned_gateway_classes, owned_gateways)
+}
 
-    // Flatten ReferenceGrant objects into two sets for O(1) cross-namespace ref checks:
-    //   backend_grants: HTTPRoute → Service  (used by GatewayApiReconciler::reconcile)
-    //   cert_grants:    Gateway   → Secret   (used by GatewayApiReconciler::reconcile_tls)
-    let grants: Vec<_> = grant_store.state();
-    let backend_grants: HashSet<(String, String, Option<String>)> = grants
-        .iter()
-        .filter_map(|grant| {
-            let to_ns = grant.metadata.namespace.clone()?;
-            Some((grant, to_ns))
-        })
-        .flat_map(|(grant, to_ns)| {
-            let from_entries: Vec<_> = grant
-                .spec
-                .from
-                .iter()
-                .filter(|f| f.group == "gateway.networking.k8s.io" && f.kind == "HTTPRoute")
-                .map(|f| f.namespace.clone())
-                .collect();
-            let to_entries: Vec<_> = grant
-                .spec
-                .to
-                .iter()
-                .filter(|t| (t.group.is_empty() || t.group == "core") && t.kind == "Service")
-                .map(|t| t.name.clone())
-                .collect();
-            from_entries.into_iter().flat_map(move |from_ns| {
-                let to_ns = to_ns.clone();
-                to_entries
-                    .clone()
-                    .into_iter()
-                    .map(move |to_name| (from_ns.clone(), to_ns.clone(), to_name))
+type GrantSet = HashSet<ReferenceGrantKey>;
+
+/// Flatten `ReferenceGrant` objects into two O(1) sets for cross-namespace ref checks:
+/// - `backend_grants`: HTTPRoute → Service (used by `GatewayApiReconciler::reconcile`)
+/// - `cert_grants`: Gateway → Secret (used by `GatewayApiReconciler::reconcile_tls`)
+fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
+    fn flatten(grants: &[Arc<ReferenceGrant>], from_kind: &str, to_kind: &str) -> GrantSet {
+        grants
+            .iter()
+            .filter_map(|grant| {
+                let to_ns = grant.metadata.namespace.clone()?;
+                Some((grant, to_ns))
             })
-        })
-        .collect();
-    let cert_grants: HashSet<(String, String, Option<String>)> = grants
-        .iter()
-        .filter_map(|grant| {
-            let to_ns = grant.metadata.namespace.clone()?;
-            Some((grant, to_ns))
-        })
-        .flat_map(|(grant, to_ns)| {
-            let from_entries: Vec<_> = grant
-                .spec
-                .from
-                .iter()
-                .filter(|f| f.group == "gateway.networking.k8s.io" && f.kind == "Gateway")
-                .map(|f| f.namespace.clone())
-                .collect();
-            let to_entries: Vec<_> = grant
-                .spec
-                .to
-                .iter()
-                .filter(|t| (t.group.is_empty() || t.group == "core") && t.kind == "Secret")
-                .map(|t| t.name.clone())
-                .collect();
-            from_entries.into_iter().flat_map(move |from_ns| {
-                let to_ns = to_ns.clone();
-                to_entries
-                    .clone()
-                    .into_iter()
-                    .map(move |to_name| (from_ns.clone(), to_ns.clone(), to_name))
+            .flat_map(|(grant, to_ns)| {
+                let from_entries: Vec<_> = grant
+                    .spec
+                    .from
+                    .iter()
+                    .filter(|f| f.group == "gateway.networking.k8s.io" && f.kind == from_kind)
+                    .map(|f| f.namespace.clone())
+                    .collect();
+                let to_entries: Vec<_> = grant
+                    .spec
+                    .to
+                    .iter()
+                    .filter(|t| (t.group.is_empty() || t.group == "core") && t.kind == to_kind)
+                    .map(|t| t.name.clone())
+                    .collect();
+                from_entries.into_iter().flat_map(move |from_ns| {
+                    let to_ns = to_ns.clone();
+                    to_entries
+                        .clone()
+                        .into_iter()
+                        .map(move |to_name| match to_name {
+                            Some(name) => {
+                                ReferenceGrantKey::specific(from_ns.clone(), to_ns.clone(), name)
+                            }
+                            None => ReferenceGrantKey::wildcard(from_ns.clone(), to_ns.clone()),
+                        })
+                })
             })
-        })
-        .collect();
+            .collect()
+    }
 
-    tracing::debug!(
-        http_routes = routes.len(),
-        ingresses = ingresses.len(),
-        owned_ingress_classes = owned_ingress_classes.len(),
-        owned_gateways = owned_gateways.len(),
-        "Rebuilding routing table"
-    );
-    // Precompute (gw_ns, gw_name, listener_name) → hostname so reconcile() can scope
-    // routes without spec.hostnames to their parent listener's hostname.
-    let listener_hostname_map: HashMap<(String, String, String), String> = gateway_store
+    let backend_grants = flatten(grants, "HTTPRoute", "Service");
+    let cert_grants = flatten(grants, "Gateway", "Secret");
+    (backend_grants, cert_grants)
+}
+
+/// Build and publish the routing table from HTTPRoutes and Ingresses.
+#[allow(clippy::too_many_arguments)]
+fn build_routes(
+    routes: &[Arc<HTTPRoute>],
+    ingresses: &[Arc<Ingress>],
+    owned_ingress_classes: &HashSet<String>,
+    owned_gateways: &HashSet<ObjectKey>,
+    backend_grants: &GrantSet,
+    gateway_store: &reflector::Store<Gateway>,
+    owned_gateway_classes: &HashSet<String>,
+    slice_store: &reflector::Store<EndpointSlice>,
+    service_store: &reflector::Store<Service>,
+    ingress_default_backend: Option<&IngressDefaultBackend>,
+    shared: &SharedRoutingTable,
+) {
+    // Precompute ListenerKey → hostname so reconcile() can scope routes without
+    // spec.hostnames to their parent listener's hostname.
+    let listener_hostname_map: HashMap<ListenerKey, String> = gateway_store
         .state()
         .into_iter()
         .filter(|g| owned_gateway_classes.contains(&g.spec.gateway_class_name))
@@ -573,7 +526,7 @@ fn rebuild(
                 .iter()
                 .map(|l| {
                     (
-                        (ns.clone(), name.clone(), l.name.clone()),
+                        ListenerKey::new(ns.clone(), name.clone(), l.name.clone()),
                         l.hostname.clone().unwrap_or_default(),
                     )
                 })
@@ -582,23 +535,23 @@ fn rebuild(
         .collect();
 
     let mut builder = RoutingTableBuilder::new();
-    for route in &routes {
+    for route in routes {
         GatewayApiReconciler::reconcile(
             route,
             slice_store,
             service_store,
-            &owned_gateways,
-            &backend_grants,
+            owned_gateways,
+            backend_grants,
             &listener_hostname_map,
             &mut builder,
         );
     }
-    for ingress in &ingresses {
+    for ingress in ingresses {
         IngressReconciler::reconcile(
             ingress,
             slice_store,
             service_store,
-            &owned_ingress_classes,
+            owned_ingress_classes,
             &mut builder,
         );
     }
@@ -653,20 +606,29 @@ fn rebuild(
             tracing::error!(error = %e, "Routing table build failed — retaining previous table");
         }
     }
+}
 
-    // Build and publish the TLS cert store independently of the route table.
+/// Build and publish the TLS cert store; returns per-gateway listener health for further use.
+fn build_tls(
+    ingresses: &[Arc<Ingress>],
+    gateway_store: &reflector::Store<Gateway>,
+    owned_gateway_classes: &HashSet<String>,
+    owned_ingress_classes: &HashSet<String>,
+    cert_grants: &GrantSet,
+    secret_store: &reflector::Store<Secret>,
+    tls_shared: &SharedTlsStore,
+) -> HashMap<ObjectKey, GatewayListenerHealth> {
     let mut tls_builder = TlsStoreBuilder::new();
-    for ingress in &ingresses {
+    for ingress in ingresses {
         IngressReconciler::reconcile_tls(
             ingress,
             secret_store,
-            &owned_ingress_classes,
+            owned_ingress_classes,
             &mut tls_builder,
         );
     }
 
-    // Gateway API TLS pass: walk every owned Gateway and register listener certs.
-    let mut gateway_tls_health: HashMap<(String, String), GatewayListenerHealth> = HashMap::new();
+    let mut gateway_tls_health: HashMap<ObjectKey, GatewayListenerHealth> = HashMap::new();
     for gw in gateway_store.state() {
         if !owned_gateway_classes.contains(&gw.spec.gateway_class_name) {
             continue;
@@ -674,8 +636,8 @@ fn rebuild(
         let ns = gw.metadata.namespace.clone().unwrap_or_default();
         let name = gw.metadata.name.clone().unwrap_or_default();
         let health =
-            GatewayApiReconciler::reconcile_tls(&gw, secret_store, &cert_grants, &mut tls_builder);
-        gateway_tls_health.insert((ns, name), health);
+            GatewayApiReconciler::reconcile_tls(&gw, secret_store, cert_grants, &mut tls_builder);
+        gateway_tls_health.insert(ObjectKey::new(ns, name), health);
     }
 
     let tls_store = tls_builder.build();
@@ -688,9 +650,17 @@ fn rebuild(
         tracing::trace!(certs, "TLS cert store unchanged, skip swap");
     }
 
-    // Count attached routes per gateway per listener, filtering by hostname intersection.
-    // Only routes whose hostnames intersect with the listener's hostname restriction are counted.
-    for route in &routes {
+    gateway_tls_health
+}
+
+/// Increment `attached_routes` counters for each gateway listener whose hostname
+/// intersects with the route's hostnames. Only owned gateways are counted.
+fn count_attached_routes(
+    routes: &[Arc<HTTPRoute>],
+    owned_gateways: &HashSet<ObjectKey>,
+    gateway_tls_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
+) {
+    for route in routes {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let route_hostnames: Vec<&str> = route
             .spec
@@ -704,7 +674,7 @@ fn rebuild(
         for pr in route.spec.parent_refs.as_deref().unwrap_or(&[]) {
             let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
             let gw_name = pr.name.as_str();
-            let key = (gw_ns.to_string(), gw_name.to_string());
+            let key = ObjectKey::new(gw_ns, gw_name);
             if !owned_gateways.contains(&key) {
                 continue;
             }
@@ -716,11 +686,9 @@ fn rebuild(
                         .get(sn)
                         .copied()
                         .unwrap_or(false);
-                    // Skip cross-namespace routes when the listener restricts to Same.
                     if gw_ns != route_ns && !allows_all {
                         continue;
                     }
-                    // parentRef.port must match the named listener's port when specified.
                     if let Some(port) = pr_port
                         && health.listener_ports.get(sn).copied().unwrap_or(0) != port
                     {
@@ -736,7 +704,6 @@ fn rebuild(
                         .listener_hostnames
                         .iter()
                         .filter_map(|(n, hn)| {
-                            // Filter by parentRef.port when specified.
                             if let Some(p) = pr_port
                                 && health.listener_ports.get(n).copied().unwrap_or(0) != p
                             {
@@ -762,19 +729,4 @@ fn rebuild(
             }
         }
     }
-
-    // Publish per-gateway listener health and wake the controller to re-evaluate statuses.
-    tls_health_shared.store_and_notify(gateway_tls_health);
-
-    // Compute and publish per-(route, parent) health for HTTPRoute status conditions.
-    let gateways = gateway_store.state();
-    let route_health_map = GatewayApiReconciler::compute_route_health(
-        &routes,
-        &gateways,
-        &owned_gateways,
-        &backend_grants,
-        slice_store,
-        service_store,
-    );
-    route_health_shared.store_and_notify(route_health_map);
 }

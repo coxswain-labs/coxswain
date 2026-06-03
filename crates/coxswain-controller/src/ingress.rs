@@ -1,5 +1,6 @@
 use crate::endpoints;
 use crate::tls::load_tls_cert;
+use crate::translate::metadata_created_at;
 use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, Upstream};
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -8,8 +9,6 @@ use k8s_openapi::api::networking::v1::Ingress;
 use kube::runtime::reflector;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::SystemTime;
-
 pub struct IngressReconciler;
 
 /// Returns the IngressClass name claimed by `ingress`.
@@ -58,12 +57,7 @@ impl IngressReconciler {
         let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
         let ingress_name = ingress.metadata.name.as_deref().unwrap_or("unknown");
         let route_id = format!("{ns}/{ingress_name}");
-        let created_at: Option<SystemTime> = ingress
-            .metadata
-            .creation_timestamp
-            .as_ref()
-            .and_then(|t| t.0.as_millisecond().try_into().ok())
-            .map(|ms: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms));
+        let created_at = metadata_created_at(&ingress.metadata);
         let spec = ingress.spec.as_ref();
         let rules = spec.and_then(|s| s.rules.as_deref());
 
@@ -111,11 +105,7 @@ impl IngressReconciler {
                 let upstream = Arc::new(Upstream::new(format!("{ns}/{}", svc.name), addrs));
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
-                let host_builder = match rule.host.as_deref() {
-                    None => builder.catchall(),
-                    Some(h) if h.starts_with("*.") => builder.wildcard_host(h),
-                    Some(h) => builder.exact_host(h),
-                };
+                let host_builder = builder.host_for(rule.host.as_deref());
 
                 let e = Arc::new(RouteEntry::path_only(
                     upstream,
@@ -153,11 +143,7 @@ impl IngressReconciler {
             } else {
                 let upstream = Arc::new(Upstream::new(format!("{ns}/{}", default_svc.name), addrs));
                 for rule in rules {
-                    let host_builder = match rule.host.as_deref() {
-                        None => builder.catchall(),
-                        Some(h) if h.starts_with("*.") => builder.wildcard_host(h),
-                        Some(h) => builder.exact_host(h),
-                    };
+                    let host_builder = builder.host_for(rule.host.as_deref());
                     let e = Arc::new(RouteEntry::path_only(
                         Arc::clone(&upstream),
                         route_id.clone(),

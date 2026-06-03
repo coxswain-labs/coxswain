@@ -1,5 +1,5 @@
 use crate::proxy::ProxyCtx;
-use coxswain_core::routing::{FilterAction, PathModifier};
+use coxswain_core::routing::{FilterAction, HeaderMod, PathModifier};
 use http::{HeaderName, HeaderValue};
 use pingora_core::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -18,7 +18,7 @@ impl TrafficFilter {
         for filter in filters {
             match filter {
                 FilterAction::RequestHeaderModifier(m) => {
-                    apply_header_mod_request(upstream_request, m);
+                    apply_header_mod(upstream_request, m, "RequestHeaderModifier");
                 }
                 FilterAction::UrlRewrite { hostname, path } => {
                     if let Some(h) = hostname {
@@ -59,112 +59,75 @@ impl TrafficFilter {
     ) {
         for filter in filters {
             if let FilterAction::ResponseHeaderModifier(m) = filter {
-                apply_header_mod_response(upstream_response, m);
+                apply_header_mod(upstream_response, m, "ResponseHeaderModifier");
             }
         }
     }
 }
 
-fn apply_header_mod_request(req: &mut RequestHeader, m: &coxswain_core::routing::HeaderMod) {
-    for (name, value) in &m.set {
-        match (
-            HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            (Ok(n), Ok(v)) => {
-                let _ = req.insert_header(n, v);
-            }
-            _ => tracing::warn!(%name, "RequestHeaderModifier set: invalid header name or value"),
-        }
+trait HeaderTarget {
+    fn hdr_set(&mut self, name: HeaderName, value: HeaderValue);
+    fn hdr_add(&mut self, name: HeaderName, value: HeaderValue);
+    fn hdr_remove(&mut self, name: &HeaderName);
+}
+
+impl HeaderTarget for RequestHeader {
+    fn hdr_set(&mut self, name: HeaderName, value: HeaderValue) {
+        let _ = self.insert_header(name, value);
     }
-    for (name, value) in &m.add {
-        match (
-            HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            (Ok(n), Ok(v)) => {
-                let _ = req.append_header(n, v);
-            }
-            _ => tracing::warn!(%name, "RequestHeaderModifier add: invalid header name or value"),
-        }
+    fn hdr_add(&mut self, name: HeaderName, value: HeaderValue) {
+        let _ = self.append_header(name, value);
     }
-    for name in &m.remove {
-        match HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()) {
-            Ok(n) => {
-                req.remove_header(&n);
-            }
-            Err(_) => tracing::warn!(%name, "RequestHeaderModifier remove: invalid header name"),
-        }
+    fn hdr_remove(&mut self, name: &HeaderName) {
+        self.remove_header(name);
     }
 }
 
-fn apply_header_mod_response(resp: &mut ResponseHeader, m: &coxswain_core::routing::HeaderMod) {
+impl HeaderTarget for ResponseHeader {
+    fn hdr_set(&mut self, name: HeaderName, value: HeaderValue) {
+        let _ = self.insert_header(name, value);
+    }
+    fn hdr_add(&mut self, name: HeaderName, value: HeaderValue) {
+        let _ = self.append_header(name, value);
+    }
+    fn hdr_remove(&mut self, name: &HeaderName) {
+        self.remove_header(name);
+    }
+}
+
+fn apply_header_mod<H: HeaderTarget>(target: &mut H, m: &HeaderMod, kind: &'static str) {
     for (name, value) in &m.set {
         match (
-            HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()),
+            HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_str(value),
         ) {
-            (Ok(n), Ok(v)) => {
-                let _ = resp.insert_header(n, v);
-            }
-            _ => tracing::warn!(%name, "ResponseHeaderModifier set: invalid header name or value"),
+            (Ok(n), Ok(v)) => target.hdr_set(n, v),
+            _ => tracing::warn!(%name, "{kind} set: invalid header name or value"),
         }
     }
     for (name, value) in &m.add {
         match (
-            HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()),
+            HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_str(value),
         ) {
-            (Ok(n), Ok(v)) => {
-                let _ = resp.append_header(n, v);
-            }
-            _ => tracing::warn!(%name, "ResponseHeaderModifier add: invalid header name or value"),
+            (Ok(n), Ok(v)) => target.hdr_add(n, v),
+            _ => tracing::warn!(%name, "{kind} add: invalid header name or value"),
         }
     }
     for name in &m.remove {
-        match HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()) {
-            Ok(n) => {
-                resp.remove_header(&n);
-            }
-            Err(_) => tracing::warn!(%name, "ResponseHeaderModifier remove: invalid header name"),
+        match HeaderName::from_bytes(name.as_bytes()) {
+            Ok(n) => target.hdr_remove(&n),
+            Err(_) => tracing::warn!(%name, "{kind} remove: invalid header name"),
         }
     }
 }
 
 fn rewrite_path(req: &mut RequestHeader, modifier: &PathModifier, original_path: &str) {
-    let query = req.uri.query();
-    let new_path = match modifier {
-        PathModifier::ReplaceFullPath(p) => p.clone(),
-        PathModifier::ReplacePrefixMatch {
-            prefix,
-            replacement,
-        } => {
-            let prefix_trimmed = prefix.trim_end_matches('/');
-            if original_path == prefix_trimmed || original_path.starts_with(prefix_trimmed) {
-                let suffix = &original_path[prefix_trimmed.len()..];
-                let rep = replacement.trim_end_matches('/');
-                match suffix {
-                    "" | "/" => {
-                        if rep.is_empty() {
-                            "/".to_string()
-                        } else {
-                            rep.to_string()
-                        }
-                    }
-                    s => format!("{rep}{s}"),
-                }
-            } else {
-                original_path.to_string()
-            }
-        }
+    let new_path = modifier.apply(original_path);
+    let path_and_query = match req.uri.query() {
+        Some(q) => format!("{new_path}?{q}"),
+        None => new_path,
     };
-
-    let path_and_query = if let Some(q) = query {
-        format!("{new_path}?{q}")
-    } else {
-        new_path
-    };
-
     match http::Uri::builder()
         .path_and_query(path_and_query.as_str())
         .build()
@@ -208,7 +171,7 @@ mod tests {
             set: vec![("x-keep".to_string(), "overwritten".to_string())],
             ..Default::default()
         };
-        apply_header_mod_request(&mut r, &m);
+        apply_header_mod(&mut r, &m, "RequestHeaderModifier");
         assert_eq!(r.headers.get("x-keep").unwrap(), "overwritten");
     }
 
@@ -219,7 +182,7 @@ mod tests {
             add: vec![("x-keep".to_string(), "extra".to_string())],
             ..Default::default()
         };
-        apply_header_mod_request(&mut r, &m);
+        apply_header_mod(&mut r, &m, "RequestHeaderModifier");
         let vals: Vec<_> = r.headers.get_all("x-keep").iter().collect();
         assert_eq!(vals.len(), 2);
     }
@@ -231,7 +194,7 @@ mod tests {
             remove: vec!["x-keep".to_string()],
             ..Default::default()
         };
-        apply_header_mod_request(&mut r, &m);
+        apply_header_mod(&mut r, &m, "RequestHeaderModifier");
         assert!(r.headers.get("x-keep").is_none());
     }
 
@@ -243,7 +206,7 @@ mod tests {
             set: vec![("x-old".to_string(), "new".to_string())],
             ..Default::default()
         };
-        apply_header_mod_response(&mut r, &m);
+        apply_header_mod(&mut r, &m, "ResponseHeaderModifier");
         assert_eq!(r.headers.get("x-old").unwrap(), "new");
     }
 
@@ -255,7 +218,7 @@ mod tests {
             add: vec![("x-multi".to_string(), "b".to_string())],
             ..Default::default()
         };
-        apply_header_mod_response(&mut r, &m);
+        apply_header_mod(&mut r, &m, "ResponseHeaderModifier");
         let vals: Vec<_> = r.headers.get_all("x-multi").iter().collect();
         assert_eq!(vals.len(), 2);
     }

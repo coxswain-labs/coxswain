@@ -1,33 +1,27 @@
-use arc_swap::ArcSwap;
+use crate::shared::Shared;
 use std::collections::HashSet;
-use std::sync::Arc;
 
-/// Shared snapshot of `(namespace, name)` pairs for Gateway resources managed by Coxswain.
+/// A key identifying a specific Kubernetes object by namespace and name.
 ///
-/// Written by the reconciler on every rebuild; read by the controller before writing status.
-/// Lock-free: `store` swaps the inner `Arc`; `load` atomically borrows the current snapshot.
-#[derive(Clone)]
-pub struct OwnedGateways(Arc<ArcSwap<HashSet<(String, String)>>>);
+/// "Object" is the K8s term for an instance (a Pod, a Gateway); "resource" refers to
+/// the API endpoint type. Matches the terminology used by `kube`'s `ObjectRef`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjectKey {
+    pub ns: String,
+    pub name: String,
+}
 
-impl OwnedGateways {
-    pub fn new() -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(HashSet::new())))
-    }
-
-    pub fn load(&self) -> arc_swap::Guard<Arc<HashSet<(String, String)>>> {
-        self.0.load()
-    }
-
-    pub fn store(&self, set: HashSet<(String, String)>) {
-        self.0.store(Arc::new(set));
+impl ObjectKey {
+    pub fn new(ns: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            ns: ns.into(),
+            name: name.into(),
+        }
     }
 }
 
-impl Default for OwnedGateways {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Shared snapshot of Gateway objects managed by Coxswain.
+pub type OwnedGateways = Shared<HashSet<ObjectKey>>;
 
 /// Returns true if the given `ParentReference` fields refer to a Gateway managed by Coxswain.
 ///
@@ -41,7 +35,7 @@ pub fn parent_ref_owned(
     namespace: Option<&str>,
     name: &str,
     default_ns: &str,
-    owned: &HashSet<(String, String)>,
+    owned: &HashSet<ObjectKey>,
 ) -> bool {
     let group = group.unwrap_or("gateway.networking.k8s.io");
     let kind = kind.unwrap_or("Gateway");
@@ -49,17 +43,18 @@ pub fn parent_ref_owned(
         return false;
     }
     let ns = namespace.unwrap_or(default_ns);
-    owned.contains(&(ns.to_string(), name.to_string()))
+    owned.contains(&ObjectKey::new(ns, name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
-    fn owned(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
+    fn owned(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {
         pairs
             .iter()
-            .map(|(ns, name)| (ns.to_string(), name.to_string()))
+            .map(|(ns, name)| ObjectKey::new(*ns, *name))
             .collect()
     }
 
@@ -141,9 +136,9 @@ mod tests {
         let og = OwnedGateways::new();
         assert!(og.load().is_empty());
         let mut set = HashSet::new();
-        set.insert(("ns".to_string(), "gw".to_string()));
-        og.store(set);
-        assert!(og.load().contains(&("ns".to_string(), "gw".to_string())));
+        set.insert(ObjectKey::new("ns", "gw"));
+        og.store(Arc::new(set));
+        assert!(og.load().contains(&ObjectKey::new("ns", "gw")));
     }
 
     #[test]
@@ -151,8 +146,8 @@ mod tests {
         let og = OwnedGateways::new();
         let og2 = og.clone();
         let mut set = HashSet::new();
-        set.insert(("ns".to_string(), "gw".to_string()));
-        og.store(set);
-        assert!(og2.load().contains(&("ns".to_string(), "gw".to_string())));
+        set.insert(ObjectKey::new("ns", "gw"));
+        og.store(Arc::new(set));
+        assert!(og2.load().contains(&ObjectKey::new("ns", "gw")));
     }
 }
