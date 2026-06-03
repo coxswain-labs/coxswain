@@ -1,14 +1,7 @@
 on:
-  pull_request:
+  push:
     branches:
       - main
-    paths:
-      - 'crates/**'
-      - 'deploy/manifests/**'
-      - 'conformance/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/conformance.yml'
   schedule:
     - cron: '0 2 * * *'
   workflow_dispatch:
@@ -113,38 +106,6 @@ jobs:
             --report-output="${REPORT_FILE}" \
             --cleanup-base-resources=true
           echo "report_file=${REPORT_FILE}" >> "$GITHUB_OUTPUT"
-
-      - name: Post conformance results as PR comment
-        if: github.event_name == 'pull_request' && always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          REPORT=conformance/${{ steps.conformance.outputs.report_file }}
-          if [ ! -f "$REPORT" ]; then
-            BODY="## Gateway API Conformance\n\n❌ Report not generated — conformance suite failed before producing output."
-          else
-            PASSED=$(yq '.results[] | select(.result == "success") | .testName' "$REPORT" 2>/dev/null | wc -l | tr -d ' ')
-            FAILED=$(yq '.results[] | select(.result != "success") | .testName' "$REPORT" 2>/dev/null | wc -l | tr -d ' ')
-            BODY=$(cat <<EOF
-          ## Gateway API Conformance
-
-          | | Count |
-          |---|---|
-          | ✅ Passed | ${PASSED} |
-          | ❌ Failed | ${FAILED} |
-
-          <details><summary>Full report</summary>
-
-          \`\`\`yaml
-          $(cat "$REPORT")
-          \`\`\`
-
-          </details>
-          EOF
-          )
-          fi
-          gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY" \
-            --repo "${{ github.repository }}"
 
       - name: Upload conformance report as artifact
         if: always()

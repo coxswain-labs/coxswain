@@ -38,10 +38,9 @@ TLS is a launch blocker. WebSocket and protocol negotiation are the minimum need
 - [x] ~~TLS termination for Gateway API listeners (GEP-2907) — [#9](https://github.com/coxswain-labs/coxswain/issues/9) `MUST`~~
 - [x] ~~Secret watch + hot TLS reload — [#10](https://github.com/coxswain-labs/coxswain/issues/10) `MUST`~~
 - [x] ~~cert-manager integration (both APIs) — [#11](https://github.com/coxswain-labs/coxswain/issues/11) `MUST`~~
-- [ ] WebSocket upgrade passthrough — [#12](https://github.com/coxswain-labs/coxswain/issues/12) `MUST` _(superseded by #90 once implemented)_
 - [x] ~~PROXY protocol v1/v2 support — [#49](https://github.com/coxswain-labs/coxswain/issues/49) `MUST`~~
 - [ ] TLS Passthrough for Gateway API listeners (`tls.mode: Passthrough`, GEP-2643) — [#70](https://github.com/coxswain-labs/coxswain/issues/70) `MUST`
-- [ ] Honor `appProtocol` on Service ports for backend protocol selection (GEP-1911) — [#90](https://github.com/coxswain-labs/coxswain/issues/90) `SHOULD` _(supersedes #12)_
+- [ ] Honor `appProtocol` on Service ports for backend protocol selection (GEP-1911) — [#90](https://github.com/coxswain-labs/coxswain/issues/90) `SHOULD` _(covers WebSocket `kubernetes.io/ws`, H2C, and WSS; supersedes closed #12)_
 
 #### Traffic Management
 
