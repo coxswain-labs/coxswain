@@ -94,7 +94,8 @@ cargo run --bin coxswain -- serve --log-format console
 
 | Port | Purpose |
 |------|---------|
-| `8080` | HTTP proxy (data plane) |
+| `80`   | HTTP proxy (data plane) |
+| `443`  | HTTPS proxy (data plane, SNI TLS) |
 | `8081` | Health endpoints (`/healthz`, `/readyz`) |
 | `8082` | Admin endpoints (`/metrics`, `/routes`, `/status`) |
 
@@ -137,30 +138,30 @@ kubectl apply -f deploy/dev/ingress.yaml
 
 ```bash
 # echo.local — path-based routing, single backend per rule
-curl -H "Host: echo.local" http://localhost:8080/a          # hello from echo-a
-curl -H "Host: echo.local" http://localhost:8080/b          # hello from echo-b
-curl -H "Host: echo.local" http://localhost:8080/           # hello from echo-a (catchall)
+curl -H "Host: echo.local" http://localhost/a          # hello from echo-a
+curl -H "Host: echo.local" http://localhost/b          # hello from echo-b
+curl -H "Host: echo.local" http://localhost/           # hello from echo-a (catchall)
 
 # split.local — both echo-a and echo-b are pooled into one upstream;
 # coxswain round-robins across all ready pod addresses from both services
-curl -H "Host: split.local" http://localhost:8080/          # hello from echo-a
-curl -H "Host: split.local" http://localhost:8080/          # hello from echo-b
+curl -H "Host: split.local" http://localhost/          # hello from echo-a
+curl -H "Host: split.local" http://localhost/          # hello from echo-b
 
 # *.wildcard.local — any subdomain matches
-curl -H "Host: foo.wildcard.local" http://localhost:8080/   # hello from echo-c
-curl -H "Host: bar.wildcard.local" http://localhost:8080/   # hello from echo-c
+curl -H "Host: foo.wildcard.local" http://localhost/   # hello from echo-c
+curl -H "Host: bar.wildcard.local" http://localhost/   # hello from echo-c
 ```
 
 ### Test classic Ingress routes
 
 ```bash
 # ingress.local
-curl -H "Host: ingress.local" http://localhost:8080/a       # hello from echo-a
-curl -H "Host: ingress.local" http://localhost:8080/b       # hello from echo-b
+curl -H "Host: ingress.local" http://localhost/a       # hello from echo-a
+curl -H "Host: ingress.local" http://localhost/b       # hello from echo-b
 
 # ingress2.local — second Ingress resource
-curl -H "Host: ingress2.local" http://localhost:8080/c      # hello from echo-c
-curl -H "Host: ingress2.local" http://localhost:8080/       # hello from echo-a (catchall)
+curl -H "Host: ingress2.local" http://localhost/c      # hello from echo-c
+curl -H "Host: ingress2.local" http://localhost/       # hello from echo-a (catchall)
 ```
 
 ### Test cross-namespace routes (ReferenceGrant)
@@ -173,14 +174,14 @@ kubectl apply -f deploy/dev/cross-namespace.yaml
 
 ```bash
 # Route resolves when the grant is present
-curl -H "Host: cross-ns.local" http://localhost:8080/   # hello from echo-d
+curl -H "Host: cross-ns.local" http://localhost/   # hello from echo-d
 ```
 
 Delete the grant to confirm enforcement:
 
 ```bash
 kubectl delete referencegrant allow-httproute-from-default -n echo-tenant
-curl -H "Host: cross-ns.local" http://localhost:8080/   # 503 Service Unavailable
+curl -H "Host: cross-ns.local" http://localhost/   # 503 Service Unavailable
 
 # Restore
 kubectl apply -f deploy/dev/cross-namespace.yaml

@@ -152,14 +152,14 @@ pub struct ServeArgs {
     pub health_addr: SocketAddr,
 
     /// Socket address to listen on for inbound HTTP traffic.
-    #[arg(long, env = "COXSWAIN_PROXY_ADDR", default_value = "0.0.0.0:8080")]
+    #[arg(long, env = "COXSWAIN_PROXY_ADDR", default_value = "0.0.0.0:80")]
     pub proxy_addr: SocketAddr,
 
     /// Socket address to listen on for inbound HTTPS traffic.
     ///
     /// SNI selects the certificate from each Ingress's `spec.tls` block.
     /// The listener is always bound; handshakes with no matching SNI fail cleanly.
-    #[arg(long, env = "COXSWAIN_PROXY_TLS_ADDR", default_value = "0.0.0.0:8443")]
+    #[arg(long, env = "COXSWAIN_PROXY_TLS_ADDR", default_value = "0.0.0.0:443")]
     pub proxy_tls_addr: SocketAddr,
 
     /// External address written to every owned `Ingress.status.loadBalancer.ingress[0]`
@@ -271,29 +271,30 @@ fn main() -> Result<()> {
     let leader = Arc::new(AtomicBool::new(false));
     let owned_gateways = OwnedGateways::new();
 
+    let reconciler = Reconciler::new(
+        routing_table.clone(),
+        tls_store.clone(),
+        gateway_tls_health.clone(),
+        owned_gateways.clone(),
+        args.controller_name.clone(),
+        args.controller_watch_namespace.clone(),
+        args.ingress_default_backend,
+    );
+    let route_health = reconciler.route_health();
+
     server.add_service(background_service(
         "controller",
         Controller::new(
             synced.clone(),
             leader.clone(),
-            owned_gateways.clone(),
-            gateway_tls_health.clone(),
+            owned_gateways,
+            gateway_tls_health,
+            route_health,
             controller_config,
         ),
     ));
 
-    server.add_service(background_service(
-        "reconciler",
-        Reconciler::new(
-            routing_table.clone(),
-            tls_store.clone(),
-            gateway_tls_health,
-            owned_gateways,
-            args.controller_name.clone(),
-            args.controller_watch_namespace.clone(),
-            args.ingress_default_backend,
-        ),
-    ));
+    server.add_service(background_service("reconciler", reconciler));
 
     let default_timeouts = RouteTimeouts {
         request: args.proxy_default_request_timeout,

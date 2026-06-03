@@ -166,7 +166,8 @@ Three `Arc<AtomicBool>` flags are shared across services:
 
 | Port   | Service  | Endpoints                          |
 |--------|----------|------------------------------------|
-| `8080` | proxy    | HTTP data plane                    |
+| `80`   | proxy    | HTTP data plane                    |
+| `443`  | proxy    | HTTPS data plane (SNI TLS)         |
 | `8081` | health   | `/healthz`, `/readyz`              |
 | `8082` | admin    | `/metrics`, `/routes`, `/status`   |
 

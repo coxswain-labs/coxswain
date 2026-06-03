@@ -32,7 +32,8 @@ coxswain-bin
 
 | Port   | Service | Endpoints                        |
 |--------|---------|----------------------------------|
-| `8080` | proxy   | HTTP data plane                  |
+| `80`   | proxy   | HTTP data plane                  |
+| `443`  | proxy   | HTTPS data plane (SNI TLS)       |
 | `8081` | health  | `/healthz`, `/readyz`            |
 | `8082` | admin   | `/metrics`, `/routes`, `/status` |
 
@@ -76,7 +77,7 @@ All flags have environment variable equivalents. Most use a `COXSWAIN_*` prefix 
 | `--log-format` | `COXSWAIN_LOG_FORMAT` | `json` | `json` (production) or `console` (local dev) |
 | `--pod-name` | `POD_NAME` | `coxswain-local` | Pod name used as the leader-election holder identity |
 | `--pod-namespace` | `POD_NAMESPACE` | `coxswain-system` | Pod namespace used to scope the leader-election Lease |
-| `--proxy-addr` | `COXSWAIN_PROXY_ADDR` | `0.0.0.0:8080` | Inbound HTTP proxy address |
+| `--proxy-addr` | `COXSWAIN_PROXY_ADDR` | `0.0.0.0:80` | Inbound HTTP proxy address |
 | `--proxy-shutdown-grace-period` | `COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD` | `30s` | Drain window after shutdown signal; connections are given this long to complete |
 | `--proxy-shutdown-timeout` | `COXSWAIN_PROXY_SHUTDOWN_TIMEOUT` | `5s` | Hard deadline for the final shutdown step after the grace period expires |
 | `--proxy-threads` | `COXSWAIN_PROXY_THREADS` | `2` | Worker threads per proxy service; set to CPU core count for maximum throughput |
