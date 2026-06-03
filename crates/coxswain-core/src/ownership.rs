@@ -1,33 +1,10 @@
-use arc_swap::ArcSwap;
+use crate::shared::Shared;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 /// Shared snapshot of `(namespace, name)` pairs for Gateway resources managed by Coxswain.
 ///
 /// Written by the reconciler on every rebuild; read by the controller before writing status.
-/// Lock-free: `store` swaps the inner `Arc`; `load` atomically borrows the current snapshot.
-#[derive(Clone)]
-pub struct OwnedGateways(Arc<ArcSwap<HashSet<(String, String)>>>);
-
-impl OwnedGateways {
-    pub fn new() -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(HashSet::new())))
-    }
-
-    pub fn load(&self) -> arc_swap::Guard<Arc<HashSet<(String, String)>>> {
-        self.0.load()
-    }
-
-    pub fn store(&self, set: HashSet<(String, String)>) {
-        self.0.store(Arc::new(set));
-    }
-}
-
-impl Default for OwnedGateways {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub type OwnedGateways = Shared<HashSet<(String, String)>>;
 
 /// Returns true if the given `ParentReference` fields refer to a Gateway managed by Coxswain.
 ///
@@ -55,6 +32,7 @@ pub fn parent_ref_owned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn owned(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
         pairs
@@ -142,7 +120,7 @@ mod tests {
         assert!(og.load().is_empty());
         let mut set = HashSet::new();
         set.insert(("ns".to_string(), "gw".to_string()));
-        og.store(set);
+        og.store(Arc::new(set));
         assert!(og.load().contains(&("ns".to_string(), "gw".to_string())));
     }
 
@@ -152,7 +130,7 @@ mod tests {
         let og2 = og.clone();
         let mut set = HashSet::new();
         set.insert(("ns".to_string(), "gw".to_string()));
-        og.store(set);
+        og.store(Arc::new(set));
         assert!(og2.load().contains(&("ns".to_string(), "gw".to_string())));
     }
 }

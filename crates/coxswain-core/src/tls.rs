@@ -1,4 +1,4 @@
-use arc_swap::ArcSwap;
+use crate::shared::Shared;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -133,35 +133,9 @@ impl TlsStoreBuilder {
 
 /// A cheaply-cloneable handle to the active TLS cert store.
 ///
-/// Parallel to [`crate::routing::SharedRoutingTable`] — certs and routes have
-/// separate lifecycles (cert-manager rotates certs independently of route edits)
-/// and are swapped independently.
-#[derive(Clone)]
-pub struct SharedTlsStore {
-    inner: Arc<ArcSwap<TlsStore>>,
-}
-
-impl SharedTlsStore {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(ArcSwap::from_pointee(TlsStore::default())),
-        }
-    }
-
-    pub fn load(&self) -> Arc<TlsStore> {
-        self.inner.load_full()
-    }
-
-    pub fn store(&self, store: Arc<TlsStore>) {
-        self.inner.store(store);
-    }
-}
-
-impl Default for SharedTlsStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Certs and routes have separate lifecycles (cert-manager rotates certs
+/// independently of route edits) and are swapped independently.
+pub type SharedTlsStore = Shared<TlsStore>;
 
 #[cfg(test)]
 mod tests {

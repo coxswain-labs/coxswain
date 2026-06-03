@@ -1,4 +1,4 @@
-use arc_swap::ArcSwap;
+use crate::shared::Shared;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,35 +27,7 @@ pub enum RouterError {
 }
 
 /// A cheaply-cloneable handle to the active routing table.
-///
-/// Backed by `ArcSwap` for lock-free atomic swaps; the storage type is an
-/// implementation detail that may change without affecting callers.
-#[derive(Clone)]
-pub struct SharedRoutingTable {
-    inner: Arc<ArcSwap<RoutingTable>>,
-}
-
-impl SharedRoutingTable {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(ArcSwap::from_pointee(RoutingTable::default())),
-        }
-    }
-
-    pub fn load(&self) -> Arc<RoutingTable> {
-        self.inner.load_full()
-    }
-
-    pub fn store(&self, table: Arc<RoutingTable>) {
-        self.inner.store(table);
-    }
-}
-
-impl Default for SharedRoutingTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub type SharedRoutingTable = Shared<RoutingTable>;
 
 /// Result of a two-level host+path routing lookup.
 pub enum RouteOutcome {

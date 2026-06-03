@@ -485,7 +485,7 @@ fn rebuild(
         .collect();
 
     // Publish the owned-gateways snapshot so the controller can filter status writes.
-    owned_gateways_handle.store(owned_gateways.clone());
+    owned_gateways_handle.store(Arc::new(owned_gateways.clone()));
 
     // Flatten ReferenceGrant objects into two sets for O(1) cross-namespace ref checks:
     //   backend_grants: HTTPRoute → Service  (used by GatewayApiReconciler::reconcile)
