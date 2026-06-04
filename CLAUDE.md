@@ -11,7 +11,7 @@ When the user says "start working on issue N":
 4. Once plan mode exits and implementation begins: ensure you're working on the latest code and create the branch: `git checkout main && git pull --ff-only origin main && git checkout -b issue-N`.
 5. Implement the issue per its acceptance criteria.
 6. Add or update e2e tests in `crates/coxswain-e2e/` that cover the new behaviour. Every issue that changes routing, status conditions, or proxy behaviour must have at least one new scenario in `tests/gateway_api.rs` or `tests/ingress.rs`. 
-7. Run `cargo test -p coxswain-e2e --test <file> -- --test-threads=1` locally before pushing.
+7. ALWAYS run `cargo test -p coxswain-e2e --test <file> -- --test-threads=1` locally before pushing to ensure no regression.
 8. If the issue implements a Gateway API conformance feature (check the issue body for a **Feature flags** line), add the corresponding `features.SupportXxx` constant(s) to `opts.SupportedFeatures` in `conformance/main_test.go`. Include a comment referencing the issue number. Run `go vet ./...` in `conformance/` to confirm the constant names are valid.
 9. In `ROADMAP.md`, change the corresponding checklist item from `- ⬜` to `- ✅ ~~...~~` (swap the emoji and wrap the description in strikethrough). Only commit this change on the new branch with `Refs #N` at the end, when the issue is fully implemented.
 
@@ -90,9 +90,9 @@ cd conformance && go test -v -timeout 60m -run TestConformance \
   --version=$(git describe --tags --always) \
   --report-output=reports/local-report.yaml
 
-# Reset the local k8s cluster (Orb)
+# Reset the local k8s cluster (Orb) before running the conformance or e2e test above.
 # After this ensure to load the coxswain manifests from deploy/manifests/ excluding deployment.yaml
-orb delete k8s -f && orb start k8s
+orb delete -f k8s && orb start k8s
 ```
 
 ## Architecture
