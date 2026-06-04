@@ -54,8 +54,12 @@ pub(crate) fn resolve(
             continue;
         }
         for ep in &slice.endpoints {
-            // Skip endpoints explicitly marked not-ready; treat unknown (None) as ready.
-            if ep.conditions.as_ref().and_then(|c| c.ready) == Some(false) {
+            // `serving` is authoritative when set (K8s 1.22+); fall back to `ready`
+            // for older clusters. Skip only when the effective signal is explicitly
+            // false; treat unknown (None) as eligible.
+            let cond = ep.conditions.as_ref();
+            let eligible = cond.and_then(|c| c.serving.or(c.ready));
+            if eligible == Some(false) {
                 continue;
             }
             for addr in &ep.addresses {
@@ -86,7 +90,13 @@ mod tests {
     use kube::runtime::watcher;
     use std::collections::BTreeMap;
 
-    fn make_slice(ns: &str, svc: &str, ip: &str, ready: Option<bool>) -> EndpointSlice {
+    fn make_slice(
+        ns: &str,
+        svc: &str,
+        ip: &str,
+        serving: Option<bool>,
+        ready: Option<bool>,
+    ) -> EndpointSlice {
         let mut labels = BTreeMap::new();
         labels.insert("kubernetes.io/service-name".to_string(), svc.to_string());
         EndpointSlice {
@@ -100,6 +110,7 @@ mod tests {
             endpoints: vec![Endpoint {
                 addresses: vec![ip.to_string()],
                 conditions: Some(EndpointConditions {
+                    serving,
                     ready,
                     ..Default::default()
                 }),
@@ -150,20 +161,20 @@ mod tests {
 
     #[test]
     fn resolve_returns_ready_endpoints() {
-        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", Some(true))]);
+        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", None, Some(true))]);
         let addrs = resolve("ns", "svc", 8080, &store, &empty_svc_store());
         assert_eq!(addrs, vec!["10.0.0.1:8080".parse::<SocketAddr>().unwrap()]);
     }
 
     #[test]
     fn resolve_skips_not_ready_endpoints() {
-        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", Some(false))]);
+        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", None, Some(false))]);
         assert!(resolve("ns", "svc", 8080, &store, &empty_svc_store()).is_empty());
     }
 
     #[test]
     fn resolve_includes_unknown_ready_endpoints() {
-        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", None)]);
+        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", None, None)]);
         assert_eq!(
             resolve("ns", "svc", 8080, &store, &empty_svc_store()).len(),
             1
@@ -172,13 +183,25 @@ mod tests {
 
     #[test]
     fn resolve_ignores_wrong_namespace() {
-        let store = make_store(vec![make_slice("other-ns", "svc", "10.0.0.1", Some(true))]);
+        let store = make_store(vec![make_slice(
+            "other-ns",
+            "svc",
+            "10.0.0.1",
+            None,
+            Some(true),
+        )]);
         assert!(resolve("ns", "svc", 8080, &store, &empty_svc_store()).is_empty());
     }
 
     #[test]
     fn resolve_ignores_wrong_service() {
-        let store = make_store(vec![make_slice("ns", "other-svc", "10.0.0.1", Some(true))]);
+        let store = make_store(vec![make_slice(
+            "ns",
+            "other-svc",
+            "10.0.0.1",
+            None,
+            Some(true),
+        )]);
         assert!(resolve("ns", "svc", 8080, &store, &empty_svc_store()).is_empty());
     }
 
@@ -189,7 +212,7 @@ mod tests {
 
     #[test]
     fn resolve_uses_target_port_when_service_port_differs() {
-        let slices = make_store(vec![make_slice("ns", "svc", "10.0.0.1", Some(true))]);
+        let slices = make_store(vec![make_slice("ns", "svc", "10.0.0.1", None, Some(true))]);
         let svcs = make_svc_store(vec![make_service("ns", "svc", 8082, 3000)]);
         let addrs = resolve("ns", "svc", 8082, &slices, &svcs);
         assert_eq!(addrs, vec!["10.0.0.1:3000".parse::<SocketAddr>().unwrap()]);
@@ -197,8 +220,65 @@ mod tests {
 
     #[test]
     fn resolve_falls_back_to_service_port_when_service_missing() {
-        let slices = make_store(vec![make_slice("ns", "svc", "10.0.0.1", Some(true))]);
+        let slices = make_store(vec![make_slice("ns", "svc", "10.0.0.1", None, Some(true))]);
         let addrs = resolve("ns", "svc", 8082, &slices, &empty_svc_store());
         assert_eq!(addrs, vec!["10.0.0.1:8082".parse::<SocketAddr>().unwrap()]);
+    }
+
+    // --- serving condition tests ---
+
+    #[test]
+    fn resolve_skips_not_serving_endpoints_even_when_ready_true() {
+        // Regression: serving:false must exclude the endpoint even if ready:true
+        // (the race window during rolling deploys where ready lags behind serving).
+        let store = make_store(vec![make_slice(
+            "ns",
+            "svc",
+            "10.0.0.1",
+            Some(false),
+            Some(true),
+        )]);
+        assert!(resolve("ns", "svc", 8080, &store, &empty_svc_store()).is_empty());
+    }
+
+    #[test]
+    fn resolve_includes_serving_endpoints_with_unknown_ready() {
+        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", Some(true), None)]);
+        assert_eq!(
+            resolve("ns", "svc", 8080, &store, &empty_svc_store()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_ready_when_serving_unset_and_ready_true() {
+        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", None, Some(true))]);
+        assert_eq!(
+            resolve("ns", "svc", 8080, &store, &empty_svc_store()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_ready_when_serving_unset_and_ready_false() {
+        let store = make_store(vec![make_slice("ns", "svc", "10.0.0.1", None, Some(false))]);
+        assert!(resolve("ns", "svc", 8080, &store, &empty_svc_store()).is_empty());
+    }
+
+    #[test]
+    fn resolve_serving_true_overrides_ready_false() {
+        // serving wins when both are set; serving:true/ready:false means the
+        // endpoint is in the process of becoming ready but can serve traffic.
+        let store = make_store(vec![make_slice(
+            "ns",
+            "svc",
+            "10.0.0.1",
+            Some(true),
+            Some(false),
+        )]);
+        assert_eq!(
+            resolve("ns", "svc", 8080, &store, &empty_svc_store()).len(),
+            1
+        );
     }
 }
