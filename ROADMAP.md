@@ -33,7 +33,7 @@ The first fully usable version: all must-have features implemented, OCI image pu
 - ✅ ~~Fix `gateway_needs_status_patch` `observedGeneration` comparison (GEP-1364) — [#89](https://github.com/coxswain-labs/coxswain/issues/89)~~
 - ✅ ~~Respect `EndpointSlice.conditions.serving` for endpoint drain — [#50](https://github.com/coxswain-labs/coxswain/issues/50)~~
 - ✅ ~~Wildcard hostname must match exactly one DNS label — [#100](https://github.com/coxswain-labs/coxswain/issues/100)~~
-- ⬜ Resolve `Service.port.name` for Ingress backends — [#101](https://github.com/coxswain-labs/coxswain/issues/101)
+- ✅ ~~Resolve `Service.port.name` for Ingress backends — [#101](https://github.com/coxswain-labs/coxswain/issues/101)~~
 - ⬜ Honor `ingressclass.kubernetes.io/is-default-class` annotation — [#102](https://github.com/coxswain-labs/coxswain/issues/102)
 - ⬜ Fix `spec.defaultBackend` semantics: rules-less Ingresses and cross-host fallthrough — [#103](https://github.com/coxswain-labs/coxswain/issues/103)
 - ⬜ Warn instead of silently dropping `Resource`-type Ingress backends — [#104](https://github.com/coxswain-labs/coxswain/issues/104)

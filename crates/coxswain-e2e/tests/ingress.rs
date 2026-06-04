@@ -1,7 +1,7 @@
 use coxswain_e2e::{
     fixtures::{
-        self, BACKENDS_ECHO, INGRESS_CERT_MANAGER, INGRESS_DEFAULT_BACKEND, INGRESS_PATH_MATCHING,
-        INGRESS_TLS_TERMINATION, INGRESS_WILDCARD_HOST,
+        self, BACKENDS_ECHO, INGRESS_CERT_MANAGER, INGRESS_DEFAULT_BACKEND, INGRESS_NAMED_PORT,
+        INGRESS_PATH_MATCHING, INGRESS_TLS_TERMINATION, INGRESS_WILDCARD_HOST,
     },
     harness::{
         ControllerOptions, ControllerProcess, GeneratedCert, Harness, HttpClient, NamespaceGuard,
@@ -480,6 +480,31 @@ async fn wildcard_host() -> anyhow::Result<()> {
         status, 404,
         "nested subdomain should not match wildcard rule"
     );
+
+    Ok(())
+}
+
+/// Verifies that an Ingress backend with a named service port (`port.name: http`)
+/// is resolved correctly and routes traffic to the expected backend.
+/// Also covers `pathType: Exact` end-to-end (previously untested at this level).
+#[tokio::test]
+async fn named_port_backend() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-named-port").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("named.{}.local", ns.name);
+    fixtures::apply_fixture(INGRESS_NAMED_PORT, &ns.name, &[("INGRESS_HOST", &host)]).await?;
+
+    let resp = wait::wait_for_route(&h.http, &host, "/named", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    // Exact pathType: a longer path must not match.
+    let status = h.http.get_status(&host, "/named/extra").await?;
+    assert_eq!(status, 404, "Exact path should not match /named/extra");
 
     Ok(())
 }

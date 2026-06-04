@@ -5,11 +5,38 @@ use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, Upstream};
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::api::networking::v1::{Ingress, IngressServiceBackend};
 use kube::runtime::reflector;
 use std::collections::HashSet;
 use std::sync::Arc;
 pub struct IngressReconciler;
+
+/// Resolves a backend port to its numeric value.
+///
+/// Tries `port.number` first; when absent, looks up `port.name` in the
+/// Service store. Emits a warning and returns `None` when the name is set
+/// but the Service is missing or has no matching port.
+fn resolve_backend_port(
+    ns: &str,
+    svc: &IngressServiceBackend,
+    services: &reflector::Store<Service>,
+) -> Option<i32> {
+    let port = svc.port.as_ref()?;
+    if let Some(n) = port.number {
+        return Some(n);
+    }
+    let name = port.name.as_deref()?;
+    let resolved = endpoints::port_for_name(ns, &svc.name, name, services);
+    if resolved.is_none() {
+        tracing::warn!(
+            namespace = %ns,
+            service = %svc.name,
+            port_name = %name,
+            "Ingress backend references unknown named port on Service — skipping"
+        );
+    }
+    resolved
+}
 
 /// Returns the IngressClass name claimed by `ingress`.
 ///
@@ -87,7 +114,7 @@ impl IngressReconciler {
                     Some(s) => s,
                     None => continue,
                 };
-                let port = match svc.port.as_ref().and_then(|p| p.number) {
+                let port = match resolve_backend_port(ns, svc, services) {
                     Some(p) => p,
                     None => continue,
                 };
@@ -131,7 +158,7 @@ impl IngressReconciler {
         if let Some(default_svc) = spec
             .and_then(|s| s.default_backend.as_ref())
             .and_then(|b| b.service.as_ref())
-            && let Some(port) = default_svc.port.as_ref().and_then(|p| p.number)
+            && let Some(port) = resolve_backend_port(ns, default_svc, services)
         {
             let addrs = endpoints::resolve(ns, &default_svc.name, port, slices, services);
             if addrs.is_empty() {
@@ -268,6 +295,79 @@ mod tests {
             writer.apply_watcher_event(&watcher::Event::Apply(slice));
         }
         writer.as_reader()
+    }
+
+    fn make_svc_store(services: Vec<Service>) -> reflector::Store<Service> {
+        let mut writer = reflector::store::Writer::<Service>::default();
+        for svc in services {
+            writer.apply_watcher_event(&watcher::Event::Apply(svc));
+        }
+        writer.as_reader()
+    }
+
+    fn make_service_with_named_port(
+        ns: &str,
+        name: &str,
+        port_name: &str,
+        port_number: i32,
+    ) -> Service {
+        use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
+        Service {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                ports: Some(vec![ServicePort {
+                    name: Some(port_name.to_string()),
+                    port: port_number,
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn make_ingress_named_port(
+        ns: &str,
+        host: Option<&str>,
+        svc: &str,
+        port_name: &str,
+    ) -> Ingress {
+        Ingress {
+            metadata: ObjectMeta {
+                name: Some("test-ingress".to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                ingress_class_name: Some("coxswain".to_string()),
+                rules: Some(vec![IngressRule {
+                    host: host.map(str::to_string),
+                    http: Some(HTTPIngressRuleValue {
+                        paths: vec![HTTPIngressPath {
+                            path: Some("/named".to_string()),
+                            path_type: "Exact".to_string(),
+                            backend: IngressBackend {
+                                service: Some(IngressServiceBackend {
+                                    name: svc.to_string(),
+                                    port: Some(ServiceBackendPort {
+                                        name: Some(port_name.to_string()),
+                                        number: None,
+                                        ..Default::default()
+                                    }),
+                                }),
+                                ..Default::default()
+                            },
+                        }],
+                    }),
+                }]),
+                ..Default::default()
+            }),
+            status: None,
+        }
     }
 
     fn make_ingress(
@@ -564,6 +664,152 @@ mod tests {
 
         assert!(table.route("example.com", "/api", &ctx).is_some());
         assert!(table.route("example.com", "/api/users", &ctx).is_none());
+    }
+
+    #[test]
+    fn reconcile_named_port_resolves_to_route() {
+        let slices = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let svcs = make_svc_store(vec![make_service_with_named_port(
+            "default", "svc", "http", 80,
+        )]);
+        let ingress = make_ingress_named_port("default", Some("example.com"), "svc", "http");
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(
+            &ingress,
+            &slices,
+            &svcs,
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        let route = table.route("example.com", "/named", &ctx);
+        assert!(
+            route.is_some(),
+            "named port backend should resolve to a route"
+        );
+        assert_eq!(route.unwrap().name, "default/svc");
+    }
+
+    #[test]
+    fn reconcile_named_port_skips_when_service_missing() {
+        let slices = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        // No Service in the store → port_for_name returns None → path skipped
+        let ingress = make_ingress_named_port("default", Some("example.com"), "svc", "http");
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(
+            &ingress,
+            &slices,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        assert!(
+            table
+                .route("example.com", "/named", &RequestContext::default())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconcile_named_port_skips_when_port_name_not_found() {
+        let slices = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        // Service exists but has port name "grpc", not "http"
+        let svcs = make_svc_store(vec![make_service_with_named_port(
+            "default", "svc", "grpc", 9000,
+        )]);
+        let ingress = make_ingress_named_port("default", Some("example.com"), "svc", "http");
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(
+            &ingress,
+            &slices,
+            &svcs,
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        assert!(
+            table
+                .route("example.com", "/named", &RequestContext::default())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconcile_named_port_default_backend_resolves() {
+        let slices = slice_store(vec![
+            make_slice("default", "rule-svc", "10.0.0.1"),
+            make_slice("default", "default-svc", "10.0.0.2"),
+        ]);
+        let svcs = make_svc_store(vec![make_service_with_named_port(
+            "default",
+            "default-svc",
+            "http",
+            80,
+        )]);
+        let ingress = Ingress {
+            metadata: ObjectMeta {
+                name: Some("test-ingress".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                ingress_class_name: Some("coxswain".to_string()),
+                rules: Some(vec![IngressRule {
+                    host: Some("example.com".to_string()),
+                    http: Some(HTTPIngressRuleValue {
+                        paths: vec![HTTPIngressPath {
+                            path: Some("/api".to_string()),
+                            path_type: "Prefix".to_string(),
+                            backend: IngressBackend {
+                                service: Some(IngressServiceBackend {
+                                    name: "rule-svc".to_string(),
+                                    port: Some(ServiceBackendPort {
+                                        number: Some(80),
+                                        ..Default::default()
+                                    }),
+                                }),
+                                ..Default::default()
+                            },
+                        }],
+                    }),
+                }]),
+                default_backend: Some(IngressBackend {
+                    service: Some(IngressServiceBackend {
+                        name: "default-svc".to_string(),
+                        port: Some(ServiceBackendPort {
+                            name: Some("http".to_string()),
+                            number: None,
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(
+            &ingress,
+            &slices,
+            &svcs,
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        assert_eq!(
+            table.route("example.com", "/api/v1", &ctx).unwrap().name,
+            "default/rule-svc"
+        );
+        assert_eq!(
+            table.route("example.com", "/other", &ctx).unwrap().name,
+            "default/default-svc"
+        );
     }
 
     #[test]

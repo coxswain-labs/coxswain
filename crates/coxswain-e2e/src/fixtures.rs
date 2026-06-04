@@ -104,6 +104,11 @@ pub const INGRESS_WILDCARD_HOST: &str = concat!(
     "/fixtures/ingress/wildcard_host.yaml"
 );
 
+pub const INGRESS_NAMED_PORT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/ingress/named_port.yaml"
+);
+
 pub const GATEWAY_API_CERT_MANAGER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/gateway_api/cert_manager.yaml"
