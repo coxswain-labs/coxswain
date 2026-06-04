@@ -140,25 +140,23 @@ impl GatewayApiReconciler {
                     _ => continue,
                 };
 
-                let addrs =
-                    Self::resolve_upstream_addrs(backend_refs, route_ns, slices, services, grants);
-                if addrs.is_empty() {
+                let weighted = Self::resolve_weighted_backends(
+                    backend_refs,
+                    route_ns,
+                    slices,
+                    services,
+                    grants,
+                );
+                let upstream_name = upstream_name(backend_refs, route_ns);
+                let upstream = Arc::new(Upstream::weighted(upstream_name, weighted));
+                if upstream.endpoints().is_empty() {
                     tracing::warn!(
                         route = ?route.metadata.name,
                         "No ready endpoints for rule — installing error route (500)"
                     );
-                    (
-                        Arc::new(Upstream::new(format!("{route_ns}/error-sentinel"), vec![])),
-                        Some(500u16),
-                    )
+                    (upstream, Some(500u16))
                 } else {
-                    (
-                        Arc::new(Upstream::new(
-                            format!("{route_ns}/{}", backend_refs[0].name),
-                            addrs,
-                        )),
-                        None,
-                    )
+                    (upstream, None)
                 }
             };
 
@@ -335,22 +333,34 @@ impl GatewayApiReconciler {
         }
     }
 
-    fn resolve_upstream_addrs(
+    /// Resolve each backendRef to `(pod_addresses, weight)`.
+    ///
+    /// Weight defaults to 1 when absent (per the Gateway API spec). Refs with
+    /// `weight: 0`, non-Service kind, denied cross-namespace access, or no ready
+    /// endpoints contribute an empty entry and are naturally dropped by
+    /// `Upstream::weighted`.
+    fn resolve_weighted_backends(
         backend_refs: &[HttpRouteRulesBackendRefs],
         route_ns: &str,
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
         grants: &HashSet<ReferenceGrantKey>,
-    ) -> Vec<SocketAddr> {
+    ) -> Vec<(Vec<SocketAddr>, u16)> {
         backend_refs
             .iter()
             .filter_map(|b| b.port.map(|port| (b, port)))
-            .flat_map(|(b, port)| {
+            .map(|(b, port)| {
+                let weight = weight_of(b);
+                if weight == 0 {
+                    return (vec![], 0);
+                }
+
                 let b_kind = b.kind.as_deref().unwrap_or("Service");
                 let b_group = b.group.as_deref().unwrap_or("");
                 if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
-                    return vec![];
+                    return (vec![], weight);
                 }
+
                 let ns = b.namespace.as_deref().unwrap_or(route_ns);
                 if ns != route_ns
                     && !reference_grants::backend_ref_allowed(route_ns, ns, &b.name, grants)
@@ -361,9 +371,13 @@ impl GatewayApiReconciler {
                         backend_svc = %b.name,
                         "Cross-namespace backendRef denied — no matching ReferenceGrant"
                     );
-                    return vec![];
+                    return (vec![], weight);
                 }
-                endpoints::resolve(ns, &b.name, port, slices, services)
+
+                (
+                    endpoints::resolve(ns, &b.name, port, slices, services),
+                    weight,
+                )
             })
             .collect()
     }
@@ -575,5 +589,23 @@ fn apply_rule(
                 }
             }
         }
+    }
+}
+
+/// Extract weight from a backendRef, clamped to u16. Defaults to 1 when absent.
+fn weight_of(b: &HttpRouteRulesBackendRefs) -> u16 {
+    match b.weight {
+        None => 1,
+        Some(w) if w <= 0 => 0,
+        Some(w) => w.min(u16::MAX as i32) as u16,
+    }
+}
+
+/// Build a logging-only upstream name for a rule's backend pool.
+fn upstream_name(refs: &[HttpRouteRulesBackendRefs], ns: &str) -> String {
+    match refs {
+        [] => format!("{ns}/empty"),
+        [single] => format!("{ns}/{}", single.name),
+        [first, rest @ ..] => format!("{ns}/{}+{}more", first.name, rest.len()),
     }
 }

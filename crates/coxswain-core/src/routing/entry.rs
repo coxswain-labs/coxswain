@@ -4,6 +4,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
+/// One backend service's resolved pod endpoints with a round-robin counter.
+struct BackendPool {
+    addrs: Box<[SocketAddr]>,
+    rr: AtomicUsize,
+}
+
+impl BackendPool {
+    fn new(addrs: Vec<SocketAddr>) -> Self {
+        Self {
+            addrs: addrs.into_boxed_slice(),
+            rr: AtomicUsize::new(0),
+        }
+    }
+
+    fn next(&self) -> SocketAddr {
+        let idx = self.rr.fetch_add(1, Ordering::Relaxed) % self.addrs.len();
+        self.addrs[idx]
+    }
+}
+
 /// How a path is modified by `URLRewrite` or `RequestRedirect`.
 #[derive(Clone, Debug)]
 pub enum PathModifier {
@@ -93,37 +113,132 @@ pub struct RouteTimeouts {
     pub backend_request: Option<Duration>,
 }
 
-/// A named group of pod endpoints with lock-free round-robin selection.
+/// A named group of pod endpoints with two-level weighted round-robin selection.
+///
+/// Level 1 — backend selection: a GCD-reduced slot array maps request indices to
+/// one of the backend pools proportional to their weights.
+/// Level 2 — pod selection: within the chosen pool, a per-pool atomic counter
+/// does fair round-robin across that backend's pods.
+///
+/// This gives exact per-backend traffic ratios regardless of pod count, and fair
+/// pod distribution within each backend.
 pub struct Upstream {
-    /// Service identity in `"namespace/name"` form — used for logging only.
+    /// Service identity — used for logging only.
     pub name: String,
-    endpoints: Vec<SocketAddr>,
-    index: AtomicUsize,
+    /// One entry per non-zero-weight backend ref.
+    backends: Box<[BackendPool]>,
+    /// Slot array: each entry is an index into `backends`.
+    /// Length = Σ(weight_i after GCD reduction).
+    slots: Box<[u16]>,
+    /// Advances monotonically; taken mod `slots.len()` on each request.
+    slot_counter: AtomicUsize,
+    /// Flat snapshot of all pod addresses for the admin `/routes` endpoint.
+    addrs_snapshot: Box<[SocketAddr]>,
 }
 
 impl Upstream {
+    /// All endpoints with equal weight (weight-1 uniform round-robin).
+    /// Used by Ingress reconciler and single-backend Gateway API rules.
     pub fn new(name: String, endpoints: Vec<SocketAddr>) -> Self {
+        if endpoints.is_empty() {
+            return Self::empty(name);
+        }
+        let addrs_snapshot = endpoints.clone().into_boxed_slice();
+        let slots = vec![0u16].into_boxed_slice();
+        let backends = Box::new([BackendPool::new(endpoints)]);
         Self {
             name,
-            endpoints,
-            index: AtomicUsize::new(0),
+            backends,
+            slots,
+            slot_counter: AtomicUsize::new(0),
+            addrs_snapshot,
         }
     }
 
-    pub fn endpoints(&self) -> &[SocketAddr] {
-        &self.endpoints
+    /// Weighted constructor for multi-backend Gateway API rules.
+    ///
+    /// `weighted` is `[(pod_addrs_for_backend, weight), ...]` — one entry per
+    /// `backendRef`. Backends with `weight == 0` or empty address lists are
+    /// dropped. Returns an empty `Upstream` when all weights resolve to zero.
+    pub fn weighted(name: String, weighted: Vec<(Vec<SocketAddr>, u16)>) -> Self {
+        let pools: Vec<(Vec<SocketAddr>, u16)> = weighted
+            .into_iter()
+            .filter(|(addrs, w)| *w > 0 && !addrs.is_empty())
+            .collect();
+
+        if pools.is_empty() {
+            return Self::empty(name);
+        }
+
+        let weights: Vec<u16> = pools.iter().map(|(_, w)| *w).collect();
+        let reduced = gcd_reduce(&weights);
+
+        let mut slots: Vec<u16> = Vec::with_capacity(reduced.iter().map(|&w| w as usize).sum());
+        for (idx, &w) in reduced.iter().enumerate() {
+            for _ in 0..w {
+                slots.push(idx as u16);
+            }
+        }
+
+        let addrs_snapshot: Box<[SocketAddr]> = pools
+            .iter()
+            .flat_map(|(addrs, _)| addrs.iter().copied())
+            .collect();
+
+        let backends: Box<[BackendPool]> = pools
+            .into_iter()
+            .map(|(addrs, _)| BackendPool::new(addrs))
+            .collect();
+
+        Self {
+            name,
+            backends,
+            slots: slots.into_boxed_slice(),
+            slot_counter: AtomicUsize::new(0),
+            addrs_snapshot,
+        }
     }
 
-    /// Returns the next endpoint using round-robin selection.
+    fn empty(name: String) -> Self {
+        Self {
+            name,
+            backends: Box::new([]),
+            slots: Box::new([]),
+            slot_counter: AtomicUsize::new(0),
+            addrs_snapshot: Box::new([]),
+        }
+    }
+
+    /// Flat list of all pod addresses — used by the admin `/routes` endpoint.
+    pub fn endpoints(&self) -> &[SocketAddr] {
+        &self.addrs_snapshot
+    }
+
+    /// Returns the next endpoint using weighted round-robin.
     ///
-    /// Returns `None` if the upstream has no endpoints.
-    pub fn next_endpoint(&self) -> Option<&SocketAddr> {
-        if self.endpoints.is_empty() {
+    /// Returns `None` when the upstream has no endpoints.
+    pub fn next_endpoint(&self) -> Option<SocketAddr> {
+        if self.slots.is_empty() {
             return None;
         }
-        let idx = self.index.fetch_add(1, Ordering::Relaxed) % self.endpoints.len();
-        self.endpoints.get(idx)
+        let slot = self.slot_counter.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        let pool = &self.backends[self.slots[slot] as usize];
+        Some(pool.next())
     }
+}
+
+/// Reduce a slice of weights by their GCD so the slot array stays compact.
+fn gcd_reduce(weights: &[u16]) -> Vec<u16> {
+    let g = weights.iter().copied().fold(0u16, gcd);
+    if g <= 1 {
+        weights.to_vec()
+    } else {
+        weights.iter().map(|&w| w / g).collect()
+    }
+}
+
+fn gcd(a: u16, b: u16) -> u16 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// How a path rule was registered — for introspection only.

@@ -124,6 +124,11 @@ pub const GATEWAY_API_TLS_REDIRECT: &str = concat!(
     "/fixtures/gateway_api/tls_redirect.yaml"
 );
 
+pub const GATEWAY_API_WEIGHTED_SPLIT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/weighted_split.yaml"
+);
+
 /// Apply a fixture YAML to `namespace`.
 ///
 /// Supports template substitutions: `TESTNS` is always replaced with `namespace`.

@@ -106,6 +106,33 @@ impl HttpClient {
     }
 }
 
+/// Send `n` GET requests to `path` and count how often each deployment prefix responded.
+///
+/// The returned map keys are deployment names (e.g. `"echo-a"`), derived by stripping the
+/// pod's random suffix (`"echo-a-xxxx-yyyy"` → `"echo-a"`). Pods that cannot be identified
+/// are counted under `"unknown"`.
+pub async fn count_backends(
+    http: &HttpClient,
+    host: &str,
+    path: &str,
+    n: usize,
+) -> anyhow::Result<std::collections::HashMap<String, usize>> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for _ in 0..n {
+        let resp = http.get(host, path).await?;
+        let pod = resp.pod.as_deref().unwrap_or("");
+        // Pod name format: "<deployment>-<replicaset>-<random>" — take the first two segments.
+        let key = pod.splitn(3, '-').take(2).collect::<Vec<_>>().join("-");
+        let key = if key.is_empty() {
+            "unknown".to_string()
+        } else {
+            key
+        };
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    Ok(counts)
+}
+
 /// Make a single HTTPS GET and return the peer's leaf certificate as DER bytes.
 ///
 /// Requires `reqwest` built with `rustls-tls` (already the case in this crate).

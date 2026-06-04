@@ -1,0 +1,74 @@
+# Weighted backendRefs fixture (issue #17).
+# TESTNS is substituted with the test namespace at runtime.
+#
+# Routes:
+#   /probe  → echo-a (weight 1) — used by wait_for_route
+#   /zero   → echo-a weight 0, echo-b weight 1 → 100% to echo-b
+#   /equal  → echo-a weight 1, echo-b weight 1 → ~50% each
+#   /skewed → echo-a weight 4, echo-b weight 1 → ~80% to echo-a
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: 8080
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: weighted-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "weighted.TESTNS.local"
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /probe
+      backendRefs:
+        - name: echo-a
+          port: 3000
+          weight: 1
+    - matches:
+        - path:
+            type: Exact
+            value: /zero
+      backendRefs:
+        - name: echo-a
+          port: 3000
+          weight: 0
+        - name: echo-b
+          port: 3000
+          weight: 1
+    - matches:
+        - path:
+            type: Exact
+            value: /equal
+      backendRefs:
+        - name: echo-a
+          port: 3000
+          weight: 1
+        - name: echo-b
+          port: 3000
+          weight: 1
+    - matches:
+        - path:
+            type: Exact
+            value: /skewed
+      backendRefs:
+        - name: echo-a
+          port: 3000
+          weight: 4
+        - name: echo-b
+          port: 3000
+          weight: 1
