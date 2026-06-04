@@ -7,6 +7,8 @@ use std::time::Instant;
 #[derive(Clone)]
 pub(crate) struct ConnectionInfo {
     pub real_addr: SocketAddr,
+    /// Local address the server accepted this connection on.
+    pub local_addr: SocketAddr,
     pub proto: &'static str,
 }
 
@@ -31,6 +33,9 @@ pub struct ResolvedRoute {
 pub struct ProxyCtx {
     pub real_client_addr: Option<SocketAddr>,
     pub real_client_proto: Option<&'static str>,
+    /// Local listener port for the connection; set from CONN_INFO on the PROXY-protocol path,
+    /// or derived from the session's server address on the standard path.
+    pub local_port: Option<u16>,
     pub resolved: Option<ResolvedRoute>,
     /// Absolute deadline for the total request (from `timeouts.request`). 504 if exceeded.
     pub request_deadline: Option<Instant>,

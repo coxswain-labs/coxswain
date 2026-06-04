@@ -33,15 +33,44 @@ impl TrustedSources {
     }
 }
 
-/// Listens on both the HTTP and HTTPS ports, reads HAProxy PROXY protocol v1/v2
+/// Whether a listener speaks plain HTTP or HTTPS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenerProtocol {
+    Http,
+    Https,
+}
+
+/// One listen address with its associated protocol.
+#[derive(Clone, Debug)]
+pub struct ListenerSpec {
+    pub addr: SocketAddr,
+    pub protocol: ListenerProtocol,
+}
+
+impl ListenerSpec {
+    pub fn http(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            protocol: ListenerProtocol::Http,
+        }
+    }
+
+    pub fn https(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            protocol: ListenerProtocol::Https,
+        }
+    }
+}
+
+/// Listens on one or more `(addr, protocol)` pairs, reads HAProxy PROXY protocol v1/v2
 /// headers, and hands the resulting sessions to a shared [`HttpProxy`].
 ///
 /// Activated only when `--proxy-accept-proxy-protocol` is set. When the flag is
 /// off, the standard `http_proxy_service_with_name` path is used instead.
 pub struct ProxyAcceptor {
     proxy: Arc<HttpProxy<Proxy>>,
-    http_addr: SocketAddr,
-    https_addr: SocketAddr,
+    listeners: Vec<ListenerSpec>,
     trusted: Arc<TrustedSources>,
     ssl_acceptor: Arc<SslAcceptor>,
     tls_callbacks: Arc<pingora_core::listeners::TlsAcceptCallbacks>,
@@ -50,8 +79,7 @@ pub struct ProxyAcceptor {
 impl ProxyAcceptor {
     pub fn new(
         proxy: Arc<HttpProxy<Proxy>>,
-        http_addr: SocketAddr,
-        https_addr: SocketAddr,
+        listeners: Vec<ListenerSpec>,
         trusted: Arc<TrustedSources>,
         tls: SniCertSelector,
     ) -> anyhow::Result<Self> {
@@ -61,8 +89,7 @@ impl ProxyAcceptor {
         let tls_callbacks: pingora_core::listeners::TlsAcceptCallbacks = Box::new(tls);
         Ok(Self {
             proxy,
-            http_addr,
-            https_addr,
+            listeners,
             trusted,
             ssl_acceptor,
             tls_callbacks: Arc::new(tls_callbacks),
@@ -78,67 +105,73 @@ impl Service for ProxyAcceptor {
         shutdown: ShutdownWatch,
         _listeners_per_fd: usize,
     ) {
-        let http_listener = TcpListener::bind(self.http_addr)
-            .await
-            .expect("bind HTTP listener for PROXY protocol");
-        let https_listener = TcpListener::bind(self.https_addr)
-            .await
-            .expect("bind HTTPS listener for PROXY protocol");
-
         let proxy = self.proxy.clone();
         let trusted = self.trusted.clone();
         let ssl_acceptor = self.ssl_acceptor.clone();
         let tls_callbacks = self.tls_callbacks.clone();
 
-        let http_loop = {
+        let mut handles = Vec::new();
+        for spec in &self.listeners {
+            let listener = match spec.protocol {
+                ListenerProtocol::Http => TcpListener::bind(spec.addr).await.unwrap_or_else(|e| {
+                    panic!("bind HTTP listener {} for PROXY protocol: {e}", spec.addr)
+                }),
+                ListenerProtocol::Https => TcpListener::bind(spec.addr).await.unwrap_or_else(|e| {
+                    panic!("bind HTTPS listener {} for PROXY protocol: {e}", spec.addr)
+                }),
+            };
+            let local_addr = listener.local_addr().unwrap_or(spec.addr);
+            let proto: &'static str = match spec.protocol {
+                ListenerProtocol::Http => "http",
+                ListenerProtocol::Https => "https",
+            };
+            let is_tls = spec.protocol == ListenerProtocol::Https;
+
             let proxy = proxy.clone();
             let trusted = trusted.clone();
-            let mut shutdown = shutdown.clone();
-            async move {
+            let ssl = if is_tls {
+                Some(ssl_acceptor.clone())
+            } else {
+                None
+            };
+            let cb = if is_tls {
+                Some(tls_callbacks.clone())
+            } else {
+                None
+            };
+            let mut sd = shutdown.clone();
+
+            handles.push(tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        _ = shutdown.changed() => return,
-                        result = http_listener.accept() => match result {
+                        _ = sd.changed() => return,
+                        result = listener.accept() => match result {
                             Ok((tcp, peer)) => {
                                 let proxy = proxy.clone();
                                 let trusted = trusted.clone();
-                                let sd = shutdown.clone();
+                                let ssl = ssl.clone();
+                                let cb = cb.clone();
+                                let sd = sd.clone();
+                                let args = ConnectionArgs {
+                                    ssl_acceptor: ssl,
+                                    tls_callbacks: cb,
+                                    proto,
+                                    local_addr,
+                                };
                                 tokio::spawn(async move {
-                                    handle_connection(tcp, peer, proxy, trusted, ConnectionArgs { ssl_acceptor: None, tls_callbacks: None, proto: "http" }, sd).await;
+                                    handle_connection(tcp, peer, proxy, trusted, args, sd).await;
                                 });
                             }
-                            Err(e) => tracing::error!(error = %e, "HTTP accept error"),
+                            Err(e) => tracing::error!(addr = %local_addr, error = %e, "accept error"),
                         },
                     }
                 }
-            }
-        };
+            }));
+        }
 
-        let https_loop = {
-            let mut shutdown = shutdown.clone();
-            async move {
-                loop {
-                    tokio::select! {
-                        _ = shutdown.changed() => return,
-                        result = https_listener.accept() => match result {
-                            Ok((tcp, peer)) => {
-                                let proxy = proxy.clone();
-                                let trusted = trusted.clone();
-                                let ssl = ssl_acceptor.clone();
-                                let cb = tls_callbacks.clone();
-                                let sd = shutdown.clone();
-                                tokio::spawn(async move {
-                                    handle_connection(tcp, peer, proxy, trusted, ConnectionArgs { ssl_acceptor: Some(ssl), tls_callbacks: Some(cb), proto: "https" }, sd).await;
-                                });
-                            }
-                            Err(e) => tracing::error!(error = %e, "HTTPS accept error"),
-                        },
-                    }
-                }
-            }
-        };
-
-        tokio::join!(http_loop, https_loop);
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 
     fn name(&self) -> &str {
@@ -150,6 +183,7 @@ struct ConnectionArgs {
     ssl_acceptor: Option<Arc<SslAcceptor>>,
     tls_callbacks: Option<Arc<pingora_core::listeners::TlsAcceptCallbacks>>,
     proto: &'static str,
+    local_addr: SocketAddr,
 }
 
 async fn handle_connection(
@@ -164,6 +198,7 @@ async fn handle_connection(
         ssl_acceptor,
         tls_callbacks,
         proto,
+        local_addr,
     } = args;
     if !trusted.contains(&peer_addr.ip()) {
         tracing::debug!(
@@ -181,7 +216,11 @@ async fn handle_connection(
         }
     };
 
-    let conn_info = ConnectionInfo { real_addr, proto };
+    let conn_info = ConnectionInfo {
+        real_addr,
+        local_addr,
+        proto,
+    };
 
     let stream: pingora_core::protocols::Stream = match ssl_acceptor {
         Some(acceptor) => {

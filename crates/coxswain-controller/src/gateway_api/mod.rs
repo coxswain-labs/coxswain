@@ -32,21 +32,31 @@ pub(crate) use hostnames::hostnames_intersect;
 #[cfg(test)]
 mod tests;
 
+/// Resolved hostname and port for a single Gateway listener, indexed by [`ListenerKey`].
+///
+/// Used to scope `HTTPRoute` entries to the correct per-port routing table slot and to
+/// apply listener hostname filtering when the route has no `spec.hostnames` of its own.
+#[derive(Clone, Debug)]
+pub struct ListenerBinding {
+    pub hostname: String,
+    pub port: u16,
+}
+
 pub struct GatewayApiReconciler;
 
 impl GatewayApiReconciler {
     /// Skips routes whose `spec.parentRefs` do not include at least one Gateway
     /// managed by this controller. Never queries the API server.
     ///
-    /// `listener_hostnames` maps `(gw_ns, gw_name, listener_name) → hostname` and is
-    /// used to scope routes without `spec.hostnames` to their listener's hostname.
+    /// `listener_info` maps `(gw_ns, gw_name, listener_name) → (hostname, port)`, used
+    /// to scope routes to the correct per-port routing table slot and listener hostname.
     pub fn reconcile(
         route: &HTTPRoute,
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
         owned_gateways: &HashSet<ObjectKey>,
         grants: &HashSet<ReferenceGrantKey>,
-        listener_hostnames: &HashMap<ListenerKey, String>,
+        listener_info: &HashMap<ListenerKey, ListenerBinding>,
         builder: &mut RoutingTableBuilder,
     ) {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -95,19 +105,18 @@ impl GatewayApiReconciler {
             .map(String::as_str)
             .collect();
 
-        let (use_catchall, effective_hostnames) = compute_effective_hostnames(
+        let bindings = compute_listener_bindings(
             &route_hostnames,
             route.spec.parent_refs.as_deref().unwrap_or(&[]),
             route_ns,
-            listener_hostnames,
+            listener_info,
         );
 
         tracing::debug!(
             name = ?route.metadata.name,
             ns = route_ns,
             rules = rules.len(),
-            effective_hostnames = effective_hostnames.len(),
-            catchall = use_catchall,
+            bindings = bindings.len(),
             "Reconciling HTTPRoute"
         );
 
@@ -160,9 +169,15 @@ impl GatewayApiReconciler {
                 }
             };
 
-            let apply = |pb: &mut HostRouterBuilder| {
+            for (hostname_opt, port) in &bindings {
+                let pb = builder.for_port(*port);
+                let hb = match hostname_opt {
+                    None => pb.catchall(),
+                    Some(h) if h.starts_with("*.") => pb.wildcard_host(h),
+                    Some(h) => pb.exact_host(h),
+                };
                 apply_rule(
-                    pb,
+                    hb,
                     rule,
                     rule_filters,
                     &rule_timeouts,
@@ -170,21 +185,9 @@ impl GatewayApiReconciler {
                     error_status,
                     &route_id,
                     created_at,
-                )
-            };
-
-            if use_catchall {
-                apply(builder.catchall());
+                );
             }
-            for h in &effective_hostnames {
-                if h.starts_with("*.") {
-                    apply(builder.wildcard_host(h));
-                } else {
-                    apply(builder.exact_host(h));
-                }
-            }
-            // If use_catchall=false AND effective_hostnames is empty, the route has no
-            // matching listener hostnames — skip (not admitted to the routing table).
+            // If bindings is empty, the route has no matching listener — skip.
         }
     }
 
@@ -399,66 +402,79 @@ impl GatewayApiReconciler {
     }
 }
 
-/// Computes the effective hostname set for a route across all its parent refs and listeners.
+/// Computes the set of `(hostname_option, port)` pairs for route insertion.
 ///
-/// Returns `(use_catchall, effective_hostnames)`.
-fn compute_effective_hostnames(
+/// Returns one entry per (listener hostname, listener port) binding derived from the
+/// route's `parentRefs`. `None` hostname means insert under the port's catchall.
+/// When no listener info is available (tests/misconfigured), port 80 is used as a fallback.
+fn compute_listener_bindings(
     route_hostnames: &[&str],
     parent_refs: &[gateway_api::apis::standard::httproutes::HttpRouteParentRefs],
     route_ns: &str,
-    listener_hostnames: &HashMap<ListenerKey, String>,
-) -> (bool, Vec<String>) {
-    let mut use_catchall = false;
-    let mut eff_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    listener_info: &HashMap<ListenerKey, ListenerBinding>,
+) -> Vec<(Option<String>, u16)> {
+    // Maps hostname_opt → set of ports.  None key = catchall.
+    let mut bindings: HashMap<Option<String>, HashSet<u16>> = HashMap::new();
 
-    if listener_hostnames.is_empty() {
-        // No listener info: tests or misconfigured — use original behavior
+    macro_rules! add {
+        ($hostname:expr, $port:expr) => {
+            bindings.entry($hostname).or_default().insert($port);
+        };
+    }
+
+    if listener_info.is_empty() {
+        // No listener info: tests or misconfigured — use port 80 as fallback.
         if route_hostnames.is_empty() {
-            use_catchall = true;
+            add!(None, 80u16);
         } else {
-            eff_set.extend(route_hostnames.iter().map(|h| h.to_string()));
+            for h in route_hostnames {
+                add!(Some(h.to_string()), 80u16);
+            }
         }
     } else {
         for pr in parent_refs {
             let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
             let gw_name = pr.name.as_str();
+            let pr_port_filter = pr.port.map(|p| p as u16);
 
-            // Collect listener hostnames for this parentRef (specific or all).
-            let l_hosts: Vec<&str> = if let Some(sn) = pr.section_name.as_deref() {
+            // Collect (port, listener_hostname) pairs for this parentRef.
+            let l_bindings: Vec<(u16, &str)> = if let Some(sn) = pr.section_name.as_deref() {
                 let key = ListenerKey::new(gw_ns, gw_name, sn);
-                listener_hostnames
-                    .get(&key)
-                    .map(|h| h.as_str())
-                    .into_iter()
-                    .collect()
+                match listener_info.get(&key) {
+                    Some(info) if pr_port_filter.is_none_or(|pp| pp == info.port) => {
+                        vec![(info.port, info.hostname.as_str())]
+                    }
+                    _ => vec![],
+                }
             } else {
-                listener_hostnames
+                listener_info
                     .iter()
-                    .filter(|(k, _)| k.gw_ns == gw_ns && k.gw_name == gw_name)
-                    .map(|(_, h)| h.as_str())
+                    .filter_map(|(k, info)| {
+                        if k.gw_ns != gw_ns || k.gw_name != gw_name {
+                            return None;
+                        }
+                        if pr_port_filter.is_none_or(|pp| pp == info.port) {
+                            Some((info.port, info.hostname.as_str()))
+                        } else {
+                            None
+                        }
+                    })
                     .collect()
             };
 
-            if l_hosts.is_empty() {
-                // Listener not in map (not our gateway) — skip
-                continue;
-            }
-
-            for lh in l_hosts {
+            for (port, lh) in l_bindings {
                 if lh.is_empty() {
-                    // Listener accepts any hostname
                     if route_hostnames.is_empty() {
-                        use_catchall = true;
+                        add!(None, port);
                     } else {
-                        eff_set.extend(route_hostnames.iter().map(|h| h.to_string()));
+                        for h in route_hostnames {
+                            add!(Some(h.to_string()), port);
+                        }
                     }
                 } else if route_hostnames.is_empty() {
-                    // Inherit the listener's hostname
-                    eff_set.insert(lh.to_string());
+                    add!(Some(lh.to_string()), port);
                 } else {
                     // Intersection: the effective hostname is the more specific of the two.
-                    // If the route has a wildcard (*.foo.com) and the listener has a specific
-                    // hostname (bar.foo.com), the intersection is bar.foo.com (GEP-719).
                     for rh in route_hostnames {
                         if hostnames::hostname_matches(rh, lh) {
                             let effective = if rh.starts_with("*.") && !lh.starts_with("*.") {
@@ -466,7 +482,7 @@ fn compute_effective_hostnames(
                             } else {
                                 rh.to_string()
                             };
-                            eff_set.insert(effective);
+                            add!(Some(effective), port);
                         }
                     }
                 }
@@ -474,36 +490,36 @@ fn compute_effective_hostnames(
         }
     }
 
-    // Listener isolation: drop any effective hostname E that another, more-specific listener
-    // in the same gateway would claim exclusively, so routes don't leak across listener
-    // boundaries.
-    if !listener_hostnames.is_empty() {
-        eff_set.retain(|e| {
-            // Isolation only applies when the parentRef names a specific listener (sectionName
-            // present).  A route without sectionName attaches to all matching listeners and
-            // the hostname intersection already handles scoping correctly.
+    // Listener isolation: drop any hostname that a more-specific listener in the same
+    // gateway would claim exclusively. Catchall bindings (None) are never dominated.
+    if !listener_info.is_empty() {
+        bindings.retain(|hostname_opt, _| {
+            let e = match hostname_opt {
+                Some(h) => h.as_str(),
+                None => return true,
+            };
+            // Isolation only applies when the parentRef names a specific listener.
             !parent_refs.iter().any(|pr| {
                 let our_sn = match pr.section_name.as_deref() {
                     Some(sn) if !sn.is_empty() => sn,
-                    _ => return false, // no sectionName → skip isolation for this parentRef
+                    _ => return false,
                 };
                 let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
                 let gw_name = pr.name.as_str();
-                let our_spec = listener_hostnames
+                let our_spec = listener_info
                     .get(&ListenerKey::new(gw_ns, gw_name, our_sn))
-                    .map(|h| hostnames::listener_specificity(h))
+                    .map(|info| hostnames::listener_specificity(&info.hostname))
                     .unwrap_or(0);
                 let e_is_wildcard = e.starts_with("*.");
-                listener_hostnames.iter().any(|(k, h_other)| {
+                listener_info.iter().any(|(k, info)| {
+                    let h_other = &info.hostname;
                     k.gw_ns == gw_ns
                         && k.gw_name == gw_name
                         && k.listener.as_str() != our_sn
                         && hostnames::listener_specificity(h_other) > our_spec
                         && if e_is_wildcard {
-                            // Wildcard E is dominated only by an identical wildcard listener.
                             h_other == e
                         } else {
-                            // Concrete E is dominated by any more-specific listener that covers it.
                             hostnames::hostname_matches(e, h_other)
                         }
                 })
@@ -511,7 +527,13 @@ fn compute_effective_hostnames(
         });
     }
 
-    (use_catchall, eff_set.into_iter().collect())
+    let mut result = Vec::new();
+    for (hostname_opt, ports) in bindings {
+        for port in ports {
+            result.push((hostname_opt.clone(), port));
+        }
+    }
+    result
 }
 
 /// Installs one HTTPRoute rule into a `HostRouterBuilder`.

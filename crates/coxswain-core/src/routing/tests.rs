@@ -4,6 +4,8 @@ use regex::Regex;
 use std::net::SocketAddr;
 use std::time::SystemTime;
 
+const PORT: u16 = 80;
+
 fn upstream(name: &str, addr: &str) -> Arc<Upstream> {
     Arc::new(Upstream::new(
         name.to_string(),
@@ -25,18 +27,26 @@ fn exact_host_beats_wildcard() {
     let wildcard_up = upstream("wildcard", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
-    b.exact_host("example.com")
+    b.for_port(PORT)
+        .exact_host("example.com")
         .add_exact_route("/", entry(exact_up));
-    b.wildcard_host("*.com")
+    b.for_port(PORT)
+        .wildcard_host("*.com")
         .add_exact_route("/", entry(wildcard_up));
 
     let table = b.build().unwrap();
     assert_eq!(
-        table.route("example.com", "/", &ctx_get()).unwrap().name,
+        table
+            .route(PORT, "example.com", "/", &ctx_get())
+            .unwrap()
+            .name,
         "exact"
     );
     assert_eq!(
-        table.route("other.com", "/", &ctx_get()).unwrap().name,
+        table
+            .route(PORT, "other.com", "/", &ctx_get())
+            .unwrap()
+            .name,
         "wildcard"
     );
 }
@@ -47,21 +57,21 @@ fn path_routing_within_host() {
     let health_up = upstream("health", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
-    let host = b.exact_host("example.com");
+    let host = b.for_port(PORT).exact_host("example.com");
     host.add_prefix_route("/api", entry(api_up));
     host.add_exact_route("/health", entry(health_up));
 
     let table = b.build().unwrap();
     assert_eq!(
         table
-            .route("example.com", "/api/users", &ctx_get())
+            .route(PORT, "example.com", "/api/users", &ctx_get())
             .unwrap()
             .name,
         "api"
     );
     assert_eq!(
         table
-            .route("example.com", "/health", &ctx_get())
+            .route(PORT, "example.com", "/health", &ctx_get())
             .unwrap()
             .name,
         "health"
@@ -73,16 +83,17 @@ fn wildcard_host_matches() {
     let up = upstream("svc", "10.0.0.1:80");
 
     let mut b = RoutingTableBuilder::new();
-    b.wildcard_host("*.test.com")
+    b.for_port(PORT)
+        .wildcard_host("*.test.com")
         .add_exact_route("/", entry(up));
 
     let table = b.build().unwrap();
-    assert!(table.route("api.test.com", "/", &ctx_get()).is_some());
-    assert!(table.route("test.com", "/", &ctx_get()).is_none());
+    assert!(table.route(PORT, "api.test.com", "/", &ctx_get()).is_some());
+    assert!(table.route(PORT, "test.com", "/", &ctx_get()).is_none());
     // Multi-label prefix must not match — * covers exactly one DNS label.
     assert!(
         table
-            .route("nested.api.test.com", "/", &ctx_get())
+            .route(PORT, "nested.api.test.com", "/", &ctx_get())
             .is_none()
     );
 }
@@ -93,21 +104,24 @@ fn route_falls_through_to_catchall_on_exact_host_path_miss() {
     let catchall_up = upstream("catchall", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
-    b.exact_host("example.com")
+    b.for_port(PORT)
+        .exact_host("example.com")
         .add_prefix_route("/api", entry(host_up));
-    b.catchall().add_prefix_route("/", entry(catchall_up));
+    b.for_port(PORT)
+        .catchall()
+        .add_prefix_route("/", entry(catchall_up));
 
     let table = b.build().unwrap();
     assert_eq!(
         table
-            .route("example.com", "/api/v1", &ctx_get())
+            .route(PORT, "example.com", "/api/v1", &ctx_get())
             .unwrap()
             .name,
         "host"
     );
     assert_eq!(
         table
-            .route("example.com", "/other", &ctx_get())
+            .route(PORT, "example.com", "/other", &ctx_get())
             .unwrap()
             .name,
         "catchall"
@@ -120,21 +134,24 @@ fn route_falls_through_to_catchall_on_wildcard_host_path_miss() {
     let catchall_up = upstream("catchall", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
-    b.wildcard_host("*.example.com")
+    b.for_port(PORT)
+        .wildcard_host("*.example.com")
         .add_prefix_route("/api", entry(host_up));
-    b.catchall().add_prefix_route("/", entry(catchall_up));
+    b.for_port(PORT)
+        .catchall()
+        .add_prefix_route("/", entry(catchall_up));
 
     let table = b.build().unwrap();
     assert_eq!(
         table
-            .route("api.example.com", "/api/v1", &ctx_get())
+            .route(PORT, "api.example.com", "/api/v1", &ctx_get())
             .unwrap()
             .name,
         "host"
     );
     assert_eq!(
         table
-            .route("api.example.com", "/other", &ctx_get())
+            .route(PORT, "api.example.com", "/other", &ctx_get())
             .unwrap()
             .name,
         "catchall"
@@ -146,12 +163,21 @@ fn route_returns_none_when_neither_host_router_nor_catchall_match() {
     let host_up = upstream("host", "10.0.0.1:80");
 
     let mut b = RoutingTableBuilder::new();
-    b.exact_host("example.com")
+    b.for_port(PORT)
+        .exact_host("example.com")
         .add_prefix_route("/api", entry(host_up));
 
     let table = b.build().unwrap();
-    assert!(table.route("example.com", "/other", &ctx_get()).is_none());
-    assert!(table.route("unknown.com", "/api", &ctx_get()).is_none());
+    assert!(
+        table
+            .route(PORT, "example.com", "/other", &ctx_get())
+            .is_none()
+    );
+    assert!(
+        table
+            .route(PORT, "unknown.com", "/api", &ctx_get())
+            .is_none()
+    );
 }
 
 #[test]
@@ -160,25 +186,62 @@ fn route_host_router_takes_precedence_over_catchall_for_same_path() {
     let catchall_up = upstream("catchall", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
-    b.exact_host("example.com")
+    b.for_port(PORT)
+        .exact_host("example.com")
         .add_prefix_route("/api", entry(host_up));
-    b.catchall().add_prefix_route("/api", entry(catchall_up));
+    b.for_port(PORT)
+        .catchall()
+        .add_prefix_route("/api", entry(catchall_up));
 
     let table = b.build().unwrap();
     assert_eq!(
         table
-            .route("example.com", "/api/v1", &ctx_get())
+            .route(PORT, "example.com", "/api/v1", &ctx_get())
             .unwrap()
             .name,
         "host"
     );
     assert_eq!(
         table
-            .route("other.com", "/api/v1", &ctx_get())
+            .route(PORT, "other.com", "/api/v1", &ctx_get())
             .unwrap()
             .name,
         "catchall"
     );
+}
+
+#[test]
+fn routes_on_different_ports_are_isolated() {
+    let up80 = upstream("svc-80", "10.0.0.1:80");
+    let up8080 = upstream("svc-8080", "10.0.0.2:8080");
+
+    let mut b = RoutingTableBuilder::new();
+    b.for_port(80)
+        .exact_host("example.com")
+        .add_prefix_route("/", entry(up80));
+    b.for_port(8080)
+        .exact_host("example.com")
+        .add_prefix_route("/", entry(up8080));
+
+    let table = b.build().unwrap();
+    assert_eq!(
+        table
+            .route(80, "example.com", "/", &ctx_get())
+            .unwrap()
+            .name,
+        "svc-80"
+    );
+    assert_eq!(
+        table
+            .route(8080, "example.com", "/", &ctx_get())
+            .unwrap()
+            .name,
+        "svc-8080"
+    );
+    // A route scoped to 8080 must not be reachable on 80.
+    assert!(table.route(80, "example.com", "/api", &ctx_get()).is_some()); // prefix / catches it
+    // A port with no registered routes returns NoHost.
+    assert!(table.route(9090, "example.com", "/", &ctx_get()).is_none());
 }
 
 #[test]
@@ -486,7 +549,7 @@ fn specificity_ordering_more_headers_wins() {
 
     let mut b = RoutingTableBuilder::new();
     // Insert generic first, specific second — specificity sort should reorder.
-    let hb = b.exact_host("example.com");
+    let hb = b.for_port(PORT).exact_host("example.com");
     hb.add_exact_route("/", Arc::clone(&generic));
     hb.add_exact_route("/", Arc::clone(&specific));
 
@@ -507,12 +570,15 @@ fn specificity_ordering_more_headers_wins() {
 
     // With matching header → specific wins (sorted first due to header count).
     assert_eq!(
-        table.route("example.com", "/", &ctx_match).unwrap().name,
+        table
+            .route(PORT, "example.com", "/", &ctx_match)
+            .unwrap()
+            .name,
         "specific"
     );
     // Without matching header → specific's predicate fails; falls through to generic.
     assert_eq!(
-        table.route("example.com", "/", &ctx_no).unwrap().name,
+        table.route(PORT, "example.com", "/", &ctx_no).unwrap().name,
         "generic"
     );
 }
@@ -538,14 +604,17 @@ fn timestamp_tiebreaker_older_wins() {
     ));
 
     let mut b = RoutingTableBuilder::new();
-    let hb = b.exact_host("example.com");
+    let hb = b.for_port(PORT).exact_host("example.com");
     // Insert newer first; sort should put older first.
     hb.add_exact_route("/", Arc::clone(&newer));
     hb.add_exact_route("/", Arc::clone(&older));
 
     let table = b.build().unwrap();
     assert_eq!(
-        table.route("example.com", "/", &ctx_get()).unwrap().name,
+        table
+            .route(PORT, "example.com", "/", &ctx_get())
+            .unwrap()
+            .name,
         "older"
     );
 }
@@ -564,7 +633,7 @@ fn or_semantics_across_multiple_entries() {
     let entry_b = Arc::new(RouteEntry::new(up_b, pred_b, "default/b".to_string(), None));
 
     let mut b = RoutingTableBuilder::new();
-    let hb = b.exact_host("example.com");
+    let hb = b.for_port(PORT).exact_host("example.com");
     hb.add_exact_route("/", Arc::clone(&entry_a));
     hb.add_exact_route("/", Arc::clone(&entry_b));
 
@@ -583,8 +652,14 @@ fn or_semantics_across_multiple_entries() {
         query: None,
     };
 
-    assert_eq!(table.route("example.com", "/", &ctx_a).unwrap().name, "a");
-    assert_eq!(table.route("example.com", "/", &ctx_b).unwrap().name, "b");
+    assert_eq!(
+        table.route(PORT, "example.com", "/", &ctx_a).unwrap().name,
+        "a"
+    );
+    assert_eq!(
+        table.route(PORT, "example.com", "/", &ctx_b).unwrap().name,
+        "b"
+    );
 }
 
 #[test]
@@ -604,10 +679,12 @@ fn find_returns_timeouts_from_route_entry() {
     ));
 
     let mut b = RoutingTableBuilder::new();
-    b.exact_host("example.com").add_prefix_route("/", e);
+    b.for_port(PORT)
+        .exact_host("example.com")
+        .add_prefix_route("/", e);
     let table = b.build().unwrap();
 
-    match table.find("example.com", "/foo", &ctx_get()) {
+    match table.find(PORT, "example.com", "/foo", &ctx_get()) {
         RouteOutcome::Found(_, _, t) => {
             assert_eq!(t.request, timeouts.request);
             assert_eq!(t.backend_request, timeouts.backend_request);
@@ -623,7 +700,7 @@ fn prefix_insert_collision_emits_debug_log() {
     let second = upstream("second", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
-    let host = b.exact_host("example.com");
+    let host = b.for_port(PORT).exact_host("example.com");
     // /foo expands to: /foo, /foo/, /foo/{*rest}
     // /foo/ expands to: /foo/, /foo/{*rest}
     // The second group's inserts collide with the first.

@@ -1,13 +1,14 @@
 use coxswain_e2e::{
     fixtures::{
-        self, BACKENDS_ECHO, BACKENDS_SLOW_ECHO, BACKENDS_WEBSOCKET_ECHO, GATEWAY_API_CERT_MANAGER,
+        BACKENDS_ECHO, BACKENDS_SLOW_ECHO, BACKENDS_WEBSOCKET_ECHO, GATEWAY_API_CERT_MANAGER,
         GATEWAY_API_COMBINED_MATCHING, GATEWAY_API_CROSS_NAMESPACE_ROUTE,
         GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_FILTERS, GATEWAY_API_HEADER_MATCHING,
-        GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PATH_MATCHING,
-        GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_SERVING_DRAIN, GATEWAY_API_TIMEOUTS,
-        GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS, GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
-        GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_REDIRECT, GATEWAY_API_TLS_TERMINATION,
-        GATEWAY_API_WEBSOCKET, GATEWAY_API_WEIGHTED_SPLIT, GATEWAY_API_WILDCARD_HOST,
+        GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PARENT_REF_PORT,
+        GATEWAY_API_PATH_MATCHING, GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_SERVING_DRAIN,
+        GATEWAY_API_TIMEOUTS, GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS,
+        GATEWAY_API_TLS_CROSS_NAMESPACE_GW, GATEWAY_API_TLS_GATEWAY_NO_CERTS,
+        GATEWAY_API_TLS_REDIRECT, GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WEBSOCKET,
+        GATEWAY_API_WEIGHTED_SPLIT, GATEWAY_API_WILDCARD_HOST,
     },
     harness::{GeneratedCert, Harness, NamespaceGuard, http, wait},
 };
@@ -35,9 +36,9 @@ async fn path_matching() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-path").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(GATEWAY_API_PATH_MATCHING, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_PATH_MATCHING, &ns.name, &[]).await?;
 
     let host = format!("echo.{}.local", ns.name);
 
@@ -61,9 +62,9 @@ async fn host_pool() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-pool").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(GATEWAY_API_HOST_POOL, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_HOST_POOL, &ns.name, &[]).await?;
 
     let host = format!("pool.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
@@ -96,9 +97,9 @@ async fn wildcard_host() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-wildcard").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(GATEWAY_API_WILDCARD_HOST, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_WILDCARD_HOST, &ns.name, &[]).await?;
 
     // Any subdomain of *.wildcard.TESTNS.local should reach echo-c.
     let host = format!("foo.wildcard.{}.local", ns.name);
@@ -120,7 +121,7 @@ async fn cross_namespace_with_grant() -> anyhow::Result<()> {
     let tenant = NamespaceGuard::create(&h.client, "gw-xns-tenant").await?;
 
     // Deploy the backend + ReferenceGrant into the tenant namespace.
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_CROSS_NAMESPACE_TENANT,
         &tenant.name,
         &[("TESTNS", &ns.name)],
@@ -129,7 +130,7 @@ async fn cross_namespace_with_grant() -> anyhow::Result<()> {
     wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
 
     // Deploy the Gateway + HTTPRoute into the primary namespace.
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_CROSS_NAMESPACE_ROUTE,
         &ns.name,
         &[("TENANTNS", &tenant.name)],
@@ -149,9 +150,9 @@ async fn gateway_status() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-status").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(GATEWAY_API_PATH_MATCHING, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_PATH_MATCHING, &ns.name, &[]).await?;
 
     wait::wait_for_gateway_programmed(
         &h.client,
@@ -174,9 +175,9 @@ async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-gen-tracking").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(GATEWAY_API_PATH_MATCHING, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_PATH_MATCHING, &ns.name, &[]).await?;
 
     wait::wait_for_gateway_programmed(
         &h.client,
@@ -207,9 +208,10 @@ async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
 
     // Bump .metadata.generation with a harmless spec change (allowedRoutes.namespaces.from
     // changes from Same to All — the HTTPRoute is in the same namespace so it still attaches).
+    let http_port = h.controller.proxy_addr.port();
     let bump_patch = serde_json::json!({
         "spec": {
-            "listeners": [{"name": "http", "port": 8080, "protocol": "HTTP",
+            "listeners": [{"name": "http", "port": http_port, "protocol": "HTTP",
                            "allowedRoutes": {"namespaces": {"from": "All"}}}]
         }
     });
@@ -294,9 +296,9 @@ async fn header_matching() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-hdr").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(GATEWAY_API_HEADER_MATCHING, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_HEADER_MATCHING, &ns.name, &[]).await?;
 
     let host = format!("echo.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
@@ -333,9 +335,9 @@ async fn method_matching() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-method").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(GATEWAY_API_METHOD_MATCHING, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_METHOD_MATCHING, &ns.name, &[]).await?;
 
     let host = format!("echo.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
@@ -359,9 +361,10 @@ async fn query_param_matching() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-query").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(GATEWAY_API_QUERY_PARAM_MATCHING, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_QUERY_PARAM_MATCHING, &ns.name, &[])
+        .await?;
 
     let host = format!("echo.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
@@ -398,9 +401,10 @@ async fn combined_matching() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-combined").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(GATEWAY_API_COMBINED_MATCHING, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_COMBINED_MATCHING, &ns.name, &[])
+        .await?;
 
     let host = format!("echo.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
@@ -444,7 +448,7 @@ async fn cross_namespace_without_grant() -> anyhow::Result<()> {
     // Deploy tenant backend WITHOUT a ReferenceGrant.
     // Apply only the Deployment + Service from the tenant fixture
     // by stripping the ReferenceGrant via a second apply after deletion.
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_CROSS_NAMESPACE_TENANT,
         &tenant.name,
         &[("TESTNS", &ns.name)],
@@ -465,7 +469,7 @@ async fn cross_namespace_without_grant() -> anyhow::Result<()> {
         .status()
         .await?;
 
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_CROSS_NAMESPACE_ROUTE,
         &ns.name,
         &[("TENANTNS", &tenant.name)],
@@ -497,7 +501,7 @@ async fn tls_termination_with_sni() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-sni").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host_a = format!("tls-a.{}.local", ns.name);
@@ -505,7 +509,7 @@ async fn tls_termination_with_sni() -> anyhow::Result<()> {
     let cert_a = GeneratedCert::for_host(&host_a);
     let cert_b = GeneratedCert::for_host(&host_b);
 
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_TLS_TERMINATION,
         &ns.name,
         &[
@@ -556,7 +560,7 @@ async fn tls_missing_secret_marks_gateway_not_programmed() -> anyhow::Result<()>
     let secret_name = "cert-missing";
 
     // Apply a Gateway with an HTTPS listener whose Secret does not exist yet.
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_TLS_GATEWAY_NO_CERTS,
         &ns.name,
         &[("LISTENER_HOSTNAME", &host), ("SECRET_NAME", secret_name)],
@@ -641,7 +645,7 @@ async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
     let certs_ns = NamespaceGuard::create(&h.client, "gw-tls-xns-certs").await?;
 
     // Deploy backend in the primary namespace.
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host = format!("tls-xns.{}.local", ns.name);
@@ -649,7 +653,7 @@ async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
     let secret_name = "xns-cert";
 
     // Deploy Secret + ReferenceGrant into the certs namespace.
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS,
         &certs_ns.name,
         &[
@@ -662,7 +666,7 @@ async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
     .await?;
 
     // Deploy Gateway + HTTPRoute into the primary namespace.
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
         &ns.name,
         &[
@@ -691,7 +695,7 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-rotate").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host_a = format!("tls-rot-a.{}.local", ns.name);
@@ -701,7 +705,7 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
     let cert_b = GeneratedCert::for_host(&host_b);
 
     // Deploy with original certs.
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_TLS_TERMINATION,
         &ns.name,
         &[
@@ -724,7 +728,7 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
     let old_der_b = http::https_peer_leaf_der(&host_b, "/", h.tls_addr).await?;
 
     // Rotate only Secret A; Secret B data is unchanged.
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_TLS_TERMINATION,
         &ns.name,
         &[
@@ -778,13 +782,13 @@ async fn cert_manager_gateway_provisioning() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-cert-mgr").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host = format!("tls-cm.{}.local", ns.name);
     let secret_name = "cert-manager-tls";
 
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_CERT_MANAGER,
         &ns.name,
         &[("LISTENER_HOSTNAME", &host), ("SECRET_NAME", secret_name)],
@@ -812,9 +816,9 @@ async fn websocket_passthrough() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-ws").await?;
 
-    fixtures::apply_fixture(BACKENDS_WEBSOCKET_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_WEBSOCKET_ECHO, &ns.name, &[]).await?;
     wait::wait_for_deployments(&ns.name, &["ws-echo"]).await?;
-    fixtures::apply_fixture(GATEWAY_API_WEBSOCKET, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_WEBSOCKET, &ns.name, &[]).await?;
 
     let host = format!("ws.{}.local", ns.name);
 
@@ -861,9 +865,9 @@ async fn filters() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-filters").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(GATEWAY_API_FILTERS, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_FILTERS, &ns.name, &[]).await?;
 
     let host = format!("echo.{}.local", ns.name);
 
@@ -940,9 +944,9 @@ async fn timeouts_request_returns_504() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-timeouts-req").await?;
 
-    fixtures::apply_fixture(BACKENDS_SLOW_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_SLOW_ECHO, &ns.name, &[]).await?;
     wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
-    fixtures::apply_fixture(GATEWAY_API_TIMEOUTS, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_TIMEOUTS, &ns.name, &[]).await?;
 
     let host = format!("timeout.{}.local", ns.name);
 
@@ -972,9 +976,9 @@ async fn timeouts_backend_request_returns_504() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-timeouts-be").await?;
 
-    fixtures::apply_fixture(BACKENDS_SLOW_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_SLOW_ECHO, &ns.name, &[]).await?;
     wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
-    fixtures::apply_fixture(GATEWAY_API_TIMEOUTS, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_TIMEOUTS, &ns.name, &[]).await?;
 
     let host = format!("timeout.{}.local", ns.name);
 
@@ -1007,14 +1011,14 @@ async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-redirect").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host = format!("tls-redirect.{}.local", ns.name);
     let cert = GeneratedCert::for_host(&host);
     let secret_name = "cert-tls-redirect";
 
-    fixtures::apply_fixture(
+    h.apply(
         GATEWAY_API_TLS_REDIRECT,
         &ns.name,
         &[
@@ -1069,9 +1073,9 @@ async fn weighted_split() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-weighted").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(GATEWAY_API_WEIGHTED_SPLIT, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_WEIGHTED_SPLIT, &ns.name, &[]).await?;
 
     let host = format!("weighted.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
@@ -1108,7 +1112,7 @@ async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-serving").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     // Inject an orphan EndpointSlice for echo-a whose single endpoint has
@@ -1150,7 +1154,7 @@ async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
     };
     slice_api.create(&PostParams::default(), &orphan).await?;
 
-    fixtures::apply_fixture(GATEWAY_API_SERVING_DRAIN, &ns.name, &[]).await?;
+    h.apply(GATEWAY_API_SERVING_DRAIN, &ns.name, &[]).await?;
     let host = format!("serving.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
 
@@ -1162,6 +1166,46 @@ async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
         counts.get("echo-a").copied().unwrap_or(0),
         30,
         "not all requests hit echo-a: {counts:?}"
+    );
+
+    Ok(())
+}
+
+// Verifies SupportHTTPRouteParentRefPort (#98):
+// A route with parentRef.port matching the listener is routable;
+// a route with parentRef.port pointing at a non-existent port is not attached.
+#[tokio::test]
+async fn parent_ref_port_matching() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-port").await?;
+
+    // Any unused high port that coxswain is definitely NOT listening on.
+    let wrong_port = "19999";
+
+    h.apply(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(
+        GATEWAY_API_PARENT_REF_PORT,
+        &ns.name,
+        &[("WRONG_PORT", wrong_port)],
+    )
+    .await?;
+
+    // route-pinned (parentRef.port=HTTP_PORT) should be live.
+    let pinned_host = format!("pinned.{}.local", ns.name);
+    let resp =
+        wait::wait_for_route(&h.http, &pinned_host, "/probe", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    // route-wrong-port (parentRef.port=WRONG_PORT) must NOT be routable:
+    // coxswain has no listener on that port, so the route is unattached and
+    // nothing is inserted in the routing table for wrong.TESTNS.local.
+    let wrong_host = format!("wrong.{}.local", ns.name);
+    let resp = h.http.get(&wrong_host, "/").await;
+    assert!(
+        resp.is_err() || resp.unwrap().status() != reqwest::StatusCode::OK,
+        "route-wrong-port must not be routable on HTTP_PORT"
     );
 
     Ok(())

@@ -12,12 +12,24 @@ impl RoutingEngine {
     }
 
     /// Like [`find`] but returns only the upstream, without host/path distinction.
-    pub fn route(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<Upstream>> {
-        self.table.load().route(host, path, ctx)
+    pub fn route(
+        &self,
+        port: u16,
+        host: &str,
+        path: &str,
+        ctx: &RequestContext<'_>,
+    ) -> Option<Arc<Upstream>> {
+        self.table.load().route(port, host, path, ctx)
     }
 
     /// Distinguishes "host not registered" from "path/predicate not matched".
-    pub fn find(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> RouteOutcome {
-        self.table.load().find(host, path, ctx)
+    pub fn find(
+        &self,
+        port: u16,
+        host: &str,
+        path: &str,
+        ctx: &RequestContext<'_>,
+    ) -> RouteOutcome {
+        self.table.load().find(port, host, path, ctx)
     }
 }

@@ -17,7 +17,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: 8080
+      port: HTTP_PORT
       protocol: HTTP
       allowedRoutes:
         namespaces:

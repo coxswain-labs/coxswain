@@ -159,6 +159,11 @@ pub const GATEWAY_API_SERVING_DRAIN: &str = concat!(
     "/fixtures/gateway_api/serving_drain.yaml"
 );
 
+pub const GATEWAY_API_PARENT_REF_PORT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/parent_ref_port.yaml"
+);
+
 /// Apply a fixture YAML to `namespace`.
 ///
 /// Supports template substitutions: `TESTNS` is always replaced with `namespace`.

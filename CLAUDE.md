@@ -68,8 +68,8 @@ cargo run --bin coxswain -- serve --log-format console
 # Start coxswain for conformance testing (ports 80/443, status-address = localhost)
 # Must be running before the go test command below.
 cargo run --bin coxswain -- serve \
-  --proxy-addr 0.0.0.0:80 \
-  --proxy-tls-addr 0.0.0.0:443 \
+  --proxy-http-port 80 \
+  --proxy-https-port 443 \
   --health-addr 127.0.0.1:8081 \
   --admin-addr 127.0.0.1:8082 \
   --status-address 127.0.0.1 \

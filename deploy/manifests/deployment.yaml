@@ -60,6 +60,10 @@ spec:
               value: "0.0.0.0:8081"
             - name: COXSWAIN_ADMIN_ADDR
               value: "0.0.0.0:8082"
+            - name: COXSWAIN_PROXY_HTTP_PORT
+              value: "80"
+            - name: COXSWAIN_PROXY_HTTPS_PORT
+              value: "443"
           livenessProbe:
             httpGet:
               path: /healthz

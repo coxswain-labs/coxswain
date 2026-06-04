@@ -1,7 +1,11 @@
 use crate::gateway_api::hostnames_intersect;
 use crate::keys::ListenerKey;
 use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth};
-use crate::{endpoints, gateway_api::GatewayApiReconciler, ingress::IngressReconciler};
+use crate::{
+    endpoints,
+    gateway_api::{GatewayApiReconciler, ListenerBinding},
+    ingress::{IngressPorts, IngressReconciler},
+};
 use async_trait::async_trait;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::reference_grants::ReferenceGrantKey;
@@ -63,6 +67,17 @@ impl std::str::FromStr for IngressDefaultBackend {
     }
 }
 
+/// Optional configuration for a [`Reconciler`].
+#[derive(Default)]
+pub struct ReconcilerOptions {
+    /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
+    pub watch_namespace: Option<String>,
+    /// Controller-wide default backend for Ingress traffic with no matching rule.
+    pub ingress_default_backend: Option<IngressDefaultBackend>,
+    /// Ports on which Ingress routes are served.
+    pub ingress_ports: IngressPorts,
+}
+
 /// Pingora background service that maintains reflector-backed stores for
 /// `HTTPRoute`, `Ingress`, `IngressClass`, `Gateway`, `GatewayClass`, and
 /// `EndpointSlice`, and rebuilds the routing table whenever any of them change
@@ -75,9 +90,7 @@ pub struct Reconciler {
     route_health: SharedHttpRouteHealth,
     owned_gateways: OwnedGateways,
     controller_name: String,
-    /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
-    watch_namespace: Option<String>,
-    ingress_default_backend: Option<IngressDefaultBackend>,
+    opts: ReconcilerOptions,
 }
 
 impl Reconciler {
@@ -87,8 +100,7 @@ impl Reconciler {
         tls_health: SharedGatewayListenerHealth,
         owned_gateways: OwnedGateways,
         controller_name: String,
-        watch_namespace: Option<String>,
-        ingress_default_backend: Option<IngressDefaultBackend>,
+        opts: ReconcilerOptions,
     ) -> Self {
         Self {
             routes,
@@ -97,8 +109,7 @@ impl Reconciler {
             route_health: SharedHttpRouteHealth::new(),
             owned_gateways,
             controller_name,
-            watch_namespace,
-            ingress_default_backend,
+            opts,
         }
     }
 
@@ -113,6 +124,7 @@ struct ReconcilerConfig {
     controller_name: String,
     watch_namespace: Option<String>,
     ingress_default_backend: Option<IngressDefaultBackend>,
+    ingress_ports: IngressPorts,
 }
 
 fn scoped_api<T>(client: Client, ns: Option<&str>) -> Api<T>
@@ -163,8 +175,9 @@ impl BackgroundService for Reconciler {
             .expect("K8s client for reconciler");
         let config = ReconcilerConfig {
             controller_name: self.controller_name.clone(),
-            watch_namespace: self.watch_namespace.clone(),
-            ingress_default_backend: self.ingress_default_backend.clone(),
+            watch_namespace: self.opts.watch_namespace.clone(),
+            ingress_default_backend: self.opts.ingress_default_backend.clone(),
+            ingress_ports: self.opts.ingress_ports,
         };
         let mut set = spawn_tasks(
             client,
@@ -202,6 +215,7 @@ async fn spawn_tasks(
         controller_name,
         watch_namespace,
         ingress_default_backend,
+        ingress_ports,
     } = config;
     let (route_reader, route_writer) = reflector::store::<HTTPRoute>();
     let (ingress_reader, ingress_writer) = reflector::store::<Ingress>();
@@ -319,6 +333,7 @@ async fn spawn_tasks(
                 &controller_name,
                 &owned_gateways,
                 ingress_default_backend.as_ref(),
+                ingress_ports,
                 &routes,
                 &tls,
                 &tls_health,
@@ -344,6 +359,7 @@ fn rebuild(
     controller_name: &str,
     owned_gateways_handle: &OwnedGateways,
     ingress_default_backend: Option<&IngressDefaultBackend>,
+    ingress_ports: IngressPorts,
     shared: &SharedRoutingTable,
     tls_shared: &SharedTlsStore,
     tls_health_shared: &SharedGatewayListenerHealth,
@@ -383,6 +399,7 @@ fn rebuild(
         slice_store,
         service_store,
         ingress_default_backend,
+        ingress_ports,
         shared,
     );
 
@@ -543,27 +560,25 @@ fn build_routes(
     slice_store: &reflector::Store<EndpointSlice>,
     service_store: &reflector::Store<Service>,
     ingress_default_backend: Option<&IngressDefaultBackend>,
+    ingress_ports: IngressPorts,
     shared: &SharedRoutingTable,
 ) {
-    // Precompute ListenerKey → hostname so reconcile() can scope routes without
-    // spec.hostnames to their parent listener's hostname.
-    let listener_hostname_map: HashMap<ListenerKey, String> = gateway_store
+    // Precompute ListenerKey → (hostname, port) from all owned gateway listeners.
+    let listener_info: HashMap<ListenerKey, ListenerBinding> = gateway_store
         .state()
         .into_iter()
         .filter(|g| owned_gateway_classes.contains(&g.spec.gateway_class_name))
         .flat_map(|g| {
             let ns = g.metadata.namespace.clone().unwrap_or_default();
             let name = g.metadata.name.clone().unwrap_or_default();
-            g.spec
-                .listeners
-                .iter()
-                .map(|l| {
-                    (
-                        ListenerKey::new(ns.clone(), name.clone(), l.name.clone()),
-                        l.hostname.clone().unwrap_or_default(),
-                    )
-                })
-                .collect::<Vec<_>>()
+            g.spec.listeners.clone().into_iter().map(move |l| {
+                let key = ListenerKey::new(ns.clone(), name.clone(), l.name);
+                let binding = ListenerBinding {
+                    hostname: l.hostname.unwrap_or_default(),
+                    port: l.port as u16,
+                };
+                (key, binding)
+            })
         })
         .collect();
 
@@ -575,7 +590,7 @@ fn build_routes(
             service_store,
             owned_gateways,
             backend_grants,
-            &listener_hostname_map,
+            &listener_info,
             &mut builder,
         );
     }
@@ -586,14 +601,14 @@ fn build_routes(
             service_store,
             owned_ingress_classes,
             owned_default_ingress_class,
+            ingress_ports,
             &mut builder,
         );
     }
 
-    // Install the controller-wide default backend on the global catchall. Thanks to
-    // the catchall fall-through in RoutingTable::route, this also serves path-misses
-    // on hosts that did not declare their own spec.defaultBackend. Per-Ingress defaults
-    // always win because they are installed on the host router (matched first).
+    // Install the controller-wide default backend on the catchall for each configured
+    // Ingress port. Per-Ingress defaults always win because they are installed on the
+    // host router (matched first).
     if let Some(db) = ingress_default_backend {
         let addrs =
             endpoints::resolve(&db.namespace, &db.name, db.port, slice_store, service_store);
@@ -607,12 +622,18 @@ fn build_routes(
                 format!("{}/{}", db.namespace, db.name),
                 addrs,
             ));
-            let e = Arc::new(RouteEntry::path_only(
-                upstream,
-                format!("{}/{}", db.namespace, db.name),
-                None,
-            ));
-            builder.catchall().add_prefix_route("/", e);
+            let svc_id = format!("{}/{}", db.namespace, db.name);
+            for port in [ingress_ports.http, ingress_ports.https]
+                .into_iter()
+                .flatten()
+            {
+                let e = Arc::new(RouteEntry::path_only(
+                    Arc::clone(&upstream),
+                    svc_id.clone(),
+                    None,
+                ));
+                builder.for_port(port).catchall().add_prefix_route("/", e);
+            }
         }
     }
 
@@ -620,6 +641,7 @@ fn build_routes(
         Ok(table) => {
             for c in table.conflicts() {
                 tracing::warn!(
+                    port = c.port,
                     host = %c.host,
                     path = %c.path,
                     kind = c.kind.as_str(),

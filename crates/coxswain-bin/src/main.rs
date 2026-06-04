@@ -2,13 +2,19 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use coxswain_admin::AdminServer;
 use coxswain_controller::tls::SharedGatewayListenerHealth;
-use coxswain_controller::{Controller, ControllerConfig, IngressDefaultBackend, Reconciler};
+use coxswain_controller::{
+    Controller, ControllerConfig, IngressDefaultBackend, IngressPorts, Reconciler,
+    ReconcilerOptions,
+};
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::RouteTimeouts;
 use coxswain_core::routing::SharedRoutingTable;
 use coxswain_core::tls::SharedTlsStore;
 use coxswain_health::HealthServer;
-use coxswain_proxy::{Proxy, ProxyAcceptor, RoutingEngine, SniCertSelector, TrustedSources};
+use coxswain_proxy::{
+    ListenerProtocol, ListenerSpec, Proxy, ProxyAcceptor, RoutingEngine, SniCertSelector,
+    TrustedSources,
+};
 use ipnet::IpNet;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
@@ -16,7 +22,7 @@ use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::services::background::background_service;
 use pingora_core::services::listening::Service;
 use pingora_proxy::{http_proxy, http_proxy_service_with_name};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -151,16 +157,29 @@ pub struct ServeArgs {
     #[arg(long, env = "COXSWAIN_HEALTH_ADDR", default_value = "0.0.0.0:8081")]
     pub health_addr: SocketAddr,
 
-    /// Socket address to listen on for inbound HTTP traffic.
-    #[arg(long, env = "COXSWAIN_PROXY_ADDR", default_value = "0.0.0.0:80")]
-    pub proxy_addr: SocketAddr,
+    /// IP address to bind all proxy listeners to.
+    ///
+    /// Shared by both HTTP and HTTPS listeners. Combine with `--proxy-http-port`
+    /// and/or `--proxy-https-port` to form the full bind address for each listener.
+    #[arg(long, env = "COXSWAIN_PROXY_BIND_ADDRESS", default_value = "0.0.0.0")]
+    pub proxy_bind_address: IpAddr,
 
-    /// Socket address to listen on for inbound HTTPS traffic.
+    /// Port to listen on for inbound HTTP traffic.
+    ///
+    /// When omitted, no default HTTP listener is bound; coxswain relies on
+    /// Gateway `spec.listeners` to discover which ports to serve.
+    #[arg(long, env = "COXSWAIN_PROXY_HTTP_PORT")]
+    pub proxy_http_port: Option<u16>,
+
+    /// Port to listen on for inbound HTTPS traffic.
     ///
     /// SNI selects the certificate from each Ingress's `spec.tls` block.
-    /// The listener is always bound; handshakes with no matching SNI fail cleanly.
-    #[arg(long, env = "COXSWAIN_PROXY_TLS_ADDR", default_value = "0.0.0.0:443")]
-    pub proxy_tls_addr: SocketAddr,
+    /// Handshakes with no matching SNI fail cleanly.
+    ///
+    /// When omitted, no default HTTPS listener is bound; coxswain relies on
+    /// Gateway `spec.listeners` to discover which ports to serve.
+    #[arg(long, env = "COXSWAIN_PROXY_HTTPS_PORT")]
+    pub proxy_https_port: Option<u16>,
 
     /// External address written to every owned `Ingress.status.loadBalancer.ingress[0]`
     /// and `Gateway.status.addresses[0]`.
@@ -277,8 +296,11 @@ fn main() -> Result<()> {
         gateway_tls_health.clone(),
         owned_gateways.clone(),
         args.controller_name.clone(),
-        args.controller_watch_namespace.clone(),
-        args.ingress_default_backend,
+        ReconcilerOptions {
+            watch_namespace: args.controller_watch_namespace.clone(),
+            ingress_default_backend: args.ingress_default_backend,
+            ingress_ports: IngressPorts::new(args.proxy_http_port, args.proxy_https_port),
+        },
     );
     let route_health = reconciler.route_health();
 
@@ -301,6 +323,27 @@ fn main() -> Result<()> {
         backend_request: args.proxy_default_backend_request_timeout,
     };
 
+    // Build the list of (addr, protocol) pairs from the configured port flags.
+    let mut listeners: Vec<ListenerSpec> = Vec::new();
+    if let Some(port) = args.proxy_http_port {
+        listeners.push(ListenerSpec::http(SocketAddr::new(
+            args.proxy_bind_address,
+            port,
+        )));
+    }
+    if let Some(port) = args.proxy_https_port {
+        listeners.push(ListenerSpec::https(SocketAddr::new(
+            args.proxy_bind_address,
+            port,
+        )));
+    }
+    if listeners.is_empty() {
+        tracing::warn!(
+            "No proxy listener ports configured (--proxy-http-port / --proxy-https-port). \
+             No traffic will be served until ports are added."
+        );
+    }
+
     if args.proxy_accept_proxy_protocol {
         if args.proxy_trusted_sources.is_empty() {
             tracing::warn!(
@@ -318,34 +361,34 @@ fn main() -> Result<()> {
         ));
         let trusted = Arc::new(TrustedSources::new(args.proxy_trusted_sources.clone()));
         let sni_selector = SniCertSelector::new(tls_store);
-        let acceptor = ProxyAcceptor::new(
-            proxy,
-            args.proxy_addr,
-            args.proxy_tls_addr,
-            trusted,
-            sni_selector,
-        )
-        .expect("build ProxyAcceptor");
+        let acceptor = ProxyAcceptor::new(proxy, listeners, trusted, sni_selector)
+            .expect("build ProxyAcceptor");
         server.add_service(acceptor);
     } else {
-        server.add_service({
-            let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
-            let mut svc = http_proxy_service_with_name(
-                &server.configuration,
-                Proxy {
-                    engine,
-                    default_timeouts,
-                },
-                "proxy",
-            );
-            svc.add_tcp(&args.proxy_addr.to_string());
-            let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
-                Box::new(SniCertSelector::new(tls_store));
-            let tls_settings =
-                TlsSettings::with_callbacks(callbacks).expect("TlsSettings::with_callbacks");
-            svc.add_tls_with_settings(&args.proxy_tls_addr.to_string(), None, tls_settings);
-            svc
-        });
+        let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
+        let mut svc = http_proxy_service_with_name(
+            &server.configuration,
+            Proxy {
+                engine,
+                default_timeouts,
+            },
+            "proxy",
+        );
+        for spec in &listeners {
+            match spec.protocol {
+                ListenerProtocol::Http => {
+                    svc.add_tcp(&spec.addr.to_string());
+                }
+                ListenerProtocol::Https => {
+                    let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
+                        Box::new(SniCertSelector::new(tls_store.clone()));
+                    let tls_settings = TlsSettings::with_callbacks(callbacks)
+                        .expect("TlsSettings::with_callbacks");
+                    svc.add_tls_with_settings(&spec.addr.to_string(), None, tls_settings);
+                }
+            }
+        }
+        server.add_service(svc);
     }
 
     server.add_service({
@@ -369,8 +412,9 @@ fn main() -> Result<()> {
     );
 
     tracing::info!(
-        proxy_addr = %args.proxy_addr,
-        proxy_tls_addr = %args.proxy_tls_addr,
+        proxy_bind_address = %args.proxy_bind_address,
+        proxy_http_port = ?args.proxy_http_port,
+        proxy_https_port = ?args.proxy_https_port,
         health_addr = %args.health_addr,
         admin_addr = %args.admin_addr,
         proxy_shutdown_grace_period = ?args.proxy_shutdown_grace_period,
