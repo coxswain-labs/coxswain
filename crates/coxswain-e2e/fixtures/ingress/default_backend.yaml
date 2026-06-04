@@ -4,7 +4,8 @@
 # Routes:
 #   app.TESTNS.local /api  → echo-a  (explicit rule)
 #   app.TESTNS.local /*    → echo-b  (per-Ingress defaultBackend, path-miss)
-#   <any other host>       → echo-c  (controller-wide --ingress-default-backend)
+#   <any other host>       → echo-b  (per-Ingress defaultBackend wins over controller-wide on catchall)
+#   <unclaimed host>       → echo-c  (controller-wide --ingress-default-backend, before Ingress is applied)
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

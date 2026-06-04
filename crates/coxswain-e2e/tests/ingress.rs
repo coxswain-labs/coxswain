@@ -1,7 +1,8 @@
 use coxswain_e2e::{
     fixtures::{
-        self, BACKENDS_ECHO, INGRESS_CERT_MANAGER, INGRESS_DEFAULT_BACKEND, INGRESS_DEFAULT_CLASS,
-        INGRESS_NAMED_PORT, INGRESS_PATH_MATCHING, INGRESS_TLS_TERMINATION, INGRESS_WILDCARD_HOST,
+        self, BACKENDS_ECHO, INGRESS_CERT_MANAGER, INGRESS_DEFAULT_BACKEND,
+        INGRESS_DEFAULT_BACKEND_ONLY, INGRESS_DEFAULT_CLASS, INGRESS_NAMED_PORT,
+        INGRESS_PATH_MATCHING, INGRESS_TLS_TERMINATION, INGRESS_WILDCARD_HOST,
     },
     harness::{
         ControllerOptions, ControllerProcess, GeneratedCert, Harness, HttpClient,
@@ -74,17 +75,42 @@ async fn default_backend() -> anyhow::Result<()> {
     let host = format!("app.{}.local", ns.name);
     let unknown_host = format!("unknown.{}.local", ns.name);
 
-    // Wait until the explicit rule is live, then test all three cases.
-    let resp = wait::wait_for_route(&http, &host, "/api", Duration::from_secs(60)).await?;
-    resp.assert_backend("echo-a");
+    // Wait until the explicit rule is live with the correct backend.
+    // Use wait_for_backend (not wait_for_route) because the controller-wide catchall
+    // may serve echo-c for this host before the Ingress-specific route is reconciled.
+    wait::wait_for_backend(&http, &host, "/api", "echo-a", Duration::from_secs(60)).await?;
 
     // Per-Ingress defaultBackend catches path-miss on the rule's host.
     let resp = http.get(&host, "/other").await?;
     resp.assert_backend("echo-b");
 
-    // Controller-wide default catches requests to an unknown host.
+    // Per-Ingress defaultBackend wins over controller-wide for unmatched hosts too.
     let resp = http.get(&unknown_host, "/anything").await?;
-    resp.assert_backend("echo-c");
+    resp.assert_backend("echo-b");
+
+    Ok(())
+}
+
+/// Tests a rules-less Ingress (only spec.defaultBackend, no spec.rules).
+/// The defaultBackend should serve all traffic regardless of host or path.
+#[tokio::test]
+async fn default_backend_only() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-default-only").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(INGRESS_DEFAULT_BACKEND_ONLY, &ns.name, &[]).await?;
+
+    // Wait for the defaultBackend to be live, probing an arbitrary host+path.
+    let resp =
+        wait::wait_for_route(&h.http, "random.example", "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-b");
+
+    // Any host and any path should hit echo-b.
+    let resp = h.http.get("other.io", "/api/v1").await?;
+    resp.assert_backend("echo-b");
 
     Ok(())
 }
@@ -528,8 +554,9 @@ async fn default_ingress_class() -> anyhow::Result<()> {
     fixtures::apply_fixture(INGRESS_DEFAULT_CLASS, &ns.name, &[]).await?;
 
     let host = format!("default-ingress.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
-    resp.assert_backend("echo-a");
+    // Use wait_for_backend rather than wait_for_route: a leftover catchall entry
+    // from a concurrent test could serve a 200 before this route is reconciled.
+    wait::wait_for_backend(&h.http, &host, "/", "echo-a", Duration::from_secs(60)).await?;
 
     Ok(())
 }

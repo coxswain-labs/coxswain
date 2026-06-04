@@ -1,0 +1,17 @@
+# Rules-less Ingress fixture — only spec.defaultBackend, no spec.rules.
+# TESTNS is substituted with the test namespace at runtime.
+#
+# Routes:
+#   <any host, any path>   → echo-b  (per-Ingress defaultBackend on the catchall)
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: default-only-ingress
+spec:
+  ingressClassName: coxswain
+  defaultBackend:
+    service:
+      name: echo-b
+      port:
+        number: 3000

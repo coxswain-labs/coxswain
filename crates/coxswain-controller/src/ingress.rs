@@ -102,20 +102,7 @@ impl IngressReconciler {
         let route_id = format!("{ns}/{ingress_name}");
         let created_at = metadata_created_at(&ingress.metadata);
         let spec = ingress.spec.as_ref();
-        let rules = spec.and_then(|s| s.rules.as_deref());
-
-        if rules.is_none_or(|r| r.is_empty()) {
-            if spec.and_then(|s| s.default_backend.as_ref()).is_some() {
-                tracing::warn!(
-                    name = ?ingress.metadata.name,
-                    "spec.defaultBackend is set but spec.rules is empty — \
-                     default backend is a no-op; use --ingress-default-backend \
-                     for a controller-wide fallback"
-                );
-            }
-            return;
-        }
-        let rules = rules.unwrap();
+        let rules = spec.and_then(|s| s.rules.as_deref()).unwrap_or(&[]);
 
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
@@ -167,10 +154,15 @@ impl IngressReconciler {
             }
         }
 
-        // Install spec.defaultBackend as prefix "/" on each rule host so path-misses
-        // on those hosts fall to this backend. Per-rule routes win because they are
-        // inserted above; first-writer-wins semantics mean "/" is only claimed here
-        // if no rule already registered it.
+        // Install spec.defaultBackend as prefix "/" on:
+        //   - each rule host  → catches path-misses on hosts named in spec.rules
+        //   - the catchall    → catches requests to hosts not named in any rule,
+        //                       including rules-less Ingresses that claim all traffic
+        //
+        // Per-rule routes registered above are inserted as exact or as specific
+        // prefix paths, so they outrank "/" via matchit's longest-match lookup.
+        // The controller-wide --ingress-default-backend uses created_at = None
+        // (sorts last), so this per-Ingress entry naturally wins on the catchall.
         if let Some(default_svc) = spec
             .and_then(|s| s.default_backend.as_ref())
             .and_then(|b| b.service.as_ref())
@@ -185,15 +177,19 @@ impl IngressReconciler {
                 );
             } else {
                 let upstream = Arc::new(Upstream::new(format!("{ns}/{}", default_svc.name), addrs));
-                for rule in rules {
-                    let host_builder = builder.host_for(rule.host.as_deref());
-                    let e = Arc::new(RouteEntry::path_only(
+                let make_entry = || {
+                    Arc::new(RouteEntry::path_only(
                         Arc::clone(&upstream),
                         route_id.clone(),
                         created_at,
-                    ));
-                    host_builder.add_prefix_route("/", e);
+                    ))
+                };
+                for rule in rules {
+                    builder
+                        .host_for(rule.host.as_deref())
+                        .add_prefix_route("/", make_entry());
                 }
+                builder.host_for(None).add_prefix_route("/", make_entry());
             }
         }
     }
@@ -272,6 +268,7 @@ mod tests {
         HTTPIngressPath, HTTPIngressRuleValue, IngressBackend, IngressRule, IngressServiceBackend,
         IngressSpec, IngressTLS, ServiceBackendPort,
     };
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use kube::api::ObjectMeta;
     use kube::runtime::{reflector, watcher};
     use std::collections::BTreeMap;
@@ -566,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_default_backend_skipped_when_no_rules() {
+    fn reconcile_default_backend_only_routes_all_traffic() {
         let store = slice_store(vec![make_slice("default", "default-svc", "10.0.0.1")]);
         let ingress = make_default_only_ingress("default", "default-svc");
         let mut builder = RoutingTableBuilder::new();
@@ -580,7 +577,220 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
-        assert!(table.route("any.host.com", "/", &ctx).is_none());
+        assert_eq!(
+            table.route("any.host.com", "/", &ctx).unwrap().name,
+            "default/default-svc"
+        );
+        assert_eq!(
+            table.route("other.io", "/api/v1", &ctx).unwrap().name,
+            "default/default-svc"
+        );
+    }
+
+    #[test]
+    fn reconcile_default_backend_catches_unmatched_host() {
+        let store = slice_store(vec![
+            make_slice("default", "rule-svc", "10.0.0.1"),
+            make_slice("default", "default-svc", "10.0.0.2"),
+        ]);
+        let ingress = make_ingress_with_default(
+            "default",
+            Some("a.com"),
+            "/api",
+            "rule-svc",
+            Some("default-svc"),
+        );
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        assert_eq!(
+            table.route("a.com", "/api", &ctx).unwrap().name,
+            "default/rule-svc"
+        );
+        assert_eq!(
+            table.route("a.com", "/other", &ctx).unwrap().name,
+            "default/default-svc"
+        );
+        assert_eq!(
+            table.route("b.com", "/", &ctx).unwrap().name,
+            "default/default-svc"
+        );
+    }
+
+    fn make_ingress_with_timestamp(
+        ns: &str,
+        host: Option<&str>,
+        path: &str,
+        path_type: &str,
+        svc: &str,
+        created_at_ms: i64,
+    ) -> Ingress {
+        Ingress {
+            metadata: ObjectMeta {
+                name: Some(format!("{svc}-ingress")),
+                namespace: Some(ns.to_string()),
+                creation_timestamp: Some(Time(
+                    k8s_openapi::jiff::Timestamp::from_millisecond(created_at_ms).unwrap(),
+                )),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                ingress_class_name: Some("coxswain".to_string()),
+                rules: Some(vec![IngressRule {
+                    host: host.map(str::to_string),
+                    http: Some(HTTPIngressRuleValue {
+                        paths: vec![HTTPIngressPath {
+                            path: Some(path.to_string()),
+                            path_type: path_type.to_string(),
+                            backend: IngressBackend {
+                                service: Some(IngressServiceBackend {
+                                    name: svc.to_string(),
+                                    port: Some(ServiceBackendPort {
+                                        number: Some(80),
+                                        ..Default::default()
+                                    }),
+                                }),
+                                ..Default::default()
+                            },
+                        }],
+                    }),
+                }]),
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_older_ingress_wins_same_prefix_path() {
+        let store = slice_store(vec![
+            make_slice("default", "old-svc", "10.0.0.1"),
+            make_slice("default", "new-svc", "10.0.0.2"),
+        ]);
+        let old_ingress = make_ingress_with_timestamp(
+            "default",
+            Some("example.com"),
+            "/foo",
+            "Prefix",
+            "old-svc",
+            1000,
+        );
+        let new_ingress = make_ingress_with_timestamp(
+            "default",
+            Some("example.com"),
+            "/foo",
+            "Prefix",
+            "new-svc",
+            2000,
+        );
+
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &old_ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        reconcile_no_default(
+            &new_ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        assert_eq!(
+            table.route("example.com", "/foo", &ctx).unwrap().name,
+            "default/old-svc",
+            "older Ingress should win on conflicting Prefix /foo"
+        );
+    }
+
+    #[test]
+    fn reconcile_exact_beats_prefix_same_path() {
+        let store = slice_store(vec![
+            make_slice("default", "exact-svc", "10.0.0.1"),
+            make_slice("default", "prefix-svc", "10.0.0.2"),
+        ]);
+        let ingress = Ingress {
+            metadata: ObjectMeta {
+                name: Some("test-ingress".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                ingress_class_name: Some("coxswain".to_string()),
+                rules: Some(vec![IngressRule {
+                    host: Some("example.com".to_string()),
+                    http: Some(HTTPIngressRuleValue {
+                        paths: vec![
+                            HTTPIngressPath {
+                                path: Some("/foo".to_string()),
+                                path_type: "Exact".to_string(),
+                                backend: IngressBackend {
+                                    service: Some(IngressServiceBackend {
+                                        name: "exact-svc".to_string(),
+                                        port: Some(ServiceBackendPort {
+                                            number: Some(80),
+                                            ..Default::default()
+                                        }),
+                                    }),
+                                    ..Default::default()
+                                },
+                            },
+                            HTTPIngressPath {
+                                path: Some("/foo".to_string()),
+                                path_type: "Prefix".to_string(),
+                                backend: IngressBackend {
+                                    service: Some(IngressServiceBackend {
+                                        name: "prefix-svc".to_string(),
+                                        port: Some(ServiceBackendPort {
+                                            number: Some(80),
+                                            ..Default::default()
+                                        }),
+                                    }),
+                                    ..Default::default()
+                                },
+                            },
+                        ],
+                    }),
+                }]),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        assert_eq!(
+            table.route("example.com", "/foo", &ctx).unwrap().name,
+            "default/exact-svc",
+            "Exact /foo should win over Prefix /foo"
+        );
+        assert_eq!(
+            table.route("example.com", "/foo/sub", &ctx).unwrap().name,
+            "default/prefix-svc",
+            "Prefix /foo should still match /foo/sub"
+        );
     }
 
     #[test]

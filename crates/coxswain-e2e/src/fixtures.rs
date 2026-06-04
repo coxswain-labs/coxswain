@@ -89,6 +89,11 @@ pub const INGRESS_DEFAULT_BACKEND: &str = concat!(
     "/fixtures/ingress/default_backend.yaml"
 );
 
+pub const INGRESS_DEFAULT_BACKEND_ONLY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/ingress/default_backend_only.yaml"
+);
+
 pub const INGRESS_TLS_TERMINATION: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/ingress/tls_termination.yaml"

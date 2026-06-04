@@ -258,6 +258,44 @@ pub async fn wait_for_route(
     }
 }
 
+/// Poll `host`+`path` until the response comes from `expected_backend`.
+///
+/// Unlike [`wait_for_route`], this keeps retrying even when a 200 is received
+/// from a *different* backend (e.g. a catchall that currently wins). Useful
+/// when a global catchall could intercept requests before the intended
+/// host-specific route is reconciled.
+pub async fn wait_for_backend(
+    http: &crate::harness::HttpClient,
+    host: &str,
+    path: &str,
+    expected_backend: &str,
+    timeout: Duration,
+) -> anyhow::Result<crate::harness::http::EchoResponse> {
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        match http.get(host, path).await {
+            Ok(resp) => {
+                let pod = resp.pod.as_deref().unwrap_or("");
+                if pod.starts_with(&format!("{expected_backend}-")) {
+                    return Ok(resp);
+                }
+                tracing::debug!(
+                    host,
+                    path,
+                    pod,
+                    expected_backend,
+                    "wrong backend — retrying"
+                );
+            }
+            Err(e) => tracing::debug!(host, path, error = %e, "route not yet live"),
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for backend '{expected_backend}' at {host}{path}");
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Poll until `host`+`path` returns `expected_status`. Useful for routes where
 /// the expected response is an error code (e.g. 502 from a timeout route).
 pub async fn wait_for_route_status(
