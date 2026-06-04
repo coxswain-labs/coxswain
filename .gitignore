@@ -3,4 +3,4 @@
 .wip/
 /target
 .cargo/config.toml
-conformance/reports/local-report.yaml
+conformance/reports/*.yaml
