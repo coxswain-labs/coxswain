@@ -39,7 +39,7 @@ The first fully usable version: all must-have features implemented, OCI image pu
 - ✅ ~~Warn instead of silently dropping `Resource`-type Ingress backends — [#104](https://github.com/coxswain-labs/coxswain/issues/104)~~
 - ✅ ~~Warn when `spec.tls[].hosts` is empty or omitted — [#105](https://github.com/coxswain-labs/coxswain/issues/105)~~
 - ✅ ~~Validate and warn on Ingress paths that do not start with `/`~~ — [#106](https://github.com/coxswain-labs/coxswain/issues/106)
-- ⬜ Surface `HostRouterBuilder` insert failures as debug log — [#107](https://github.com/coxswain-labs/coxswain/issues/107)
+- ✅ ~~Surface `HostRouterBuilder` insert failures as debug log — [#107](https://github.com/coxswain-labs/coxswain/issues/107)~~
 - ⬜ Dynamic per-port proxy binding (Pingora hot-reload or `--extra-ports` stepping stone) — [#98](https://github.com/coxswain-labs/coxswain/issues/98) _(unblocks `SupportHTTPRouteParentRefPort` and #82)_
 - ⬜ Finish `parentRef.port` traffic-routing path (GEP-957) — [#82](https://github.com/coxswain-labs/coxswain/issues/82) _(controller validation already done; traffic path blocked by #98)_
 - ⬜ Honor `appProtocol` on Service ports for backend protocol selection (GEP-1911) — [#90](https://github.com/coxswain-labs/coxswain/issues/90) _(unlocks `SupportHTTPRouteBackendProtocolH2C` and `SupportHTTPRouteBackendProtocolWebSocket`; supersedes closed #12)_
