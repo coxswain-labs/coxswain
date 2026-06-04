@@ -90,11 +90,11 @@ fn wildcard_host_matches() {
     let table = b.build().unwrap();
     assert!(table.route(PORT, "api.test.com", "/", &ctx_get()).is_some());
     assert!(table.route(PORT, "test.com", "/", &ctx_get()).is_none());
-    // Multi-label prefix must not match — * covers exactly one DNS label.
+    // Per Gateway API spec, `*` matches any number of subdomain labels.
     assert!(
         table
             .route(PORT, "nested.api.test.com", "/", &ctx_get())
-            .is_none()
+            .is_some()
     );
 }
 

@@ -278,13 +278,21 @@ impl HostRouterBuilder {
 }
 
 /// Returns `true` when `host` matches the wildcard pattern `*.{suffix}`.
-/// Requires exactly one label before the suffix: `api.example.com` matches
-/// suffix `example.com`, but `example.com` and `a.b.example.com` do not.
+///
+/// Per the Gateway API `Hostname` type definition, the wildcard label `*.`
+/// matches **any number** of subdomain labels. So `*.example.com` matches
+/// `a.example.com`, `a.b.example.com`, and `a.b.c.example.com` alike.
+/// `example.com` itself does not match (the prefix must be non-empty).
+///
+/// Listener isolation still works correctly because `wildcard_hosts` is sorted
+/// longest-suffix-first: the more specific `*.foo.example.com` is checked
+/// before `*.example.com`, so `bar.foo.example.com` hits the more-specific
+/// entry first and never falls through to the less-specific one.
 pub(super) fn wildcard_matches(host: &str, suffix: &str) -> bool {
     if let Some(rest) = host.strip_suffix(suffix)
-        && let Some(label) = rest.strip_suffix('.')
+        && let Some(prefix) = rest.strip_suffix('.')
     {
-        return !label.is_empty() && !label.contains('.');
+        return !prefix.is_empty();
     }
     false
 }
