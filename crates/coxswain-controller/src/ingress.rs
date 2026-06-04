@@ -147,6 +147,16 @@ impl IngressReconciler {
                 let upstream = Arc::new(Upstream::new(format!("{ns}/{}", svc.name), addrs));
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
+                if !path.starts_with('/') {
+                    tracing::warn!(
+                        ingress = %route_id,
+                        host = ?rule.host,
+                        path = %path,
+                        "Ingress path does not start with '/' — skipping rule"
+                    );
+                    continue;
+                }
+
                 let host_builder = builder.host_for(rule.host.as_deref());
 
                 let e = Arc::new(RouteEntry::path_only(
@@ -1619,6 +1629,44 @@ mod tests {
                 .unwrap()
                 .route("example.com", "/", &RequestContext::default())
                 .is_some()
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn reconcile_skips_path_without_leading_slash() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "api/v1",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        assert!(
+            table.route("example.com", "/api/v1", &ctx).is_none(),
+            "malformed path without leading slash should not install a route"
+        );
+        assert!(
+            logs_contain("does not start with '/'"),
+            "expected warning about missing leading slash"
+        );
+        assert!(
+            logs_contain("api/v1"),
+            "warning should include the malformed path"
         );
     }
 
