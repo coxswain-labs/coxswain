@@ -141,6 +141,9 @@ impl Controller {
         // Names of IngressClass resources whose spec.controller matches ours.
         let mut owned_ingress_classes: HashSet<String> = HashSet::new();
 
+        // Subset of owned IngressClasses annotated `is-default-class: "true"`.
+        let mut owned_default_ingress_classes: HashSet<String> = HashSet::new();
+
         // Local cache of known Gateway objects.
         let mut known_gateways: HashMap<ObjectKey, Gateway> = HashMap::new();
 
@@ -330,17 +333,24 @@ impl Controller {
                     match event {
                         Ok(watcher::Event::Apply(ic) | watcher::Event::InitApply(ic)) => {
                             let name = ic.metadata.name.clone().unwrap_or_default();
-                            if ic.spec.as_ref().and_then(|s| s.controller.as_deref())
-                                == Some(self.config.controller_name.as_str())
-                            {
-                                owned_ingress_classes.insert(name);
+                            let is_owned = ic.spec.as_ref().and_then(|s| s.controller.as_deref())
+                                == Some(self.config.controller_name.as_str());
+                            let is_default = crate::ingress::is_default_ingress_class(&ic);
+                            if is_owned {
+                                owned_ingress_classes.insert(name.clone());
                             } else {
                                 owned_ingress_classes.remove(&name);
+                            }
+                            if is_owned && is_default {
+                                owned_default_ingress_classes.insert(name);
+                            } else {
+                                owned_default_ingress_classes.remove(&name);
                             }
                         }
                         Ok(watcher::Event::Delete(ic)) => {
                             let name = ic.metadata.name.clone().unwrap_or_default();
                             owned_ingress_classes.remove(&name);
+                            owned_default_ingress_classes.remove(&name);
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "IngressClass watch error"),
@@ -351,8 +361,10 @@ impl Controller {
                     if let Some(addr) = &self.config.status_address {
                         match event {
                             Ok(watcher::Event::Apply(ing) | watcher::Event::InitApply(ing)) => {
-                                let class = crate::ingress::claimed_ingress_class(&ing);
-                                let owned = class.is_some_and(|c| owned_ingress_classes.contains(c));
+                                let owned = match crate::ingress::claimed_ingress_class(&ing) {
+                                    Some(c) => owned_ingress_classes.contains(c),
+                                    None => !owned_default_ingress_classes.is_empty(),
+                                };
                                 if is_leader && owned && !ingress_lb_already_matches(&ing, addr) {
                                     Self::patch_ingress_status(&client, &ing, addr).await;
                                 }

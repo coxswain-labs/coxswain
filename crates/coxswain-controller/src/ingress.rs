@@ -5,10 +5,20 @@ use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, Upstream};
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use k8s_openapi::api::networking::v1::{Ingress, IngressServiceBackend};
+use k8s_openapi::api::networking::v1::{Ingress, IngressClass, IngressServiceBackend};
 use kube::runtime::reflector;
 use std::collections::HashSet;
 use std::sync::Arc;
+pub const IS_DEFAULT_CLASS_ANNOTATION: &str = "ingressclass.kubernetes.io/is-default-class";
+
+pub fn is_default_ingress_class(ic: &IngressClass) -> bool {
+    ic.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(IS_DEFAULT_CLASS_ANNOTATION).map(String::as_str))
+        == Some("true")
+}
+
 pub struct IngressReconciler;
 
 /// Resolves a backend port to its numeric value.
@@ -59,21 +69,27 @@ pub fn claimed_ingress_class(ingress: &Ingress) -> Option<&str> {
 
 impl IngressReconciler {
     /// Skips the Ingress when it does not reference an owned IngressClass.
+    /// When `owned_default_class` is `Some`, an Ingress with neither
+    /// `spec.ingressClassName` nor the legacy annotation is also claimed.
     /// Never queries the API server.
     pub fn reconcile(
         ingress: &Ingress,
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
         owned_classes: &HashSet<String>,
+        owned_default_class: Option<&str>,
         builder: &mut RoutingTableBuilder,
     ) {
         let claimed_class = claimed_ingress_class(ingress);
 
         match claimed_class {
-            None => {
-                tracing::debug!(name = ?ingress.metadata.name, "Skipping Ingress — no ingressClassName or annotation");
-                return;
-            }
+            None => match owned_default_class {
+                Some(_) => {}
+                None => {
+                    tracing::debug!(name = ?ingress.metadata.name, "Skipping Ingress — no ingressClassName or annotation");
+                    return;
+                }
+            },
             Some(class) if !owned_classes.contains(class) => {
                 tracing::debug!(name = ?ingress.metadata.name, %class, "Skipping Ingress — class not owned by this controller");
                 return;
@@ -193,11 +209,13 @@ impl IngressReconciler {
         ingress: &Ingress,
         secrets: &reflector::Store<Secret>,
         owned_classes: &HashSet<String>,
+        owned_default_class: Option<&str>,
         builder: &mut TlsStoreBuilder,
     ) {
         let claimed_class = claimed_ingress_class(ingress);
         match claimed_class {
-            None => return,
+            None if owned_default_class.is_none() => return,
+            None => {}
             Some(class) if !owned_classes.contains(class) => return,
             Some(_) => {}
         }
@@ -260,6 +278,25 @@ mod tests {
 
     fn owned(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn reconcile_no_default(
+        ing: &Ingress,
+        slices: &reflector::Store<EndpointSlice>,
+        svcs: &reflector::Store<Service>,
+        owned: &HashSet<String>,
+        b: &mut RoutingTableBuilder,
+    ) {
+        IngressReconciler::reconcile(ing, slices, svcs, owned, None, b);
+    }
+
+    fn reconcile_tls_no_default(
+        ing: &Ingress,
+        secrets: &reflector::Store<Secret>,
+        owned: &HashSet<String>,
+        b: &mut TlsStoreBuilder,
+    ) {
+        IngressReconciler::reconcile_tls(ing, secrets, owned, None, b);
     }
 
     fn empty_svc_store() -> reflector::Store<Service> {
@@ -508,7 +545,7 @@ mod tests {
             Some("default-svc"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -533,7 +570,7 @@ mod tests {
         let store = slice_store(vec![make_slice("default", "default-svc", "10.0.0.1")]);
         let ingress = make_default_only_ingress("default", "default-svc");
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -560,7 +597,7 @@ mod tests {
             Some("default-svc"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -588,7 +625,7 @@ mod tests {
             Some("default-svc"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -623,7 +660,7 @@ mod tests {
             Some("default-svc"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -652,7 +689,7 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -674,7 +711,7 @@ mod tests {
         )]);
         let ingress = make_ingress_named_port("default", Some("example.com"), "svc", "http");
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &slices,
             &svcs,
@@ -698,7 +735,7 @@ mod tests {
         // No Service in the store → port_for_name returns None → path skipped
         let ingress = make_ingress_named_port("default", Some("example.com"), "svc", "http");
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &slices,
             &empty_svc_store(),
@@ -722,7 +759,7 @@ mod tests {
         )]);
         let ingress = make_ingress_named_port("default", Some("example.com"), "svc", "http");
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &slices,
             &svcs,
@@ -792,7 +829,7 @@ mod tests {
             status: None,
         };
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &slices,
             &svcs,
@@ -825,7 +862,7 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -853,7 +890,7 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -880,7 +917,7 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -907,7 +944,7 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -934,7 +971,7 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -961,7 +998,7 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -987,7 +1024,7 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -1016,7 +1053,7 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -1045,7 +1082,7 @@ mod tests {
             Some("coxswain"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -1074,7 +1111,7 @@ mod tests {
             Some("nginx"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -1103,11 +1140,71 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        assert!(
+            builder
+                .build()
+                .unwrap()
+                .route("example.com", "/", &RequestContext::default())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconcile_claims_unclassified_when_owned_default_exists() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            None,
+            None,
+        );
+        let mut builder = RoutingTableBuilder::new();
         IngressReconciler::reconcile(
             &ingress,
             &store,
             &empty_svc_store(),
             &owned(&["coxswain"]),
+            Some("coxswain"),
+            &mut builder,
+        );
+        assert!(
+            builder
+                .build()
+                .unwrap()
+                .route("example.com", "/", &RequestContext::default())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn reconcile_skips_unclassified_when_no_owned_default() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            None,
+            None,
+        );
+        let mut builder = RoutingTableBuilder::new();
+        IngressReconciler::reconcile(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            None,
             &mut builder,
         );
         assert!(
@@ -1132,7 +1229,7 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -1162,7 +1259,7 @@ mod tests {
             Some("nginx"),
         );
         let mut builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -1263,7 +1360,7 @@ mod tests {
             }],
         );
         let mut builder = TlsStoreBuilder::new();
-        IngressReconciler::reconcile_tls(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
+        reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         let store = builder.build();
         assert!(store.find_cert("example.com").is_some());
     }
@@ -1280,7 +1377,7 @@ mod tests {
             }],
         );
         let mut builder = TlsStoreBuilder::new();
-        IngressReconciler::reconcile_tls(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
+        reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         assert!(builder.build().find_cert("example.com").is_none());
     }
 
@@ -1298,7 +1395,7 @@ mod tests {
             }],
         );
         let mut builder = TlsStoreBuilder::new();
-        IngressReconciler::reconcile_tls(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
+        reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         assert!(builder.build().find_cert("example.com").is_none());
     }
 
@@ -1316,7 +1413,7 @@ mod tests {
             }],
         );
         let mut builder = TlsStoreBuilder::new();
-        IngressReconciler::reconcile_tls(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
+        reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         assert!(builder.build().find_cert("example.com").is_none());
     }
 
@@ -1334,7 +1431,7 @@ mod tests {
             }],
         );
         let mut builder = TlsStoreBuilder::new();
-        IngressReconciler::reconcile_tls(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
+        reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         assert!(builder.build().find_cert("example.com").is_none());
     }
 
@@ -1350,7 +1447,7 @@ mod tests {
             }],
         );
         let mut builder = TlsStoreBuilder::new();
-        IngressReconciler::reconcile_tls(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
+        reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         assert!(builder.build().find_cert("example.com").is_none());
     }
 
@@ -1368,7 +1465,7 @@ mod tests {
         );
         // Routes still reconcile even when TLS cert is missing
         let mut route_builder = RoutingTableBuilder::new();
-        IngressReconciler::reconcile(
+        reconcile_no_default(
             &ingress,
             &slice_st,
             &empty_svc_store(),
@@ -1384,12 +1481,7 @@ mod tests {
 
         // And TLS store ends up empty
         let mut tls_builder = TlsStoreBuilder::new();
-        IngressReconciler::reconcile_tls(
-            &ingress,
-            &secrets,
-            &owned(&["coxswain"]),
-            &mut tls_builder,
-        );
+        reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut tls_builder);
         assert!(tls_builder.build().find_cert("example.com").is_none());
     }
 
@@ -1408,7 +1500,7 @@ mod tests {
             }],
         );
         let mut builder = TlsStoreBuilder::new();
-        IngressReconciler::reconcile_tls(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
+        reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         let store = builder.build();
         assert!(store.find_cert("a.example.com").is_some());
         assert!(store.find_cert("b.example.com").is_some());
