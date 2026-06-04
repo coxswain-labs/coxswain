@@ -1202,9 +1202,9 @@ async fn parent_ref_port_matching() -> anyhow::Result<()> {
     // coxswain has no listener on that port, so the route is unattached and
     // nothing is inserted in the routing table for wrong.TESTNS.local.
     let wrong_host = format!("wrong.{}.local", ns.name);
-    let resp = h.http.get(&wrong_host, "/").await;
-    assert!(
-        resp.is_err() || resp.unwrap().status() != reqwest::StatusCode::OK,
+    let status = h.http.get_status(&wrong_host, "/").await?;
+    assert_ne!(
+        status, 200,
         "route-wrong-port must not be routable on HTTP_PORT"
     );
 

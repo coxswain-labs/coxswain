@@ -149,13 +149,17 @@ pub struct ServeArgs {
     )]
     pub controller_lease_renew_interval: Duration,
 
-    /// Socket address to listen on for the admin, metrics, and diagnostics endpoints.
-    #[arg(long, env = "COXSWAIN_ADMIN_ADDR", default_value = "0.0.0.0:8082")]
-    pub admin_addr: SocketAddr,
+    /// Port to listen on for the admin, metrics, and diagnostics endpoints.
+    ///
+    /// The bind address is controlled by `--proxy-bind-address`.
+    #[arg(long, env = "COXSWAIN_ADMIN_PORT", default_value_t = 8082)]
+    pub admin_port: u16,
 
-    /// Socket address to listen on for liveness and readiness health endpoints.
-    #[arg(long, env = "COXSWAIN_HEALTH_ADDR", default_value = "0.0.0.0:8081")]
-    pub health_addr: SocketAddr,
+    /// Port to listen on for liveness and readiness health endpoints.
+    ///
+    /// The bind address is controlled by `--proxy-bind-address`.
+    #[arg(long, env = "COXSWAIN_HEALTH_PORT", default_value_t = 8081)]
+    pub health_port: u16,
 
     /// IP address to bind all proxy listeners to.
     ///
@@ -391,6 +395,7 @@ fn main() -> Result<()> {
         server.add_service(svc);
     }
 
+    let health_addr = SocketAddr::new(args.proxy_bind_address, args.health_port);
     server.add_service({
         let mut svc = Service::new(
             "health".to_string(),
@@ -398,25 +403,26 @@ fn main() -> Result<()> {
                 synced: synced.clone(),
             },
         );
-        svc.add_tcp(&args.health_addr.to_string());
+        svc.add_tcp(&health_addr.to_string());
         svc
     });
 
+    let admin_addr = SocketAddr::new(args.proxy_bind_address, args.admin_port);
     server.add_service(
         AdminServer {
             synced,
             leader,
             routes: routing_table,
         }
-        .into_service(args.admin_addr),
+        .into_service(admin_addr),
     );
 
     tracing::info!(
         proxy_bind_address = %args.proxy_bind_address,
         proxy_http_port = ?args.proxy_http_port,
         proxy_https_port = ?args.proxy_https_port,
-        health_addr = %args.health_addr,
-        admin_addr = %args.admin_addr,
+        health_port = args.health_port,
+        admin_port = args.admin_port,
         proxy_shutdown_grace_period = ?args.proxy_shutdown_grace_period,
         proxy_shutdown_timeout = ?args.proxy_shutdown_timeout,
         "Listening"

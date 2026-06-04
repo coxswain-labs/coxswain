@@ -37,11 +37,13 @@ impl ControllerProcess {
     pub async fn start_with_options(opts: ControllerOptions) -> anyhow::Result<Self> {
         let http_port = free_port()?;
         let https_port = free_port()?;
-        let health_addr = free_addr()?;
-        let admin_addr = free_addr()?;
+        let health_port = free_port()?;
+        let admin_port = free_port()?;
 
         let proxy_addr = SocketAddr::new(BIND_ADDR, http_port);
         let tls_addr = SocketAddr::new(BIND_ADDR, https_port);
+        let health_addr = SocketAddr::new(BIND_ADDR, health_port);
+        let admin_addr = SocketAddr::new(BIND_ADDR, admin_port);
 
         // Use the test process's PID as pod-name: if the lease is still held by
         // a prior test's controller (same pod-name), renewal succeeds immediately
@@ -57,10 +59,10 @@ impl ControllerProcess {
             http_port.to_string(),
             "--proxy-https-port".to_string(),
             https_port.to_string(),
-            "--health-addr".to_string(),
-            health_addr.to_string(),
-            "--admin-addr".to_string(),
-            admin_addr.to_string(),
+            "--health-port".to_string(),
+            health_port.to_string(),
+            "--admin-port".to_string(),
+            admin_port.to_string(),
             "--log-format".to_string(),
             "console".to_string(),
             "--pod-name".to_string(),

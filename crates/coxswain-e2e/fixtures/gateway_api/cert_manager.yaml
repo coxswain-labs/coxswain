@@ -28,7 +28,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: https
-      port: 443
+      port: HTTPS_PORT
       protocol: HTTPS
       hostname: "LISTENER_HOSTNAME"
       tls:
