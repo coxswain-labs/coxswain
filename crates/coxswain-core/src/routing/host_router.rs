@@ -185,6 +185,19 @@ impl HostRouterBuilder {
         }
 
         // ── Prefix routes ─────────────────────────────────────────────────────
+        let log_conflict =
+            |entries: &[Arc<RouteEntry>], pattern: &str, err: &matchit::InsertError| {
+                use std::collections::BTreeSet;
+                let ids: BTreeSet<&str> = entries.iter().map(|e| e.route_id.as_str()).collect();
+                let ids: Vec<&str> = ids.into_iter().collect();
+                tracing::debug!(
+                    pattern = %pattern,
+                    routes = ?ids,
+                    error = %err,
+                    "host router prefix insert shadowed by earlier rule"
+                );
+            };
+
         let prefix_groups = group_by_path(self.prefix_routes);
         for (path, entries) in prefix_groups {
             if check_query(&entries) {
@@ -208,14 +221,26 @@ impl HostRouterBuilder {
             let had_trailing_slash = path.ends_with('/');
             let base = path.trim_end_matches('/');
             if base.is_empty() {
-                let _ = router.insert("/", frozen.clone());
-                let _ = router.insert("/{*rest}", frozen);
-            } else {
-                if !had_trailing_slash {
-                    let _ = router.insert(base, frozen.clone());
+                if let Err(e) = router.insert("/", frozen.clone()) {
+                    log_conflict(&frozen, "/", &e);
                 }
-                let _ = router.insert(format!("{base}/"), frozen.clone());
-                let _ = router.insert(format!("{base}/{{*rest}}"), frozen);
+                if let Err(e) = router.insert("/{*rest}", frozen.clone()) {
+                    log_conflict(&frozen, "/{*rest}", &e);
+                }
+            } else {
+                if !had_trailing_slash
+                    && let Err(e) = router.insert(base.to_string(), frozen.clone())
+                {
+                    log_conflict(&frozen, base, &e);
+                }
+                let with_slash = format!("{base}/");
+                if let Err(e) = router.insert(with_slash.clone(), frozen.clone()) {
+                    log_conflict(&frozen, &with_slash, &e);
+                }
+                let wildcard = format!("{base}/{{*rest}}");
+                if let Err(e) = router.insert(wildcard.clone(), frozen.clone()) {
+                    log_conflict(&frozen, &wildcard, &e);
+                }
             }
         }
 

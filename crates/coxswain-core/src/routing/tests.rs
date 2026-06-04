@@ -615,3 +615,25 @@ fn find_returns_timeouts_from_route_entry() {
         _ => panic!("expected Found"),
     }
 }
+
+#[test]
+#[tracing_test::traced_test]
+fn prefix_insert_collision_emits_debug_log() {
+    let first = upstream("first", "10.0.0.1:80");
+    let second = upstream("second", "10.0.0.2:80");
+
+    let mut b = RoutingTableBuilder::new();
+    let host = b.exact_host("example.com");
+    // /foo expands to: /foo, /foo/, /foo/{*rest}
+    // /foo/ expands to: /foo/, /foo/{*rest}
+    // The second group's inserts collide with the first.
+    host.add_prefix_route("/foo", entry(first));
+    host.add_prefix_route("/foo/", entry(second));
+
+    let _table = b.build().unwrap();
+
+    assert!(logs_contain(
+        "host router prefix insert shadowed by earlier rule"
+    ));
+    assert!(logs_contain("default/svc"));
+}

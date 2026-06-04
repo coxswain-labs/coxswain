@@ -17,3 +17,6 @@ matchit          = { workspace = true }
 regex            = { workspace = true }
 thiserror        = { workspace = true }
 tracing          = { workspace = true }
+
+[dev-dependencies]
+tracing-test = { workspace = true }
