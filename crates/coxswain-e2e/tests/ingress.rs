@@ -2,7 +2,8 @@ use coxswain_e2e::{
     fixtures::{
         self, BACKENDS_ECHO, INGRESS_CERT_MANAGER, INGRESS_DEFAULT_BACKEND,
         INGRESS_DEFAULT_BACKEND_ONLY, INGRESS_DEFAULT_CLASS, INGRESS_NAMED_PORT,
-        INGRESS_PATH_MATCHING, INGRESS_TLS_TERMINATION, INGRESS_WILDCARD_HOST,
+        INGRESS_PATH_MATCHING, INGRESS_TLS_NO_HOSTS, INGRESS_TLS_TERMINATION,
+        INGRESS_WILDCARD_HOST,
     },
     harness::{
         ControllerOptions, ControllerProcess, GeneratedCert, Harness, HttpClient,
@@ -201,6 +202,40 @@ async fn tls_termination_with_sni() -> anyhow::Result<()> {
         result.is_err(),
         "expected TLS error for unknown SNI, got: {result:?}"
     );
+
+    Ok(())
+}
+
+/// Verifies that when `spec.tls[].hosts` is omitted, the controller falls back to the
+/// rule hosts and the cert is still served correctly via SNI.
+#[tokio::test]
+async fn tls_fallback_when_hosts_omitted() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-tls-nohosts").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("tls-nohosts.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&host);
+
+    fixtures::apply_fixture(
+        INGRESS_TLS_NO_HOSTS,
+        &ns.name,
+        &[
+            ("INGRESS_NAME", "ingress-nohosts"),
+            ("SECRET_NAME", "cert-nohosts"),
+            ("TLS_HOST", &host),
+            ("BACKEND_NAME", "echo-a"),
+            ("TLS_CRT_B64", &cert.cert_b64()),
+            ("TLS_KEY_B64", &cert.key_b64()),
+        ],
+    )
+    .await?;
+
+    let resp = wait::wait_for_https_route(h.tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
 
     Ok(())
 }

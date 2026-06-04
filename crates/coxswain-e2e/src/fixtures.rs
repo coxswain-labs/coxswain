@@ -99,6 +99,11 @@ pub const INGRESS_TLS_TERMINATION: &str = concat!(
     "/fixtures/ingress/tls_termination.yaml"
 );
 
+pub const INGRESS_TLS_NO_HOSTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/ingress/tls_no_hosts.yaml"
+);
+
 pub const INGRESS_CERT_MANAGER: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/ingress/cert_manager.yaml"

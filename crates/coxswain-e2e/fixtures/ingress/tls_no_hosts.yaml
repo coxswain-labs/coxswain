@@ -1,0 +1,40 @@
+# TLS termination fixture where spec.tls[].hosts is intentionally omitted.
+# The controller should warn and fall back to applying the cert to all rule
+# hosts found in spec.rules[].host.
+# Placeholders replaced at test runtime:
+#   TESTNS       - test namespace
+#   INGRESS_NAME - name of the Ingress resource
+#   SECRET_NAME  - name of the kubernetes.io/tls Secret
+#   TLS_HOST     - hostname used only in spec.rules[0].host (NOT in spec.tls)
+#   BACKEND_NAME - backend Service name (must already exist)
+#   TLS_CRT_B64  - base64-encoded PEM certificate
+#   TLS_KEY_B64  - base64-encoded PEM private key
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: SECRET_NAME
+type: kubernetes.io/tls
+data:
+  tls.crt: TLS_CRT_B64
+  tls.key: TLS_KEY_B64
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: INGRESS_NAME
+spec:
+  ingressClassName: coxswain
+  tls:
+    - secretName: SECRET_NAME
+  rules:
+    - host: TLS_HOST
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: BACKEND_NAME
+                port:
+                  number: 3000

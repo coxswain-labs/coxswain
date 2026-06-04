@@ -37,7 +37,7 @@ The first fully usable version: all must-have features implemented, OCI image pu
 - ✅ ~~Honor `ingressclass.kubernetes.io/is-default-class` annotation — [#102](https://github.com/coxswain-labs/coxswain/issues/102)~~
 - ✅ ~~Fix `spec.defaultBackend` semantics: rules-less Ingresses and cross-host fallthrough — [#103](https://github.com/coxswain-labs/coxswain/issues/103)~~
 - ✅ ~~Warn instead of silently dropping `Resource`-type Ingress backends — [#104](https://github.com/coxswain-labs/coxswain/issues/104)~~
-- ⬜ Warn when `spec.tls[].hosts` is empty or omitted — [#105](https://github.com/coxswain-labs/coxswain/issues/105)
+- ✅ ~~Warn when `spec.tls[].hosts` is empty or omitted — [#105](https://github.com/coxswain-labs/coxswain/issues/105)~~
 - ⬜ Validate and warn on Ingress paths that do not start with `/` — [#106](https://github.com/coxswain-labs/coxswain/issues/106)
 - ⬜ Surface `HostRouterBuilder` insert failures as debug log — [#107](https://github.com/coxswain-labs/coxswain/issues/107)
 - ⬜ Dynamic per-port proxy binding (Pingora hot-reload or `--extra-ports` stepping stone) — [#98](https://github.com/coxswain-labs/coxswain/issues/98) _(unblocks `SupportHTTPRouteParentRefPort` and #82)_

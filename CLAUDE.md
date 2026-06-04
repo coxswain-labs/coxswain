@@ -5,23 +5,25 @@ This file provides guidance to Claude Code when working with code in this reposi
 ## GitHub Issue Workflow
 
 When the user says "start working on issue N":
-1. Run `gh issue view N --repo coxswain-labs/coxswain` to read the full issue description and grill the user, if necessary.
-2. Read all relevant source files and plan the implementation. Branch creation is deferred to step 3 — do NOT create the branch while in plan mode, as tool access may be restricted.
-3. Once plan mode exits and implementation begins: sync local `main` with the remote and create the branch: `git checkout main && git pull --ff-only origin main && git checkout -b issue-N`.
-4. In `ROADMAP.md`, change the corresponding checklist item from `- ⬜` to `- ✅ ~~...~~` (swap the emoji and wrap the description in strikethrough). Commit this change on the new branch with `Refs #N`.
+1. Enter plan mode
+2. Run `gh issue view N --repo coxswain-labs/coxswain` to read the full issue description and grill the user, if necessary.
+3. Read all relevant source files and plan the implementation. Branch creation is deferred to step 3 — do NOT create the branch while in plan mode, as tool access may be restricted.
+4. Once plan mode exits and implementation begins: ensure you're working on the latest code and create the branch: `git checkout main && git pull --ff-only origin main && git checkout -b issue-N`.
 5. Implement the issue per its acceptance criteria.
-6. Add or update e2e tests in `crates/coxswain-e2e/` that cover the new behaviour. Every issue that changes routing, status conditions, or proxy behaviour must have at least one new scenario in `tests/gateway_api.rs` or `tests/ingress.rs`. Run `cargo test -p coxswain-e2e --test <file> -- --test-threads=1` locally before pushing.
-7. If the issue implements a Gateway API conformance feature (check the issue body for a **Feature flags** line), add the corresponding `features.SupportXxx` constant(s) to `opts.SupportedFeatures` in `conformance/main_test.go`. Include a comment referencing the issue number. Run `go vet ./...` in `conformance/` to confirm the constant names are valid.
-
-When working on a GitHub issue, always include a reference in every commit message:
-- Use `Refs #N` for partial work on an issue.
-- Use `Fixes #N` for the final commit that completes it (GitHub closes the issue automatically on push).
+6. Add or update e2e tests in `crates/coxswain-e2e/` that cover the new behaviour. Every issue that changes routing, status conditions, or proxy behaviour must have at least one new scenario in `tests/gateway_api.rs` or `tests/ingress.rs`. 
+7. ALWAYS run `cargo test -p coxswain-e2e --test <file> -- --test-threads=1` locally before pushing to ensure no regression.
+8. If the issue implements a Gateway API conformance feature (check the issue body for a **Feature flags** line), add the corresponding `features.SupportXxx` constant(s) to `opts.SupportedFeatures` in `conformance/main_test.go`. Include a comment referencing the issue number. Run `go vet ./...` in `conformance/` to confirm the constant names are valid.
+9. In `ROADMAP.md`, change the corresponding checklist item from `- ⬜` to `- ✅ ~~...~~` (swap the emoji and wrap the description in strikethrough). Only commit this change on the new branch with `Refs #N` at the end, when the issue is fully implemented.
 
 When the user says "close the issue" or "an issue is done":
 1. Run `gh issue close N --repo coxswain-labs/coxswain`.
 2. Ensure the `ROADMAP.md` item is `- ✅ ~~...~~` (emoji + strikethrough). This should already be done from step 4 above; if not, do it now and commit with `Fixes #N`.
 3. Merge the PR with `gh pr merge --squash --delete-branch`.
 4. Return to `main` and pull the merged changes: `git checkout main && git pull --ff-only origin main`.
+
+When working on a GitHub issue, always include a reference in every commit message:
+- Use `Refs #N` for partial work on an issue.
+- Use `Fixes #N` for the final commit that completes it (GitHub closes the issue automatically on push).
 
 ## GitHub Milestones and Labels
 
@@ -79,6 +81,7 @@ cargo run --bin coxswain -- serve \
 cd conformance && go vet ./...
 
 # Run the Gateway API conformance suite (requires a live cluster with coxswain running)
+# Must reset the local k8s cluster before running this command.
 cd conformance && go test -v -timeout 60m -run TestConformance \
   -args \
   --organization=coxswain-labs \
@@ -86,11 +89,15 @@ cd conformance && go test -v -timeout 60m -run TestConformance \
   --url=https://github.com/coxswain-labs/coxswain \
   --version=$(git describe --tags --always) \
   --report-output=reports/local-report.yaml
+
+# Reset the local k8s cluster (Orb) before running the conformance or e2e test above.
+# After this ensure to load the coxswain manifests from deploy/manifests/ excluding deployment.yaml
+orb delete -f k8s && orb start k8s
 ```
 
 ## Architecture
 
-The workspace has six crates under `crates/` with a strict dependency order:
+The workspace has seven crates under `crates/` with a strict dependency order:
 
 ```
 coxswain-bin
@@ -99,80 +106,78 @@ coxswain-bin
   ├── coxswain-proxy
   │     └── coxswain-core
   ├── coxswain-health
+  ├── coxswain-admin
   │     └── coxswain-core
-  └── coxswain-admin
-        └── coxswain-core
+  └── (coxswain-e2e — black-box tests, not a runtime dep)
 ```
 
 ### `coxswain-core`
-Shared types and the routing table. `RoutingTable` maps hostnames to per-host `matchit` radix-tree routers, each routing URL paths to an `Upstream` (a named group of pod `SocketAddr`s with lock-free round-robin selection).
+Shared types and the routing table.
 
-`SharedRoutingTable` is an opaque newtype wrapping `Arc<ArcSwap<RoutingTable>>`. It exposes `load() -> Arc<RoutingTable>` and `store(Arc<RoutingTable>)`. The controller stores a new table on every reconcile; the proxy loads on every request. No locks or channels on the hot path. `arc-swap` is an implementation detail confined to this crate.
+- `routing/` — `RoutingTable`, `RoutingTableBuilder`, `Upstream` (pod `SocketAddr`s with round-robin), `FilterAction`, `RouteTimeouts`, `MatchPredicates`. `RoutingTable` maps hostnames to per-host `matchit` radix-tree routers.
+- `shared.rs` — generic `Shared<T>` newtype over `ArcSwap<T>`; `SharedRoutingTable` and `SharedTlsStore` are type aliases. The controller stores; the proxy loads atomically with no locks.
+- `tls.rs` — `TlsCert`, `TlsStore`, `SharedTlsStore`.
+- `ownership.rs` — `OwnedGateways`, parent-ref ownership tracking.
+- `reference_grants.rs` — cross-namespace backend ref validation.
 
 ### `coxswain-controller`
-Kubernetes controller split into two independent Pingora `BackgroundService`s.
+Kubernetes controller split into two Pingora `BackgroundService`s.
 
-**`controller.rs` — `Controller`**
-Status writer and leader elector. Runs two raw watch streams (`HTTPRoute`, `GatewayClass`) in a `tokio::select!` loop. Responsibilities:
-- Renews the `kube-leader-election` Lease every 5 s (15 s TTL); updates the `leader` flag.
-- On `HTTPRoute InitDone`: flips the `synced` flag, unblocking `/readyz`.
-- On `HTTPRoute Apply`/`InitApply`: if leader, patches "Programmed" status back to the API server.
-- On `GatewayClass Apply`/`InitApply`: if leader, patches "Accepted" status.
-- On shutdown: steps down from the Lease gracefully.
+**`reconciler.rs` — `Reconciler`**
+Routing and TLS table builder. Runs reflector tasks for **HTTPRoute, Ingress, IngressClass, Gateway, GatewayClass, EndpointSlice, ReferenceGrant, Secret, Service**; debounces changes with a 500 ms trailing-edge timer and rebuilds `RoutingTable` + `TlsStore` from scratch on each tick, then atomically publishes both via `store()`.
 
-**`reconciler.rs` — `ReconcilerService`**
-Routing table builder. Spawns four tasks in a `JoinSet`:
-- Three reflector tasks — one each for `HTTPRoute`, `Ingress`, and `EndpointSlice`. Each task populates an in-memory store via `kube::runtime::reflector` and signals a shared `Notify` on every event.
-- One debounce+rebuild task — waits for the first `Notify`, then races further signals against a 500 ms timer (trailing-edge debounce). When the timer expires uninterrupted, calls `rebuild()`, which snapshots all three stores and constructs a fresh `RoutingTable` from scratch. On success, atomically publishes it via `SharedRoutingTable::store()`.
+**`controller/` — `Controller`**
+Status writer and leader elector. Watches five streams — `HTTPRoute`, `GatewayClass`, `Gateway`, `IngressClass`, `Ingress` — in a `tokio::select!` loop. Renews the `kube-leader-election` Lease every 5 s (15 s TTL); if leader, patches Accepted/Programmed status back to the API server. Flips `synced` on `InitDone`, steps down from the Lease on shutdown.
 
-**`endpoints.rs`**
-`pub(crate) fn resolve(ns, svc, port, slices) -> Vec<SocketAddr>` — scans the local `EndpointSlice` store for ready pod addresses. Shared by both reconcilers; never queries the API server.
+Sub-files: `conditions.rs`, `config.rs` (`ControllerConfig`, `StatusAddress`), `gateway_class_status.rs` (includes `SUPPORTED_FEATURES`), `gateway_status.rs`, `ingress_status.rs`.
 
-**`gateway_api.rs` — `GatewayApiReconciler`**
-`reconcile(route, slices, builder)` — translates one `HTTPRoute` into `RoutingTableBuilder` entries. Resolves pod addresses via `endpoints::resolve`. Handles exact/prefix/regex path types and exact/wildcard/catch-all host patterns.
+**`gateway_api/` — `GatewayApiReconciler`**
+Translates one `HTTPRoute` into `RoutingTableBuilder` entries. Sub-files: `filters.rs`, `hostnames.rs`, `status.rs`, `timeouts.rs` (GEP-2257 duration parsing).
 
 **`ingress.rs` — `IngressReconciler`**
-`reconcile(ingress, slices, builder)` — translates one `Ingress` into `RoutingTableBuilder` entries. Same endpoint resolution and host-pattern logic.
+Translates one `Ingress` into `RoutingTableBuilder` entries. Also handles `IngressDefaultBackend`.
 
-**Leader election** uses `kube-leader-election` (Kubernetes `Lease` objects, 15 s TTL, renewed every 5 s). Only the active leader patches resource status; standby replicas skip writes to avoid feedback loops. Status writes are idempotent — the controller checks whether a condition is already `True` before patching.
+**`endpoints.rs`** — `resolve(ns, svc, port, slices) -> Vec<SocketAddr>` over the local EndpointSlice store; never queries the API server.
 
-**kube 3.x watcher event variants (relevant to `controller.rs`):**
+**`tls.rs`** — Secret → `TlsCert` loading; `SharedGatewayListenerHealth` and `SharedHttpRouteHealth` health maps read by the status writer.
+
+**kube 3.x watcher event variants:**
 - `Event::InitApply(obj)` — existing objects from the initial LIST phase
-- `Event::Apply(obj)` — subsequent watch-stream updates (creates/updates)
-- `Event::Delete(obj)` — deletions (routing table deletions handled automatically by the reflector stores in `ReconcilerService`)
+- `Event::Apply(obj)` — creates/updates
+- `Event::Delete(obj)` — deletions (handled automatically by the reflector stores)
 - `Event::InitDone` — end of initial list; used to flip `synced`
 
 ### `coxswain-proxy`
-Pingora-based reverse proxy. Reads routing decisions from `coxswain-core` and forwards requests upstream.
+Pingora-based reverse proxy.
 
-Key files:
-- `engine.rs` — `RoutingEngine` wraps `SharedRoutingTable` for reads on the hot path. `CoxswainProxy` implements `ProxyHttp`, calling `engine.route(host, path)` on every request.
-- `filter.rs` — `TrafficFilter`: injects the `X-Proxy-Engine: Coxswain-Pingora` header on upstream requests.
+- `proxy/` — `Proxy` (`ProxyHttp` impl), `ProxyCtx`, `RoutingEngine` (lock-free routing lookup), redirect builder.
+- `filter.rs` — request/response filter application: URL rewrite, header mods, `X-Proxy-Engine` injection.
+- `tls.rs` — `SniCertSelector` (`TlsAccept` impl driven by `SharedTlsStore`) for in-process SNI termination.
+- `accept.rs` — `ProxyAcceptor` for HAProxy PROXY protocol v1/v2; `TrustedSources` CIDR allow-list.
 
 ### `coxswain-health`
-Health endpoints served on a dedicated port, keeping liveness/readiness concerns out of the proxy hot path. `HealthService` implements Pingora's `Service` trait and handles:
-- `GET /healthz` — always 200; confirms the process is alive.
-- `GET /readyz` — 200 once `synced` flips true (initial LIST completed); 503 before.
+`HealthServer` serves `GET /healthz` (always 200) and `GET /readyz` (200/503 based on `synced`).
 
 ### `coxswain-admin`
-Diagnostics and observability endpoints, served on a separate port.
-
-- `GET /metrics` — Prometheus text format (via the `prometheus` crate).
-- `GET /routes` — JSON list of active hostnames in the routing table.
-- `GET /status` — JSON with `version`, `synced`, `leader`, and `host_count`.
+`AdminServer` serves `GET /metrics` (Prometheus), `GET /routes` (JSON), `GET /status` (JSON: `version`, `synced`, `leader`, `host_count`).
 
 ### `coxswain-bin`
-Entry point only — parses CLI args, wires all services together, and starts the Pingora runtime.
+Entry point only — parses CLI args, wires all services together, starts the Pingora runtime.
 
-`SharedRoutingTable::new()` is created first in `main()` and cloned into `RoutingEngine`, `ReconcilerService`, and `AdminService`. The `Controller` and `ReconcilerService` are registered as Pingora `BackgroundService`s alongside the proxy, health, and admin services.
+Shared state created in `main()` and cloned into services: `SharedRoutingTable`, `SharedTlsStore`, `SharedGatewayListenerHealth`, `OwnedGateways`, `route_health`, `default_timeouts`, `synced` (`Arc<AtomicBool>`), `leader` (`Arc<AtomicBool>`). The proxy has two registration paths: standard `http_proxy_service` vs. `ProxyAcceptor`-wrapped when `--proxy-accept-proxy-protocol` is set.
+
+### `coxswain-e2e`
+Black-box integration tests; not part of `default-members`. `src/harness/` spawns the `coxswain` binary against a real cluster (kind/Orb), installs Gateway API CRDs, and runs scenarios in `tests/gateway_api.rs` and `tests/ingress.rs` with RAII namespace cleanup.
 
 ## Key design pattern
 
-`SharedRoutingTable` is the single shared state between the controller and proxy. `ReconcilerService` stores a new table after every debounced rebuild; the proxy loads atomically on every request with no locks.
+`SharedRoutingTable` and `SharedTlsStore` are the core shared state: `Reconciler` stores new snapshots after every debounced rebuild; the proxy and SNI selector load atomically on every request with no locks.
 
-Three `Arc<AtomicBool>` flags are shared across services:
-- `synced` — flips to `true` when `HTTPRoute` initial sync completes; gates `/readyz`.
-- `leader` — mirrors the current Lease election outcome; exposed on `/status`.
+Shared flags and derived state:
+- `synced` — flips to `true` on `InitDone`; gates `/readyz`.
+- `leader` — mirrors the current Lease outcome; exposed on `/status`.
+- `SharedGatewayListenerHealth` / `SharedHttpRouteHealth` — reconciler writes, status writer reads.
+- `OwnedGateways` — tracks which `Gateway` objects this controller is responsible for.
 
 ## Ports (default)
 
