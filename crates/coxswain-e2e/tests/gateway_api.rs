@@ -4,7 +4,7 @@ use coxswain_e2e::{
         GATEWAY_API_COMBINED_MATCHING, GATEWAY_API_CROSS_NAMESPACE_ROUTE,
         GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_FILTERS, GATEWAY_API_HEADER_MATCHING,
         GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PATH_MATCHING,
-        GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_TIMEOUTS,
+        GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_SERVING_DRAIN, GATEWAY_API_TIMEOUTS,
         GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS, GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
         GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_REDIRECT, GATEWAY_API_TLS_TERMINATION,
         GATEWAY_API_WEBSOCKET, GATEWAY_API_WEIGHTED_SPLIT, GATEWAY_API_WILDCARD_HOST,
@@ -14,6 +14,7 @@ use coxswain_e2e::{
 use futures::StreamExt as _;
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Api;
 use kube::api::{Patch, PatchParams, PostParams};
@@ -1096,6 +1097,71 @@ async fn weighted_split() -> anyhow::Result<()> {
     assert!(
         (0.70..=0.90).contains(&ratio),
         "/skewed: echo-a ratio {ratio:.2} out of expected 0.70–0.90 (counts: {counts:?})"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-serving").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Inject an orphan EndpointSlice for echo-a whose single endpoint has
+    // serving:false/ready:true — the race window during rolling deploys.
+    // The unroutable RFC 5737 TEST-NET-1 address (192.0.2.1) is used so that
+    // any accidental selection causes an immediate connection error rather than
+    // silently hanging. The non-standard managed-by label prevents the cluster's
+    // endpointslice-controller from reconciling this slice away.
+    let slice_api: Api<EndpointSlice> = Api::namespaced(h.client.clone(), &ns.name);
+    let orphan = EndpointSlice {
+        metadata: ObjectMeta {
+            name: Some("echo-a-drain-test".to_string()),
+            namespace: Some(ns.name.clone()),
+            labels: Some({
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "kubernetes.io/service-name".to_string(),
+                    "echo-a".to_string(),
+                );
+                m.insert(
+                    "endpointslice.kubernetes.io/managed-by".to_string(),
+                    "e2e-test".to_string(),
+                );
+                m
+            }),
+            ..Default::default()
+        },
+        address_type: "IPv4".to_string(),
+        endpoints: vec![Endpoint {
+            addresses: vec!["192.0.2.1".to_string()],
+            conditions: Some(EndpointConditions {
+                serving: Some(false),
+                ready: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ports: None,
+    };
+    slice_api.create(&PostParams::default(), &orphan).await?;
+
+    fixtures::apply_fixture(GATEWAY_API_SERVING_DRAIN, &ns.name, &[]).await?;
+    let host = format!("serving.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    // All 30 requests must reach echo-a. If the serving:false endpoint were
+    // selected, ~50% of requests would fail with a connection error to 192.0.2.1,
+    // causing count_backends to return Err and the test to fail.
+    let counts = http::count_backends(&h.http, &host, "/", 30).await?;
+    assert_eq!(
+        counts.get("echo-a").copied().unwrap_or(0),
+        30,
+        "not all requests hit echo-a: {counts:?}"
     );
 
     Ok(())

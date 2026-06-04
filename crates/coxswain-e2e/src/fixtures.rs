@@ -129,6 +129,11 @@ pub const GATEWAY_API_WEIGHTED_SPLIT: &str = concat!(
     "/fixtures/gateway_api/weighted_split.yaml"
 );
 
+pub const GATEWAY_API_SERVING_DRAIN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/serving_drain.yaml"
+);
+
 /// Apply a fixture YAML to `namespace`.
 ///
 /// Supports template substitutions: `TESTNS` is always replaced with `namespace`.
