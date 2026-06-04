@@ -115,7 +115,19 @@ impl IngressReconciler {
             for path_rule in &http.paths {
                 let svc = match path_rule.backend.service.as_ref() {
                     Some(s) => s,
-                    None => continue,
+                    None => {
+                        if let Some(resource) = path_rule.backend.resource.as_ref() {
+                            tracing::warn!(
+                                ingress = %route_id,
+                                path = ?path_rule.path,
+                                api_group = ?resource.api_group,
+                                kind = %resource.kind,
+                                name = %resource.name,
+                                "Ingress path backend uses Resource type — only Service backends are supported; skipping path"
+                            );
+                        }
+                        continue;
+                    }
                 };
                 let port = match resolve_backend_port(ns, svc, services) {
                     Some(p) => p,
@@ -163,33 +175,42 @@ impl IngressReconciler {
         // prefix paths, so they outrank "/" via matchit's longest-match lookup.
         // The controller-wide --ingress-default-backend uses created_at = None
         // (sorts last), so this per-Ingress entry naturally wins on the catchall.
-        if let Some(default_svc) = spec
-            .and_then(|s| s.default_backend.as_ref())
-            .and_then(|b| b.service.as_ref())
-            && let Some(port) = resolve_backend_port(ns, default_svc, services)
-        {
-            let addrs = endpoints::resolve(ns, &default_svc.name, port, slices, services);
-            if addrs.is_empty() {
-                tracing::warn!(
-                    ingress = ?ingress.metadata.name,
-                    svc = %default_svc.name,
-                    "No ready endpoints for defaultBackend — skipping"
-                );
-            } else {
-                let upstream = Arc::new(Upstream::new(format!("{ns}/{}", default_svc.name), addrs));
-                let make_entry = || {
-                    Arc::new(RouteEntry::path_only(
-                        Arc::clone(&upstream),
-                        route_id.clone(),
-                        created_at,
-                    ))
-                };
-                for rule in rules {
-                    builder
-                        .host_for(rule.host.as_deref())
-                        .add_prefix_route("/", make_entry());
+        if let Some(default_backend) = spec.and_then(|s| s.default_backend.as_ref()) {
+            if let Some(default_svc) = default_backend.service.as_ref() {
+                if let Some(port) = resolve_backend_port(ns, default_svc, services) {
+                    let addrs = endpoints::resolve(ns, &default_svc.name, port, slices, services);
+                    if addrs.is_empty() {
+                        tracing::warn!(
+                            ingress = ?ingress.metadata.name,
+                            svc = %default_svc.name,
+                            "No ready endpoints for defaultBackend — skipping"
+                        );
+                    } else {
+                        let upstream =
+                            Arc::new(Upstream::new(format!("{ns}/{}", default_svc.name), addrs));
+                        let make_entry = || {
+                            Arc::new(RouteEntry::path_only(
+                                Arc::clone(&upstream),
+                                route_id.clone(),
+                                created_at,
+                            ))
+                        };
+                        for rule in rules {
+                            builder
+                                .host_for(rule.host.as_deref())
+                                .add_prefix_route("/", make_entry());
+                        }
+                        builder.host_for(None).add_prefix_route("/", make_entry());
+                    }
                 }
-                builder.host_for(None).add_prefix_route("/", make_entry());
+            } else if let Some(resource) = default_backend.resource.as_ref() {
+                tracing::warn!(
+                    ingress = %route_id,
+                    api_group = ?resource.api_group,
+                    kind = %resource.kind,
+                    name = %resource.name,
+                    "Ingress defaultBackend uses Resource type — only Service backends are supported; skipping"
+                );
             }
         }
     }
@@ -1452,6 +1473,100 @@ mod tests {
                 .unwrap()
                 .route("example.com", "/", &RequestContext::default())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn reconcile_path_resource_backend_skipped() {
+        use k8s_openapi::api::core::v1::TypedLocalObjectReference;
+
+        let store = slice_store(vec![]);
+        let ingress = Ingress {
+            metadata: ObjectMeta {
+                name: Some("test-ingress".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                ingress_class_name: Some("coxswain".to_string()),
+                rules: Some(vec![IngressRule {
+                    host: Some("example.com".to_string()),
+                    http: Some(HTTPIngressRuleValue {
+                        paths: vec![HTTPIngressPath {
+                            path: Some("/api".to_string()),
+                            path_type: "Prefix".to_string(),
+                            backend: IngressBackend {
+                                service: None,
+                                resource: Some(TypedLocalObjectReference {
+                                    api_group: Some("example.com".to_string()),
+                                    kind: "StorageBucket".to_string(),
+                                    name: "my-bucket".to_string(),
+                                }),
+                            },
+                        }],
+                    }),
+                }]),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        assert!(
+            table
+                .route("example.com", "/api", &RequestContext::default())
+                .is_none(),
+            "Resource backend path rule should not install a route"
+        );
+    }
+
+    #[test]
+    fn reconcile_default_backend_resource_skipped() {
+        use k8s_openapi::api::core::v1::TypedLocalObjectReference;
+
+        let store = slice_store(vec![]);
+        let ingress = Ingress {
+            metadata: ObjectMeta {
+                name: Some("test-ingress".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                ingress_class_name: Some("coxswain".to_string()),
+                rules: None,
+                default_backend: Some(IngressBackend {
+                    service: None,
+                    resource: Some(TypedLocalObjectReference {
+                        api_group: Some("example.com".to_string()),
+                        kind: "StorageBucket".to_string(),
+                        name: "my-bucket".to_string(),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        assert!(
+            table
+                .route("any.host.com", "/", &RequestContext::default())
+                .is_none(),
+            "Resource defaultBackend should not install a catchall route"
         );
     }
 
