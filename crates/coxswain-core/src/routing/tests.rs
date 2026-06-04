@@ -79,6 +79,12 @@ fn wildcard_host_matches() {
     let table = b.build().unwrap();
     assert!(table.route("api.test.com", "/", &ctx_get()).is_some());
     assert!(table.route("test.com", "/", &ctx_get()).is_none());
+    // Multi-label prefix must not match — * covers exactly one DNS label.
+    assert!(
+        table
+            .route("nested.api.test.com", "/", &ctx_get())
+            .is_none()
+    );
 }
 
 #[test]

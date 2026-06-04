@@ -1,0 +1,23 @@
+# Ingress wildcard host fixture.
+# TESTNS is substituted with the test namespace at runtime.
+#
+# Routes:
+#   *.wildcard.TESTNS.local / → echo-c
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: echo-ingress-wildcard
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: "*.wildcard.TESTNS.local"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-c
+                port:
+                  number: 3000
