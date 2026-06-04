@@ -12,10 +12,11 @@ use coxswain_e2e::{
     harness::{GeneratedCert, Harness, NamespaceGuard, http, wait},
 };
 use futures::StreamExt as _;
+use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Api;
-use kube::api::PostParams;
+use kube::api::{Patch, PatchParams, PostParams};
 use reqwest::Method;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -160,6 +161,102 @@ async fn gateway_status() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Verifies that `gateway_needs_status_patch` detects a stale `observedGeneration`
+/// after a spec-only change and re-patches all conditions to the new generation.
+/// Exercises the GEP-1364 requirement that `observedGeneration` tracks
+/// `metadata.generation` even when the programmed-ness of the Gateway is unchanged.
+#[tokio::test]
+async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-gen-tracking").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(GATEWAY_API_PATH_MATCHING, &ns.name, &[]).await?;
+
+    wait::wait_for_gateway_programmed(
+        &h.client,
+        "coxswain-test",
+        &ns.name,
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let gw = gw_api.get("coxswain-test").await?;
+    let gen_before = gw.metadata.generation.unwrap_or(0);
+
+    // Sanity: initial conditions should already be at gen_before.
+    let top_conds = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[]);
+    for c in top_conds {
+        assert_eq!(
+            c.observed_generation.unwrap_or(0),
+            gen_before,
+            "condition {} not at initial generation",
+            c.type_
+        );
+    }
+
+    // Bump .metadata.generation with a harmless spec change (allowedRoutes.namespaces.from
+    // changes from Same to All — the HTTPRoute is in the same namespace so it still attaches).
+    let bump_patch = serde_json::json!({
+        "spec": {
+            "listeners": [{"name": "http", "port": 8080, "protocol": "HTTP",
+                           "allowedRoutes": {"namespaces": {"from": "All"}}}]
+        }
+    });
+    gw_api
+        .patch(
+            "coxswain-test",
+            &PatchParams::default(),
+            &Patch::Merge(&bump_patch),
+        )
+        .await?;
+
+    // Wait for the controller to detect the stale observedGeneration and re-patch.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(gw) = gw_api.get("coxswain-test").await {
+            let new_gen = gw.metadata.generation.unwrap_or(0);
+            if new_gen > gen_before {
+                let top = gw
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.conditions.as_deref())
+                    .unwrap_or(&[]);
+                let listeners = gw
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.listeners.as_deref())
+                    .unwrap_or(&[]);
+                let top_fresh = top
+                    .iter()
+                    .all(|c| c.observed_generation.unwrap_or(0) >= new_gen);
+                let listeners_fresh = listeners.iter().all(|sl| {
+                    sl.conditions
+                        .iter()
+                        .all(|c| c.observed_generation.unwrap_or(0) >= new_gen)
+                });
+                if top_fresh && listeners_fresh {
+                    return Ok(());
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out: Gateway coxswain-test conditions did not advance observedGeneration \
+                 to the new generation after a spec bump"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 #[tokio::test]
