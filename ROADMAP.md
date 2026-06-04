@@ -31,7 +31,7 @@ The first fully usable version: all must-have features implemented, OCI image pu
 - ✅ ~~Per-listener Gateway status (`status.listeners`) — [#63](https://github.com/coxswain-labs/coxswain/issues/63)~~
 - ✅ ~~Populate `GatewayClass.status.supportedFeatures` (GEP-2162) — [#91](https://github.com/coxswain-labs/coxswain/issues/91)~~
 - ✅ ~~Fix `gateway_needs_status_patch` `observedGeneration` comparison (GEP-1364) — [#89](https://github.com/coxswain-labs/coxswain/issues/89)~~
-- ⬜ Respect `EndpointSlice.conditions.serving` for endpoint drain — [#50](https://github.com/coxswain-labs/coxswain/issues/50)
+- ✅ ~~Respect `EndpointSlice.conditions.serving` for endpoint drain — [#50](https://github.com/coxswain-labs/coxswain/issues/50)~~
 - ⬜ Wildcard hostname must match exactly one DNS label — [#100](https://github.com/coxswain-labs/coxswain/issues/100)
 - ⬜ Resolve `Service.port.name` for Ingress backends — [#101](https://github.com/coxswain-labs/coxswain/issues/101)
 - ⬜ Honor `ingressclass.kubernetes.io/is-default-class` annotation — [#102](https://github.com/coxswain-labs/coxswain/issues/102)
