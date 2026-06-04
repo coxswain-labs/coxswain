@@ -63,6 +63,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26" }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-test = { version = "0.2" }
 
 [workspace.lints.clippy]
 type_complexity = "deny"

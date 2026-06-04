@@ -270,8 +270,30 @@ impl IngressReconciler {
                 }
             };
 
-            for host in tls.hosts.as_deref().unwrap_or(&[]) {
-                builder.add_cert(host, Arc::clone(&cert));
+            let hosts = tls.hosts.as_deref().unwrap_or(&[]);
+            if hosts.is_empty() {
+                let fallback: Vec<&str> = spec
+                    .and_then(|s| s.rules.as_deref())
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|r| r.host.as_deref())
+                    .filter(|h| !h.is_empty())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                tracing::warn!(
+                    ingress = ?ingress.metadata.name,
+                    secret = %format!("{ns}/{secret_name}"),
+                    fallback_hosts = ?fallback,
+                    "spec.tls[].hosts is empty or omitted — applying cert to rule hosts as fallback"
+                );
+                for host in &fallback {
+                    builder.add_cert(host, Arc::clone(&cert));
+                }
+            } else {
+                for host in hosts {
+                    builder.add_cert(host, Arc::clone(&cert));
+                }
             }
         }
     }
@@ -1829,5 +1851,131 @@ mod tests {
         let store = builder.build();
         assert!(store.find_cert("a.example.com").is_some());
         assert!(store.find_cert("b.example.com").is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    // reconcile_tls: empty/omitted hosts fallback tests
+    // -------------------------------------------------------------------------
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn reconcile_tls_falls_back_to_rule_hosts_when_hosts_omitted() {
+        let secrets = secret_store(vec![make_tls_secret("default", "my-cert")]);
+        let ingress = make_ingress_with_tls(
+            "default",
+            "coxswain",
+            vec![IngressTLS {
+                hosts: None,
+                secret_name: Some("my-cert".to_string()),
+            }],
+        );
+        let mut builder = TlsStoreBuilder::new();
+        reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
+        let store = builder.build();
+        // make_ingress_with_tls has spec.rules[0].host = "example.com"
+        assert!(store.find_cert("example.com").is_some());
+        assert!(logs_contain("my-cert"));
+        assert!(logs_contain("hosts is empty or omitted"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn reconcile_tls_falls_back_to_rule_hosts_when_hosts_empty() {
+        let secrets = secret_store(vec![make_tls_secret("default", "my-cert")]);
+        let ingress = make_ingress_with_tls(
+            "default",
+            "coxswain",
+            vec![IngressTLS {
+                hosts: Some(vec![]),
+                secret_name: Some("my-cert".to_string()),
+            }],
+        );
+        let mut builder = TlsStoreBuilder::new();
+        reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
+        let store = builder.build();
+        assert!(store.find_cert("example.com").is_some());
+        assert!(logs_contain("my-cert"));
+        assert!(logs_contain("hosts is empty or omitted"));
+    }
+
+    #[test]
+    fn reconcile_tls_fallback_includes_wildcard_rule_host() {
+        let secrets = secret_store(vec![make_tls_secret("default", "wildcard-cert")]);
+        let ingress = make_ingress_with_tls(
+            "default",
+            "coxswain",
+            vec![IngressTLS {
+                hosts: None,
+                secret_name: Some("wildcard-cert".to_string()),
+            }],
+        );
+        // Reuse make_ingress_with_tls but override the rule host to a wildcard.
+        let mut wildcard_ingress = ingress;
+        wildcard_ingress
+            .spec
+            .as_mut()
+            .unwrap()
+            .rules
+            .as_mut()
+            .unwrap()[0]
+            .host = Some("*.example.com".to_string());
+
+        let mut builder = TlsStoreBuilder::new();
+        reconcile_tls_no_default(
+            &wildcard_ingress,
+            &secrets,
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let store = builder.build();
+        assert!(store.find_cert("api.example.com").is_some());
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn reconcile_tls_fallback_no_rule_hosts_registers_nothing() {
+        let secrets = secret_store(vec![make_tls_secret("default", "my-cert")]);
+        // Ingress whose sole rule has no host (catchall) and tls.hosts is empty.
+        let ingress = Ingress {
+            metadata: ObjectMeta {
+                name: Some("no-host-ingress".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                ingress_class_name: Some("coxswain".to_string()),
+                rules: Some(vec![IngressRule {
+                    host: None,
+                    http: Some(HTTPIngressRuleValue {
+                        paths: vec![HTTPIngressPath {
+                            path: Some("/".to_string()),
+                            path_type: "Prefix".to_string(),
+                            backend: IngressBackend {
+                                service: Some(IngressServiceBackend {
+                                    name: "svc".to_string(),
+                                    port: Some(ServiceBackendPort {
+                                        number: Some(80),
+                                        ..Default::default()
+                                    }),
+                                }),
+                                ..Default::default()
+                            },
+                        }],
+                    }),
+                }]),
+                tls: Some(vec![IngressTLS {
+                    hosts: Some(vec![]),
+                    secret_name: Some("my-cert".to_string()),
+                }]),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut builder = TlsStoreBuilder::new();
+        reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
+        let store = builder.build();
+        // No named rule hosts → no cert should be registered
+        assert!(store.find_cert("any.host.com").is_none());
+        assert!(logs_contain("hosts is empty or omitted"));
     }
 }
