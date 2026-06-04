@@ -28,6 +28,24 @@ fn target_port(
     None
 }
 
+/// Looks up `svc` in the Service store and returns the numeric service port
+/// whose `name` field matches `port_name`. Returns `None` if the Service is
+/// not in the store or no port has the given name.
+pub(crate) fn port_for_name(
+    ns: &str,
+    svc: &str,
+    port_name: &str,
+    services: &reflector::Store<Service>,
+) -> Option<i32> {
+    let key = reflector::ObjectRef::<Service>::new(svc).within(ns);
+    let service = services.get(&key)?;
+    let ports = service.spec.as_ref()?.ports.as_deref()?;
+    ports
+        .iter()
+        .find(|sp| sp.name.as_deref() == Some(port_name))
+        .map(|sp| sp.port)
+}
+
 /// Scans the local `EndpointSlice` store for ready pod addresses backing
 /// `svc` in `ns` on `port`. When the Service is in the store and its port
 /// has a numeric `targetPort`, the pod port is resolved correctly even when

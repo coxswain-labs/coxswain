@@ -1,0 +1,38 @@
+# Ingress fixture for named-port backend resolution (issue #101).
+#
+# Defines a Service with a named port ("http" → 3000) that wraps the echo-a
+# Deployment from backends/echo.yaml. The Ingress backend references it by
+# name rather than number. The Exact pathType also provides e2e coverage for
+# Exact path matching, which was previously untested at the integration level.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-named
+  namespace: TESTNS
+spec:
+  selector:
+    app: echo-a
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: named-port-ingress
+  namespace: TESTNS
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: INGRESS_HOST
+      http:
+        paths:
+          - path: /named
+            pathType: Exact
+            backend:
+              service:
+                name: echo-named
+                port:
+                  name: http
