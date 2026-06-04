@@ -30,7 +30,7 @@ The first fully usable version: all must-have features implemented, OCI image pu
 - ✅ ~~Gateway HTTP listener isolation: per-port route scoping — [#84](https://github.com/coxswain-labs/coxswain/issues/84)~~
 - ✅ ~~Per-listener Gateway status (`status.listeners`) — [#63](https://github.com/coxswain-labs/coxswain/issues/63)~~
 - ✅ ~~Populate `GatewayClass.status.supportedFeatures` (GEP-2162) — [#91](https://github.com/coxswain-labs/coxswain/issues/91)~~
-- ⬜ Fix `gateway_needs_status_patch` `observedGeneration` comparison (GEP-1364) — [#89](https://github.com/coxswain-labs/coxswain/issues/89)
+- ✅ ~~Fix `gateway_needs_status_patch` `observedGeneration` comparison (GEP-1364) — [#89](https://github.com/coxswain-labs/coxswain/issues/89)~~
 - ⬜ Respect `EndpointSlice.conditions.serving` for endpoint drain — [#50](https://github.com/coxswain-labs/coxswain/issues/50)
 - ⬜ Wildcard hostname must match exactly one DNS label — [#100](https://github.com/coxswain-labs/coxswain/issues/100)
 - ⬜ Resolve `Service.port.name` for Ingress backends — [#101](https://github.com/coxswain-labs/coxswain/issues/101)
