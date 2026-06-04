@@ -1,0 +1,33 @@
+# Default IngressClass fixture.
+# Verifies that an Ingress with no ingressClassName and no legacy annotation is
+# claimed when the controller owns the cluster-default IngressClass.
+# TESTNS is substituted with the test namespace at runtime.
+#
+# Routes:
+#   default-ingress.TESTNS.local / → echo-a
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: coxswain-default-TESTNS
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+spec:
+  controller: coxswain-labs.dev/gateway-controller
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: echo-ingress
+spec:
+  rules:
+    - host: default-ingress.TESTNS.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

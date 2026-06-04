@@ -1,11 +1,11 @@
 use coxswain_e2e::{
     fixtures::{
-        self, BACKENDS_ECHO, INGRESS_CERT_MANAGER, INGRESS_DEFAULT_BACKEND, INGRESS_NAMED_PORT,
-        INGRESS_PATH_MATCHING, INGRESS_TLS_TERMINATION, INGRESS_WILDCARD_HOST,
+        self, BACKENDS_ECHO, INGRESS_CERT_MANAGER, INGRESS_DEFAULT_BACKEND, INGRESS_DEFAULT_CLASS,
+        INGRESS_NAMED_PORT, INGRESS_PATH_MATCHING, INGRESS_TLS_TERMINATION, INGRESS_WILDCARD_HOST,
     },
     harness::{
-        ControllerOptions, ControllerProcess, GeneratedCert, Harness, HttpClient, NamespaceGuard,
-        bootstrap, http, wait,
+        ControllerOptions, ControllerProcess, GeneratedCert, Harness, HttpClient,
+        IngressClassGuard, NamespaceGuard, bootstrap, http, wait,
     },
 };
 use std::time::Duration;
@@ -505,6 +505,31 @@ async fn named_port_backend() -> anyhow::Result<()> {
     // Exact pathType: a longer path must not match.
     let status = h.http.get_status(&host, "/named/extra").await?;
     assert_eq!(status, 404, "Exact path should not match /named/extra");
+
+    Ok(())
+}
+
+/// Verifies that an Ingress with no ingressClassName and no legacy annotation
+/// is reconciled and routes traffic when the controller owns the cluster-default
+/// IngressClass (annotated `ingressclass.kubernetes.io/is-default-class: "true"`).
+#[tokio::test]
+async fn default_ingress_class() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-default-class").await?;
+
+    // Create a uniquely-named default IngressClass scoped to this test run.
+    // The guard deletes it on drop so the cluster-scoped resource doesn't leak.
+    let ic_name = format!("coxswain-default-{}", ns.name);
+    let _ic_guard = IngressClassGuard::new(&h.client, &ic_name);
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(INGRESS_DEFAULT_CLASS, &ns.name, &[]).await?;
+
+    let host = format!("default-ingress.{}.local", ns.name);
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
 
     Ok(())
 }
