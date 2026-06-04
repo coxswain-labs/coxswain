@@ -7,7 +7,7 @@ use coxswain_e2e::{
         GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_TIMEOUTS,
         GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS, GATEWAY_API_TLS_CROSS_NAMESPACE_GW,
         GATEWAY_API_TLS_GATEWAY_NO_CERTS, GATEWAY_API_TLS_REDIRECT, GATEWAY_API_TLS_TERMINATION,
-        GATEWAY_API_WEBSOCKET, GATEWAY_API_WILDCARD_HOST,
+        GATEWAY_API_WEBSOCKET, GATEWAY_API_WEIGHTED_SPLIT, GATEWAY_API_WILDCARD_HOST,
     },
     harness::{GeneratedCert, Harness, NamespaceGuard, http, wait},
 };
@@ -960,6 +960,45 @@ async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
     assert!(
         location.starts_with("https://"),
         "expected Location to start with https://, got {location:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn weighted_split() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-weighted").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(GATEWAY_API_WEIGHTED_SPLIT, &ns.name, &[]).await?;
+
+    let host = format!("weighted.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
+
+    // /zero: echo-a has weight 0 → all traffic must go to echo-b.
+    let counts = http::count_backends(&h.http, &host, "/zero", 40).await?;
+    assert_eq!(
+        counts.get("echo-a").copied().unwrap_or(0),
+        0,
+        "/zero: weight-0 backend echo-a received traffic: {counts:?}"
+    );
+    assert!(
+        counts.get("echo-b").copied().unwrap_or(0) > 0,
+        "/zero: echo-b should receive all traffic: {counts:?}"
+    );
+
+    // /skewed: echo-a weight 4, echo-b weight 1 → ~80% to echo-a.
+    // Send 200 requests; allow ±10pp tolerance to stay robust under scheduling noise.
+    let n = 200usize;
+    let counts = http::count_backends(&h.http, &host, "/skewed", n).await?;
+    let a = counts.get("echo-a").copied().unwrap_or(0);
+    let ratio = a as f64 / n as f64;
+    assert!(
+        (0.70..=0.90).contains(&ratio),
+        "/skewed: echo-a ratio {ratio:.2} out of expected 0.70–0.90 (counts: {counts:?})"
     );
 
     Ok(())
