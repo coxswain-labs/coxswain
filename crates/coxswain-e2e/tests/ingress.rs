@@ -1,7 +1,7 @@
 use coxswain_e2e::{
     fixtures::{
         self, BACKENDS_ECHO, INGRESS_CERT_MANAGER, INGRESS_DEFAULT_BACKEND, INGRESS_PATH_MATCHING,
-        INGRESS_TLS_TERMINATION,
+        INGRESS_TLS_TERMINATION, INGRESS_WILDCARD_HOST,
     },
     harness::{
         ControllerOptions, ControllerProcess, GeneratedCert, Harness, HttpClient, NamespaceGuard,
@@ -452,6 +452,34 @@ async fn proxy_protocol_strict_drop() -> anyhow::Result<()> {
                 || e.kind() == std::io::ErrorKind::ConnectionAborted => {}
         Err(e) => return Err(e.into()),
     }
+
+    Ok(())
+}
+
+/// Verifies that a wildcard Ingress (`*.wildcard.{ns}.local`) routes exactly
+/// one DNS label — `api.wildcard.{ns}.local` reaches the backend, but
+/// `nested.api.wildcard.{ns}.local` (two labels before the suffix) is rejected.
+#[tokio::test]
+async fn wildcard_host() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-wildcard").await?;
+
+    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(INGRESS_WILDCARD_HOST, &ns.name, &[("TESTNS", &ns.name)]).await?;
+
+    let host = format!("api.wildcard.{}.local", ns.name);
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-c");
+
+    // Multi-label prefix must not match — the * covers exactly one DNS label.
+    let nested = format!("nested.api.wildcard.{}.local", ns.name);
+    let status = h.http.get_status(&nested, "/").await?;
+    assert_eq!(
+        status, 404,
+        "nested subdomain should not match wildcard rule"
+    );
 
     Ok(())
 }

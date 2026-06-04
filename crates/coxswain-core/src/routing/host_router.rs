@@ -252,10 +252,14 @@ impl HostRouterBuilder {
     }
 }
 
-/// Returns `true` if `host` is a subdomain of `suffix`
-/// (e.g. `suffix = "example.com"` matches `"api.example.com"`).
+/// Returns `true` when `host` matches the wildcard pattern `*.{suffix}`.
+/// Requires exactly one label before the suffix: `api.example.com` matches
+/// suffix `example.com`, but `example.com` and `a.b.example.com` do not.
 pub(super) fn wildcard_matches(host: &str, suffix: &str) -> bool {
-    host.len() > suffix.len() + 1
-        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
-        && host.ends_with(suffix)
+    if let Some(rest) = host.strip_suffix(suffix)
+        && let Some(label) = rest.strip_suffix('.')
+    {
+        return !label.is_empty() && !label.contains('.');
+    }
+    false
 }
