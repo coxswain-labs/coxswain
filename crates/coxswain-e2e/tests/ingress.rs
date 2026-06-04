@@ -69,21 +69,16 @@ async fn default_backend() -> anyhow::Result<()> {
     wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
     let http = HttpClient::new(controller.proxy_addr);
 
-    let unknown_host = format!("unknown.{}.local", ns.name);
-
-    // Before any Ingress is applied, the controller-wide default serves unknown hosts.
-    let resp =
-        wait::wait_for_route(&http, &unknown_host, "/anything", Duration::from_secs(30)).await?;
-    resp.assert_backend("echo-c");
-
     // Apply the fixture: rule /api → echo-a, spec.defaultBackend → echo-b.
     fixtures::apply_fixture(INGRESS_DEFAULT_BACKEND, &ns.name, &[]).await?;
 
     let host = format!("app.{}.local", ns.name);
+    let unknown_host = format!("unknown.{}.local", ns.name);
 
-    // Wait until the explicit rule is live, then test all cases.
-    let resp = wait::wait_for_route(&http, &host, "/api", Duration::from_secs(60)).await?;
-    resp.assert_backend("echo-a");
+    // Wait until the explicit rule is live with the correct backend.
+    // Use wait_for_backend (not wait_for_route) because the controller-wide catchall
+    // may serve echo-c for this host before the Ingress-specific route is reconciled.
+    wait::wait_for_backend(&http, &host, "/api", "echo-a", Duration::from_secs(60)).await?;
 
     // Per-Ingress defaultBackend catches path-miss on the rule's host.
     let resp = http.get(&host, "/other").await?;
@@ -559,8 +554,9 @@ async fn default_ingress_class() -> anyhow::Result<()> {
     fixtures::apply_fixture(INGRESS_DEFAULT_CLASS, &ns.name, &[]).await?;
 
     let host = format!("default-ingress.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
-    resp.assert_backend("echo-a");
+    // Use wait_for_backend rather than wait_for_route: a leftover catchall entry
+    // from a concurrent test could serve a 200 before this route is reconciled.
+    wait::wait_for_backend(&h.http, &host, "/", "echo-a", Duration::from_secs(60)).await?;
 
     Ok(())
 }
