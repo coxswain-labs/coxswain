@@ -1,4 +1,5 @@
 use k8s_openapi::api::core::v1::Namespace;
+use k8s_openapi::api::networking::v1::IngressClass;
 use kube::{
     Api, Client,
     api::{DeleteParams, ObjectMeta, PostParams},
@@ -48,6 +49,34 @@ impl Drop for NamespaceGuard {
             let api: Api<Namespace> = Api::all(client);
             let _ = api.delete(&name, &DeleteParams::default()).await;
             tracing::debug!(namespace = %name, "deleted test namespace");
+        });
+    }
+}
+
+/// RAII guard for a cluster-scoped `IngressClass`. Deletes the IngressClass on
+/// drop so test-only classes don't leak between runs.
+pub struct IngressClassGuard {
+    pub name: String,
+    client: Client,
+}
+
+impl IngressClassGuard {
+    pub fn new(client: &Client, name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            client: client.clone(),
+        }
+    }
+}
+
+impl Drop for IngressClassGuard {
+    fn drop(&mut self) {
+        let client = self.client.clone();
+        let name = self.name.clone();
+        tokio::spawn(async move {
+            let api: Api<IngressClass> = Api::all(client);
+            let _ = api.delete(&name, &DeleteParams::default()).await;
+            tracing::debug!(ingress_class = %name, "deleted test IngressClass");
         });
     }
 }

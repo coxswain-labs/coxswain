@@ -9,7 +9,7 @@ use anyhow::Context as _;
 pub use bootstrap::bootstrap;
 pub use controller::{ControllerOptions, ControllerProcess};
 pub use http::HttpClient;
-pub use namespace::NamespaceGuard;
+pub use namespace::{IngressClassGuard, NamespaceGuard};
 pub use tls::GeneratedCert;
 
 pub struct Harness {

@@ -352,13 +352,14 @@ fn rebuild(
     let routes = route_store.state();
     let ingresses = ingress_store.state();
 
-    let (owned_ingress_classes, owned_gateway_classes, owned_gateways) = compute_ownership(
-        class_store,
-        gateway_class_store,
-        gateway_store,
-        controller_name,
-        owned_gateways_handle,
-    );
+    let (owned_ingress_classes, owned_default_ingress_class, owned_gateway_classes, owned_gateways) =
+        compute_ownership(
+            class_store,
+            gateway_class_store,
+            gateway_store,
+            controller_name,
+            owned_gateways_handle,
+        );
 
     let (backend_grants, cert_grants) = flatten_grants(&grant_store.state());
 
@@ -374,6 +375,7 @@ fn rebuild(
         &routes,
         &ingresses,
         &owned_ingress_classes,
+        owned_default_ingress_class.as_deref(),
         &owned_gateways,
         &backend_grants,
         gateway_store,
@@ -389,6 +391,7 @@ fn rebuild(
         gateway_store,
         &owned_gateway_classes,
         &owned_ingress_classes,
+        owned_default_ingress_class.as_deref(),
         &cert_grants,
         secret_store,
         tls_shared,
@@ -410,21 +413,45 @@ fn rebuild(
 
 /// Compute which IngressClasses, GatewayClasses, and Gateways are owned by this controller.
 /// Publishes the owned-gateways snapshot to `owned_gateways_handle` as a side effect.
+/// The fourth element of the returned tuple is the name of the owned default IngressClass (if any).
 fn compute_ownership(
     class_store: &reflector::Store<IngressClass>,
     gateway_class_store: &reflector::Store<GatewayClass>,
     gateway_store: &reflector::Store<Gateway>,
     controller_name: &str,
     owned_gateways_handle: &OwnedGateways,
-) -> (HashSet<String>, HashSet<String>, HashSet<ObjectKey>) {
-    let owned_ingress_classes: HashSet<String> = class_store
+) -> (
+    HashSet<String>,
+    Option<String>,
+    HashSet<String>,
+    HashSet<ObjectKey>,
+) {
+    let owned_class_objs: Vec<_> = class_store
         .state()
         .into_iter()
         .filter(|ic| {
             ic.spec.as_ref().and_then(|s| s.controller.as_deref()) == Some(controller_name)
         })
+        .collect();
+
+    let owned_ingress_classes: HashSet<String> = owned_class_objs
+        .iter()
         .filter_map(|ic| ic.metadata.name.clone())
         .collect();
+
+    let mut defaults: Vec<String> = owned_class_objs
+        .iter()
+        .filter(|ic| crate::ingress::is_default_ingress_class(ic))
+        .filter_map(|ic| ic.metadata.name.clone())
+        .collect();
+    defaults.sort();
+    if defaults.len() > 1 {
+        tracing::warn!(
+            ?defaults,
+            "Multiple owned IngressClasses annotated as default; using lexicographically lowest"
+        );
+    }
+    let owned_default_ingress_class = defaults.into_iter().next();
 
     let owned_gateway_classes: HashSet<String> = gateway_class_store
         .state()
@@ -445,7 +472,12 @@ fn compute_ownership(
         .collect();
 
     owned_gateways_handle.store(Arc::new(owned_gateways.clone()));
-    (owned_ingress_classes, owned_gateway_classes, owned_gateways)
+    (
+        owned_ingress_classes,
+        owned_default_ingress_class,
+        owned_gateway_classes,
+        owned_gateways,
+    )
 }
 
 type GrantSet = HashSet<ReferenceGrantKey>;
@@ -503,6 +535,7 @@ fn build_routes(
     routes: &[Arc<HTTPRoute>],
     ingresses: &[Arc<Ingress>],
     owned_ingress_classes: &HashSet<String>,
+    owned_default_ingress_class: Option<&str>,
     owned_gateways: &HashSet<ObjectKey>,
     backend_grants: &GrantSet,
     gateway_store: &reflector::Store<Gateway>,
@@ -552,6 +585,7 @@ fn build_routes(
             slice_store,
             service_store,
             owned_ingress_classes,
+            owned_default_ingress_class,
             &mut builder,
         );
     }
@@ -609,11 +643,13 @@ fn build_routes(
 }
 
 /// Build and publish the TLS cert store; returns per-gateway listener health for further use.
+#[allow(clippy::too_many_arguments)]
 fn build_tls(
     ingresses: &[Arc<Ingress>],
     gateway_store: &reflector::Store<Gateway>,
     owned_gateway_classes: &HashSet<String>,
     owned_ingress_classes: &HashSet<String>,
+    owned_default_ingress_class: Option<&str>,
     cert_grants: &GrantSet,
     secret_store: &reflector::Store<Secret>,
     tls_shared: &SharedTlsStore,
@@ -624,6 +660,7 @@ fn build_tls(
             ingress,
             secret_store,
             owned_ingress_classes,
+            owned_default_ingress_class,
             &mut tls_builder,
         );
     }
