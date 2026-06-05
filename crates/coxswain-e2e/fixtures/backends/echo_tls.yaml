@@ -55,16 +55,20 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # TLS_SERVER_CERT / TLS_SERVER_PRIVKEY are FILE PATHS (not PEM content).
+            # The echo-basic server calls tls.LoadX509KeyPair(cert, key) internally.
             - name: TLS_SERVER_CERT
-              valueFrom:
-                secretKeyRef:
-                  name: echo-tls-backend-cert
-                  key: tls.crt
+              value: /certs/tls.crt
             - name: TLS_SERVER_PRIVKEY
-              valueFrom:
-                secretKeyRef:
-                  name: echo-tls-backend-cert
-                  key: tls.key
+              value: /certs/tls.key
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: echo-tls-backend-cert
 ---
 apiVersion: v1
 kind: Service

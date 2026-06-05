@@ -232,6 +232,7 @@ jobs:
           kubectl apply -f deploy/manifests/gateway-class.yaml
           kubectl wait --for=condition=Established crd/gatewayclasses.gateway.networking.k8s.io --timeout=60s
           kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io --timeout=60s
+          kubectl wait --for=condition=Established crd/backendtlspolicies.gateway.networking.k8s.io --timeout=60s
 
       - name: Download e2e binaries
         uses: actions/download-artifact@v7

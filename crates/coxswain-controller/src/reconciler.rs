@@ -353,12 +353,22 @@ async fn spawn_tasks(
     // against a 500 ms timer. Each new notification resets the timer. When
     // the timer expires uninterrupted, the full routing table is rebuilt from
     // the current store snapshots — never from the API server.
+    //
+    // The 5 s maximum cap prevents ConfigMap churn from system controllers
+    // (kube-system, cert-manager, etc.) from indefinitely deferring the
+    // rebuild: under continuous-event conditions a rebuild fires at most 5 s
+    // after the first triggering event.
     set.spawn(async move {
         loop {
             notify.notified().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
                 tokio::select! {
-                    _ = notify.notified() => {}
+                    _ = notify.notified() => {
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                    }
                     _ = tokio::time::sleep(Duration::from_millis(500)) => break,
                 }
             }

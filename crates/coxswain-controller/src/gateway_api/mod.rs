@@ -161,6 +161,19 @@ impl GatewayApiReconciler {
                     btp_index,
                 );
                 let group_name = backend_group_name(backend_refs, route_ns);
+
+                // If any backendRef targets a Service with an invalid BackendTLSPolicy
+                // (e.g. missing ConfigMap), connections MUST fail with 5xx per GEP-1897.
+                let has_invalid_btp = backend_refs.iter().any(|b| {
+                    let b_kind = b.kind.as_deref().unwrap_or("Service");
+                    let b_group = b.group.as_deref().unwrap_or("");
+                    if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
+                        return false;
+                    }
+                    let ns = b.namespace.as_deref().unwrap_or(route_ns);
+                    btp_index.has_failed_policy(ns, &b.name)
+                });
+
                 let protocols: Vec<BackendProtocol> = resolved
                     .iter()
                     .map(|(r, _, _)| parse_app_protocol(r.app_protocol.as_deref().unwrap_or("")))
@@ -172,7 +185,13 @@ impl GatewayApiReconciler {
                     .collect();
                 let group =
                     Arc::new(BackendGroup::weighted(group_name, weighted).with_protocol(protocol));
-                if group.endpoints().is_empty() {
+                if has_invalid_btp {
+                    tracing::warn!(
+                        route = ?route.metadata.name,
+                        "Backend has invalid BackendTLSPolicy — installing error route (500)"
+                    );
+                    (group, Some(500u16))
+                } else if group.endpoints().is_empty() {
                     tracing::warn!(
                         route = ?route.metadata.name,
                         "No ready endpoints for rule — installing error route (500)"

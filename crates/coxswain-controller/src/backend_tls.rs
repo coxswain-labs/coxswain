@@ -118,6 +118,27 @@ pub struct BackendTlsIndex {
 }
 
 impl BackendTlsIndex {
+    /// Returns `true` when a `BackendTLSPolicy` targets this Service but failed
+    /// validation (e.g. the referenced ConfigMap doesn't exist).
+    ///
+    /// Per spec, requests to a Service covered by an invalid policy MUST return
+    /// HTTP 5xx — callers should install an error route rather than routing normally.
+    ///
+    /// A conflict-loser policy does NOT block the service — the winner is still valid.
+    /// We only block when there is NO valid winner in `by_service` for this service.
+    pub fn has_failed_policy(&self, ns: &str, svc: &str) -> bool {
+        // If any accepted policy covers this service, don't block — the winner is valid.
+        if self.by_service.keys().any(|k| k.ns == ns && k.svc == svc) {
+            return false;
+        }
+        // No valid winner. Block if there's an invalid (non-conflict) policy.
+        self.targets.iter().any(|(key, target)| {
+            target.ns == ns
+                && target.svc == svc
+                && self.health.get(key).map(|o| !o.accepted).unwrap_or(false)
+        })
+    }
+
     /// Look up the TLS config for a backend reference.
     ///
     /// First tries an exact `(ns, svc, Some(port_name))` entry, then falls back
@@ -224,6 +245,15 @@ pub fn build_backend_tls_index(
 
         // Conflict: a higher-priority policy already claimed this slot.
         if by_service.contains_key(&service_key) {
+            // Track target so build_btp_health_map can find ancestors for this loser
+            // and write Accepted=False/Conflicted to its status.
+            targets.insert(
+                policy_key.clone(),
+                PolicyServiceTarget {
+                    ns: policy_ns.to_string(),
+                    svc: target.name.clone(),
+                },
+            );
             health.insert(
                 policy_key,
                 PolicyHealthOutcome::conflicted(format!(
