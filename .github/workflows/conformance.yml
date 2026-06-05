@@ -27,7 +27,7 @@ jobs:
           key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-conformance-
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: conformance/go.mod
           cache-dependency-path: conformance/go.sum
@@ -116,7 +116,7 @@ jobs:
 
       - name: Upload conformance report as artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: conformance-report
           path: conformance/reports/
