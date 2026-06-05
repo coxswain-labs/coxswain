@@ -1,18 +1,16 @@
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     branches:
       - main
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/experimental.yml'
 
 name: Experimental
 
 jobs:
   experimental-build:
     name: experimental-build
+    # Only run for PRs labeled "api: gateway" — i.e. changes touching Gateway API internals.
+    if: contains(github.event.pull_request.labels.*.name, 'api: gateway')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
