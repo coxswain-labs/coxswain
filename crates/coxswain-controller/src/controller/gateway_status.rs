@@ -32,17 +32,35 @@ pub(super) fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerH
         .unwrap_or(&[]);
     for listener in &gw.spec.listeners {
         let (has_invalid_kinds, _) = listener_route_kind_info(listener);
-        let desired_healthy = !has_invalid_kinds
-            && health
-                .by_listener
-                .get(&listener.name)
-                .map(|o| o.is_healthy())
-                .unwrap_or(true);
+        let desired_outcome = health
+            .by_listener
+            .get(&listener.name)
+            .cloned()
+            .unwrap_or_else(|| ListenerTlsOutcome::default_for_protocol(&listener.protocol));
+        let desired_healthy = !has_invalid_kinds && desired_outcome.is_healthy();
+        let desired_reason = listener_resolved_refs_reason(has_invalid_kinds, &desired_outcome);
         let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);
         let current_resolved = current_listener
             .map(|sl| has_condition(Some(sl.conditions.as_slice()), "ResolvedRefs"))
             .unwrap_or(false);
         if desired_healthy != current_resolved {
+            return true;
+        }
+        let current_programmed = current_listener
+            .map(|sl| has_condition(Some(sl.conditions.as_slice()), "Programmed"))
+            .unwrap_or(false);
+        if desired_healthy != current_programmed {
+            return true;
+        }
+        // Detect transitions where status stays False but reason changes
+        // (e.g. Pending → InvalidCertificateRef once the reconciler discovers
+        // the real cert ref outcome). Without this check `gateway_needs_status_patch`
+        // would return false and the listener would be stuck advertising "Pending".
+        let current_resolved_reason = current_listener
+            .and_then(|sl| sl.conditions.iter().find(|c| c.type_ == "ResolvedRefs"))
+            .map(|c| c.reason.as_str())
+            .unwrap_or("");
+        if desired_reason != current_resolved_reason {
             return true;
         }
         let desired_attached = health
@@ -76,6 +94,23 @@ fn any_condition_stale(conditions: &[Condition], expected_gen: i64) -> bool {
     conditions
         .iter()
         .any(|c| c.observed_generation.unwrap_or(0) < expected_gen)
+}
+
+/// Reason written into the listener's `ResolvedRefs` condition for a given
+/// outcome and kind-validation result. Kept here as a single source of truth
+/// so `gateway_needs_status_patch` and `build_gateway_status_patch` agree on
+/// what the condition should look like.
+fn listener_resolved_refs_reason(
+    has_invalid_kinds: bool,
+    outcome: &ListenerTlsOutcome,
+) -> &'static str {
+    if has_invalid_kinds {
+        "InvalidRouteKinds"
+    } else if outcome.is_healthy() {
+        "ResolvedRefs"
+    } else {
+        outcome.reason()
+    }
 }
 
 /// Returns `(has_any_invalid, supported_kinds)` for a listener's `allowedRoutes.kinds`.
@@ -157,7 +192,7 @@ pub(super) fn build_gateway_status_patch(
                 .by_listener
                 .get(&l.name)
                 .cloned()
-                .unwrap_or(ListenerTlsOutcome::NotApplicable);
+                .unwrap_or_else(|| ListenerTlsOutcome::default_for_protocol(&l.protocol));
             let (has_invalid_kinds, supported_kinds_list) = listener_route_kind_info(l);
             let (resolved_refs_status, resolved_refs_reason, resolved_refs_msg) =
                 if has_invalid_kinds {
@@ -242,10 +277,14 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 
     fn condition(type_: &str, observed_gen: i64) -> Condition {
+        condition_with_reason(type_, observed_gen, "")
+    }
+
+    fn condition_with_reason(type_: &str, observed_gen: i64, reason: &str) -> Condition {
         Condition {
             type_: type_.to_string(),
             status: "True".to_string(),
-            reason: String::new(),
+            reason: reason.to_string(),
             message: String::new(),
             observed_generation: Some(observed_gen),
             last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
@@ -262,7 +301,7 @@ mod tests {
             conditions: vec![
                 condition("Accepted", cond_gen),
                 condition("Programmed", cond_gen),
-                condition("ResolvedRefs", cond_gen),
+                condition_with_reason("ResolvedRefs", cond_gen, "ResolvedRefs"),
             ],
         }
     }
@@ -359,6 +398,96 @@ mod tests {
             Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
             Some(vec![listener_status("http", 1)]),
         );
+        assert!(!gateway_needs_status_patch(&gw, &default_health()));
+    }
+
+    fn https_gateway(meta_gen: i64, listeners: Option<Vec<GatewayStatusListeners>>) -> Gateway {
+        Gateway {
+            metadata: kube::api::ObjectMeta {
+                generation: Some(meta_gen),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                listeners: vec![gateway_api::apis::standard::gateways::GatewayListeners {
+                    name: "https".to_string(),
+                    port: 443,
+                    protocol: "HTTPS".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            status: Some(GatewayStatus {
+                conditions: Some(vec![
+                    condition("Accepted", meta_gen),
+                    condition("Programmed", meta_gen),
+                ]),
+                listeners,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn listener_status_false(name: &str, cond_gen: i64, reason: &str) -> GatewayStatusListeners {
+        GatewayStatusListeners {
+            name: name.to_string(),
+            attached_routes: 0,
+            supported_kinds: None,
+            conditions: vec![
+                condition("Accepted", cond_gen),
+                Condition {
+                    type_: "Programmed".to_string(),
+                    status: "False".to_string(),
+                    reason: reason.to_string(),
+                    message: String::new(),
+                    observed_generation: Some(cond_gen),
+                    last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                        k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
+                    ),
+                },
+                Condition {
+                    type_: "ResolvedRefs".to_string(),
+                    status: "False".to_string(),
+                    reason: reason.to_string(),
+                    message: String::new(),
+                    observed_generation: Some(cond_gen),
+                    last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                        k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
+                    ),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn needs_patch_https_listener_with_no_health_data() {
+        // Fresh HTTPS gateway, no status yet. Pending default makes desired ResolvedRefs
+        // and Programmed = False, so the patch is needed (current has no conditions).
+        let gw = https_gateway(1, None);
+        assert!(gateway_needs_status_patch(&gw, &default_health()));
+    }
+
+    #[test]
+    fn needs_patch_when_listener_reason_changes() {
+        // Listener was patched with Pending; real outcome arrives as
+        // InvalidCertificateRef. Status flag stays False, but reason changes —
+        // must still re-patch.
+        let gw = https_gateway(1, Some(vec![listener_status_false("https", 1, "Pending")]));
+        let mut health = default_health();
+        health.by_listener.insert(
+            "https".to_string(),
+            ListenerTlsOutcome::InvalidCertificateRef {
+                message: "secret missing".to_string(),
+            },
+        );
+        assert!(gateway_needs_status_patch(&gw, &health));
+    }
+
+    #[test]
+    fn no_patch_when_listener_pending_matches() {
+        // Listener was patched with Pending and the reconciler still has no entry
+        // for it. The protocol-aware default again resolves to Pending, so the
+        // current and desired states match and we should NOT re-patch.
+        let gw = https_gateway(1, Some(vec![listener_status_false("https", 1, "Pending")]));
         assert!(!gateway_needs_status_patch(&gw, &default_health()));
     }
 }

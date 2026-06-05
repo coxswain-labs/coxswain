@@ -28,6 +28,11 @@ pub(crate) enum TlsLoadError {
 pub enum ListenerTlsOutcome {
     /// Non-HTTPS listener — no TLS check performed.
     NotApplicable,
+    /// HTTPS/TLS listener seen by the controller before the reconciler has
+    /// produced real health data. Treated as unhealthy so a freshly-created
+    /// Gateway never writes a spurious `ResolvedRefs=True` that could mislead
+    /// users (or conformance tests) about an invalid cert ref.
+    Pending,
     /// HTTPS listener; certificate resolved and installed in the TLS store.
     Resolved,
     /// `certificateRefs[0].namespace` differs from the Gateway namespace and
@@ -46,6 +51,7 @@ impl ListenerTlsOutcome {
 
     pub(crate) fn reason(&self) -> &'static str {
         match self {
+            Self::Pending => "Pending",
             Self::RefNotPermitted { .. } => "RefNotPermitted",
             Self::InvalidCertificateRef { .. } => "InvalidCertificateRef",
             Self::Invalid { .. } => "Invalid",
@@ -55,10 +61,22 @@ impl ListenerTlsOutcome {
 
     pub(crate) fn message(&self) -> &str {
         match self {
+            Self::Pending => "Waiting for initial reconcile",
             Self::RefNotPermitted { message }
             | Self::InvalidCertificateRef { message }
             | Self::Invalid { message } => message.as_str(),
             Self::NotApplicable | Self::Resolved => "",
+        }
+    }
+
+    /// Default outcome to assume for a listener whose `name` is not yet in
+    /// `GatewayListenerHealth::by_listener`. HTTPS/TLS listeners default to
+    /// `Pending` (unhealthy); everything else defaults to `NotApplicable`.
+    pub(crate) fn default_for_protocol(protocol: &str) -> Self {
+        if protocol.eq_ignore_ascii_case("HTTPS") || protocol.eq_ignore_ascii_case("TLS") {
+            Self::Pending
+        } else {
+            Self::NotApplicable
         }
     }
 }
