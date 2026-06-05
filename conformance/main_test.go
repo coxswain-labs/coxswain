@@ -64,7 +64,7 @@ func TestConformance(t *testing.T) {
 		features.SupportGatewayAddressEmpty,
 		// Extended: parentRef port mismatch → NoMatchingParent (#34)
 		features.SupportHTTPRouteDestinationPortMatching,
-		// Extended: per-port listener routing (#98)
+		// Extended: per-port listener routing (#82, #98)
 		features.SupportHTTPRouteParentRefPort,
 // 		// Extended: websocket (#15 dependency, port mapping fix)
 // 		features.SupportHTTPRouteBackendProtocolWebSocket,

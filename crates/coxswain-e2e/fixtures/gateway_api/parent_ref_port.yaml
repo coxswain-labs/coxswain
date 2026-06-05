@@ -1,9 +1,11 @@
 # parentRef.port matching fixture.
 #
-# One Gateway with a single HTTP listener on HTTP_PORT.
+# One Gateway with two HTTP listeners: one on HTTP_PORT (coxswain-bound) and
+# one on WRONG_PORT (declared but coxswain is NOT listening on it).
 #
-# route-pinned:  parentRef.port=HTTP_PORT  → routes to echo-a   (should be routable)
-# route-wrong:   parentRef.port=WRONG_PORT → routes to echo-b   (no listener, unattached)
+# route-pinned:   parentRef.port=HTTP_PORT  → routes to echo-a   (should be routable)
+# route-wrong:    parentRef.port=WRONG_PORT → routes to echo-b   (coxswain not listening, unreachable)
+# route-unpinned: no parentRef.port         → routes to echo-a   (attaches to both listeners)
 #
 # TESTNS and HTTP_PORT are substituted at runtime.
 # WRONG_PORT is substituted at runtime with a port that coxswain is NOT listening on.
@@ -17,6 +19,12 @@ spec:
   listeners:
     - name: http
       port: HTTP_PORT
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: alt
+      port: WRONG_PORT
       protocol: HTTP
       allowedRoutes:
         namespaces:
@@ -37,7 +45,6 @@ spec:
     - backendRefs:
         - name: echo-a
           port: 3000
-    # Probe rule
     - matches:
         - path:
             type: Exact
@@ -46,7 +53,7 @@ spec:
         - name: echo-a
           port: 3000
 ---
-# Route bound to a port that doesn't exist — should NOT be routable.
+# Route bound to the alt listener port — should NOT be routable on HTTP_PORT.
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -60,4 +67,26 @@ spec:
   rules:
     - backendRefs:
         - name: echo-b
+          port: 3000
+---
+# Route with no parentRef.port — should attach to BOTH listeners.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: route-unpinned
+spec:
+  parentRefs:
+    - name: port-gw
+  hostnames:
+    - "both.TESTNS.local"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000
+    - matches:
+        - path:
+            type: Exact
+            value: /probe
+      backendRefs:
+        - name: echo-a
           port: 3000
