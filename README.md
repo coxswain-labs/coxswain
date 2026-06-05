@@ -7,6 +7,8 @@ A pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](http
 
 Coxswain watches Kubernetes `Ingress` and `HTTPRoute` resources and dynamically updates its routing table without a process restart or config reload. Multiple replicas can run simultaneously using Kubernetes Lease-based leader election — all replicas maintain a hot routing table, but only the active leader writes status back to the API server.
 
+> **Note**: This project is currently in early development and not accepting external contributions. Bug reports and feature requests in issues are welcome; we'll revisit contribution guidelines as the project matures.
+
 ## Features
 
 - **Gateway API + Ingress** — supports both `HTTPRoute` (Gateway API) and classic `Ingress` resources side-by-side
