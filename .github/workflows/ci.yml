@@ -56,22 +56,6 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-test-
       - run: cargo test
 
-  build:
-    name: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
-      - run: cargo build --release
-
   deny:
     name: deny
     runs-on: ubuntu-latest

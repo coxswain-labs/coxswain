@@ -21,8 +21,8 @@ on:
 name: E2E
 
 jobs:
-  build-coxswain:
-    name: build-coxswain
+  build:
+    name: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -51,7 +51,7 @@ jobs:
 
   e2e-gateway-api:
     name: e2e (gateway_api)
-    needs: build-coxswain
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -124,7 +124,7 @@ jobs:
 
   e2e-ingress:
     name: e2e (ingress)
-    needs: build-coxswain
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
