@@ -22,4 +22,4 @@ spec:
   rules:
     - backendRefs:
         - name: h2c-echo
-          port: 3000
+          port: 3001
