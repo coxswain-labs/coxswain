@@ -21,8 +21,8 @@ on:
 name: E2E
 
 jobs:
-  e2e:
-    name: e2e
+  build:
+    name: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -36,21 +36,45 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/
-          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-e2e-
+          key: ${{ runner.os }}-cargo-e2e-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-e2e-build-
+
+      - name: Build coxswain binary
+        run: cargo build --bin coxswain
+
+      - name: Build e2e test binaries
+        run: |
+          mkdir -p bin
+          cargo test --no-run -p coxswain-e2e --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .executable != null) | "\(.executable) \(.target.name)"' \
+            | while read -r src name; do cp "$src" "bin/$name"; done
+          cp target/debug/coxswain bin/coxswain
+
+      - name: Upload e2e binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-bins
+          path: bin/
+          retention-days: 1
+
+  e2e-gateway-api:
+    name: gateway_api
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
 
       - name: Create kind cluster
         uses: helm/kind-action@v1
         with:
-          cluster_name: coxswain-e2e
+          cluster_name: coxswain-e2e-gateway-api
 
       - name: Route pod CIDR to kind node
         run: |
-          # kind places nodes on a named "kind" network, not the default bridge.
-          KIND_NODE_IP=$(docker inspect coxswain-e2e-control-plane \
+          KIND_NODE_IP=$(docker inspect coxswain-e2e-gateway-api-control-plane \
             --format '{{ (index .NetworkSettings.Networks "kind").IPAddress }}')
-          # spec.podCIDR may not be populated; fall back to the kindnet default.
-          POD_CIDR=$(kubectl get node coxswain-e2e-control-plane \
+          POD_CIDR=$(kubectl get node coxswain-e2e-gateway-api-control-plane \
             -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
           POD_CIDR=${POD_CIDR:-10.244.0.0/16}
           echo "Routing $POD_CIDR via $KIND_NODE_IP"
@@ -64,18 +88,85 @@ jobs:
         run: |
           GW_VER=${{ steps.gw-version.outputs.version }}
           docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER}
-          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER} --name coxswain-e2e
+          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER} --name coxswain-e2e-gateway-api
           docker pull busybox:1.37
-          kind load docker-image busybox:1.37 --name coxswain-e2e
+          kind load docker-image busybox:1.37 --name coxswain-e2e-gateway-api
 
-      - name: Build coxswain binary
-        run: cargo build --bin coxswain
+      - name: Download e2e binaries
+        uses: actions/download-artifact@v7
+        with:
+          name: e2e-bins
+          path: bin/
 
-      - name: Run e2e tests
-        run: |
-          cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
-          cargo test -p coxswain-e2e --test ingress -- --test-threads=1
+      - name: Make binaries executable
+        run: chmod +x bin/coxswain bin/gateway_api
+
+      - name: Run e2e tests (gateway_api)
+        run: bin/gateway_api --test-threads=1
         env:
+          COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
+          RUST_LOG: coxswain_e2e=debug,warn
+
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          echo "=== Namespaces ==="
+          kubectl get namespaces -l coxswain-e2e=true
+          echo "=== Events ==="
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50
+          echo "=== HTTPRoutes ==="
+          kubectl get httproutes -A
+          echo "=== Ingresses ==="
+          kubectl get ingresses -A
+
+  e2e-ingress:
+    name: ingress
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: coxswain-e2e-ingress
+
+      - name: Route pod CIDR to kind node
+        run: |
+          KIND_NODE_IP=$(docker inspect coxswain-e2e-ingress-control-plane \
+            --format '{{ (index .NetworkSettings.Networks "kind").IPAddress }}')
+          POD_CIDR=$(kubectl get node coxswain-e2e-ingress-control-plane \
+            -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
+          POD_CIDR=${POD_CIDR:-10.244.0.0/16}
+          echo "Routing $POD_CIDR via $KIND_NODE_IP"
+          sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
+
+      - name: Read Gateway API version
+        id: gw-version
+        run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Pre-pull backend images into kind
+        run: |
+          GW_VER=${{ steps.gw-version.outputs.version }}
+          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER}
+          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER} --name coxswain-e2e-ingress
+          docker pull busybox:1.37
+          kind load docker-image busybox:1.37 --name coxswain-e2e-ingress
+
+      - name: Download e2e binaries
+        uses: actions/download-artifact@v7
+        with:
+          name: e2e-bins
+          path: bin/
+
+      - name: Make binaries executable
+        run: chmod +x bin/coxswain bin/ingress
+
+      - name: Run e2e tests (ingress)
+        run: bin/ingress --test-threads=1
+        env:
+          COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
           RUST_LOG: coxswain_e2e=debug,warn
 
       - name: Dump cluster state on failure
