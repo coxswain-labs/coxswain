@@ -1301,7 +1301,7 @@ async fn backend_tls_policy_re_encrypts_to_backend() -> anyhow::Result<()> {
         ],
     )
     .await?;
-    wait::wait_for_backends(&ns.name).await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
 
     h.apply(
         GATEWAY_API_BACKEND_TLS_POLICY,
@@ -1339,7 +1339,7 @@ async fn backend_tls_policy_rejects_unknown_ca() -> anyhow::Result<()> {
         ],
     )
     .await?;
-    wait::wait_for_backends(&ns.name).await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
 
     h.apply(
         GATEWAY_API_BACKEND_TLS_POLICY,
