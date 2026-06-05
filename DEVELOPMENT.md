@@ -198,6 +198,34 @@ kubectl apply -f deploy/dev/cross-namespace.yaml
 curl -s http://localhost:8082/routes | jq .    # lists all active hostnames
 ```
 
+## CI secrets
+
+### `GH_LABELER_PAT` — conformance label propagation
+
+The labeler workflow uses a fine-grained PAT instead of `GITHUB_TOKEN` so that
+when it applies `needs: conformance` to a PR, GitHub fires the `labeled` event
+and the conformance workflow starts automatically. (`GITHUB_TOKEN`-generated
+events are deliberately blocked from triggering downstream workflows.)
+
+**Initial setup or renewal:**
+
+```bash
+./scripts/refresh-labeler-pat.sh
+```
+
+The script opens the GitHub PAT creation page in your browser, then updates the
+`GH_LABELER_PAT` repo secret via `gh secret set` once you paste the new token.
+
+PAT settings:
+- Resource owner: `coxswain-labs`
+- Repository access: `coxswain-labs/coxswain` only
+- Permission: Pull requests → Read and write
+
+GitHub sends an email before the token expires. When you get it, run the script
+above to rotate it.
+
+---
+
 ## Cutting a release
 
 Coxswain uses [`cargo-release`](https://github.com/crate-ci/cargo-release) to version, tag, and publish releases.
