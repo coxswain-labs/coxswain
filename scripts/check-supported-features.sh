@@ -21,6 +21,16 @@ go_features=$(grep -v '^\s*//' "$GO_FILE" \
   | sed 's/features\.Support//' \
   | sort)
 
+if [ -z "$rust_features" ]; then
+  echo "ERROR: extracted zero features from $RUST_FILE — check the grep pattern."
+  exit 1
+fi
+
+if [ -z "$go_features" ]; then
+  echo "ERROR: extracted zero features from $GO_FILE — check the grep pattern."
+  exit 1
+fi
+
 if [ "$rust_features" = "$go_features" ]; then
   echo "OK: SUPPORTED_FEATURES in Rust and Go are in sync ($(echo "$rust_features" | wc -l | tr -d ' ') features)."
   exit 0

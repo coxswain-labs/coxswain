@@ -13,7 +13,9 @@ use crate::{
 use async_trait::async_trait;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::reference_grants::ReferenceGrantKey;
-use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, SharedRoutingTable};
+use coxswain_core::routing::{
+    BackendGroup, RouteEntry, RoutingTableBuilder, SharedRoutingTable, parse_app_protocol,
+};
 use coxswain_core::tls::{SharedTlsStore, TlsStoreBuilder};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -610,18 +612,19 @@ fn build_routes(
     // Ingress port. Per-Ingress defaults always win because they are installed on the
     // host router (matched first).
     if let Some(db) = ingress_default_backend {
-        let addrs =
+        let resolved =
             endpoints::resolve(&db.namespace, &db.name, db.port, slice_store, service_store);
-        if addrs.is_empty() {
+        if resolved.addrs.is_empty() {
             tracing::warn!(
                 svc = %format!("{}/{}", db.namespace, db.name),
                 "No ready endpoints for --ingress-default-backend — skipping"
             );
         } else {
-            let group = Arc::new(BackendGroup::new(
-                format!("{}/{}", db.namespace, db.name),
-                addrs,
-            ));
+            let protocol = parse_app_protocol(resolved.app_protocol.as_deref().unwrap_or(""));
+            let group = Arc::new(
+                BackendGroup::new(format!("{}/{}", db.namespace, db.name), resolved.addrs)
+                    .with_protocol(protocol),
+            );
             let svc_id = format!("{}/{}", db.namespace, db.name);
             for port in [ingress_ports.http, ingress_ports.https]
                 .into_iter()

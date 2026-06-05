@@ -16,6 +16,7 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRoute303RedirectStatusCode",
     "HTTPRoute307RedirectStatusCode",
     "HTTPRoute308RedirectStatusCode",
+    "HTTPRouteBackendProtocolWebSocket",
     "HTTPRouteBackendTimeout",
     "HTTPRouteDestinationPortMatching",
     "HTTPRouteHostRewrite",

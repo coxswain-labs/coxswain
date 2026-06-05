@@ -4,6 +4,36 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
+/// Wire protocol spoken by a backend, derived from `Service.spec.ports[].appProtocol`
+/// per [GEP-1911](https://gateway-api.sigs.k8s.io/geps/gep-1911/).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackendProtocol {
+    /// Plain HTTP/1.1 — the default when `appProtocol` is absent or unrecognised.
+    #[default]
+    Http1,
+    /// HTTP/2 cleartext (prior knowledge) — `kubernetes.io/h2c`.
+    H2c,
+    /// HTTP/1.1 with WebSocket upgrade — `kubernetes.io/ws`.
+    WebSocket,
+    /// HTTPS (TLS to upstream) — `https`.
+    Https,
+    /// WebSocket over TLS — `kubernetes.io/wss`.
+    WebSocketTls,
+}
+
+/// Parse a raw `appProtocol` string into a `BackendProtocol`.
+///
+/// Unknown or absent values map to `Http1` (the safe default).
+pub fn parse_app_protocol(raw: &str) -> BackendProtocol {
+    match raw {
+        "kubernetes.io/h2c" => BackendProtocol::H2c,
+        "kubernetes.io/ws" => BackendProtocol::WebSocket,
+        "kubernetes.io/wss" => BackendProtocol::WebSocketTls,
+        "https" => BackendProtocol::Https,
+        _ => BackendProtocol::Http1,
+    }
+}
+
 /// One backend service's resolved pod endpoints with a round-robin counter.
 struct BackendPool {
     addrs: Box<[SocketAddr]>,
@@ -134,6 +164,8 @@ pub struct BackendGroup {
     slot_counter: AtomicUsize,
     /// Flat snapshot of all pod addresses for the admin `/routes` endpoint.
     addrs_snapshot: Box<[SocketAddr]>,
+    /// Wire protocol for upstream connections, derived from `appProtocol`.
+    protocol: BackendProtocol,
 }
 
 impl BackendGroup {
@@ -152,6 +184,7 @@ impl BackendGroup {
             slots,
             slot_counter: AtomicUsize::new(0),
             addrs_snapshot,
+            protocol: BackendProtocol::default(),
         }
     }
 
@@ -196,6 +229,7 @@ impl BackendGroup {
             slots: slots.into_boxed_slice(),
             slot_counter: AtomicUsize::new(0),
             addrs_snapshot,
+            protocol: BackendProtocol::default(),
         }
     }
 
@@ -206,7 +240,19 @@ impl BackendGroup {
             slots: Box::new([]),
             slot_counter: AtomicUsize::new(0),
             addrs_snapshot: Box::new([]),
+            protocol: BackendProtocol::default(),
         }
+    }
+
+    /// Set the upstream transport protocol (builder-style).
+    pub fn with_protocol(mut self, protocol: BackendProtocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// Wire protocol for upstream connections.
+    pub fn protocol(&self) -> BackendProtocol {
+        self.protocol
     }
 
     /// Flat list of all pod addresses — used by the admin `/routes` endpoint.
@@ -349,5 +395,49 @@ impl RouteEntry {
             created_at,
             error_status: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod backend_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn parse_app_protocol_known_values() {
+        assert_eq!(
+            parse_app_protocol("kubernetes.io/h2c"),
+            BackendProtocol::H2c
+        );
+        assert_eq!(
+            parse_app_protocol("kubernetes.io/ws"),
+            BackendProtocol::WebSocket
+        );
+        assert_eq!(
+            parse_app_protocol("kubernetes.io/wss"),
+            BackendProtocol::WebSocketTls
+        );
+        assert_eq!(parse_app_protocol("https"), BackendProtocol::Https);
+    }
+
+    #[test]
+    fn parse_app_protocol_defaults_to_http1() {
+        assert_eq!(parse_app_protocol(""), BackendProtocol::Http1);
+        assert_eq!(parse_app_protocol("http"), BackendProtocol::Http1);
+        assert_eq!(
+            parse_app_protocol("example.com/custom"),
+            BackendProtocol::Http1
+        );
+    }
+
+    #[test]
+    fn upstream_with_protocol_round_trips() {
+        let u = BackendGroup::new("ns/svc".to_string(), vec![]).with_protocol(BackendProtocol::H2c);
+        assert_eq!(u.protocol(), BackendProtocol::H2c);
+    }
+
+    #[test]
+    fn upstream_default_protocol_is_http1() {
+        let u = BackendGroup::new("ns/svc".to_string(), vec![]);
+        assert_eq!(u.protocol(), BackendProtocol::Http1);
     }
 }
