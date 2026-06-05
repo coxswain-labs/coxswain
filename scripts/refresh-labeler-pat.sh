@@ -17,10 +17,8 @@ echo ""
 echo "Opening GitHub in your browser..."
 open "https://github.com/settings/personal-access-tokens/new"
 echo ""
-read -rsp "Paste the new PAT and press Enter: " pat
-echo
-
-gh secret set "$SECRET" --repo "$REPO" --body "$pat"
+echo "Paste the new PAT when prompted below (input is hidden by gh):"
+gh secret set "$SECRET" --repo "$REPO"
 
 echo "Done — $SECRET updated on $REPO."
 echo "The labeler workflow will use the new token on the next PR push."
