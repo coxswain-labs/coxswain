@@ -42,11 +42,19 @@ jobs:
       - name: Build coxswain binary
         run: cargo build --bin coxswain
 
-      - name: Upload coxswain binary
+      - name: Build e2e test binaries
+        run: |
+          mkdir -p bin
+          cargo test --no-run -p coxswain-e2e --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .executable != null) | "\(.executable) \(.target.name)"' \
+            | while read -r src name; do cp "$src" "bin/$name"; done
+          cp target/debug/coxswain bin/coxswain
+
+      - name: Upload e2e binaries
         uses: actions/upload-artifact@v7
         with:
-          name: coxswain-bin
-          path: target/debug/coxswain
+          name: e2e-bins
+          path: bin/
           retention-days: 1
 
   e2e-gateway-api:
@@ -56,17 +64,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-e2e-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-e2e-build-
 
       - name: Create kind cluster
         uses: helm/kind-action@v1
@@ -95,17 +92,17 @@ jobs:
           docker pull busybox:1.37
           kind load docker-image busybox:1.37 --name coxswain-e2e-gateway-api
 
-      - name: Download coxswain binary
+      - name: Download e2e binaries
         uses: actions/download-artifact@v7
         with:
-          name: coxswain-bin
+          name: e2e-bins
           path: bin/
 
-      - name: Make binary executable
-        run: chmod +x bin/coxswain
+      - name: Make binaries executable
+        run: chmod +x bin/coxswain bin/gateway_api
 
       - name: Run e2e tests (gateway_api)
-        run: cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
+        run: bin/gateway_api --test-threads=1
         env:
           COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
           RUST_LOG: coxswain_e2e=debug,warn
@@ -129,17 +126,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-e2e-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-e2e-build-
 
       - name: Create kind cluster
         uses: helm/kind-action@v1
@@ -168,17 +154,17 @@ jobs:
           docker pull busybox:1.37
           kind load docker-image busybox:1.37 --name coxswain-e2e-ingress
 
-      - name: Download coxswain binary
+      - name: Download e2e binaries
         uses: actions/download-artifact@v7
         with:
-          name: coxswain-bin
+          name: e2e-bins
           path: bin/
 
-      - name: Make binary executable
-        run: chmod +x bin/coxswain
+      - name: Make binaries executable
+        run: chmod +x bin/coxswain bin/ingress
 
       - name: Run e2e tests (ingress)
-        run: cargo test -p coxswain-e2e --test ingress -- --test-threads=1
+        run: bin/ingress --test-threads=1
         env:
           COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
           RUST_LOG: coxswain_e2e=debug,warn
