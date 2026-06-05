@@ -1,9 +1,9 @@
 use super::conditions::{has_condition, make_condition};
 use super::config::StatusAddress;
-use crate::tls::{GatewayListenerHealth, ListenerTlsOutcome};
-use gateway_api::apis::standard::gateways::{
+use crate::gw_types::v::gateways::{
     Gateway, GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
+use crate::tls::{GatewayListenerHealth, ListenerTlsOutcome};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Returns true when the Gateway's current status does not yet reflect the desired

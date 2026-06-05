@@ -56,10 +56,15 @@ jobs:
           echo "Routing $POD_CIDR via $KIND_NODE_IP"
           sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
 
+      - name: Read Gateway API version
+        id: gw-version
+        run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
+
       - name: Pre-pull backend images into kind
         run: |
-          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
-          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1 --name coxswain-e2e
+          GW_VER=${{ steps.gw-version.outputs.version }}
+          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER}
+          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER} --name coxswain-e2e
           docker pull busybox:1.37
           kind load docker-image busybox:1.37 --name coxswain-e2e
 

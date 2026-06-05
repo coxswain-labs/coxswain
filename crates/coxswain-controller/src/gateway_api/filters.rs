@@ -1,10 +1,10 @@
+use crate::gw_types::v::httproutes::{
+    HttpRouteRulesFilters, HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType,
+    HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesQueryParamsType,
+};
 use coxswain_core::routing::{
     FilterAction, HeaderMod, HeaderPredicate, MatchPredicates, PathModifier, QueryPredicate,
     ValueMatch,
-};
-use gateway_api::apis::standard::httproutes::{
-    HttpRouteRulesFilters, HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType,
-    HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesQueryParamsType,
 };
 use http::{HeaderName, Method};
 use regex::Regex;
@@ -76,7 +76,7 @@ pub(super) fn build_filters(
                 };
                 let path = parse_redirect_path(&r.path, matched_prefix, is_prefix_match);
                 let scheme = r.scheme.as_ref().map(|s| {
-                    use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirectScheme;
+                    use crate::gw_types::v::httproutes::HttpRouteRulesFiltersRequestRedirectScheme;
                     match s {
                         HttpRouteRulesFiltersRequestRedirectScheme::Http => "http".to_string(),
                         HttpRouteRulesFiltersRequestRedirectScheme::Https => "https".to_string(),
@@ -113,19 +113,22 @@ pub(super) fn build_filters(
                     "Skipping unsupported HTTPRouteFilter type"
                 );
             }
+            // ExternalAuth is an alpha filter that only exists in the experimental channel.
+            #[cfg(feature = "experimental")]
+            HttpRouteRulesFiltersType::ExternalAuth => {
+                tracing::warn!("Skipping ExternalAuth filter — not yet implemented");
+            }
         }
     }
     out
 }
 
 fn parse_redirect_path(
-    path: &Option<
-        gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirectPath,
-    >,
+    path: &Option<crate::gw_types::v::httproutes::HttpRouteRulesFiltersRequestRedirectPath>,
     matched_prefix: &str,
     is_prefix_match: bool,
 ) -> Option<PathModifier> {
-    use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersRequestRedirectPathType;
+    use crate::gw_types::v::httproutes::HttpRouteRulesFiltersRequestRedirectPathType;
     let p = path.as_ref()?;
     match p.r#type {
         HttpRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath => Some(
@@ -147,11 +150,11 @@ fn parse_redirect_path(
 }
 
 fn parse_url_rewrite_path(
-    path: &gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersUrlRewritePath,
+    path: &crate::gw_types::v::httproutes::HttpRouteRulesFiltersUrlRewritePath,
     matched_prefix: &str,
     is_prefix_match: bool,
 ) -> Option<PathModifier> {
-    use gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersUrlRewritePathType;
+    use crate::gw_types::v::httproutes::HttpRouteRulesFiltersUrlRewritePathType;
     match path.r#type {
         HttpRouteRulesFiltersUrlRewritePathType::ReplaceFullPath => Some(
             PathModifier::ReplaceFullPath(path.replace_full_path.clone().unwrap_or_default()),
@@ -175,7 +178,7 @@ fn parse_url_rewrite_path(
 ///
 /// Returns `None` if any regex pattern in the headers or query predicates is invalid.
 pub(super) fn build_predicates(
-    m: &gateway_api::apis::standard::httproutes::HttpRouteRulesMatches,
+    m: &crate::gw_types::v::httproutes::HttpRouteRulesMatches,
 ) -> Option<MatchPredicates> {
     // ── Method ────────────────────────────────────────────────────────────
     let method: Option<Method> = match m.method.as_ref() {

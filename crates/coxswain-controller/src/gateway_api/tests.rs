@@ -1,12 +1,12 @@
 use super::*;
-use coxswain_core::ownership::ObjectKey;
-use coxswain_core::routing::RoutingTableBuilder;
-use gateway_api::apis::standard::httproutes::{
+use crate::gw_types::v::httproutes::{
     HTTPRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
     HttpRouteRulesMatches, HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType,
     HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType,
     HttpRouteRulesMatchesQueryParams, HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
 };
+use coxswain_core::ownership::ObjectKey;
+use coxswain_core::routing::RoutingTableBuilder;
 use http::{HeaderMap, HeaderName, Method};
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use kube::api::ObjectMeta;

@@ -1,3 +1,8 @@
+use crate::gw_types::v::gatewayclasses::GatewayClass;
+use crate::gw_types::v::gateways::Gateway;
+use crate::gw_types::v::httproutes::{
+    HTTPRoute, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+};
 use crate::keys::RouteParentKey;
 use crate::tls::{
     GatewayListenerHealth, HttpRouteHealthMap, RouteParentHealth, SharedGatewayListenerHealth,
@@ -6,11 +11,6 @@ use crate::tls::{
 use async_trait::async_trait;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use futures::StreamExt;
-use gateway_api::apis::standard::gatewayclasses::GatewayClass;
-use gateway_api::apis::standard::gateways::Gateway;
-use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
-};
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{

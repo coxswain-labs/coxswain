@@ -1,4 +1,10 @@
 use crate::endpoints;
+use crate::gw_types::v::gateways::{
+    Gateway, GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode,
+};
+use crate::gw_types::v::httproutes::{
+    HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFiltersType, HttpRouteRulesMatchesPathType,
+};
 use crate::keys::ListenerKey;
 use crate::tls::{GatewayListenerHealth, HttpRouteHealthMap, ListenerTlsOutcome, load_tls_cert};
 use crate::translate::metadata_created_at;
@@ -8,12 +14,6 @@ use coxswain_core::routing::{
     HostRouterBuilder, MatchPredicates, RouteEntry, RoutingTableBuilder, Upstream,
 };
 use coxswain_core::tls::TlsStoreBuilder;
-use gateway_api::apis::standard::gateways::{
-    Gateway, GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode,
-};
-use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFiltersType, HttpRouteRulesMatchesPathType,
-};
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
@@ -243,7 +243,7 @@ impl GatewayApiReconciler {
     fn resolve_listener_tls(
         gw_ns: &str,
         gw_name: &str,
-        listener: &gateway_api::apis::standard::gateways::GatewayListeners,
+        listener: &crate::gw_types::v::gateways::GatewayListeners,
         secrets: &reflector::Store<Secret>,
         cert_grants: &HashSet<ReferenceGrantKey>,
         builder: &mut TlsStoreBuilder,
@@ -409,7 +409,7 @@ impl GatewayApiReconciler {
 /// When no listener info is available (tests/misconfigured), port 80 is used as a fallback.
 fn compute_listener_bindings(
     route_hostnames: &[&str],
-    parent_refs: &[gateway_api::apis::standard::httproutes::HttpRouteParentRefs],
+    parent_refs: &[crate::gw_types::v::httproutes::HttpRouteParentRefs],
     route_ns: &str,
     listener_info: &HashMap<ListenerKey, ListenerBinding>,
 ) -> Vec<(Option<String>, u16)> {
@@ -540,8 +540,8 @@ fn compute_listener_bindings(
 #[allow(clippy::too_many_arguments)]
 fn apply_rule(
     pb: &mut HostRouterBuilder,
-    rule: &gateway_api::apis::standard::httproutes::HttpRouteRules,
-    rule_filters: &[gateway_api::apis::standard::httproutes::HttpRouteRulesFilters],
+    rule: &crate::gw_types::v::httproutes::HttpRouteRules,
+    rule_filters: &[crate::gw_types::v::httproutes::HttpRouteRulesFilters],
     rule_timeouts: &coxswain_core::routing::RouteTimeouts,
     upstream: &Arc<Upstream>,
     error_status: Option<u16>,

@@ -1,5 +1,5 @@
 use super::conditions::{gateway_class_accepted, make_condition};
-use gateway_api::apis::standard::gatewayclasses::GatewayClass;
+use crate::gw_types::v::gatewayclasses::GatewayClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
 /// All Gateway API feature names Coxswain advertises support for.
@@ -69,7 +69,7 @@ pub(super) fn build_gateway_class_status_patch(generation: i64, now: &Time) -> s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway_api::apis::standard::gatewayclasses::{
+    use crate::gw_types::v::gatewayclasses::{
         GatewayClass, GatewayClassStatus, GatewayClassStatusSupportedFeatures,
     };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;

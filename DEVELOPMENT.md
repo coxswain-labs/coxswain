@@ -67,7 +67,7 @@ When developing locally, run the binary directly on your machine. It discovers t
 The Gateway API CRDs are not bundled with Kubernetes and must be installed once per cluster:
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
+kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$(cat .gateway-api-version)/standard-install.yaml"
 ```
 
 ### 2. Apply the cluster manifests

@@ -9,6 +9,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Expose alpha Gateway API resources and experimental fields. For contributor/CI
+# use only — never enabled in release builds. See docs/gateway-api-support.md.
+experimental = ["gateway-api/experimental"]
+
 [dependencies]
 arc-swap = { workspace = true }
 tracing = { workspace = true }
