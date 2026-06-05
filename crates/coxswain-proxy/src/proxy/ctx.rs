@@ -1,4 +1,4 @@
-use coxswain_core::routing::{FilterAction, RouteTimeouts, Upstream};
+use coxswain_core::routing::{BackendGroup, FilterAction, RouteTimeouts};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,7 +21,7 @@ tokio::task_local! {
 
 /// Routing result cached from `request_filter` for use in later hooks.
 pub struct ResolvedRoute {
-    pub upstream: Arc<Upstream>,
+    pub backend_group: Arc<BackendGroup>,
     pub filters: Arc<[FilterAction]>,
     pub timeouts: RouteTimeouts,
     pub original_host: String,

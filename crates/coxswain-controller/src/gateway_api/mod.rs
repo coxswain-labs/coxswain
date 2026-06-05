@@ -11,7 +11,7 @@ use crate::translate::metadata_created_at;
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
-    HostRouterBuilder, MatchPredicates, RouteEntry, RoutingTableBuilder, Upstream,
+    BackendGroup, HostRouterBuilder, MatchPredicates, RouteEntry, RoutingTableBuilder,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -135,9 +135,9 @@ impl GatewayApiReconciler {
                 .iter()
                 .any(|f| matches!(f.r#type, HttpRouteRulesFiltersType::RequestRedirect));
 
-            let (upstream, error_status) = if has_redirect {
+            let (group, error_status) = if has_redirect {
                 (
-                    Arc::new(Upstream::new(
+                    Arc::new(BackendGroup::new(
                         format!("{route_ns}/redirect-sentinel"),
                         vec![],
                     )),
@@ -156,16 +156,16 @@ impl GatewayApiReconciler {
                     services,
                     grants,
                 );
-                let upstream_name = upstream_name(backend_refs, route_ns);
-                let upstream = Arc::new(Upstream::weighted(upstream_name, weighted));
-                if upstream.endpoints().is_empty() {
+                let group_name = backend_group_name(backend_refs, route_ns);
+                let group = Arc::new(BackendGroup::weighted(group_name, weighted));
+                if group.endpoints().is_empty() {
                     tracing::warn!(
                         route = ?route.metadata.name,
                         "No ready endpoints for rule — installing error route (500)"
                     );
-                    (upstream, Some(500u16))
+                    (group, Some(500u16))
                 } else {
-                    (upstream, None)
+                    (group, None)
                 }
             };
 
@@ -181,7 +181,7 @@ impl GatewayApiReconciler {
                     rule,
                     rule_filters,
                     &rule_timeouts,
-                    &upstream,
+                    &group,
                     error_status,
                     &route_id,
                     created_at,
@@ -543,7 +543,7 @@ fn apply_rule(
     rule: &crate::gw_types::v::httproutes::HttpRouteRules,
     rule_filters: &[crate::gw_types::v::httproutes::HttpRouteRulesFilters],
     rule_timeouts: &coxswain_core::routing::RouteTimeouts,
-    upstream: &Arc<Upstream>,
+    group: &Arc<BackendGroup>,
     error_status: Option<u16>,
     route_id: &str,
     created_at: Option<SystemTime>,
@@ -552,7 +552,7 @@ fn apply_rule(
         None | Some([]) => {
             let filter_list = filters::build_filters(rule_filters, "/", false);
             let mut e = RouteEntry::with_filters(
-                Arc::clone(upstream),
+                Arc::clone(group),
                 MatchPredicates::default(),
                 filter_list,
                 rule_timeouts.clone(),
@@ -588,7 +588,7 @@ fn apply_rule(
                 let filter_list = filters::build_filters(rule_filters, val, is_prefix);
 
                 let mut e = RouteEntry::with_filters(
-                    Arc::clone(upstream),
+                    Arc::clone(group),
                     predicates,
                     filter_list,
                     rule_timeouts.clone(),
@@ -623,8 +623,8 @@ fn weight_of(b: &HttpRouteRulesBackendRefs) -> u16 {
     }
 }
 
-/// Build a logging-only upstream name for a rule's backend pool.
-fn upstream_name(refs: &[HttpRouteRulesBackendRefs], ns: &str) -> String {
+/// Build a logging-only name for a rule's backend group.
+fn backend_group_name(refs: &[HttpRouteRulesBackendRefs], ns: &str) -> String {
     match refs {
         [] => format!("{ns}/empty"),
         [single] => format!("{ns}/{}", single.name),

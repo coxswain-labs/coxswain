@@ -1,4 +1,4 @@
-use coxswain_core::routing::{RequestContext, RouteOutcome, SharedRoutingTable, Upstream};
+use coxswain_core::routing::{BackendGroup, RequestContext, RouteOutcome, SharedRoutingTable};
 use std::sync::Arc;
 
 /// Lock-free routing engine for the request hot path.
@@ -11,14 +11,14 @@ impl RoutingEngine {
         Self { table }
     }
 
-    /// Like [`find`] but returns only the upstream, without host/path distinction.
+    /// Like [`find`] but returns only the backend group, without host/path distinction.
     pub fn route(
         &self,
         port: u16,
         host: &str,
         path: &str,
         ctx: &RequestContext<'_>,
-    ) -> Option<Arc<Upstream>> {
+    ) -> Option<Arc<BackendGroup>> {
         self.table.load().route(port, host, path, ctx)
     }
 
