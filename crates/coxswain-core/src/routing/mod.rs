@@ -9,8 +9,9 @@ mod predicate;
 
 pub use builder::{PortTableBuilder, RoutingTableBuilder};
 pub use entry::{
-    BackendGroup, BackendProtocol, FilterAction, HeaderMod, PathModifier, RouteConflict,
-    RouteEntry, RouteInfo, RouteKind, RouteTimeouts, parse_app_protocol,
+    BackendCaSource, BackendGroup, BackendProtocol, BackendTlsConfig, FilterAction, HeaderMod,
+    PathModifier, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts, Selection,
+    parse_app_protocol,
 };
 pub use host_router::{HostRouter, HostRouterBuilder};
 pub use predicate::{HeaderPredicate, MatchPredicates, QueryPredicate, RequestContext, ValueMatch};

@@ -252,7 +252,7 @@ fn round_robin_cycles() {
         "10.0.0.3:80".parse().unwrap(),
     ];
     let up = BackendGroup::new("svc".to_string(), addrs.clone());
-    let results: Vec<SocketAddr> = (0..6).map(|_| up.next_endpoint().unwrap()).collect();
+    let results: Vec<SocketAddr> = (0..6).map(|_| up.next_endpoint().unwrap().addr).collect();
     assert_eq!(
         results,
         [addrs[0], addrs[1], addrs[2], addrs[0], addrs[1], addrs[2]]
@@ -267,13 +267,16 @@ fn weighted_round_robin_distributes_proportionally() {
 
     // Backend A: 2 pods, weight 4.  Backend B: 1 pod, weight 1.
     // Expected: P(A) = 4/5 = 80%.
-    let up = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a1, a2], 4), (vec![b1], 1)]);
+    let up = BackendGroup::weighted(
+        "ns/svc".to_string(),
+        vec![(vec![a1, a2], 4, None), (vec![b1], 1, None)],
+    );
 
     let n = 1000;
     let mut a_count = 0usize;
     let mut b_count = 0usize;
     for _ in 0..n {
-        let addr = up.next_endpoint().unwrap();
+        let addr = up.next_endpoint().unwrap().addr;
         if addr == a1 || addr == a2 {
             a_count += 1;
         } else if addr == b1 {
@@ -294,16 +297,19 @@ fn weighted_zero_weight_backend_gets_no_traffic() {
     let a1: SocketAddr = "10.0.0.1:80".parse().unwrap();
     let b1: SocketAddr = "10.0.1.1:80".parse().unwrap();
 
-    let up = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a1], 0), (vec![b1], 1)]);
+    let up = BackendGroup::weighted(
+        "ns/svc".to_string(),
+        vec![(vec![a1], 0, None), (vec![b1], 1, None)],
+    );
     for _ in 0..100 {
-        assert_eq!(up.next_endpoint().unwrap(), b1);
+        assert_eq!(up.next_endpoint().unwrap().addr, b1);
     }
 }
 
 #[test]
 fn weighted_all_zero_is_empty() {
     let a1: SocketAddr = "10.0.0.1:80".parse().unwrap();
-    let up = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a1], 0)]);
+    let up = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a1], 0, None)]);
     assert!(up.next_endpoint().is_none());
 }
 
@@ -313,8 +319,11 @@ fn weighted_equal_weights_uniform() {
     let b1: SocketAddr = "10.0.1.1:80".parse().unwrap();
 
     // Equal weights → after GCD reduction both get 1 slot → 50/50.
-    let up = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a1], 5), (vec![b1], 5)]);
-    let results: Vec<SocketAddr> = (0..4).map(|_| up.next_endpoint().unwrap()).collect();
+    let up = BackendGroup::weighted(
+        "ns/svc".to_string(),
+        vec![(vec![a1], 5, None), (vec![b1], 5, None)],
+    );
+    let results: Vec<SocketAddr> = (0..4).map(|_| up.next_endpoint().unwrap().addr).collect();
     // slots = [0, 1] after reduction; cycling: a1, b1, a1, b1
     assert_eq!(results, [a1, b1, a1, b1]);
 }

@@ -71,6 +71,9 @@ func TestConformance(t *testing.T) {
 		// connections from clients, not just use h2c on the upstream leg.
 		// Deferred until downstream h2c is implemented — see #32.
 		features.SupportHTTPRouteBackendProtocolWebSocket,
+		// Extended: upstream re-encryption via BackendTLSPolicy — GEP-1897 (#16)
+		// SANs (SupportBackendTLSPolicySANValidation) tracked separately in #133.
+		features.SupportBackendTLSPolicy,
 	)
 
 	conformance.RunConformanceWithOptions(t, opts)

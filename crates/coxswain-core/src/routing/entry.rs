@@ -1,8 +1,71 @@
 use crate::routing::predicate::MatchPredicates;
+use std::any::Any;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
+
+/// CA bundle source for upstream TLS verification (from `BackendTLSPolicy`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackendCaSource {
+    /// Use the platform's native root CA store (`wellKnownCACertificates: System`).
+    System,
+    /// PEM-encoded CA bundle from one or more ConfigMap refs (concatenated).
+    Pem(Vec<u8>),
+}
+
+/// TLS configuration for a single backend pool, derived from an attached `BackendTLSPolicy`.
+pub struct BackendTlsConfig {
+    /// SNI hostname sent to the backend, and the name used for certificate verification.
+    pub sni_hostname: String,
+    /// CA bundle used to verify the backend's certificate.
+    pub ca_source: BackendCaSource,
+    /// Stable opaque key for Pingora connection-pool isolation.
+    ///
+    /// Pingora's `Hash for HttpPeer` does not include the `ca` field, so two policies with
+    /// identical addr+SNI+verify flags but different CA bundles would share pooled connections.
+    /// Setting `peer.group_key = cfg.group_key` ensures the pool keys them apart.
+    pub group_key: u64,
+    /// Lazily-parsed CA stack; initialised once on first proxy use, then reused for the
+    /// lifetime of this `Arc`. Dropping the `Arc` drops the parsed stack with it.
+    parsed: OnceLock<Arc<dyn Any + Send + Sync>>,
+}
+
+impl BackendTlsConfig {
+    pub fn new(sni_hostname: String, ca_source: BackendCaSource, group_key: u64) -> Self {
+        Self {
+            sni_hostname,
+            ca_source,
+            group_key,
+            parsed: OnceLock::new(),
+        }
+    }
+
+    /// Get or initialise the parsed CA stack.  The closure is called at most once.
+    pub fn parsed_or_init<F>(&self, init: F) -> &Arc<dyn Any + Send + Sync>
+    where
+        F: FnOnce() -> Arc<dyn Any + Send + Sync>,
+    {
+        self.parsed.get_or_init(init)
+    }
+}
+
+impl std::fmt::Debug for BackendTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendTlsConfig")
+            .field("sni_hostname", &self.sni_hostname)
+            .field("ca_source", &self.ca_source)
+            .field("group_key", &self.group_key)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The result of a single `next_endpoint` call: the chosen pod address and the
+/// optional per-pool TLS configuration that must be used to reach it.
+pub struct Selection<'a> {
+    pub addr: SocketAddr,
+    pub tls_config: Option<&'a Arc<BackendTlsConfig>>,
+}
 
 /// Wire protocol spoken by a backend, derived from `Service.spec.ports[].appProtocol`
 /// per [GEP-1911](https://gateway-api.sigs.k8s.io/geps/gep-1911/).
@@ -38,13 +101,15 @@ pub fn parse_app_protocol(raw: &str) -> BackendProtocol {
 struct BackendPool {
     addrs: Box<[SocketAddr]>,
     rr: AtomicUsize,
+    tls_config: Option<Arc<BackendTlsConfig>>,
 }
 
 impl BackendPool {
-    fn new(addrs: Vec<SocketAddr>) -> Self {
+    fn new(addrs: Vec<SocketAddr>, tls_config: Option<Arc<BackendTlsConfig>>) -> Self {
         Self {
             addrs: addrs.into_boxed_slice(),
             rr: AtomicUsize::new(0),
+            tls_config,
         }
     }
 
@@ -177,7 +242,7 @@ impl BackendGroup {
         }
         let addrs_snapshot = endpoints.clone().into_boxed_slice();
         let slots = vec![0u16].into_boxed_slice();
-        let backends = Box::new([BackendPool::new(endpoints)]);
+        let backends = Box::new([BackendPool::new(endpoints, None)]);
         Self {
             name,
             backends,
@@ -190,20 +255,23 @@ impl BackendGroup {
 
     /// Weighted constructor for multi-backend Gateway API rules.
     ///
-    /// `weighted` is `[(pod_addrs_for_backend, weight), ...]` — one entry per
-    /// `backendRef`. Backends with `weight == 0` or empty address lists are
-    /// dropped. Returns an empty `BackendGroup` when all weights resolve to zero.
-    pub fn weighted(name: String, weighted: Vec<(Vec<SocketAddr>, u16)>) -> Self {
-        let pools: Vec<(Vec<SocketAddr>, u16)> = weighted
+    /// `weighted` is `[(pod_addrs, weight, tls_config), ...]` — one entry per `backendRef`.
+    /// Backends with `weight == 0` or empty address lists are dropped.
+    /// Returns an empty `BackendGroup` when all weights resolve to zero.
+    pub fn weighted(
+        name: String,
+        weighted: Vec<(Vec<SocketAddr>, u16, Option<Arc<BackendTlsConfig>>)>,
+    ) -> Self {
+        let pools: Vec<(Vec<SocketAddr>, u16, Option<Arc<BackendTlsConfig>>)> = weighted
             .into_iter()
-            .filter(|(addrs, w)| *w > 0 && !addrs.is_empty())
+            .filter(|(addrs, w, _)| *w > 0 && !addrs.is_empty())
             .collect();
 
         if pools.is_empty() {
             return Self::empty(name);
         }
 
-        let weights: Vec<u16> = pools.iter().map(|(_, w)| *w).collect();
+        let weights: Vec<u16> = pools.iter().map(|(_, w, _)| *w).collect();
         let reduced = gcd_reduce(&weights);
 
         let mut slots: Vec<u16> = Vec::with_capacity(reduced.iter().map(|&w| w as usize).sum());
@@ -215,12 +283,12 @@ impl BackendGroup {
 
         let addrs_snapshot: Box<[SocketAddr]> = pools
             .iter()
-            .flat_map(|(addrs, _)| addrs.iter().copied())
+            .flat_map(|(addrs, _, _)| addrs.iter().copied())
             .collect();
 
         let backends: Box<[BackendPool]> = pools
             .into_iter()
-            .map(|(addrs, _)| BackendPool::new(addrs))
+            .map(|(addrs, _, tls)| BackendPool::new(addrs, tls))
             .collect();
 
         Self {
@@ -250,6 +318,15 @@ impl BackendGroup {
         self
     }
 
+    /// Set a single TLS config on all pools (builder-style).
+    /// Used for single-backend routes; use the `weighted` constructor for per-pool configs.
+    pub fn with_tls(mut self, tls: Arc<BackendTlsConfig>) -> Self {
+        for pool in self.backends.iter_mut() {
+            pool.tls_config = Some(Arc::clone(&tls));
+        }
+        self
+    }
+
     /// Wire protocol for upstream connections.
     pub fn protocol(&self) -> BackendProtocol {
         self.protocol
@@ -260,16 +337,19 @@ impl BackendGroup {
         &self.addrs_snapshot
     }
 
-    /// Returns the next endpoint using weighted round-robin.
+    /// Returns the next endpoint using weighted round-robin, along with its TLS config.
     ///
     /// Returns `None` when there are no active endpoints.
-    pub fn next_endpoint(&self) -> Option<SocketAddr> {
+    pub fn next_endpoint(&self) -> Option<Selection<'_>> {
         if self.slots.is_empty() {
             return None;
         }
         let slot = self.slot_counter.fetch_add(1, Ordering::Relaxed) % self.slots.len();
         let pool = &self.backends[self.slots[slot] as usize];
-        Some(pool.next())
+        Some(Selection {
+            addr: pool.next(),
+            tls_config: pool.tls_config.as_ref(),
+        })
     }
 }
 
@@ -401,6 +481,19 @@ impl RouteEntry {
 #[cfg(test)]
 mod backend_protocol_tests {
     use super::*;
+    use std::net::SocketAddr;
+
+    fn addr(ip: &str, port: u16) -> SocketAddr {
+        format!("{ip}:{port}").parse().unwrap()
+    }
+
+    fn tls_cfg(sni: &str) -> Arc<BackendTlsConfig> {
+        Arc::new(BackendTlsConfig::new(
+            sni.to_string(),
+            BackendCaSource::System,
+            42,
+        ))
+    }
 
     #[test]
     fn parse_app_protocol_known_values() {
@@ -439,5 +532,51 @@ mod backend_protocol_tests {
     fn upstream_default_protocol_is_http1() {
         let u = BackendGroup::new("ns/svc".to_string(), vec![]);
         assert_eq!(u.protocol(), BackendProtocol::Http1);
+    }
+
+    #[test]
+    fn new_group_has_no_tls_by_default() {
+        let addrs = vec![addr("10.0.0.1", 80)];
+        let g = BackendGroup::new("ns/svc".to_string(), addrs);
+        let sel = g.next_endpoint().unwrap();
+        assert!(sel.tls_config.is_none());
+    }
+
+    #[test]
+    fn with_tls_sets_config_on_single_pool() {
+        let addrs = vec![addr("10.0.0.1", 443)];
+        let cfg = tls_cfg("backend.example.com");
+        let g = BackendGroup::new("ns/svc".to_string(), addrs).with_tls(Arc::clone(&cfg));
+        let sel = g.next_endpoint().unwrap();
+        let found = sel.tls_config.unwrap();
+        assert_eq!(found.sni_hostname, "backend.example.com");
+        assert_eq!(found.group_key, 42);
+    }
+
+    #[test]
+    fn weighted_preserves_per_pool_tls_config() {
+        let cfg_a = tls_cfg("a.example.com");
+        let weighted = vec![
+            (vec![addr("10.0.0.1", 443)], 1u16, Some(Arc::clone(&cfg_a))),
+            (vec![addr("10.0.0.2", 80)], 1u16, None),
+        ];
+        let g = BackendGroup::weighted("ns/mixed".to_string(), weighted);
+        // Collect 4 selections to cover both pools.
+        let selections: Vec<_> = (0..4)
+            .map(|_| {
+                let s = g.next_endpoint().unwrap();
+                (s.addr.port(), s.tls_config.is_some())
+            })
+            .collect();
+        let has_tls = selections.iter().filter(|(_, tls)| *tls).count();
+        let no_tls = selections.iter().filter(|(_, tls)| !tls).count();
+        assert!(has_tls > 0, "at least one selection should have TLS");
+        assert!(no_tls > 0, "at least one selection should have no TLS");
+    }
+
+    #[test]
+    fn empty_group_returns_none_from_next_endpoint() {
+        let g = BackendGroup::new("ns/empty".to_string(), vec![]);
+        assert!(g.next_endpoint().is_none());
     }
 }

@@ -1,3 +1,4 @@
+use crate::gw_types::v::backendtlspolicies::BackendTLSPolicy;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::httproutes::{
@@ -5,8 +6,8 @@ use crate::gw_types::v::httproutes::{
 };
 use crate::keys::RouteParentKey;
 use crate::tls::{
-    GatewayListenerHealth, HttpRouteHealthMap, RouteParentHealth, SharedGatewayListenerHealth,
-    SharedHttpRouteHealth,
+    GatewayListenerHealth, HttpRouteHealthMap, RouteParentHealth, SharedBackendTlsPolicyHealth,
+    SharedGatewayListenerHealth, SharedHttpRouteHealth,
 };
 use async_trait::async_trait;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
@@ -25,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod backend_tls_policy_status;
 mod conditions;
 mod config;
 mod gateway_class_status;
@@ -33,6 +35,7 @@ mod ingress_status;
 
 pub use config::{ControllerConfig, StatusAddress};
 
+use backend_tls_policy_status::{build_backend_tls_policy_status_patch, policy_needs_status_patch};
 use conditions::{
     filter_owned_parent_refs, gateway_accepted, http_route_programmed, make_condition,
 };
@@ -54,13 +57,14 @@ where
 }
 
 /// Kubernetes watch loop for leader election and writing status conditions
-/// back to `HTTPRoute`, `Gateway`, and `GatewayClass` resources.
+/// back to `HTTPRoute`, `Gateway`, `GatewayClass`, and `BackendTLSPolicy` resources.
 pub struct Controller {
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
     owned_gateways: OwnedGateways,
     tls_health: SharedGatewayListenerHealth,
     route_health: SharedHttpRouteHealth,
+    btp_health: SharedBackendTlsPolicyHealth,
     config: ControllerConfig,
 }
 
@@ -71,6 +75,7 @@ impl Controller {
         owned_gateways: OwnedGateways,
         tls_health: SharedGatewayListenerHealth,
         route_health: SharedHttpRouteHealth,
+        btp_health: SharedBackendTlsPolicyHealth,
         config: ControllerConfig,
     ) -> Self {
         Self {
@@ -79,6 +84,7 @@ impl Controller {
             owned_gateways,
             tls_health,
             route_health,
+            btp_health,
             config,
         }
     }
@@ -108,6 +114,11 @@ impl Controller {
             watcher::Config::default(),
         )
         .default_backoff();
+        let btp_watcher = watcher(
+            scoped_api::<BackendTLSPolicy>(client.clone(), self.config.watch_namespace.as_deref()),
+            watcher::Config::default(),
+        )
+        .default_backoff();
         let gateway_class_watcher = watcher(
             Api::<GatewayClass>::all(client.clone()),
             watcher::Config::default(),
@@ -130,6 +141,7 @@ impl Controller {
         .default_backoff();
 
         tokio::pin!(route_watcher);
+        tokio::pin!(btp_watcher);
         tokio::pin!(gateway_class_watcher);
         tokio::pin!(gateway_watcher);
         tokio::pin!(ingress_class_watcher);
@@ -143,6 +155,9 @@ impl Controller {
 
         // Subset of owned IngressClasses annotated `is-default-class: "true"`.
         let mut owned_default_ingress_classes: HashSet<String> = HashSet::new();
+
+        // Local cache of known BackendTLSPolicy objects.
+        let mut known_policies: HashMap<ObjectKey, BackendTLSPolicy> = HashMap::new();
 
         // Local cache of known Gateway objects.
         let mut known_gateways: HashMap<ObjectKey, Gateway> = HashMap::new();
@@ -329,6 +344,55 @@ impl Controller {
                             &rh,
                         )
                         .await;
+                    }
+                }
+
+                Some(event) = btp_watcher.next() => {
+                    match event {
+                        Ok(watcher::Event::Apply(policy) | watcher::Event::InitApply(policy)) => {
+                            let ns = policy.metadata.namespace.clone().unwrap_or_default();
+                            let name = policy.metadata.name.clone().unwrap_or_default();
+                            known_policies.insert(ObjectKey::new(ns, name), policy.clone());
+                            if is_leader {
+                                let health_map = self.btp_health.load();
+                                let key = crate::tls::PolicyKey {
+                                    ns: policy.metadata.namespace.clone().unwrap_or_default(),
+                                    name: policy.metadata.name.clone().unwrap_or_default(),
+                                };
+                                if let Some(health) = health_map.get(&key)
+                                    && policy_needs_status_patch(&policy, health, &self.config.controller_name)
+                                {
+                                    let now = Time(k8s_openapi::jiff::Timestamp::now());
+                                    Self::patch_btp_status(&client, &policy, health, &self.config.controller_name, &now).await;
+                                }
+                            }
+                        }
+                        Ok(watcher::Event::Delete(policy)) => {
+                            let ns = policy.metadata.namespace.clone().unwrap_or_default();
+                            let name = policy.metadata.name.clone().unwrap_or_default();
+                            known_policies.remove(&ObjectKey::new(ns, name));
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "BackendTLSPolicy watch error — Gateway API CRDs may not be installed"),
+                    }
+                }
+
+                _ = self.btp_health.notified() => {
+                    if !is_leader {
+                        continue;
+                    }
+                    let health_map = self.btp_health.load();
+                    for (key, policy) in &known_policies {
+                        let policy_key = crate::tls::PolicyKey {
+                            ns: key.ns.clone(),
+                            name: key.name.clone(),
+                        };
+                        if let Some(health) = health_map.get(&policy_key)
+                            && policy_needs_status_patch(policy, health, &self.config.controller_name)
+                        {
+                            let now = Time(k8s_openapi::jiff::Timestamp::now());
+                            Self::patch_btp_status(&client, policy, health, &self.config.controller_name, &now).await;
+                        }
                     }
                 }
 
@@ -573,6 +637,31 @@ impl Controller {
         {
             Ok(_) => tracing::info!(name, ns, "Ingress loadBalancer status patched"),
             Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Ingress status"),
+        }
+    }
+
+    async fn patch_btp_status(
+        client: &Client,
+        policy: &BackendTLSPolicy,
+        health: &crate::tls::BackendTlsPolicyAncestorHealth,
+        controller_name: &str,
+        now: &Time,
+    ) {
+        let name = match policy.metadata.name.as_deref() {
+            Some(n) => n,
+            None => return,
+        };
+        let ns = policy.metadata.namespace.as_deref().unwrap_or("default");
+        let api: Api<BackendTLSPolicy> = Api::namespaced(client.clone(), ns);
+        let patch = build_backend_tls_policy_status_patch(policy, health, controller_name, now);
+        match api
+            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => tracing::info!(name, ns, "BackendTLSPolicy status patched"),
+            Err(e) => {
+                tracing::warn!(name, ns, error = %e, "Failed to patch BackendTLSPolicy status")
+            }
         }
     }
 }

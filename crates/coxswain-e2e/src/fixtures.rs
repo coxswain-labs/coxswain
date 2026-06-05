@@ -174,6 +174,16 @@ pub const GATEWAY_API_BACKEND_PROTOCOL_H2C: &str = concat!(
     "/fixtures/gateway_api/backend_protocol_h2c.yaml"
 );
 
+pub const BACKENDS_ECHO_TLS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/echo_tls.yaml"
+);
+
+pub const GATEWAY_API_BACKEND_TLS_POLICY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/backend_tls_policy.yaml"
+);
+
 /// Apply a fixture YAML to `namespace`.
 ///
 /// Supports template substitutions: `TESTNS` is always replaced with `namespace`.

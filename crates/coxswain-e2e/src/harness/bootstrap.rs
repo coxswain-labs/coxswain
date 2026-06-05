@@ -174,6 +174,7 @@ async fn wait_for_crds_established() -> anyhow::Result<()> {
             "crd/gateways.gateway.networking.k8s.io",
             "crd/httproutes.gateway.networking.k8s.io",
             "crd/referencegrants.gateway.networking.k8s.io",
+            "crd/backendtlspolicies.gateway.networking.k8s.io",
         ])
         .status()
         .await

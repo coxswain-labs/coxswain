@@ -65,6 +65,16 @@ fn no_listener_info() -> HashMap<ListenerKey, ListenerBinding> {
     HashMap::new()
 }
 
+/// Empty BackendTLSPolicy index for tests that don't exercise upstream TLS.
+fn empty_btp_index() -> crate::backend_tls::BackendTlsIndex {
+    crate::backend_tls::build_backend_tls_index(
+        &reflector::store::Writer::<crate::gw_types::v::backendtlspolicies::BackendTLSPolicy>::default().as_reader(),
+        &reflector::store::Writer::<k8s_openapi::api::core::v1::ConfigMap>::default().as_reader(),
+        &reflector::store::Writer::<k8s_openapi::api::core::v1::Service>::default().as_reader(),
+        false,
+    )
+}
+
 /// Build a listener info map from `(listener_name, hostname, port)` triples.
 fn make_listener_info(
     gw_ns: &str,
@@ -239,6 +249,7 @@ fn reconcile_exact_path() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -270,6 +281,7 @@ fn reconcile_prefix_path() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -301,6 +313,7 @@ fn reconcile_regex_path() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -324,6 +337,7 @@ fn reconcile_no_matches_defaults_to_root_prefix() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -346,6 +360,7 @@ fn reconcile_skips_route_without_owned_parent() {
         &owned(&[("other", "gw")]),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -407,6 +422,7 @@ fn reconcile_header_exact_routes_to_correct_backend() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -444,6 +460,7 @@ fn reconcile_header_regex_routes_to_correct_backend() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -506,6 +523,7 @@ fn reconcile_method_routes_to_correct_backend() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -573,6 +591,7 @@ fn reconcile_query_param_routes_to_correct_backend() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -621,6 +640,7 @@ fn reconcile_invalid_regex_skips_match_entry() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -740,6 +760,7 @@ fn reconcile_request_header_modifier_stored() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -782,6 +803,7 @@ fn reconcile_response_header_modifier_stored() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -825,6 +847,7 @@ fn reconcile_request_redirect_stored() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -873,6 +896,7 @@ fn reconcile_url_rewrite_replace_prefix_stored() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -986,6 +1010,7 @@ fn reconcile_timeouts_stored_and_round_trip() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1021,6 +1046,7 @@ fn listener_isolation_empty_listener_route_not_accessible_via_more_specific_list
         &default_owned(),
         &HashSet::new(),
         &listener_info,
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1126,6 +1152,7 @@ fn reconcile_timeouts_missing_field_falls_back_to_none() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1181,6 +1208,7 @@ fn weighted_backends_80_20_split() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1190,7 +1218,7 @@ fn weighted_backends_80_20_split() {
     let n = 1000usize;
     let mut a_count = 0usize;
     for _ in 0..n {
-        let addr = upstream.next_endpoint().unwrap();
+        let addr = upstream.next_endpoint().unwrap().addr;
         if addr == a {
             a_count += 1;
         }
@@ -1219,6 +1247,7 @@ fn zero_weight_backend_gets_no_traffic() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1227,7 +1256,7 @@ fn zero_weight_backend_gets_no_traffic() {
     let b: std::net::SocketAddr = format!("{b_ip}:80").parse().unwrap();
     for _ in 0..100 {
         assert_eq!(
-            upstream.next_endpoint().unwrap(),
+            upstream.next_endpoint().unwrap().addr,
             b,
             "weight-0 backend should receive no traffic"
         );
@@ -1249,6 +1278,7 @@ fn all_zero_weights_installs_error_route() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1278,6 +1308,7 @@ fn absent_weight_defaults_to_1() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1285,7 +1316,9 @@ fn absent_weight_defaults_to_1() {
 
     let a: std::net::SocketAddr = format!("{a_ip}:80").parse().unwrap();
     let b: std::net::SocketAddr = format!("{b_ip}:80").parse().unwrap();
-    let results: Vec<_> = (0..4).map(|_| upstream.next_endpoint().unwrap()).collect();
+    let results: Vec<_> = (0..4)
+        .map(|_| upstream.next_endpoint().unwrap().addr)
+        .collect();
     // With equal weights, slots = [0, 1]; cycling: a, b, a, b
     assert_eq!(results, [a, b, a, b]);
 }
@@ -1309,6 +1342,7 @@ fn parent_ref_port_filters_to_matching_listener() {
         &owned(&[("default", "gw")]),
         &HashSet::new(),
         &listener_info,
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1341,6 +1375,7 @@ fn parent_ref_port_unset_attaches_to_all_listeners() {
         &owned(&[("default", "gw")]),
         &HashSet::new(),
         &listener_info,
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1373,6 +1408,7 @@ fn parent_ref_port_no_match_drops_route() {
         &owned(&[("default", "gw")]),
         &HashSet::new(),
         &listener_info,
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1438,6 +1474,7 @@ fn parent_ref_port_with_section_name_combined() {
         &owned_gw,
         &HashSet::new(),
         &listener_info,
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1456,6 +1493,7 @@ fn parent_ref_port_with_section_name_combined() {
         &owned_gw,
         &HashSet::new(),
         &listener_info,
+        &empty_btp_index(),
         &mut builder,
     );
     let table = builder.build().unwrap();

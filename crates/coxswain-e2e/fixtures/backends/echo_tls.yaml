@@ -1,0 +1,79 @@
+# TLS-terminating echo backend for BackendTLSPolicy e2e tests.
+# echo-basic supports TLS server mode when TLS_SERVER_CERT and TLS_SERVER_PRIVKEY are set.
+# Port 8443 serves HTTPS; port 3000 is NOT exposed here.
+#
+# Placeholders replaced at test runtime:
+#   TESTNS         - test namespace
+#   TLS_CRT_B64    - base64-encoded PEM cert for the backend server
+#   TLS_KEY_B64    - base64-encoded PEM key for the backend server
+#   CA_CRT_B64     - base64-encoded PEM CA bundle (stored in ConfigMap binaryData)
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: echo-tls-backend-cert
+type: kubernetes.io/tls
+data:
+  tls.crt: TLS_CRT_B64
+  tls.key: TLS_KEY_B64
+---
+# ConfigMap with the CA bundle used by BackendTLSPolicy to verify echo-tls.
+# Uses binaryData so the base64-encoded PEM is passed without YAML escaping concerns.
+# CA_CRT_B64 is replaced at test time with base64(cert_pem).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: echo-tls-ca
+binaryData:
+  ca.crt: CA_CRT_B64
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-tls
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-tls
+  template:
+    metadata:
+      labels:
+        app: echo-tls
+    spec:
+      containers:
+        - name: echo
+          image: gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
+          ports:
+            - containerPort: 8443
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: TLS_SERVER_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: echo-tls-backend-cert
+                  key: tls.crt
+            - name: TLS_SERVER_PRIVKEY
+              valueFrom:
+                secretKeyRef:
+                  name: echo-tls-backend-cert
+                  key: tls.key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-tls
+spec:
+  selector:
+    app: echo-tls
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443

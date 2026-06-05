@@ -19,7 +19,8 @@ rules:
   - apiGroups: [""]
     # secrets: covers kubernetes.io/tls Secrets for TLS termination (#8, #9),
     # including those provisioned automatically by cert-manager (#11).
-    resources: ["services", "endpoints", "pods", "secrets"]
+    # configmaps: covers CA bundles referenced by BackendTLSPolicy (#16).
+    resources: ["services", "endpoints", "pods", "secrets", "configmaps"]
     verbs: ["get", "list", "watch"]
 
   - apiGroups: ["networking.k8s.io"]
@@ -31,11 +32,11 @@ rules:
     verbs: ["patch", "update"]
 
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses", "gateways", "httproutes", "referencegrants"]
+    resources: ["gatewayclasses", "gateways", "httproutes", "referencegrants", "backendtlspolicies"]
     verbs: ["get", "list", "watch"]
 
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status"]
+    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status", "backendtlspolicies/status"]
     verbs: ["patch", "update"]
 
 ---
@@ -145,7 +146,7 @@ roleRef:
 #     app.kubernetes.io/component: controller
 # rules:
 #   - apiGroups: [""]
-#     resources: ["services", "endpoints", "pods", "secrets"]
+#     resources: ["services", "endpoints", "pods", "secrets", "configmaps"]
 #     verbs: ["get", "list", "watch"]
 #
 #   - apiGroups: ["networking.k8s.io"]
@@ -157,11 +158,11 @@ roleRef:
 #     verbs: ["patch", "update"]
 #
 #   - apiGroups: ["gateway.networking.k8s.io"]
-#     resources: ["gateways", "httproutes", "referencegrants"]
+#     resources: ["gateways", "httproutes", "referencegrants", "backendtlspolicies"]
 #     verbs: ["get", "list", "watch"]
 #
 #   - apiGroups: ["gateway.networking.k8s.io"]
-#     resources: ["gateways/status", "httproutes/status"]
+#     resources: ["gateways/status", "httproutes/status", "backendtlspolicies/status"]
 #     verbs: ["patch", "update"]
 
 # --- RoleBinding for the namespaced Role ---

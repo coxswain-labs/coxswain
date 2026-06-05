@@ -43,6 +43,27 @@ fn lookup_service_port(
     None
 }
 
+/// Looks up `svc` in the Service store and returns the `name` field of the
+/// `ServicePort` whose `port` number matches `service_port`. Returns `None`
+/// if the Service is absent or the port has no name.
+///
+/// Used by BackendTLSPolicy look-up to map a numeric `backendRef.port` to
+/// the `sectionName` in the policy's `targetRefs`.
+pub(crate) fn port_name_for(
+    ns: &str,
+    svc: &str,
+    service_port: i32,
+    services: &reflector::Store<Service>,
+) -> Option<String> {
+    let key = reflector::ObjectRef::<Service>::new(svc).within(ns);
+    let service = services.get(&key)?;
+    let ports = service.spec.as_ref()?.ports.as_deref()?;
+    ports
+        .iter()
+        .find(|sp| sp.port == service_port)
+        .and_then(|sp| sp.name.clone())
+}
+
 /// Looks up `svc` in the Service store and returns the numeric service port
 /// whose `name` field matches `port_name`. Returns `None` if the Service is
 /// not in the store or no port has the given name.

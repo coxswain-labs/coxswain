@@ -1,11 +1,12 @@
 use coxswain_e2e::{
     fixtures::{
-        BACKENDS_ECHO, BACKENDS_H2C_ECHO, BACKENDS_SLOW_ECHO, BACKENDS_WEBSOCKET_ECHO,
-        GATEWAY_API_BACKEND_PROTOCOL_H2C, GATEWAY_API_CERT_MANAGER, GATEWAY_API_COMBINED_MATCHING,
-        GATEWAY_API_CROSS_NAMESPACE_ROUTE, GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_FILTERS,
-        GATEWAY_API_HEADER_MATCHING, GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING,
-        GATEWAY_API_PARENT_REF_PORT, GATEWAY_API_PATH_MATCHING, GATEWAY_API_QUERY_PARAM_MATCHING,
-        GATEWAY_API_SERVING_DRAIN, GATEWAY_API_TIMEOUTS, GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS,
+        BACKENDS_ECHO, BACKENDS_ECHO_TLS, BACKENDS_H2C_ECHO, BACKENDS_SLOW_ECHO,
+        BACKENDS_WEBSOCKET_ECHO, GATEWAY_API_BACKEND_PROTOCOL_H2C, GATEWAY_API_BACKEND_TLS_POLICY,
+        GATEWAY_API_CERT_MANAGER, GATEWAY_API_COMBINED_MATCHING, GATEWAY_API_CROSS_NAMESPACE_ROUTE,
+        GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_FILTERS, GATEWAY_API_HEADER_MATCHING,
+        GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PARENT_REF_PORT,
+        GATEWAY_API_PATH_MATCHING, GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_SERVING_DRAIN,
+        GATEWAY_API_TIMEOUTS, GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS,
         GATEWAY_API_TLS_CROSS_NAMESPACE_GW, GATEWAY_API_TLS_GATEWAY_NO_CERTS,
         GATEWAY_API_TLS_REDIRECT, GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WEBSOCKET,
         GATEWAY_API_WEIGHTED_SPLIT, GATEWAY_API_WILDCARD_HOST,
@@ -1272,6 +1273,140 @@ async fn parent_ref_port_matching() -> anyhow::Result<()> {
         both_ports.contains(&http_port) && both_ports.contains(&wrong_port_u64),
         "both.* must appear under both HTTP_PORT and WRONG_PORT, got {both_ports:?}"
     );
+
+    Ok(())
+}
+
+// ── BackendTLSPolicy tests (issue #16) ────────────────────────────────────────
+
+/// The proxy re-encrypts connections to a TLS-terminating backend pod when a
+/// `BackendTLSPolicy` with the correct CA is attached. The request must reach
+/// the backend and the response body must identify the `echo-tls` service.
+#[tokio::test]
+async fn backend_tls_policy_re_encrypts_to_backend() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-btp-reencrypt").await?;
+
+    let hostname = format!("echo-tls.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&hostname);
+
+    h.apply(
+        BACKENDS_ECHO_TLS,
+        &ns.name,
+        &[
+            ("TLS_CRT_B64", &cert.cert_b64()),
+            ("TLS_KEY_B64", &cert.key_b64()),
+            ("CA_CRT_B64", &cert.cert_b64()), // self-signed: cert IS the CA
+        ],
+    )
+    .await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    h.apply(
+        GATEWAY_API_BACKEND_TLS_POLICY,
+        &ns.name,
+        &[("TLS_HOSTNAME", &hostname)],
+    )
+    .await?;
+
+    let resp = wait::wait_for_route(&h.http, &hostname, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-tls");
+
+    Ok(())
+}
+
+/// When the CA bundle in the ConfigMap does NOT match the backend's certificate,
+/// the proxy must reject the TLS handshake and return a 5xx to the client.
+#[tokio::test]
+async fn backend_tls_policy_rejects_unknown_ca() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-btp-badca").await?;
+
+    let hostname = format!("echo-tls.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&hostname);
+    let wrong_cert = GeneratedCert::for_host("wrong-ca.example.com");
+
+    // Backend uses `cert` but ConfigMap carries `wrong_cert` as the CA.
+    h.apply(
+        BACKENDS_ECHO_TLS,
+        &ns.name,
+        &[
+            ("TLS_CRT_B64", &cert.cert_b64()),
+            ("TLS_KEY_B64", &cert.key_b64()),
+            ("CA_CRT_B64", &wrong_cert.cert_b64()), // wrong CA — verification must fail
+        ],
+    )
+    .await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    h.apply(
+        GATEWAY_API_BACKEND_TLS_POLICY,
+        &ns.name,
+        &[("TLS_HOSTNAME", &hostname)],
+    )
+    .await?;
+
+    // Wait until the policy reaches Accepted=True — the CA is syntactically valid,
+    // so Accepted=True is expected even though the CA won't match at runtime. This
+    // ensures the reconciler has rebuilt the routing table with the wrong CA attached
+    // before we probe, eliminating the race between route installation and BTP rebuild.
+    wait::wait_for_backend_tls_policy_accepted(
+        &h.client,
+        &ns.name,
+        "echo-tls-policy",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // The TLS handshake fails because the backend cert is signed by a different CA.
+    // Coxswain should return 502 Bad Gateway.
+    let status = h.http.get_status(&hostname, "/").await?;
+    assert!(
+        status >= 500,
+        "expected 5xx for cert mismatch, got {status}"
+    );
+
+    Ok(())
+}
+
+/// After a `BackendTLSPolicy` is applied with a valid CA, the policy's
+/// `status.ancestors[*].conditions` must include `Accepted=True`.
+#[tokio::test]
+async fn backend_tls_policy_status_accepted() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-btp-status").await?;
+
+    let hostname = format!("echo-tls.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&hostname);
+
+    h.apply(
+        BACKENDS_ECHO_TLS,
+        &ns.name,
+        &[
+            ("TLS_CRT_B64", &cert.cert_b64()),
+            ("TLS_KEY_B64", &cert.key_b64()),
+            ("CA_CRT_B64", &cert.cert_b64()),
+        ],
+    )
+    .await?;
+
+    h.apply(
+        GATEWAY_API_BACKEND_TLS_POLICY,
+        &ns.name,
+        &[("TLS_HOSTNAME", &hostname)],
+    )
+    .await?;
+
+    wait::wait_for_backend_tls_policy_accepted(
+        &h.client,
+        &ns.name,
+        "echo-tls-policy",
+        Duration::from_secs(60),
+    )
+    .await?;
 
     Ok(())
 }

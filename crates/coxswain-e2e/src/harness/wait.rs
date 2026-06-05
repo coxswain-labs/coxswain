@@ -1,4 +1,5 @@
 use anyhow::Context as _;
+use gateway_api::apis::standard::backendtlspolicies::BackendTLSPolicy;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
@@ -447,4 +448,40 @@ fn condition_matches(conditions: &[Condition], type_: &str, status: &str) -> boo
     conditions
         .iter()
         .any(|c| c.type_ == type_ && c.status == status)
+}
+
+/// Poll until the named `BackendTLSPolicy` has `Accepted=True` in at least one
+/// ancestor entry, or until `timeout` expires.
+pub async fn wait_for_backend_tls_policy_accepted(
+    client: &kube::Client,
+    ns: &str,
+    name: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<BackendTLSPolicy> = Api::namespaced(client.clone(), ns);
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        if let Ok(policy) = api.get(name).await {
+            let accepted = policy
+                .status
+                .as_ref()
+                .map(|s| {
+                    s.ancestors.iter().any(|a| {
+                        a.conditions
+                            .iter()
+                            .any(|c| c.type_ == "Accepted" && c.status == "True")
+                    })
+                })
+                .unwrap_or(false);
+            if accepted {
+                return Ok(());
+            }
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "BackendTLSPolicy {ns}/{name} did not reach Accepted=True within {timeout:?}"
+            );
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
 }

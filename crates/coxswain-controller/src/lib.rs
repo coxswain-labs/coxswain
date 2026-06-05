@@ -1,3 +1,4 @@
+pub(crate) mod backend_tls;
 mod controller;
 pub(crate) mod endpoints;
 pub(crate) mod gateway_api;

@@ -189,6 +189,62 @@ impl SharedHttpRouteHealth {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// BackendTLSPolicy health
+// ──────────────────────────────────────────────────────────────────────────────
+
+pub use crate::backend_tls::{PolicyHealthOutcome, PolicyKey};
+
+/// Which managed Gateways are considered the ancestors of a BackendTLSPolicy.
+/// A policy's Service is an ancestor's downstream iff at least one HTTPRoute
+/// under that Gateway references the Service.
+#[derive(Clone, Debug, Default)]
+pub struct BackendTlsPolicyAncestorHealth {
+    /// Keys of managed Gateways that have routes targeting the policy's Service.
+    pub gateway_keys: Vec<ObjectKey>,
+    pub outcome: Option<PolicyHealthOutcome>,
+}
+
+pub type BackendTlsPolicyHealthMap = HashMap<PolicyKey, BackendTlsPolicyAncestorHealth>;
+
+struct SharedBackendTlsPolicyHealthInner {
+    map: ArcSwap<BackendTlsPolicyHealthMap>,
+    notify: Notify,
+}
+
+/// Shared handle to per-policy health, produced after each reconciler rebuild.
+/// The controller reads this to write `BackendTLSPolicy.status.ancestors`.
+#[derive(Clone)]
+pub struct SharedBackendTlsPolicyHealth(Arc<SharedBackendTlsPolicyHealthInner>);
+
+impl Default for SharedBackendTlsPolicyHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedBackendTlsPolicyHealth {
+    pub fn new() -> Self {
+        Self(Arc::new(SharedBackendTlsPolicyHealthInner {
+            map: ArcSwap::from_pointee(HashMap::new()),
+            notify: Notify::new(),
+        }))
+    }
+
+    pub fn load(&self) -> arc_swap::Guard<Arc<BackendTlsPolicyHealthMap>> {
+        self.0.map.load()
+    }
+
+    pub fn store_and_notify(&self, map: BackendTlsPolicyHealthMap) {
+        self.0.map.store(Arc::new(map));
+        self.0.notify.notify_one();
+    }
+
+    pub async fn notified(&self) {
+        self.0.notify.notified().await;
+    }
+}
+
 /// Look up a `kubernetes.io/tls` Secret by namespace/name from the reflector
 /// store and extract the PEM bytes. Both cert and key data must contain a PEM
 /// header (`-----BEGIN`) to be considered valid.

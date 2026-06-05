@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use coxswain_core::routing::{
-    BackendProtocol, FilterAction, RequestContext, RouteOutcome, RouteTimeouts,
+    BackendProtocol, BackendTlsConfig, FilterAction, RequestContext, RouteOutcome, RouteTimeouts,
 };
 use http::header;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::filter::TrafficFilter;
+use crate::upstream_tls::UpstreamTls;
 
 mod ctx;
 mod engine;
@@ -30,6 +31,8 @@ pub struct Proxy {
     pub engine: Arc<RoutingEngine>,
     /// Global fallback timeouts used when a matched route has no per-rule timeouts set.
     pub default_timeouts: RouteTimeouts,
+    /// Handles parsing and caching of upstream TLS CA bundles.
+    pub upstream_tls: UpstreamTls,
 }
 
 /// Merge per-route timeouts with global defaults; per-route wins when set.
@@ -238,21 +241,35 @@ impl ProxyHttp for Proxy {
             ));
         }
 
-        let addr = resolved.backend_group.next_endpoint().ok_or_else(|| {
+        let selection = resolved.backend_group.next_endpoint().ok_or_else(|| {
             pingora_core::Error::explain(HTTPStatus(503), "no active endpoints for backend group")
         })?;
-
-        // Use the (potentially rewritten) host from UrlRewrite hostname, or the original host.
-        let sni_host = resolved.original_host.clone();
+        let pool_tls: Option<&Arc<BackendTlsConfig>> = selection.tls_config;
 
         let protocol = resolved.backend_group.protocol();
-        let tls = matches!(
-            protocol,
-            BackendProtocol::Https | BackendProtocol::WebSocketTls
-        );
-        let mut peer = HttpPeer::new(addr.to_string(), tls, sni_host);
+        let tls = pool_tls.is_some()
+            || matches!(
+                protocol,
+                BackendProtocol::Https | BackendProtocol::WebSocketTls
+            );
+
+        // Use the policy SNI when present; otherwise fall back to the original host header.
+        let sni = pool_tls
+            .map(|c| c.sni_hostname.clone())
+            .unwrap_or_else(|| resolved.original_host.clone());
+
+        let mut peer = HttpPeer::new(selection.addr.to_string(), tls, sni);
         if matches!(protocol, BackendProtocol::H2c) {
             peer.options.set_http_version(2, 2);
+        }
+
+        if let Some(cfg) = pool_tls {
+            peer.options.verify_cert = true;
+            peer.options.verify_hostname = true;
+            // Pingora's Hash for HttpPeer omits the `ca` field; setting group_key ensures the
+            // connection pool does not re-use connections across different CA bundles.
+            peer.group_key = cfg.group_key;
+            peer.options.ca = Some(self.upstream_tls.ca_stack(cfg));
         }
 
         // Apply per-route timeout settings.

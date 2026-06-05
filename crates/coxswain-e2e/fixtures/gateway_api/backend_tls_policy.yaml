@@ -1,0 +1,49 @@
+# BackendTLSPolicy re-encryption test fixture.
+# Placeholders replaced at test runtime:
+#   TESTNS       - test namespace
+#   HTTP_PORT    - proxy HTTP listener port
+#   TLS_HOSTNAME - SNI hostname matching the backend cert (e.g. "echo-tls.example.com")
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-btp-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: HTTP_PORT
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: btp-route
+spec:
+  parentRefs:
+    - name: coxswain-btp-test
+  hostnames:
+    - "TLS_HOSTNAME"
+  rules:
+    - backendRefs:
+        - name: echo-tls
+          port: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: echo-tls-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-tls
+  validation:
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: echo-tls-ca
+    hostname: "TLS_HOSTNAME"

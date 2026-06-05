@@ -15,7 +15,7 @@ use coxswain_core::tls::SharedTlsStore;
 use coxswain_health::HealthServer;
 use coxswain_proxy::{
     ListenerProtocol, ListenerSpec, Proxy, ProxyAcceptor, RoutingEngine, SniCertSelector,
-    TrustedSources,
+    TrustedSources, UpstreamTls, load_system_ca,
 };
 use ipnet::IpNet;
 use pingora_core::listeners::tls::TlsSettings;
@@ -306,12 +306,16 @@ fn main() -> Result<()> {
     // Clone before move into Controller so HotReloader can subscribe to the same health map.
     let hot_reload_health = gateway_tls_health.clone();
 
+    let system_ca = load_system_ca();
+    let system_ca_available = !system_ca.is_empty();
+
     let reconciler = Reconciler::new(
         routing_table.clone(),
         tls_store.clone(),
         gateway_tls_health.clone(),
         owned_gateways.clone(),
         args.controller_name.clone(),
+        system_ca_available,
         ReconcilerOptions {
             watch_namespace: args.controller_watch_namespace.clone(),
             ingress_default_backend: args.ingress_default_backend,
@@ -319,6 +323,7 @@ fn main() -> Result<()> {
         },
     );
     let route_health = reconciler.route_health();
+    let btp_health = reconciler.btp_health();
 
     server.add_service(background_service(
         "controller",
@@ -328,6 +333,7 @@ fn main() -> Result<()> {
             owned_gateways,
             gateway_tls_health,
             route_health,
+            btp_health,
             controller_config,
         ),
     ));
@@ -391,6 +397,8 @@ fn main() -> Result<()> {
     // Track the full set of ports we actually bind, so HotReloader can detect additions.
     let currently_bound: HashSet<u16> = listeners.iter().map(|l| l.addr.port()).collect();
 
+    let upstream_tls = UpstreamTls::new(Arc::clone(&system_ca));
+
     if args.proxy_accept_proxy_protocol {
         if args.proxy_trusted_sources.is_empty() {
             tracing::warn!(
@@ -404,6 +412,7 @@ fn main() -> Result<()> {
             Proxy {
                 engine,
                 default_timeouts: default_timeouts.clone(),
+                upstream_tls,
             },
         ));
         let trusted = Arc::new(TrustedSources::new(args.proxy_trusted_sources.clone()));
@@ -418,6 +427,7 @@ fn main() -> Result<()> {
             Proxy {
                 engine,
                 default_timeouts,
+                upstream_tls,
             },
             "proxy",
         );

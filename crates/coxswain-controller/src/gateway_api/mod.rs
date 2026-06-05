@@ -1,3 +1,4 @@
+use crate::backend_tls::BackendTlsIndex;
 use crate::endpoints;
 use crate::gw_types::v::gateways::{
     Gateway, GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode,
@@ -50,6 +51,7 @@ impl GatewayApiReconciler {
     ///
     /// `listener_info` maps `(gw_ns, gw_name, listener_name) → (hostname, port)`, used
     /// to scope routes to the correct per-port routing table slot and listener hostname.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconcile(
         route: &HTTPRoute,
         slices: &reflector::Store<EndpointSlice>,
@@ -57,6 +59,7 @@ impl GatewayApiReconciler {
         owned_gateways: &HashSet<ObjectKey>,
         grants: &HashSet<ReferenceGrantKey>,
         listener_info: &HashMap<ListenerKey, ListenerBinding>,
+        btp_index: &BackendTlsIndex,
         builder: &mut RoutingTableBuilder,
     ) {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -155,14 +158,18 @@ impl GatewayApiReconciler {
                     slices,
                     services,
                     grants,
+                    btp_index,
                 );
                 let group_name = backend_group_name(backend_refs, route_ns);
                 let protocols: Vec<BackendProtocol> = resolved
                     .iter()
-                    .map(|(r, _)| parse_app_protocol(r.app_protocol.as_deref().unwrap_or("")))
+                    .map(|(r, _, _)| parse_app_protocol(r.app_protocol.as_deref().unwrap_or("")))
                     .collect();
                 let protocol = pick_route_protocol(&protocols, &group_name);
-                let weighted = resolved.into_iter().map(|(r, w)| (r.addrs, w)).collect();
+                let weighted = resolved
+                    .into_iter()
+                    .map(|(r, w, tls)| (r.addrs, w, tls))
+                    .collect();
                 let group =
                     Arc::new(BackendGroup::weighted(group_name, weighted).with_protocol(protocol));
                 if group.endpoints().is_empty() {
@@ -343,19 +350,24 @@ impl GatewayApiReconciler {
         }
     }
 
-    /// Resolve each backendRef to `(pod_addresses, weight)`.
+    /// Resolve each backendRef to `(pod_addresses, weight, tls_config)`.
     ///
     /// Weight defaults to 1 when absent (per the Gateway API spec). Refs with
     /// `weight: 0`, non-Service kind, denied cross-namespace access, or no ready
     /// endpoints contribute an empty entry and are naturally dropped by
-    /// `Upstream::weighted`.
+    /// `BackendGroup::weighted`.
     fn resolve_weighted_backends(
         backend_refs: &[HttpRouteRulesBackendRefs],
         route_ns: &str,
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
         grants: &HashSet<ReferenceGrantKey>,
-    ) -> Vec<(endpoints::ResolvedEndpoints, u16)> {
+        btp_index: &BackendTlsIndex,
+    ) -> Vec<(
+        endpoints::ResolvedEndpoints,
+        u16,
+        Option<Arc<coxswain_core::routing::BackendTlsConfig>>,
+    )> {
         backend_refs
             .iter()
             .filter_map(|b| b.port.map(|port| (b, port)))
@@ -368,6 +380,7 @@ impl GatewayApiReconciler {
                             app_protocol: None,
                         },
                         0,
+                        None,
                     );
                 }
 
@@ -380,6 +393,7 @@ impl GatewayApiReconciler {
                             app_protocol: None,
                         },
                         weight,
+                        None,
                     );
                 }
 
@@ -399,12 +413,18 @@ impl GatewayApiReconciler {
                             app_protocol: None,
                         },
                         weight,
+                        None,
                     );
                 }
+
+                // Resolve the port name for BackendTLSPolicy section-name look-up.
+                let port_name = endpoints::port_name_for(ns, &b.name, port, services);
+                let tls_config = btp_index.lookup(ns, &b.name, port_name.as_deref());
 
                 (
                     endpoints::resolve(ns, &b.name, port, slices, services),
                     weight,
+                    tls_config,
                 )
             })
             .collect()
