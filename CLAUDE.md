@@ -68,10 +68,10 @@ cargo run --bin coxswain -- serve --log-format console
 # Start coxswain for conformance testing (ports 80/443, status-address = localhost)
 # Must be running before the go test command below.
 cargo run --bin coxswain -- serve \
-  --proxy-addr 0.0.0.0:80 \
-  --proxy-tls-addr 0.0.0.0:443 \
-  --health-addr 127.0.0.1:8081 \
-  --admin-addr 127.0.0.1:8082 \
+  --proxy-http-port 80 \
+  --proxy-https-port 443 \
+  --health-port 8081 \
+  --admin-port 8082 \
   --status-address 127.0.0.1 \
   --log-format console \
   --pod-name coxswain-conformance \
@@ -91,7 +91,7 @@ cd conformance && go test -v -timeout 60m -run TestConformance \
   --report-output=reports/local-report.yaml
 
 # Reset the local k8s cluster (Orb) before running the conformance or e2e test above.
-# After this ensure to load the coxswain manifests from deploy/manifests/ excluding deployment.yaml
+# After this ensure to prepare the cluster as explained in as explained in DEVELOPMENT.md 
 orb delete -f k8s && orb start k8s
 ```
 

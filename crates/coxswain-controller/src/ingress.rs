@@ -21,6 +21,22 @@ pub fn is_default_ingress_class(ic: &IngressClass) -> bool {
 
 pub struct IngressReconciler;
 
+/// Ports on which Ingress routes are served.
+///
+/// Both fields are optional; when both are `None` no listener is configured
+/// and the Ingress is skipped with a warning.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IngressPorts {
+    pub http: Option<u16>,
+    pub https: Option<u16>,
+}
+
+impl IngressPorts {
+    pub fn new(http: Option<u16>, https: Option<u16>) -> Self {
+        Self { http, https }
+    }
+}
+
 /// Resolves a backend port to its numeric value.
 ///
 /// Tries `port.number` first; when absent, looks up `port.name` in the
@@ -72,12 +88,16 @@ impl IngressReconciler {
     /// When `owned_default_class` is `Some`, an Ingress with neither
     /// `spec.ingressClassName` nor the legacy annotation is also claimed.
     /// Never queries the API server.
+    ///
+    /// Routes are inserted on `http_port` and `https_port` (whichever are `Some`).
+    /// When both are `None` the Ingress is skipped with a warning.
     pub fn reconcile(
         ingress: &Ingress,
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
         owned_classes: &HashSet<String>,
         owned_default_class: Option<&str>,
+        ports: IngressPorts,
         builder: &mut RoutingTableBuilder,
     ) {
         let claimed_class = claimed_ingress_class(ingress);
@@ -95,6 +115,15 @@ impl IngressReconciler {
                 return;
             }
             Some(_) => {}
+        }
+
+        let ports: Vec<u16> = [ports.http, ports.https].into_iter().flatten().collect();
+        if ports.is_empty() {
+            tracing::warn!(
+                name = ?ingress.metadata.name,
+                "No HTTP or HTTPS listener port configured — skipping Ingress routes"
+            );
+            return;
         }
 
         let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
@@ -157,20 +186,23 @@ impl IngressReconciler {
                     continue;
                 }
 
-                let host_builder = builder.host_for(rule.host.as_deref());
-
                 let e = Arc::new(RouteEntry::path_only(
                     upstream,
                     route_id.clone(),
                     created_at,
                 ));
                 // "Prefix" and "ImplementationSpecific" both map to prefix matching.
-                match path_rule.path_type.as_str() {
-                    "Exact" => {
-                        host_builder.add_exact_route(path, e);
-                    }
-                    _ => {
-                        host_builder.add_prefix_route(path, e);
+                for &listener_port in &ports {
+                    let host_builder = builder
+                        .for_port(listener_port)
+                        .host_for(rule.host.as_deref());
+                    match path_rule.path_type.as_str() {
+                        "Exact" => {
+                            host_builder.add_exact_route(path, Arc::clone(&e));
+                        }
+                        _ => {
+                            host_builder.add_prefix_route(path, Arc::clone(&e));
+                        }
                     }
                 }
             }
@@ -205,12 +237,18 @@ impl IngressReconciler {
                                 created_at,
                             ))
                         };
-                        for rule in rules {
+                        for &listener_port in &ports {
+                            for rule in rules {
+                                builder
+                                    .for_port(listener_port)
+                                    .host_for(rule.host.as_deref())
+                                    .add_prefix_route("/", make_entry());
+                            }
                             builder
-                                .host_for(rule.host.as_deref())
+                                .for_port(listener_port)
+                                .host_for(None)
                                 .add_prefix_route("/", make_entry());
                         }
-                        builder.host_for(None).add_prefix_route("/", make_entry());
                     }
                 }
             } else if let Some(resource) = default_backend.resource.as_ref() {
@@ -337,7 +375,15 @@ mod tests {
         owned: &HashSet<String>,
         b: &mut RoutingTableBuilder,
     ) {
-        IngressReconciler::reconcile(ing, slices, svcs, owned, None, b);
+        IngressReconciler::reconcile(
+            ing,
+            slices,
+            svcs,
+            owned,
+            None,
+            IngressPorts::new(Some(80), None),
+            b,
+        );
     }
 
     fn reconcile_tls_no_default(
@@ -606,11 +652,14 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route("example.com", "/api/v1", &ctx).unwrap().name,
+            table
+                .route(80, "example.com", "/api/v1", &ctx)
+                .unwrap()
+                .name,
             "default/rule-svc"
         );
         assert_eq!(
-            table.route("example.com", "/other", &ctx).unwrap().name,
+            table.route(80, "example.com", "/other", &ctx).unwrap().name,
             "default/default-svc"
         );
     }
@@ -631,11 +680,11 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route("any.host.com", "/", &ctx).unwrap().name,
+            table.route(80, "any.host.com", "/", &ctx).unwrap().name,
             "default/default-svc"
         );
         assert_eq!(
-            table.route("other.io", "/api/v1", &ctx).unwrap().name,
+            table.route(80, "other.io", "/api/v1", &ctx).unwrap().name,
             "default/default-svc"
         );
     }
@@ -665,15 +714,15 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route("a.com", "/api", &ctx).unwrap().name,
+            table.route(80, "a.com", "/api", &ctx).unwrap().name,
             "default/rule-svc"
         );
         assert_eq!(
-            table.route("a.com", "/other", &ctx).unwrap().name,
+            table.route(80, "a.com", "/other", &ctx).unwrap().name,
             "default/default-svc"
         );
         assert_eq!(
-            table.route("b.com", "/", &ctx).unwrap().name,
+            table.route(80, "b.com", "/", &ctx).unwrap().name,
             "default/default-svc"
         );
     }
@@ -764,7 +813,7 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route("example.com", "/foo", &ctx).unwrap().name,
+            table.route(80, "example.com", "/foo", &ctx).unwrap().name,
             "default/old-svc",
             "older Ingress should win on conflicting Prefix /foo"
         );
@@ -835,12 +884,15 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route("example.com", "/foo", &ctx).unwrap().name,
+            table.route(80, "example.com", "/foo", &ctx).unwrap().name,
             "default/exact-svc",
             "Exact /foo should win over Prefix /foo"
         );
         assert_eq!(
-            table.route("example.com", "/foo/sub", &ctx).unwrap().name,
+            table
+                .route(80, "example.com", "/foo/sub", &ctx)
+                .unwrap()
+                .name,
             "default/prefix-svc",
             "Prefix /foo should still match /foo/sub"
         );
@@ -870,8 +922,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/api", &ctx).is_some());
-        assert!(table.route("example.com", "/other", &ctx).is_none());
+        assert!(table.route(80, "example.com", "/api", &ctx).is_some());
+        assert!(table.route(80, "example.com", "/other", &ctx).is_none());
     }
 
     #[test]
@@ -899,11 +951,17 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route("api.example.com", "/api", &ctx).unwrap().name,
+            table
+                .route(80, "api.example.com", "/api", &ctx)
+                .unwrap()
+                .name,
             "default/rule-svc"
         );
         assert_eq!(
-            table.route("api.example.com", "/other", &ctx).unwrap().name,
+            table
+                .route(80, "api.example.com", "/other", &ctx)
+                .unwrap()
+                .name,
             "default/default-svc"
         );
     }
@@ -934,7 +992,10 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route("example.com", "/anything", &ctx).unwrap().name,
+            table
+                .route(80, "example.com", "/anything", &ctx)
+                .unwrap()
+                .name,
             "default/rule-svc"
         );
     }
@@ -962,8 +1023,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/api", &ctx).is_some());
-        assert!(table.route("example.com", "/api/users", &ctx).is_none());
+        assert!(table.route(80, "example.com", "/api", &ctx).is_some());
+        assert!(table.route(80, "example.com", "/api/users", &ctx).is_none());
     }
 
     #[test]
@@ -984,7 +1045,7 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
-        let route = table.route("example.com", "/named", &ctx);
+        let route = table.route(80, "example.com", "/named", &ctx);
         assert!(
             route.is_some(),
             "named port backend should resolve to a route"
@@ -1008,7 +1069,7 @@ mod tests {
         let table = builder.build().unwrap();
         assert!(
             table
-                .route("example.com", "/named", &RequestContext::default())
+                .route(80, "example.com", "/named", &RequestContext::default())
                 .is_none()
         );
     }
@@ -1032,7 +1093,7 @@ mod tests {
         let table = builder.build().unwrap();
         assert!(
             table
-                .route("example.com", "/named", &RequestContext::default())
+                .route(80, "example.com", "/named", &RequestContext::default())
                 .is_none()
         );
     }
@@ -1103,11 +1164,14 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route("example.com", "/api/v1", &ctx).unwrap().name,
+            table
+                .route(80, "example.com", "/api/v1", &ctx)
+                .unwrap()
+                .name,
             "default/rule-svc"
         );
         assert_eq!(
-            table.route("example.com", "/other", &ctx).unwrap().name,
+            table.route(80, "example.com", "/other", &ctx).unwrap().name,
             "default/default-svc"
         );
     }
@@ -1135,9 +1199,9 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/api", &ctx).is_some());
-        assert!(table.route("example.com", "/api/users", &ctx).is_some());
-        assert!(table.route("example.com", "/other", &ctx).is_none());
+        assert!(table.route(80, "example.com", "/api", &ctx).is_some());
+        assert!(table.route(80, "example.com", "/api/users", &ctx).is_some());
+        assert!(table.route(80, "example.com", "/other", &ctx).is_none());
     }
 
     #[test]
@@ -1163,8 +1227,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/api", &ctx).is_some());
-        assert!(table.route("example.com", "/api/v2", &ctx).is_some());
+        assert!(table.route(80, "example.com", "/api", &ctx).is_some());
+        assert!(table.route(80, "example.com", "/api/v2", &ctx).is_some());
     }
 
     #[test]
@@ -1190,8 +1254,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/", &ctx).is_some());
-        assert!(table.route("other.com", "/", &ctx).is_none());
+        assert!(table.route(80, "example.com", "/", &ctx).is_some());
+        assert!(table.route(80, "other.com", "/", &ctx).is_none());
     }
 
     #[test]
@@ -1217,8 +1281,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
-        assert!(table.route("api.example.com", "/", &ctx).is_some());
-        assert!(table.route("example.com", "/", &ctx).is_none());
+        assert!(table.route(80, "api.example.com", "/", &ctx).is_some());
+        assert!(table.route(80, "example.com", "/", &ctx).is_none());
     }
 
     #[test]
@@ -1244,8 +1308,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
-        assert!(table.route("any-host.example.com", "/", &ctx).is_some());
-        assert!(table.route("other.io", "/", &ctx).is_some());
+        assert!(table.route(80, "any-host.example.com", "/", &ctx).is_some());
+        assert!(table.route(80, "other.io", "/", &ctx).is_some());
     }
 
     #[test]
@@ -1271,7 +1335,7 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
-        assert!(table.route("example.com", "/", &ctx).is_none());
+        assert!(table.route(80, "example.com", "/", &ctx).is_none());
     }
 
     #[test]
@@ -1298,7 +1362,7 @@ mod tests {
             builder
                 .build()
                 .unwrap()
-                .route("example.com", "/", &RequestContext::default())
+                .route(80, "example.com", "/", &RequestContext::default())
                 .is_some()
         );
     }
@@ -1327,7 +1391,7 @@ mod tests {
             builder
                 .build()
                 .unwrap()
-                .route("example.com", "/", &RequestContext::default())
+                .route(80, "example.com", "/", &RequestContext::default())
                 .is_none()
         );
     }
@@ -1356,7 +1420,7 @@ mod tests {
             builder
                 .build()
                 .unwrap()
-                .route("example.com", "/", &RequestContext::default())
+                .route(80, "example.com", "/", &RequestContext::default())
                 .is_some()
         );
     }
@@ -1385,7 +1449,7 @@ mod tests {
             builder
                 .build()
                 .unwrap()
-                .route("example.com", "/", &RequestContext::default())
+                .route(80, "example.com", "/", &RequestContext::default())
                 .is_none()
         );
     }
@@ -1414,7 +1478,7 @@ mod tests {
             builder
                 .build()
                 .unwrap()
-                .route("example.com", "/", &RequestContext::default())
+                .route(80, "example.com", "/", &RequestContext::default())
                 .is_none()
         );
     }
@@ -1438,13 +1502,14 @@ mod tests {
             &empty_svc_store(),
             &owned(&["coxswain"]),
             Some("coxswain"),
+            IngressPorts::new(Some(80), None),
             &mut builder,
         );
         assert!(
             builder
                 .build()
                 .unwrap()
-                .route("example.com", "/", &RequestContext::default())
+                .route(80, "example.com", "/", &RequestContext::default())
                 .is_some()
         );
     }
@@ -1468,13 +1533,14 @@ mod tests {
             &empty_svc_store(),
             &owned(&["coxswain"]),
             None,
+            IngressPorts::new(Some(80), None),
             &mut builder,
         );
         assert!(
             builder
                 .build()
                 .unwrap()
-                .route("example.com", "/", &RequestContext::default())
+                .route(80, "example.com", "/", &RequestContext::default())
                 .is_none()
         );
     }
@@ -1503,7 +1569,7 @@ mod tests {
             builder
                 .build()
                 .unwrap()
-                .route("example.com", "/", &RequestContext::default())
+                .route(80, "example.com", "/", &RequestContext::default())
                 .is_none()
         );
     }
@@ -1553,7 +1619,7 @@ mod tests {
         let table = builder.build().unwrap();
         assert!(
             table
-                .route("example.com", "/api", &RequestContext::default())
+                .route(80, "example.com", "/api", &RequestContext::default())
                 .is_none(),
             "Resource backend path rule should not install a route"
         );
@@ -1596,7 +1662,7 @@ mod tests {
         let table = builder.build().unwrap();
         assert!(
             table
-                .route("any.host.com", "/", &RequestContext::default())
+                .route(80, "any.host.com", "/", &RequestContext::default())
                 .is_none(),
             "Resource defaultBackend should not install a catchall route"
         );
@@ -1627,7 +1693,7 @@ mod tests {
             builder
                 .build()
                 .unwrap()
-                .route("example.com", "/", &RequestContext::default())
+                .route(80, "example.com", "/", &RequestContext::default())
                 .is_some()
         );
     }
@@ -1657,7 +1723,7 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert!(
-            table.route("example.com", "/api/v1", &ctx).is_none(),
+            table.route(80, "example.com", "/api/v1", &ctx).is_none(),
             "malformed path without leading slash should not install a route"
         );
         assert!(
@@ -1870,7 +1936,7 @@ mod tests {
         let table = route_builder.build().unwrap();
         assert!(
             table
-                .route("example.com", "/", &RequestContext::default())
+                .route(80, "example.com", "/", &RequestContext::default())
                 .is_some()
         );
 

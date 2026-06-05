@@ -268,6 +268,8 @@ pub struct RouteInfo {
 
 /// A path rule that was silently dropped because an earlier rule already claimed the same slot.
 pub struct RouteConflict {
+    /// Listener port on which the conflict occurred.
+    pub port: u16,
     /// Host pattern where the conflict occurred (`"*"` for catch-all, `"*.example.com"` for wildcard).
     pub host: String,
     pub path: String,

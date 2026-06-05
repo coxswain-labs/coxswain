@@ -60,9 +60,29 @@ fn default_owned() -> HashSet<ObjectKey> {
     owned(&[("default", "gw")])
 }
 
-/// Empty listener-hostname map for tests that don't exercise hostname scoping.
-fn no_listeners() -> HashMap<ListenerKey, String> {
+/// Empty listener info map for tests that don't exercise hostname or port scoping.
+fn no_listener_info() -> HashMap<ListenerKey, ListenerBinding> {
     HashMap::new()
+}
+
+/// Build a listener info map from `(listener_name, hostname, port)` triples.
+fn make_listener_info(
+    gw_ns: &str,
+    gw_name: &str,
+    listeners: &[(&str, &str, u16)],
+) -> HashMap<ListenerKey, ListenerBinding> {
+    listeners
+        .iter()
+        .map(|(ln, hostname, port)| {
+            (
+                ListenerKey::new(gw_ns, gw_name, *ln),
+                ListenerBinding {
+                    hostname: hostname.to_string(),
+                    port: *port,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Default parent refs pointing to the Gateway in `default_owned`.
@@ -218,15 +238,15 @@ fn reconcile_exact_path() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
     let empty_hdrs = HeaderMap::new();
     let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
 
-    assert!(table.route("example.com", "/api", &ctx).is_some());
-    assert!(table.route("example.com", "/api/users", &ctx).is_none());
+    assert!(table.route(80, "example.com", "/api", &ctx).is_some());
+    assert!(table.route(80, "example.com", "/api/users", &ctx).is_none());
 }
 
 #[test]
@@ -249,15 +269,15 @@ fn reconcile_prefix_path() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
     let empty_hdrs = HeaderMap::new();
     let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
 
-    assert!(table.route("example.com", "/api", &ctx).is_some());
-    assert!(table.route("example.com", "/api/users", &ctx).is_some());
+    assert!(table.route(80, "example.com", "/api", &ctx).is_some());
+    assert!(table.route(80, "example.com", "/api/users", &ctx).is_some());
 }
 
 #[test]
@@ -280,15 +300,15 @@ fn reconcile_regex_path() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
     let empty_hdrs = HeaderMap::new();
     let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
 
-    assert!(table.route("example.com", "/item/42", &ctx).is_some());
-    assert!(table.route("example.com", "/item/abc", &ctx).is_none());
+    assert!(table.route(80, "example.com", "/item/42", &ctx).is_some());
+    assert!(table.route(80, "example.com", "/item/abc", &ctx).is_none());
 }
 
 #[test]
@@ -303,14 +323,14 @@ fn reconcile_no_matches_defaults_to_root_prefix() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
     let empty_hdrs = HeaderMap::new();
     let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
 
-    assert!(table.route("example.com", "/anything", &ctx).is_some());
+    assert!(table.route(80, "example.com", "/anything", &ctx).is_some());
 }
 
 #[test]
@@ -325,14 +345,14 @@ fn reconcile_skips_route_without_owned_parent() {
         &empty_svc_store(),
         &owned(&[("other", "gw")]),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
     let empty_hdrs = HeaderMap::new();
     let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
 
-    assert!(table.route("example.com", "/", &ctx).is_none());
+    assert!(table.route(80, "example.com", "/", &ctx).is_none());
 }
 
 // ── New predicate tests ────────────────────────────────────────────────────
@@ -386,7 +406,7 @@ fn reconcile_header_exact_routes_to_correct_backend() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -397,11 +417,11 @@ fn reconcile_header_exact_routes_to_correct_backend() {
     let ctx_b = ctx_with(&Method::GET, &hdrs_b, None);
 
     assert_eq!(
-        table.route("example.com", "/", &ctx_a).unwrap().name,
+        table.route(80, "example.com", "/", &ctx_a).unwrap().name,
         "default/svc-a"
     );
     assert_eq!(
-        table.route("example.com", "/", &ctx_b).unwrap().name,
+        table.route(80, "example.com", "/", &ctx_b).unwrap().name,
         "default/svc-b"
     );
 }
@@ -423,7 +443,7 @@ fn reconcile_header_regex_routes_to_correct_backend() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -433,8 +453,8 @@ fn reconcile_header_regex_routes_to_correct_backend() {
     let ctx_ok = ctx_with(&Method::GET, &hdrs_ok, None);
     let ctx_bad = ctx_with(&Method::GET, &hdrs_bad, None);
 
-    assert!(table.route("example.com", "/", &ctx_ok).is_some());
-    assert!(table.route("example.com", "/", &ctx_bad).is_none());
+    assert!(table.route(80, "example.com", "/", &ctx_ok).is_some());
+    assert!(table.route(80, "example.com", "/", &ctx_bad).is_none());
 }
 
 #[test]
@@ -485,7 +505,7 @@ fn reconcile_method_routes_to_correct_backend() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -495,11 +515,11 @@ fn reconcile_method_routes_to_correct_backend() {
     let ctx_post = ctx_with(&Method::POST, &h, None);
 
     assert_eq!(
-        table.route("example.com", "/", &ctx_get).unwrap().name,
+        table.route(80, "example.com", "/", &ctx_get).unwrap().name,
         "default/svc-get"
     );
     assert_eq!(
-        table.route("example.com", "/", &ctx_post).unwrap().name,
+        table.route(80, "example.com", "/", &ctx_post).unwrap().name,
         "default/svc-post"
     );
 }
@@ -552,7 +572,7 @@ fn reconcile_query_param_routes_to_correct_backend() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -562,11 +582,11 @@ fn reconcile_query_param_routes_to_correct_backend() {
     let ctx_v2 = ctx_with(&Method::GET, &h, Some("version=v2"));
 
     assert_eq!(
-        table.route("example.com", "/", &ctx_v1).unwrap().name,
+        table.route(80, "example.com", "/", &ctx_v1).unwrap().name,
         "default/svc-v1"
     );
     assert_eq!(
-        table.route("example.com", "/", &ctx_v2).unwrap().name,
+        table.route(80, "example.com", "/", &ctx_v2).unwrap().name,
         "default/svc-v2"
     );
 }
@@ -600,14 +620,14 @@ fn reconcile_invalid_regex_skips_match_entry() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
 
     let empty_hdrs = HeaderMap::new();
     let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
-    assert!(table.route("example.com", "/", &ctx).is_some());
+    assert!(table.route(80, "example.com", "/", &ctx).is_some());
 }
 
 #[test]
@@ -685,7 +705,7 @@ fn find_filters(
 ) -> std::sync::Arc<[FilterAction]> {
     let empty_hdrs = http::HeaderMap::new();
     let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
-    match table.find(host, path, &ctx) {
+    match table.find(80, host, path, &ctx) {
         RouteOutcome::Found(_, f, _) => f,
         _ => panic!("expected Found"),
     }
@@ -719,7 +739,7 @@ fn reconcile_request_header_modifier_stored() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -761,7 +781,7 @@ fn reconcile_response_header_modifier_stored() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -804,7 +824,7 @@ fn reconcile_request_redirect_stored() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -852,7 +872,7 @@ fn reconcile_url_rewrite_replace_prefix_stored() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -887,7 +907,7 @@ fn find_timeouts(
 ) -> coxswain_core::routing::RouteTimeouts {
     let empty_hdrs = http::HeaderMap::new();
     let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
-    match table.find(host, path, &ctx) {
+    match table.find(80, host, path, &ctx) {
         RouteOutcome::Found(_, _, t) => t,
         _ => panic!("expected Found"),
     }
@@ -965,7 +985,7 @@ fn reconcile_timeouts_stored_and_round_trip() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -976,17 +996,6 @@ fn reconcile_timeouts_stored_and_round_trip() {
 
 // ── Listener isolation tests ──────────────────────────────────────────────────
 
-fn make_listener_hostnames(
-    gw_ns: &str,
-    gw_name: &str,
-    listeners: &[(&str, &str)],
-) -> HashMap<ListenerKey, String> {
-    listeners
-        .iter()
-        .map(|(ln, h)| (ListenerKey::new(gw_ns, gw_name, *ln), h.to_string()))
-        .collect()
-}
-
 #[test]
 fn listener_isolation_empty_listener_route_not_accessible_via_more_specific_listener() {
     let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
@@ -996,12 +1005,12 @@ fn listener_isolation_empty_listener_route_not_accessible_via_more_specific_list
         "gw",
         Some("empty-listener"),
     );
-    let listeners = make_listener_hostnames(
+    let listener_info = make_listener_info(
         "default",
         "gw",
         &[
-            ("empty-listener", ""),
-            ("specific-listener", "*.example.com"),
+            ("empty-listener", "", 80),
+            ("specific-listener", "*.example.com", 80),
         ],
     );
     let mut builder = RoutingTableBuilder::new();
@@ -1011,16 +1020,18 @@ fn listener_isolation_empty_listener_route_not_accessible_via_more_specific_list
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &listeners,
+        &listener_info,
         &mut builder,
     );
     let table = builder.build().unwrap();
     assert!(
-        table.route("bar.com", "/", &ctx_get()).is_some(),
+        table.route(80, "bar.com", "/", &ctx_get()).is_some(),
         "bar.com should be routable"
     );
     assert!(
-        table.route("bar.example.com", "/", &ctx_get()).is_none(),
+        table
+            .route(80, "bar.example.com", "/", &ctx_get())
+            .is_none(),
         "bar.example.com should not leak from the empty-hostname listener"
     );
 }
@@ -1087,7 +1098,7 @@ fn reconcile_timeouts_missing_field_falls_back_to_none() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -1142,11 +1153,11 @@ fn weighted_backends_80_20_split() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
-    let upstream = table.route("example.com", "/", &ctx_get()).unwrap();
+    let upstream = table.route(80, "example.com", "/", &ctx_get()).unwrap();
 
     let a: std::net::SocketAddr = format!("{a_ip}:80").parse().unwrap();
     let n = 1000usize;
@@ -1180,11 +1191,11 @@ fn zero_weight_backend_gets_no_traffic() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
-    let upstream = table.route("example.com", "/", &ctx_get()).unwrap();
+    let upstream = table.route(80, "example.com", "/", &ctx_get()).unwrap();
 
     let b: std::net::SocketAddr = format!("{b_ip}:80").parse().unwrap();
     for _ in 0..100 {
@@ -1210,12 +1221,12 @@ fn all_zero_weights_installs_error_route() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
     // All weights zero → empty upstream → error_status = Some(500) → RouteOutcome::Error
-    let outcome = table.find("example.com", "/", &ctx_get());
+    let outcome = table.find(80, "example.com", "/", &ctx_get());
     assert!(
         matches!(outcome, coxswain_core::routing::RouteOutcome::Error(500)),
         "all-zero-weight rule must resolve to Error(500)"
@@ -1239,11 +1250,11 @@ fn absent_weight_defaults_to_1() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listeners(),
+        &no_listener_info(),
         &mut builder,
     );
     let table = builder.build().unwrap();
-    let upstream = table.route("example.com", "/", &ctx_get()).unwrap();
+    let upstream = table.route(80, "example.com", "/", &ctx_get()).unwrap();
 
     let a: std::net::SocketAddr = format!("{a_ip}:80").parse().unwrap();
     let b: std::net::SocketAddr = format!("{b_ip}:80").parse().unwrap();

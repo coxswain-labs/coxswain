@@ -20,6 +20,7 @@ pub(super) fn extract_host<'a>(req: &'a RequestHeader, host_hdr: &'a mut String)
 pub(super) struct RedirectOrigin<'a> {
     pub scheme: &'a str,
     pub host: &'a str,
+    pub port: u16,
     pub path: &'a str,
     pub query: Option<&'a str>,
 }
@@ -35,6 +36,21 @@ pub(super) fn build_redirect_location(
     let eff_scheme = filter_scheme.unwrap_or(origin.scheme);
     let eff_host = filter_hostname.unwrap_or(origin.host);
 
+    // Per Gateway API spec:
+    // - filter_port set → use filter_port
+    // - filter_port nil, filter_scheme set → use well-known port for new scheme
+    // - filter_port nil, filter_scheme nil → preserve Listener (incoming) port
+    let eff_port = filter_port.unwrap_or_else(|| {
+        if filter_scheme.is_some() {
+            match eff_scheme {
+                "https" => 443,
+                _ => 80,
+            }
+        } else {
+            origin.port
+        }
+    });
+
     let new_path = match path_modifier {
         None => origin.path.to_string(),
         Some(pm) => pm.apply(origin.path),
@@ -46,17 +62,12 @@ pub(super) fn build_redirect_location(
     };
 
     // Omit default ports per Gateway API spec.
-    let omit_port = filter_port.is_none()
-        || (eff_scheme == "http" && filter_port == Some(80))
-        || (eff_scheme == "https" && filter_port == Some(443));
+    let omit_port =
+        (eff_scheme == "http" && eff_port == 80) || (eff_scheme == "https" && eff_port == 443);
 
     if omit_port {
         format!("{eff_scheme}://{eff_host}{path_and_query}")
     } else {
-        format!(
-            "{eff_scheme}://{}:{}{path_and_query}",
-            eff_host,
-            filter_port.unwrap()
-        )
+        format!("{eff_scheme}://{}:{eff_port}{path_and_query}", eff_host)
     }
 }

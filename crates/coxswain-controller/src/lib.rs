@@ -8,4 +8,5 @@ pub mod tls;
 pub(crate) mod translate;
 
 pub use controller::{Controller, ControllerConfig};
-pub use reconciler::{IngressDefaultBackend, Reconciler};
+pub use ingress::IngressPorts;
+pub use reconciler::{IngressDefaultBackend, Reconciler, ReconcilerOptions};

@@ -7,7 +7,7 @@ mod entry;
 mod host_router;
 mod predicate;
 
-pub use builder::RoutingTableBuilder;
+pub use builder::{PortTableBuilder, RoutingTableBuilder};
 pub use entry::{
     FilterAction, HeaderMod, PathModifier, RouteConflict, RouteEntry, RouteInfo, RouteKind,
     RouteTimeouts, Upstream,
@@ -40,48 +40,18 @@ pub enum RouteOutcome {
     NoPath,
 }
 
-/// Immutable compiled routing table.
+/// Per-port routing bucket: the host+path+predicate logic for one listener port.
 ///
-/// Host resolution follows K8s Gateway API precedence:
-/// exact match → wildcard (most specific first) → catch-all.
-#[derive(Default)]
-pub struct RoutingTable {
+/// This is the content that `RoutingTable` used to hold directly at the top level.
+pub(crate) struct PortRoutingTable {
     pub(crate) exact_hosts: HashMap<String, HostRouter>,
     /// Sorted most-specific (longest suffix) first.
     pub(crate) wildcard_hosts: Vec<(String, HostRouter)>,
     pub(crate) catchall: Option<HostRouter>,
-    /// Rules that were dropped due to un-insertable matchit patterns.
-    pub(crate) conflicts: Vec<RouteConflict>,
 }
 
-impl RoutingTable {
-    /// Routes to an upstream, discarding filter and timeout information.
-    ///
-    /// Convenience for tests and admin introspection. The proxy hot path should
-    /// use [`find`] to also receive the filter list and timeouts.
-    pub fn route(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<Upstream>> {
-        let host_router = if let Some(router) = self.exact_hosts.get(host) {
-            Some(router)
-        } else {
-            self.wildcard_hosts
-                .iter()
-                .find(|(s, _)| host_router::wildcard_matches(host, s))
-                .map(|(_, r)| r)
-        };
-        if let Some(router) = host_router
-            && let Some((upstream, _, _, _)) = router.route(path, ctx)
-        {
-            return Some(upstream);
-        }
-        self.catchall
-            .as_ref()?
-            .route(path, ctx)
-            .map(|(u, _, _, _)| u)
-    }
-
-    /// Like [`route`] but distinguishes "host not registered" from "path not matched",
-    /// and returns filters and timeouts alongside the upstream.
-    pub fn find(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> RouteOutcome {
+impl PortRoutingTable {
+    fn find(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> RouteOutcome {
         let router = if let Some(r) = self.exact_hosts.get(host) {
             r
         } else if let Some((_, r)) = self
@@ -102,16 +72,27 @@ impl RoutingTable {
         }
     }
 
-    /// Rules dropped due to un-insertable matchit patterns, in the order they were encountered.
-    pub fn conflicts(&self) -> &[RouteConflict] {
-        &self.conflicts
+    fn route(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<Upstream>> {
+        let router = if let Some(r) = self.exact_hosts.get(host) {
+            Some(r)
+        } else {
+            self.wildcard_hosts
+                .iter()
+                .find(|(s, _)| host_router::wildcard_matches(host, s))
+                .map(|(_, r)| r)
+        };
+        if let Some(r) = router
+            && let Some((upstream, _, _, _)) = r.route(path, ctx)
+        {
+            return Some(upstream);
+        }
+        self.catchall
+            .as_ref()?
+            .route(path, ctx)
+            .map(|(u, _, _, _)| u)
     }
 
-    /// All host entries with their compiled routers, for introspection.
-    ///
-    /// Yields `(host_pattern, router)` tuples: exact hostnames as-is, wildcard
-    /// patterns with their `*.` prefix restored, and `"*"` for the catch-all.
-    pub fn host_routes(&self) -> Vec<(String, &HostRouter)> {
+    fn host_routes(&self) -> Vec<(String, &HostRouter)> {
         let mut result: Vec<(String, &HostRouter)> = Vec::new();
         for (host, router) in &self.exact_hosts {
             result.push((host.clone(), router));
@@ -124,18 +105,84 @@ impl RoutingTable {
         }
         result
     }
+}
 
-    /// All configured hostnames (exact and wildcard). Wildcard patterns include the `*.` prefix.
+/// Immutable compiled routing table keyed by listener port.
+///
+/// Each port maintains its own host+path+predicate routers; a request on port 8080
+/// only matches routes attached to a listener declared on port 8080.
+#[derive(Default)]
+pub struct RoutingTable {
+    pub(crate) by_port: HashMap<u16, PortRoutingTable>,
+    /// Rules dropped due to un-insertable matchit patterns, across all ports.
+    pub(crate) conflicts: Vec<RouteConflict>,
+}
+
+impl RoutingTable {
+    /// Routes to an upstream by port, host, and path, discarding filter and timeout information.
+    ///
+    /// Convenience for tests and admin introspection. The proxy hot path should
+    /// use [`find`] to also receive the filter list and timeouts.
+    pub fn route(
+        &self,
+        port: u16,
+        host: &str,
+        path: &str,
+        ctx: &RequestContext<'_>,
+    ) -> Option<Arc<Upstream>> {
+        self.by_port.get(&port)?.route(host, path, ctx)
+    }
+
+    /// Like [`route`] but distinguishes "host not registered" from "path not matched",
+    /// and returns filters and timeouts alongside the upstream.
+    pub fn find(
+        &self,
+        port: u16,
+        host: &str,
+        path: &str,
+        ctx: &RequestContext<'_>,
+    ) -> RouteOutcome {
+        match self.by_port.get(&port) {
+            Some(pt) => pt.find(host, path, ctx),
+            None => RouteOutcome::NoHost,
+        }
+    }
+
+    /// Rules dropped due to un-insertable matchit patterns, in the order they were encountered.
+    pub fn conflicts(&self) -> &[RouteConflict] {
+        &self.conflicts
+    }
+
+    /// All host entries with their compiled routers, across all ports.
+    ///
+    /// Each tuple is `(port, host_pattern, router)`. Host patterns: exact hostnames
+    /// as-is, wildcard patterns with `*.` prefix restored, `"*"` for catch-all.
+    pub fn host_routes(&self) -> Vec<(u16, String, &HostRouter)> {
+        let mut result = Vec::new();
+        for (port, pt) in &self.by_port {
+            for (host, router) in pt.host_routes() {
+                result.push((*port, host, router));
+            }
+        }
+        result
+    }
+
+    /// All configured hostnames across all ports. Wildcard patterns include the `*.` prefix.
     pub fn host_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.exact_hosts.keys().cloned().collect();
-        for (suffix, _) in &self.wildcard_hosts {
-            names.push(format!("*.{suffix}"));
+        let mut names: Vec<String> = Vec::new();
+        for pt in self.by_port.values() {
+            for (host, _) in pt.host_routes() {
+                names.push(host);
+            }
         }
         names
     }
 
-    /// Number of distinct host entries (exact + wildcard, excluding the catch-all).
+    /// Number of distinct host entries summed across all ports (exact + wildcard, excluding catch-all).
     pub fn host_count(&self) -> usize {
-        self.exact_hosts.len() + self.wildcard_hosts.len()
+        self.by_port
+            .values()
+            .map(|pt| pt.exact_hosts.len() + pt.wildcard_hosts.len())
+            .sum()
     }
 }

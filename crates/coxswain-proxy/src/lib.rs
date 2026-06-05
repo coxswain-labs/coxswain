@@ -3,6 +3,6 @@ pub(crate) mod filter;
 mod proxy;
 mod tls;
 
-pub use accept::{ProxyAcceptor, TrustedSources};
+pub use accept::{ListenerProtocol, ListenerSpec, ProxyAcceptor, TrustedSources};
 pub use proxy::{Proxy, ProxyCtx, RoutingEngine};
 pub use tls::SniCertSelector;

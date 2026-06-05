@@ -36,7 +36,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: https-a
-      port: 443
+      port: HTTPS_PORT
       protocol: HTTPS
       hostname: "LISTENER_A_HOSTNAME"
       tls:
@@ -48,7 +48,7 @@ spec:
         namespaces:
           from: Same
     - name: https-b
-      port: 443
+      port: HTTPS_PORT
       protocol: HTTPS
       hostname: "LISTENER_B_HOSTNAME"
       tls:

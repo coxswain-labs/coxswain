@@ -63,7 +63,7 @@ fn routes_response(routes: &SharedRoutingTable) -> Response<Vec<u8>> {
     let hosts: Vec<serde_json::Value> = table
         .host_routes()
         .into_iter()
-        .map(|(host, router)| {
+        .map(|(port, host, router)| {
             let routes: Vec<serde_json::Value> = router
                 .routes()
                 .iter()
@@ -76,7 +76,7 @@ fn routes_response(routes: &SharedRoutingTable) -> Response<Vec<u8>> {
                     })
                 })
                 .collect();
-            serde_json::json!({ "host": host, "routes": routes })
+            serde_json::json!({ "port": port, "host": host, "routes": routes })
         })
         .collect();
     let conflicts: Vec<serde_json::Value> = table
@@ -84,6 +84,7 @@ fn routes_response(routes: &SharedRoutingTable) -> Response<Vec<u8>> {
         .iter()
         .map(|c| {
             serde_json::json!({
+                "port": c.port,
                 "host": c.host,
                 "type": c.kind.as_str(),
                 "path": c.path,

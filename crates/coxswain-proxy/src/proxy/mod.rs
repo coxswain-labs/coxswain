@@ -82,6 +82,7 @@ async fn try_redirect(
     filters: &[FilterAction],
     proto: &str,
     host: &str,
+    incoming_port: u16,
     path: &str,
     query: Option<&str>,
 ) -> Result<bool> {
@@ -97,6 +98,7 @@ async fn try_redirect(
             let origin = RedirectOrigin {
                 scheme: proto,
                 host,
+                port: incoming_port,
                 path,
                 query,
             };
@@ -128,6 +130,7 @@ impl ProxyHttp for Proxy {
             .try_with(|info| ProxyCtx {
                 real_client_addr: Some(info.real_addr),
                 real_client_proto: Some(info.proto),
+                local_port: Some(info.local_addr.port()),
                 resolved: None,
                 request_deadline: None,
                 request_timeout_is_controlling: false,
@@ -158,13 +161,24 @@ impl ProxyHttp for Proxy {
             if is_tls { "https" } else { "http" }
         });
 
+        let port = ctx
+            .local_port
+            .or_else(|| {
+                session
+                    .as_downstream()
+                    .server_addr()
+                    .and_then(|a| a.as_inet())
+                    .map(|a| a.port())
+            })
+            .unwrap_or(0);
+
         let outcome = {
             let route_ctx = RequestContext {
                 method: &req.method,
                 headers: &req.headers,
                 query: query.as_deref(),
             };
-            self.engine.find(&host, &path, &route_ctx)
+            self.engine.find(port, &host, &path, &route_ctx)
         }; // route_ctx (and req borrow) drops here
 
         let Some((upstream, filters, route_timeouts)) =
@@ -176,7 +190,17 @@ impl ProxyHttp for Proxy {
         let timeouts = merge_timeouts(&route_timeouts, &self.default_timeouts);
         ctx.request_deadline = timeouts.request.map(|d| Instant::now() + d);
 
-        if try_redirect(session, &filters, proto, &host, &path, query.as_deref()).await? {
+        if try_redirect(
+            session,
+            &filters,
+            proto,
+            &host,
+            port,
+            &path,
+            query.as_deref(),
+        )
+        .await?
+        {
             return Ok(true);
         }
 
@@ -378,11 +402,14 @@ mod tests {
         RoutingEngine::new(shared)
     }
 
+    const PORT: u16 = 80;
+
     #[test]
     fn route_resolves_matched_host_and_path() {
         let upstream = make_upstream("default/backend", "10.0.0.1:8080");
         let mut builder = RoutingTableBuilder::new();
         builder
+            .for_port(PORT)
             .exact_host("example.com")
             .add_prefix_route("/", entry(upstream));
         let shared = SharedRoutingTable::new();
@@ -390,7 +417,7 @@ mod tests {
 
         let engine = engine_with_table(shared);
         let ctx = RequestContext::default();
-        let result = engine.route("example.com", "/api/users", &ctx);
+        let result = engine.route(PORT, "example.com", "/api/users", &ctx);
         assert!(result.is_some());
         assert_eq!(result.unwrap().name, "default/backend");
     }
@@ -400,6 +427,7 @@ mod tests {
         let upstream = make_upstream("default/backend", "10.0.0.1:8080");
         let mut builder = RoutingTableBuilder::new();
         builder
+            .for_port(PORT)
             .exact_host("example.com")
             .add_prefix_route("/", entry(upstream));
         let shared = SharedRoutingTable::new();
@@ -407,14 +435,14 @@ mod tests {
 
         let engine = engine_with_table(shared);
         let ctx = RequestContext::default();
-        assert!(engine.route("other.com", "/", &ctx).is_none());
+        assert!(engine.route(PORT, "other.com", "/", &ctx).is_none());
     }
 
     #[test]
     fn route_returns_none_on_empty_table() {
         let engine = engine_with_table(SharedRoutingTable::new());
         let ctx = RequestContext::default();
-        assert!(engine.route("example.com", "/", &ctx).is_none());
+        assert!(engine.route(PORT, "example.com", "/", &ctx).is_none());
     }
 
     #[test]
@@ -422,6 +450,7 @@ mod tests {
         let upstream = Arc::new(Upstream::new("default/empty".to_string(), vec![]));
         let mut builder = RoutingTableBuilder::new();
         builder
+            .for_port(PORT)
             .exact_host("example.com")
             .add_exact_route("/", entry(upstream));
         let shared = SharedRoutingTable::new();
@@ -429,7 +458,7 @@ mod tests {
 
         let engine = engine_with_table(shared);
         let ctx = RequestContext::default();
-        let resolved = engine.route("example.com", "/", &ctx);
+        let resolved = engine.route(PORT, "example.com", "/", &ctx);
         assert!(resolved.is_some(), "route should resolve");
         assert!(
             resolved.unwrap().next_endpoint().is_none(),
@@ -440,12 +469,14 @@ mod tests {
     fn origin(
         scheme: &'static str,
         host: &'static str,
+        port: u16,
         path: &'static str,
         query: Option<&'static str>,
     ) -> RedirectOrigin<'static> {
         RedirectOrigin {
             scheme,
             host,
+            port,
             path,
             query,
         }
@@ -458,9 +489,21 @@ mod tests {
             None,
             None,
             None,
-            &origin("http", "example.com", "/foo", None),
+            &origin("http", "example.com", 80, "/foo", None),
         );
         assert_eq!(loc, "http://example.com/foo");
+    }
+
+    #[test]
+    fn redirect_location_no_overrides_preserves_non_default_port() {
+        let loc = build_redirect_location(
+            None,
+            None,
+            None,
+            None,
+            &origin("http", "example.com", 8080, "/foo", None),
+        );
+        assert_eq!(loc, "http://example.com:8080/foo");
     }
 
     #[test]
@@ -470,7 +513,7 @@ mod tests {
             None,
             None,
             None,
-            &origin("http", "example.com", "/foo", None),
+            &origin("http", "example.com", 80, "/foo", None),
         );
         assert_eq!(loc, "https://example.com/foo");
     }
@@ -482,7 +525,7 @@ mod tests {
             Some("new.example.com"),
             None,
             None,
-            &origin("http", "old.example.com", "/bar", None),
+            &origin("http", "old.example.com", 80, "/bar", None),
         );
         assert_eq!(loc, "http://new.example.com/bar");
     }
@@ -494,7 +537,7 @@ mod tests {
             None,
             None,
             None,
-            &origin("http", "example.com", "/x", Some("k=v")),
+            &origin("http", "example.com", 80, "/x", Some("k=v")),
         );
         assert_eq!(loc, "http://example.com/x?k=v");
     }
@@ -506,7 +549,7 @@ mod tests {
             None,
             Some(8080),
             None,
-            &origin("http", "example.com", "/", None),
+            &origin("http", "example.com", 80, "/", None),
         );
         assert_eq!(loc, "http://example.com:8080/");
     }
@@ -518,7 +561,7 @@ mod tests {
             None,
             Some(80),
             None,
-            &origin("http", "example.com", "/", None),
+            &origin("http", "example.com", 80, "/", None),
         );
         assert_eq!(loc, "http://example.com/");
     }
@@ -531,7 +574,7 @@ mod tests {
             None,
             None,
             Some(&pm),
-            &origin("http", "example.com", "/old/path", None),
+            &origin("http", "example.com", 80, "/old/path", None),
         );
         assert_eq!(loc, "http://example.com/new");
     }
@@ -547,7 +590,7 @@ mod tests {
             None,
             None,
             Some(&pm),
-            &origin("http", "example.com", "/api/users", None),
+            &origin("http", "example.com", 80, "/api/users", None),
         );
         assert_eq!(loc, "http://example.com/v2/users");
     }
@@ -569,6 +612,7 @@ mod tests {
         ));
         let mut builder = RoutingTableBuilder::new();
         builder
+            .for_port(PORT)
             .exact_host("example.com")
             .add_prefix_route("/", entry);
         let shared = SharedRoutingTable::new();
@@ -576,7 +620,7 @@ mod tests {
 
         let engine = engine_with_table(shared);
         let ctx = RequestContext::default();
-        match engine.find("example.com", "/test", &ctx) {
+        match engine.find(PORT, "example.com", "/test", &ctx) {
             RouteOutcome::Found(_, filters, _) => {
                 assert_eq!(filters.len(), 1);
                 assert!(matches!(

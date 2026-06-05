@@ -10,6 +10,7 @@ pub use bootstrap::bootstrap;
 pub use controller::{ControllerOptions, ControllerProcess};
 pub use http::HttpClient;
 pub use namespace::{IngressClassGuard, NamespaceGuard};
+use std::path::Path;
 pub use tls::GeneratedCert;
 
 pub struct Harness {
@@ -45,5 +46,21 @@ impl Harness {
 
     pub fn admin_url(&self, path: &str) -> String {
         format!("http://{}{path}", self.controller.admin_addr)
+    }
+
+    pub async fn apply(
+        &self,
+        path: impl AsRef<Path>,
+        namespace: &str,
+        extra_vars: &[(&str, &str)],
+    ) -> anyhow::Result<()> {
+        let http_port = self.controller.proxy_addr.port().to_string();
+        let https_port = self.tls_addr.port().to_string();
+        let mut vars: Vec<(&str, &str)> = Vec::with_capacity(3 + extra_vars.len());
+        vars.push(("HTTP_PORT", &http_port));
+        vars.push(("HTTP_PORT_STR", &http_port));
+        vars.push(("HTTPS_PORT", &https_port));
+        vars.extend_from_slice(extra_vars);
+        crate::fixtures::apply_fixture(path, namespace, &vars).await
     }
 }

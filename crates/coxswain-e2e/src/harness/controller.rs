@@ -1,6 +1,11 @@
 use anyhow::Context as _;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+};
 use tokio::process::{Child, Command};
+
+const BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 pub struct ControllerProcess {
     child: Child,
@@ -30,10 +35,15 @@ impl ControllerProcess {
     }
 
     pub async fn start_with_options(opts: ControllerOptions) -> anyhow::Result<Self> {
-        let proxy_addr = free_addr()?;
-        let tls_addr = free_addr()?;
-        let health_addr = free_addr()?;
-        let admin_addr = free_addr()?;
+        let http_port = free_port()?;
+        let https_port = free_port()?;
+        let health_port = free_port()?;
+        let admin_port = free_port()?;
+
+        let proxy_addr = SocketAddr::new(BIND_ADDR, http_port);
+        let tls_addr = SocketAddr::new(BIND_ADDR, https_port);
+        let health_addr = SocketAddr::new(BIND_ADDR, health_port);
+        let admin_addr = SocketAddr::new(BIND_ADDR, admin_port);
 
         // Use the test process's PID as pod-name: if the lease is still held by
         // a prior test's controller (same pod-name), renewal succeeds immediately
@@ -43,14 +53,16 @@ impl ControllerProcess {
         let binary = coxswain_bin()?;
         let mut args = vec![
             "serve".to_string(),
-            "--proxy-addr".to_string(),
-            proxy_addr.to_string(),
-            "--proxy-tls-addr".to_string(),
-            tls_addr.to_string(),
-            "--health-addr".to_string(),
-            health_addr.to_string(),
-            "--admin-addr".to_string(),
-            admin_addr.to_string(),
+            "--proxy-bind-address".to_string(),
+            BIND_ADDR.to_string(),
+            "--proxy-http-port".to_string(),
+            http_port.to_string(),
+            "--proxy-https-port".to_string(),
+            https_port.to_string(),
+            "--health-port".to_string(),
+            health_port.to_string(),
+            "--admin-port".to_string(),
+            admin_port.to_string(),
             "--log-format".to_string(),
             "console".to_string(),
             "--pod-name".to_string(),
@@ -104,6 +116,10 @@ fn free_addr() -> anyhow::Result<SocketAddr> {
     let addr = listener.local_addr().context("local_addr")?;
     Ok(addr)
     // listener drops here, releasing the port; small race window is acceptable
+}
+
+fn free_port() -> anyhow::Result<u16> {
+    free_addr().map(|a| a.port())
 }
 
 fn coxswain_bin() -> anyhow::Result<PathBuf> {
