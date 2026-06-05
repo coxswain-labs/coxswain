@@ -1,7 +1,6 @@
 # Coxswain
 
-[![E2E](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml/badge.svg)](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml)
-[![Conformance](https://github.com/coxswain-labs/coxswain/actions/workflows/conformance.yml/badge.svg)](https://github.com/coxswain-labs/coxswain/actions/workflows/conformance.yml)
+[![E2E & Conformance](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml/badge.svg)](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml)
 
 A pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine.
 
