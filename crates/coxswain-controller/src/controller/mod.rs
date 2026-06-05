@@ -222,7 +222,10 @@ impl Controller {
                             if gc.spec.controller_name == self.config.controller_name {
                                 owned_gateway_classes.insert(name.clone());
                                 if is_leader && gateway_class_needs_status_patch(&gc) {
-                                    let generation = gc.metadata.generation.unwrap_or(0);
+                                    let Some(generation) = gc.metadata.generation else {
+                                        tracing::warn!(name, "Skipping GatewayClass status patch: metadata.generation is unset");
+                                        continue;
+                                    };
                                     Self::patch_gateway_class_status(&client, &name, generation).await;
                                 }
                             } else {
@@ -427,7 +430,14 @@ impl Controller {
             None => return,
         };
         let ns = gw.metadata.namespace.as_deref().unwrap_or("default");
-        let generation = gw.metadata.generation.unwrap_or(0);
+        let Some(generation) = gw.metadata.generation else {
+            tracing::warn!(
+                name,
+                ns,
+                "Skipping Gateway status patch: metadata.generation is unset"
+            );
+            return;
+        };
         let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
         let now = Time(k8s_openapi::jiff::Timestamp::now());
         let patch = build_gateway_status_patch(gw, health, generation, &now, addr);
@@ -465,7 +475,14 @@ impl Controller {
 
         let api: Api<HTTPRoute> = Api::namespaced(client.clone(), ns);
         let now = Time(k8s_openapi::jiff::Timestamp::now());
-        let observed_gen = route.metadata.generation.unwrap_or(0);
+        let Some(observed_gen) = route.metadata.generation else {
+            tracing::warn!(
+                name,
+                ns,
+                "Skipping HTTPRoute status patch: metadata.generation is unset"
+            );
+            return;
+        };
 
         let default_health = RouteParentHealth::default();
         let parents: Vec<HttpRouteStatusParents> = owned_refs
