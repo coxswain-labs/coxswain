@@ -19,3 +19,4 @@ jobs:
         uses: actions/labeler@v6
         with:
           configuration-path: .github/labeler.yml
+          repo-token: ${{ secrets.GH_LABELER_PAT }}
