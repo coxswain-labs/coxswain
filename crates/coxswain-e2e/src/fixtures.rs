@@ -14,6 +14,11 @@ pub const BACKENDS_SLOW_ECHO: &str = concat!(
     "/fixtures/backends/slow_echo.yaml"
 );
 
+pub const BACKENDS_H2C_ECHO: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/h2c_echo.yaml"
+);
+
 pub const GATEWAY_API_PATH_MATCHING: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/gateway_api/path_matching.yaml"
@@ -162,6 +167,11 @@ pub const GATEWAY_API_SERVING_DRAIN: &str = concat!(
 pub const GATEWAY_API_PARENT_REF_PORT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/gateway_api/parent_ref_port.yaml"
+);
+
+pub const GATEWAY_API_BACKEND_PROTOCOL_H2C: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/gateway_api/backend_protocol_h2c.yaml"
 );
 
 /// Apply a fixture YAML to `namespace`.

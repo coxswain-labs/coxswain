@@ -11,14 +11,14 @@ use crate::translate::metadata_created_at;
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
-    BackendGroup, HostRouterBuilder, MatchPredicates, RouteEntry, RoutingTableBuilder,
+    BackendGroup, BackendProtocol, HostRouterBuilder, MatchPredicates, RouteEntry,
+    RoutingTableBuilder, parse_app_protocol,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -149,7 +149,7 @@ impl GatewayApiReconciler {
                     _ => continue,
                 };
 
-                let weighted = Self::resolve_weighted_backends(
+                let resolved = Self::resolve_weighted_backends(
                     backend_refs,
                     route_ns,
                     slices,
@@ -157,7 +157,14 @@ impl GatewayApiReconciler {
                     grants,
                 );
                 let group_name = backend_group_name(backend_refs, route_ns);
-                let group = Arc::new(BackendGroup::weighted(group_name, weighted));
+                let protocols: Vec<BackendProtocol> = resolved
+                    .iter()
+                    .map(|(r, _)| parse_app_protocol(r.app_protocol.as_deref().unwrap_or("")))
+                    .collect();
+                let protocol = pick_route_protocol(&protocols, &group_name);
+                let weighted = resolved.into_iter().map(|(r, w)| (r.addrs, w)).collect();
+                let group =
+                    Arc::new(BackendGroup::weighted(group_name, weighted).with_protocol(protocol));
                 if group.endpoints().is_empty() {
                     tracing::warn!(
                         route = ?route.metadata.name,
@@ -348,20 +355,32 @@ impl GatewayApiReconciler {
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
         grants: &HashSet<ReferenceGrantKey>,
-    ) -> Vec<(Vec<SocketAddr>, u16)> {
+    ) -> Vec<(endpoints::ResolvedEndpoints, u16)> {
         backend_refs
             .iter()
             .filter_map(|b| b.port.map(|port| (b, port)))
             .map(|(b, port)| {
                 let weight = weight_of(b);
                 if weight == 0 {
-                    return (vec![], 0);
+                    return (
+                        endpoints::ResolvedEndpoints {
+                            addrs: vec![],
+                            app_protocol: None,
+                        },
+                        0,
+                    );
                 }
 
                 let b_kind = b.kind.as_deref().unwrap_or("Service");
                 let b_group = b.group.as_deref().unwrap_or("");
                 if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
-                    return (vec![], weight);
+                    return (
+                        endpoints::ResolvedEndpoints {
+                            addrs: vec![],
+                            app_protocol: None,
+                        },
+                        weight,
+                    );
                 }
 
                 let ns = b.namespace.as_deref().unwrap_or(route_ns);
@@ -374,7 +393,13 @@ impl GatewayApiReconciler {
                         backend_svc = %b.name,
                         "Cross-namespace backendRef denied — no matching ReferenceGrant"
                     );
-                    return (vec![], weight);
+                    return (
+                        endpoints::ResolvedEndpoints {
+                            addrs: vec![],
+                            app_protocol: None,
+                        },
+                        weight,
+                    );
                 }
 
                 (
@@ -629,5 +654,36 @@ fn backend_group_name(refs: &[HttpRouteRulesBackendRefs], ns: &str) -> String {
         [] => format!("{ns}/empty"),
         [single] => format!("{ns}/{}", single.name),
         [first, rest @ ..] => format!("{ns}/{}+{}more", first.name, rest.len()),
+    }
+}
+
+/// Choose the representative `BackendProtocol` for a rule whose backendRefs
+/// may declare different `appProtocol` values (per GEP-1911, mixed protocols
+/// within a single rule are undefined).
+///
+/// Returns the first non-`Http1` protocol; falls back to `Http1` if all are
+/// default. Emits a warning when more than one distinct non-default protocol
+/// is present.
+fn pick_route_protocol(protocols: &[BackendProtocol], group_name: &str) -> BackendProtocol {
+    let non_default: Vec<BackendProtocol> = protocols
+        .iter()
+        .copied()
+        .filter(|&p| p != BackendProtocol::Http1)
+        .collect();
+
+    match non_default.as_slice() {
+        [] => BackendProtocol::Http1,
+        [single] => *single,
+        [first, ..] => {
+            let all_same = non_default.iter().all(|&p| p == *first);
+            if !all_same {
+                tracing::warn!(
+                    backend_group = group_name,
+                    "Mixed appProtocol across backendRefs is undefined per GEP-1911; \
+                     using first non-default"
+                );
+            }
+            *first
+        }
     }
 }

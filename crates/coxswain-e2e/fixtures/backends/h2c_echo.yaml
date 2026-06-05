@@ -1,0 +1,48 @@
+# H2C test backend for e2e tests.
+# Uses the same echo-basic image as other gateway-api tests; the Service port
+# declares appProtocol: kubernetes.io/h2c so Coxswain routes this backend via
+# BackendProtocol::H2c. The test asserts that a route to this backend is
+# successfully programmed and returns 200 — validating the appProtocol data
+# path without requiring the backend to speak h2c natively.
+# Actual h2c wire-protocol verification is covered by the conformance suite.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: h2c-echo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: h2c-echo
+  template:
+    metadata:
+      labels:
+        app: h2c-echo
+    spec:
+      containers:
+        - name: echo
+          image: gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
+          ports:
+            - containerPort: 3000
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: h2c-echo
+spec:
+  selector:
+    app: h2c-echo
+  ports:
+    - port: 3000
+      targetPort: 3000
+      appProtocol: kubernetes.io/h2c

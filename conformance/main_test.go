@@ -66,8 +66,9 @@ func TestConformance(t *testing.T) {
 		features.SupportHTTPRouteDestinationPortMatching,
 		// Extended: per-port listener routing (#82, #98)
 		features.SupportHTTPRouteParentRefPort,
-// 		// Extended: websocket (#15 dependency, port mapping fix)
-// 		features.SupportHTTPRouteBackendProtocolWebSocket,
+		// Extended: backend protocol selection — GEP-1911 (#90)
+		features.SupportHTTPRouteBackendProtocolH2C,
+		features.SupportHTTPRouteBackendProtocolWebSocket,
 	)
 
 	conformance.RunConformanceWithOptions(t, opts)

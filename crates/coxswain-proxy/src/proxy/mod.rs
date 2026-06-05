@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use coxswain_core::routing::{FilterAction, RequestContext, RouteOutcome, RouteTimeouts};
+use coxswain_core::routing::{
+    BackendProtocol, FilterAction, RequestContext, RouteOutcome, RouteTimeouts,
+};
 use http::header;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{
@@ -243,7 +245,15 @@ impl ProxyHttp for Proxy {
         // Use the (potentially rewritten) host from UrlRewrite hostname, or the original host.
         let sni_host = resolved.original_host.clone();
 
-        let mut peer = HttpPeer::new(addr.to_string(), false, sni_host);
+        let protocol = resolved.backend_group.protocol();
+        let tls = matches!(
+            protocol,
+            BackendProtocol::Https | BackendProtocol::WebSocketTls
+        );
+        let mut peer = HttpPeer::new(addr.to_string(), tls, sni_host);
+        if matches!(protocol, BackendProtocol::H2c) {
+            peer.options.set_http_version(2, 2);
+        }
 
         // Apply per-route timeout settings.
         // backendRequest controls the upstream read (and connect) phase → 502 on expiry.

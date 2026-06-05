@@ -1,7 +1,7 @@
 use crate::endpoints;
 use crate::tls::load_tls_cert;
 use crate::translate::metadata_created_at;
-use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder};
+use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, parse_app_protocol};
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -163,8 +163,8 @@ impl IngressReconciler {
                     None => continue,
                 };
 
-                let addrs = endpoints::resolve(ns, &svc.name, port, slices, services);
-                if addrs.is_empty() {
+                let resolved = endpoints::resolve(ns, &svc.name, port, slices, services);
+                if resolved.addrs.is_empty() {
                     tracing::warn!(
                         ingress = ?ingress.metadata.name,
                         svc = %svc.name,
@@ -172,8 +172,11 @@ impl IngressReconciler {
                     );
                     continue;
                 }
-
-                let group = Arc::new(BackendGroup::new(format!("{ns}/{}", svc.name), addrs));
+                let protocol = parse_app_protocol(resolved.app_protocol.as_deref().unwrap_or(""));
+                let group = Arc::new(
+                    BackendGroup::new(format!("{ns}/{}", svc.name), resolved.addrs)
+                        .with_protocol(protocol),
+                );
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
                 if !path.starts_with('/') {
@@ -216,18 +219,21 @@ impl IngressReconciler {
         if let Some(default_backend) = spec.and_then(|s| s.default_backend.as_ref()) {
             if let Some(default_svc) = default_backend.service.as_ref() {
                 if let Some(port) = resolve_backend_port(ns, default_svc, services) {
-                    let addrs = endpoints::resolve(ns, &default_svc.name, port, slices, services);
-                    if addrs.is_empty() {
+                    let resolved =
+                        endpoints::resolve(ns, &default_svc.name, port, slices, services);
+                    if resolved.addrs.is_empty() {
                         tracing::warn!(
                             ingress = ?ingress.metadata.name,
                             svc = %default_svc.name,
                             "No ready endpoints for defaultBackend — skipping"
                         );
                     } else {
-                        let group = Arc::new(BackendGroup::new(
-                            format!("{ns}/{}", default_svc.name),
-                            addrs,
-                        ));
+                        let protocol =
+                            parse_app_protocol(resolved.app_protocol.as_deref().unwrap_or(""));
+                        let group = Arc::new(
+                            BackendGroup::new(format!("{ns}/{}", default_svc.name), resolved.addrs)
+                                .with_protocol(protocol),
+                        );
                         let make_entry = || {
                             Arc::new(RouteEntry::path_only(
                                 Arc::clone(&group),

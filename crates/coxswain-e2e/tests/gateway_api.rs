@@ -1,11 +1,11 @@
 use coxswain_e2e::{
     fixtures::{
-        BACKENDS_ECHO, BACKENDS_SLOW_ECHO, BACKENDS_WEBSOCKET_ECHO, GATEWAY_API_CERT_MANAGER,
-        GATEWAY_API_COMBINED_MATCHING, GATEWAY_API_CROSS_NAMESPACE_ROUTE,
-        GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_FILTERS, GATEWAY_API_HEADER_MATCHING,
-        GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING, GATEWAY_API_PARENT_REF_PORT,
-        GATEWAY_API_PATH_MATCHING, GATEWAY_API_QUERY_PARAM_MATCHING, GATEWAY_API_SERVING_DRAIN,
-        GATEWAY_API_TIMEOUTS, GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS,
+        BACKENDS_ECHO, BACKENDS_H2C_ECHO, BACKENDS_SLOW_ECHO, BACKENDS_WEBSOCKET_ECHO,
+        GATEWAY_API_BACKEND_PROTOCOL_H2C, GATEWAY_API_CERT_MANAGER, GATEWAY_API_COMBINED_MATCHING,
+        GATEWAY_API_CROSS_NAMESPACE_ROUTE, GATEWAY_API_CROSS_NAMESPACE_TENANT, GATEWAY_API_FILTERS,
+        GATEWAY_API_HEADER_MATCHING, GATEWAY_API_HOST_POOL, GATEWAY_API_METHOD_MATCHING,
+        GATEWAY_API_PARENT_REF_PORT, GATEWAY_API_PATH_MATCHING, GATEWAY_API_QUERY_PARAM_MATCHING,
+        GATEWAY_API_SERVING_DRAIN, GATEWAY_API_TIMEOUTS, GATEWAY_API_TLS_CROSS_NAMESPACE_CERTS,
         GATEWAY_API_TLS_CROSS_NAMESPACE_GW, GATEWAY_API_TLS_GATEWAY_NO_CERTS,
         GATEWAY_API_TLS_REDIRECT, GATEWAY_API_TLS_TERMINATION, GATEWAY_API_WEBSOCKET,
         GATEWAY_API_WEIGHTED_SPLIT, GATEWAY_API_WILDCARD_HOST,
@@ -856,6 +856,31 @@ async fn websocket_passthrough() -> anyhow::Result<()> {
     );
 
     ws.close(None).await?;
+    Ok(())
+}
+
+/// Verifies that a Service with `appProtocol: kubernetes.io/h2c` is correctly
+/// routed by Coxswain (GEP-1911). The test confirms that the `appProtocol`
+/// annotation is propagated through the data pipeline (endpoint resolution →
+/// BackendGroup → proxy) and that the route is successfully programmed and
+/// returns responses. Actual h2c wire-protocol verification (that the proxy
+/// speaks HTTP/2 cleartext on the upstream leg) is covered by the conformance
+/// suite, which requires a backend that natively accepts h2c connections.
+#[tokio::test]
+async fn backend_protocol_h2c() -> anyhow::Result<()> {
+    init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-h2c").await?;
+
+    h.apply(BACKENDS_H2C_ECHO, &ns.name, &[]).await?;
+    wait::wait_for_deployments(&ns.name, &["h2c-echo"]).await?;
+    h.apply(GATEWAY_API_BACKEND_PROTOCOL_H2C, &ns.name, &[])
+        .await?;
+
+    let host = format!("h2c.{}.local", ns.name);
+
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("h2c-echo");
     Ok(())
 }
 
