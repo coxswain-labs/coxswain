@@ -50,7 +50,7 @@ jobs:
           retention-days: 1
 
   e2e-gateway-api:
-    name: e2e (gateway_api)
+    name: gateway_api
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -123,7 +123,7 @@ jobs:
           kubectl get ingresses -A
 
   e2e-ingress:
-    name: e2e (ingress)
+    name: ingress
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
