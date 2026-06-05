@@ -1171,9 +1171,10 @@ async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Verifies SupportHTTPRouteParentRefPort (#98):
-// A route with parentRef.port matching the listener is routable;
-// a route with parentRef.port pointing at a non-existent port is not attached.
+// Verifies SupportHTTPRouteParentRefPort (#82, #98):
+// A route pinned to a listener port attaches only to that port; a route with no
+// port filter attaches to all listeners; routing-table isolation is verified via
+// the admin /routes endpoint.
 #[tokio::test]
 async fn parent_ref_port_matching() -> anyhow::Result<()> {
     init_tracing();
@@ -1192,20 +1193,59 @@ async fn parent_ref_port_matching() -> anyhow::Result<()> {
     )
     .await?;
 
-    // route-pinned (parentRef.port=HTTP_PORT) should be live.
+    // route-pinned (parentRef.port=HTTP_PORT) must attach only to the HTTP listener.
     let pinned_host = format!("pinned.{}.local", ns.name);
     let resp =
         wait::wait_for_route(&h.http, &pinned_host, "/probe", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
-    // route-wrong-port (parentRef.port=WRONG_PORT) must NOT be routable:
-    // coxswain has no listener on that port, so the route is unattached and
-    // nothing is inserted in the routing table for wrong.TESTNS.local.
+    // route-unpinned (no parentRef.port) must attach to BOTH listeners.
+    let both_host = format!("both.{}.local", ns.name);
+    let resp = wait::wait_for_route(&h.http, &both_host, "/probe", Duration::from_secs(30)).await?;
+    resp.assert_backend("echo-a");
+
+    // route-wrong-port (parentRef.port=WRONG_PORT) must NOT be routable on HTTP_PORT:
+    // the route is scoped to the alt listener, which coxswain doesn't bind.
     let wrong_host = format!("wrong.{}.local", ns.name);
     let status = h.http.get_status(&wrong_host, "/").await?;
     assert_ne!(
         status, 200,
         "route-wrong-port must not be routable on HTTP_PORT"
+    );
+
+    // Verify routing-table isolation via admin /routes.
+    // Once pinned.* and both.* are live the table is fully settled.
+    let routes: serde_json::Value = reqwest::get(h.admin_url("/routes")).await?.json().await?;
+    let hosts = routes["hosts"].as_array().expect("hosts array");
+
+    let http_port = u64::from(h.controller.proxy_addr.port());
+    let wrong_port_u64: u64 = wrong_port.parse().unwrap();
+
+    let ports_for = |host: &str| -> std::collections::BTreeSet<u64> {
+        hosts
+            .iter()
+            .filter(|e| e["host"].as_str() == Some(host))
+            .filter_map(|e| e["port"].as_u64())
+            .collect()
+    };
+
+    // pinned.* appears under http_port only.
+    assert_eq!(
+        ports_for(&pinned_host),
+        [http_port].into(),
+        "pinned.* must appear only under HTTP_PORT in the routing table"
+    );
+    // wrong.* appears under wrong_port only (installed by controller; proxy doesn't bind that port).
+    assert_eq!(
+        ports_for(&wrong_host),
+        [wrong_port_u64].into(),
+        "wrong.* must appear only under WRONG_PORT in the routing table"
+    );
+    // both.* appears under both ports (no port filter → all listeners).
+    let both_ports = ports_for(&both_host);
+    assert!(
+        both_ports.contains(&http_port) && both_ports.contains(&wrong_port_u64),
+        "both.* must appear under both HTTP_PORT and WRONG_PORT, got {both_ports:?}"
     );
 
     Ok(())

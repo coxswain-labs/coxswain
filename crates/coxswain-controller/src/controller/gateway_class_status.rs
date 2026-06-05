@@ -21,6 +21,7 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteHostRewrite",
     "HTTPRouteMethodMatching",
     "HTTPRouteNamedRouteRule",
+    "HTTPRouteParentRefPort",
     "HTTPRoutePathRedirect",
     "HTTPRoutePathRewrite",
     "HTTPRoutePortRedirect",

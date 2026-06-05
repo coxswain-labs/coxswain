@@ -74,10 +74,11 @@ jobs:
           # KUBECONFIG must be passed explicitly because sudo runs as root, which would
           # look at /root/.kube/config — kind writes the config under the runner's home.
           sudo KUBECONFIG="$HOME/.kube/config" ./target/debug/coxswain serve \
-            --proxy-addr 0.0.0.0:80 \
-            --proxy-tls-addr 0.0.0.0:443 \
-            --health-addr 0.0.0.0:8081 \
-            --admin-addr 0.0.0.0:8082 \
+            --proxy-bind-address 0.0.0.0 \
+            --proxy-http-port 80 \
+            --proxy-https-port 443 \
+            --health-port 8081 \
+            --admin-port 8082 \
             --status-address 127.0.0.1 \
             --log-format console \
             --pod-name coxswain-conformance \
@@ -85,11 +86,12 @@ jobs:
             --controller-lease-ttl 15s \
             --controller-lease-renew-interval 5s \
             &
-          # Wait for readyz
+          # Wait for readyz — fail fast if coxswain exits before becoming ready.
           for i in $(seq 1 30); do
-            curl -sf http://localhost:8081/readyz && break
+            curl -sf http://localhost:8081/readyz && break || true
             sleep 2
           done
+          curl -sf http://localhost:8081/readyz
 
       - name: Run Gateway API conformance suite
         id: conformance

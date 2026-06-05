@@ -1,5 +1,8 @@
 # Coxswain
 
+[![E2E](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml/badge.svg)](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml)
+[![Conformance](https://github.com/coxswain-labs/coxswain/actions/workflows/conformance.yml/badge.svg)](https://github.com/coxswain-labs/coxswain/actions/workflows/conformance.yml)
+
 A pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine.
 
 Coxswain watches Kubernetes `Ingress` and `HTTPRoute` resources and dynamically updates its routing table without a process restart or config reload. Multiple replicas can run simultaneously using Kubernetes Lease-based leader election — all replicas maintain a hot routing table, but only the active leader writes status back to the API server.
@@ -67,20 +70,23 @@ All flags have environment variable equivalents. Most use a `COXSWAIN_*` prefix 
 
 | Flag | Env var | Default | Description |
 |------|---------|---------|-------------|
-| `--admin-addr` | `COXSWAIN_ADMIN_ADDR` | `0.0.0.0:8082` | Admin, metrics, and diagnostics address |
+| `--admin-port` | `COXSWAIN_ADMIN_PORT` | `8082` | Port for admin, metrics, and diagnostics endpoints |
 | `--controller-lease-renew-interval` | `COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL` | `5s` | How often the leader renews its lease; must be ≤ 1/3 of `--controller-lease-ttl` |
 | `--controller-lease-ttl` | `COXSWAIN_CONTROLLER_LEASE_TTL` | `15s` | How long a lease stays valid without renewal; must be ≥ 3× `--controller-lease-renew-interval` |
 | `--controller-name` | `COXSWAIN_CONTROLLER_NAME` | `coxswain-labs.dev/gateway-controller` | GatewayClass `spec.controllerName` to claim |
 | `--controller-watch-namespace` | `COXSWAIN_CONTROLLER_WATCH_NAMESPACE` | _(cluster-wide)_ | Restrict watch to a single namespace |
-| `--health-addr` | `COXSWAIN_HEALTH_ADDR` | `0.0.0.0:8081` | Liveness and readiness health endpoints address |
+| `--health-port` | `COXSWAIN_HEALTH_PORT` | `8081` | Port for liveness and readiness health endpoints |
 | `--log` | `COXSWAIN_LOG` | `info` | Log level; supports `RUST_LOG` directive syntax (e.g. `info,coxswain=debug`) |
 | `--log-format` | `COXSWAIN_LOG_FORMAT` | `json` | `json` (production) or `console` (local dev) |
 | `--pod-name` | `POD_NAME` | `coxswain-local` | Pod name used as the leader-election holder identity |
 | `--pod-namespace` | `POD_NAMESPACE` | `coxswain-system` | Pod namespace used to scope the leader-election Lease |
-| `--proxy-addr` | `COXSWAIN_PROXY_ADDR` | `0.0.0.0:80` | Inbound HTTP proxy address |
+| `--proxy-bind-address` | `COXSWAIN_PROXY_BIND_ADDRESS` | `0.0.0.0` | IP address shared by all proxy, health, and admin listeners |
+| `--proxy-http-port` | `COXSWAIN_PROXY_HTTP_PORT` | _(none)_ | Port for inbound HTTP traffic; omit to disable the HTTP listener |
+| `--proxy-https-port` | `COXSWAIN_PROXY_HTTPS_PORT` | _(none)_ | Port for inbound HTTPS traffic (SNI TLS); omit to disable |
 | `--proxy-shutdown-grace-period` | `COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD` | `30s` | Drain window after shutdown signal; connections are given this long to complete |
 | `--proxy-shutdown-timeout` | `COXSWAIN_PROXY_SHUTDOWN_TIMEOUT` | `5s` | Hard deadline for the final shutdown step after the grace period expires |
 | `--proxy-threads` | `COXSWAIN_PROXY_THREADS` | `2` | Worker threads per proxy service; set to CPU core count for maximum throughput |
+| `--status-address` | `COXSWAIN_STATUS_ADDRESS` | _(none)_ | IP or hostname written to `Ingress.status` and `Gateway.status.addresses`; required for cert-manager HTTP-01 and external-dns |
 
 ## License
 
