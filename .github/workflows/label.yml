@@ -7,15 +7,15 @@ on:
 name: Label
 
 jobs:
-  label-experimental:
-    name: label-experimental
+  apply-labels:
+    name: apply-labels
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
     steps:
       - uses: actions/checkout@v6
 
-      - name: Apply 'experimental' label when experimental channel files change
+      - name: Apply labels based on changed files
         uses: actions/labeler@v6
         with:
           configuration-path: .github/labeler.yml

@@ -2,8 +2,10 @@ on:
   push:
     branches:
       - main
-  schedule:
-    - cron: '0 2 * * *'
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    branches:
+      - main
   workflow_dispatch:
 
 name: Conformance
@@ -11,6 +13,10 @@ name: Conformance
 jobs:
   conformance:
     name: gateway-api-conformance
+    # On PRs, only run when labeled 'needs: conformance'; push/workflow_dispatch always run.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'needs: conformance')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -133,3 +139,21 @@ jobs:
           kubectl get gateways -A -o wide
           echo "=== HTTPRoutes ==="
           kubectl get httproutes -A
+
+  # Always-green stub on PRs so branch protection can require it without getting
+  # stuck when the label gate skips the real conformance job. Passes on success or
+  # skipped (label absent = conformance not needed); fails on failure/cancelled.
+  conformance-required:
+    name: conformance-required
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs: [conformance]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report conformance result
+        run: |
+          result="${{ needs.conformance.result }}"
+          echo "conformance job result: ${result}"
+          case "${result}" in
+            success|skipped) exit 0 ;;
+            *)               exit 1 ;;
+          esac
