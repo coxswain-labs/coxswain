@@ -9,8 +9,8 @@ mod predicate;
 
 pub use builder::{PortTableBuilder, RoutingTableBuilder};
 pub use entry::{
-    FilterAction, HeaderMod, PathModifier, RouteConflict, RouteEntry, RouteInfo, RouteKind,
-    RouteTimeouts, Upstream,
+    BackendGroup, FilterAction, HeaderMod, PathModifier, RouteConflict, RouteEntry, RouteInfo,
+    RouteKind, RouteTimeouts,
 };
 pub use host_router::{HostRouter, HostRouterBuilder};
 pub use predicate::{HeaderPredicate, MatchPredicates, QueryPredicate, RequestContext, ValueMatch};
@@ -31,7 +31,7 @@ pub type SharedRoutingTable = Shared<RoutingTable>;
 
 /// Result of a two-level host+path routing lookup.
 pub enum RouteOutcome {
-    Found(Arc<Upstream>, Arc<[FilterAction]>, RouteTimeouts),
+    Found(Arc<BackendGroup>, Arc<[FilterAction]>, RouteTimeouts),
     /// Route matched but backend is invalid/missing/forbidden — return this status immediately.
     Error(u16),
     /// No entry for this hostname (host is not registered at this proxy).
@@ -72,7 +72,7 @@ impl PortRoutingTable {
         }
     }
 
-    fn route(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<Upstream>> {
+    fn route(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> Option<Arc<BackendGroup>> {
         let router = if let Some(r) = self.exact_hosts.get(host) {
             Some(r)
         } else {
@@ -82,9 +82,9 @@ impl PortRoutingTable {
                 .map(|(_, r)| r)
         };
         if let Some(r) = router
-            && let Some((upstream, _, _, _)) = r.route(path, ctx)
+            && let Some((group, _, _, _)) = r.route(path, ctx)
         {
-            return Some(upstream);
+            return Some(group);
         }
         self.catchall
             .as_ref()?
@@ -119,7 +119,7 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
-    /// Routes to an upstream by port, host, and path, discarding filter and timeout information.
+    /// Routes to a backend group by port, host, and path, discarding filter and timeout information.
     ///
     /// Convenience for tests and admin introspection. The proxy hot path should
     /// use [`find`] to also receive the filter list and timeouts.
@@ -129,12 +129,12 @@ impl RoutingTable {
         host: &str,
         path: &str,
         ctx: &RequestContext<'_>,
-    ) -> Option<Arc<Upstream>> {
+    ) -> Option<Arc<BackendGroup>> {
         self.by_port.get(&port)?.route(host, path, ctx)
     }
 
     /// Like [`route`] but distinguishes "host not registered" from "path not matched",
-    /// and returns filters and timeouts alongside the upstream.
+    /// and returns filters and timeouts alongside the backend group.
     pub fn find(
         &self,
         port: u16,

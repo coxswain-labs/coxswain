@@ -6,15 +6,15 @@ use std::time::SystemTime;
 
 const PORT: u16 = 80;
 
-fn upstream(name: &str, addr: &str) -> Arc<Upstream> {
-    Arc::new(Upstream::new(
+fn group(name: &str, addr: &str) -> Arc<BackendGroup> {
+    Arc::new(BackendGroup::new(
         name.to_string(),
         vec![addr.parse::<SocketAddr>().unwrap()],
     ))
 }
 
-fn entry(us: Arc<Upstream>) -> Arc<RouteEntry> {
-    Arc::new(RouteEntry::path_only(us, "default/svc".to_string(), None))
+fn entry(g: Arc<BackendGroup>) -> Arc<RouteEntry> {
+    Arc::new(RouteEntry::path_only(g, "default/svc".to_string(), None))
 }
 
 fn ctx_get() -> RequestContext<'static> {
@@ -23,8 +23,8 @@ fn ctx_get() -> RequestContext<'static> {
 
 #[test]
 fn exact_host_beats_wildcard() {
-    let exact_up = upstream("exact", "10.0.0.1:80");
-    let wildcard_up = upstream("wildcard", "10.0.0.2:80");
+    let exact_up = group("exact", "10.0.0.1:80");
+    let wildcard_up = group("wildcard", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -53,8 +53,8 @@ fn exact_host_beats_wildcard() {
 
 #[test]
 fn path_routing_within_host() {
-    let api_up = upstream("api", "10.0.0.1:80");
-    let health_up = upstream("health", "10.0.0.2:80");
+    let api_up = group("api", "10.0.0.1:80");
+    let health_up = group("health", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     let host = b.for_port(PORT).exact_host("example.com");
@@ -80,7 +80,7 @@ fn path_routing_within_host() {
 
 #[test]
 fn wildcard_host_matches() {
-    let up = upstream("svc", "10.0.0.1:80");
+    let up = group("svc", "10.0.0.1:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -100,8 +100,8 @@ fn wildcard_host_matches() {
 
 #[test]
 fn route_falls_through_to_catchall_on_exact_host_path_miss() {
-    let host_up = upstream("host", "10.0.0.1:80");
-    let catchall_up = upstream("catchall", "10.0.0.2:80");
+    let host_up = group("host", "10.0.0.1:80");
+    let catchall_up = group("catchall", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -130,8 +130,8 @@ fn route_falls_through_to_catchall_on_exact_host_path_miss() {
 
 #[test]
 fn route_falls_through_to_catchall_on_wildcard_host_path_miss() {
-    let host_up = upstream("host", "10.0.0.1:80");
-    let catchall_up = upstream("catchall", "10.0.0.2:80");
+    let host_up = group("host", "10.0.0.1:80");
+    let catchall_up = group("catchall", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -160,7 +160,7 @@ fn route_falls_through_to_catchall_on_wildcard_host_path_miss() {
 
 #[test]
 fn route_returns_none_when_neither_host_router_nor_catchall_match() {
-    let host_up = upstream("host", "10.0.0.1:80");
+    let host_up = group("host", "10.0.0.1:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -182,8 +182,8 @@ fn route_returns_none_when_neither_host_router_nor_catchall_match() {
 
 #[test]
 fn route_host_router_takes_precedence_over_catchall_for_same_path() {
-    let host_up = upstream("host", "10.0.0.1:80");
-    let catchall_up = upstream("catchall", "10.0.0.2:80");
+    let host_up = group("host", "10.0.0.1:80");
+    let catchall_up = group("catchall", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -212,8 +212,8 @@ fn route_host_router_takes_precedence_over_catchall_for_same_path() {
 
 #[test]
 fn routes_on_different_ports_are_isolated() {
-    let up80 = upstream("svc-80", "10.0.0.1:80");
-    let up8080 = upstream("svc-8080", "10.0.0.2:8080");
+    let up80 = group("svc-80", "10.0.0.1:80");
+    let up8080 = group("svc-8080", "10.0.0.2:8080");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(80)
@@ -251,7 +251,7 @@ fn round_robin_cycles() {
         "10.0.0.2:80".parse().unwrap(),
         "10.0.0.3:80".parse().unwrap(),
     ];
-    let up = Upstream::new("svc".to_string(), addrs.clone());
+    let up = BackendGroup::new("svc".to_string(), addrs.clone());
     let results: Vec<SocketAddr> = (0..6).map(|_| up.next_endpoint().unwrap()).collect();
     assert_eq!(
         results,
@@ -267,7 +267,7 @@ fn weighted_round_robin_distributes_proportionally() {
 
     // Backend A: 2 pods, weight 4.  Backend B: 1 pod, weight 1.
     // Expected: P(A) = 4/5 = 80%.
-    let up = Upstream::weighted("ns/svc".to_string(), vec![(vec![a1, a2], 4), (vec![b1], 1)]);
+    let up = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a1, a2], 4), (vec![b1], 1)]);
 
     let n = 1000;
     let mut a_count = 0usize;
@@ -294,7 +294,7 @@ fn weighted_zero_weight_backend_gets_no_traffic() {
     let a1: SocketAddr = "10.0.0.1:80".parse().unwrap();
     let b1: SocketAddr = "10.0.1.1:80".parse().unwrap();
 
-    let up = Upstream::weighted("ns/svc".to_string(), vec![(vec![a1], 0), (vec![b1], 1)]);
+    let up = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a1], 0), (vec![b1], 1)]);
     for _ in 0..100 {
         assert_eq!(up.next_endpoint().unwrap(), b1);
     }
@@ -303,7 +303,7 @@ fn weighted_zero_weight_backend_gets_no_traffic() {
 #[test]
 fn weighted_all_zero_is_empty() {
     let a1: SocketAddr = "10.0.0.1:80".parse().unwrap();
-    let up = Upstream::weighted("ns/svc".to_string(), vec![(vec![a1], 0)]);
+    let up = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a1], 0)]);
     assert!(up.next_endpoint().is_none());
 }
 
@@ -313,7 +313,7 @@ fn weighted_equal_weights_uniform() {
     let b1: SocketAddr = "10.0.1.1:80".parse().unwrap();
 
     // Equal weights → after GCD reduction both get 1 slot → 50/50.
-    let up = Upstream::weighted("ns/svc".to_string(), vec![(vec![a1], 5), (vec![b1], 5)]);
+    let up = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a1], 5), (vec![b1], 5)]);
     let results: Vec<SocketAddr> = (0..4).map(|_| up.next_endpoint().unwrap()).collect();
     // slots = [0, 1] after reduction; cycling: a1, b1, a1, b1
     assert_eq!(results, [a1, b1, a1, b1]);
@@ -531,8 +531,8 @@ fn header_lookup_is_case_insensitive() {
 fn specificity_ordering_more_headers_wins() {
     // Two entries at the same path: one with a header predicate, one without.
     // The one with more predicates should win when its predicate passes.
-    let specific_up = upstream("specific", "10.0.0.1:80");
-    let generic_up = upstream("generic", "10.0.0.2:80");
+    let specific_up = group("specific", "10.0.0.1:80");
+    let generic_up = group("generic", "10.0.0.2:80");
 
     let pred = make_predicates(None, &[("x-tenant", "acme")], &[]);
     let specific = Arc::new(RouteEntry::new(
@@ -586,8 +586,8 @@ fn specificity_ordering_more_headers_wins() {
 #[test]
 fn timestamp_tiebreaker_older_wins() {
     // Two entries with the same predicate count; older route wins.
-    let older_up = upstream("older", "10.0.0.1:80");
-    let newer_up = upstream("newer", "10.0.0.2:80");
+    let older_up = group("older", "10.0.0.1:80");
+    let newer_up = group("newer", "10.0.0.2:80");
 
     let t_old = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
     let t_new = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2000);
@@ -623,8 +623,8 @@ fn timestamp_tiebreaker_older_wins() {
 fn or_semantics_across_multiple_entries() {
     // Two entries at the same path with different header predicates:
     // whichever predicate matches the request wins.
-    let up_a = upstream("a", "10.0.0.1:80");
-    let up_b = upstream("b", "10.0.0.2:80");
+    let up_a = group("a", "10.0.0.1:80");
+    let up_b = group("b", "10.0.0.2:80");
 
     let pred_a = make_predicates(None, &[("x-tenant", "a")], &[]);
     let pred_b = make_predicates(None, &[("x-tenant", "b")], &[]);
@@ -664,7 +664,7 @@ fn or_semantics_across_multiple_entries() {
 
 #[test]
 fn find_returns_timeouts_from_route_entry() {
-    let up = upstream("svc", "10.0.0.1:80");
+    let up = group("svc", "10.0.0.1:80");
     let timeouts = RouteTimeouts {
         request: Some(std::time::Duration::from_secs(10)),
         backend_request: Some(std::time::Duration::from_secs(2)),
@@ -696,8 +696,8 @@ fn find_returns_timeouts_from_route_entry() {
 #[test]
 #[tracing_test::traced_test]
 fn prefix_insert_collision_emits_debug_log() {
-    let first = upstream("first", "10.0.0.1:80");
-    let second = upstream("second", "10.0.0.2:80");
+    let first = group("first", "10.0.0.1:80");
+    let second = group("second", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     let host = b.for_port(PORT).exact_host("example.com");

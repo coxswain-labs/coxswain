@@ -122,7 +122,7 @@ pub struct RouteTimeouts {
 ///
 /// This gives exact per-backend traffic ratios regardless of pod count, and fair
 /// pod distribution within each backend.
-pub struct Upstream {
+pub struct BackendGroup {
     /// Service identity — used for logging only.
     pub name: String,
     /// One entry per non-zero-weight backend ref.
@@ -136,7 +136,7 @@ pub struct Upstream {
     addrs_snapshot: Box<[SocketAddr]>,
 }
 
-impl Upstream {
+impl BackendGroup {
     /// All endpoints with equal weight (weight-1 uniform round-robin).
     /// Used by Ingress reconciler and single-backend Gateway API rules.
     pub fn new(name: String, endpoints: Vec<SocketAddr>) -> Self {
@@ -159,7 +159,7 @@ impl Upstream {
     ///
     /// `weighted` is `[(pod_addrs_for_backend, weight), ...]` — one entry per
     /// `backendRef`. Backends with `weight == 0` or empty address lists are
-    /// dropped. Returns an empty `Upstream` when all weights resolve to zero.
+    /// dropped. Returns an empty `BackendGroup` when all weights resolve to zero.
     pub fn weighted(name: String, weighted: Vec<(Vec<SocketAddr>, u16)>) -> Self {
         let pools: Vec<(Vec<SocketAddr>, u16)> = weighted
             .into_iter()
@@ -216,7 +216,7 @@ impl Upstream {
 
     /// Returns the next endpoint using weighted round-robin.
     ///
-    /// Returns `None` when the upstream has no endpoints.
+    /// Returns `None` when there are no active endpoints.
     pub fn next_endpoint(&self) -> Option<SocketAddr> {
         if self.slots.is_empty() {
             return None;
@@ -263,7 +263,7 @@ impl RouteKind {
 pub struct RouteInfo {
     pub path: String,
     pub kind: RouteKind,
-    pub upstream: Arc<Upstream>,
+    pub backend_group: Arc<BackendGroup>,
 }
 
 /// A path rule that was silently dropped because an earlier rule already claimed the same slot.
@@ -274,14 +274,14 @@ pub struct RouteConflict {
     pub host: String,
     pub path: String,
     pub kind: RouteKind,
-    /// `Upstream::name` of the rule that was rejected.
-    pub rejected_upstream: String,
+    /// `BackendGroup::name` of the rule that was rejected.
+    pub rejected_group: String,
 }
 
-/// A single routing candidate: an upstream plus the predicates that must hold
+/// A single routing candidate: a backend group plus the predicates that must hold
 /// for this candidate to be selected, along with metadata for precedence ordering.
 pub struct RouteEntry {
-    pub upstream: Arc<Upstream>,
+    pub backend_group: Arc<BackendGroup>,
     pub predicates: MatchPredicates,
     pub filters: Arc<[FilterAction]>,
     pub timeouts: RouteTimeouts,
@@ -298,12 +298,12 @@ pub struct RouteEntry {
 impl RouteEntry {
     /// Constructs an entry with no predicates, no filters, and no timeouts.
     pub fn path_only(
-        upstream: Arc<Upstream>,
+        backend_group: Arc<BackendGroup>,
         route_id: String,
         created_at: Option<SystemTime>,
     ) -> Self {
         Self {
-            upstream,
+            backend_group,
             predicates: MatchPredicates::default(),
             filters: Arc::from([]),
             timeouts: RouteTimeouts::default(),
@@ -315,13 +315,13 @@ impl RouteEntry {
 
     /// Constructs an entry with predicates but no filters and no timeouts.
     pub fn new(
-        upstream: Arc<Upstream>,
+        backend_group: Arc<BackendGroup>,
         predicates: MatchPredicates,
         route_id: String,
         created_at: Option<SystemTime>,
     ) -> Self {
         Self {
-            upstream,
+            backend_group,
             predicates,
             filters: Arc::from([]),
             timeouts: RouteTimeouts::default(),
@@ -333,7 +333,7 @@ impl RouteEntry {
 
     /// Constructs an entry with predicates, filters, and per-rule timeouts.
     pub fn with_filters(
-        upstream: Arc<Upstream>,
+        backend_group: Arc<BackendGroup>,
         predicates: MatchPredicates,
         filters: Vec<FilterAction>,
         timeouts: RouteTimeouts,
@@ -341,7 +341,7 @@ impl RouteEntry {
         created_at: Option<SystemTime>,
     ) -> Self {
         Self {
-            upstream,
+            backend_group,
             predicates,
             filters: Arc::from(filters.into_boxed_slice()),
             timeouts,

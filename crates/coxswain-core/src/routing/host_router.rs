@@ -1,5 +1,5 @@
 use crate::routing::entry::{
-    FilterAction, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts, Upstream,
+    BackendGroup, FilterAction, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts,
 };
 use crate::routing::predicate::RequestContext;
 use matchit::Router;
@@ -8,9 +8,9 @@ use std::cmp::Reverse;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// Return type of `HostRouter::route`: upstream + filters + timeouts + optional error status.
+/// Return type of `HostRouter::route`: backend group + filters + timeouts + optional error status.
 pub(super) type RouteMatch = (
-    Arc<Upstream>,
+    Arc<BackendGroup>,
     Arc<[FilterAction]>,
     RouteTimeouts,
     Option<u16>,
@@ -39,7 +39,7 @@ impl HostRouter {
             for entry in m.value.iter() {
                 if entry.predicates.matches(ctx) {
                     return Some((
-                        Arc::clone(&entry.upstream),
+                        Arc::clone(&entry.backend_group),
                         Arc::clone(&entry.filters),
                         entry.timeouts.clone(),
                         entry.error_status,
@@ -54,7 +54,7 @@ impl HostRouter {
                 for entry in entries.iter() {
                     if entry.predicates.matches(ctx) {
                         return Some((
-                            Arc::clone(&entry.upstream),
+                            Arc::clone(&entry.backend_group),
                             Arc::clone(&entry.filters),
                             entry.timeouts.clone(),
                             entry.error_status,
@@ -176,7 +176,7 @@ impl HostRouterBuilder {
                 route_info.push(RouteInfo {
                     path: path.clone(),
                     kind: RouteKind::Exact,
-                    upstream: Arc::clone(&e.upstream),
+                    backend_group: Arc::clone(&e.backend_group),
                 });
             }
             let frozen = sort_and_freeze(entries);
@@ -207,7 +207,7 @@ impl HostRouterBuilder {
                 route_info.push(RouteInfo {
                     path: path.clone(),
                     kind: RouteKind::Prefix,
-                    upstream: Arc::clone(&e.upstream),
+                    backend_group: Arc::clone(&e.backend_group),
                 });
             }
             let frozen = sort_and_freeze(entries);
@@ -256,7 +256,7 @@ impl HostRouterBuilder {
                 route_info.push(RouteInfo {
                     path: pattern.clone(),
                     kind: RouteKind::Regex,
-                    upstream: Arc::clone(&e.upstream),
+                    backend_group: Arc::clone(&e.backend_group),
                 });
             }
             // RegexSet::new already validates the pattern; the second compile is redundant.

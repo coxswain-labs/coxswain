@@ -1,7 +1,7 @@
 use crate::endpoints;
 use crate::tls::load_tls_cert;
 use crate::translate::metadata_created_at;
-use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, Upstream};
+use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder};
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -173,7 +173,7 @@ impl IngressReconciler {
                     continue;
                 }
 
-                let upstream = Arc::new(Upstream::new(format!("{ns}/{}", svc.name), addrs));
+                let group = Arc::new(BackendGroup::new(format!("{ns}/{}", svc.name), addrs));
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
                 if !path.starts_with('/') {
@@ -186,11 +186,7 @@ impl IngressReconciler {
                     continue;
                 }
 
-                let e = Arc::new(RouteEntry::path_only(
-                    upstream,
-                    route_id.clone(),
-                    created_at,
-                ));
+                let e = Arc::new(RouteEntry::path_only(group, route_id.clone(), created_at));
                 // "Prefix" and "ImplementationSpecific" both map to prefix matching.
                 for &listener_port in &ports {
                     let host_builder = builder
@@ -228,11 +224,13 @@ impl IngressReconciler {
                             "No ready endpoints for defaultBackend — skipping"
                         );
                     } else {
-                        let upstream =
-                            Arc::new(Upstream::new(format!("{ns}/{}", default_svc.name), addrs));
+                        let group = Arc::new(BackendGroup::new(
+                            format!("{ns}/{}", default_svc.name),
+                            addrs,
+                        ));
                         let make_entry = || {
                             Arc::new(RouteEntry::path_only(
-                                Arc::clone(&upstream),
+                                Arc::clone(&group),
                                 route_id.clone(),
                                 created_at,
                             ))

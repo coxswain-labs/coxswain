@@ -13,7 +13,7 @@ use crate::{
 use async_trait::async_trait;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::reference_grants::ReferenceGrantKey;
-use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, SharedRoutingTable, Upstream};
+use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, SharedRoutingTable};
 use coxswain_core::tls::{SharedTlsStore, TlsStoreBuilder};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -618,7 +618,7 @@ fn build_routes(
                 "No ready endpoints for --ingress-default-backend — skipping"
             );
         } else {
-            let upstream = Arc::new(Upstream::new(
+            let group = Arc::new(BackendGroup::new(
                 format!("{}/{}", db.namespace, db.name),
                 addrs,
             ));
@@ -628,7 +628,7 @@ fn build_routes(
                 .flatten()
             {
                 let e = Arc::new(RouteEntry::path_only(
-                    Arc::clone(&upstream),
+                    Arc::clone(&group),
                     svc_id.clone(),
                     None,
                 ));
@@ -645,7 +645,7 @@ fn build_routes(
                     host = %c.host,
                     path = %c.path,
                     kind = c.kind.as_str(),
-                    rejected_upstream = %c.rejected_upstream,
+                    rejected_group = %c.rejected_group,
                     "Route conflict: path already claimed by an earlier rule — ignoring"
                 );
             }

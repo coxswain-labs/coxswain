@@ -49,7 +49,7 @@ async fn resolve_outcome(
     outcome: RouteOutcome,
 ) -> Result<
     Option<(
-        Arc<coxswain_core::routing::Upstream>,
+        Arc<coxswain_core::routing::BackendGroup>,
         Arc<[FilterAction]>,
         RouteTimeouts,
     )>,
@@ -181,7 +181,7 @@ impl ProxyHttp for Proxy {
             self.engine.find(port, &host, &path, &route_ctx)
         }; // route_ctx (and req borrow) drops here
 
-        let Some((upstream, filters, route_timeouts)) =
+        let Some((backend_group, filters, route_timeouts)) =
             resolve_outcome(session, &host, &path, outcome).await?
         else {
             return Ok(true);
@@ -205,7 +205,7 @@ impl ProxyHttp for Proxy {
         }
 
         ctx.resolved = Some(ResolvedRoute {
-            upstream,
+            backend_group,
             filters,
             timeouts,
             original_host: host,
@@ -236,8 +236,8 @@ impl ProxyHttp for Proxy {
             ));
         }
 
-        let addr = resolved.upstream.next_endpoint().ok_or_else(|| {
-            pingora_core::Error::explain(HTTPStatus(503), "upstream has no active endpoints")
+        let addr = resolved.backend_group.next_endpoint().ok_or_else(|| {
+            pingora_core::Error::explain(HTTPStatus(503), "no active endpoints for backend group")
         })?;
 
         // Use the (potentially rewritten) host from UrlRewrite hostname, or the original host.
@@ -381,21 +381,21 @@ mod tests {
     use super::redirect::{RedirectOrigin, build_redirect_location};
     use super::*;
     use coxswain_core::routing::{
-        FilterAction, HeaderMod, PathModifier, RouteEntry, RouteOutcome, RoutingTableBuilder,
-        SharedRoutingTable, Upstream,
+        BackendGroup, FilterAction, HeaderMod, PathModifier, RouteEntry, RouteOutcome,
+        RoutingTableBuilder, SharedRoutingTable,
     };
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    fn make_upstream(name: &str, addr: &str) -> Arc<Upstream> {
-        Arc::new(Upstream::new(
+    fn make_group(name: &str, addr: &str) -> Arc<BackendGroup> {
+        Arc::new(BackendGroup::new(
             name.to_string(),
             vec![addr.parse::<SocketAddr>().unwrap()],
         ))
     }
 
-    fn entry(us: Arc<Upstream>) -> Arc<RouteEntry> {
-        Arc::new(RouteEntry::path_only(us, "default/svc".to_string(), None))
+    fn entry(g: Arc<BackendGroup>) -> Arc<RouteEntry> {
+        Arc::new(RouteEntry::path_only(g, "default/svc".to_string(), None))
     }
 
     fn engine_with_table(shared: SharedRoutingTable) -> RoutingEngine {
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn route_resolves_matched_host_and_path() {
-        let upstream = make_upstream("default/backend", "10.0.0.1:8080");
+        let upstream = make_group("default/backend", "10.0.0.1:8080");
         let mut builder = RoutingTableBuilder::new();
         builder
             .for_port(PORT)
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn route_returns_none_for_unknown_host() {
-        let upstream = make_upstream("default/backend", "10.0.0.1:8080");
+        let upstream = make_group("default/backend", "10.0.0.1:8080");
         let mut builder = RoutingTableBuilder::new();
         builder
             .for_port(PORT)
@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn upstream_with_no_endpoints_returns_none_from_next_endpoint() {
-        let upstream = Arc::new(Upstream::new("default/empty".to_string(), vec![]));
+        let upstream = Arc::new(BackendGroup::new("default/empty".to_string(), vec![]));
         let mut builder = RoutingTableBuilder::new();
         builder
             .for_port(PORT)
@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn find_returns_filters_alongside_upstream() {
-        let upstream = make_upstream("default/backend", "10.0.0.1:8080");
+        let upstream = make_group("default/backend", "10.0.0.1:8080");
         let filters = vec![FilterAction::RequestHeaderModifier(HeaderMod {
             set: vec![("x-env".to_string(), "test".to_string())],
             ..Default::default()
