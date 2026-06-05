@@ -210,7 +210,7 @@ events are deliberately blocked from triggering downstream workflows.)
 **Initial setup or renewal:**
 
 ```bash
-bash scripts/refresh-labeler-pat.sh
+./scripts/refresh-labeler-pat.sh
 ```
 
 The script opens the GitHub PAT creation page in your browser, then updates the
