@@ -1,13 +1,4 @@
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'deny.toml'
-      - '.github/workflows/ci.yml'
   pull_request:
     branches:
       - main
