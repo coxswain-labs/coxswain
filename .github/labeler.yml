@@ -1,0 +1,7 @@
+experimental:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'crates/coxswain-controller/src/gw_types.rs'
+      - 'crates/coxswain-controller/Cargo.toml'
+      - 'crates/coxswain-bin/Cargo.toml'
+      - '.github/workflows/experimental.yml'
