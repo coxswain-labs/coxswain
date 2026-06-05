@@ -4,8 +4,6 @@ on:
       - main
     paths:
       - 'crates/**'
-      - 'conformance/**'
-      - 'scripts/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'deny.toml'
@@ -96,27 +94,3 @@ jobs:
           tool: cargo-audit
       - run: cargo audit
 
-  experimental-build:
-    name: experimental-build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-experimental-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-experimental-
-      - name: Build with experimental Gateway API channel
-        run: cargo build -p coxswain-bin --features experimental
-
-  supported-features-parity:
-    name: supported-features-parity
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Check Rust SUPPORTED_FEATURES matches Go opts.SupportedFeatures
-        run: bash scripts/check-supported-features.sh

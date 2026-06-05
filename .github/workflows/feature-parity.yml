@@ -1,0 +1,20 @@
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'crates/coxswain-controller/src/controller/gateway_class_status.rs'
+      - 'conformance/main_test.go'
+      - 'scripts/check-supported-features.sh'
+      - '.github/workflows/feature-parity.yml'
+
+name: Feature parity
+
+jobs:
+  supported-features-parity:
+    name: supported-features-parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check Rust SUPPORTED_FEATURES matches Go opts.SupportedFeatures
+        run: bash scripts/check-supported-features.sh
