@@ -1,5 +1,5 @@
+use crate::gw_types::v::httproutes::HttpRouteRulesTimeouts;
 use coxswain_core::routing::RouteTimeouts;
-use gateway_api::apis::standard::httproutes::HttpRouteRulesTimeouts;
 
 /// Parse a Gateway API GEP-2257 duration string (Go `time.ParseDuration` format).
 ///

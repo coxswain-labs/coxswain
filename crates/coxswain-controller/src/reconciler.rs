@@ -1,4 +1,8 @@
 use crate::gateway_api::hostnames_intersect;
+use crate::gw_types::v::gatewayclasses::GatewayClass;
+use crate::gw_types::v::gateways::Gateway;
+use crate::gw_types::v::httproutes::HTTPRoute;
+use crate::gw_types::v::referencegrants::ReferenceGrant;
 use crate::keys::ListenerKey;
 use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth};
 use crate::{
@@ -12,10 +16,6 @@ use coxswain_core::reference_grants::ReferenceGrantKey;
 use coxswain_core::routing::{RouteEntry, RoutingTableBuilder, SharedRoutingTable, Upstream};
 use coxswain_core::tls::{SharedTlsStore, TlsStoreBuilder};
 use futures::StreamExt;
-use gateway_api::apis::standard::gatewayclasses::GatewayClass;
-use gateway_api::apis::standard::gateways::Gateway;
-use gateway_api::apis::standard::httproutes::HTTPRoute;
-use gateway_api::apis::standard::referencegrants::ReferenceGrant;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};

@@ -1,7 +1,7 @@
+use crate::gw_types::v::gatewayclasses::GatewayClass;
+use crate::gw_types::v::gateways::Gateway;
+use crate::gw_types::v::httproutes::{HTTPRoute, HttpRouteParentRefs};
 use coxswain_core::ownership::{self, ObjectKey};
-use gateway_api::apis::standard::gatewayclasses::GatewayClass;
-use gateway_api::apis::standard::gateways::Gateway;
-use gateway_api::apis::standard::httproutes::{HTTPRoute, HttpRouteParentRefs};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use std::collections::HashSet;
 

@@ -1,10 +1,10 @@
 use crate::gateway_api::hostnames::hostnames_intersect;
+use crate::gw_types::v::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom};
+use crate::gw_types::v::httproutes::{HTTPRoute, HttpRouteRulesFiltersType};
 use crate::keys::RouteParentKey;
 use crate::tls::{HttpRouteHealthMap, RouteParentHealth};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
-use gateway_api::apis::standard::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom};
-use gateway_api::apis::standard::httproutes::{HTTPRoute, HttpRouteRulesFiltersType};
 use k8s_openapi::api::core::v1::Service;
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};

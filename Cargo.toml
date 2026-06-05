@@ -44,6 +44,10 @@ futures = { version = "0.3" }
 http = { version = "1" }
 humantime = { version = "2" }
 gateway-api = { version = "0.21" }
+# Enable the "experimental" feature to expose alpha Gateway API resources
+# (GRPCRoute, TCPRoute, BackendTLSPolicy, etc.) and experimental fields on
+# stable CRDs. This feature is for contributor/CI/preview builds ONLY —
+# release images are always built without it. See docs/gateway-api-support.md.
 k8s-openapi = { version = "0.27", features = ["latest"] }
 kube = { version = "3.1", features = ["runtime", "derive", "client"] }
 kube-leader-election = { version = "0.43" }

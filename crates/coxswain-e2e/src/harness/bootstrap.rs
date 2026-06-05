@@ -2,6 +2,11 @@ use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+/// Single source of truth for the Gateway API CRD version installed in tests.
+/// To bump: change `.gateway-api-version` at the repo root and update
+/// `gateway-api` in workspace `Cargo.toml`. See `docs/gateway-api-support.md`.
+const GATEWAY_API_VERSION: &str = include_str!("../../../../.gateway-api-version").trim_ascii();
+
 pub async fn bootstrap() -> anyhow::Result<()> {
     let root = workspace_root();
 
@@ -21,9 +26,9 @@ pub async fn bootstrap() -> anyhow::Result<()> {
         .await;
 
     if !gateway_v1_crds_installed().await {
-        tracing::info!("Gateway API CRDs absent or pre-v1, installing v1.5.1");
+        tracing::info!("Gateway API CRDs absent or pre-v1, installing {GATEWAY_API_VERSION}");
         kubectl_apply_url(
-            "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml",
+            &format!("https://github.com/kubernetes-sigs/gateway-api/releases/download/{GATEWAY_API_VERSION}/standard-install.yaml"),
         )
         .await
         .context("install Gateway API CRDs")?;

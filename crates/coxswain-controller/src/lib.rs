@@ -1,6 +1,7 @@
 mod controller;
 pub(crate) mod endpoints;
 pub(crate) mod gateway_api;
+pub(crate) mod gw_types;
 pub(crate) mod ingress;
 pub(crate) mod keys;
 mod reconciler;

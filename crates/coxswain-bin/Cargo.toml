@@ -13,6 +13,11 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Expose alpha Gateway API resources and experimental fields. For contributor/CI
+# use only — never enabled in release builds. See docs/gateway-api-support.md.
+experimental = ["coxswain-controller/experimental", "gateway-api/experimental"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }

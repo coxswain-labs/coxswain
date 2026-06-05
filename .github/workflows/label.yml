@@ -1,0 +1,21 @@
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+name: Label
+
+jobs:
+  label-experimental:
+    name: label-experimental
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Apply 'experimental' label when experimental channel files change
+        uses: actions/labeler@v5
+        with:
+          configuration-path: .github/labeler.yml

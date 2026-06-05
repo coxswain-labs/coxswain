@@ -47,10 +47,15 @@ jobs:
           echo "Routing $POD_CIDR via $KIND_NODE_IP"
           sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
 
+      - name: Read Gateway API version
+        id: gw-version
+        run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
+
       - name: Pre-pull conformance backend images into kind
         run: |
-          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
-          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1 \
+          GW_VER=${{ steps.gw-version.outputs.version }}
+          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER}
+          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER} \
             --name coxswain-conformance
 
       - name: Build coxswain binary
@@ -58,8 +63,8 @@ jobs:
 
       - name: Bootstrap cluster (CRDs, RBAC, GatewayClass)
         run: |
-          # Gateway API CRDs
-          kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
+          # Gateway API CRDs — version sourced from .gateway-api-version
+          kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/${{ steps.gw-version.outputs.version }}/standard-install.yaml
           # Coxswain system namespace, RBAC, and GatewayClass
           kubectl apply -f deploy/manifests/namespace.yaml
           kubectl apply -f deploy/manifests/rbac.yaml
