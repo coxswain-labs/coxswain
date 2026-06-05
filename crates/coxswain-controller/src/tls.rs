@@ -113,7 +113,7 @@ impl SharedGatewayListenerHealth {
     /// Store a new health map and wake any `notified()` waiters.
     pub fn store_and_notify(&self, map: HashMap<ObjectKey, GatewayListenerHealth>) {
         self.0.map.store(Arc::new(map));
-        self.0.notify.notify_waiters();
+        self.0.notify.notify_one();
     }
 
     /// Returns a future that resolves once `store_and_notify` is called.

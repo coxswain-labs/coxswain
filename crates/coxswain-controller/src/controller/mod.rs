@@ -285,11 +285,16 @@ impl Controller {
                                     gw.metadata.namespace.clone().unwrap_or_default(),
                                     gw.metadata.name.clone().unwrap_or_default(),
                                 );
-                                let health = health_map
-                                    .get(&key)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                if gateway_needs_status_patch(&gw, &health) {
+                                // Only patch when the reconciler has already produced health data
+                                // for this gateway. When the map has no entry (gateway just created,
+                                // reconciler hasn't run yet), writing with empty/default health would
+                                // set ResolvedRefs=True on every listener — wrong for HTTPS listeners
+                                // whose cert ref turns out to be invalid.
+                                // tls_health.notified() fires once the reconciler has real data and
+                                // handles the first accurate status write for new gateways.
+                                if let Some(health) = health_map.get(&key).cloned()
+                                    && gateway_needs_status_patch(&gw, &health)
+                                {
                                     Self::patch_gateway_status(&client, &gw, &health, self.config.status_address.as_ref()).await;
                                 }
                             } else if is_leader && !gateway_accepted(&gw) {
@@ -319,10 +324,11 @@ impl Controller {
                         if !owned_gateway_classes.contains(&gw.spec.gateway_class_name) {
                             continue;
                         }
-                        let health = health_map
-                            .get(key)
-                            .cloned()
-                            .unwrap_or_default();
+                        let Some(health) = health_map.get(key).cloned() else {
+                            // Reconciler hasn't processed this gateway yet; the next
+                            // rebuild will include it and fire another notification.
+                            continue;
+                        };
                         if gateway_needs_status_patch(gw, &health) {
                             Self::patch_gateway_status(&client, gw, &health, self.config.status_address.as_ref()).await;
                         }
