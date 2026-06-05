@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 coxswain-core = { workspace = true }
 ipnet = { workspace = true }
 coxswain-admin = { workspace = true }
@@ -22,8 +23,11 @@ coxswain-controller = { workspace = true }
 coxswain-health = { workspace = true }
 coxswain-proxy = { workspace = true }
 clap = { workspace = true }
+gateway-api = { workspace = true }
 humantime = { workspace = true }
+kube = { workspace = true }
 pingora-core = { workspace = true, features = ["boringssl"] }
 pingora-proxy = { workspace = true, features = ["boringssl"] }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

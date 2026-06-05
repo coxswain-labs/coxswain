@@ -534,16 +534,20 @@ name = "coxswain-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "coxswain-admin",
  "coxswain-controller",
  "coxswain-core",
  "coxswain-health",
  "coxswain-proxy",
+ "gateway-api",
  "humantime",
  "ipnet",
+ "kube",
  "pingora-core",
  "pingora-proxy",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

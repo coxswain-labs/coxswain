@@ -1,3 +1,5 @@
+mod hot_reload;
+
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use coxswain_admin::AdminServer;
@@ -22,6 +24,7 @@ use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::services::background::background_service;
 use pingora_core::services::listening::Service;
 use pingora_proxy::{http_proxy, http_proxy_service_with_name};
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -263,6 +266,12 @@ pub struct ServeArgs {
 }
 
 fn main() -> Result<()> {
+    // When spawned as a restart child, wait for the parent process to exit and
+    // release its bound sockets before we try to bind them ourselves.
+    if std::env::var("COXSWAIN_RESTART_CHILD").is_ok() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
     let cli = Cli::parse();
     let Commands::Serve(args) = cli.command;
 
@@ -293,6 +302,9 @@ fn main() -> Result<()> {
     let synced = Arc::new(AtomicBool::new(false));
     let leader = Arc::new(AtomicBool::new(false));
     let owned_gateways = OwnedGateways::new();
+
+    // Clone before move into Controller so HotReloader can subscribe to the same health map.
+    let hot_reload_health = gateway_tls_health.clone();
 
     let reconciler = Reconciler::new(
         routing_table.clone(),
@@ -341,12 +353,43 @@ fn main() -> Result<()> {
             port,
         )));
     }
+
+    // CLI-configured ports are always included in the "desired" set used by HotReloader.
+    let cli_ports: HashSet<u16> = listeners.iter().map(|l| l.addr.port()).collect();
+
+    // Discover additional Gateway listener ports from the cluster's current state so
+    // that, if Gateways already exist when coxswain restarts, we bind their ports
+    // immediately rather than waiting for the first reconcile + restart cycle.
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime for startup Gateway port discovery");
+        let extra = rt.block_on(discover_gateway_ports(
+            &args.controller_name,
+            args.controller_watch_namespace.as_deref(),
+            args.proxy_bind_address,
+            &cli_ports,
+        ));
+        if !extra.is_empty() {
+            let ports: Vec<u16> = extra.iter().map(|l| l.addr.port()).collect();
+            tracing::info!(
+                ?ports,
+                "Adding listener ports discovered from existing Gateway specs"
+            );
+        }
+        listeners.extend(extra);
+    }
+
     if listeners.is_empty() {
         tracing::warn!(
-            "No proxy listener ports configured (--proxy-http-port / --proxy-https-port). \
-             No traffic will be served until ports are added."
+            "No proxy listener ports configured (--proxy-http-port / --proxy-https-port) \
+             and no Gateway listeners found. No traffic will be served until ports are added."
         );
     }
+
+    // Track the full set of ports we actually bind, so HotReloader can detect additions.
+    let currently_bound: HashSet<u16> = listeners.iter().map(|l| l.addr.port()).collect();
 
     if args.proxy_accept_proxy_protocol {
         if args.proxy_trusted_sources.is_empty() {
@@ -395,6 +438,11 @@ fn main() -> Result<()> {
         server.add_service(svc);
     }
 
+    server.add_service(background_service(
+        "hot-reloader",
+        hot_reload::HotReloader::new(hot_reload_health, currently_bound, cli_ports),
+    ));
+
     let health_addr = SocketAddr::new(args.proxy_bind_address, args.health_port);
     server.add_service({
         let mut svc = Service::new(
@@ -428,6 +476,94 @@ fn main() -> Result<()> {
         "Listening"
     );
     server.run_forever();
+}
+
+/// List all owned Gateway objects from the cluster and return listener specs for
+/// ports that are not already in `already_bound`.
+///
+/// Soft-fails on any Kubernetes API error by logging a warning and returning an
+/// empty list — coxswain will continue with the CLI-configured ports only and
+/// pick up any new ports on the first HotReloader cycle.
+async fn discover_gateway_ports(
+    controller_name: &str,
+    watch_namespace: Option<&str>,
+    bind_address: IpAddr,
+    already_bound: &HashSet<u16>,
+) -> Vec<ListenerSpec> {
+    use gateway_api::apis::standard::gatewayclasses::GatewayClass;
+    use gateway_api::apis::standard::gateways::Gateway;
+    use kube::api::ListParams;
+    use kube::{Api, Client};
+
+    let client = match Client::try_default().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Cannot connect to Kubernetes at startup; skipping Gateway listener port discovery"
+            );
+            return vec![];
+        }
+    };
+
+    let gc_api = Api::<GatewayClass>::all(client.clone());
+    let gcs = match gc_api.list(&ListParams::default()).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list GatewayClasses at startup");
+            return vec![];
+        }
+    };
+
+    let owned_classes: HashSet<String> = gcs
+        .iter()
+        .filter(|gc| gc.spec.controller_name == controller_name)
+        .filter_map(|gc| gc.metadata.name.clone())
+        .collect();
+
+    if owned_classes.is_empty() {
+        return vec![];
+    }
+
+    let gw_api: Api<Gateway> = match watch_namespace {
+        Some(ns) => Api::namespaced(client, ns),
+        None => Api::all(client),
+    };
+    let gateways = match gw_api.list(&ListParams::default()).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list Gateways at startup");
+            return vec![];
+        }
+    };
+
+    let mut result: Vec<ListenerSpec> = Vec::new();
+    let mut seen = already_bound.clone();
+
+    for gw in gateways.iter() {
+        if !owned_classes.contains(&gw.spec.gateway_class_name) {
+            continue;
+        }
+        for listener in &gw.spec.listeners {
+            let port = listener.port as u16;
+            if !seen.insert(port) {
+                continue;
+            }
+            match listener.protocol.as_str() {
+                "HTTP" => result.push(ListenerSpec::http(SocketAddr::new(bind_address, port))),
+                "HTTPS" | "TLS" => {
+                    result.push(ListenerSpec::https(SocketAddr::new(bind_address, port)))
+                }
+                other => tracing::debug!(
+                    protocol = other,
+                    port,
+                    "Skipping non-HTTP/HTTPS Gateway listener at startup"
+                ),
+            }
+        }
+    }
+
+    result
 }
 
 fn build_server(args: &ServeArgs) -> Server {

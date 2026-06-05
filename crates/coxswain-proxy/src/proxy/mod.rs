@@ -82,6 +82,7 @@ async fn try_redirect(
     filters: &[FilterAction],
     proto: &str,
     host: &str,
+    incoming_port: u16,
     path: &str,
     query: Option<&str>,
 ) -> Result<bool> {
@@ -97,6 +98,7 @@ async fn try_redirect(
             let origin = RedirectOrigin {
                 scheme: proto,
                 host,
+                port: incoming_port,
                 path,
                 query,
             };
@@ -188,7 +190,17 @@ impl ProxyHttp for Proxy {
         let timeouts = merge_timeouts(&route_timeouts, &self.default_timeouts);
         ctx.request_deadline = timeouts.request.map(|d| Instant::now() + d);
 
-        if try_redirect(session, &filters, proto, &host, &path, query.as_deref()).await? {
+        if try_redirect(
+            session,
+            &filters,
+            proto,
+            &host,
+            port,
+            &path,
+            query.as_deref(),
+        )
+        .await?
+        {
             return Ok(true);
         }
 
@@ -457,12 +469,14 @@ mod tests {
     fn origin(
         scheme: &'static str,
         host: &'static str,
+        port: u16,
         path: &'static str,
         query: Option<&'static str>,
     ) -> RedirectOrigin<'static> {
         RedirectOrigin {
             scheme,
             host,
+            port,
             path,
             query,
         }
@@ -475,9 +489,21 @@ mod tests {
             None,
             None,
             None,
-            &origin("http", "example.com", "/foo", None),
+            &origin("http", "example.com", 80, "/foo", None),
         );
         assert_eq!(loc, "http://example.com/foo");
+    }
+
+    #[test]
+    fn redirect_location_no_overrides_preserves_non_default_port() {
+        let loc = build_redirect_location(
+            None,
+            None,
+            None,
+            None,
+            &origin("http", "example.com", 8080, "/foo", None),
+        );
+        assert_eq!(loc, "http://example.com:8080/foo");
     }
 
     #[test]
@@ -487,7 +513,7 @@ mod tests {
             None,
             None,
             None,
-            &origin("http", "example.com", "/foo", None),
+            &origin("http", "example.com", 80, "/foo", None),
         );
         assert_eq!(loc, "https://example.com/foo");
     }
@@ -499,7 +525,7 @@ mod tests {
             Some("new.example.com"),
             None,
             None,
-            &origin("http", "old.example.com", "/bar", None),
+            &origin("http", "old.example.com", 80, "/bar", None),
         );
         assert_eq!(loc, "http://new.example.com/bar");
     }
@@ -511,7 +537,7 @@ mod tests {
             None,
             None,
             None,
-            &origin("http", "example.com", "/x", Some("k=v")),
+            &origin("http", "example.com", 80, "/x", Some("k=v")),
         );
         assert_eq!(loc, "http://example.com/x?k=v");
     }
@@ -523,7 +549,7 @@ mod tests {
             None,
             Some(8080),
             None,
-            &origin("http", "example.com", "/", None),
+            &origin("http", "example.com", 80, "/", None),
         );
         assert_eq!(loc, "http://example.com:8080/");
     }
@@ -535,7 +561,7 @@ mod tests {
             None,
             Some(80),
             None,
-            &origin("http", "example.com", "/", None),
+            &origin("http", "example.com", 80, "/", None),
         );
         assert_eq!(loc, "http://example.com/");
     }
@@ -548,7 +574,7 @@ mod tests {
             None,
             None,
             Some(&pm),
-            &origin("http", "example.com", "/old/path", None),
+            &origin("http", "example.com", 80, "/old/path", None),
         );
         assert_eq!(loc, "http://example.com/new");
     }
@@ -564,7 +590,7 @@ mod tests {
             None,
             None,
             Some(&pm),
-            &origin("http", "example.com", "/api/users", None),
+            &origin("http", "example.com", 80, "/api/users", None),
         );
         assert_eq!(loc, "http://example.com/v2/users");
     }
