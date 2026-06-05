@@ -87,10 +87,13 @@ kubectl apply -f deploy/manifests/gateway-class.yaml
 ### 3. Run the binary
 
 ```bash
-cargo run --bin coxswain -- serve --log-format console
+cargo run --bin coxswain -- serve \
+  --log-format console \
+  --proxy-http-port 80 \
+  --proxy-https-port 443
 ```
 
-`--log-format console` produces human-readable output instead of JSON. All ports bind on localhost at their defaults:
+`--log-format console` produces human-readable output instead of JSON. `--proxy-http-port` and `--proxy-https-port` are required to bind proxy listeners; omitting both logs a warning and starts no listeners.
 
 | Port | Purpose |
 |------|---------|
@@ -98,6 +101,8 @@ cargo run --bin coxswain -- serve --log-format console
 | `443`  | HTTPS proxy (data plane, SNI TLS) |
 | `8081` | Health endpoints (`/healthz`, `/readyz`) |
 | `8082` | Admin endpoints (`/metrics`, `/routes`, `/status`) |
+
+The bind address for all listeners defaults to `0.0.0.0`. Pass `--proxy-bind-address 127.0.0.1` to restrict to localhost.
 
 ### 4. Verify
 
