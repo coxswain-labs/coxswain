@@ -1,4 +1,4 @@
-experimental:
+"type: experimental":
   - changed-files:
     - any-glob-to-any-file:
       - 'crates/coxswain-controller/src/gw_types.rs'

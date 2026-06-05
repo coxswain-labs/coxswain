@@ -9,8 +9,8 @@ name: Experimental
 jobs:
   experimental-build:
     name: experimental-build
-    # Only run for PRs labeled "experimental" — i.e. changes touching the experimental channel.
-    if: contains(github.event.pull_request.labels.*.name, 'experimental')
+    # Only run for PRs labeled "type: experimental" — i.e. changes touching the experimental channel.
+    if: contains(github.event.pull_request.labels.*.name, 'type: experimental')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
