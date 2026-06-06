@@ -39,14 +39,14 @@ fn exact_host_beats_wildcard() {
         table
             .route(PORT, "example.com", "/", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "exact"
     );
     assert_eq!(
         table
             .route(PORT, "other.com", "/", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "wildcard"
     );
 }
@@ -66,14 +66,14 @@ fn path_routing_within_host() {
         table
             .route(PORT, "example.com", "/api/users", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "api"
     );
     assert_eq!(
         table
             .route(PORT, "example.com", "/health", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "health"
     );
 }
@@ -116,14 +116,14 @@ fn route_falls_through_to_catchall_on_exact_host_path_miss() {
         table
             .route(PORT, "example.com", "/api/v1", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "host"
     );
     assert_eq!(
         table
             .route(PORT, "example.com", "/other", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "catchall"
     );
 }
@@ -146,14 +146,14 @@ fn route_falls_through_to_catchall_on_wildcard_host_path_miss() {
         table
             .route(PORT, "api.example.com", "/api/v1", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "host"
     );
     assert_eq!(
         table
             .route(PORT, "api.example.com", "/other", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "catchall"
     );
 }
@@ -198,14 +198,14 @@ fn route_host_router_takes_precedence_over_catchall_for_same_path() {
         table
             .route(PORT, "example.com", "/api/v1", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "host"
     );
     assert_eq!(
         table
             .route(PORT, "other.com", "/api/v1", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "catchall"
     );
 }
@@ -228,14 +228,14 @@ fn routes_on_different_ports_are_isolated() {
         table
             .route(80, "example.com", "/", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "svc-80"
     );
     assert_eq!(
         table
             .route(8080, "example.com", "/", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "svc-8080"
     );
     // A route scoped to 8080 must not be reachable on 80.
@@ -573,12 +573,15 @@ fn specificity_ordering_more_headers_wins() {
         table
             .route(PORT, "example.com", "/", &ctx_match)
             .unwrap()
-            .name,
+            .name(),
         "specific"
     );
     // Without matching header → specific's predicate fails; falls through to generic.
     assert_eq!(
-        table.route(PORT, "example.com", "/", &ctx_no).unwrap().name,
+        table
+            .route(PORT, "example.com", "/", &ctx_no)
+            .unwrap()
+            .name(),
         "generic"
     );
 }
@@ -614,7 +617,7 @@ fn timestamp_tiebreaker_older_wins() {
         table
             .route(PORT, "example.com", "/", &ctx_get())
             .unwrap()
-            .name,
+            .name(),
         "older"
     );
 }
@@ -653,11 +656,17 @@ fn or_semantics_across_multiple_entries() {
     };
 
     assert_eq!(
-        table.route(PORT, "example.com", "/", &ctx_a).unwrap().name,
+        table
+            .route(PORT, "example.com", "/", &ctx_a)
+            .unwrap()
+            .name(),
         "a"
     );
     assert_eq!(
-        table.route(PORT, "example.com", "/", &ctx_b).unwrap().name,
+        table
+            .route(PORT, "example.com", "/", &ctx_b)
+            .unwrap()
+            .name(),
         "b"
     );
 }

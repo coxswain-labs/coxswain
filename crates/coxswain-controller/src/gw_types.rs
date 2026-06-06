@@ -12,3 +12,8 @@ pub use gateway_api::apis::standard as v;
 
 #[cfg(feature = "experimental")]
 pub use gateway_api::apis::experimental as v;
+
+// Project-canonical alias: the codegen emits `HTTPRoute` (all-caps); we use
+// `HttpRoute` (PascalCase) everywhere internally to satisfy `upper_case_acronyms`.
+// Keep `"HTTPRoute"` only in literal strings sent to the Kubernetes API server.
+pub use v::httproutes::HTTPRoute as HttpRoute;

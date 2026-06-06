@@ -34,6 +34,9 @@ impl TrafficFilter {
                 }
                 // Redirect and response filters are handled elsewhere.
                 FilterAction::RequestRedirect { .. } | FilterAction::ResponseHeaderModifier(_) => {}
+                // Skip unknown filter variants — new types added to the core crate
+                // are handled by the proxy once explicitly wired.
+                _ => {}
             }
         }
 

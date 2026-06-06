@@ -7,6 +7,7 @@ use thiserror::Error;
 ///
 /// Parsed from `--status-address` at startup: if the value is a valid
 /// `IpAddr` it becomes `Ip`, otherwise it is treated as a DNS hostname.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum StatusAddress {
     Ip(IpAddr),
@@ -29,6 +30,7 @@ pub enum ControllerConfigError {
 /// Validated on construction: `lease_renew_interval * 3` must not exceed `lease_ttl`,
 /// which keeps the renewal rate safely below the threshold where a live leader could
 /// be evicted by a standby.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct ControllerConfig {
     pub controller_name: String,
@@ -45,6 +47,7 @@ pub struct ControllerConfig {
 }
 
 impl ControllerConfig {
+    #[must_use = "the validated config must be used or the validation is pointless"]
     pub fn new(
         controller_name: String,
         pod_name: String,

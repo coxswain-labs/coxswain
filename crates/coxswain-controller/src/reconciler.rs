@@ -1,7 +1,7 @@
 use crate::gateway_api::hostnames_intersect;
+use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
-use crate::gw_types::v::httproutes::HTTPRoute;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
 use crate::keys::ListenerKey;
 use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth};
@@ -80,6 +80,7 @@ impl std::str::FromStr for IngressDefaultBackend {
 }
 
 /// Optional configuration for a [`Reconciler`].
+#[non_exhaustive]
 #[derive(Default)]
 pub struct ReconcilerOptions {
     /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
@@ -233,7 +234,7 @@ async fn spawn_tasks(
         ingress_default_backend,
         ingress_ports,
     } = config;
-    let (route_reader, route_writer) = reflector::store::<HTTPRoute>();
+    let (route_reader, route_writer) = reflector::store::<HttpRoute>();
     let (ingress_reader, ingress_writer) = reflector::store::<Ingress>();
     let (class_reader, class_writer) = reflector::store::<IngressClass>();
     let (gateway_reader, gateway_writer) = reflector::store::<Gateway>();
@@ -249,10 +250,10 @@ async fn spawn_tasks(
     spawn_reflector(
         &mut set,
         route_writer,
-        scoped_api::<HTTPRoute>(client.clone(), ns),
+        scoped_api::<HttpRoute>(client.clone(), ns),
         watcher::Config::default(),
         Arc::clone(&notify),
-        "HTTPRoute",
+        "HttpRoute",
     );
     spawn_reflector(
         &mut set,
@@ -363,7 +364,7 @@ async fn spawn_tasks(
 
 #[allow(clippy::too_many_arguments)]
 fn rebuild(
-    route_store: &reflector::Store<HTTPRoute>,
+    route_store: &reflector::Store<HttpRoute>,
     ingress_store: &reflector::Store<Ingress>,
     class_store: &reflector::Store<IngressClass>,
     gateway_store: &reflector::Store<Gateway>,
@@ -565,7 +566,7 @@ fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
 /// Build and publish the routing table from HTTPRoutes and Ingresses.
 #[allow(clippy::too_many_arguments)]
 fn build_routes(
-    routes: &[Arc<HTTPRoute>],
+    routes: &[Arc<HttpRoute>],
     ingresses: &[Arc<Ingress>],
     owned_ingress_classes: &HashSet<String>,
     owned_default_ingress_class: Option<&str>,
@@ -732,7 +733,7 @@ fn build_tls(
 /// Increment `attached_routes` counters for each gateway listener whose hostname
 /// intersects with the route's hostnames. Only owned gateways are counted.
 fn count_attached_routes(
-    routes: &[Arc<HTTPRoute>],
+    routes: &[Arc<HttpRoute>],
     owned_gateways: &HashSet<ObjectKey>,
     gateway_tls_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
 ) {

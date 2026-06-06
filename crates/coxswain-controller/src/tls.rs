@@ -24,6 +24,7 @@ pub(crate) enum TlsLoadError {
 }
 
 /// Outcome of resolving one HTTPS listener's TLS configuration during a rebuild.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum ListenerTlsOutcome {
     /// Non-HTTPS listener — no TLS check performed.
@@ -192,6 +193,7 @@ impl SharedHttpRouteHealth {
 /// Look up a `kubernetes.io/tls` Secret by namespace/name from the reflector
 /// store and extract the PEM bytes. Both cert and key data must contain a PEM
 /// header (`-----BEGIN`) to be considered valid.
+#[must_use = "TLS certificate load result must be handled"]
 pub(crate) fn load_tls_cert(
     ns: &str,
     name: &str,

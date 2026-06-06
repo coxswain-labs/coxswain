@@ -18,6 +18,7 @@ pub use predicate::{HeaderPredicate, MatchPredicates, QueryPredicate, RequestCon
 #[cfg(test)]
 mod tests;
 
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {
     #[error("matchit insert failed: {0}")]
@@ -30,6 +31,7 @@ pub enum RouterError {
 pub type SharedRoutingTable = Shared<RoutingTable>;
 
 /// Result of a two-level host+path routing lookup.
+#[non_exhaustive]
 pub enum RouteOutcome {
     Found(Arc<BackendGroup>, Arc<[FilterAction]>, RouteTimeouts),
     /// Route matched but backend is invalid/missing/forbidden — return this status immediately.

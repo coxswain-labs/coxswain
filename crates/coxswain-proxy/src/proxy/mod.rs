@@ -72,6 +72,7 @@ async fn resolve_outcome(
             HTTPStatus(404),
             format!("no route for path {path} on host {host}"),
         )),
+        _ => unreachable!("unhandled RouteOutcome variant"),
     }
 }
 
@@ -425,7 +426,7 @@ mod tests {
         let ctx = RequestContext::default();
         let result = engine.route(PORT, "example.com", "/api/users", &ctx);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().name, "default/backend");
+        assert_eq!(result.unwrap().name(), "default/backend");
     }
 
     #[test]

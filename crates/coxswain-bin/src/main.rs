@@ -316,10 +316,12 @@ fn main() -> Result<()> {
         gateway_tls_health.clone(),
         owned_gateways.clone(),
         args.controller_name.clone(),
-        ReconcilerOptions {
-            watch_namespace: args.controller_watch_namespace.clone(),
-            ingress_default_backend: args.ingress_default_backend,
-            ingress_ports: IngressPorts::new(args.proxy_http_port, args.proxy_https_port),
+        {
+            let mut opts = ReconcilerOptions::default();
+            opts.watch_namespace = args.controller_watch_namespace.clone();
+            opts.ingress_default_backend = args.ingress_default_backend;
+            opts.ingress_ports = IngressPorts::new(args.proxy_http_port, args.proxy_https_port);
+            opts
         },
     );
     let route_health = reconciler.route_health();

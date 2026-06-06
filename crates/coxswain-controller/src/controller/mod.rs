@@ -1,7 +1,8 @@
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
-use crate::gw_types::v::httproutes::{
-    HTTPRoute, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+use crate::gw_types::{
+    HttpRoute,
+    v::httproutes::{HttpRouteStatusParents, HttpRouteStatusParentsParentRef},
 };
 use crate::keys::RouteParentKey;
 use crate::tls::{
@@ -108,7 +109,7 @@ impl Controller {
         self.leader.store(is_leader, Ordering::Release);
 
         let route_watcher = watcher(
-            scoped_api::<HTTPRoute>(client.clone(), self.config.watch_namespace.as_deref()),
+            scoped_api::<HttpRoute>(client.clone(), self.config.watch_namespace.as_deref()),
             watcher::Config::default(),
         )
         .default_backoff();
@@ -152,7 +153,7 @@ impl Controller {
         let mut known_gateways: HashMap<ObjectKey, Gateway> = HashMap::new();
 
         // Local cache of known HTTPRoute objects.
-        let mut known_routes: HashMap<ObjectKey, HTTPRoute> = HashMap::new();
+        let mut known_routes: HashMap<ObjectKey, HttpRoute> = HashMap::new();
 
         // interval_at delays the first tick so we don't double-acquire immediately.
         let mut renewal_interval = tokio::time::interval_at(
@@ -181,7 +182,7 @@ impl Controller {
                     match event {
                         Ok(watcher::Event::InitDone) => {
                             self.synced.store(true, Ordering::Release);
-                            tracing::info!("HTTPRoute initial sync complete");
+                            tracing::info!("HttpRoute initial sync complete");
                         }
                         Ok(watcher::Event::Apply(route) | watcher::Event::InitApply(route)) => {
                             let ns = route.metadata.namespace.clone().unwrap_or_default();
@@ -214,7 +215,7 @@ impl Controller {
                         Ok(_) => {}
                         Err(e) => tracing::warn!(
                             error = %e,
-                            "HTTPRoute watch error — Gateway API CRDs may not be installed"
+                            "HttpRoute watch error — Gateway API CRDs may not be installed"
                         ),
                     }
                 }
@@ -456,7 +457,7 @@ impl Controller {
 
     async fn mark_http_route_programmed(
         client: &Client,
-        route: &HTTPRoute,
+        route: &HttpRoute,
         controller_name: &str,
         owned_gateways: &HashSet<ObjectKey>,
         route_health: &HttpRouteHealthMap,
@@ -477,13 +478,13 @@ impl Controller {
             return;
         }
 
-        let api: Api<HTTPRoute> = Api::namespaced(client.clone(), ns);
+        let api: Api<HttpRoute> = Api::namespaced(client.clone(), ns);
         let now = Time(k8s_openapi::jiff::Timestamp::now());
         let Some(observed_gen) = route.metadata.generation else {
             tracing::warn!(
                 name,
                 ns,
-                "Skipping HTTPRoute status patch: metadata.generation is unset"
+                "Skipping HttpRoute status patch: metadata.generation is unset"
             );
             return;
         };
@@ -558,8 +559,8 @@ impl Controller {
             .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await
         {
-            Ok(_) => tracing::info!(name, ns, "HTTPRoute programmed"),
-            Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch HTTPRoute status"),
+            Ok(_) => tracing::info!(name, ns, "HttpRoute programmed"),
+            Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch HttpRoute status"),
         }
     }
 
@@ -596,10 +597,11 @@ mod tests {
     };
     use super::ingress_status::{build_ingress_status_patch, ingress_lb_already_matches};
     use super::*;
+    use crate::gw_types::HttpRoute;
     use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassStatus};
     use gateway_api::apis::standard::gateways::{Gateway, GatewayStatus};
     use gateway_api::apis::standard::httproutes::{
-        HTTPRoute, HttpRouteParentRefs, HttpRouteStatus, HttpRouteStatusParents,
+        HttpRouteParentRefs, HttpRouteStatus, HttpRouteStatusParents,
         HttpRouteStatusParentsParentRef,
     };
 
@@ -666,7 +668,7 @@ mod tests {
     #[test]
     fn http_route_programmed_for_matching_controller_and_owned_parent() {
         let set = owned(&[("default", "gw")]);
-        let route = HTTPRoute {
+        let route = HttpRoute {
             metadata: kube::api::ObjectMeta {
                 namespace: Some("default".to_string()),
                 ..Default::default()
@@ -693,7 +695,7 @@ mod tests {
     #[test]
     fn http_route_not_programmed_for_different_controller() {
         let set = owned(&[("default", "gw")]);
-        let route = HTTPRoute {
+        let route = HttpRoute {
             metadata: kube::api::ObjectMeta {
                 namespace: Some("default".to_string()),
                 ..Default::default()
@@ -717,7 +719,7 @@ mod tests {
     #[test]
     fn http_route_not_programmed_when_parent_not_owned() {
         let set = owned(&[("default", "gw")]);
-        let route = HTTPRoute {
+        let route = HttpRoute {
             metadata: kube::api::ObjectMeta {
                 namespace: Some("default".to_string()),
                 ..Default::default()

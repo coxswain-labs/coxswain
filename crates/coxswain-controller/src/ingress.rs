@@ -25,6 +25,7 @@ pub struct IngressReconciler;
 ///
 /// Both fields are optional; when both are `None` no listener is configured
 /// and the Ingress is skipped with a warning.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IngressPorts {
     pub http: Option<u16>,
@@ -657,11 +658,14 @@ mod tests {
             table
                 .route(80, "example.com", "/api/v1", &ctx)
                 .unwrap()
-                .name,
+                .name(),
             "default/rule-svc"
         );
         assert_eq!(
-            table.route(80, "example.com", "/other", &ctx).unwrap().name,
+            table
+                .route(80, "example.com", "/other", &ctx)
+                .unwrap()
+                .name(),
             "default/default-svc"
         );
     }
@@ -682,11 +686,11 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route(80, "any.host.com", "/", &ctx).unwrap().name,
+            table.route(80, "any.host.com", "/", &ctx).unwrap().name(),
             "default/default-svc"
         );
         assert_eq!(
-            table.route(80, "other.io", "/api/v1", &ctx).unwrap().name,
+            table.route(80, "other.io", "/api/v1", &ctx).unwrap().name(),
             "default/default-svc"
         );
     }
@@ -716,15 +720,15 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route(80, "a.com", "/api", &ctx).unwrap().name,
+            table.route(80, "a.com", "/api", &ctx).unwrap().name(),
             "default/rule-svc"
         );
         assert_eq!(
-            table.route(80, "a.com", "/other", &ctx).unwrap().name,
+            table.route(80, "a.com", "/other", &ctx).unwrap().name(),
             "default/default-svc"
         );
         assert_eq!(
-            table.route(80, "b.com", "/", &ctx).unwrap().name,
+            table.route(80, "b.com", "/", &ctx).unwrap().name(),
             "default/default-svc"
         );
     }
@@ -815,7 +819,7 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route(80, "example.com", "/foo", &ctx).unwrap().name,
+            table.route(80, "example.com", "/foo", &ctx).unwrap().name(),
             "default/old-svc",
             "older Ingress should win on conflicting Prefix /foo"
         );
@@ -886,7 +890,7 @@ mod tests {
         let ctx = RequestContext::default();
 
         assert_eq!(
-            table.route(80, "example.com", "/foo", &ctx).unwrap().name,
+            table.route(80, "example.com", "/foo", &ctx).unwrap().name(),
             "default/exact-svc",
             "Exact /foo should win over Prefix /foo"
         );
@@ -894,7 +898,7 @@ mod tests {
             table
                 .route(80, "example.com", "/foo/sub", &ctx)
                 .unwrap()
-                .name,
+                .name(),
             "default/prefix-svc",
             "Prefix /foo should still match /foo/sub"
         );
@@ -956,14 +960,14 @@ mod tests {
             table
                 .route(80, "api.example.com", "/api", &ctx)
                 .unwrap()
-                .name,
+                .name(),
             "default/rule-svc"
         );
         assert_eq!(
             table
                 .route(80, "api.example.com", "/other", &ctx)
                 .unwrap()
-                .name,
+                .name(),
             "default/default-svc"
         );
     }
@@ -997,7 +1001,7 @@ mod tests {
             table
                 .route(80, "example.com", "/anything", &ctx)
                 .unwrap()
-                .name,
+                .name(),
             "default/rule-svc"
         );
     }
@@ -1052,7 +1056,7 @@ mod tests {
             route.is_some(),
             "named port backend should resolve to a route"
         );
-        assert_eq!(route.unwrap().name, "default/svc");
+        assert_eq!(route.unwrap().name(), "default/svc");
     }
 
     #[test]
@@ -1168,11 +1172,14 @@ mod tests {
             table
                 .route(80, "example.com", "/api/v1", &ctx)
                 .unwrap()
-                .name,
+                .name(),
             "default/rule-svc"
         );
         assert_eq!(
-            table.route(80, "example.com", "/other", &ctx).unwrap().name,
+            table
+                .route(80, "example.com", "/other", &ctx)
+                .unwrap()
+                .name(),
             "default/default-svc"
         );
     }
