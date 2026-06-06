@@ -3,7 +3,7 @@ use super::config::StatusAddress;
 use crate::gw_types::v::gateways::{
     Gateway, GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
-use crate::tls::{GatewayListenerHealth, ListenerTlsOutcome};
+use crate::tls::GatewayListenerHealth;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Returns true when the Gateway's current status does not yet reflect the desired
@@ -32,12 +32,9 @@ pub(super) fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerH
         .unwrap_or(&[]);
     for listener in &gw.spec.listeners {
         let (has_invalid_kinds, _) = listener_route_kind_info(listener);
-        let desired_healthy = !has_invalid_kinds
-            && health
-                .by_listener
-                .get(&listener.name)
-                .map(|o| o.is_healthy())
-                .unwrap_or(true);
+        let info = health.listeners.get(&listener.name);
+        let desired_healthy =
+            !has_invalid_kinds && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true);
         let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);
         let current_resolved = current_listener
             .map(|sl| has_condition(Some(sl.conditions.as_slice()), "ResolvedRefs"))
@@ -45,11 +42,7 @@ pub(super) fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerH
         if desired_healthy != current_resolved {
             return true;
         }
-        let desired_attached = health
-            .attached_routes
-            .get(&listener.name)
-            .copied()
-            .unwrap_or(0);
+        let desired_attached = info.map(|i| i.attached_routes).unwrap_or(0);
         let current_attached = current_listener.map(|sl| sl.attached_routes).unwrap_or(0);
         if desired_attached != current_attached {
             return true;
@@ -154,10 +147,10 @@ pub(super) fn build_gateway_status_patch(
         .iter()
         .map(|l| {
             let outcome = health
-                .by_listener
+                .listeners
                 .get(&l.name)
-                .cloned()
-                .unwrap_or(ListenerTlsOutcome::NotApplicable);
+                .map(|i| i.tls_outcome.clone())
+                .unwrap_or_default();
             let (has_invalid_kinds, supported_kinds_list) = listener_route_kind_info(l);
             let (resolved_refs_status, resolved_refs_reason, resolved_refs_msg) =
                 if has_invalid_kinds {
@@ -177,7 +170,7 @@ pub(super) fn build_gateway_status_patch(
                 } else {
                     ("False", outcome.reason(), outcome.message())
                 };
-            let attached = health.attached_routes.get(&l.name).copied().unwrap_or(0);
+            let attached = health.listeners.get(&l.name).map(|i| i.attached_routes).unwrap_or(0);
             tracing::debug!(
                 listener = %l.name,
                 resolved_refs = resolved_refs_status,

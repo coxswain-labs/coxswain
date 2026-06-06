@@ -1,6 +1,10 @@
 use crate::proxy::ProxyCtx;
 use coxswain_core::routing::{FilterAction, HeaderMod, PathModifier};
 use http::{HeaderName, HeaderValue};
+use std::sync::LazyLock;
+
+static X_PROXY_ENGINE: LazyLock<HeaderValue> =
+    LazyLock::new(|| HeaderValue::from_static(concat!("Coxswain/", env!("CARGO_PKG_VERSION"))));
 use pingora_core::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 
@@ -41,10 +45,7 @@ impl TrafficFilter {
         }
 
         // Fixed infrastructure headers added after user-defined filters.
-        upstream_request.insert_header(
-            "X-Proxy-Engine",
-            concat!("Coxswain/", env!("CARGO_PKG_VERSION")),
-        )?;
+        upstream_request.insert_header("X-Proxy-Engine", X_PROXY_ENGINE.clone())?;
 
         if let Some(addr) = ctx.real_client_addr {
             let proto = ctx.real_client_proto.unwrap_or("http");
@@ -98,30 +99,15 @@ impl HeaderTarget for ResponseHeader {
     }
 }
 
-fn apply_header_mod<H: HeaderTarget>(target: &mut H, m: &HeaderMod, kind: &'static str) {
+fn apply_header_mod<H: HeaderTarget>(target: &mut H, m: &HeaderMod, _kind: &'static str) {
     for (name, value) in &m.set {
-        match (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            (Ok(n), Ok(v)) => target.hdr_set(n, v),
-            _ => tracing::warn!(%name, "{kind} set: invalid header name or value"),
-        }
+        target.hdr_set(name.clone(), value.clone());
     }
     for (name, value) in &m.add {
-        match (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            (Ok(n), Ok(v)) => target.hdr_add(n, v),
-            _ => tracing::warn!(%name, "{kind} add: invalid header name or value"),
-        }
+        target.hdr_add(name.clone(), value.clone());
     }
     for name in &m.remove {
-        match HeaderName::from_bytes(name.as_bytes()) {
-            Ok(n) => target.hdr_remove(&n),
-            Err(_) => tracing::warn!(%name, "{kind} remove: invalid header name"),
-        }
+        target.hdr_remove(name);
     }
 }
 
@@ -167,13 +153,14 @@ mod tests {
         ResponseHeader::build(200, None).unwrap()
     }
 
+    fn hmod(add: &[(&str, &str)], set: &[(&str, &str)], remove: &[&str]) -> HeaderMod {
+        HeaderMod::parse(add, set, remove).unwrap()
+    }
+
     #[test]
     fn request_header_set_overwrites() {
         let mut r = req();
-        let m = HeaderMod {
-            set: vec![("x-keep".to_string(), "overwritten".to_string())],
-            ..Default::default()
-        };
+        let m = hmod(&[], &[("x-keep", "overwritten")], &[]);
         apply_header_mod(&mut r, &m, "RequestHeaderModifier");
         assert_eq!(r.headers.get("x-keep").unwrap(), "overwritten");
     }
@@ -181,10 +168,7 @@ mod tests {
     #[test]
     fn request_header_add_appends() {
         let mut r = req();
-        let m = HeaderMod {
-            add: vec![("x-keep".to_string(), "extra".to_string())],
-            ..Default::default()
-        };
+        let m = hmod(&[("x-keep", "extra")], &[], &[]);
         apply_header_mod(&mut r, &m, "RequestHeaderModifier");
         let vals: Vec<_> = r.headers.get_all("x-keep").iter().collect();
         assert_eq!(vals.len(), 2);
@@ -193,10 +177,7 @@ mod tests {
     #[test]
     fn request_header_remove() {
         let mut r = req();
-        let m = HeaderMod {
-            remove: vec!["x-keep".to_string()],
-            ..Default::default()
-        };
+        let m = hmod(&[], &[], &["x-keep"]);
         apply_header_mod(&mut r, &m, "RequestHeaderModifier");
         assert!(r.headers.get("x-keep").is_none());
     }
@@ -205,10 +186,7 @@ mod tests {
     fn response_header_set_overwrites() {
         let mut r = resp();
         r.insert_header("x-old", "old").unwrap();
-        let m = HeaderMod {
-            set: vec![("x-old".to_string(), "new".to_string())],
-            ..Default::default()
-        };
+        let m = hmod(&[], &[("x-old", "new")], &[]);
         apply_header_mod(&mut r, &m, "ResponseHeaderModifier");
         assert_eq!(r.headers.get("x-old").unwrap(), "new");
     }
@@ -217,10 +195,7 @@ mod tests {
     fn response_header_add_appends() {
         let mut r = resp();
         r.insert_header("x-multi", "a").unwrap();
-        let m = HeaderMod {
-            add: vec![("x-multi".to_string(), "b".to_string())],
-            ..Default::default()
-        };
+        let m = hmod(&[("x-multi", "b")], &[], &[]);
         apply_header_mod(&mut r, &m, "ResponseHeaderModifier");
         let vals: Vec<_> = r.headers.get_all("x-multi").iter().collect();
         assert_eq!(vals.len(), 2);

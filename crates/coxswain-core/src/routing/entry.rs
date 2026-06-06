@@ -1,4 +1,5 @@
 use crate::routing::predicate::MatchPredicates;
+use http::{HeaderName, HeaderValue};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -125,15 +126,85 @@ impl PathModifier {
     }
 }
 
+/// Error produced when a header name or value is invalid at routing-table build time.
+#[derive(Debug, thiserror::Error)]
+pub enum HeaderModError {
+    #[error("invalid header name {name:?}: {source}")]
+    InvalidName {
+        name: String,
+        #[source]
+        source: http::header::InvalidHeaderName,
+    },
+    #[error("invalid header value for {name:?}: {source}")]
+    InvalidValue {
+        name: String,
+        #[source]
+        source: http::header::InvalidHeaderValue,
+    },
+}
+
 /// Header add/set/remove operations applied as a unit.
+///
+/// Headers are pre-parsed at routing-table build time — no per-request
+/// `HeaderName::from_bytes` / `HeaderValue::from_str` parsing on the hot path.
 #[derive(Clone, Debug, Default)]
 pub struct HeaderMod {
     /// Headers appended to any existing values.
-    pub add: Vec<(String, String)>,
+    pub add: Vec<(HeaderName, HeaderValue)>,
     /// Headers overwritten (set).
-    pub set: Vec<(String, String)>,
+    pub set: Vec<(HeaderName, HeaderValue)>,
     /// Header names removed entirely.
-    pub remove: Vec<String>,
+    pub remove: Vec<HeaderName>,
+}
+
+impl HeaderMod {
+    /// Parse and validate raw string header pairs at build time.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HeaderModError` if any name or value string is not a valid HTTP header.
+    pub fn parse(
+        add: &[(&str, &str)],
+        set: &[(&str, &str)],
+        remove: &[&str],
+    ) -> Result<Self, HeaderModError> {
+        let parse_pair = |name: &str,
+                          value: &str|
+         -> Result<(HeaderName, HeaderValue), HeaderModError> {
+            let n = HeaderName::from_bytes(name.as_bytes()).map_err(|source| {
+                HeaderModError::InvalidName {
+                    name: name.to_string(),
+                    source,
+                }
+            })?;
+            let v =
+                HeaderValue::from_str(value).map_err(|source| HeaderModError::InvalidValue {
+                    name: name.to_string(),
+                    source,
+                })?;
+            Ok((n, v))
+        };
+        let parse_name = |name: &str| -> Result<HeaderName, HeaderModError> {
+            HeaderName::from_bytes(name.as_bytes()).map_err(|source| HeaderModError::InvalidName {
+                name: name.to_string(),
+                source,
+            })
+        };
+        Ok(Self {
+            add: add
+                .iter()
+                .map(|(n, v)| parse_pair(n, v))
+                .collect::<Result<_, _>>()?,
+            set: set
+                .iter()
+                .map(|(n, v)| parse_pair(n, v))
+                .collect::<Result<_, _>>()?,
+            remove: remove
+                .iter()
+                .map(|n| parse_name(n))
+                .collect::<Result<_, _>>()?,
+        })
+    }
 }
 
 /// A filter action evaluated per-request on the proxy hot path.
@@ -408,6 +479,34 @@ impl RouteEntry {
             created_at,
             error_status: None,
         }
+    }
+
+    /// Constructs a redirect-only entry that has no upstream backend.
+    ///
+    /// Use for `RequestRedirect` filter rules: the proxy fires the redirect before
+    /// consulting any upstream, so no `BackendGroup` is needed. The `/routes` admin
+    /// endpoint skips these entries (they have no endpoints).
+    pub fn redirect_only(
+        predicates: MatchPredicates,
+        filters: Vec<FilterAction>,
+        timeouts: RouteTimeouts,
+        route_id: String,
+        created_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            backend_group: Arc::new(BackendGroup::new(String::new(), vec![])),
+            predicates,
+            filters: Arc::from(filters.into_boxed_slice()),
+            timeouts,
+            route_id,
+            created_at,
+            error_status: None,
+        }
+    }
+
+    /// Returns `true` for redirect-only entries that carry no upstream backend.
+    pub fn is_redirect_only(&self) -> bool {
+        self.backend_group.name().is_empty()
     }
 
     /// Constructs an entry with predicates, filters, and per-rule timeouts.

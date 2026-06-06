@@ -6,5 +6,5 @@ mod tls;
 pub use accept::{
     AcceptorBuildError, ListenerProtocol, ListenerSpec, ProxyAcceptor, TrustedSources,
 };
-pub use proxy::{Proxy, ProxyCtx, RoutingEngine};
+pub use proxy::{Proxy, RoutingEngine};
 pub use tls::SniCertSelector;

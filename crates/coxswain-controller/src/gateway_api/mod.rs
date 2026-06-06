@@ -9,12 +9,14 @@ use crate::gw_types::{
     },
 };
 use crate::keys::ListenerKey;
-use crate::tls::{GatewayListenerHealth, HttpRouteHealthMap, ListenerTlsOutcome, load_tls_cert};
+use crate::tls::{
+    GatewayListenerHealth, HttpRouteHealthMap, ListenerInfo, ListenerTlsOutcome, load_tls_cert,
+};
 use crate::translate::metadata_created_at;
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
-    BackendGroup, BackendProtocol, HostRouterBuilder, MatchPredicates, RouteEntry,
+    BackendGroup, BackendProtocol, FilterAction, HostRouterBuilder, MatchPredicates, RouteEntry,
     RoutingTableBuilder,
 };
 use coxswain_core::tls::TlsStoreBuilder;
@@ -131,21 +133,14 @@ impl GatewayApiReconciler {
                 .map(timeouts::parse_rule_timeouts)
                 .unwrap_or_default();
 
-            // Rules with RequestRedirect are terminal: the proxy short-circuits before
-            // upstream_peer() is called, so no real backend is needed. Use a sentinel
-            // upstream with no endpoints; the redirect fires first and it is never used.
+            // Rules with RequestRedirect are terminal: the proxy fires the redirect before
+            // consulting any upstream, so no BackendGroup is needed.
             let has_redirect = rule_filters
                 .iter()
                 .any(|f| matches!(f.r#type, HttpRouteRulesFiltersType::RequestRedirect));
 
-            let (group, error_status) = if has_redirect {
-                (
-                    Arc::new(BackendGroup::new(
-                        format!("{route_ns}/redirect-sentinel"),
-                        vec![],
-                    )),
-                    None,
-                )
+            let (group, error_status): (Option<Arc<BackendGroup>>, Option<u16>) = if has_redirect {
+                (None, None)
             } else {
                 let backend_refs = match rule.backend_refs.as_deref() {
                     Some(b) if !b.is_empty() => b,
@@ -171,9 +166,9 @@ impl GatewayApiReconciler {
                         route = ?route.metadata.name,
                         "No ready endpoints for rule — installing error route (500)"
                     );
-                    (group, Some(500u16))
+                    (Some(group), Some(500u16))
                 } else {
-                    (group, None)
+                    (Some(group), None)
                 }
             };
 
@@ -189,7 +184,7 @@ impl GatewayApiReconciler {
                     rule,
                     rule_filters,
                     &rule_timeouts,
-                    &group,
+                    group.as_ref(),
                     error_status,
                     &route_id,
                     created_at,
@@ -214,38 +209,35 @@ impl GatewayApiReconciler {
     ) -> GatewayListenerHealth {
         let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
         let gw_name = gateway.metadata.name.as_deref().unwrap_or("unknown");
-        let mut by_listener: BTreeMap<String, ListenerTlsOutcome> = BTreeMap::new();
-        let mut listener_hostnames: BTreeMap<String, String> = BTreeMap::new();
-        let mut listener_allows_all_namespaces: BTreeMap<String, bool> = BTreeMap::new();
-        let mut listener_ports: BTreeMap<String, u16> = BTreeMap::new();
+        let mut listeners = BTreeMap::new();
 
         for listener in &gateway.spec.listeners {
-            let outcome = if listener.protocol != "HTTPS" {
+            let tls_outcome = if listener.protocol != "HTTPS" {
                 ListenerTlsOutcome::NotApplicable
             } else {
                 Self::resolve_listener_tls(gw_ns, gw_name, listener, secrets, cert_grants, builder)
             };
             let hostname = listener.hostname.as_deref().unwrap_or("").to_string();
-            let allows_all = listener
+            let allows_all_namespaces = listener
                 .allowed_routes
                 .as_ref()
                 .and_then(|ar| ar.namespaces.as_ref())
                 .and_then(|ns| ns.from.as_ref())
                 .map(|f| !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same))
                 .unwrap_or(false); // default per spec is Same
-            by_listener.insert(listener.name.clone(), outcome);
-            listener_hostnames.insert(listener.name.clone(), hostname);
-            listener_allows_all_namespaces.insert(listener.name.clone(), allows_all);
-            listener_ports.insert(listener.name.clone(), listener.port as u16);
+            listeners.insert(
+                listener.name.clone(),
+                ListenerInfo {
+                    tls_outcome,
+                    attached_routes: 0,
+                    hostname,
+                    allows_all_namespaces,
+                    port: listener.port as u16,
+                },
+            );
         }
 
-        GatewayListenerHealth {
-            by_listener,
-            listener_hostnames,
-            listener_allows_all_namespaces,
-            listener_ports,
-            ..Default::default()
-        }
+        GatewayListenerHealth { listeners }
     }
 
     fn resolve_listener_tls(
@@ -563,30 +555,51 @@ fn compute_listener_bindings(
 }
 
 /// Installs one HTTPRoute rule into a `HostRouterBuilder`.
+///
+/// When `group` is `None`, the rule has a `RequestRedirect` filter and no
+/// upstream backend — `RouteEntry::redirect_only` is used in that case.
 #[allow(clippy::too_many_arguments)]
 fn apply_rule(
     pb: &mut HostRouterBuilder,
     rule: &crate::gw_types::v::httproutes::HttpRouteRules,
     rule_filters: &[crate::gw_types::v::httproutes::HttpRouteRulesFilters],
     rule_timeouts: &coxswain_core::routing::RouteTimeouts,
-    group: &Arc<BackendGroup>,
+    group: Option<&Arc<BackendGroup>>,
     error_status: Option<u16>,
     route_id: &str,
     created_at: Option<SystemTime>,
 ) {
-    match rule.matches.as_deref() {
-        None | Some([]) => {
-            let filter_list = filters::build_filters(rule_filters, "/", false);
-            let mut e = RouteEntry::with_filters(
-                Arc::clone(group),
-                MatchPredicates::default(),
+    let make_entry = |predicates: MatchPredicates, filter_list: Vec<FilterAction>| -> RouteEntry {
+        match group {
+            Some(g) => {
+                let mut e = RouteEntry::with_filters(
+                    Arc::clone(g),
+                    predicates,
+                    filter_list,
+                    rule_timeouts.clone(),
+                    route_id.to_string(),
+                    created_at,
+                );
+                e.error_status = error_status;
+                e
+            }
+            None => RouteEntry::redirect_only(
+                predicates,
                 filter_list,
                 rule_timeouts.clone(),
                 route_id.to_string(),
                 created_at,
+            ),
+        }
+    };
+
+    match rule.matches.as_deref() {
+        None | Some([]) => {
+            let filter_list = filters::build_filters(rule_filters, "/", false);
+            pb.add_prefix_route(
+                "/",
+                Arc::new(make_entry(MatchPredicates::default(), filter_list)),
             );
-            e.error_status = error_status;
-            pb.add_prefix_route("/", Arc::new(e));
         }
         Some(ms) => {
             for m in ms {
@@ -612,27 +625,18 @@ fn apply_rule(
                     None | Some(HttpRouteRulesMatchesPathType::PathPrefix)
                 );
                 let filter_list = filters::build_filters(rule_filters, val, is_prefix);
-
-                let mut e = RouteEntry::with_filters(
-                    Arc::clone(group),
-                    predicates,
-                    filter_list,
-                    rule_timeouts.clone(),
-                    route_id.to_string(),
-                    created_at,
-                );
-                e.error_status = error_status;
+                let e = Arc::new(make_entry(predicates, filter_list));
 
                 match m.path.as_ref().and_then(|p| p.r#type.as_ref()) {
                     Some(HttpRouteRulesMatchesPathType::Exact) => {
-                        pb.add_exact_route(val, Arc::new(e));
+                        pb.add_exact_route(val, e);
                     }
                     Some(HttpRouteRulesMatchesPathType::RegularExpression) => {
-                        pb.add_regex_route(val, Arc::new(e));
+                        pb.add_regex_route(val, e);
                     }
                     // PathPrefix is the default per spec
                     _ => {
-                        pb.add_prefix_route(val, Arc::new(e));
+                        pb.add_prefix_route(val, e);
                     }
                 }
             }
