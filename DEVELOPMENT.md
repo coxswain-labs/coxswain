@@ -1,12 +1,25 @@
 # Development Guide
 
+## Quick reference
+
+```bash
+cargo build                                    # build
+cargo test --workspace --exclude coxswain-e2e  # unit tests (no cluster)
+cargo check && cargo clippy -- -D warnings     # check + lint
+cargo fmt                                      # format
+cargo run --bin coxswain -- serve --log-format console  # run locally
+```
+
+For the release procedure, see `RELEASE.md`.
+
+---
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable toolchain)
 - A local Kubernetes cluster with `kubectl` configured (`~/.kube/config`)
 
-Any local distribution works: 
-
+Any of the following should work:
 - [OrbStack](https://orbstack.dev/)
 - [Docker Desktop](https://docs.docker.com/desktop/kubernetes/)
 - [minikube](https://minikube.sigs.k8s.io/)
@@ -14,51 +27,9 @@ Any local distribution works:
 - [k3d](https://k3d.io/)
 - etc.
 
-## macOS: BoringSSL build setup
-
-Coxswain's proxy crate uses Pingora with the `boringssl` feature, which compiles BoringSSL
-from source via `boring-sys`. This requires `cmake` and `go` (for the BoringSSL build) and
-the correct `libclang` (for the `bindgen`-generated FFI bindings).
-
-### First-time build requirements
-
-```bash
-brew install cmake go
-```
-
-### macOS 26+ libclang issue
-
-On macOS 26 (Tahoe) the system `libclang` in CommandLineTools ships with the macOS 26 SDK.
-A change in that SDK's `cdefs.h` causes `bindgen 0.72` to panic:
-
-```
-assertion `left == right` failed: "arm64-apple-darwin" "aarch64-apple-darwin"
-  left: 4
- right: 8
-```
-
-**Fix:** install Xcode 16.x alongside the macOS 26 beta toolchain, then tell `bindgen`
-to use Xcode 16's `libclang` and the macOS 15 SDK it ships with.
-
-```bash
-xcodes install 16.3          # or download from https://xcodereleases.com/
-```
-
-Then copy the provided Cargo config template to your local (gitignored) override:
-
-```bash
-cp .cargo/config.toml.example .cargo/config.toml
-```
-
-Edit `.cargo/config.toml` if your Xcode path or SDK version differs from the defaults
-in the template. After that, `cargo build` and `cargo check` work without any extra
-environment variables.
-
-This file is gitignored — the paths are machine-local.
-
 ---
 
-## Local development (no Docker required)
+## Running the controller locally
 
 When developing locally, run the binary directly on your machine. It discovers the cluster via `~/.kube/config` and talks to Kubernetes without needing to be inside a pod.
 
@@ -101,11 +72,11 @@ cargo run --bin coxswain -- serve \
 
 `--log-format console` produces human-readable output instead of JSON. `--proxy-http-port` and `--proxy-https-port` are required to bind proxy listeners; omitting both logs a warning and starts no listeners.
 
-| Port | Purpose |
-|------|---------|
-| `80`   | HTTP proxy (data plane) |
-| `443`  | HTTPS proxy (data plane, SNI TLS) |
-| `8081` | Health endpoints (`/healthz`, `/readyz`) |
+| Port   | Purpose                                          |
+|--------|--------------------------------------------------|
+| `80`   | HTTP proxy (data plane)                          |
+| `443`  | HTTPS proxy (data plane, SNI TLS)                |
+| `8081` | Health endpoints (`/healthz`, `/readyz`)          |
 | `8082` | Admin endpoints (`/metrics`, `/routes`, `/status`) |
 
 The bind address for all listeners defaults to `0.0.0.0`. Pass `--proxy-bind-address 127.0.0.1` to restrict to localhost.
@@ -126,9 +97,11 @@ curl -s http://localhost:8082/metrics      # Prometheus text
 kubectl get gatewayclass                   # should show "coxswain" accepted
 ```
 
-`synced` in `/status` flips to `true` once both Ingress and HTTPRoute watch streams complete their initial LIST. You will see `ingress initial sync complete` in the logs when this happens.
+`synced` in `/status` flips to `true` once the HTTPRoute watch stream completes its initial LIST. You will see `HttpRoute initial sync complete` in the logs when this happens. Note: the Ingress stream's `InitDone` is not yet gated — tracked in #158.
 
-## Testing routing with dev manifests
+---
+
+## Manual smoke tests
 
 The `deploy/dev/` directory contains lightweight test fixtures for exercising both routing paths without any application code.
 
@@ -204,135 +177,34 @@ kubectl apply -f deploy/dev/cross-namespace.yaml
 curl -s http://localhost:8082/routes | jq .    # lists all active hostnames
 ```
 
-## CI secrets
-
-### `GH_LABELER_PAT` — conformance label propagation
-
-The labeler workflow uses a fine-grained PAT instead of `GITHUB_TOKEN` so that
-when it applies `needs: conformance` to a PR, GitHub fires the `labeled` event
-and the conformance workflow starts automatically. (`GITHUB_TOKEN`-generated
-events are deliberately blocked from triggering downstream workflows.)
-
-**Initial setup or renewal:**
-
-```bash
-./scripts/refresh-labeler-pat.sh
-```
-
-The script opens the GitHub PAT creation page in your browser, then updates the
-`GH_LABELER_PAT` repo secret via `gh secret set` once you paste the new token.
-
-PAT settings:
-- Resource owner: `coxswain-labs`
-- Repository access: `coxswain-labs/coxswain` only
-- Permission: Pull requests → Read and write
-
-GitHub sends an email before the token expires. When you get it, run the script
-above to rotate it.
-
----
-
-## Cutting a release
-
-Coxswain uses [`cargo-release`](https://github.com/crate-ci/cargo-release) to version, tag, and publish releases.
-
-### Install
-
-```bash
-cargo install cargo-release
-```
-
-### Ship a release
-
-```bash
-cargo release patch   # 0.2.0 → 0.2.1  (bug fixes)
-cargo release minor   # 0.2.0 → 0.3.0  (new milestone)
-cargo release major   # 0.9.0 → 1.0.0  (GA)
-```
-
-This single command:
-1. Bumps the version in `Cargo.toml`
-2. Updates `charts/coxswain/Chart.yaml` `appVersion` via a pre-release hook
-3. Commits the version change
-4. Creates a `v{version}` git tag
-5. Pushes the commit and tag
-
-CI picks up the tag and publishes the Docker image and Helm chart automatically. You never edit `Cargo.toml` or create git tags manually.
-
-### Dry run
-
-```bash
-cargo release minor --dry-run
-```
-
-Shows exactly what would happen without making any changes.
-
 ---
 
 ## E2E tests
 
-The `crates/coxswain-e2e/` crate contains cluster-backed integration tests split into two suites: `gateway_api` and `ingress`. They run against any Kubernetes cluster pointed to by `~/.kube/config`.
+All three suites require a live cluster. Reset your cluster (delete and recreate it) per your distro's documentation, then prepare it as described in the **Running coxswain locally** section above.
 
-**Tests must run sequentially and require a freshly reset cluster.** Reset before each run:
+### ingress
 
-```bash
-orb delete -f k8s && orb start k8s
-```
-
-Then prepare the cluster as described in the **Local development** section above.
-
-### Run the suites
+The harness spawns coxswain automatically on ephemeral ports. Build the binary first:
 
 ```bash
-# Build the controller binary first (the harness locates it from the build output).
 cargo build --bin coxswain
-
-# Run (pick one or both; --test-threads=1 is required).
-cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
 cargo test -p coxswain-e2e --test ingress -- --test-threads=1
 ```
 
-The harness bootstraps the cluster on first run (installs Gateway API CRDs, applies
-`deploy/manifests/`). Subsequent runs skip bootstrap in ~100 ms.
-
-### Verbose output
+### gateway_api
 
 ```bash
-RUST_LOG=coxswain_e2e=debug,warn \
-  cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1 --nocapture
+cargo build --bin coxswain
+cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
 ```
 
-### Manual cleanup after interrupted run
+### conformance
+
+The Gateway API conformance suite (`conformance/`) connects to a coxswain instance you start manually on fixed ports. Start coxswain in a separate terminal first:
 
 ```bash
-kubectl delete ns -l coxswain-e2e=true
-```
-
-### Notes
-
-- `cargo test` (without `-p coxswain-e2e`) does **not** run these tests; they are
-  excluded from `default-members` to keep the normal unit-test loop fast.
-- CI runs the suite in a fresh `kind` cluster on every PR (see `.github/workflows/e2e.yml`).
-- Set `COXSWAIN_BIN=/path/to/binary` to point the harness at a specific binary instead
-  of using the default `target/debug/coxswain`.
-
----
-
-## Conformance tests
-
-The Gateway API conformance suite lives in `conformance/` (a Go module). It requires a live cluster, a running coxswain instance, and a fresh cluster reset before each run.
-
-**Reset the cluster first:**
-
-```bash
-orb delete -f k8s && orb start k8s
-```
-
-Then prepare the cluster as described in the **Local development** section above.
-
-**Start coxswain in a separate terminal:**
-
-```bash
+# Terminal 1 — keep running
 cargo run --bin coxswain -- serve \
   --proxy-http-port 80 \
   --proxy-https-port 443 \
@@ -344,9 +216,10 @@ cargo run --bin coxswain -- serve \
   --pod-namespace coxswain-system
 ```
 
-**Run the conformance suite:**
+Then run the suite:
 
 ```bash
+# Terminal 2
 cd conformance && go test -v -timeout 60m -run TestConformance \
   -args \
   --organization=coxswain-labs \
@@ -356,11 +229,82 @@ cd conformance && go test -v -timeout 60m -run TestConformance \
   --report-output=reports/local-report.yaml
 ```
 
-**Verify the conformance file compiles (no cluster needed):**
+Verify the conformance file compiles (no cluster needed):
 
 ```bash
 cd conformance && go vet ./...
 ```
 
-`main_test.go` is the test entrypoint; `opts.SupportedFeatures` lists the feature flags this release claims to pass. Reports are written to `reports/` (`local-report.yaml` is gitignored from CI artifacts).
+`main_test.go` is the entrypoint; `opts.SupportedFeatures` lists the feature flags this release claims to pass. Reports are written to `reports/` (`local-report.yaml` is gitignored from CI artifacts).
 
+### Tips
+
+- **Verbose output** (ingress/gateway_api): prepend `RUST_LOG=coxswain_e2e=debug,warn` and pass `--nocapture`.
+- **Manual cleanup** after an interrupted run: `kubectl delete ns -l coxswain-e2e=true`.
+- The harness bootstraps the cluster on first ingress/gateway_api run (installs Gateway API CRDs, applies `deploy/manifests/`); subsequent runs skip bootstrap in ~100 ms.
+- `cargo test` alone does **not** run e2e — the crate is excluded from `default-members` to keep the unit-test loop fast.
+- CI runs all three suites on every PR (see `.github/workflows/e2e.yml`).
+- Set `COXSWAIN_BIN=/path/to/binary` to point the ingress/gateway_api harness at a specific binary instead of `target/debug/coxswain`.
+
+---
+
+## CI secrets
+
+### `GH_LABELER_PAT` — PR labeler
+
+The labeler workflow (`.github/workflows/label.yml`) uses a fine-grained PAT instead of `GITHUB_TOKEN` so that label events fired by the labeler can propagate to any downstream workflows. (`GITHUB_TOKEN`-generated events are deliberately blocked from triggering downstream workflows.) Label rules live in `.github/labeler.yml`.
+
+**Initial setup or renewal:**
+
+```bash
+./scripts/refresh-labeler-pat.sh
+```
+
+The script opens the GitHub PAT creation page in your browser, then updates the `GH_LABELER_PAT` repo secret via `gh secret set` once you paste the new token.
+
+PAT settings:
+- Resource owner: `coxswain-labs`
+- Repository access: `coxswain-labs/coxswain` only
+- Permission: Pull requests → Read and write
+
+GitHub sends an email before the token expires. When you get it, run the script above to rotate it.
+
+---
+
+## Troubleshooting
+
+### macOS: BoringSSL build setup
+
+Coxswain's proxy crate uses Pingora with the `boringssl` feature, which compiles BoringSSL from source via `boring-sys`. This requires `cmake` and `go` (for the BoringSSL build) and the correct `libclang` (for the `bindgen`-generated FFI bindings).
+
+#### First-time build requirements
+
+```bash
+brew install cmake go
+```
+
+#### macOS 26+ libclang issue
+
+On macOS 26 (Tahoe) the system `libclang` in CommandLineTools ships with the macOS 26 SDK. A change in that SDK's `cdefs.h` causes `bindgen 0.72` to panic:
+
+```
+assertion `left == right` failed: "arm64-apple-darwin" "aarch64-apple-darwin"
+  left: 4
+ right: 8
+```
+
+**Fix:** install Xcode 16.x alongside the macOS 26 beta toolchain, then tell `bindgen` to use Xcode 16's `libclang` and the macOS 15 SDK it ships with.
+
+```bash
+xcodes install 16.3          # or download from https://xcodereleases.com/
+```
+
+Then copy the provided Cargo config template to your local (gitignored) override:
+
+```bash
+cp .cargo/config.toml.example .cargo/config.toml
+```
+
+Edit `.cargo/config.toml` if your Xcode path or SDK version differs from the defaults in the template. After that, `cargo build` and `cargo check` work without any extra environment variables.
+
+This file is gitignored — the paths are machine-local.
