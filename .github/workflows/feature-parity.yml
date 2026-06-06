@@ -2,11 +2,6 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - 'crates/coxswain-controller/src/controller/gateway_class_status.rs'
-      - 'conformance/main_test.go'
-      - 'scripts/check-supported-features.sh'
-      - '.github/workflows/feature-parity.yml'
 
 name: Feature parity
 

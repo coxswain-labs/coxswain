@@ -3,8 +3,8 @@ use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
+use crate::k8s_utils::scoped_api;
 use crate::keys::ListenerKey;
-use crate::kube_helpers::scoped_api;
 use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth};
 use crate::{
     endpoints,

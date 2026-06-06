@@ -1,0 +1,123 @@
+use super::conditions::{filter_owned_parent_refs, make_condition};
+use crate::gw_types::{
+    HttpRoute,
+    v::httproutes::{HttpRouteStatusParents, HttpRouteStatusParentsParentRef},
+};
+use crate::keys::RouteParentKey;
+use crate::tls::{HttpRouteHealthMap, RouteParentHealth};
+use coxswain_core::ownership::ObjectKey;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use kube::{
+    Client,
+    api::{Api, Patch, PatchParams},
+};
+use std::collections::HashSet;
+
+pub(super) async fn mark_http_route_programmed(
+    client: &Client,
+    route: &HttpRoute,
+    controller_name: &str,
+    owned_gateways: &HashSet<ObjectKey>,
+    route_health: &HttpRouteHealthMap,
+) {
+    let name = match route.metadata.name.as_deref() {
+        Some(n) => n,
+        None => return,
+    };
+    let ns = route.metadata.namespace.as_deref().unwrap_or("default");
+    let parent_refs = match route.spec.parent_refs.as_deref() {
+        Some(refs) if !refs.is_empty() => refs,
+        _ => return,
+    };
+
+    let owned_refs = filter_owned_parent_refs(parent_refs, ns, owned_gateways);
+    if owned_refs.is_empty() {
+        tracing::debug!(name, ns, "Skipping status patch — no owned parentRefs");
+        return;
+    }
+
+    let api: Api<HttpRoute> = Api::namespaced(client.clone(), ns);
+    let now = Time(k8s_openapi::jiff::Timestamp::now());
+    let Some(observed_gen) = route.metadata.generation else {
+        tracing::warn!(
+            name,
+            ns,
+            "Skipping HttpRoute status patch: metadata.generation is unset"
+        );
+        return;
+    };
+
+    let default_health = RouteParentHealth::default();
+    let parents: Vec<HttpRouteStatusParents> = owned_refs
+        .iter()
+        .map(|p| {
+            let gw_ns = p.namespace.as_deref().unwrap_or(ns);
+            let section = p.section_name.as_deref().unwrap_or("").to_string();
+            let health_key = RouteParentKey::new(ns, name, gw_ns, &p.name, section);
+            let health = route_health.get(&health_key).unwrap_or(&default_health);
+
+            let (acc_status, acc_reason) = if health.accepted {
+                ("True", health.accepted_reason)
+            } else {
+                ("False", health.accepted_reason)
+            };
+            let (res_status, res_reason) = if health.resolved_refs {
+                ("True", health.resolved_refs_reason)
+            } else {
+                ("False", health.resolved_refs_reason)
+            };
+            let (prog_status, prog_reason) = if health.accepted {
+                ("True", "Programmed")
+            } else {
+                ("False", health.accepted_reason)
+            };
+
+            let accepted_cond = make_condition(
+                "Accepted",
+                acc_status,
+                acc_reason,
+                "",
+                observed_gen,
+                now.clone(),
+            );
+            let programmed_cond = make_condition(
+                "Programmed",
+                prog_status,
+                prog_reason,
+                "",
+                observed_gen,
+                now.clone(),
+            );
+            let resolved_refs_cond = make_condition(
+                "ResolvedRefs",
+                res_status,
+                res_reason,
+                "",
+                observed_gen,
+                now.clone(),
+            );
+
+            HttpRouteStatusParents {
+                controller_name: controller_name.to_string(),
+                parent_ref: HttpRouteStatusParentsParentRef {
+                    group: p.group.clone(),
+                    kind: p.kind.clone(),
+                    name: p.name.clone(),
+                    namespace: p.namespace.clone(),
+                    port: p.port,
+                    section_name: p.section_name.clone(),
+                },
+                conditions: vec![accepted_cond, programmed_cond, resolved_refs_cond],
+            }
+        })
+        .collect();
+
+    let patch = serde_json::json!({ "status": { "parents": parents } });
+    match api
+        .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+    {
+        Ok(_) => tracing::info!(name, ns, "HttpRoute programmed"),
+        Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch HttpRoute status"),
+    }
+}

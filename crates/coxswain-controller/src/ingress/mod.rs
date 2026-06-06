@@ -1,88 +1,24 @@
+mod backend;
+mod class;
+mod ports;
+
+pub use class::{claimed_ingress_class, is_default_ingress_class};
+pub use ports::IngressPorts;
+
 use crate::endpoints;
+use crate::k8s_utils::metadata_created_at;
 use crate::tls::load_tls_cert;
-use crate::translate::metadata_created_at;
+use backend::resolve_backend_port;
 use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder};
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use k8s_openapi::api::networking::v1::{Ingress, IngressClass, IngressServiceBackend};
+use k8s_openapi::api::networking::v1::Ingress;
 use kube::runtime::reflector;
 use std::collections::HashSet;
 use std::sync::Arc;
-pub const IS_DEFAULT_CLASS_ANNOTATION: &str = "ingressclass.kubernetes.io/is-default-class";
-
-pub fn is_default_ingress_class(ic: &IngressClass) -> bool {
-    ic.metadata
-        .annotations
-        .as_ref()
-        .and_then(|a| a.get(IS_DEFAULT_CLASS_ANNOTATION).map(String::as_str))
-        == Some("true")
-}
 
 pub struct IngressReconciler;
-
-/// Ports on which Ingress routes are served.
-///
-/// Both fields are optional; when both are `None` no listener is configured
-/// and the Ingress is skipped with a warning.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct IngressPorts {
-    pub http: Option<u16>,
-    pub https: Option<u16>,
-}
-
-impl IngressPorts {
-    pub fn new(http: Option<u16>, https: Option<u16>) -> Self {
-        Self { http, https }
-    }
-}
-
-/// Resolves a backend port to its numeric value.
-///
-/// Tries `port.number` first; when absent, looks up `port.name` in the
-/// Service store. Emits a warning and returns `None` when the name is set
-/// but the Service is missing or has no matching port.
-fn resolve_backend_port(
-    ns: &str,
-    svc: &IngressServiceBackend,
-    services: &reflector::Store<Service>,
-) -> Option<i32> {
-    let port = svc.port.as_ref()?;
-    if let Some(n) = port.number {
-        return Some(n);
-    }
-    let name = port.name.as_deref()?;
-    let resolved = endpoints::port_for_name(ns, &svc.name, name, services);
-    if resolved.is_none() {
-        tracing::warn!(
-            namespace = %ns,
-            service = %svc.name,
-            port_name = %name,
-            "Ingress backend references unknown named port on Service — skipping"
-        );
-    }
-    resolved
-}
-
-/// Returns the IngressClass name claimed by `ingress`.
-///
-/// Checks `spec.ingressClassName` first; falls back to the legacy
-/// `kubernetes.io/ingress.class` annotation. Returns `None` when neither
-/// is set (opt-in semantics: unclassified Ingresses are ignored).
-pub fn claimed_ingress_class(ingress: &Ingress) -> Option<&str> {
-    ingress
-        .spec
-        .as_ref()
-        .and_then(|s| s.ingress_class_name.as_deref())
-        .or_else(|| {
-            ingress
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|a| a.get("kubernetes.io/ingress.class").map(String::as_str))
-        })
-}
 
 impl IngressReconciler {
     /// Skips the Ingress when it does not reference an owned IngressClass.
