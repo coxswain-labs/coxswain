@@ -1,3 +1,5 @@
+//! `Ingress` load-balancer status patch builder and staleness check.
+
 use super::config::StatusAddress;
 use k8s_openapi::api::networking::v1::Ingress;
 

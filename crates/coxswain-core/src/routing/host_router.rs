@@ -1,3 +1,5 @@
+//! Per-host path router: exact, prefix, and regex path matching with predicate filtering.
+
 use crate::routing::entry::{
     BackendGroup, FilterAction, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts,
 };
@@ -16,6 +18,7 @@ pub(super) type RouteMatch = (
     Option<u16>,
 );
 
+/// Compiled path router for a single hostname, supporting exact, prefix, and regex patterns.
 pub struct HostRouter {
     router: Router<Box<[Arc<RouteEntry>]>>,
     regex_routes: Vec<(RegexSet, Box<[Arc<RouteEntry>]>)>,
@@ -133,6 +136,7 @@ fn sort_and_freeze(entries: Vec<(usize, Arc<RouteEntry>)>) -> Box<[Arc<RouteEntr
         .into_boxed_slice()
 }
 
+/// Builder for a [`HostRouter`]; accumulates routes then compiles them in one pass.
 #[derive(Default)]
 pub struct HostRouterBuilder {
     exact_routes: Vec<(String, Arc<RouteEntry>)>,
@@ -141,16 +145,19 @@ pub struct HostRouterBuilder {
 }
 
 impl HostRouterBuilder {
+    /// Register an exact-path route.
     pub fn add_exact_route(&mut self, path: &str, entry: Arc<RouteEntry>) -> &mut Self {
         self.exact_routes.push((path.to_string(), entry));
         self
     }
 
+    /// Register a prefix-path route (Gateway API `PathMatchPathPrefix` semantics).
     pub fn add_prefix_route(&mut self, path: &str, entry: Arc<RouteEntry>) -> &mut Self {
         self.prefix_routes.push((path.to_string(), entry));
         self
     }
 
+    /// Register a regex-path route.
     pub fn add_regex_route(&mut self, pattern: &str, entry: Arc<RouteEntry>) -> &mut Self {
         self.regex_routes.push((pattern.to_string(), entry));
         self

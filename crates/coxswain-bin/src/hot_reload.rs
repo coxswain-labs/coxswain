@@ -1,3 +1,6 @@
+//! Hot-reload background service: detects new Gateway listener ports and restarts the
+//! process to rebind sockets without dropping existing routes.
+
 use coxswain_controller::SharedGatewayListenerHealth;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;

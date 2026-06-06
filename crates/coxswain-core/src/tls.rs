@@ -1,3 +1,5 @@
+//! TLS certificate store and builder — maps SNI host patterns to PEM cert/key pairs.
+
 use crate::shared::Shared;
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -9,13 +11,16 @@ use std::sync::Arc;
 /// on each SNI handshake (cheap relative to the handshake itself).
 #[derive(Debug)]
 pub struct TlsCert {
+    /// Raw PEM-encoded certificate chain.
     pub cert_pem: Vec<u8>,
+    /// Raw PEM-encoded private key.
     pub key_pem: Vec<u8>,
     /// `"namespace/secret-name"` — for log messages only.
     pub source: String,
 }
 
 impl TlsCert {
+    /// Construct a [`TlsCert`] from raw PEM bytes and a diagnostic source label.
     pub fn new(cert_pem: Vec<u8>, key_pem: Vec<u8>, source: String) -> Self {
         Self {
             cert_pem,
@@ -61,6 +66,7 @@ impl TlsStore {
         self.default.as_ref().map(Arc::clone)
     }
 
+    /// Total number of certificates across all buckets (exact + wildcard + default).
     pub fn cert_count(&self) -> usize {
         self.exact.len() + self.wildcard.len() + self.default.is_some() as usize
     }
@@ -88,6 +94,7 @@ pub struct TlsStoreBuilder {
 }
 
 impl TlsStoreBuilder {
+    /// Construct an empty builder.
     pub fn new() -> Self {
         Self::default()
     }
@@ -120,6 +127,7 @@ impl TlsStoreBuilder {
         }
     }
 
+    /// Compile accumulated certs into an immutable [`TlsStore`].
     pub fn build(self) -> TlsStore {
         let mut wildcard: Vec<(String, Arc<TlsCert>)> = self.wildcard.into_iter().collect();
         wildcard.sort_by_key(|(suffix, _)| Reverse(suffix.len()));

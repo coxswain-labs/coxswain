@@ -1,3 +1,5 @@
+//! Core Ingress reconciliation: maps rules to routing-table entries.
+
 use super::IngressReconciler;
 use super::backend::resolve_backend_port;
 use super::class::claimed_ingress_class;

@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use coxswain_e2e::{
     ControllerOptions, ControllerProcess, FixtureVars, GeneratedCert, Harness, HttpClient,
     IngressClassGuard, NamespaceGuard, bootstrap,

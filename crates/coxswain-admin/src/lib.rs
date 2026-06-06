@@ -1,3 +1,5 @@
+//! Admin HTTP endpoints for Coxswain: `/metrics` (Prometheus), `/routes`, and `/status`.
+
 use async_trait::async_trait;
 use coxswain_core::routing::SharedRoutingTable;
 use http::{HeaderValue, Response, StatusCode, header};
@@ -10,13 +12,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Pingora HTTP app serving `/metrics`, `/routes`, and `/status`.
 pub struct AdminServer {
+    /// Flipped to `true` by the reconciler once the initial resource list completes.
     pub synced: Arc<AtomicBool>,
+    /// Flipped to `true` while this replica holds the leader-election lease.
     pub leader: Arc<AtomicBool>,
+    /// Live routing table snapshot used by `/routes`.
     pub routes: SharedRoutingTable,
 }
 
 impl AdminServer {
+    /// Wraps `self` in a Pingora [`Service`] bound to `addr`.
     pub fn into_service(self, addr: SocketAddr) -> Service<HttpServer<Self>> {
         let mut http_server = HttpServer::new_app(self);
         http_server.add_module(ResponseCompressionBuilder::enable(7));

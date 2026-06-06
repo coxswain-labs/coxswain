@@ -1,3 +1,5 @@
+//! Builders for [`RoutingTable`][super::RoutingTable] and per-port/host routers.
+
 use crate::routing::entry::RouteConflict;
 use crate::routing::host_router::{HostRouter, HostRouterBuilder};
 use std::cmp::Reverse;
@@ -101,6 +103,7 @@ pub struct RoutingTableBuilder {
 }
 
 impl RoutingTableBuilder {
+    /// Construct an empty routing table builder.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

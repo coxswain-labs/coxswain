@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, SharedRoutingTable};
 use coxswain_proxy::RoutingEngine;
 use criterion::{Criterion, criterion_group, criterion_main};

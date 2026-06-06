@@ -1,10 +1,15 @@
+//! Parses GEP-2257 (Go `time.ParseDuration`) duration strings into `std::time::Duration`.
+
 use crate::gw_types::v::httproutes::HttpRouteRulesTimeouts;
 use coxswain_core::routing::RouteTimeouts;
 
 /// Parse a Gateway API GEP-2257 duration string (Go `time.ParseDuration` format).
 ///
 /// Supported units: `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`. Values may be compounded
-/// without spaces (`"1h30m"`). Returns `None` for zero (`"0s"`, `"0"`) or invalid input.
+/// without spaces (`"1h30m"`).
+///
+/// Returns `None` for **both** invalid input and zero values (`"0s"`, `"0"`).
+/// Per GEP-2257, zero is treated as "unset" — the same as omitting the field entirely.
 pub(super) fn parse_gateway_duration(s: &str) -> Option<std::time::Duration> {
     if s.is_empty() || s == "0" {
         return None;

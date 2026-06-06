@@ -1,3 +1,5 @@
+//! Internal key types used as `HashMap` keys inside the controller.
+
 /// Key for a specific listener on a Gateway: `(gw_ns, gw_name, listener_name)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ListenerKey {

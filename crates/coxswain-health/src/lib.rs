@@ -1,3 +1,5 @@
+//! Health HTTP endpoints: `/healthz` (always 200) and `/readyz` (gated on sync).
+
 use async_trait::async_trait;
 use http::{HeaderValue, Response, StatusCode, header};
 use pingora_core::apps::http_app::ServeHttp;
@@ -5,7 +7,9 @@ use pingora_core::protocols::http::ServerSession;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Pingora HTTP app serving `/healthz` (always 200) and `/readyz` (gated on `synced`).
 pub struct HealthServer {
+    /// Flipped to `true` by the reconciler once the initial resource list completes.
     pub synced: Arc<AtomicBool>,
 }
 

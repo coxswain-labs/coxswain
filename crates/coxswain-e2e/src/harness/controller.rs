@@ -1,3 +1,5 @@
+//! Spawns a coxswain subprocess on ephemeral ports and tears it down on drop.
+
 use anyhow::Context as _;
 use ipnet::IpNet;
 use std::{
@@ -8,11 +10,16 @@ use tokio::process::{Child, Command};
 
 const BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
+/// Handle to a running coxswain subprocess spawned for e2e tests.
 pub struct ControllerProcess {
     child: Child,
+    /// Bound address of the HTTP proxy listener.
     pub proxy_addr: SocketAddr,
+    /// Bound address of the HTTPS/TLS proxy listener.
     pub tls_addr: SocketAddr,
+    /// Bound address of the `/healthz`/`/readyz` endpoint.
     pub health_addr: SocketAddr,
+    /// Bound address of the `/metrics`/`/routes`/`/status` endpoint.
     pub admin_addr: SocketAddr,
 }
 
@@ -31,10 +38,12 @@ pub struct ControllerOptions {
 }
 
 impl ControllerProcess {
+    /// Spawn a controller with default options.
     pub async fn start() -> anyhow::Result<Self> {
         Self::start_with_options(ControllerOptions::default()).await
     }
 
+    /// Spawn a controller with the given options, binding ephemeral ports for all listeners.
     pub async fn start_with_options(opts: ControllerOptions) -> anyhow::Result<Self> {
         let http_port = free_port()?;
         let https_port = free_port()?;

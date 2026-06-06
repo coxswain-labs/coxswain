@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use coxswain_e2e::{
     FixtureVars, GeneratedCert, Harness, NamespaceGuard,
     fixtures::{backends, gateway_api as gwa},

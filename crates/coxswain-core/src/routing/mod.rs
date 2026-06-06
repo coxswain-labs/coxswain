@@ -1,3 +1,8 @@
+//! Compiled routing table keyed by listener port, host pattern, and path rule.
+//!
+//! Build with [`RoutingTableBuilder`], then wrap in a [`SharedRoutingTable`] for
+//! lock-free access across threads.
+
 use crate::shared::Shared;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,11 +23,14 @@ pub use predicate::{HeaderPredicate, MatchPredicates, QueryPredicate, RequestCon
 #[cfg(test)]
 mod tests;
 
+/// Errors that can occur while building a routing table.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {
+    /// A path pattern could not be inserted into the `matchit` router.
     #[error("matchit insert failed: {0}")]
     MatchitInsert(#[from] matchit::InsertError),
+    /// A regex pattern string is syntactically invalid.
     #[error("invalid regex pattern: {0}")]
     Regex(#[from] regex::Error),
 }
@@ -33,6 +41,7 @@ pub type SharedRoutingTable = Shared<RoutingTable>;
 /// Result of a two-level host+path routing lookup.
 #[non_exhaustive]
 pub enum RouteOutcome {
+    /// Route matched; tuple is `(backend_group, filters, timeouts)`.
     Found(Arc<BackendGroup>, Arc<[FilterAction]>, RouteTimeouts),
     /// Route matched but backend is invalid/missing/forbidden — return this status immediately.
     Error(u16),
@@ -124,7 +133,7 @@ impl RoutingTable {
     /// Routes to a backend group by port, host, and path, discarding filter and timeout information.
     ///
     /// Convenience for tests and admin introspection. The proxy hot path should
-    /// use [`find`] to also receive the filter list and timeouts.
+    /// use [`Self::find`] to also receive the filter list and timeouts.
     pub fn route(
         &self,
         port: u16,
@@ -135,7 +144,7 @@ impl RoutingTable {
         self.by_port.get(&port)?.route(host, path, ctx)
     }
 
-    /// Like [`route`] but distinguishes "host not registered" from "path not matched",
+    /// Like [`Self::route`] but distinguishes "host not registered" from "path not matched",
     /// and returns filters and timeouts alongside the backend group.
     pub fn find(
         &self,

@@ -1,3 +1,5 @@
+//! Computes the `ResolvedRefs` and `Accepted` health for each (HTTPRoute, parent) pair.
+
 use crate::gateway_api::hostnames::hostnames_intersect;
 use crate::gw_types::v::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom};
 use crate::gw_types::v::httproutes::{HTTPRoute, HttpRouteRulesFiltersType};

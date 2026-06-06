@@ -45,7 +45,9 @@ pub enum AcceptorBuildError {
     /// A listen address could not be bound.
     #[error("failed to bind {addr}: {source}")]
     BindFailed {
+        /// The address that could not be bound.
         addr: SocketAddr,
+        /// The underlying I/O error.
         #[source]
         source: std::io::Error,
     },
@@ -118,10 +120,12 @@ pub struct TrustedSources {
 }
 
 impl TrustedSources {
+    /// Build a new allow-list from a set of CIDR ranges.
     pub fn new(nets: Vec<IpNet>) -> Self {
         Self { nets }
     }
 
+    /// Returns `true` if `ip` is covered by at least one of the trusted CIDR ranges.
     pub fn contains(&self, ip: &IpAddr) -> bool {
         self.nets.iter().any(|n| n.contains(ip))
     }
@@ -130,18 +134,23 @@ impl TrustedSources {
 /// Whether a listener speaks plain HTTP or HTTPS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListenerProtocol {
+    /// Plain HTTP/1.1 (no TLS).
     Http,
+    /// HTTPS with SNI-based certificate selection.
     Https,
 }
 
 /// One listen address with its associated protocol.
 #[derive(Clone, Debug)]
 pub struct ListenerSpec {
+    /// The socket address to bind.
     pub addr: SocketAddr,
+    /// Whether this listener speaks HTTP or HTTPS.
     pub protocol: ListenerProtocol,
 }
 
 impl ListenerSpec {
+    /// Create an HTTP listener spec for the given address.
     pub fn http(addr: SocketAddr) -> Self {
         Self {
             addr,
@@ -149,6 +158,7 @@ impl ListenerSpec {
         }
     }
 
+    /// Create an HTTPS listener spec for the given address.
     pub fn https(addr: SocketAddr) -> Self {
         Self {
             addr,

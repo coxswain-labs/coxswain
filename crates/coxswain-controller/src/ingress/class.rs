@@ -1,3 +1,5 @@
+//! IngressClass ownership checks and `is-default-class` annotation helper.
+
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 
 pub const IS_DEFAULT_CLASS_ANNOTATION: &str = "ingressclass.kubernetes.io/is-default-class";

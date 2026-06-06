@@ -1,3 +1,5 @@
+//! Per-request match predicates: method, header, and query-parameter conditions.
+
 use http::{HeaderMap, HeaderName, Method};
 use regex::Regex;
 use smallvec::SmallVec;
@@ -6,7 +8,9 @@ use smallvec::SmallVec;
 #[non_exhaustive]
 #[derive(Clone)]
 pub enum ValueMatch {
+    /// Case-sensitive equality comparison.
     Exact(String),
+    /// Regular-expression match (anchored by the regex itself).
     Regex(Regex),
 }
 
@@ -25,7 +29,9 @@ impl ValueMatch {
 /// `HeaderMap`. The comparison is against the header value string.
 #[derive(Clone)]
 pub struct HeaderPredicate {
+    /// Canonical (lowercased) header name for O(1) `HeaderMap` lookup.
     pub name: HeaderName,
+    /// Value comparison strategy.
     pub matcher: ValueMatch,
 }
 
@@ -34,7 +40,9 @@ pub struct HeaderPredicate {
 /// Query parameter names are case-sensitive per RFC 3986.
 #[derive(Clone)]
 pub struct QueryPredicate {
+    /// Query parameter name (case-sensitive).
     pub name: String,
+    /// Value comparison strategy.
     pub matcher: ValueMatch,
 }
 
@@ -44,12 +52,16 @@ pub struct QueryPredicate {
 /// (AND semantics). Empty fields pass unconditionally.
 #[derive(Clone, Default)]
 pub struct MatchPredicates {
+    /// Required HTTP method, or `None` to match any method.
     pub method: Option<Method>,
+    /// All header predicates (must all pass).
     pub headers: Vec<HeaderPredicate>,
+    /// All query-parameter predicates (must all pass).
     pub query: Vec<QueryPredicate>,
 }
 
 impl MatchPredicates {
+    /// Returns `true` when no predicates are set (matches any request unconditionally).
     pub fn is_empty(&self) -> bool {
         self.method.is_none() && self.headers.is_empty() && self.query.is_empty()
     }
@@ -93,7 +105,9 @@ impl MatchPredicates {
 ///
 /// All fields are borrows from the live request — no allocations.
 pub struct RequestContext<'a> {
+    /// HTTP method of the incoming request.
     pub method: &'a Method,
+    /// Full request headers map.
     pub headers: &'a HeaderMap,
     /// Raw query string (the part after `?`), if present.
     pub query: Option<&'a str>,

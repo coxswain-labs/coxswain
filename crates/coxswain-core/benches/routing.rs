@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use coxswain_core::routing::{BackendGroup, RequestContext, RouteEntry, RoutingTableBuilder};
 use criterion::{Criterion, criterion_group, criterion_main};
 use http::{HeaderMap, Method};

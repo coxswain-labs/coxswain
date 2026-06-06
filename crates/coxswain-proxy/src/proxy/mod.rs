@@ -1,3 +1,6 @@
+//! Pingora `ProxyHttp` implementation: routing, filter application, upstream selection,
+//! and error-code mapping.
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use coxswain_core::routing::{FilterAction, RequestContext, RouteOutcome, RouteTimeouts};
@@ -27,7 +30,9 @@ use redirect::{RedirectOrigin, build_redirect_location, extract_host};
 #[cfg(test)]
 mod tests;
 
+/// Pingora `ProxyHttp` implementation that routes requests through [`RoutingEngine`].
 pub struct Proxy {
+    /// Lock-free routing engine shared across all worker threads.
     pub engine: Arc<RoutingEngine>,
     /// Global fallback timeouts used when a matched route has no per-rule timeouts set.
     pub default_timeouts: RouteTimeouts,

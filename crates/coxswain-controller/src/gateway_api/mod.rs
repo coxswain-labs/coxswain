@@ -1,3 +1,6 @@
+//! Gateway API reconciler: routes `HTTPRoute` and `Gateway` resources into the
+//! routing table and TLS store.
+
 mod bindings;
 mod filters;
 mod hostnames;
