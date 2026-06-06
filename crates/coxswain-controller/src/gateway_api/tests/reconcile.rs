@@ -23,6 +23,7 @@ fn reconcile_exact_path() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -54,6 +55,7 @@ fn reconcile_prefix_path() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -85,6 +87,7 @@ fn reconcile_regex_path() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -108,6 +111,7 @@ fn reconcile_no_matches_defaults_to_root_prefix() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -130,6 +134,7 @@ fn reconcile_skips_route_without_owned_parent() {
         &owned(&[("other", "gw")]),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -191,6 +196,7 @@ fn reconcile_header_exact_routes_to_correct_backend() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -228,6 +234,7 @@ fn reconcile_header_regex_routes_to_correct_backend() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -290,6 +297,7 @@ fn reconcile_method_routes_to_correct_backend() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -363,6 +371,7 @@ fn reconcile_query_param_routes_to_correct_backend() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -411,6 +420,7 @@ fn reconcile_invalid_regex_skips_match_entry() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -492,6 +502,7 @@ fn weighted_backends_80_20_split() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -530,6 +541,7 @@ fn zero_weight_backend_gets_no_traffic() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -560,6 +572,7 @@ fn all_zero_weights_installs_error_route() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -589,6 +602,7 @@ fn absent_weight_defaults_to_1() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();

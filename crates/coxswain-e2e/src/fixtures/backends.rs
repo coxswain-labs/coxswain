@@ -20,3 +20,10 @@ pub const H2C_ECHO: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/backends/h2c_echo.yaml"
 );
+
+/// TLS echo server deployment (HTTPS on port 8443, used for BackendTLSPolicy tests).
+/// Requires `TLS_SERVER_CERT_B64`, `TLS_SERVER_KEY_B64` substitutions.
+pub const ECHO_TLS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/echo_tls.yaml"
+);

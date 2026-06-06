@@ -1,10 +1,13 @@
 //! Leader-elected status writer: watches resource events and patches Gateway API
 //! status conditions back to the Kubernetes API server.
 
-use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
-use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth};
+use crate::gw_types::{BackendTlsPolicy, HttpRoute};
+use crate::tls::{
+    GatewayListenerHealth, SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth,
+    SharedHttpRouteHealth,
+};
 use async_trait::async_trait;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use futures::StreamExt;
@@ -21,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod backend_tls_events;
 mod conditions;
 mod config;
 mod gateway_class_status;
@@ -46,13 +50,14 @@ use crate::k8s_utils::scoped_api;
 const LEASE_NAME: &str = "coxswain-leader-lock";
 
 /// Kubernetes watch loop for leader election and writing status conditions
-/// back to `HTTPRoute`, `Gateway`, and `GatewayClass` resources.
+/// back to `HTTPRoute`, `Gateway`, `GatewayClass`, and `BackendTLSPolicy` resources.
 pub struct Controller {
     synced: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
     owned_gateways: OwnedGateways,
     tls_health: SharedGatewayListenerHealth,
     route_health: SharedHttpRouteHealth,
+    policy_health: SharedBackendTlsPolicyHealth,
     config: ControllerConfig,
 }
 
@@ -64,6 +69,7 @@ impl Controller {
         owned_gateways: OwnedGateways,
         tls_health: SharedGatewayListenerHealth,
         route_health: SharedHttpRouteHealth,
+        policy_health: SharedBackendTlsPolicyHealth,
         config: ControllerConfig,
     ) -> Self {
         Self {
@@ -72,6 +78,7 @@ impl Controller {
             owned_gateways,
             tls_health,
             route_health,
+            policy_health,
             config,
         }
     }
@@ -125,12 +132,18 @@ impl Controller {
             watcher::Config::default(),
         )
         .default_backoff();
+        let policy_watcher = watcher(
+            scoped_api::<BackendTlsPolicy>(client.clone(), self.config.watch_namespace.as_deref()),
+            watcher::Config::default(),
+        )
+        .default_backoff();
 
         tokio::pin!(route_watcher);
         tokio::pin!(gateway_class_watcher);
         tokio::pin!(gateway_watcher);
         tokio::pin!(ingress_class_watcher);
         tokio::pin!(ingress_watcher);
+        tokio::pin!(policy_watcher);
 
         // Names of GatewayClass resources whose controllerName matches ours.
         let mut owned_gateway_classes: HashSet<String> = HashSet::new();
@@ -146,6 +159,9 @@ impl Controller {
 
         // Local cache of known HTTPRoute objects.
         let mut known_routes: HashMap<ObjectKey, HttpRoute> = HashMap::new();
+
+        // Local cache of known BackendTLSPolicy objects.
+        let mut known_policies: HashMap<ObjectKey, BackendTlsPolicy> = HashMap::new();
 
         // interval_at delays the first tick so we don't double-acquire immediately.
         let mut renewal_interval = tokio::time::interval_at(
@@ -372,6 +388,49 @@ impl Controller {
                             Ok(_) => {}
                             Err(e) => tracing::warn!(error = %e, "Ingress watch error"),
                         }
+                    }
+                }
+
+                Some(event) = policy_watcher.next() => {
+                    match event {
+                        Ok(watcher::Event::Apply(p) | watcher::Event::InitApply(p)) => {
+                            let ns = p.metadata.namespace.clone().unwrap_or_default();
+                            let name = p.metadata.name.clone().unwrap_or_default();
+                            known_policies.insert(ObjectKey::new(ns, name), p.clone());
+                            if is_leader {
+                                let ph = self.policy_health.load();
+                                backend_tls_events::patch_backend_tls_policy_status(
+                                    &client,
+                                    &p,
+                                    &self.config.controller_name,
+                                    &ph,
+                                )
+                                .await;
+                            }
+                        }
+                        Ok(watcher::Event::Delete(p)) => {
+                            let ns = p.metadata.namespace.clone().unwrap_or_default();
+                            let name = p.metadata.name.clone().unwrap_or_default();
+                            known_policies.remove(&ObjectKey::new(ns, name));
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "BackendTLSPolicy watch error"),
+                    }
+                }
+
+                _ = self.policy_health.notified() => {
+                    if !is_leader {
+                        continue;
+                    }
+                    let ph = self.policy_health.load();
+                    for policy in known_policies.values() {
+                        backend_tls_events::patch_backend_tls_policy_status(
+                            &client,
+                            policy,
+                            &self.config.controller_name,
+                            &ph,
+                        )
+                        .await;
                     }
                 }
 

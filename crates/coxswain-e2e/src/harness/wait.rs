@@ -1,6 +1,7 @@
 //! Polling helpers that retry until Kubernetes resources reach the desired state.
 
 use anyhow::Context as _;
+use gateway_api::apis::standard::backendtlspolicies::BackendTLSPolicy;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
@@ -491,4 +492,43 @@ fn condition_matches(conditions: &[Condition], type_: &str, status: &str) -> boo
     conditions
         .iter()
         .any(|c| c.type_ == type_ && c.status == status)
+}
+
+/// Poll until a `BackendTLSPolicy`'s `status.ancestors[]` contains a condition
+/// with the given type and status from our controller.
+pub async fn wait_for_backend_tls_policy_condition(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    controller_name: &str,
+    type_: &str,
+    status: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<BackendTLSPolicy> = Api::namespaced(client.clone(), namespace);
+    poll_until(
+        timeout,
+        POLL,
+        || {
+            format!(
+                "BackendTLSPolicy {namespace}/{name} to have ancestor condition {type_}={status}"
+            )
+        },
+        || async {
+            api.get(name)
+                .await
+                .ok()
+                .filter(|p| {
+                    p.status
+                        .as_ref()
+                        .map(|s| s.ancestors.as_slice())
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter(|a| a.controller_name == controller_name)
+                        .any(|a| condition_matches(&a.conditions, type_, status))
+                })
+                .map(|_| ())
+        },
+    )
+    .await
 }

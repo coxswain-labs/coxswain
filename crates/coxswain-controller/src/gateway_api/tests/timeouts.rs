@@ -92,6 +92,7 @@ fn reconcile_timeouts_stored_and_round_trip() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -113,6 +114,7 @@ fn reconcile_timeouts_missing_field_falls_back_to_none() {
         &default_owned(),
         &grants,
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();

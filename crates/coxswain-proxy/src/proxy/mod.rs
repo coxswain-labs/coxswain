@@ -3,7 +3,9 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use coxswain_core::routing::{FilterAction, RequestContext, RouteOutcome, RouteTimeouts};
+use coxswain_core::routing::{
+    FilterAction, RequestContext, RouteOutcome, RouteTimeouts, UpstreamCa,
+};
 use http::header;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{
@@ -16,6 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::filter::TrafficFilter;
+use crate::upstream_ca::UpstreamCaCache;
 
 mod ctx;
 mod engine;
@@ -36,6 +39,11 @@ pub struct Proxy {
     pub engine: Arc<RoutingEngine>,
     /// Global fallback timeouts used when a matched route has no per-rule timeouts set.
     pub default_timeouts: RouteTimeouts,
+    /// Parse cache for upstream CA bundles from `BackendTLSPolicy` attachments.
+    ///
+    /// Shared across all requests; `get_or_parse` holds the lock only briefly and
+    /// never across an `.await`.
+    pub ca_cache: Arc<UpstreamCaCache>,
 }
 
 /// Merge per-route timeouts with global defaults; per-route wins when set.
@@ -250,19 +258,44 @@ impl ProxyHttp for Proxy {
         })?;
 
         let protocol = resolved.backend_group.protocol();
-        // Allocate SNI string only for TLS connections; non-TLS ignores it.
-        let sni_host = if protocol.is_tls() {
-            resolved.original_host.to_string()
-        } else {
-            String::new()
-        };
+
+        // BackendTLSPolicy overrides appProtocol-derived TLS decisions.
+        let (is_tls, sni_host, group_key, ca_override) =
+            if let Some(btls) = resolved.backend_group.upstream_tls() {
+                let ca = match &btls.ca {
+                    UpstreamCa::System => None,
+                    UpstreamCa::Bundle(pem) => {
+                        let parsed = self.ca_cache.get_or_parse(btls.group_key, pem);
+                        if parsed.is_none() {
+                            return Err(pingora_core::Error::explain(
+                                HTTPStatus(502),
+                                "BackendTLSPolicy CA bundle parse failed",
+                            ));
+                        }
+                        parsed
+                    }
+                    _ => None, // non-exhaustive guard
+                };
+                (true, btls.sni.to_string(), btls.group_key, ca)
+            } else if protocol.is_tls() {
+                // appProtocol-driven TLS: use the request Host as SNI (existing behaviour).
+                (true, resolved.original_host.to_string(), 0u64, None)
+            } else {
+                (false, String::new(), 0u64, None)
+            };
+
         // Pass SocketAddr directly — avoids the per-request addr.to_string() allocation.
-        let mut peer = HttpPeer::new(addr, protocol.is_tls(), sni_host);
+        let mut peer = HttpPeer::new(addr, is_tls, sni_host);
+        peer.group_key = group_key;
+        peer.options.verify_cert = is_tls;
+        peer.options.verify_hostname = is_tls;
+        if let Some(ca) = ca_override {
+            peer.options.ca = Some(ca);
+        }
         if protocol.is_h2() {
             peer.options.set_http_version(2, 2);
         }
-        // Pingora's HttpPeer hash includes http_version; pool isolation is automatic.
-        // CA-based pool aliasing tracked separately: see #16.
+        // Pingora's HttpPeer hash includes sni and group_key; pool isolation is automatic.
 
         // Apply per-route timeout settings.
         // backendRequest controls the upstream read (and connect) phase → 502 on expiry.

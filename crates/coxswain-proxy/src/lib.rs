@@ -8,6 +8,7 @@ pub(crate) mod accept;
 pub(crate) mod filter;
 mod proxy;
 mod tls;
+pub mod upstream_ca;
 
 #[cfg(test)]
 mod tests;
@@ -17,3 +18,4 @@ pub use accept::{
 };
 pub use proxy::{Proxy, RoutingEngine};
 pub use tls::SniCertSelector;
+pub use upstream_ca::UpstreamCaCache;

@@ -1260,3 +1260,113 @@ async fn parent_ref_port_matching() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// `BackendTLSPolicy` happy-path: proxy verifies upstream cert against a CA bundle
+/// stored in a ConfigMap and forwards the request successfully.
+///
+/// Sequence:
+/// 1. Deploy a TLS echo backend (self-signed cert for `TLS_HOSTNAME`).
+/// 2. Apply a Gateway + HTTPRoute + ConfigMap CA + BackendTLSPolicy.
+/// 3. Wait for the route to return a 2xx echo response (proves TLS was established).
+/// 4. Poll `BackendTLSPolicy.status.ancestors[].conditions` for `Accepted=True` / `ResolvedRefs=True`.
+#[tokio::test]
+async fn backend_tls_policy_configmap() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-backend-tls").await?;
+
+    // Generate a self-signed cert for the backend.
+    let tls_hostname = format!("echo-tls.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&tls_hostname);
+
+    // Deploy the TLS echo backend.
+    h.apply(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    let host = format!("backend-tls.{}.local", ns.name);
+
+    // Apply Gateway + HTTPRoute + ConfigMap CA + BackendTLSPolicy.
+    h.apply(
+        gwa::BACKEND_TLS_POLICY,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", &cert.cert_pem), // self-signed: cert IS the CA
+    )
+    .await?;
+
+    // The route should come up once the controller reconciles and the proxy verifies the cert.
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-tls");
+
+    // Controller must have written Accepted=True / ResolvedRefs=True on the policy.
+    let controller_name = "coxswain-labs.dev/gateway-controller";
+    wait::wait_for_backend_tls_policy_condition(
+        &h.client,
+        "echo-tls-policy",
+        &ns.name,
+        controller_name,
+        "Accepted",
+        "True",
+        Duration::from_secs(30),
+    )
+    .await?;
+    wait::wait_for_backend_tls_policy_condition(
+        &h.client,
+        "echo-tls-policy",
+        &ns.name,
+        controller_name,
+        "ResolvedRefs",
+        "True",
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// `BackendTLSPolicy` hostname-mismatch: the policy's `validation.hostname` does not
+/// match the SAN in the backend's certificate → TLS handshake fails → proxy returns 5xx.
+#[tokio::test]
+async fn backend_tls_policy_hostname_mismatch() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-backend-tls-mismatch").await?;
+
+    // Backend cert is issued for the real hostname.
+    let real_hostname = format!("echo-tls.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&real_hostname);
+
+    h.apply(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    // Policy specifies a hostname that does NOT match the cert's SAN.
+    let wrong_hostname = format!("wrong-hostname.{}.local", ns.name);
+
+    h.apply(
+        gwa::BACKEND_TLS_POLICY,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &wrong_hostname) // mismatch
+            .with("CA_PEM", &cert.cert_pem),
+    )
+    .await?;
+
+    let host = format!("backend-tls.{}.local", ns.name);
+
+    // Wait for the route to appear in the routing table (reconciler must have processed it).
+    // Then assert that requests fail with 5xx (TLS verification error from Pingora).
+    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}

@@ -1,4 +1,4 @@
-//! TLS load helpers and shared health-map types for Gateway listeners and HTTPRoutes.
+//! TLS load helpers and shared health-map types for Gateway listeners, HTTPRoutes, and BackendTLSPolicies.
 
 use crate::keys::RouteParentKey;
 use arc_swap::ArcSwap;
@@ -204,6 +204,82 @@ impl SharedHttpRouteHealth {
 
     /// Store a new health map and wake any `notified()` waiters.
     pub fn store_and_notify(&self, map: HttpRouteHealthMap) {
+        self.0.map.store(Arc::new(map));
+        self.0.notify.notify_one();
+    }
+
+    /// Returns a future that resolves once `store_and_notify` is called.
+    pub async fn notified(&self) {
+        self.0.notify.notified().await;
+    }
+}
+
+/// Health status for one `BackendTLSPolicy`.
+///
+/// Produced during each reconciler rebuild and consumed by the controller's
+/// leader-gated status writer.
+#[derive(Clone, Debug)]
+pub struct BackendTlsPolicyHealth {
+    /// Owned Gateways that reference the policy's target Service via an HTTPRoute.
+    /// Each becomes one entry in `status.ancestors[]`.
+    pub ancestors: Vec<ObjectKey>,
+    /// `true` when this policy wins conflict resolution for its target Service.
+    pub accepted: bool,
+    /// Reason string for the `Accepted` condition.
+    pub accepted_reason: &'static str,
+    /// `true` when all CA cert refs are valid and resolvable.
+    pub resolved_refs: bool,
+    /// Reason string for the `ResolvedRefs` condition.
+    pub resolved_refs_reason: &'static str,
+}
+
+impl Default for BackendTlsPolicyHealth {
+    fn default() -> Self {
+        Self {
+            ancestors: Vec::new(),
+            accepted: true,
+            accepted_reason: "Accepted",
+            resolved_refs: true,
+            resolved_refs_reason: "ResolvedRefs",
+        }
+    }
+}
+
+/// Map from `(policy_namespace, policy_name)` to its health status.
+pub type BackendTlsPolicyHealthMap = HashMap<ObjectKey, BackendTlsPolicyHealth>;
+
+struct SharedBackendTlsPolicyHealthInner {
+    map: ArcSwap<BackendTlsPolicyHealthMap>,
+    notify: Notify,
+}
+
+/// Shared handle to per-`BackendTLSPolicy` health, produced after each reconciler rebuild.
+/// The controller reads this to write `status.ancestors[]` when leader.
+#[derive(Clone)]
+pub struct SharedBackendTlsPolicyHealth(Arc<SharedBackendTlsPolicyHealthInner>);
+
+impl Default for SharedBackendTlsPolicyHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedBackendTlsPolicyHealth {
+    /// Construct a new shared policy health map (initially empty).
+    pub fn new() -> Self {
+        Self(Arc::new(SharedBackendTlsPolicyHealthInner {
+            map: ArcSwap::from_pointee(HashMap::new()),
+            notify: Notify::new(),
+        }))
+    }
+
+    /// Load the current policy health map snapshot.
+    pub fn load(&self) -> arc_swap::Guard<Arc<BackendTlsPolicyHealthMap>> {
+        self.0.map.load()
+    }
+
+    /// Store a new health map and wake any `notified()` waiters.
+    pub fn store_and_notify(&self, map: BackendTlsPolicyHealthMap) {
         self.0.map.store(Arc::new(map));
         self.0.notify.notify_one();
     }

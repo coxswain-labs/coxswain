@@ -16,7 +16,7 @@ use coxswain_core::tls::SharedTlsStore;
 use coxswain_health::HealthServer;
 use coxswain_proxy::{
     ListenerProtocol, ListenerSpec, Proxy, ProxyAcceptor, RoutingEngine, SniCertSelector,
-    TrustedSources,
+    TrustedSources, UpstreamCaCache,
 };
 use ipnet::IpNet;
 use pingora_core::listeners::tls::TlsSettings;
@@ -333,6 +333,7 @@ fn main() -> Result<()> {
         },
     );
     let route_health = reconciler.route_health();
+    let policy_health = reconciler.policy_health();
 
     server.add_service(background_service(
         "controller",
@@ -342,6 +343,7 @@ fn main() -> Result<()> {
             owned_gateways,
             gateway_tls_health,
             route_health,
+            policy_health,
             controller_config,
         ),
     ));
@@ -413,11 +415,13 @@ fn main() -> Result<()> {
             );
         }
         let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
+        let ca_cache = Arc::new(UpstreamCaCache::new());
         let proxy = Arc::new(http_proxy(
             &server.configuration,
             Proxy {
                 engine,
                 default_timeouts: default_timeouts.clone(),
+                ca_cache,
             },
         ));
         let trusted = Arc::new(TrustedSources::new(args.proxy_trusted_sources.clone()));
@@ -427,11 +431,13 @@ fn main() -> Result<()> {
         server.add_service(acceptor);
     } else {
         let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
+        let ca_cache = Arc::new(UpstreamCaCache::new());
         let mut svc = http_proxy_service_with_name(
             &server.configuration,
             Proxy {
                 engine,
                 default_timeouts,
+                ca_cache,
             },
             "proxy",
         );

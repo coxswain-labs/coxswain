@@ -85,6 +85,7 @@ fn reconcile_request_header_modifier_stored() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -129,6 +130,7 @@ fn reconcile_response_header_modifier_stored() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -171,6 +173,7 @@ fn reconcile_request_redirect_stored() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -219,6 +222,7 @@ fn reconcile_url_rewrite_replace_prefix_stored() {
         &default_owned(),
         &HashSet::new(),
         &no_listener_info(),
+        &HashMap::new(),
         &mut builder,
     );
     let table = builder.build().unwrap();

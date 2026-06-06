@@ -50,3 +50,6 @@ pub const SERVING_DRAIN: &str = fixture!("serving_drain.yaml");
 pub const PARENT_REF_PORT: &str = fixture!("parent_ref_port.yaml");
 /// HTTPRoute backend using `kubernetes.io/h2c` app protocol.
 pub const BACKEND_PROTOCOL_H2C: &str = fixture!("backend_protocol_h2c.yaml");
+/// BackendTLSPolicy test: Gateway + HTTPRoute + ConfigMap CA + policy targeting the TLS echo Service.
+/// Requires `CA_PEM`, `TLS_HOSTNAME` substitutions.
+pub const BACKEND_TLS_POLICY: &str = fixture!("backend_tls_policy.yaml");

@@ -2,6 +2,7 @@
 //! listener bindings and resolved backend groups.
 
 use super::GatewayApiReconciler;
+use super::backend_tls::BackendTlsIndex;
 use super::bindings::{ListenerBinding, compute_listener_bindings};
 use crate::endpoints;
 use crate::gw_types::{
@@ -19,7 +20,7 @@ use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, FilterAction, HostRouterBuilder, MatchPredicates, RouteEntry,
-    RouteTimeouts, RoutingTableBuilder,
+    RouteTimeouts, RoutingTableBuilder, UpstreamTls,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -35,6 +36,10 @@ impl GatewayApiReconciler {
     ///
     /// `listener_info` maps `(gw_ns, gw_name, listener_name) → (hostname, port)`, used
     /// to scope routes to the correct per-port routing table slot and listener hostname.
+    ///
+    /// `policy_index` maps `(svc_ns, svc_name)` to an `UpstreamTls` derived from an
+    /// attached `BackendTLSPolicy`. When a backend ref matches, the group is forced to
+    /// TLS and the policy's SNI / CA override is attached.
     pub fn reconcile(
         route: &HttpRoute,
         slices: &reflector::Store<EndpointSlice>,
@@ -42,6 +47,7 @@ impl GatewayApiReconciler {
         owned_gateways: &HashSet<ObjectKey>,
         grants: &HashSet<ReferenceGrantKey>,
         listener_info: &HashMap<ListenerKey, ListenerBinding>,
+        policy_index: &BackendTlsIndex,
         builder: &mut RoutingTableBuilder,
     ) {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -132,10 +138,24 @@ impl GatewayApiReconciler {
                 let group_name = backend_group_name(backend_refs, route_ns);
                 let protocols: Vec<BackendProtocol> =
                     resolved.iter().map(|(r, _)| r.app_protocol).collect();
-                let protocol = pick_route_protocol(&protocols, &group_name);
+                let mut protocol = pick_route_protocol(&protocols, &group_name);
                 let weighted = resolved.into_iter().map(|(r, w)| (r.addrs, w)).collect();
-                let group =
-                    Arc::new(BackendGroup::weighted(group_name, weighted).with_protocol(protocol));
+
+                // Look up BackendTLSPolicy for this rule's backends. Highest-weight ref
+                // wins on conflicts (ties break by backendRefs array order).
+                let policy_tls =
+                    pick_backend_tls(backend_refs, route_ns, protocol, policy_index, &group_name);
+                if policy_tls.is_some() {
+                    // Policy presence forces TLS regardless of appProtocol.
+                    protocol = BackendProtocol::Https;
+                }
+
+                let mut group =
+                    BackendGroup::weighted(group_name, weighted).with_protocol(protocol);
+                if let Some(tls) = policy_tls {
+                    group = group.with_tls(tls);
+                }
+                let group = Arc::new(group);
                 if group.endpoints().is_empty() {
                     tracing::warn!(
                         route = ?route.metadata.name,
@@ -375,6 +395,72 @@ fn pick_route_protocol(protocols: &[BackendProtocol], group_name: &str) -> Backe
             *first
         }
     }
+}
+
+/// Select the `BackendTLSPolicy` TLS configuration to attach to a rule's `BackendGroup`.
+///
+/// Scans `backend_refs` and looks each up in `policy_index`. If any backend ref matches,
+/// the policy of the highest-weight ref wins (ties broken by array order). When all
+/// matched refs share the same policy, no warning is emitted. When they differ, the
+/// winner is logged.
+///
+/// Returns `None` when no backend ref has an attached policy.
+fn pick_backend_tls(
+    backend_refs: &[HttpRouteRulesBackendRefs],
+    route_ns: &str,
+    current_protocol: BackendProtocol,
+    policy_index: &BackendTlsIndex,
+    group_name: &str,
+) -> Option<Arc<UpstreamTls>> {
+    let mut best: Option<(Arc<UpstreamTls>, u16)> = None; // (tls, weight)
+
+    for b in backend_refs {
+        let b_ns = b.namespace.as_deref().unwrap_or(route_ns);
+        let svc_key = ObjectKey::new(b_ns, &b.name);
+        let Some(resolved) = policy_index.get(&svc_key) else {
+            continue;
+        };
+        let w = match b.weight {
+            None => 1u16,
+            Some(w) if w <= 0 => 0u16,
+            Some(w) => w.min(u16::MAX as i32) as u16,
+        };
+        match &best {
+            None => best = Some((Arc::clone(&resolved.tls), w)),
+            Some((_, best_w)) if w > *best_w => best = Some((Arc::clone(&resolved.tls), w)),
+            _ => {}
+        }
+    }
+
+    if let Some((ref tls, _)) = best {
+        // Warn if we're changing from a non-TLS appProtocol.
+        if !current_protocol.is_tls() {
+            tracing::debug!(
+                backend_group = group_name,
+                sni = %tls.sni,
+                "BackendTLSPolicy attached — forcing TLS to upstream"
+            );
+        }
+        // Warn if there are multiple distinct policies across backends.
+        let distinct = backend_refs
+            .iter()
+            .filter_map(|b| {
+                let b_ns = b.namespace.as_deref().unwrap_or(route_ns);
+                policy_index.get(&ObjectKey::new(b_ns, &b.name))
+            })
+            .map(|r| &r.policy_key)
+            .collect::<HashSet<_>>()
+            .len();
+        if distinct > 1 {
+            tracing::warn!(
+                backend_group = group_name,
+                "Multiple BackendTLSPolicies across backendRefs in one rule — \
+                 using highest-weight ref's policy"
+            );
+        }
+    }
+
+    best.map(|(tls, _)| tls)
 }
 
 // ── Gateway TLS listener reconciliation ──────────────────────────────────────

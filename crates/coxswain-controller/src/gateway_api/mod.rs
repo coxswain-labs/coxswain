@@ -1,6 +1,7 @@
 //! Gateway API reconciler: routes `HTTPRoute` and `Gateway` resources into the
 //! routing table and TLS store.
 
+mod backend_tls;
 mod bindings;
 mod filters;
 mod hostnames;
@@ -8,6 +9,7 @@ mod reconcile;
 mod status;
 mod timeouts;
 
+pub use backend_tls::{BackendTlsIndex, build_backend_tls_index};
 pub use bindings::ListenerBinding;
 pub(crate) use hostnames::hostnames_intersect;
 
@@ -16,7 +18,7 @@ mod tests;
 
 use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gateways::Gateway;
-use crate::tls::HttpRouteHealthMap;
+use crate::tls::{BackendTlsPolicyHealthMap, HttpRouteHealthMap};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::ReferenceGrantKey;
 use k8s_openapi::api::core::v1::Service;
@@ -41,5 +43,14 @@ impl GatewayApiReconciler {
             backend_grants,
             service_store,
         )
+    }
+
+    /// Compute per-policy health from the pre-built index.
+    pub fn compute_policy_health(
+        index: &BackendTlsIndex,
+        routes: &[Arc<HttpRoute>],
+        owned_gateways: &HashSet<ObjectKey>,
+    ) -> BackendTlsPolicyHealthMap {
+        backend_tls::compute_policy_health(index, routes, owned_gateways)
     }
 }
