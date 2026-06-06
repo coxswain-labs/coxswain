@@ -84,7 +84,7 @@ Work items are listed in execution order; each should be completed and merged be
 - ✅ ~~Test-structure alignment and pragmatic coverage gaps — [#159](https://github.com/coxswain-labs/coxswain/issues/159)~~
 - ✅ ~~E2E harness ergonomics — [#145](https://github.com/coxswain-labs/coxswain/issues/145)~~
 - ✅ ~~Workspace lint block and Cargo metadata hygiene — [#146](https://github.com/coxswain-labs/coxswain/issues/146)~~
-- ⬜ Workspace-wide `//!` module docs and `///` public item coverage — [#147](https://github.com/coxswain-labs/coxswain/issues/147)
+- ✅ ~~Workspace-wide `//!` module docs and `///` public item coverage — [#147](https://github.com/coxswain-labs/coxswain/issues/147)~~
 
 ---
 
