@@ -80,6 +80,12 @@ kubectl apply -f deploy/manifests/rbac.yaml
 kubectl apply -f deploy/manifests/gateway-class.yaml
 ```
 
+`deploy/` is split into three subdirectories:
+
+- **`deploy/manifests/`** — production Kubernetes manifests (namespace, RBAC, GatewayClass, Deployment).
+- **`deploy/dev/`** — local dev fixtures for manual testing (echo backends, sample HTTPRoute and Ingress objects, cross-namespace scenarios). Not applied to production.
+- **`deploy/examples/`** — user-facing example configurations shipped as documentation (e.g. cert-manager TLS setup).
+
 > The RBAC grants are scoped to the `coxswain-controller` ServiceAccount inside the cluster. When running locally, your kubeconfig identity is used instead, which typically has cluster-admin on local distributions.
 
 > **Namespace-scoped install**: `deploy/manifests/rbac.yaml` contains a commented-out example showing how to replace the default ClusterRole with a namespaced Role + a residual ClusterRole (for GatewayClass/IngressClass only). Use this when running Coxswain with `COXSWAIN_CONTROLLER_WATCH_NAMESPACE=<ns>` to minimise RBAC surface.
@@ -263,23 +269,27 @@ Shows exactly what would happen without making any changes.
 
 ---
 
-## Integration tests
+## E2E tests
 
-The `crates/coxswain-e2e/` crate contains cluster-backed integration tests that run
-against any Kubernetes cluster pointed to by `~/.kube/config`.
+The `crates/coxswain-e2e/` crate contains cluster-backed integration tests split into two suites: `gateway_api` and `ingress`. They run against any Kubernetes cluster pointed to by `~/.kube/config`.
 
-### Prerequisites
+**Tests must run sequentially and require a freshly reset cluster.** Reset before each run:
 
-Same as above: a running local cluster and `kubectl` in `$PATH`.
+```bash
+orb delete -f k8s && orb start k8s
+```
 
-### Run the suite
+Then prepare the cluster as described in the **Local development** section above.
+
+### Run the suites
 
 ```bash
 # Build the controller binary first (the harness locates it from the build output).
 cargo build --bin coxswain
 
-# Run all e2e tests (serial, ~1–2 min on first run while images are pulled).
-cargo test -p coxswain-e2e -- --test-threads=1
+# Run (pick one or both; --test-threads=1 is required).
+cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
+cargo test -p coxswain-e2e --test ingress -- --test-threads=1
 ```
 
 The harness bootstraps the cluster on first run (installs Gateway API CRDs, applies
@@ -289,7 +299,7 @@ The harness bootstraps the cluster on first run (installs Gateway API CRDs, appl
 
 ```bash
 RUST_LOG=coxswain_e2e=debug,warn \
-  cargo test -p coxswain-e2e -- --test-threads=1 --nocapture
+  cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1 --nocapture
 ```
 
 ### Manual cleanup after interrupted run
@@ -308,21 +318,49 @@ kubectl delete ns -l coxswain-e2e=true
 
 ---
 
-## Common commands
+## Conformance tests
+
+The Gateway API conformance suite lives in `conformance/` (a Go module). It requires a live cluster, a running coxswain instance, and a fresh cluster reset before each run.
+
+**Reset the cluster first:**
 
 ```bash
-# Build
-cargo build
-
-# Check (fast, no codegen)
-cargo check
-
-# Run tests
-cargo test
-
-# Lint
-cargo clippy -- -D warnings
-
-# Format
-cargo fmt
+orb delete -f k8s && orb start k8s
 ```
+
+Then prepare the cluster as described in the **Local development** section above.
+
+**Start coxswain in a separate terminal:**
+
+```bash
+cargo run --bin coxswain -- serve \
+  --proxy-http-port 80 \
+  --proxy-https-port 443 \
+  --health-port 8081 \
+  --admin-port 8082 \
+  --status-address 127.0.0.1 \
+  --log-format console \
+  --pod-name coxswain-conformance \
+  --pod-namespace coxswain-system
+```
+
+**Run the conformance suite:**
+
+```bash
+cd conformance && go test -v -timeout 60m -run TestConformance \
+  -args \
+  --organization=coxswain-labs \
+  --project=coxswain \
+  --url=https://github.com/coxswain-labs/coxswain \
+  --version=$(git describe --tags --always) \
+  --report-output=reports/local-report.yaml
+```
+
+**Verify the conformance file compiles (no cluster needed):**
+
+```bash
+cd conformance && go vet ./...
+```
+
+`main_test.go` is the test entrypoint; `opts.SupportedFeatures` lists the feature flags this release claims to pass. Reports are written to `reports/` (`local-report.yaml` is gitignored from CI artifacts).
+

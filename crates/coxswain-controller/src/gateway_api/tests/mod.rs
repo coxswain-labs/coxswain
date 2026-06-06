@@ -1,8 +1,9 @@
 mod bindings;
 mod filters;
-mod matching;
+mod hostnames;
+mod reconcile;
+mod status;
 mod timeouts;
-mod weighted;
 
 use super::*;
 use crate::gw_types::HttpRoute;
@@ -12,13 +13,15 @@ use crate::gw_types::v::httproutes::{
     HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
     HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
 };
+use crate::keys::ListenerKey;
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::RoutingTableBuilder;
 use http::{HeaderMap, HeaderName, Method};
+use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use kube::api::ObjectMeta;
 use kube::runtime::watcher;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 fn make_slice(ns: &str, svc: &str, ip: &str) -> EndpointSlice {
     let mut labels = BTreeMap::new();

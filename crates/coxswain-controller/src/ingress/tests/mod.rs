@@ -1,4 +1,6 @@
-mod routing;
+mod backend;
+mod class;
+mod reconcile;
 mod tls;
 
 use super::*;
@@ -7,12 +9,12 @@ use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use k8s_openapi::api::networking::v1::{
-    HTTPIngressPath, HTTPIngressRuleValue, IngressBackend, IngressRule, IngressServiceBackend,
-    IngressSpec, ServiceBackendPort,
+    HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
+    IngressServiceBackend, IngressSpec, ServiceBackendPort,
 };
 use kube::api::ObjectMeta;
 use kube::runtime::{reflector, watcher};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub(super) fn owned(names: &[&str]) -> HashSet<String> {
     names.iter().map(|s| s.to_string()).collect()
