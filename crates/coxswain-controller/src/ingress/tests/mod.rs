@@ -7,14 +7,16 @@ use super::*;
 use coxswain_core::routing::RoutingTableBuilder;
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
-use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
     IngressServiceBackend, IngressSpec, ServiceBackendPort,
 };
 use kube::api::ObjectMeta;
-use kube::runtime::{reflector, watcher};
+use kube::runtime::reflector;
 use std::collections::{BTreeMap, HashSet};
+
+use crate::tests::fixtures::{empty_svc_store, make_slice, make_svc_store, slice_store};
 
 pub(super) fn owned(names: &[&str]) -> HashSet<String> {
     names.iter().map(|s| s.to_string()).collect()
@@ -45,49 +47,6 @@ pub(super) fn reconcile_tls_no_default(
     b: &mut TlsStoreBuilder,
 ) {
     IngressReconciler::reconcile_tls(ing, secrets, owned, None, b);
-}
-
-pub(super) fn empty_svc_store() -> reflector::Store<Service> {
-    reflector::store::Writer::<Service>::default().as_reader()
-}
-
-pub(super) fn make_slice(ns: &str, svc: &str, ip: &str) -> EndpointSlice {
-    let mut labels = BTreeMap::new();
-    labels.insert("kubernetes.io/service-name".to_string(), svc.to_string());
-    EndpointSlice {
-        metadata: ObjectMeta {
-            name: Some(format!("{svc}-slice")),
-            namespace: Some(ns.to_string()),
-            labels: Some(labels),
-            ..Default::default()
-        },
-        address_type: "IPv4".to_string(),
-        endpoints: vec![Endpoint {
-            addresses: vec![ip.to_string()],
-            conditions: Some(EndpointConditions {
-                ready: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }],
-        ports: None,
-    }
-}
-
-pub(super) fn slice_store(slices: Vec<EndpointSlice>) -> reflector::Store<EndpointSlice> {
-    let mut writer = reflector::store::Writer::<EndpointSlice>::default();
-    for slice in slices {
-        writer.apply_watcher_event(&watcher::Event::Apply(slice));
-    }
-    writer.as_reader()
-}
-
-pub(super) fn make_svc_store(services: Vec<Service>) -> reflector::Store<Service> {
-    let mut writer = reflector::store::Writer::<Service>::default();
-    for svc in services {
-        writer.apply_watcher_event(&watcher::Event::Apply(svc));
-    }
-    writer.as_reader()
 }
 
 pub(super) fn make_service_with_named_port(

@@ -17,46 +17,10 @@ use crate::keys::ListenerKey;
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::RoutingTableBuilder;
 use http::{HeaderMap, HeaderName, Method};
-use k8s_openapi::api::core::v1::Service;
-use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use kube::api::ObjectMeta;
-use kube::runtime::watcher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-fn make_slice(ns: &str, svc: &str, ip: &str) -> EndpointSlice {
-    let mut labels = BTreeMap::new();
-    labels.insert("kubernetes.io/service-name".to_string(), svc.to_string());
-    EndpointSlice {
-        metadata: ObjectMeta {
-            name: Some(format!("{svc}-slice")),
-            namespace: Some(ns.to_string()),
-            labels: Some(labels),
-            ..Default::default()
-        },
-        address_type: "IPv4".to_string(),
-        endpoints: vec![Endpoint {
-            addresses: vec![ip.to_string()],
-            conditions: Some(EndpointConditions {
-                ready: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }],
-        ports: None,
-    }
-}
-
-fn slice_store(slices: Vec<EndpointSlice>) -> reflector::Store<EndpointSlice> {
-    let mut writer = reflector::store::Writer::<EndpointSlice>::default();
-    for slice in slices {
-        writer.apply_watcher_event(&watcher::Event::Apply(slice));
-    }
-    writer.as_reader()
-}
-
-fn empty_svc_store() -> reflector::Store<Service> {
-    reflector::store::Writer::<Service>::default().as_reader()
-}
+use crate::tests::fixtures::{empty_svc_store, make_slice, slice_store};
 
 fn owned(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {
     pairs
