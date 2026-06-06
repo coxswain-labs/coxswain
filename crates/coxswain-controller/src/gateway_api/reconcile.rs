@@ -5,7 +5,8 @@ use crate::gw_types::{
     HttpRoute,
     v::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode},
     v::httproutes::{
-        HttpRouteRulesBackendRefs, HttpRouteRulesFiltersType, HttpRouteRulesMatchesPathType,
+        HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesFiltersType,
+        HttpRouteRulesMatchesPathType,
     },
 };
 use crate::k8s_utils::metadata_created_at;
@@ -15,7 +16,7 @@ use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, FilterAction, HostRouterBuilder, MatchPredicates, RouteEntry,
-    RoutingTableBuilder,
+    RouteTimeouts, RoutingTableBuilder,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -143,6 +144,13 @@ impl GatewayApiReconciler {
                 }
             };
 
+            let ctx = RuleContext {
+                filters: rule_filters,
+                timeouts: &rule_timeouts,
+                error_status,
+                route_id: &route_id,
+                created_at,
+            };
             for (hostname_opt, port) in &bindings {
                 let pb = builder.for_port(*port);
                 let hb = match hostname_opt {
@@ -150,16 +158,7 @@ impl GatewayApiReconciler {
                     Some(h) if h.starts_with("*.") => pb.wildcard_host(h),
                     Some(h) => pb.exact_host(h),
                 };
-                apply_rule(
-                    hb,
-                    rule,
-                    rule_filters,
-                    &rule_timeouts,
-                    group.as_ref(),
-                    error_status,
-                    &route_id,
-                    created_at,
-                );
+                apply_rule(hb, rule, group.as_ref(), &ctx);
             }
             // If bindings is empty, the route has no matching listener — skip.
         }
@@ -233,20 +232,23 @@ fn resolve_weighted_backends(
         .collect()
 }
 
+struct RuleContext<'a> {
+    filters: &'a [HttpRouteRulesFilters],
+    timeouts: &'a RouteTimeouts,
+    error_status: Option<u16>,
+    route_id: &'a str,
+    created_at: Option<SystemTime>,
+}
+
 /// Installs one HTTPRoute rule into a `HostRouterBuilder`.
 ///
 /// When `group` is `None`, the rule has a `RequestRedirect` filter and no
 /// upstream backend — `RouteEntry::redirect_only` is used in that case.
-#[allow(clippy::too_many_arguments)]
 fn apply_rule(
     pb: &mut HostRouterBuilder,
     rule: &crate::gw_types::v::httproutes::HttpRouteRules,
-    rule_filters: &[crate::gw_types::v::httproutes::HttpRouteRulesFilters],
-    rule_timeouts: &coxswain_core::routing::RouteTimeouts,
     group: Option<&Arc<BackendGroup>>,
-    error_status: Option<u16>,
-    route_id: &str,
-    created_at: Option<SystemTime>,
+    ctx: &RuleContext<'_>,
 ) {
     let make_entry = |predicates: MatchPredicates, filter_list: Vec<FilterAction>| -> RouteEntry {
         match group {
@@ -255,26 +257,26 @@ fn apply_rule(
                     Arc::clone(g),
                     predicates,
                     filter_list,
-                    rule_timeouts.clone(),
-                    route_id.to_string(),
-                    created_at,
+                    ctx.timeouts.clone(),
+                    ctx.route_id.to_string(),
+                    ctx.created_at,
                 );
-                e.error_status = error_status;
+                e.error_status = ctx.error_status;
                 e
             }
             None => RouteEntry::redirect_only(
                 predicates,
                 filter_list,
-                rule_timeouts.clone(),
-                route_id.to_string(),
-                created_at,
+                ctx.timeouts.clone(),
+                ctx.route_id.to_string(),
+                ctx.created_at,
             ),
         }
     };
 
     match rule.matches.as_deref() {
         None | Some([]) => {
-            let filter_list = super::filters::build_filters(rule_filters, "/", false);
+            let filter_list = super::filters::build_filters(ctx.filters, "/", false);
             pb.add_prefix_route(
                 "/",
                 Arc::new(make_entry(MatchPredicates::default(), filter_list)),
@@ -303,7 +305,7 @@ fn apply_rule(
                     m.path.as_ref().and_then(|p| p.r#type.as_ref()),
                     None | Some(HttpRouteRulesMatchesPathType::PathPrefix)
                 );
-                let filter_list = super::filters::build_filters(rule_filters, val, is_prefix);
+                let filter_list = super::filters::build_filters(ctx.filters, val, is_prefix);
                 let e = Arc::new(make_entry(predicates, filter_list));
 
                 match m.path.as_ref().and_then(|p| p.r#type.as_ref()) {
