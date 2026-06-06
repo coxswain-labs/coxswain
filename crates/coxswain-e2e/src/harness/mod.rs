@@ -10,7 +10,6 @@ pub use bootstrap::bootstrap;
 pub use controller::{ControllerOptions, ControllerProcess};
 pub use http::HttpClient;
 pub use namespace::{IngressClassGuard, NamespaceGuard};
-use std::path::Path;
 pub use tls::GeneratedCert;
 
 pub struct Harness {
@@ -48,19 +47,18 @@ impl Harness {
         format!("http://{}{path}", self.controller.admin_addr)
     }
 
+    /// Apply a fixture YAML. Automatically substitutes `HTTP_PORT` and `HTTPS_PORT`
+    /// from the controller's bound addresses; use `vars.with(key, val)` for extras.
     pub async fn apply(
         &self,
-        path: impl AsRef<Path>,
-        namespace: &str,
-        extra_vars: &[(&str, &str)],
+        path: impl AsRef<std::path::Path>,
+        vars: crate::fixtures::FixtureVars,
     ) -> anyhow::Result<()> {
-        let http_port = self.controller.proxy_addr.port().to_string();
-        let https_port = self.tls_addr.port().to_string();
-        let mut vars: Vec<(&str, &str)> = Vec::with_capacity(3 + extra_vars.len());
-        vars.push(("HTTP_PORT", &http_port));
-        vars.push(("HTTP_PORT_STR", &http_port));
-        vars.push(("HTTPS_PORT", &https_port));
-        vars.extend_from_slice(extra_vars);
-        crate::fixtures::apply_fixture(path, namespace, &vars).await
+        let vars = crate::fixtures::FixtureVars {
+            http_port: self.controller.proxy_addr.port(),
+            https_port: self.tls_addr.port(),
+            ..vars
+        };
+        crate::fixtures::apply_fixture(path, vars).await
     }
 }

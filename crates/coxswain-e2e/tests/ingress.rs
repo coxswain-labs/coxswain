@@ -1,14 +1,8 @@
 use coxswain_e2e::{
-    fixtures::{
-        self, BACKENDS_ECHO, INGRESS_CERT_MANAGER, INGRESS_DEFAULT_BACKEND,
-        INGRESS_DEFAULT_BACKEND_ONLY, INGRESS_DEFAULT_CLASS, INGRESS_NAMED_PORT,
-        INGRESS_PATH_MATCHING, INGRESS_TLS_NO_HOSTS, INGRESS_TLS_TERMINATION,
-        INGRESS_WILDCARD_HOST,
-    },
-    harness::{
-        ControllerOptions, ControllerProcess, GeneratedCert, Harness, HttpClient,
-        IngressClassGuard, NamespaceGuard, bootstrap, http, wait,
-    },
+    ControllerOptions, ControllerProcess, FixtureVars, GeneratedCert, Harness, HttpClient,
+    IngressClassGuard, NamespaceGuard, bootstrap,
+    fixtures::{self, backends, ingress},
+    harness::{http, wait},
 };
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,15 +13,15 @@ mod common;
 async fn status_load_balancer_ip() -> anyhow::Result<()> {
     common::init_tracing();
     let h = Harness::start_with_options(ControllerOptions {
-        status_address: Some("203.0.113.1".to_string()),
+        status_address: Some("203.0.113.1".parse().unwrap()),
         ..Default::default()
     })
     .await?;
     let ns = NamespaceGuard::create(&h.client, "ing-lb-status").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(INGRESS_PATH_MATCHING, &ns.name, &[]).await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     wait::wait_for_ingress_lb_ip(
         &h.client,
@@ -54,7 +48,7 @@ async fn default_backend() -> anyhow::Result<()> {
     let client = kube::Client::try_default().await?;
     let ns = NamespaceGuard::create(&client, "ing-default").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     // Start the controller with the controller-wide default pointing at echo-c.
@@ -67,7 +61,7 @@ async fn default_backend() -> anyhow::Result<()> {
     let http = HttpClient::new(controller.proxy_addr);
 
     // Apply the fixture: rule /api → echo-a, spec.defaultBackend → echo-b.
-    fixtures::apply_fixture(INGRESS_DEFAULT_BACKEND, &ns.name, &[]).await?;
+    fixtures::apply_fixture(ingress::DEFAULT_BACKEND, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("app.{}.local", ns.name);
     let unknown_host = format!("unknown.{}.local", ns.name);
@@ -96,9 +90,9 @@ async fn default_backend_only() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-default-only").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(INGRESS_DEFAULT_BACKEND_ONLY, &ns.name, &[]).await?;
+    fixtures::apply_fixture(ingress::DEFAULT_BACKEND_ONLY, FixtureVars::new(&ns.name)).await?;
 
     // Wait for the defaultBackend to be live, probing an arbitrary host+path.
     let resp =
@@ -118,9 +112,9 @@ async fn path_matching() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-path").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(INGRESS_PATH_MATCHING, &ns.name, &[]).await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("ingress.{}.local", ns.name);
 
@@ -145,7 +139,7 @@ async fn tls_termination_with_sni() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-tls").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host_a = format!("tls-a.{}.local", ns.name);
@@ -156,29 +150,25 @@ async fn tls_termination_with_sni() -> anyhow::Result<()> {
 
     // Apply two independent TLS Ingresses (same fixture, different params).
     fixtures::apply_fixture(
-        INGRESS_TLS_TERMINATION,
-        &ns.name,
-        &[
-            ("INGRESS_NAME", "ingress-a"),
-            ("SECRET_NAME", "cert-a"),
-            ("TLS_HOST", &host_a),
-            ("BACKEND_NAME", "echo-a"),
-            ("TLS_CRT_B64", &cert_a.cert_b64()),
-            ("TLS_KEY_B64", &cert_a.key_b64()),
-        ],
+        ingress::TLS_TERMINATION,
+        FixtureVars::new(&ns.name)
+            .with("INGRESS_NAME", "ingress-a")
+            .with("SECRET_NAME", "cert-a")
+            .with("TLS_HOST", &host_a)
+            .with("BACKEND_NAME", "echo-a")
+            .with("TLS_CRT_B64", cert_a.cert_b64())
+            .with("TLS_KEY_B64", cert_a.key_b64()),
     )
     .await?;
     fixtures::apply_fixture(
-        INGRESS_TLS_TERMINATION,
-        &ns.name,
-        &[
-            ("INGRESS_NAME", "ingress-b"),
-            ("SECRET_NAME", "cert-b"),
-            ("TLS_HOST", &host_b),
-            ("BACKEND_NAME", "echo-b"),
-            ("TLS_CRT_B64", &cert_b.cert_b64()),
-            ("TLS_KEY_B64", &cert_b.key_b64()),
-        ],
+        ingress::TLS_TERMINATION,
+        FixtureVars::new(&ns.name)
+            .with("INGRESS_NAME", "ingress-b")
+            .with("SECRET_NAME", "cert-b")
+            .with("TLS_HOST", &host_b)
+            .with("BACKEND_NAME", "echo-b")
+            .with("TLS_CRT_B64", cert_b.cert_b64())
+            .with("TLS_KEY_B64", cert_b.key_b64()),
     )
     .await?;
 
@@ -210,23 +200,21 @@ async fn tls_fallback_when_hosts_omitted() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-tls-nohosts").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host = format!("tls-nohosts.{}.local", ns.name);
     let cert = GeneratedCert::for_host(&host);
 
     fixtures::apply_fixture(
-        INGRESS_TLS_NO_HOSTS,
-        &ns.name,
-        &[
-            ("INGRESS_NAME", "ingress-nohosts"),
-            ("SECRET_NAME", "cert-nohosts"),
-            ("TLS_HOST", &host),
-            ("BACKEND_NAME", "echo-a"),
-            ("TLS_CRT_B64", &cert.cert_b64()),
-            ("TLS_KEY_B64", &cert.key_b64()),
-        ],
+        ingress::TLS_NO_HOSTS,
+        FixtureVars::new(&ns.name)
+            .with("INGRESS_NAME", "ingress-nohosts")
+            .with("SECRET_NAME", "cert-nohosts")
+            .with("TLS_HOST", &host)
+            .with("BACKEND_NAME", "echo-a")
+            .with("TLS_CRT_B64", cert.cert_b64())
+            .with("TLS_KEY_B64", cert.key_b64()),
     )
     .await?;
 
@@ -248,7 +236,7 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-tls-rotate").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host = format!("tls-rotate.{}.local", ns.name);
@@ -257,16 +245,14 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
 
     // Deploy with the original cert.
     fixtures::apply_fixture(
-        INGRESS_TLS_TERMINATION,
-        &ns.name,
-        &[
-            ("INGRESS_NAME", "ingress-rotate"),
-            ("SECRET_NAME", "cert-rotate"),
-            ("TLS_HOST", &host),
-            ("BACKEND_NAME", "echo-a"),
-            ("TLS_CRT_B64", &cert_old.cert_b64()),
-            ("TLS_KEY_B64", &cert_old.key_b64()),
-        ],
+        ingress::TLS_TERMINATION,
+        FixtureVars::new(&ns.name)
+            .with("INGRESS_NAME", "ingress-rotate")
+            .with("SECRET_NAME", "cert-rotate")
+            .with("TLS_HOST", &host)
+            .with("BACKEND_NAME", "echo-a")
+            .with("TLS_CRT_B64", cert_old.cert_b64())
+            .with("TLS_KEY_B64", cert_old.key_b64()),
     )
     .await?;
 
@@ -275,16 +261,14 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
 
     // Rotate: re-apply the same fixture with new PEM bytes. kubectl apply patches the Secret.
     fixtures::apply_fixture(
-        INGRESS_TLS_TERMINATION,
-        &ns.name,
-        &[
-            ("INGRESS_NAME", "ingress-rotate"),
-            ("SECRET_NAME", "cert-rotate"),
-            ("TLS_HOST", &host),
-            ("BACKEND_NAME", "echo-a"),
-            ("TLS_CRT_B64", &cert_new.cert_b64()),
-            ("TLS_KEY_B64", &cert_new.key_b64()),
-        ],
+        ingress::TLS_TERMINATION,
+        FixtureVars::new(&ns.name)
+            .with("INGRESS_NAME", "ingress-rotate")
+            .with("SECRET_NAME", "cert-rotate")
+            .with("TLS_HOST", &host)
+            .with("BACKEND_NAME", "echo-a")
+            .with("TLS_CRT_B64", cert_new.cert_b64())
+            .with("TLS_KEY_B64", cert_new.key_b64()),
     )
     .await?;
 
@@ -314,21 +298,19 @@ async fn cert_manager_ingress_provisioning() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-cert-mgr").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host = format!("tls-cm.{}.local", ns.name);
     let secret_name = "cert-manager-tls";
 
     fixtures::apply_fixture(
-        INGRESS_CERT_MANAGER,
-        &ns.name,
-        &[
-            ("INGRESS_NAME", "cm-ingress"),
-            ("TLS_HOST", &host),
-            ("SECRET_NAME", secret_name),
-            ("BACKEND_NAME", "echo-a"),
-        ],
+        ingress::CERT_MANAGER,
+        FixtureVars::new(&ns.name)
+            .with("INGRESS_NAME", "cm-ingress")
+            .with("TLS_HOST", &host)
+            .with("SECRET_NAME", secret_name)
+            .with("BACKEND_NAME", "echo-a"),
     )
     .await?;
 
@@ -354,13 +336,13 @@ async fn proxy_protocol_http_v1_forwarded() -> anyhow::Result<()> {
     let client = kube::Client::try_default().await?;
     let ns = NamespaceGuard::create(&client, "pp-http-v1").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(INGRESS_PATH_MATCHING, &ns.name, &[]).await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     let controller = ControllerProcess::start_with_options(ControllerOptions {
         proxy_accept_proxy_protocol: true,
-        proxy_trusted_sources: vec!["127.0.0.1/32".to_string()],
+        proxy_trusted_sources: vec!["127.0.0.1/32".parse().unwrap()],
         ..Default::default()
     })
     .await?;
@@ -410,29 +392,27 @@ async fn proxy_protocol_https_v2_forwarded() -> anyhow::Result<()> {
     let client = kube::Client::try_default().await?;
     let ns = NamespaceGuard::create(&client, "pp-https-v2").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host = format!("tls-pp.{}.local", ns.name);
     let cert = GeneratedCert::for_host(&host);
 
     fixtures::apply_fixture(
-        INGRESS_TLS_TERMINATION,
-        &ns.name,
-        &[
-            ("INGRESS_NAME", "pp-ingress"),
-            ("SECRET_NAME", "pp-cert"),
-            ("TLS_HOST", &host),
-            ("BACKEND_NAME", "echo-a"),
-            ("TLS_CRT_B64", &cert.cert_b64()),
-            ("TLS_KEY_B64", &cert.key_b64()),
-        ],
+        ingress::TLS_TERMINATION,
+        FixtureVars::new(&ns.name)
+            .with("INGRESS_NAME", "pp-ingress")
+            .with("SECRET_NAME", "pp-cert")
+            .with("TLS_HOST", &host)
+            .with("BACKEND_NAME", "echo-a")
+            .with("TLS_CRT_B64", cert.cert_b64())
+            .with("TLS_KEY_B64", cert.key_b64()),
     )
     .await?;
 
     let controller = ControllerProcess::start_with_options(ControllerOptions {
         proxy_accept_proxy_protocol: true,
-        proxy_trusted_sources: vec!["127.0.0.1/32".to_string()],
+        proxy_trusted_sources: vec!["127.0.0.1/32".parse().unwrap()],
         ..Default::default()
     })
     .await?;
@@ -486,7 +466,7 @@ async fn proxy_protocol_strict_drop() -> anyhow::Result<()> {
 
     let controller = ControllerProcess::start_with_options(ControllerOptions {
         proxy_accept_proxy_protocol: true,
-        proxy_trusted_sources: vec!["127.0.0.1/32".to_string()],
+        proxy_trusted_sources: vec!["127.0.0.1/32".parse().unwrap()],
         ..Default::default()
     })
     .await?;
@@ -529,9 +509,13 @@ async fn wildcard_host() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-wildcard").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(INGRESS_WILDCARD_HOST, &ns.name, &[("TESTNS", &ns.name)]).await?;
+    fixtures::apply_fixture(
+        ingress::WILDCARD_HOST,
+        FixtureVars::new(&ns.name).with("TESTNS", &ns.name),
+    )
+    .await?;
 
     let host = format!("api.wildcard.{}.local", ns.name);
     let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
@@ -555,11 +539,15 @@ async fn named_port_backend() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-named-port").await?;
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host = format!("named.{}.local", ns.name);
-    fixtures::apply_fixture(INGRESS_NAMED_PORT, &ns.name, &[("INGRESS_HOST", &host)]).await?;
+    fixtures::apply_fixture(
+        ingress::NAMED_PORT,
+        FixtureVars::new(&ns.name).with("INGRESS_HOST", &host),
+    )
+    .await?;
 
     let resp = wait::wait_for_route(&h.http, &host, "/named", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
@@ -585,9 +573,9 @@ async fn default_ingress_class() -> anyhow::Result<()> {
     let ic_name = format!("coxswain-default-{}", ns.name);
     let _ic_guard = IngressClassGuard::new(&h.client, &ic_name);
 
-    fixtures::apply_fixture(BACKENDS_ECHO, &ns.name, &[]).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(INGRESS_DEFAULT_CLASS, &ns.name, &[]).await?;
+    fixtures::apply_fixture(ingress::DEFAULT_CLASS, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("default-ingress.{}.local", ns.name);
     // Use wait_for_backend rather than wait_for_route: a leftover catchall entry
