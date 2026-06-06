@@ -1,11 +1,10 @@
-mod routing;
+mod proxy;
 
 use super::redirect::RedirectOrigin;
+use super::*;
 use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, SharedRoutingTable};
 use std::net::SocketAddr;
 use std::sync::Arc;
-
-use super::RoutingEngine;
 
 pub(super) fn make_group(name: &str, addr: &str) -> Arc<BackendGroup> {
     Arc::new(BackendGroup::new(

@@ -24,15 +24,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("coxswain_e2e=debug,warn")
-        .try_init();
-}
+mod common;
 
 #[tokio::test]
 async fn path_matching() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-path").await?;
 
@@ -58,7 +54,7 @@ async fn path_matching() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn host_pool() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-pool").await?;
 
@@ -93,7 +89,7 @@ async fn host_pool() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn wildcard_host() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-wildcard").await?;
 
@@ -115,7 +111,7 @@ async fn wildcard_host() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn cross_namespace_with_grant() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-xns").await?;
     let tenant = NamespaceGuard::create(&h.client, "gw-xns-tenant").await?;
@@ -146,7 +142,7 @@ async fn cross_namespace_with_grant() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn gateway_status() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-status").await?;
 
@@ -171,7 +167,7 @@ async fn gateway_status() -> anyhow::Result<()> {
 /// `metadata.generation` even when the programmed-ness of the Gateway is unchanged.
 #[tokio::test]
 async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-gen-tracking").await?;
 
@@ -264,7 +260,7 @@ async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn gatewayclass_supported_features() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
 
     let feats = wait::wait_for_gatewayclass_supported_features(
@@ -292,7 +288,7 @@ async fn gatewayclass_supported_features() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn header_matching() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-hdr").await?;
 
@@ -331,7 +327,7 @@ async fn header_matching() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn method_matching() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-method").await?;
 
@@ -357,7 +353,7 @@ async fn method_matching() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn query_param_matching() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-query").await?;
 
@@ -397,7 +393,7 @@ async fn query_param_matching() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn combined_matching() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-combined").await?;
 
@@ -440,7 +436,7 @@ async fn combined_matching() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn cross_namespace_without_grant() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-xns-deny").await?;
     let tenant = NamespaceGuard::create(&h.client, "gw-xns-deny-tenant").await?;
@@ -497,7 +493,7 @@ async fn cross_namespace_without_grant() -> anyhow::Result<()> {
 /// - Unknown SNI fails the TLS handshake.
 #[tokio::test]
 async fn tls_termination_with_sni() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-sni").await?;
 
@@ -552,7 +548,7 @@ async fn tls_termination_with_sni() -> anyhow::Result<()> {
 /// individual listener health).
 #[tokio::test]
 async fn tls_missing_secret_marks_gateway_not_programmed() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-missing").await?;
 
@@ -639,7 +635,7 @@ async fn tls_missing_secret_marks_gateway_not_programmed() -> anyhow::Result<()>
 /// permitted by a ReferenceGrant. HTTPS must work end-to-end.
 #[tokio::test]
 async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-xns").await?;
     let certs_ns = NamespaceGuard::create(&h.client, "gw-tls-xns-certs").await?;
@@ -691,7 +687,7 @@ async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
 /// 4. Assert routing still works on both listeners after the swap.
 #[tokio::test]
 async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-rotate").await?;
 
@@ -778,7 +774,7 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
 /// 4. HTTPS request succeeds and routes to the expected backend.
 #[tokio::test]
 async fn cert_manager_gateway_provisioning() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-cert-mgr").await?;
 
@@ -812,7 +808,7 @@ async fn cert_manager_gateway_provisioning() -> anyhow::Result<()> {
 /// 4. Send a text frame and assert the same frame echoes back.
 #[tokio::test]
 async fn websocket_passthrough() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-ws").await?;
 
@@ -868,7 +864,7 @@ async fn websocket_passthrough() -> anyhow::Result<()> {
 /// suite, which requires a backend that natively accepts h2c connections.
 #[tokio::test]
 async fn backend_protocol_h2c() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-h2c").await?;
 
@@ -886,7 +882,7 @@ async fn backend_protocol_h2c() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn filters() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-filters").await?;
 
@@ -965,7 +961,7 @@ async fn filters() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn timeouts_request_returns_504() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-timeouts-req").await?;
 
@@ -997,7 +993,7 @@ async fn timeouts_request_returns_504() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn timeouts_backend_request_returns_504() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-timeouts-be").await?;
 
@@ -1032,7 +1028,7 @@ async fn timeouts_backend_request_returns_504() -> anyhow::Result<()> {
 /// the redirect-scheme fix.
 #[tokio::test]
 async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-redirect").await?;
 
@@ -1094,7 +1090,7 @@ async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn weighted_split() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-weighted").await?;
 
@@ -1133,7 +1129,7 @@ async fn weighted_split() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-serving").await?;
 
@@ -1202,7 +1198,7 @@ async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
 // the admin /routes endpoint.
 #[tokio::test]
 async fn parent_ref_port_matching() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-port").await?;
 

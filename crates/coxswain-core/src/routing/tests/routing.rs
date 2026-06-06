@@ -1,11 +1,10 @@
-use super::super::*;
-use super::{PORT, ctx_get, entry, group};
+use super::*;
 use std::time::SystemTime;
 
 #[test]
 fn exact_host_beats_wildcard() {
-    let exact_up = group("exact", "10.0.0.1:80");
-    let wildcard_up = group("wildcard", "10.0.0.2:80");
+    let exact_up = make_group("exact", "10.0.0.1:80");
+    let wildcard_up = make_group("wildcard", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -34,8 +33,8 @@ fn exact_host_beats_wildcard() {
 
 #[test]
 fn path_routing_within_host() {
-    let api_up = group("api", "10.0.0.1:80");
-    let health_up = group("health", "10.0.0.2:80");
+    let api_up = make_group("api", "10.0.0.1:80");
+    let health_up = make_group("health", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     let host = b.for_port(PORT).exact_host("example.com");
@@ -61,8 +60,8 @@ fn path_routing_within_host() {
 
 #[test]
 fn route_falls_through_to_catchall_on_exact_host_path_miss() {
-    let host_up = group("host", "10.0.0.1:80");
-    let catchall_up = group("catchall", "10.0.0.2:80");
+    let host_up = make_group("host", "10.0.0.1:80");
+    let catchall_up = make_group("catchall", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -91,8 +90,8 @@ fn route_falls_through_to_catchall_on_exact_host_path_miss() {
 
 #[test]
 fn route_falls_through_to_catchall_on_wildcard_host_path_miss() {
-    let host_up = group("host", "10.0.0.1:80");
-    let catchall_up = group("catchall", "10.0.0.2:80");
+    let host_up = make_group("host", "10.0.0.1:80");
+    let catchall_up = make_group("catchall", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -121,7 +120,7 @@ fn route_falls_through_to_catchall_on_wildcard_host_path_miss() {
 
 #[test]
 fn route_returns_none_when_neither_host_router_nor_catchall_match() {
-    let host_up = group("host", "10.0.0.1:80");
+    let host_up = make_group("host", "10.0.0.1:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -143,8 +142,8 @@ fn route_returns_none_when_neither_host_router_nor_catchall_match() {
 
 #[test]
 fn route_host_router_takes_precedence_over_catchall_for_same_path() {
-    let host_up = group("host", "10.0.0.1:80");
-    let catchall_up = group("catchall", "10.0.0.2:80");
+    let host_up = make_group("host", "10.0.0.1:80");
+    let catchall_up = make_group("catchall", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -173,8 +172,8 @@ fn route_host_router_takes_precedence_over_catchall_for_same_path() {
 
 #[test]
 fn routes_on_different_ports_are_isolated() {
-    let up80 = group("svc-80", "10.0.0.1:80");
-    let up8080 = group("svc-8080", "10.0.0.2:8080");
+    let up80 = make_group("svc-80", "10.0.0.1:80");
+    let up8080 = make_group("svc-8080", "10.0.0.2:8080");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(80)
@@ -208,7 +207,7 @@ fn routes_on_different_ports_are_isolated() {
 #[test]
 fn find_returns_timeouts_from_route_entry() {
     use std::sync::Arc;
-    let up = group("svc", "10.0.0.1:80");
+    let up = make_group("svc", "10.0.0.1:80");
     let timeouts = RouteTimeouts {
         request: Some(std::time::Duration::from_secs(10)),
         backend_request: Some(std::time::Duration::from_secs(2)),
@@ -241,8 +240,8 @@ fn find_returns_timeouts_from_route_entry() {
 fn timestamp_tiebreaker_older_wins() {
     // Two entries with the same predicate count; older route wins.
     use std::sync::Arc;
-    let older_up = group("older", "10.0.0.1:80");
-    let newer_up = group("newer", "10.0.0.2:80");
+    let older_up = make_group("older", "10.0.0.1:80");
+    let newer_up = make_group("newer", "10.0.0.2:80");
 
     let t_old = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
     let t_new = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2000);
