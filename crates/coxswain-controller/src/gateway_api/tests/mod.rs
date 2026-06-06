@@ -18,7 +18,7 @@ use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::RoutingTableBuilder;
 use http::{HeaderMap, HeaderName, Method};
 use kube::api::ObjectMeta;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::tests::fixtures::{empty_svc_store, make_slice, slice_store};
 

@@ -116,3 +116,72 @@ fn spawn_restart_child() -> std::io::Result<()> {
     tracing::info!(pid = child.id(), "Spawned restart child process");
     Ok(())
 }
+
+// hot_reload has no sibling tests/ dir (binary crate); inline test mod follows.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coxswain_controller::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome};
+    use coxswain_core::ownership::ObjectKey;
+    use std::collections::{HashMap, HashSet};
+
+    fn reloader(bound: &[u16], cli: &[u16]) -> HotReloader {
+        let health = SharedGatewayListenerHealth::default();
+        HotReloader::new(
+            health,
+            bound.iter().copied().collect(),
+            cli.iter().copied().collect(),
+        )
+    }
+
+    fn reloader_with_gw_ports(cli: &[u16], gw_ports: &[u16]) -> HotReloader {
+        let health = SharedGatewayListenerHealth::default();
+        let mut map: HashMap<ObjectKey, GatewayListenerHealth> = HashMap::new();
+        let mut gw = GatewayListenerHealth::default();
+        for (i, &port) in gw_ports.iter().enumerate() {
+            gw.listeners.insert(
+                format!("listener-{i}"),
+                ListenerInfo {
+                    port,
+                    tls_outcome: ListenerTlsOutcome::NotApplicable,
+                    attached_routes: 0,
+                    hostname: String::new(),
+                    allows_all_namespaces: false,
+                },
+            );
+        }
+        map.insert(ObjectKey::new("default", "gw"), gw);
+        health.store_and_notify(map);
+        HotReloader::new(health, HashSet::new(), cli.iter().copied().collect())
+    }
+
+    #[test]
+    fn desired_ports_empty_when_no_cli_and_no_listeners() {
+        let r = reloader(&[], &[]);
+        assert!(r.desired_ports().is_empty());
+    }
+
+    #[test]
+    fn desired_ports_includes_cli_ports() {
+        let r = reloader(&[], &[80, 443]);
+        assert_eq!(r.desired_ports(), HashSet::from([80, 443]));
+    }
+
+    #[test]
+    fn desired_ports_includes_gateway_listener_ports() {
+        let r = reloader_with_gw_ports(&[], &[8080, 8443]);
+        assert_eq!(r.desired_ports(), HashSet::from([8080, 8443]));
+    }
+
+    #[test]
+    fn desired_ports_unions_cli_and_gateway_ports() {
+        let r = reloader_with_gw_ports(&[80], &[8080]);
+        assert_eq!(r.desired_ports(), HashSet::from([80, 8080]));
+    }
+
+    #[test]
+    fn desired_ports_deduplicates_overlapping_ports() {
+        let r = reloader_with_gw_ports(&[80, 8080], &[8080, 9090]);
+        assert_eq!(r.desired_ports(), HashSet::from([80, 8080, 9090]));
+    }
+}

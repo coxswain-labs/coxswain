@@ -16,4 +16,6 @@ pub use ingress::IngressPorts;
 pub use reconciler::{
     IngressDefaultBackend, IngressDefaultBackendParseError, Reconciler, ReconcilerOptions,
 };
-pub use tls::SharedGatewayListenerHealth;
+pub use tls::{
+    GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, SharedGatewayListenerHealth,
+};
