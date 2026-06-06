@@ -39,6 +39,47 @@ Per-crate responsibilities (see each crate's `src/lib.rs` for the up-to-date mod
 - **`coxswain-bin`** — entry point: CLI parsing, shared-state wiring, Pingora runtime bootstrap.
 - **`coxswain-e2e`** — black-box integration tests against a live cluster (kind/Orb); not a runtime dependency.
 
+## Code Quality
+
+These rules were established through the v0.1 refactor pass (issues #136–#147). They are deliberate decisions — do not silently undo them.
+
+### Lints
+
+`[workspace.lints]` in `Cargo.toml` is the single source of truth for lint configuration. **Never add `#[allow(...)]` to silence a lint** — fix the root cause instead.
+
+- If a lint fires on *our* code: rename, refactor, or restructure to satisfy it.
+- If a lint fires on an *upstream-imposed* name (e.g. `HTTPRoute` from codegen tripping `upper_case_acronyms`): re-export with a project-canonical alias at the crate boundary (`gw_types.rs`) and use that alias everywhere internally. This is a one-time fix; `#[allow]` locks in an inconsistency forever.
+- Workspace-wide opt-outs in `[workspace.lints]` are acceptable when a lint genuinely does not fit the project. Per-site annotations are not.
+
+The one legitimate use of `#![allow(missing_docs)]` is at the top of bench files and integration-test crates, where `criterion_group!` and similar macros expand to `pub fn` items that are not user-controllable.
+
+`clippy.toml` sets `allow-unwrap-in-tests = true` / `allow-expect-in-tests = true`. These apply **only** to code inside `#[test]` functions and `#[cfg(test)]` modules — not to library crates that tests happen to use (e.g. `coxswain-e2e/src/`). Harness and fixture code is production code that runs under test, not test code itself.
+
+### Panics and unwrap
+
+Never use `.unwrap()` or `.expect("message")` in production code.
+
+- **Recoverable errors** → propagate with `?` or return a typed `Err`.
+- **Invariants that truly cannot fail** → `unwrap_or_else(|e| panic!("why this is impossible: {e}"))`. The message must state the *invariant*, not just repeat the operation name. A reader must be able to verify it without running the code.
+
+### Function signatures
+
+Functions with more than 7 parameters trigger `clippy::too_many_arguments`. Do not suppress — refactor into a parameter-grouping struct. Name the struct after its semantic role (`ReflectorStores<'a>`, `SharedOutputs<'a>`), not after the function it serves.
+
+### Documentation
+
+Every `.rs` file must open with a `//!` module header (1–3 lines: what the module owns, not what every function in it does). Every `pub` item must carry a `///` doc comment. Fallible `pub` functions that return `Result` must include a `# Errors` section listing the variants.
+
+Doc comments explain **why** and **what the invariants are**. They do not describe what the code literally does — the names already do that. One precise sentence beats a paragraph of padding.
+
+### Visibility
+
+Default to the narrowest visibility that compiles: `pub(crate)` for workspace-internal items, `pub(super)` for parent-module-only items. Use bare `pub` only for items that are intentionally part of the crate's public API surface and reachable from the crate root.
+
+### Hot path
+
+The proxy request path (`Proxy::request_filter`, `upstream_peer`, filter application) must remain **allocation-free per request**. Use `Arc<str>` / `Arc<[T]>` for shared immutable data cloned across hooks, and `Shared<T>` (the `ArcSwap`-backed wrapper in `coxswain-core`) for lock-free routing/TLS snapshot reads. Never hold a `Mutex` or `RwLock` guard across an `.await` point.
+
 ## GitHub Issue Workflow
 
 ### Starting work on issue N
