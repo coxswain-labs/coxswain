@@ -605,10 +605,9 @@ mod tests {
     #[test]
     fn find_returns_filters_alongside_upstream() {
         let upstream = make_group("default/backend", "10.0.0.1:8080");
-        let filters = vec![FilterAction::RequestHeaderModifier(HeaderMod {
-            set: vec![("x-env".to_string(), "test".to_string())],
-            ..Default::default()
-        })];
+        let filters = vec![FilterAction::RequestHeaderModifier(
+            HeaderMod::parse(&[], &[("x-env", "test")], &[]).unwrap(),
+        )];
         let entry = Arc::new(RouteEntry::with_filters(
             upstream,
             Default::default(),

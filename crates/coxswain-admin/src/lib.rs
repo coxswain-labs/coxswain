@@ -67,6 +67,7 @@ fn routes_response(routes: &SharedRoutingTable) -> Response<Vec<u8>> {
             let routes: Vec<serde_json::Value> = router
                 .routes()
                 .iter()
+                .filter(|r| !r.backend_group.name().is_empty())
                 .map(|r| {
                     serde_json::json!({
                         "type": r.kind.as_str(),

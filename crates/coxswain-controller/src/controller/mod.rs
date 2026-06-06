@@ -41,18 +41,9 @@ use gateway_class_status::{build_gateway_class_status_patch, gateway_class_needs
 use gateway_status::{build_gateway_status_patch, gateway_needs_status_patch};
 use ingress_status::{build_ingress_status_patch, ingress_lb_already_matches};
 
-const LEASE_NAME: &str = "coxswain-leader-lock";
+use crate::kube_helpers::scoped_api;
 
-fn scoped_api<T>(client: Client, ns: Option<&str>) -> Api<T>
-where
-    T: kube::Resource<Scope = kube::core::NamespaceResourceScope>,
-    T::DynamicType: Default,
-{
-    match ns {
-        Some(ns) => Api::namespaced(client, ns),
-        None => Api::all(client),
-    }
-}
+const LEASE_NAME: &str = "coxswain-leader-lock";
 
 /// Kubernetes watch loop for leader election and writing status conditions
 /// back to `HTTPRoute`, `Gateway`, and `GatewayClass` resources.

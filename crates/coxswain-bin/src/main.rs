@@ -3,10 +3,9 @@ mod hot_reload;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use coxswain_admin::AdminServer;
-use coxswain_controller::tls::SharedGatewayListenerHealth;
 use coxswain_controller::{
     Controller, ControllerConfig, IngressDefaultBackend, IngressPorts, Reconciler,
-    ReconcilerOptions,
+    ReconcilerOptions, SharedGatewayListenerHealth,
 };
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::RouteTimeouts;

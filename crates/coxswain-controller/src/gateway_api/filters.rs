@@ -28,46 +28,66 @@ pub(super) fn build_filters(
                     tracing::warn!("Skipping RequestHeaderModifier filter — payload is missing");
                     continue;
                 };
-                out.push(FilterAction::RequestHeaderModifier(HeaderMod {
-                    add: m
-                        .add
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .map(|h| (h.name.clone(), h.value.clone()))
-                        .collect(),
-                    set: m
-                        .set
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .map(|h| (h.name.clone(), h.value.clone()))
-                        .collect(),
-                    remove: m.remove.clone().unwrap_or_default(),
-                }));
+                let add: Vec<(&str, &str)> = m
+                    .add
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|h| (h.name.as_str(), h.value.as_str()))
+                    .collect();
+                let set: Vec<(&str, &str)> = m
+                    .set
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|h| (h.name.as_str(), h.value.as_str()))
+                    .collect();
+                let remove: Vec<&str> = m
+                    .remove
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                match HeaderMod::parse(&add, &set, &remove) {
+                    Ok(hm) => out.push(FilterAction::RequestHeaderModifier(hm)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Skipping RequestHeaderModifier — invalid header")
+                    }
+                }
             }
             HttpRouteRulesFiltersType::ResponseHeaderModifier => {
                 let Some(m) = &f.response_header_modifier else {
                     tracing::warn!("Skipping ResponseHeaderModifier filter — payload is missing");
                     continue;
                 };
-                out.push(FilterAction::ResponseHeaderModifier(HeaderMod {
-                    add: m
-                        .add
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .map(|h| (h.name.clone(), h.value.clone()))
-                        .collect(),
-                    set: m
-                        .set
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .map(|h| (h.name.clone(), h.value.clone()))
-                        .collect(),
-                    remove: m.remove.clone().unwrap_or_default(),
-                }));
+                let add: Vec<(&str, &str)> = m
+                    .add
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|h| (h.name.as_str(), h.value.as_str()))
+                    .collect();
+                let set: Vec<(&str, &str)> = m
+                    .set
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|h| (h.name.as_str(), h.value.as_str()))
+                    .collect();
+                let remove: Vec<&str> = m
+                    .remove
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                match HeaderMod::parse(&add, &set, &remove) {
+                    Ok(hm) => out.push(FilterAction::ResponseHeaderModifier(hm)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Skipping ResponseHeaderModifier — invalid header")
+                    }
+                }
             }
             HttpRouteRulesFiltersType::RequestRedirect => {
                 let Some(r) = &f.request_redirect else {

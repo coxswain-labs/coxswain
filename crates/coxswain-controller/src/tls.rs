@@ -25,9 +25,10 @@ pub(crate) enum TlsLoadError {
 
 /// Outcome of resolving one HTTPS listener's TLS configuration during a rebuild.
 #[non_exhaustive]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum ListenerTlsOutcome {
     /// Non-HTTPS listener — no TLS check performed.
+    #[default]
     NotApplicable,
     /// HTTPS listener; certificate resolved and installed in the TLS store.
     Resolved,
@@ -64,22 +65,28 @@ impl ListenerTlsOutcome {
     }
 }
 
-/// Per-listener TLS health for one Gateway, keyed by listener name.
+/// Consolidated per-listener metadata for one Gateway listener.
+#[derive(Clone, Debug, Default)]
+pub struct ListenerInfo {
+    pub tls_outcome: ListenerTlsOutcome,
+    /// Number of routes attached to this listener.
+    /// Populated by the reconciler's route-counting pass after the TLS walk.
+    pub attached_routes: i32,
+    /// Hostname restriction (empty string = match all).
+    /// Used by the route-counting pass to filter routes by hostname.
+    pub hostname: String,
+    /// Whether routes from any namespace are allowed (`true`) or only from
+    /// the same namespace as the Gateway (`false`, the spec default).
+    pub allows_all_namespaces: bool,
+    /// Listener port number.
+    pub port: u16,
+}
+
+/// Per-listener health for one Gateway, keyed by listener name.
 #[derive(Clone, Debug, Default)]
 pub struct GatewayListenerHealth {
-    pub by_listener: BTreeMap<String, ListenerTlsOutcome>,
-    /// Number of routes attached to each listener, keyed by listener name.
-    /// Populated by the reconciler's route-counting pass after the TLS walk.
-    pub attached_routes: BTreeMap<String, i32>,
-    /// Hostname restriction for each listener (empty string = match all).
-    /// Used by the route-counting pass to filter routes by hostname.
-    pub listener_hostnames: BTreeMap<String, String>,
-    /// Whether each listener allows routes from any namespace (true) or only
-    /// from the same namespace as the Gateway (false, the default per spec).
-    pub listener_allows_all_namespaces: BTreeMap<String, bool>,
-    /// Port number for each listener, keyed by listener name.
-    /// Used to validate parentRef.port against listener ports.
-    pub listener_ports: BTreeMap<String, u16>,
+    /// All listeners for this Gateway. Keyed by listener name.
+    pub listeners: BTreeMap<String, ListenerInfo>,
 }
 
 struct GatewayListenerHealthInner {

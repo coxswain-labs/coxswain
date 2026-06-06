@@ -754,7 +754,9 @@ fn reconcile_request_header_modifier_stored() {
     assert_eq!(filter_list.len(), 1);
     match &filter_list[0] {
         FilterAction::RequestHeaderModifier(m) => {
-            assert_eq!(m.set, vec![("X-Env".to_string(), "prod".to_string())]);
+            assert_eq!(m.set.len(), 1);
+            assert_eq!(m.set[0].0.as_str(), "x-env");
+            assert_eq!(m.set[0].1, "prod");
         }
         _ => panic!("expected RequestHeaderModifier"),
     }
@@ -796,10 +798,9 @@ fn reconcile_response_header_modifier_stored() {
     assert_eq!(filter_list.len(), 1);
     match &filter_list[0] {
         FilterAction::ResponseHeaderModifier(m) => {
-            assert_eq!(
-                m.add,
-                vec![("X-Served-By".to_string(), "coxswain".to_string())]
-            );
+            assert_eq!(m.add.len(), 1);
+            assert_eq!(m.add[0].0.as_str(), "x-served-by");
+            assert_eq!(m.add[0].1, "coxswain");
         }
         _ => panic!("expected ResponseHeaderModifier"),
     }

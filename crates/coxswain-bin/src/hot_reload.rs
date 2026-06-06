@@ -1,4 +1,4 @@
-use coxswain_controller::tls::SharedGatewayListenerHealth;
+use coxswain_controller::SharedGatewayListenerHealth;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use std::collections::HashSet;
@@ -42,7 +42,8 @@ impl HotReloader {
         let mut ports = self.cli_ports.clone();
         let health = self.tls_health.load();
         for gw in health.values() {
-            for &port in gw.listener_ports.values() {
+            for info in gw.listeners.values() {
+                let port = info.port;
                 ports.insert(port);
             }
         }

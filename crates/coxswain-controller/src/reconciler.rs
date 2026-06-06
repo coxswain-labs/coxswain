@@ -4,6 +4,7 @@ use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
 use crate::keys::ListenerKey;
+use crate::kube_helpers::scoped_api;
 use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth};
 use crate::{
     endpoints,
@@ -138,17 +139,6 @@ struct ReconcilerConfig {
     watch_namespace: Option<String>,
     ingress_default_backend: Option<IngressDefaultBackend>,
     ingress_ports: IngressPorts,
-}
-
-fn scoped_api<T>(client: Client, ns: Option<&str>) -> Api<T>
-where
-    T: kube::Resource<Scope = kube::core::NamespaceResourceScope>,
-    T::DynamicType: Default,
-{
-    match ns {
-        Some(ns) => Api::namespaced(client, ns),
-        None => Api::all(client),
-    }
 }
 
 fn spawn_reflector<T>(
@@ -758,48 +748,36 @@ fn count_attached_routes(
             if let Some(health) = gateway_tls_health.get_mut(&key) {
                 let pr_port = pr.port.map(|p| p as u16);
                 if let Some(sn) = pr.section_name.as_deref() {
-                    let allows_all = health
-                        .listener_allows_all_namespaces
-                        .get(sn)
-                        .copied()
-                        .unwrap_or(false);
-                    if gw_ns != route_ns && !allows_all {
+                    let Some(info) = health.listeners.get_mut(sn) else {
+                        continue;
+                    };
+                    if gw_ns != route_ns && !info.allows_all_namespaces {
                         continue;
                     }
                     if let Some(port) = pr_port
-                        && health.listener_ports.get(sn).copied().unwrap_or(0) != port
+                        && info.port != port
                     {
                         continue;
                     }
-                    if let Some(listener_hn) = health.listener_hostnames.get(sn)
-                        && hostnames_intersect(&route_hostnames, listener_hn)
-                    {
-                        *health.attached_routes.entry(sn.to_string()).or_insert(0) += 1;
+                    if hostnames_intersect(&route_hostnames, &info.hostname) {
+                        info.attached_routes += 1;
                     }
                 } else {
-                    let listeners: Vec<(String, String, bool)> = health
-                        .listener_hostnames
-                        .iter()
-                        .filter_map(|(n, hn)| {
-                            if let Some(p) = pr_port
-                                && health.listener_ports.get(n).copied().unwrap_or(0) != p
-                            {
-                                return None;
-                            }
-                            let allows = health
-                                .listener_allows_all_namespaces
-                                .get(n)
-                                .copied()
-                                .unwrap_or(false);
-                            Some((n.clone(), hn.clone(), allows))
-                        })
-                        .collect();
-                    for (ln, listener_hn, allows_all) in listeners {
-                        if gw_ns != route_ns && !allows_all {
+                    let listener_names: Vec<String> = health.listeners.keys().cloned().collect();
+                    for ln in listener_names {
+                        let Some(info) = health.listeners.get_mut(&ln) else {
+                            continue;
+                        };
+                        if let Some(p) = pr_port
+                            && info.port != p
+                        {
                             continue;
                         }
-                        if hostnames_intersect(&route_hostnames, &listener_hn) {
-                            *health.attached_routes.entry(ln).or_insert(0) += 1;
+                        if gw_ns != route_ns && !info.allows_all_namespaces {
+                            continue;
+                        }
+                        if hostnames_intersect(&route_hostnames, &info.hostname) {
+                            info.attached_routes += 1;
                         }
                     }
                 }
