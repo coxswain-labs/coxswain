@@ -493,7 +493,6 @@ mod tests {
                                     port: Some(ServiceBackendPort {
                                         name: Some(port_name.to_string()),
                                         number: None,
-                                        ..Default::default()
                                     }),
                                 }),
                                 ..Default::default()
@@ -1147,7 +1146,6 @@ mod tests {
                         port: Some(ServiceBackendPort {
                             name: Some("http".to_string()),
                             number: None,
-                            ..Default::default()
                         }),
                     }),
                     ..Default::default()

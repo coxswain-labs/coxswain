@@ -625,6 +625,7 @@ dependencies = [
  "pingora-core",
  "pingora-http",
  "pingora-proxy",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
