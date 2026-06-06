@@ -13,15 +13,11 @@ use coxswain_e2e::{
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("coxswain_e2e=debug,warn")
-        .try_init();
-}
+mod common;
 
 #[tokio::test]
 async fn status_load_balancer_ip() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start_with_options(ControllerOptions {
         status_address: Some("203.0.113.1".to_string()),
         ..Default::default()
@@ -50,7 +46,7 @@ async fn status_load_balancer_ip() -> anyhow::Result<()> {
 /// starts so that echo-c is already ready on the first routing-table rebuild.
 #[tokio::test]
 async fn default_backend() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
 
     // Bootstrap cluster connection and create the namespace before starting the
     // controller, so the default-backend endpoints are ready on first sync.
@@ -96,7 +92,7 @@ async fn default_backend() -> anyhow::Result<()> {
 /// The defaultBackend should serve all traffic regardless of host or path.
 #[tokio::test]
 async fn default_backend_only() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-default-only").await?;
 
@@ -118,7 +114,7 @@ async fn default_backend_only() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn path_matching() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-path").await?;
 
@@ -145,7 +141,7 @@ async fn path_matching() -> anyhow::Result<()> {
 /// - Unknown SNI causes a TLS handshake error (no cert installed).
 #[tokio::test]
 async fn tls_termination_with_sni() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-tls").await?;
 
@@ -210,7 +206,7 @@ async fn tls_termination_with_sni() -> anyhow::Result<()> {
 /// rule hosts and the cert is still served correctly via SNI.
 #[tokio::test]
 async fn tls_fallback_when_hosts_omitted() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-tls-nohosts").await?;
 
@@ -248,7 +244,7 @@ async fn tls_fallback_when_hosts_omitted() -> anyhow::Result<()> {
 /// 4. Assert that routing still works on the new certificate.
 #[tokio::test]
 async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-tls-rotate").await?;
 
@@ -314,7 +310,7 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
 /// 4. HTTPS request succeeds and routes to the expected backend.
 #[tokio::test]
 async fn cert_manager_ingress_provisioning() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-cert-mgr").await?;
 
@@ -352,7 +348,7 @@ async fn cert_manager_ingress_provisioning() -> anyhow::Result<()> {
 /// - Echo response must include a `forwarded` header with `for="198.51.100.42:12345"`.
 #[tokio::test]
 async fn proxy_protocol_http_v1_forwarded() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
 
     bootstrap().await?;
     let client = kube::Client::try_default().await?;
@@ -408,7 +404,7 @@ async fn proxy_protocol_http_v1_forwarded() -> anyhow::Result<()> {
 /// - Echo response must include `forwarded: for="192.0.2.7:54321";proto=https`.
 #[tokio::test]
 async fn proxy_protocol_https_v2_forwarded() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
 
     bootstrap().await?;
     let client = kube::Client::try_default().await?;
@@ -486,7 +482,7 @@ async fn proxy_protocol_https_v2_forwarded() -> anyhow::Result<()> {
 /// PROXY preamble is dropped before any response is sent.
 #[tokio::test]
 async fn proxy_protocol_strict_drop() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
 
     let controller = ControllerProcess::start_with_options(ControllerOptions {
         proxy_accept_proxy_protocol: true,
@@ -529,7 +525,7 @@ async fn proxy_protocol_strict_drop() -> anyhow::Result<()> {
 /// tests.  Coxswain's shared routing table uses multi-level semantics.
 #[tokio::test]
 async fn wildcard_host() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-wildcard").await?;
 
@@ -555,7 +551,7 @@ async fn wildcard_host() -> anyhow::Result<()> {
 /// Also covers `pathType: Exact` end-to-end (previously untested at this level).
 #[tokio::test]
 async fn named_port_backend() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-named-port").await?;
 
@@ -580,7 +576,7 @@ async fn named_port_backend() -> anyhow::Result<()> {
 /// IngressClass (annotated `ingressclass.kubernetes.io/is-default-class: "true"`).
 #[tokio::test]
 async fn default_ingress_class() -> anyhow::Result<()> {
-    init_tracing();
+    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-default-class").await?;
 

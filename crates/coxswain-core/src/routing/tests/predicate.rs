@@ -1,5 +1,4 @@
-use super::super::*;
-use super::{headers_from, make_predicates};
+use super::*;
 use http::Method;
 use regex::Regex;
 

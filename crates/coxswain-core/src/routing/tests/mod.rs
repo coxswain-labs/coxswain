@@ -1,3 +1,4 @@
+mod builder;
 mod entry;
 mod host_router;
 mod predicate;
@@ -9,7 +10,7 @@ use std::net::SocketAddr;
 
 const PORT: u16 = 80;
 
-pub(super) fn group(name: &str, addr: &str) -> Arc<BackendGroup> {
+pub(super) fn make_group(name: &str, addr: &str) -> Arc<BackendGroup> {
     Arc::new(BackendGroup::new(
         name.to_string(),
         vec![addr.parse::<SocketAddr>().unwrap()],

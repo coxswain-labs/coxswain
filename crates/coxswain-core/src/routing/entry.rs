@@ -530,6 +530,8 @@ impl RouteEntry {
     }
 }
 
-// Lock the hot-path RouteEntry size to catch accidental growth.
+// Lock the hot-path RouteEntry and BackendPool sizes to catch accidental growth.
 // Update the constant when a deliberate layout change is made.
 static_assertions::assert_eq_size!(RouteEntry, [u8; 176]);
+// Hot type — review with the team before bumping this number.
+static_assertions::assert_eq_size!(BackendPool, [u8; 24]);

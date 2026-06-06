@@ -6,6 +6,7 @@ use std::sync::Arc;
 /// A cheaply-cloneable wrapper that allows one writer and many concurrent readers
 /// with no locks. The controller stores a new snapshot on every reconcile; readers
 /// (proxy hot path, status writer) load atomically on every use.
+// No dedicated tests/shared.rs: trivial ArcSwap wrapper exercised transitively.
 pub struct Shared<T>(Arc<ArcSwap<T>>);
 
 impl<T> Clone for Shared<T> {

@@ -1,10 +1,9 @@
-use super::super::*;
-use super::{PORT, ctx_get, entry, group, make_predicates};
+use super::*;
 use std::sync::Arc;
 
 #[test]
 fn wildcard_host_matches() {
-    let up = group("svc", "10.0.0.1:80");
+    let up = make_group("svc", "10.0.0.1:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
@@ -25,8 +24,8 @@ fn wildcard_host_matches() {
 #[test]
 #[tracing_test::traced_test]
 fn prefix_insert_collision_emits_debug_log() {
-    let first = group("first", "10.0.0.1:80");
-    let second = group("second", "10.0.0.2:80");
+    let first = make_group("first", "10.0.0.1:80");
+    let second = make_group("second", "10.0.0.2:80");
 
     let mut b = RoutingTableBuilder::new();
     let host = b.for_port(PORT).exact_host("example.com");
@@ -48,8 +47,8 @@ fn prefix_insert_collision_emits_debug_log() {
 fn specificity_ordering_more_headers_wins() {
     // Two entries at the same path: one with a header predicate, one without.
     // The one with more predicates should win when its predicate passes.
-    let specific_up = group("specific", "10.0.0.1:80");
-    let generic_up = group("generic", "10.0.0.2:80");
+    let specific_up = make_group("specific", "10.0.0.1:80");
+    let generic_up = make_group("generic", "10.0.0.2:80");
 
     let pred = make_predicates(None, &[("x-tenant", "acme")], &[]);
     let specific = Arc::new(RouteEntry::new(
@@ -109,8 +108,8 @@ fn specificity_ordering_more_headers_wins() {
 fn or_semantics_across_multiple_entries() {
     // Two entries at the same path with different header predicates:
     // whichever predicate matches the request wins.
-    let up_a = group("a", "10.0.0.1:80");
-    let up_b = group("b", "10.0.0.2:80");
+    let up_a = make_group("a", "10.0.0.1:80");
+    let up_b = make_group("b", "10.0.0.2:80");
 
     let pred_a = make_predicates(None, &[("x-tenant", "a")], &[]);
     let pred_b = make_predicates(None, &[("x-tenant", "b")], &[]);

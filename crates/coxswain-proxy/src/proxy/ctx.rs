@@ -53,3 +53,7 @@ pub struct ProxyCtx {
     /// for both request and backendRequest timeout expiry).
     pub backend_request_timeout_active: bool,
 }
+
+// Hot types — review with the team before bumping these numbers.
+const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 88);
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 160);
