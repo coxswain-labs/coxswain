@@ -3,6 +3,9 @@ pub(crate) mod filter;
 mod proxy;
 mod tls;
 
+#[cfg(test)]
+mod tests;
+
 pub use accept::{
     AcceptorBuildError, ListenerProtocol, ListenerSpec, ProxyAcceptor, TrustedSources,
 };

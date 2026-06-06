@@ -5,3 +5,6 @@ pub mod shared;
 pub mod tls;
 
 pub use shared::Shared;
+
+#[cfg(test)]
+mod tests;
