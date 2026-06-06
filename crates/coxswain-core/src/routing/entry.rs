@@ -21,6 +21,24 @@ pub enum BackendProtocol {
     WebSocketTls,
 }
 
+impl BackendProtocol {
+    /// Returns `true` for protocols that require TLS to the upstream.
+    pub fn is_tls(self) -> bool {
+        match self {
+            Self::Https | Self::WebSocketTls => true,
+            Self::Http1 | Self::H2c | Self::WebSocket => false,
+        }
+    }
+
+    /// Returns `true` for protocols using HTTP/2 cleartext prior knowledge.
+    pub fn is_h2(self) -> bool {
+        match self {
+            Self::H2c => true,
+            Self::Http1 | Self::Https | Self::WebSocket | Self::WebSocketTls => false,
+        }
+    }
+}
+
 /// Parse a raw `appProtocol` string into a `BackendProtocol`.
 ///
 /// Unknown or absent values map to `Http1` (the safe default).

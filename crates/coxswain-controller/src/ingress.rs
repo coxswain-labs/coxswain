@@ -1,7 +1,7 @@
 use crate::endpoints;
 use crate::tls::load_tls_cert;
 use crate::translate::metadata_created_at;
-use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, parse_app_protocol};
+use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder};
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -172,7 +172,7 @@ impl IngressReconciler {
                     );
                     continue;
                 }
-                let protocol = parse_app_protocol(resolved.app_protocol.as_deref().unwrap_or(""));
+                let protocol = resolved.app_protocol;
                 let group = Arc::new(
                     BackendGroup::new(format!("{ns}/{}", svc.name), resolved.addrs)
                         .with_protocol(protocol),
@@ -228,8 +228,7 @@ impl IngressReconciler {
                             "No ready endpoints for defaultBackend — skipping"
                         );
                     } else {
-                        let protocol =
-                            parse_app_protocol(resolved.app_protocol.as_deref().unwrap_or(""));
+                        let protocol = resolved.app_protocol;
                         let group = Arc::new(
                             BackendGroup::new(format!("{ns}/{}", default_svc.name), resolved.addrs)
                                 .with_protocol(protocol),

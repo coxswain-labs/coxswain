@@ -13,9 +13,7 @@ use crate::{
 use async_trait::async_trait;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::reference_grants::ReferenceGrantKey;
-use coxswain_core::routing::{
-    BackendGroup, RouteEntry, RoutingTableBuilder, SharedRoutingTable, parse_app_protocol,
-};
+use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, SharedRoutingTable};
 use coxswain_core::tls::{SharedTlsStore, TlsStoreBuilder};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -636,7 +634,7 @@ fn build_routes(
                 "No ready endpoints for --ingress-default-backend — skipping"
             );
         } else {
-            let protocol = parse_app_protocol(resolved.app_protocol.as_deref().unwrap_or(""));
+            let protocol = resolved.app_protocol;
             let group = Arc::new(
                 BackendGroup::new(format!("{}/{}", db.namespace, db.name), resolved.addrs)
                     .with_protocol(protocol),
