@@ -12,7 +12,7 @@ use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, HostRouterBuilder, MatchPredicates, RouteEntry,
-    RoutingTableBuilder, parse_app_protocol,
+    RoutingTableBuilder,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -157,10 +157,8 @@ impl GatewayApiReconciler {
                     grants,
                 );
                 let group_name = backend_group_name(backend_refs, route_ns);
-                let protocols: Vec<BackendProtocol> = resolved
-                    .iter()
-                    .map(|(r, _)| parse_app_protocol(r.app_protocol.as_deref().unwrap_or("")))
-                    .collect();
+                let protocols: Vec<BackendProtocol> =
+                    resolved.iter().map(|(r, _)| r.app_protocol).collect();
                 let protocol = pick_route_protocol(&protocols, &group_name);
                 let weighted = resolved.into_iter().map(|(r, w)| (r.addrs, w)).collect();
                 let group =
@@ -365,7 +363,7 @@ impl GatewayApiReconciler {
                     return (
                         endpoints::ResolvedEndpoints {
                             addrs: vec![],
-                            app_protocol: None,
+                            app_protocol: BackendProtocol::default(),
                         },
                         0,
                     );
@@ -377,7 +375,7 @@ impl GatewayApiReconciler {
                     return (
                         endpoints::ResolvedEndpoints {
                             addrs: vec![],
-                            app_protocol: None,
+                            app_protocol: BackendProtocol::default(),
                         },
                         weight,
                     );
@@ -396,7 +394,7 @@ impl GatewayApiReconciler {
                     return (
                         endpoints::ResolvedEndpoints {
                             addrs: vec![],
-                            app_protocol: None,
+                            app_protocol: BackendProtocol::default(),
                         },
                         weight,
                     );

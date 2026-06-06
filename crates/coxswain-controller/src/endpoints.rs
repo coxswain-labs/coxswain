@@ -1,3 +1,4 @@
+use coxswain_core::routing::{BackendProtocol, parse_app_protocol};
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -7,8 +8,8 @@ use std::net::{IpAddr, SocketAddr};
 /// Resolved addresses and protocol metadata for a single backend service port.
 pub(crate) struct ResolvedEndpoints {
     pub addrs: Vec<SocketAddr>,
-    /// Raw `appProtocol` string from the matched `ServicePort`, if present.
-    pub app_protocol: Option<String>,
+    /// Backend wire protocol, parsed from `Service.spec.ports[].appProtocol`.
+    pub app_protocol: BackendProtocol,
 }
 
 struct ServicePortInfo {
@@ -79,7 +80,12 @@ pub(crate) fn resolve(
         .as_ref()
         .and_then(|i| i.target_port)
         .unwrap_or(port);
-    let app_protocol = port_info.and_then(|i| i.app_protocol);
+    let app_protocol = parse_app_protocol(
+        port_info
+            .and_then(|i| i.app_protocol)
+            .as_deref()
+            .unwrap_or(""),
+    );
 
     let mut addrs = Vec::new();
     for slice in slices.state() {
@@ -404,13 +410,13 @@ mod tests {
             "kubernetes.io/h2c",
         )]);
         let r = resolve("ns", "svc", 8080, &slices, &svcs);
-        assert_eq!(r.app_protocol.as_deref(), Some("kubernetes.io/h2c"));
+        assert_eq!(r.app_protocol, BackendProtocol::H2c);
     }
 
     #[test]
     fn resolve_app_protocol_absent_when_service_missing() {
         let slices = make_store(vec![make_slice("ns", "svc", "10.0.0.1", None, Some(true))]);
         let r = resolve("ns", "svc", 8080, &slices, &empty_svc_store());
-        assert!(r.app_protocol.is_none());
+        assert_eq!(r.app_protocol, BackendProtocol::Http1);
     }
 }

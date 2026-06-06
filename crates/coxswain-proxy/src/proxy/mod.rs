@@ -1,8 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use coxswain_core::routing::{
-    BackendProtocol, FilterAction, RequestContext, RouteOutcome, RouteTimeouts,
-};
+use coxswain_core::routing::{FilterAction, RequestContext, RouteOutcome, RouteTimeouts};
 use http::header;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{
@@ -246,14 +244,12 @@ impl ProxyHttp for Proxy {
         let sni_host = resolved.original_host.clone();
 
         let protocol = resolved.backend_group.protocol();
-        let tls = matches!(
-            protocol,
-            BackendProtocol::Https | BackendProtocol::WebSocketTls
-        );
-        let mut peer = HttpPeer::new(addr.to_string(), tls, sni_host);
-        if matches!(protocol, BackendProtocol::H2c) {
+        let mut peer = HttpPeer::new(addr.to_string(), protocol.is_tls(), sni_host);
+        if protocol.is_h2() {
             peer.options.set_http_version(2, 2);
         }
+        // Pingora's HttpPeer hash includes http_version; pool isolation is automatic.
+        // CA-based pool aliasing tracked separately: see #16.
 
         // Apply per-route timeout settings.
         // backendRequest controls the upstream read (and connect) phase → 502 on expiry.
