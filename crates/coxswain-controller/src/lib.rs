@@ -8,6 +8,9 @@ pub(crate) mod keys;
 mod reconciler;
 mod tls;
 
+#[cfg(test)]
+mod tests;
+
 pub use controller::{Controller, ControllerConfig, ControllerConfigError, StatusAddress};
 pub use ingress::IngressPorts;
 pub use reconciler::{
