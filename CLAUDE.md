@@ -111,73 +111,15 @@ coxswain-bin
   └── (coxswain-e2e — black-box tests, not a runtime dep)
 ```
 
-### `coxswain-core`
-Shared types and the routing table.
+Per-crate responsibilities (see each crate's `src/lib.rs` for the up-to-date module layout):
 
-- `routing/` — `RoutingTable`, `RoutingTableBuilder`, `Upstream` (pod `SocketAddr`s with round-robin), `FilterAction`, `RouteTimeouts`, `MatchPredicates`. `RoutingTable` maps hostnames to per-host `matchit` radix-tree routers.
-- `shared.rs` — generic `Shared<T>` newtype over `ArcSwap<T>`; `SharedRoutingTable` and `SharedTlsStore` are type aliases. The controller stores; the proxy loads atomically with no locks.
-- `tls.rs` — `TlsCert`, `TlsStore`, `SharedTlsStore`.
-- `ownership.rs` — `OwnedGateways`, parent-ref ownership tracking.
-- `reference_grants.rs` — cross-namespace backend ref validation.
-
-### `coxswain-controller`
-Kubernetes controller split into two Pingora `BackgroundService`s.
-
-**`reconciler.rs` — `Reconciler`**
-Routing and TLS table builder. Runs reflector tasks for **HTTPRoute, Ingress, IngressClass, Gateway, GatewayClass, EndpointSlice, ReferenceGrant, Secret, Service**; debounces changes with a 500 ms trailing-edge timer and rebuilds `RoutingTable` + `TlsStore` from scratch on each tick, then atomically publishes both via `store()`.
-
-**`controller/` — `Controller`**
-Status writer and leader elector. Watches five streams — `HTTPRoute`, `GatewayClass`, `Gateway`, `IngressClass`, `Ingress` — in a `tokio::select!` loop. Renews the `kube-leader-election` Lease every 5 s (15 s TTL); if leader, patches Accepted/Programmed status back to the API server. Flips `synced` on `InitDone`, steps down from the Lease on shutdown.
-
-Sub-files: `conditions.rs`, `config.rs` (`ControllerConfig`, `StatusAddress`), `gateway_class_status.rs` (includes `SUPPORTED_FEATURES`), `gateway_status.rs`, `ingress_status.rs`.
-
-**`gateway_api/` — `GatewayApiReconciler`**
-Translates one `HTTPRoute` into `RoutingTableBuilder` entries. Sub-files: `filters.rs`, `hostnames.rs`, `status.rs`, `timeouts.rs` (GEP-2257 duration parsing).
-
-**`ingress.rs` — `IngressReconciler`**
-Translates one `Ingress` into `RoutingTableBuilder` entries. Also handles `IngressDefaultBackend`.
-
-**`endpoints.rs`** — `resolve(ns, svc, port, slices) -> Vec<SocketAddr>` over the local EndpointSlice store; never queries the API server.
-
-**`tls.rs`** — Secret → `TlsCert` loading; `SharedGatewayListenerHealth` and `SharedHttpRouteHealth` health maps read by the status writer.
-
-**kube 3.x watcher event variants:**
-- `Event::InitApply(obj)` — existing objects from the initial LIST phase
-- `Event::Apply(obj)` — creates/updates
-- `Event::Delete(obj)` — deletions (handled automatically by the reflector stores)
-- `Event::InitDone` — end of initial list; used to flip `synced`
-
-### `coxswain-proxy`
-Pingora-based reverse proxy.
-
-- `proxy/` — `Proxy` (`ProxyHttp` impl), `ProxyCtx`, `RoutingEngine` (lock-free routing lookup), redirect builder.
-- `filter.rs` — request/response filter application: URL rewrite, header mods, `X-Proxy-Engine` injection.
-- `tls.rs` — `SniCertSelector` (`TlsAccept` impl driven by `SharedTlsStore`) for in-process SNI termination.
-- `accept.rs` — `ProxyAcceptor` for HAProxy PROXY protocol v1/v2; `TrustedSources` CIDR allow-list.
-
-### `coxswain-health`
-`HealthServer` serves `GET /healthz` (always 200) and `GET /readyz` (200/503 based on `synced`).
-
-### `coxswain-admin`
-`AdminServer` serves `GET /metrics` (Prometheus), `GET /routes` (JSON), `GET /status` (JSON: `version`, `synced`, `leader`, `host_count`).
-
-### `coxswain-bin`
-Entry point only — parses CLI args, wires all services together, starts the Pingora runtime.
-
-Shared state created in `main()` and cloned into services: `SharedRoutingTable`, `SharedTlsStore`, `SharedGatewayListenerHealth`, `OwnedGateways`, `route_health`, `default_timeouts`, `synced` (`Arc<AtomicBool>`), `leader` (`Arc<AtomicBool>`). The proxy has two registration paths: standard `http_proxy_service` vs. `ProxyAcceptor`-wrapped when `--proxy-accept-proxy-protocol` is set.
-
-### `coxswain-e2e`
-Black-box integration tests; not part of `default-members`. `src/harness/` spawns the `coxswain` binary against a real cluster (kind/Orb), installs Gateway API CRDs, and runs scenarios in `tests/gateway_api.rs` and `tests/ingress.rs` with RAII namespace cleanup.
-
-## Key design pattern
-
-`SharedRoutingTable` and `SharedTlsStore` are the core shared state: `Reconciler` stores new snapshots after every debounced rebuild; the proxy and SNI selector load atomically on every request with no locks.
-
-Shared flags and derived state:
-- `synced` — flips to `true` on `InitDone`; gates `/readyz`.
-- `leader` — mirrors the current Lease outcome; exposed on `/status`.
-- `SharedGatewayListenerHealth` / `SharedHttpRouteHealth` — reconciler writes, status writer reads.
-- `OwnedGateways` — tracks which `Gateway` objects this controller is responsible for.
+- **`coxswain-core`** — shared routing-table types, atomic `Shared<T>` snapshot primitive, TLS store, ownership and reference-grant helpers.
+- **`coxswain-controller`** — Kubernetes reflectors and a debounced reconciler that rebuilds the routing and TLS tables; separate status writer with `kube-leader-election`-based leader election.
+- **`coxswain-proxy`** — Pingora-based reverse proxy: lock-free routing lookup, request/response filter application, in-process SNI TLS termination, optional HAProxy PROXY-protocol acceptor.
+- **`coxswain-health`** — `/healthz` (always 200) and `/readyz` (gated on `synced`).
+- **`coxswain-admin`** — `/metrics` (Prometheus), `/routes`, `/status`.
+- **`coxswain-bin`** — entry point: CLI parsing, shared-state wiring, Pingora runtime bootstrap.
+- **`coxswain-e2e`** — black-box integration tests against a live cluster (kind/Orb); not a runtime dependency.
 
 ## Ports (default)
 
