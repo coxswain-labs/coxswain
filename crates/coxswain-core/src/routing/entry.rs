@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 
 /// Wire protocol spoken by a backend, derived from `Service.spec.ports[].appProtocol`
 /// per [GEP-1911](https://gateway-api.sigs.k8s.io/geps/gep-1911/).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BackendProtocol {
     /// Plain HTTP/1.1 — the default when `appProtocol` is absent or unrecognised.
@@ -42,6 +43,7 @@ impl BackendProtocol {
 /// Parse a raw `appProtocol` string into a `BackendProtocol`.
 ///
 /// Unknown or absent values map to `Http1` (the safe default).
+#[must_use]
 pub fn parse_app_protocol(raw: &str) -> BackendProtocol {
     match raw {
         "kubernetes.io/h2c" => BackendProtocol::H2c,
@@ -60,6 +62,10 @@ struct BackendPool {
 
 impl BackendPool {
     fn new(addrs: Vec<SocketAddr>) -> Self {
+        assert!(
+            !addrs.is_empty(),
+            "BackendPool requires at least one address"
+        );
         Self {
             addrs: addrs.into_boxed_slice(),
             rr: AtomicUsize::new(0),
@@ -73,6 +79,7 @@ impl BackendPool {
 }
 
 /// How a path is modified by `URLRewrite` or `RequestRedirect`.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum PathModifier {
     ReplaceFullPath(String),
@@ -130,6 +137,7 @@ pub struct HeaderMod {
 }
 
 /// A filter action evaluated per-request on the proxy hot path.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum FilterAction {
     /// Modify request headers before forwarding upstream.
@@ -172,7 +180,7 @@ pub struct RouteTimeouts {
 /// pod distribution within each backend.
 pub struct BackendGroup {
     /// Service identity — used for logging only.
-    pub name: String,
+    name: String,
     /// One entry per non-zero-weight backend ref.
     backends: Box<[BackendPool]>,
     /// Slot array: each entry is an index into `backends`.
@@ -268,6 +276,11 @@ impl BackendGroup {
         self
     }
 
+    /// Service identity used for logging.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Wire protocol for upstream connections.
     pub fn protocol(&self) -> BackendProtocol {
         self.protocol
@@ -281,6 +294,7 @@ impl BackendGroup {
     /// Returns the next endpoint using weighted round-robin.
     ///
     /// Returns `None` when there are no active endpoints.
+    #[must_use]
     pub fn next_endpoint(&self) -> Option<SocketAddr> {
         if self.slots.is_empty() {
             return None;
@@ -306,6 +320,7 @@ fn gcd(a: u16, b: u16) -> u16 {
 }
 
 /// How a path rule was registered — for introspection only.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteKind {
     Exact,
@@ -338,7 +353,7 @@ pub struct RouteConflict {
     pub host: String,
     pub path: String,
     pub kind: RouteKind,
-    /// `BackendGroup::name` of the rule that was rejected.
+    /// [`BackendGroup::name`] of the rule that was rejected.
     pub rejected_group: String,
 }
 
@@ -415,6 +430,10 @@ impl RouteEntry {
         }
     }
 }
+
+// Lock the hot-path RouteEntry size to catch accidental growth.
+// Update the constant when a deliberate layout change is made.
+static_assertions::assert_eq_size!(RouteEntry, [u8; 176]);
 
 #[cfg(test)]
 mod backend_protocol_tests {

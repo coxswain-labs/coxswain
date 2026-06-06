@@ -76,7 +76,7 @@ Work items are listed in execution order; each should be completed and merged be
 - ✅ ~~Propagate typed errors in startup path — [#137](https://github.com/coxswain-labs/coxswain/issues/137)~~
 - ✅ ~~Eliminate `appProtocol` string round-trip (GEP-1911 cleanup) — [#138](https://github.com/coxswain-labs/coxswain/issues/138)~~
 - ✅ ~~`hot_reload` graceful shutdown via Pingora signal instead of `process::exit` — [#139](https://github.com/coxswain-labs/coxswain/issues/139)~~
-- ⬜ `#[non_exhaustive]`/`#[must_use]` sweep, `HttpRoute` alias, `BackendPool::next` guard — [#140](https://github.com/coxswain-labs/coxswain/issues/140)
+- ✅ ~~`#[non_exhaustive]`/`#[must_use]` sweep, `HttpRoute` alias, `BackendPool::next` guard — [#140](https://github.com/coxswain-labs/coxswain/issues/140)~~
 - ⬜ Cheap perf wins and structural cleanups — [#141](https://github.com/coxswain-labs/coxswain/issues/141)
 - ⬜ Eliminate per-request allocations (deep hot-path pass) — [#142](https://github.com/coxswain-labs/coxswain/issues/142)
 - ⬜ Split large production source files — [#143](https://github.com/coxswain-labs/coxswain/issues/143)

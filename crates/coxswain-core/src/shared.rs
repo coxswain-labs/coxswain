@@ -21,6 +21,7 @@ impl<T: Default> Shared<T> {
 }
 
 impl<T> Shared<T> {
+    #[must_use]
     pub fn load(&self) -> Arc<T> {
         self.0.load_full()
     }

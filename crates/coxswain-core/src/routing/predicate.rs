@@ -2,6 +2,7 @@ use http::{HeaderMap, HeaderName, Method};
 use regex::Regex;
 
 /// How a value is compared in a predicate — used by header and query matchers.
+#[non_exhaustive]
 #[derive(Clone)]
 pub enum ValueMatch {
     Exact(String),

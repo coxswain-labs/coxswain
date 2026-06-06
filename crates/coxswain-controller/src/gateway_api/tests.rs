@@ -1,9 +1,10 @@
 use super::*;
+use crate::gw_types::HttpRoute;
 use crate::gw_types::v::httproutes::{
-    HTTPRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
-    HttpRouteRulesMatches, HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType,
-    HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType,
-    HttpRouteRulesMatchesQueryParams, HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
+    HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesMatches,
+    HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
+    HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
+    HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
 };
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::RoutingTableBuilder;
@@ -99,8 +100,8 @@ fn make_route(
     hostnames: &[&str],
     matches: Option<Vec<HttpRouteRulesMatches>>,
     svc: &str,
-) -> HTTPRoute {
-    HTTPRoute {
+) -> HttpRoute {
+    HttpRoute {
         metadata: ObjectMeta {
             name: Some("route".to_string()),
             namespace: Some(ns.to_string()),
@@ -365,7 +366,7 @@ fn reconcile_header_exact_routes_to_correct_backend() {
     ]);
 
     // Two rules: same path, different header → different backends.
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("route".to_string()),
             namespace: Some("default".to_string()),
@@ -417,11 +418,11 @@ fn reconcile_header_exact_routes_to_correct_backend() {
     let ctx_b = ctx_with(&Method::GET, &hdrs_b, None);
 
     assert_eq!(
-        table.route(80, "example.com", "/", &ctx_a).unwrap().name,
+        table.route(80, "example.com", "/", &ctx_a).unwrap().name(),
         "default/svc-a"
     );
     assert_eq!(
-        table.route(80, "example.com", "/", &ctx_b).unwrap().name,
+        table.route(80, "example.com", "/", &ctx_b).unwrap().name(),
         "default/svc-b"
     );
 }
@@ -464,7 +465,7 @@ fn reconcile_method_routes_to_correct_backend() {
         make_slice("default", "svc-post", "10.0.0.2"),
     ]);
 
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("route".to_string()),
             namespace: Some("default".to_string()),
@@ -515,11 +516,17 @@ fn reconcile_method_routes_to_correct_backend() {
     let ctx_post = ctx_with(&Method::POST, &h, None);
 
     assert_eq!(
-        table.route(80, "example.com", "/", &ctx_get).unwrap().name,
+        table
+            .route(80, "example.com", "/", &ctx_get)
+            .unwrap()
+            .name(),
         "default/svc-get"
     );
     assert_eq!(
-        table.route(80, "example.com", "/", &ctx_post).unwrap().name,
+        table
+            .route(80, "example.com", "/", &ctx_post)
+            .unwrap()
+            .name(),
         "default/svc-post"
     );
 }
@@ -531,7 +538,7 @@ fn reconcile_query_param_routes_to_correct_backend() {
         make_slice("default", "svc-v2", "10.0.0.2"),
     ]);
 
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("route".to_string()),
             namespace: Some("default".to_string()),
@@ -582,11 +589,11 @@ fn reconcile_query_param_routes_to_correct_backend() {
     let ctx_v2 = ctx_with(&Method::GET, &h, Some("version=v2"));
 
     assert_eq!(
-        table.route(80, "example.com", "/", &ctx_v1).unwrap().name,
+        table.route(80, "example.com", "/", &ctx_v1).unwrap().name(),
         "default/svc-v1"
     );
     assert_eq!(
-        table.route(80, "example.com", "/", &ctx_v2).unwrap().name,
+        table.route(80, "example.com", "/", &ctx_v2).unwrap().name(),
         "default/svc-v2"
     );
 }
@@ -673,8 +680,8 @@ fn make_route_with_filters(
     path_type: HttpRouteRulesMatchesPathType,
     svc: &str,
     filters: Vec<HttpRouteRulesFilters>,
-) -> HTTPRoute {
-    HTTPRoute {
+) -> HttpRoute {
+    HttpRoute {
         metadata: ObjectMeta {
             name: Some("route".to_string()),
             namespace: Some(ns.to_string()),
@@ -950,7 +957,7 @@ fn parse_gateway_duration_invalid_returns_none() {
 fn reconcile_timeouts_stored_and_round_trip() {
     let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
 
-    let route = HTTPRoute {
+    let route = HttpRoute {
         metadata: ObjectMeta {
             name: Some("route".to_string()),
             namespace: Some("default".to_string()),
@@ -1041,9 +1048,9 @@ fn make_route_with_hostnames_and_parent(
     hostnames: &[&str],
     gw_name: &str,
     section_name: Option<&str>,
-) -> HTTPRoute {
+) -> HttpRoute {
     use gateway_api::apis::standard::httproutes::HttpRouteSpec;
-    HTTPRoute {
+    HttpRoute {
         metadata: kube::api::ObjectMeta {
             name: Some("test-route".to_string()),
             namespace: Some(ns.to_string()),
@@ -1068,9 +1075,9 @@ fn make_route_with_parent_port(
     hostnames: &[&str],
     gw_name: &str,
     port: Option<i32>,
-) -> HTTPRoute {
+) -> HttpRoute {
     use gateway_api::apis::standard::httproutes::HttpRouteSpec;
-    HTTPRoute {
+    HttpRoute {
         metadata: kube::api::ObjectMeta {
             name: Some("test-route".to_string()),
             namespace: Some(ns.to_string()),
@@ -1136,8 +1143,8 @@ fn reconcile_timeouts_missing_field_falls_back_to_none() {
 
 // ── Weighted backendRefs (issue #17) ─────────────────────────────────────────
 
-fn weighted_route(ns: &str, refs: &[(&str, Option<i32>)]) -> HTTPRoute {
-    HTTPRoute {
+fn weighted_route(ns: &str, refs: &[(&str, Option<i32>)]) -> HttpRoute {
+    HttpRoute {
         metadata: ObjectMeta {
             name: Some("route".to_string()),
             namespace: Some(ns.to_string()),
@@ -1407,7 +1414,7 @@ fn parent_ref_port_with_section_name_combined() {
 
     let make_route_sn_port = |section_name: Option<&str>, port: Option<i32>| {
         use gateway_api::apis::standard::httproutes::HttpRouteSpec;
-        HTTPRoute {
+        HttpRoute {
             metadata: kube::api::ObjectMeta {
                 name: Some("test-route".to_string()),
                 namespace: Some("default".to_string()),

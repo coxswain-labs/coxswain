@@ -101,11 +101,13 @@ pub struct RoutingTableBuilder {
 }
 
 impl RoutingTableBuilder {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Returns the [`PortTableBuilder`] for `port`, creating it if absent.
+    #[must_use]
     pub fn for_port(&mut self, port: u16) -> &mut PortTableBuilder {
         self.by_port.entry(port).or_default()
     }

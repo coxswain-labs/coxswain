@@ -2,8 +2,11 @@ use crate::endpoints;
 use crate::gw_types::v::gateways::{
     Gateway, GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode,
 };
-use crate::gw_types::v::httproutes::{
-    HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFiltersType, HttpRouteRulesMatchesPathType,
+use crate::gw_types::{
+    HttpRoute,
+    v::httproutes::{
+        HttpRouteRulesBackendRefs, HttpRouteRulesFiltersType, HttpRouteRulesMatchesPathType,
+    },
 };
 use crate::keys::ListenerKey;
 use crate::tls::{GatewayListenerHealth, HttpRouteHealthMap, ListenerTlsOutcome, load_tls_cert};
@@ -51,7 +54,7 @@ impl GatewayApiReconciler {
     /// `listener_info` maps `(gw_ns, gw_name, listener_name) → (hostname, port)`, used
     /// to scope routes to the correct per-port routing table slot and listener hostname.
     pub fn reconcile(
-        route: &HTTPRoute,
+        route: &HttpRoute,
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
         owned_gateways: &HashSet<ObjectKey>,
@@ -409,7 +412,7 @@ impl GatewayApiReconciler {
     }
 
     pub fn compute_route_health(
-        routes: &[Arc<HTTPRoute>],
+        routes: &[Arc<HttpRoute>],
         gateways: &[Arc<Gateway>],
         owned_gateways: &HashSet<ObjectKey>,
         backend_grants: &HashSet<ReferenceGrantKey>,

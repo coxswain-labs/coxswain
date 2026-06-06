@@ -60,6 +60,7 @@ pingora-proxy = { version = "0.8", default-features = false }
 prometheus = { version = "0.14" }
 regex = { version = "1.12"}
 serde = { version = "1", features = ["derive"] }
+static_assertions = { version = "1.1" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = { version = "1.0" }
 tempfile = { version = "3" }

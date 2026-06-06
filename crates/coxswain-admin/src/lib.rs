@@ -71,7 +71,7 @@ fn routes_response(routes: &SharedRoutingTable) -> Response<Vec<u8>> {
                     serde_json::json!({
                         "type": r.kind.as_str(),
                         "path": r.path,
-                        "backend_group": r.backend_group.name,
+                        "backend_group": r.backend_group.name(),
                         "endpoints": r.backend_group.endpoints().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                     })
                 })

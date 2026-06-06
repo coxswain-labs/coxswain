@@ -111,6 +111,7 @@ impl Drop for ControllerProcess {
     }
 }
 
+#[must_use = "port allocation result must be used"]
 fn free_addr() -> anyhow::Result<SocketAddr> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
     let addr = listener.local_addr().context("local_addr")?;
@@ -118,6 +119,7 @@ fn free_addr() -> anyhow::Result<SocketAddr> {
     // listener drops here, releasing the port; small race window is acceptable
 }
 
+#[must_use = "port allocation result must be used"]
 fn free_port() -> anyhow::Result<u16> {
     free_addr().map(|a| a.port())
 }
