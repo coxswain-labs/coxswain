@@ -629,6 +629,7 @@ dependencies = [
  "base64",
  "futures",
  "gateway-api",
+ "ipnet",
  "k8s-openapi",
  "kube",
  "rcgen",

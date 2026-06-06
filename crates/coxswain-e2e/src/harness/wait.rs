@@ -8,30 +8,59 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::Api;
 use std::{net::SocketAddr, time::Duration};
 use tokio::time;
-use tokio_tungstenite::tungstenite;
+
+const POLL: Duration = Duration::from_millis(500);
+const POLL_FAST: Duration = Duration::from_millis(200);
+
+/// Poll `check` every `interval` until it returns `Some(T)` or `timeout` elapses.
+async fn poll_until<T, F, Fut>(
+    timeout: Duration,
+    interval: Duration,
+    timeout_msg: impl Fn() -> String,
+    mut check: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        if let Some(val) = check().await {
+            return Ok(val);
+        }
+        if time::Instant::now() >= deadline {
+            anyhow::bail!("{}", timeout_msg());
+        }
+        time::sleep(interval).await;
+    }
+}
 
 /// Poll HTTPS handshakes until the served leaf certificate DER differs from `old_der`.
-///
-/// Covers the full propagation path: reflector → debounce (500 ms) → rebuild → `ArcSwap` store
-/// → SNI callback on next handshake. The 10 s deadline surfaces regressions in any stage.
 pub async fn wait_for_tls_cert_rotation(
     tls_addr: SocketAddr,
     host: &str,
     old_der: &[u8],
     timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        match crate::harness::http::https_peer_leaf_der(host, "/", tls_addr).await {
-            Ok(new_der) if new_der != old_der => return Ok(new_der),
-            Ok(_) => tracing::debug!(host, "TLS leaf unchanged, waiting for rotation"),
-            Err(e) => tracing::debug!(host, error = %e, "could not read TLS peer cert"),
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for TLS cert rotation on {host}");
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+    poll_until(
+        timeout,
+        POLL,
+        || format!("TLS cert rotation on {host}"),
+        || async {
+            match crate::harness::http::https_peer_leaf_der(host, "/", tls_addr).await {
+                Ok(new_der) if new_der != old_der => Some(new_der),
+                Ok(_) => {
+                    tracing::debug!(host, "TLS leaf unchanged, waiting for rotation");
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(host, error = %e, "could not read TLS peer cert");
+                    None
+                }
+            }
+        },
+    )
+    .await
 }
 
 pub async fn wait_for_https_route(
@@ -40,20 +69,25 @@ pub async fn wait_for_https_route(
     path: &str,
     timeout: Duration,
 ) -> anyhow::Result<crate::harness::http::EchoResponse> {
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        match crate::harness::http::https_get(host, path, tls_addr).await {
-            Ok((_, Some(body))) => return Ok(body),
-            Ok((status, None)) => {
-                tracing::debug!(host, path, status, "https route returned non-2xx")
+    poll_until(
+        timeout,
+        POLL,
+        || format!("HTTPS route {host}{path} to become live"),
+        || async {
+            match crate::harness::http::https_get(host, path, tls_addr).await {
+                Ok((_, Some(body))) => Some(body),
+                Ok((status, None)) => {
+                    tracing::debug!(host, path, status, "https route returned non-2xx");
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(host, path, error = %e, "https route not yet live");
+                    None
+                }
             }
-            Err(e) => tracing::debug!(host, path, error = %e, "https route not yet live"),
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for HTTPS route {host}{path} to become live");
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+        },
+    )
+    .await
 }
 
 pub async fn wait_for_ready(addr: SocketAddr, timeout: Duration) -> anyhow::Result<()> {
@@ -62,17 +96,21 @@ pub async fn wait_for_ready(addr: SocketAddr, timeout: Duration) -> anyhow::Resu
         .timeout(Duration::from_secs(2))
         .build()
         .context("build reqwest client")?;
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        match client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => return Ok(()),
-            _ => {}
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for readyz at {addr}");
-        }
-        time::sleep(Duration::from_millis(200)).await;
-    }
+    poll_until(
+        timeout,
+        POLL_FAST,
+        || format!("readyz at {addr}"),
+        || async {
+            client
+                .get(&url)
+                .send()
+                .await
+                .ok()
+                .filter(|r| r.status().is_success())
+                .map(|_| ())
+        },
+    )
+    .await
 }
 
 pub async fn wait_for_gatewayclass_supported_features(
@@ -81,26 +119,23 @@ pub async fn wait_for_gatewayclass_supported_features(
     timeout: Duration,
 ) -> anyhow::Result<Vec<String>> {
     let api: Api<GatewayClass> = Api::all(client.clone());
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        if let Ok(gc) = api.get(name).await {
-            let feats: Vec<String> = gc
-                .status
-                .as_ref()
-                .and_then(|s| s.supported_features.as_deref())
-                .map(|fs| fs.iter().map(|f| f.name.clone()).collect())
-                .unwrap_or_default();
-            if !feats.is_empty() {
-                return Ok(feats);
-            }
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for GatewayClass {name} to have status.supportedFeatures"
-            );
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+    poll_until(
+        timeout,
+        POLL,
+        || format!("GatewayClass {name} to have status.supportedFeatures"),
+        || async {
+            api.get(name).await.ok().and_then(|gc| {
+                let feats: Vec<String> = gc
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.supported_features.as_deref())
+                    .map(|fs| fs.iter().map(|f| f.name.clone()).collect())
+                    .unwrap_or_default();
+                if feats.is_empty() { None } else { Some(feats) }
+            })
+        },
+    )
+    .await
 }
 
 pub async fn wait_for_httproute_programmed(
@@ -110,18 +145,19 @@ pub async fn wait_for_httproute_programmed(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let api: Api<HTTPRoute> = Api::namespaced(client.clone(), namespace);
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        if let Ok(route) = api.get(name).await
-            && route_has_condition(&route, "Programmed")
-        {
-            return Ok(());
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for HTTPRoute {namespace}/{name} to be Programmed");
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+    poll_until(
+        timeout,
+        POLL,
+        || format!("HTTPRoute {namespace}/{name} to be Programmed"),
+        || async {
+            api.get(name)
+                .await
+                .ok()
+                .filter(|r| route_has_condition(r, "Programmed"))
+                .map(|_| ())
+        },
+    )
+    .await
 }
 
 pub async fn wait_for_gateway_programmed(
@@ -131,25 +167,24 @@ pub async fn wait_for_gateway_programmed(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let api: Api<Gateway> = Api::namespaced(client.clone(), namespace);
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        if let Ok(gw) = api.get(name).await
-            && gateway_has_condition(&gw, "Accepted")
-            && gateway_has_condition(&gw, "Programmed")
-        {
-            return Ok(());
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for Gateway {namespace}/{name} to be Accepted and Programmed"
-            );
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+    poll_until(
+        timeout,
+        POLL,
+        || format!("Gateway {namespace}/{name} to be Accepted and Programmed"),
+        || async {
+            api.get(name)
+                .await
+                .ok()
+                .filter(|gw| {
+                    gateway_has_condition(gw, "Accepted") && gateway_has_condition(gw, "Programmed")
+                })
+                .map(|_| ())
+        },
+    )
+    .await
 }
 
 /// Poll until a `kubernetes.io/tls` Secret with non-empty `tls.crt` data exists.
-/// Used by cert-manager tests to wait for certificate issuance before testing TLS.
 pub async fn wait_for_tls_secret(
     client: &kube::Client,
     name: &str,
@@ -157,30 +192,28 @@ pub async fn wait_for_tls_secret(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        if let Ok(secret) = api.get(name).await {
-            let is_tls = secret.type_.as_deref() == Some("kubernetes.io/tls");
-            let has_cert = secret
-                .data
-                .as_ref()
-                .and_then(|d| d.get("tls.crt"))
-                .is_some_and(|b| !b.0.is_empty());
-            if is_tls && has_cert {
-                return Ok(());
-            }
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for kubernetes.io/tls Secret {namespace}/{name} to be populated"
-            );
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+    poll_until(
+        timeout,
+        POLL,
+        || format!("kubernetes.io/tls Secret {namespace}/{name} to be populated"),
+        || async {
+            api.get(name)
+                .await
+                .ok()
+                .filter(|s| {
+                    s.type_.as_deref() == Some("kubernetes.io/tls")
+                        && s.data
+                            .as_ref()
+                            .and_then(|d| d.get("tls.crt"))
+                            .is_some_and(|b| !b.0.is_empty())
+                })
+                .map(|_| ())
+        },
+    )
+    .await
 }
 
 /// Wait for the named Deployments in `namespace` to become Available.
-/// Covers the image-pull + pod-start time on a fresh cluster.
 pub async fn wait_for_backends(namespace: &str) -> anyhow::Result<()> {
     wait_for_deployments(namespace, &["echo-a", "echo-b", "echo-c"]).await
 }
@@ -202,41 +235,43 @@ pub async fn wait_for_deployments(namespace: &str, names: &[&str]) -> anyhow::Re
 }
 
 /// Retry WebSocket handshakes against the proxy until one succeeds or `timeout` expires.
-///
-/// Uses a custom request so the TCP connection goes to `proxy_addr` while the `Host`
-/// header is set to `host` — the same split used by `HttpClient` for virtual hosting.
 pub async fn wait_for_ws_route(
     proxy_addr: SocketAddr,
     host: &str,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    use tokio_tungstenite::tungstenite;
     let uri = format!("ws://{proxy_addr}/");
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        let req = tungstenite::http::Request::builder()
-            .uri(&uri)
-            .header("Host", host)
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header(
-                "Sec-WebSocket-Key",
-                tungstenite::handshake::client::generate_key(),
-            )
-            .body(())
-            .context("build WebSocket request")?;
-        match tokio_tungstenite::connect_async(req).await {
-            Ok((mut stream, _)) => {
-                let _ = stream.close(None).await;
-                return Ok(());
+    poll_until(
+        timeout,
+        POLL,
+        || format!("WebSocket route on {host}"),
+        || async {
+            let req = tungstenite::http::Request::builder()
+                .uri(&uri)
+                .header("Host", host)
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header("Sec-WebSocket-Version", "13")
+                .header(
+                    "Sec-WebSocket-Key",
+                    tungstenite::handshake::client::generate_key(),
+                )
+                .body(())
+                .ok()?;
+            match tokio_tungstenite::connect_async(req).await {
+                Ok((mut stream, _)) => {
+                    let _ = stream.close(None).await;
+                    Some(())
+                }
+                Err(e) => {
+                    tracing::debug!(host, error = %e, "ws route not yet live");
+                    None
+                }
             }
-            Err(e) => tracing::debug!(host, error = %e, "ws route not yet live"),
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for WebSocket route on {host}");
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+        },
+    )
+    .await
 }
 
 pub async fn wait_for_route(
@@ -245,25 +280,24 @@ pub async fn wait_for_route(
     path: &str,
     timeout: Duration,
 ) -> anyhow::Result<crate::harness::http::EchoResponse> {
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        match http.get(host, path).await {
-            Ok(resp) => return Ok(resp),
-            Err(e) => tracing::debug!(host, path, error = %e, "route not yet live"),
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for route {host}{path} to become live");
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+    poll_until(
+        timeout,
+        POLL,
+        || format!("route {host}{path} to become live"),
+        || async {
+            match http.get(host, path).await {
+                Ok(resp) => Some(resp),
+                Err(e) => {
+                    tracing::debug!(host, path, error = %e, "route not yet live");
+                    None
+                }
+            }
+        },
+    )
+    .await
 }
 
 /// Poll `host`+`path` until the response comes from `expected_backend`.
-///
-/// Unlike [`wait_for_route`], this keeps retrying even when a 200 is received
-/// from a *different* backend (e.g. a catchall that currently wins). Useful
-/// when a global catchall could intercept requests before the intended
-/// host-specific route is reconciled.
 pub async fn wait_for_backend(
     http: &crate::harness::HttpClient,
     host: &str,
@@ -271,33 +305,38 @@ pub async fn wait_for_backend(
     expected_backend: &str,
     timeout: Duration,
 ) -> anyhow::Result<crate::harness::http::EchoResponse> {
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        match http.get(host, path).await {
-            Ok(resp) => {
-                let pod = resp.pod.as_deref().unwrap_or("");
-                if pod.starts_with(&format!("{expected_backend}-")) {
-                    return Ok(resp);
+    poll_until(
+        timeout,
+        POLL,
+        || format!("backend '{expected_backend}' at {host}{path}"),
+        || async {
+            match http.get(host, path).await {
+                Ok(resp) => {
+                    let pod = resp.pod.as_deref().unwrap_or("");
+                    if pod.starts_with(&format!("{expected_backend}-")) {
+                        Some(resp)
+                    } else {
+                        tracing::debug!(
+                            host,
+                            path,
+                            pod,
+                            expected_backend,
+                            "wrong backend — retrying"
+                        );
+                        None
+                    }
                 }
-                tracing::debug!(
-                    host,
-                    path,
-                    pod,
-                    expected_backend,
-                    "wrong backend — retrying"
-                );
+                Err(e) => {
+                    tracing::debug!(host, path, error = %e, "route not yet live");
+                    None
+                }
             }
-            Err(e) => tracing::debug!(host, path, error = %e, "route not yet live"),
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for backend '{expected_backend}' at {host}{path}");
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+        },
+    )
+    .await
 }
 
-/// Poll until `host`+`path` returns `expected_status`. Useful for routes where
-/// the expected response is an error code (e.g. 502 from a timeout route).
+/// Poll until `host`+`path` returns `expected_status`.
 pub async fn wait_for_route_status(
     http: &crate::harness::HttpClient,
     host: &str,
@@ -305,18 +344,25 @@ pub async fn wait_for_route_status(
     expected_status: u16,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        match http.get_status(host, path).await {
-            Ok(status) if status == expected_status => return Ok(()),
-            Ok(status) => tracing::debug!(host, path, status, expected_status, "wrong status"),
-            Err(e) => tracing::debug!(host, path, error = %e, "request failed"),
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for {host}{path} to return {expected_status}");
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+    poll_until(
+        timeout,
+        POLL,
+        || format!("{host}{path} to return {expected_status}"),
+        || async {
+            match http.get_status(host, path).await {
+                Ok(status) if status == expected_status => Some(()),
+                Ok(status) => {
+                    tracing::debug!(host, path, status, expected_status, "wrong status");
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(host, path, error = %e, "request failed");
+                    None
+                }
+            }
+        },
+    )
+    .await
 }
 
 pub async fn wait_for_ingress_lb_ip(
@@ -327,31 +373,30 @@ pub async fn wait_for_ingress_lb_ip(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let api: Api<Ingress> = Api::namespaced(client.clone(), namespace);
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        if let Ok(ing) = api.get(name).await {
-            let current = ing
-                .status
-                .as_ref()
-                .and_then(|s| s.load_balancer.as_ref())
-                .and_then(|lb| lb.ingress.as_deref())
-                .and_then(|entries| entries.first())
-                .and_then(|e| e.ip.as_deref());
-            if current == Some(expected_ip) {
-                return Ok(());
-            }
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for Ingress {namespace}/{name} to have loadBalancer ip={expected_ip}"
-            );
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+    poll_until(
+        timeout,
+        POLL,
+        || format!("Ingress {namespace}/{name} to have loadBalancer ip={expected_ip}"),
+        || async {
+            api.get(name)
+                .await
+                .ok()
+                .filter(|ing| {
+                    ing.status
+                        .as_ref()
+                        .and_then(|s| s.load_balancer.as_ref())
+                        .and_then(|lb| lb.ingress.as_deref())
+                        .and_then(|entries| entries.first())
+                        .and_then(|e| e.ip.as_deref())
+                        == Some(expected_ip)
+                })
+                .map(|_| ())
+        },
+    )
+    .await
 }
 
-/// Poll until the named Gateway has a top-level condition with the given type
-/// and status value (e.g. `"True"` or `"False"`).
+/// Poll until the named Gateway has a top-level condition with the given type and status value.
 pub async fn wait_for_gateway_condition(
     client: &kube::Client,
     name: &str,
@@ -361,30 +406,27 @@ pub async fn wait_for_gateway_condition(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let api: Api<Gateway> = Api::namespaced(client.clone(), namespace);
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        if let Ok(gw) = api.get(name).await {
-            let found = gw
-                .status
-                .as_ref()
-                .and_then(|s| s.conditions.as_deref())
-                .map(|conds| condition_matches(conds, type_, status))
-                .unwrap_or(false);
-            if found {
-                return Ok(());
-            }
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for Gateway {namespace}/{name} to have condition {type_}={status}"
-            );
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+    poll_until(
+        timeout,
+        POLL,
+        || format!("Gateway {namespace}/{name} to have condition {type_}={status}"),
+        || async {
+            api.get(name)
+                .await
+                .ok()
+                .filter(|gw| {
+                    gw.status
+                        .as_ref()
+                        .and_then(|s| s.conditions.as_deref())
+                        .is_some_and(|conds| condition_matches(conds, type_, status))
+                })
+                .map(|_| ())
+        },
+    )
+    .await
 }
 
-/// Poll until the named Gateway's per-listener status has a condition with the
-/// given type and status value for the specified listener.
+/// Poll until the named Gateway's per-listener status has a condition with the given type and status.
 pub async fn wait_for_gateway_listener_condition(
     client: &kube::Client,
     gw_name: &str,
@@ -395,48 +437,40 @@ pub async fn wait_for_gateway_listener_condition(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let api: Api<Gateway> = Api::namespaced(client.clone(), namespace);
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        if let Ok(gw) = api.get(gw_name).await {
-            let found = gw
-                .status
-                .as_ref()
-                .and_then(|s| s.listeners.as_deref())
-                .and_then(|listeners| listeners.iter().find(|l| l.name == listener_name))
-                .map(|l| condition_matches(l.conditions.as_slice(), type_, status))
-                .unwrap_or(false);
-            if found {
-                return Ok(());
-            }
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for Gateway {namespace}/{gw_name} listener \
-                 '{listener_name}' to have condition {type_}={status}"
-            );
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
+    poll_until(
+        timeout,
+        POLL,
+        || {
+            format!(
+                "Gateway {namespace}/{gw_name} listener '{listener_name}' to have condition {type_}={status}"
+            )
+        },
+        || async {
+            api.get(gw_name).await.ok().filter(|gw| {
+                gw.status
+                    .as_ref()
+                    .and_then(|s| s.listeners.as_deref())
+                    .and_then(|ls| ls.iter().find(|l| l.name == listener_name))
+                    .is_some_and(|l| condition_matches(l.conditions.as_slice(), type_, status))
+            }).map(|_| ())
+        },
+    )
+    .await
 }
 
 fn gateway_has_condition(gw: &Gateway, type_: &str) -> bool {
     gw.status
         .as_ref()
         .and_then(|s| s.conditions.as_deref())
-        .map(|conds| has_condition(conds, type_))
-        .unwrap_or(false)
+        .is_some_and(|conds| has_condition(conds, type_))
 }
 
 fn route_has_condition(route: &HTTPRoute, type_: &str) -> bool {
-    route
-        .status
-        .as_ref()
-        .map(|s| {
-            s.parents
-                .iter()
-                .any(|p| has_condition(p.conditions.as_slice(), type_))
-        })
-        .unwrap_or(false)
+    route.status.as_ref().is_some_and(|s| {
+        s.parents
+            .iter()
+            .any(|p| has_condition(p.conditions.as_slice(), type_))
+    })
 }
 
 fn has_condition(conditions: &[Condition], type_: &str) -> bool {

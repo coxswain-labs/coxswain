@@ -1,4 +1,5 @@
 use anyhow::Context as _;
+use ipnet::IpNet;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
@@ -19,14 +20,14 @@ pub struct ControllerProcess {
 #[derive(Default)]
 pub struct ControllerOptions {
     /// When set, passed as `--status-address` to the controller.
-    pub status_address: Option<String>,
+    pub status_address: Option<IpAddr>,
     /// When set, passed as `--ingress-default-backend` to the controller.
     /// Format: `<namespace>/<service>:<port>`.
     pub ingress_default_backend: Option<String>,
     /// When true, passes `--proxy-accept-proxy-protocol` to the controller.
     pub proxy_accept_proxy_protocol: bool,
-    /// CIDR ranges passed to `--proxy-trusted-sources` (comma-separated).
-    pub proxy_trusted_sources: Vec<String>,
+    /// CIDR ranges passed to `--proxy-trusted-sources`.
+    pub proxy_trusted_sources: Vec<IpNet>,
 }
 
 impl ControllerProcess {
@@ -76,7 +77,7 @@ impl ControllerProcess {
         ];
         if let Some(addr) = opts.status_address {
             args.push("--status-address".to_string());
-            args.push(addr);
+            args.push(addr.to_string());
         }
         if let Some(db) = opts.ingress_default_backend {
             args.push("--ingress-default-backend".to_string());
@@ -87,7 +88,13 @@ impl ControllerProcess {
         }
         if !opts.proxy_trusted_sources.is_empty() {
             args.push("--proxy-trusted-sources".to_string());
-            args.push(opts.proxy_trusted_sources.join(","));
+            args.push(
+                opts.proxy_trusted_sources
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
 
         let child = Command::new(&binary)
