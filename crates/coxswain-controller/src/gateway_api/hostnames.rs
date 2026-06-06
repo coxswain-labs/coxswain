@@ -1,3 +1,5 @@
+//! Hostname matching and specificity ordering for Gateway API listener isolation.
+
 /// Listener isolation priority: exact hostname > wildcard (longer = more specific) > empty.
 /// Returns a numeric rank: 0 = empty, wildcard length, usize::MAX = exact.
 pub(super) fn listener_specificity(hostname: &str) -> usize {

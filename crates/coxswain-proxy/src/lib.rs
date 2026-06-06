@@ -1,3 +1,9 @@
+//! Pingora-based reverse proxy for Coxswain.
+//!
+//! Exports the [`Proxy`] Pingora service, the lock-free [`RoutingEngine`], the
+//! SNI certificate selector [`SniCertSelector`], and the PROXY-protocol acceptor
+//! [`ProxyAcceptor`].
+
 pub(crate) mod accept;
 pub(crate) mod filter;
 mod proxy;

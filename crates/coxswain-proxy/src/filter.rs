@@ -1,3 +1,6 @@
+//! Request and response filter application: header modifiers, URL rewrites, and the
+//! `Forwarded` header injection for PROXY-protocol connections.
+
 use crate::proxy::ProxyCtx;
 use coxswain_core::routing::{FilterAction, HeaderMod, PathModifier};
 use http::{HeaderName, HeaderValue};

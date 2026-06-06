@@ -1,3 +1,5 @@
+//! Builds `Location` header values for `RequestRedirect` filters.
+
 use coxswain_core::routing::PathModifier;
 use http::header;
 use pingora_http::RequestHeader;

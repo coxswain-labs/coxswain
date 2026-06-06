@@ -1,3 +1,5 @@
+//! Polling helpers that retry until Kubernetes resources reach the desired state.
+
 use anyhow::Context as _;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
@@ -63,6 +65,7 @@ pub async fn wait_for_tls_cert_rotation(
     .await
 }
 
+/// Poll HTTPS GET requests until the route returns a 2xx JSON body.
 pub async fn wait_for_https_route(
     tls_addr: SocketAddr,
     host: &str,
@@ -90,6 +93,7 @@ pub async fn wait_for_https_route(
     .await
 }
 
+/// Poll `/readyz` at `addr` until it returns 200 or `timeout` expires.
 pub async fn wait_for_ready(addr: SocketAddr, timeout: Duration) -> anyhow::Result<()> {
     let url = format!("http://{addr}/readyz");
     let client = reqwest::Client::builder()
@@ -113,6 +117,7 @@ pub async fn wait_for_ready(addr: SocketAddr, timeout: Duration) -> anyhow::Resu
     .await
 }
 
+/// Poll until the GatewayClass has a non-empty `status.supportedFeatures` list.
 pub async fn wait_for_gatewayclass_supported_features(
     client: &kube::Client,
     name: &str,
@@ -138,6 +143,7 @@ pub async fn wait_for_gatewayclass_supported_features(
     .await
 }
 
+/// Poll until the HTTPRoute has a `Programmed=True` condition from at least one parent.
 pub async fn wait_for_httproute_programmed(
     client: &kube::Client,
     name: &str,
@@ -160,6 +166,7 @@ pub async fn wait_for_httproute_programmed(
     .await
 }
 
+/// Poll until the Gateway has both `Accepted=True` and `Programmed=True` conditions.
 pub async fn wait_for_gateway_programmed(
     client: &kube::Client,
     name: &str,
@@ -218,6 +225,7 @@ pub async fn wait_for_backends(namespace: &str) -> anyhow::Result<()> {
     wait_for_deployments(namespace, &["echo-a", "echo-b", "echo-c"]).await
 }
 
+/// Poll until the named Deployments in `namespace` have `condition=Available`.
 pub async fn wait_for_deployments(namespace: &str, names: &[&str]) -> anyhow::Result<()> {
     let deployments: Vec<String> = names.iter().map(|n| format!("deployment/{n}")).collect();
     let mut args = vec!["wait", "--for=condition=available", "--timeout=300s"];
@@ -274,6 +282,7 @@ pub async fn wait_for_ws_route(
     .await
 }
 
+/// Poll until `host`+`path` returns a successful echo response.
 pub async fn wait_for_route(
     http: &crate::harness::HttpClient,
     host: &str,
@@ -365,6 +374,7 @@ pub async fn wait_for_route_status(
     .await
 }
 
+/// Poll until `Ingress.status.loadBalancer.ingress[0].ip` equals `expected_ip`.
 pub async fn wait_for_ingress_lb_ip(
     client: &kube::Client,
     name: &str,

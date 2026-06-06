@@ -1,3 +1,5 @@
+//! RAII guards for test-scoped `Namespace` and `IngressClass` resources.
+
 use k8s_openapi::api::core::v1::Namespace;
 use k8s_openapi::api::networking::v1::IngressClass;
 use kube::{
@@ -8,12 +10,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// RAII guard for a test-scoped Kubernetes namespace; deletes the namespace on drop.
 pub struct NamespaceGuard {
+    /// Name of the created namespace.
     pub name: String,
     client: Client,
 }
 
 impl NamespaceGuard {
+    /// Create a uniquely-named namespace with the given `prefix` and return its guard.
     pub async fn create(client: &Client, prefix: &str) -> anyhow::Result<Self> {
         // Include the process ID so names are unique across test runs even when
         // a previous run left namespaces in Terminating state.
@@ -55,12 +60,16 @@ impl Drop for NamespaceGuard {
 
 /// RAII guard for a cluster-scoped `IngressClass`. Deletes the IngressClass on
 /// drop so test-only classes don't leak between runs.
+/// RAII guard for a cluster-scoped `IngressClass`. Deletes the IngressClass on
+/// drop so test-only classes don't leak between runs.
 pub struct IngressClassGuard {
+    /// Name of the created IngressClass.
     pub name: String,
     client: Client,
 }
 
 impl IngressClassGuard {
+    /// Wrap an existing `IngressClass` name in a drop guard (does not create it).
     pub fn new(client: &Client, name: impl Into<String>) -> Self {
         Self {
             name: name.into(),

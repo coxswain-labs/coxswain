@@ -1,3 +1,5 @@
+//! Generic lock-free snapshot primitive backed by [`arc_swap::ArcSwap`].
+
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 
@@ -16,17 +18,20 @@ impl<T> Clone for Shared<T> {
 }
 
 impl<T: Default> Shared<T> {
+    /// Construct a new handle wrapping the default value.
     pub fn new() -> Self {
         Self(Arc::new(ArcSwap::from_pointee(T::default())))
     }
 }
 
 impl<T> Shared<T> {
+    /// Atomically load the current snapshot (refcount bump, no lock).
     #[must_use]
     pub fn load(&self) -> Arc<T> {
         self.0.load_full()
     }
 
+    /// Atomically replace the current snapshot with `value`.
     pub fn store(&self, value: Arc<T>) {
         self.0.store(value);
     }

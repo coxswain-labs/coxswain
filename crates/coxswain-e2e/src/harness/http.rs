@@ -1,20 +1,31 @@
+//! HTTP and HTTPS test clients, echo response deserialization, and backend-count helper.
+
 use anyhow::Context as _;
 use reqwest::Method;
 use std::net::SocketAddr;
 
+/// JSON body returned by the echo server on every request.
 #[derive(Debug, serde::Deserialize)]
 pub struct EchoResponse {
+    /// Request path as seen by the echo server.
     pub path: Option<String>,
+    /// `Host` header as seen by the echo server.
     pub host: Option<String>,
+    /// HTTP method of the request.
     pub method: Option<String>,
+    /// Kubernetes namespace of the pod that responded.
     pub namespace: Option<String>,
+    /// Kubernetes pod name that responded.
     pub pod: Option<String>,
+    /// Kubernetes service name that served the request.
     pub service: Option<String>,
+    /// All request headers forwarded by the proxy.
     #[serde(default)]
     pub headers: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl EchoResponse {
+    /// Assert that the response came from a pod belonging to `deployment_name`.
     pub fn assert_backend(&self, deployment_name: &str) {
         let pod = self.pod.as_deref().unwrap_or("");
         assert!(
@@ -24,12 +35,19 @@ impl EchoResponse {
     }
 }
 
+/// HTTP test client pre-configured to send requests to the coxswain proxy.
 pub struct HttpClient {
     inner: reqwest::Client,
+    /// Address of the proxy's HTTP listener.
     pub proxy_addr: SocketAddr,
 }
 
 impl HttpClient {
+    /// Construct a client targeting `proxy_addr`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying `reqwest` client cannot be built.
     pub fn new(proxy_addr: SocketAddr) -> anyhow::Result<Self> {
         let inner = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -66,11 +84,13 @@ impl HttpClient {
         }
     }
 
+    /// GET `path` with `Host: host`. Returns the parsed echo body on 2xx, or an error.
     pub async fn get(&self, host: &str, path: &str) -> anyhow::Result<EchoResponse> {
         let (status, body) = self.request(Method::GET, host, path, &[]).await?;
         body.ok_or_else(|| anyhow::anyhow!("GET {host}{path} returned {status}"))
     }
 
+    /// GET `path` and return only the HTTP status code.
     pub async fn get_status(&self, host: &str, path: &str) -> anyhow::Result<u16> {
         let (status, _) = self.request(Method::GET, host, path, &[]).await?;
         Ok(status)

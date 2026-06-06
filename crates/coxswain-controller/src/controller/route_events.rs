@@ -1,3 +1,5 @@
+//! Kubernetes API calls that write `HTTPRoute` status patches.
+
 use super::conditions::{filter_owned_parent_refs, make_condition};
 use crate::gw_types::{
     HttpRoute,

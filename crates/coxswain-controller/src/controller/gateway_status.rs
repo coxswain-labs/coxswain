@@ -1,3 +1,5 @@
+//! `Gateway` status patch builder and staleness check (GEP-1364).
+
 use super::conditions::{has_condition, make_condition};
 use super::config::StatusAddress;
 use crate::gw_types::v::gateways::{

@@ -1,3 +1,5 @@
+//! Resolves Ingress backend service port numbers from `Service.spec.ports`.
+
 use crate::endpoints;
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::networking::v1::IngressServiceBackend;

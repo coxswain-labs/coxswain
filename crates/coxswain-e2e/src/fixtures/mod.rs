@@ -1,3 +1,5 @@
+//! Fixture YAML path constants and the template-variable substitutor for `kubectl apply`.
+
 pub mod backends;
 pub mod gateway_api;
 pub mod ingress;
@@ -12,15 +14,18 @@ use tokio::io::AsyncWriteExt as _;
 /// `https_port` fields substitute `HTTP_PORT` and `HTTPS_PORT` respectively
 /// when non-zero. Use [`FixtureVars::with`] to add extra substitutions.
 pub struct FixtureVars {
+    /// Substituted for `TESTNS` in the YAML template.
     pub namespace: String,
     /// Substituted for `HTTP_PORT` in the YAML template. `0` means skip.
     pub http_port: u16,
     /// Substituted for `HTTPS_PORT` in the YAML template. `0` means skip.
     pub https_port: u16,
+    /// Additional `(placeholder, replacement)` pairs applied before the standard substitutions.
     pub extra: Vec<(String, String)>,
 }
 
 impl FixtureVars {
+    /// Construct a minimal vars set with only a namespace (all ports default to 0 = skip).
     pub fn new(namespace: impl Into<String>) -> Self {
         Self {
             namespace: namespace.into(),
@@ -30,6 +35,7 @@ impl FixtureVars {
         }
     }
 
+    /// Add an extra template substitution, returning `self` for chaining.
     pub fn with(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
         self.extra.push((key.into(), val.into()));
         self

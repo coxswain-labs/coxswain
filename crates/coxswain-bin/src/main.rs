@@ -1,3 +1,5 @@
+//! Coxswain binary entry point: CLI parsing, shared-state wiring, and Pingora runtime bootstrap.
+
 mod hot_reload;
 
 use anyhow::{Context, Result};
@@ -32,12 +34,16 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
+/// Log output format selector.
 #[derive(ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
 pub enum LogFormat {
+    /// Human-readable output for local development.
     Console,
+    /// Structured JSON output for production environments.
     Json,
 }
 
+/// Coxswain: a Kubernetes Ingress & Gateway API Controller built on Pingora.
 #[derive(Parser, Debug)]
 #[command(
     name = "coxswain",
@@ -46,16 +52,19 @@ pub enum LogFormat {
     arg_required_else_help = true
 )]
 pub struct Cli {
+    /// Subcommand to run.
     #[command(subcommand)]
     pub command: Commands,
 }
 
+/// Top-level subcommands.
 #[derive(clap::Subcommand, Debug)]
 pub enum Commands {
     /// Start the controller and proxy.
     Serve(ServeArgs),
 }
 
+/// Arguments for the `serve` subcommand.
 #[derive(Parser, Debug)]
 pub struct ServeArgs {
     /// GatewayClass `spec.controllerName` this instance claims.

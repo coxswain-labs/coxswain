@@ -1,3 +1,5 @@
+//! Validated configuration for the leader-election controller.
+
 use std::net::IpAddr;
 use std::time::Duration;
 use thiserror::Error;
@@ -10,7 +12,9 @@ use thiserror::Error;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum StatusAddress {
+    /// A bare IP address written to `.ip` in the status block.
     Ip(IpAddr),
+    /// A DNS hostname written to `.hostname` in the status block.
     Hostname(String),
 }
 
@@ -19,7 +23,12 @@ pub enum StatusAddress {
 pub enum ControllerConfigError {
     /// The lease renewal interval is too fast relative to the TTL.
     #[error("lease_renew_interval ({renew:?}) must be at most 1/3 of lease_ttl ({ttl:?})")]
-    LeaseRatioTooFast { ttl: Duration, renew: Duration },
+    LeaseRatioTooFast {
+        /// The configured lease TTL.
+        ttl: Duration,
+        /// The configured renewal interval that is too fast.
+        renew: Duration,
+    },
     /// `--status-address` was provided but the value is empty after trimming.
     #[error("status_address must not be empty")]
     EmptyStatusAddress,
@@ -33,10 +42,15 @@ pub enum ControllerConfigError {
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct ControllerConfig {
+    /// `GatewayClass.spec.controllerName` this instance claims.
     pub controller_name: String,
+    /// Pod name used as the lease holder identity.
     pub pod_name: String,
+    /// Namespace in which the leader-election `Lease` resource is created.
     pub pod_namespace: String,
+    /// How long the lease stays valid without renewal.
     pub lease_ttl: Duration,
+    /// How often the active leader renews its lease.
     pub lease_renew_interval: Duration,
     /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
     pub watch_namespace: Option<String>,
@@ -47,6 +61,16 @@ pub struct ControllerConfig {
 }
 
 impl ControllerConfig {
+    /// Validate and construct a [`ControllerConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerConfigError::LeaseRatioTooFast`] when
+    /// `lease_renew_interval * 3 > lease_ttl` (the renewal rate is too fast relative
+    /// to the TTL, risking eviction of a live leader by a standby).
+    ///
+    /// Returns [`ControllerConfigError::EmptyStatusAddress`] when `status_address`
+    /// is `Some` but is empty after trimming.
     #[must_use = "the validated config must be used or the validation is pointless"]
     pub fn new(
         controller_name: String,

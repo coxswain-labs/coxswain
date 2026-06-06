@@ -1,3 +1,5 @@
+//! Per-request and per-connection context types for the Pingora proxy.
+
 use coxswain_core::routing::{BackendGroup, FilterAction, RouteTimeouts};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,21 +27,29 @@ tokio::task_local! {
 /// in subsequent hooks (e.g. for SNI or redirect) is a refcount bump, not
 /// a heap allocation.
 pub struct ResolvedRoute {
+    /// Chosen backend group for this request.
     pub backend_group: Arc<BackendGroup>,
+    /// Filter actions to apply on request and response.
     pub filters: Arc<[FilterAction]>,
+    /// Per-route timeout settings merged with global defaults.
     pub timeouts: RouteTimeouts,
+    /// Original `Host` header value (before any rewrite).
     pub original_host: Arc<str>,
+    /// Original request path (before any rewrite).
     pub original_path: Arc<str>,
 }
 
 /// Per-request context carrying the real client address extracted from the PROXY header.
 #[derive(Default)]
 pub struct ProxyCtx {
+    /// Real client IP from the PROXY protocol header (set only on the PROXY-protocol path).
     pub real_client_addr: Option<SocketAddr>,
+    /// Protocol string (`"http"` or `"https"`) from the PROXY header.
     pub real_client_proto: Option<&'static str>,
     /// Local listener port for the connection; set from CONN_INFO on the PROXY-protocol path,
     /// or derived from the session's server address on the standard path.
     pub local_port: Option<u16>,
+    /// Routing result set during `request_filter`; consumed by later hooks.
     pub resolved: Option<ResolvedRoute>,
     /// Absolute deadline for the total request (from `timeouts.request`). 504 if exceeded.
     pub request_deadline: Option<Instant>,

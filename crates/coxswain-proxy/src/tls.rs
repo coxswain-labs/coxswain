@@ -1,3 +1,5 @@
+//! SNI-driven certificate selector for the Pingora TLS listener.
+
 use async_trait::async_trait;
 use coxswain_core::tls::SharedTlsStore;
 use pingora_core::listeners::TlsAccept;
@@ -14,6 +16,7 @@ pub struct SniCertSelector {
 }
 
 impl SniCertSelector {
+    /// Wrap a [`SharedTlsStore`] in an SNI certificate selector.
     pub fn new(tls: SharedTlsStore) -> Self {
         Self { tls }
     }

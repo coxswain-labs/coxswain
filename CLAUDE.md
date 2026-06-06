@@ -39,6 +39,97 @@ Per-crate responsibilities (see each crate's `src/lib.rs` for the up-to-date mod
 - **`coxswain-bin`** — entry point: CLI parsing, shared-state wiring, Pingora runtime bootstrap.
 - **`coxswain-e2e`** — black-box integration tests against a live cluster (kind/Orb); not a runtime dependency.
 
+## Code Quality
+
+These rules were established through the v0.1 refactor pass (issues #136–#147). They are deliberate decisions — do not silently undo them.
+
+### Lints
+
+`[workspace.lints]` in `Cargo.toml` is the single source of truth for lint configuration. **Never add `#[allow(...)]` or `#[expect(...)]` to silence a lint** — both are per-site escape hatches that this rule prohibits, regardless of attribute spelling. Fix the root cause instead.
+
+- If a lint fires on *our* code: rename, refactor, or restructure to satisfy it.
+- If a lint fires on an *upstream-imposed* name (e.g. `HTTPRoute` from codegen tripping `upper_case_acronyms`): re-export with a project-canonical alias at the crate boundary (`gw_types.rs`) and use that alias everywhere internally. This is a one-time fix; a per-site annotation locks in an inconsistency forever.
+- Workspace-wide opt-outs in `[workspace.lints]` are acceptable only when an entire lint *group* is too broad for the project. The current example is `clippy::pedantic = "allow"`. Per-site annotations are never acceptable.
+
+The current workspace shape (do not drift without a deliberate decision):
+
+```toml
+[workspace.lints.rust]
+unsafe_code  = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+correctness     = { level = "deny",  priority = -1 }
+suspicious      = { level = "warn",  priority = -1 }
+style           = { level = "warn",  priority = -1 }
+complexity      = { level = "warn",  priority = -1 }
+perf            = { level = "warn",  priority = -1 }
+pedantic        = { level = "allow", priority = -1 }
+type_complexity = "deny"
+unwrap_used     = "warn"
+expect_used     = "warn"
+```
+
+The one legitimate use of `#![allow(missing_docs)]` is at the top of bench files and `coxswain-e2e/tests/*`, where `criterion_group!` and similar macros expand to `pub fn` items that are not user-controllable.
+
+`clippy.toml` sets `allow-unwrap-in-tests = true` / `allow-expect-in-tests = true`. These apply **only** to code inside `#[test]` functions and `#[cfg(test)]` modules — not to non-test code that tests happen to call (e.g. `coxswain-e2e/src/`). Harness and fixture code is non-test code that runs under test, not test code itself.
+
+### Panics and unwrap
+
+Never use `.unwrap()` or `.expect("message")` in non-test code.
+
+- **Recoverable errors** → propagate with `?` or return a typed `Err`.
+- **Invariants** (violated only by a bug in this module) → `unwrap_or_else(|e| panic!("invariant: {e}"))`. Prefer this form over `.expect("msg")` because it interpolates the actual error alongside the invariant claim, making any violation self-diagnosing. The message must state *what must be true*, not *what the code is doing*.
+
+The same rule applies to `unreachable!()` and `todo!()` — they are panics; include a message stating the invariant that makes the branch impossible. `debug_assert!` is permitted for invariants too expensive to check in release builds.
+
+Code in `crates/*/benches/` and `crates/coxswain-e2e/` may use plain context-style messages (`"{addr}: {e}"`) because fixture and setup failures don't have the "violated only by a bug" framing.
+
+### Function signatures
+
+Functions with more than 7 parameters trigger `clippy::too_many_arguments`. Do not suppress and do not raise the threshold in `clippy.toml` — refactor into a parameter-grouping struct instead. Name the struct after its semantic role (`ReflectorStores<'a>`, `SharedOutputs<'a>`), not after the function it serves. The struct lives in the same module as the function and takes the narrowest visibility that compiles (typically `pub(crate)` or `pub(super)`).
+
+### Documentation
+
+Every `.rs` file must open with a `//!` module header (a short paragraph: what the module owns, not what every function in it does). Every `pub` item that introduces a new name must carry a `///` doc comment; trivial re-exports (`pub use foo::Bar;`) are exempt.
+
+- Fallible `pub` functions that return `Result` must include a `# Errors` section listing the variants.
+- `pub` functions that can panic under documented conditions must include `# Panics`.
+- `unsafe` functions must include `# Safety` (currently a non-issue because `unsafe_code = "deny"`, but apply this if that ever changes).
+
+Doc comments explain **why** and **what the invariants are** — the names already say *what*. One precise sentence beats a paragraph of padding.
+
+> **Backfill note:** Only ~6 fallible `pub` functions currently carry `# Errors` sections. New code is held to the rule immediately; existing under-coverage is a known gap to backfill incrementally.
+
+### Visibility
+
+Default to `pub(crate)` for items reachable within the workspace, `pub(super)` for items that only need to cross a module boundary. Use bare `pub` only for items re-exported at the crate root (`lib.rs`) that are consumed by another crate in the workspace. See `rust-skills` rules `proj-pub-crate-internal` and `proj-pub-super-parent`.
+
+### Hot path
+
+The proxy request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet::apply_request_filters`, `filter::FilterSet::apply_response_filters`) is performance-critical:
+
+- At `request_filter` entry, capture immutable request data (host, path, query) once as `Arc<str>` / `Option<String>` — at most 3 allocations per request. Later Pingora hooks clone these arcs cheaply without re-borrowing `session.req_header()`.
+- Beyond that fixed capture set, the routing lookup and upstream-selection paths must not allocate. (Exception: TLS connections allocate one `String` for the SNI hostname in `upstream_peer` — documented and deliberate.)
+- Use `Shared<T>` (the `ArcSwap`-backed wrapper in `coxswain-core`) for lock-free routing/TLS snapshot reads.
+- Never hold a `Mutex` or `RwLock` guard across an `.await` point.
+
+### Error types
+
+Every crate-defined error type uses `#[derive(thiserror::Error)]` with a `#[error("...")]` message on each variant. Error enums are `#[non_exhaustive]`. Library crates (`coxswain-core`, `coxswain-controller`, `coxswain-proxy`, `coxswain-health`, `coxswain-admin`) never use `anyhow` — only `coxswain-bin` may use it at the binary boundary.
+
+### API stability annotations
+
+Every public struct and enum is `#[non_exhaustive]` unless it is intentionally open for downstream construction. Every `pub fn` that returns a value the caller is expected to consume carries `#[must_use]`. This sweep was issue #140 — do not omit these attributes on new public items.
+
+### Test layout
+
+Per-source-file unit tests live in a `#[cfg(test)] mod tests;` submodule in the same file (small bodies) or in a sibling `<module>_tests.rs` file (large bodies). Cross-cutting tests for a crate live under `crates/<crate>/src/tests/`. Integration tests against the binary live in `crates/coxswain-e2e/tests/`. Established by issues #143 and #144 — do not collapse back into one test block per file.
+
+### Per-crate Cargo manifest
+
+Every `crates/*/Cargo.toml` must declare `[lints] workspace = true`. Without it, a new crate silently escapes every workspace lint, defeating the single-source-of-truth rule above.
+
 ## GitHub Issue Workflow
 
 ### Starting work on issue N

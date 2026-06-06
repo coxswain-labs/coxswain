@@ -1,3 +1,6 @@
+//! Leader-elected status writer: watches resource events and patches Gateway API
+//! status conditions back to the Kubernetes API server.
+
 use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
@@ -54,6 +57,7 @@ pub struct Controller {
 }
 
 impl Controller {
+    /// Construct a new controller instance (does not start the watch loop).
     pub fn new(
         synced: Arc<AtomicBool>,
         leader: Arc<AtomicBool>,

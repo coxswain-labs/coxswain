@@ -1,3 +1,10 @@
+//! Kubernetes controller for Coxswain.
+//!
+//! Runs reflector-backed stores for all relevant resources (`HTTPRoute`, `Ingress`,
+//! `Gateway`, `Secret`, `EndpointSlice`, …), debounces updates into routing-table
+//! rebuilds, and writes Gateway API status conditions back through a leader-elected
+//! [`Controller`].
+
 mod controller;
 pub(crate) mod endpoints;
 pub(crate) mod gateway_api;

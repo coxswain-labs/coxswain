@@ -1,3 +1,5 @@
+//! TLS load helpers and shared health-map types for Gateway listeners and HTTPRoutes.
+
 use crate::keys::RouteParentKey;
 use arc_swap::ArcSwap;
 use coxswain_core::ownership::ObjectKey;
@@ -34,11 +36,20 @@ pub enum ListenerTlsOutcome {
     Resolved,
     /// `certificateRefs[0].namespace` differs from the Gateway namespace and
     /// no matching `ReferenceGrant` was found.
-    RefNotPermitted { message: String },
+    RefNotPermitted {
+        /// Human-readable description of why the ref was not permitted.
+        message: String,
+    },
     /// Secret missing, wrong type, or missing `tls.crt` / `tls.key` keys.
-    InvalidCertificateRef { message: String },
+    InvalidCertificateRef {
+        /// Human-readable description of the certificate error.
+        message: String,
+    },
     /// Listener configuration is invalid (e.g. no `hostname`, unsupported mode).
-    Invalid { message: String },
+    Invalid {
+        /// Human-readable description of the configuration error.
+        message: String,
+    },
 }
 
 impl ListenerTlsOutcome {
@@ -68,6 +79,7 @@ impl ListenerTlsOutcome {
 /// Consolidated per-listener metadata for one Gateway listener.
 #[derive(Clone, Debug, Default)]
 pub struct ListenerInfo {
+    /// TLS resolution outcome for this listener.
     pub tls_outcome: ListenerTlsOutcome,
     /// Number of routes attached to this listener.
     /// Populated by the reconciler's route-counting pass after the TLS walk.
@@ -107,6 +119,7 @@ impl Default for SharedGatewayListenerHealth {
 }
 
 impl SharedGatewayListenerHealth {
+    /// Construct a new shared health map (initially empty).
     pub fn new() -> Self {
         Self(Arc::new(GatewayListenerHealthInner {
             map: ArcSwap::from_pointee(HashMap::new()),
@@ -114,6 +127,7 @@ impl SharedGatewayListenerHealth {
         }))
     }
 
+    /// Load the current health map snapshot.
     pub fn load(&self) -> arc_swap::Guard<Arc<HashMap<ObjectKey, GatewayListenerHealth>>> {
         self.0.map.load()
     }
@@ -155,6 +169,7 @@ impl Default for RouteParentHealth {
     }
 }
 
+/// Map from `(route, parent)` key to per-parent health status.
 pub type HttpRouteHealthMap = HashMap<RouteParentKey, RouteParentHealth>;
 
 struct SharedHttpRouteHealthInner {
@@ -174,6 +189,7 @@ impl Default for SharedHttpRouteHealth {
 }
 
 impl SharedHttpRouteHealth {
+    /// Construct a new shared route health map (initially empty).
     pub fn new() -> Self {
         Self(Arc::new(SharedHttpRouteHealthInner {
             map: ArcSwap::from_pointee(HashMap::new()),
@@ -181,6 +197,7 @@ impl SharedHttpRouteHealth {
         }))
     }
 
+    /// Load the current route health map snapshot.
     pub fn load(&self) -> arc_swap::Guard<Arc<HttpRouteHealthMap>> {
         self.0.map.load()
     }
@@ -200,6 +217,14 @@ impl SharedHttpRouteHealth {
 /// Look up a `kubernetes.io/tls` Secret by namespace/name from the reflector
 /// store and extract the PEM bytes. Both cert and key data must contain a PEM
 /// header (`-----BEGIN`) to be considered valid.
+///
+/// # Errors
+///
+/// Returns [`TlsLoadError::NotFound`] if the Secret is not in the store,
+/// [`TlsLoadError::WrongType`] if its `type` is not `kubernetes.io/tls`,
+/// [`TlsLoadError::MissingCert`] if `tls.crt` is absent,
+/// [`TlsLoadError::MissingKey`] if `tls.key` is absent, or
+/// [`TlsLoadError::InvalidPem`] if either field lacks a `-----BEGIN` header.
 #[must_use = "TLS certificate load result must be handled"]
 pub(crate) fn load_tls_cert(
     ns: &str,

@@ -1,3 +1,5 @@
+//! Listener binding: matches `HTTPRoute.parentRefs` to Gateway listeners.
+
 use super::hostnames;
 use crate::gw_types::v::httproutes::HttpRouteParentRefs;
 use crate::keys::ListenerKey;

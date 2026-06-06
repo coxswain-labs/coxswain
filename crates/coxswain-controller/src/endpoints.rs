@@ -1,3 +1,5 @@
+//! Endpoint resolution: maps `EndpointSlice` ready addresses into `BackendGroup`s.
+
 use coxswain_core::routing::{BackendProtocol, parse_app_protocol};
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;

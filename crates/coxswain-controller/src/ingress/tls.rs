@@ -1,3 +1,5 @@
+//! Ingress TLS reconciliation: maps `spec.tls[].secretName` entries into the TLS store.
+
 use super::IngressReconciler;
 use super::class::claimed_ingress_class;
 use crate::tls::load_tls_cert;

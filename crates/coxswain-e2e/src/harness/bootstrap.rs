@@ -1,3 +1,5 @@
+//! Cluster bootstrapping: installs Gateway API CRDs, cert-manager, and Coxswain manifests.
+
 use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -7,6 +9,16 @@ use tokio::process::Command;
 /// `gateway-api` in workspace `Cargo.toml`. See `docs/gateway-api-support.md`.
 const GATEWAY_API_VERSION: &str = include_str!("../../../../.gateway-api-version").trim_ascii();
 
+/// Ensure the cluster is ready for e2e tests: installs Gateway API CRDs (once),
+/// cert-manager (once), and applies the Coxswain service manifests.
+///
+/// Idempotent — safe to call multiple times; subsequent calls skip already-installed
+/// components in under 200 ms.
+///
+/// # Errors
+///
+/// Returns an error if any `kubectl apply` step fails or a required component
+/// does not become available within its timeout.
 pub async fn bootstrap() -> anyhow::Result<()> {
     let root = workspace_root().context("workspace root")?;
 
@@ -195,6 +207,11 @@ async fn kubectl_apply_url(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Returns the absolute path to the Cargo workspace root.
+///
+/// # Errors
+///
+/// Returns an error if [`std::fs::canonicalize`] fails (e.g. the path does not exist).
 pub fn workspace_root() -> anyhow::Result<PathBuf> {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

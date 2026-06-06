@@ -1,3 +1,5 @@
+//! Kubernetes API calls that write `Ingress` status patches.
+
 use super::config::StatusAddress;
 use super::ingress_status::build_ingress_status_patch;
 use k8s_openapi::api::networking::v1::Ingress;

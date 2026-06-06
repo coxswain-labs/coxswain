@@ -1,3 +1,5 @@
+//! Small Kubernetes API helpers shared across controller sub-modules.
+
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::{Client, api::Api};
 use std::time::SystemTime;

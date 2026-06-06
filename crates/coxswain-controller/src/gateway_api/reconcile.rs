@@ -1,3 +1,6 @@
+//! Core `HTTPRoute`/`Gateway` reconciliation: builds routing table entries from
+//! listener bindings and resolved backend groups.
+
 use super::GatewayApiReconciler;
 use super::bindings::{ListenerBinding, compute_listener_bindings};
 use crate::endpoints;

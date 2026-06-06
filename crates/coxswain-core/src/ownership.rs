@@ -1,3 +1,5 @@
+//! Kubernetes ownership helpers — object identity keys and Gateway ownership tracking.
+
 use crate::shared::Shared;
 use std::collections::HashSet;
 
@@ -7,11 +9,14 @@ use std::collections::HashSet;
 /// the API endpoint type. Matches the terminology used by `kube`'s `ObjectRef`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectKey {
+    /// Kubernetes namespace.
     pub ns: String,
+    /// Resource name within the namespace.
     pub name: String,
 }
 
 impl ObjectKey {
+    /// Construct an [`ObjectKey`] from namespace and name strings.
     pub fn new(ns: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             ns: ns.into(),

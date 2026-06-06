@@ -1,3 +1,5 @@
+//! Route entry types: backend groups, filter actions, route timeouts, and path-rule metadata.
+
 use crate::routing::predicate::MatchPredicates;
 use http::{HeaderName, HeaderValue};
 use std::net::SocketAddr;
@@ -83,10 +85,13 @@ impl BackendPool {
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum PathModifier {
+    /// Discard the entire original path and use this fixed value instead.
     ReplaceFullPath(String),
     /// Replace `prefix` with `replacement` in the matched request path.
     ReplacePrefixMatch {
+        /// The path prefix to strip (as registered at route build time).
         prefix: String,
+        /// The string to prepend in place of the stripped prefix.
         replacement: String,
     },
 }
@@ -129,15 +134,21 @@ impl PathModifier {
 /// Error produced when a header name or value is invalid at routing-table build time.
 #[derive(Debug, thiserror::Error)]
 pub enum HeaderModError {
+    /// A header name string is not a valid HTTP token.
     #[error("invalid header name {name:?}: {source}")]
     InvalidName {
+        /// The invalid header name string.
         name: String,
+        /// The underlying parse error.
         #[source]
         source: http::header::InvalidHeaderName,
     },
+    /// A header value string contains characters forbidden by RFC 7230.
     #[error("invalid header value for {name:?}: {source}")]
     InvalidValue {
+        /// The header name the value was associated with.
         name: String,
+        /// The underlying parse error.
         #[source]
         source: http::header::InvalidHeaderValue,
     },
@@ -217,16 +228,22 @@ pub enum FilterAction {
     ResponseHeaderModifier(HeaderMod),
     /// Return a 3xx redirect without connecting to the upstream.
     RequestRedirect {
+        /// Override the `scheme` component of the redirect URL.
         scheme: Option<String>,
+        /// Override the `host` component of the redirect URL.
         hostname: Option<String>,
+        /// Override the port of the redirect URL.
         port: Option<u16>,
         /// HTTP status code (default 302).
         status_code: u16,
+        /// Optional path rewrite applied to the redirect URL.
         path: Option<PathModifier>,
     },
     /// Rewrite the upstream request host and/or path (client-visible URL is unchanged).
     UrlRewrite {
+        /// Replacement `Host` header for the upstream request.
         hostname: Option<String>,
+        /// Path rewrite applied to the upstream request.
         path: Option<PathModifier>,
     },
 }
@@ -394,12 +411,16 @@ fn gcd(a: u16, b: u16) -> u16 {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteKind {
+    /// Exact path match (must equal the request path character for character).
     Exact,
+    /// Prefix path match (request path must start with the registered prefix).
     Prefix,
+    /// Regular-expression path match.
     Regex,
 }
 
 impl RouteKind {
+    /// Returns the lowercase string representation used in admin API responses.
     pub fn as_str(self) -> &'static str {
         match self {
             RouteKind::Exact => "exact",
@@ -411,8 +432,11 @@ impl RouteKind {
 
 /// Snapshot of a single path rule insertion, kept for inspection.
 pub struct RouteInfo {
+    /// Registered path string (exact, prefix, or regex).
     pub path: String,
+    /// How the path is matched.
     pub kind: RouteKind,
+    /// Backend group selected when this rule matches.
     pub backend_group: Arc<BackendGroup>,
 }
 
@@ -422,7 +446,9 @@ pub struct RouteConflict {
     pub port: u16,
     /// Host pattern where the conflict occurred (`"*"` for catch-all, `"*.example.com"` for wildcard).
     pub host: String,
+    /// Path string of the conflicting rule.
     pub path: String,
+    /// Match kind of the conflicting rule.
     pub kind: RouteKind,
     /// [`BackendGroup::name`] of the rule that was rejected.
     pub rejected_group: String,
@@ -431,9 +457,13 @@ pub struct RouteConflict {
 /// A single routing candidate: a backend group plus the predicates that must hold
 /// for this candidate to be selected, along with metadata for precedence ordering.
 pub struct RouteEntry {
+    /// Backend group to forward matching requests to.
     pub backend_group: Arc<BackendGroup>,
+    /// Method, header, and query predicates that must all pass for this rule to fire.
     pub predicates: MatchPredicates,
+    /// Filter actions applied to the request/response when this rule matches.
     pub filters: Arc<[FilterAction]>,
+    /// Per-rule timeout overrides.
     pub timeouts: RouteTimeouts,
     /// Parent resource identity `"{namespace}/{name}"` — used for precedence tiebreaking.
     pub route_id: String,

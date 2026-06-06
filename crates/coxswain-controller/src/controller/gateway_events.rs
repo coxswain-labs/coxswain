@@ -1,3 +1,5 @@
+//! Kubernetes API calls that write `Gateway` status patches.
+
 use super::config::StatusAddress;
 use super::gateway_status::build_gateway_status_patch;
 use crate::gw_types::v::gateways::Gateway;

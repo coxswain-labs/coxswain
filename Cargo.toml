@@ -83,7 +83,7 @@ tracing-test       = { version = "0.2" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
-# missing_docs intentionally deferred to W2 (#147)
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 correctness     = { level = "deny", priority = -1 }

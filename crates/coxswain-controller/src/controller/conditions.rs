@@ -1,3 +1,5 @@
+//! Condition helpers: build and inspect `metav1.Condition` objects for Gateway API resources.
+
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::httproutes::{HTTPRoute, HttpRouteParentRefs};

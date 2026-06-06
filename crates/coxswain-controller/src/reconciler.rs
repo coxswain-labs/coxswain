@@ -1,3 +1,6 @@
+//! Debounced reconciler: watches all Kubernetes resources and rebuilds the routing
+//! and TLS tables whenever any of them change.
+
 use crate::gateway_api::hostnames_intersect;
 use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
@@ -37,22 +40,32 @@ use tokio::task::JoinSet;
 /// Error returned when parsing `--ingress-default-backend`.
 #[derive(Debug, Error)]
 pub enum IngressDefaultBackendParseError {
+    /// No `:` separator found; expected `<namespace>/<service>:<port>`.
     #[error("missing port; expected <namespace>/<service>:<port>")]
     MissingPort,
+    /// No `/` separator found before the port; expected `<namespace>/<service>:<port>`.
     #[error("missing namespace; expected <namespace>/<service>:<port>")]
     MissingNamespace,
+    /// Port substring is not a valid integer.
     #[error("invalid port '{0}'; expected an integer")]
     InvalidPort(String),
+    /// Namespace or service name is empty after parsing.
     #[error("namespace and service name must not be empty")]
     EmptyComponent,
 }
 
 /// A parsed reference to the controller-wide ingress default backend service.
+///
 /// Set via `--ingress-default-backend=<namespace>/<service>:<port>`.
+/// Implements [`std::str::FromStr`]; parsing errors are reported as
+/// [`IngressDefaultBackendParseError`].
 #[derive(Clone, Debug)]
 pub struct IngressDefaultBackend {
+    /// Kubernetes namespace of the backend service.
     pub namespace: String,
+    /// Name of the backend service.
     pub name: String,
+    /// Service port number.
     pub port: i32,
 }
 
@@ -108,6 +121,7 @@ pub struct Reconciler {
 }
 
 impl Reconciler {
+    /// Construct a new reconciler (does not start the watch loop).
     pub fn new(
         routes: SharedRoutingTable,
         tls: SharedTlsStore,

@@ -1,3 +1,5 @@
+//! Lock-free routing engine wrapping a [`SharedRoutingTable`].
+
 use coxswain_core::routing::{BackendGroup, RequestContext, RouteOutcome, SharedRoutingTable};
 use std::sync::Arc;
 
@@ -7,11 +9,12 @@ pub struct RoutingEngine {
 }
 
 impl RoutingEngine {
+    /// Wrap a [`SharedRoutingTable`] in a routing engine.
     pub fn new(table: SharedRoutingTable) -> Self {
         Self { table }
     }
 
-    /// Like [`find`] but returns only the backend group, without host/path distinction.
+    /// Like [`Self::find`] but returns only the backend group, without host/path distinction.
     pub fn route(
         &self,
         port: u16,
