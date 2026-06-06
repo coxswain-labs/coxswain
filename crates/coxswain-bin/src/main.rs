@@ -266,10 +266,13 @@ pub struct ServeArgs {
 }
 
 fn main() -> Result<()> {
-    // When spawned as a restart child, wait for the parent process to exit and
-    // release its bound sockets before we try to bind them ourselves.
-    if std::env::var("COXSWAIN_RESTART_CHILD").is_ok() {
-        std::thread::sleep(std::time::Duration::from_secs(2));
+    // When spawned as a restart child, wait for the parent process to exit so
+    // it releases its bound sockets before we try to bind them ourselves.
+    if std::env::var("COXSWAIN_RESTART_CHILD").is_ok()
+        && let Ok(pid_str) = std::env::var("COXSWAIN_RESTART_PARENT_PID")
+        && let Ok(pid) = pid_str.parse::<i32>()
+    {
+        wait_for_parent_exit(pid);
     }
 
     let cli = Cli::parse();
@@ -578,6 +581,28 @@ fn build_server(args: &ServeArgs) -> Server {
     let mut server = Server::new_with_opt_and_conf(Some(Opt::default()), conf);
     server.bootstrap();
     server
+}
+
+/// Polls until `parent_pid` is no longer visible to the OS, up to 30 s.
+///
+/// Used by restart children to avoid binding ports before the parent has
+/// released them. Runs synchronously before the async runtime starts.
+fn wait_for_parent_exit(parent_pid: i32) {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let pid = Pid::from_raw(parent_pid);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Err(Errno::ESRCH) = kill(pid, None) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn init_logger(format: LogFormat, log_filter: &str) -> Result<()> {

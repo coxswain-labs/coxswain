@@ -31,6 +31,7 @@ clap = { workspace = true }
 gateway-api = { workspace = true }
 humantime = { workspace = true }
 kube = { workspace = true }
+nix = { workspace = true }
 pingora-core = { workspace = true, features = ["boringssl"] }
 pingora-proxy = { workspace = true, features = ["boringssl"] }
 tokio = { workspace = true }
