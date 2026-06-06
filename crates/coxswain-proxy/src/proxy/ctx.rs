@@ -20,12 +20,16 @@ tokio::task_local! {
 }
 
 /// Routing result cached from `request_filter` for use in later hooks.
+///
+/// `original_host` and `original_path` are `Arc<str>` so that cloning them
+/// in subsequent hooks (e.g. for SNI or redirect) is a refcount bump, not
+/// a heap allocation.
 pub struct ResolvedRoute {
     pub backend_group: Arc<BackendGroup>,
     pub filters: Arc<[FilterAction]>,
     pub timeouts: RouteTimeouts,
-    pub original_host: String,
-    pub original_path: String,
+    pub original_host: Arc<str>,
+    pub original_path: Arc<str>,
 }
 
 /// Per-request context carrying the real client address extracted from the PROXY header.

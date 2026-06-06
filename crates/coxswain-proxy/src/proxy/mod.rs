@@ -148,8 +148,8 @@ impl ProxyHttp for Proxy {
     {
         let req = session.req_header();
         let mut host_buf = String::new();
-        let host = extract_host(req, &mut host_buf).to_string();
-        let path = req.uri.path().to_string();
+        let host: Arc<str> = Arc::from(extract_host(req, &mut host_buf));
+        let path: Arc<str> = Arc::from(req.uri.path());
         let query = req.uri.query().map(str::to_string);
         // PROXY-protocol path sets real_client_proto directly; standard Pingora TLS path
         // does not set CONN_INFO, so fall back to inspecting the session's TLS digest.
@@ -241,11 +241,15 @@ impl ProxyHttp for Proxy {
             pingora_core::Error::explain(HTTPStatus(503), "no active endpoints for backend group")
         })?;
 
-        // Use the (potentially rewritten) host from UrlRewrite hostname, or the original host.
-        let sni_host = resolved.original_host.clone();
-
         let protocol = resolved.backend_group.protocol();
-        let mut peer = HttpPeer::new(addr.to_string(), protocol.is_tls(), sni_host);
+        // Allocate SNI string only for TLS connections; non-TLS ignores it.
+        let sni_host = if protocol.is_tls() {
+            resolved.original_host.to_string()
+        } else {
+            String::new()
+        };
+        // Pass SocketAddr directly — avoids the per-request addr.to_string() allocation.
+        let mut peer = HttpPeer::new(addr, protocol.is_tls(), sni_host);
         if protocol.is_h2() {
             peer.options.set_http_version(2, 2);
         }
@@ -301,13 +305,7 @@ impl ProxyHttp for Proxy {
         let (filters, original_host, original_path) = ctx
             .resolved
             .as_ref()
-            .map(|r| {
-                (
-                    r.filters.as_ref(),
-                    r.original_host.as_str(),
-                    r.original_path.as_str(),
-                )
-            })
+            .map(|r| (r.filters.as_ref(), &*r.original_host, &*r.original_path))
             .unwrap_or((&[], "", ""));
         TrafficFilter::apply_request_filters(
             upstream_request,
