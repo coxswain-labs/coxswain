@@ -15,9 +15,15 @@ form_urlencoded      = { workspace = true }
 http                 = { workspace = true }
 matchit              = { workspace = true }
 regex                = { workspace = true }
+smallvec             = { workspace = true }
 static_assertions    = { workspace = true }
 thiserror            = { workspace = true }
 tracing              = { workspace = true }
 
 [dev-dependencies]
+criterion   = { workspace = true }
 tracing-test = { workspace = true }
+
+[[bench]]
+name = "routing"
+harness = false

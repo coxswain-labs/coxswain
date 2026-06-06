@@ -1,5 +1,6 @@
 use http::{HeaderMap, HeaderName, Method};
 use regex::Regex;
+use smallvec::SmallVec;
 
 /// How a value is compared in a predicate — used by header and query matchers.
 #[non_exhaustive]
@@ -71,8 +72,9 @@ impl MatchPredicates {
         }
         if !self.query.is_empty() {
             let query_str = ctx.query.unwrap_or("");
-            // Collect once per call so we don't re-parse for each predicate.
-            let pairs: Vec<(std::borrow::Cow<str>, std::borrow::Cow<str>)> =
+            // Collect once per call to avoid re-parsing for each predicate.
+            // SmallVec avoids heap allocation for the typical case of ≤4 pairs.
+            let pairs: SmallVec<[(std::borrow::Cow<str>, std::borrow::Cow<str>); 4]> =
                 form_urlencoded::parse(query_str.as_bytes()).collect();
             for q in &self.query {
                 let found = pairs
