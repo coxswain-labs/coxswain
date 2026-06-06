@@ -1,22 +1,14 @@
+use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
-use crate::gw_types::{
-    HttpRoute,
-    v::httproutes::{HttpRouteStatusParents, HttpRouteStatusParentsParentRef},
-};
-use crate::keys::RouteParentKey;
-use crate::tls::{
-    GatewayListenerHealth, HttpRouteHealthMap, RouteParentHealth, SharedGatewayListenerHealth,
-    SharedHttpRouteHealth,
-};
+use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth};
 use async_trait::async_trait;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use futures::StreamExt;
 use k8s_openapi::api::networking::v1::Ingress;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
     Client,
-    api::{Api, Patch, PatchParams},
+    api::Api,
     runtime::{WatchStreamExt, watcher},
 };
 use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
@@ -29,19 +21,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod conditions;
 mod config;
 mod gateway_class_status;
+mod gateway_events;
 mod gateway_status;
+mod gatewayclass_events;
+mod ingress_events;
 mod ingress_status;
+mod route_events;
 
 pub use config::{ControllerConfig, ControllerConfigError, StatusAddress};
 
-use conditions::{
-    filter_owned_parent_refs, gateway_accepted, http_route_programmed, make_condition,
-};
-use gateway_class_status::{build_gateway_class_status_patch, gateway_class_needs_status_patch};
-use gateway_status::{build_gateway_status_patch, gateway_needs_status_patch};
-use ingress_status::{build_ingress_status_patch, ingress_lb_already_matches};
+use conditions::{gateway_accepted, http_route_programmed};
+use gateway_class_status::gateway_class_needs_status_patch;
+use gateway_status::gateway_needs_status_patch;
+use ingress_status::ingress_lb_already_matches;
 
-use crate::kube_helpers::scoped_api;
+use crate::k8s_utils::scoped_api;
 
 const LEASE_NAME: &str = "coxswain-leader-lock";
 
@@ -188,7 +182,7 @@ impl Controller {
                                 )
                             {
                                 let rh = self.route_health.load();
-                                Self::mark_http_route_programmed(
+                                route_events::mark_http_route_programmed(
                                     &client,
                                     &route,
                                     &self.config.controller_name,
@@ -222,7 +216,7 @@ impl Controller {
                                         tracing::warn!(name, "Skipping GatewayClass status patch: metadata.generation is unset");
                                         continue;
                                     };
-                                    Self::patch_gateway_class_status(&client, &name, generation).await;
+                                    gatewayclass_events::patch_gateway_class_status(&client, &name, generation).await;
                                 }
                             } else {
                                 tracing::debug!(
@@ -271,13 +265,13 @@ impl Controller {
                                     .cloned()
                                     .unwrap_or_default();
                                 if gateway_needs_status_patch(&gw, &health) {
-                                    Self::patch_gateway_status(&client, &gw, &health, self.config.status_address.as_ref()).await;
+                                    gateway_events::patch_gateway_status(&client, &gw, &health, self.config.status_address.as_ref()).await;
                                 }
                             } else if is_leader && !gateway_accepted(&gw) {
                                 // Before synced: only ensure Accepted is set; defer Programmed.
                                 let empty_health = GatewayListenerHealth::default();
                                 if gateway_needs_status_patch(&gw, &empty_health) {
-                                    Self::patch_gateway_status(&client, &gw, &empty_health, self.config.status_address.as_ref()).await;
+                                    gateway_events::patch_gateway_status(&client, &gw, &empty_health, self.config.status_address.as_ref()).await;
                                 }
                             }
                         }
@@ -305,7 +299,7 @@ impl Controller {
                             .cloned()
                             .unwrap_or_default();
                         if gateway_needs_status_patch(gw, &health) {
-                            Self::patch_gateway_status(&client, gw, &health, self.config.status_address.as_ref()).await;
+                            gateway_events::patch_gateway_status(&client, gw, &health, self.config.status_address.as_ref()).await;
                         }
                     }
                 }
@@ -317,7 +311,7 @@ impl Controller {
                     let owned = self.owned_gateways.load();
                     let rh = self.route_health.load();
                     for route in known_routes.values() {
-                        Self::mark_http_route_programmed(
+                        route_events::mark_http_route_programmed(
                             &client,
                             route,
                             &self.config.controller_name,
@@ -365,7 +359,7 @@ impl Controller {
                                     None => !owned_default_ingress_classes.is_empty(),
                                 };
                                 if is_leader && owned && !ingress_lb_already_matches(&ing, addr) {
-                                    Self::patch_ingress_status(&client, &ing, addr).await;
+                                    ingress_events::patch_ingress_status(&client, &ing, addr).await;
                                 }
                             }
                             Ok(_) => {}
@@ -398,179 +392,6 @@ impl Controller {
             }
         }
     }
-
-    async fn patch_gateway_class_status(client: &Client, name: &str, generation: i64) {
-        let api: Api<GatewayClass> = Api::all(client.clone());
-        let now = Time(k8s_openapi::jiff::Timestamp::now());
-        let patch = build_gateway_class_status_patch(generation, &now);
-        match api
-            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await
-        {
-            Ok(_) => tracing::info!(name, "GatewayClass status patched"),
-            Err(e) => tracing::warn!(name, error = %e, "Failed to patch GatewayClass status"),
-        }
-    }
-
-    // Single patch call sets all Gateway conditions, listener statuses, and addresses at once.
-    // A JSON merge patch replaces the entire conditions array, so splitting calls
-    // would cause conditions to toggle in a watch-feedback loop.
-    async fn patch_gateway_status(
-        client: &Client,
-        gw: &Gateway,
-        health: &GatewayListenerHealth,
-        addr: Option<&StatusAddress>,
-    ) {
-        let name = match gw.metadata.name.as_deref() {
-            Some(n) => n,
-            None => return,
-        };
-        let ns = gw.metadata.namespace.as_deref().unwrap_or("default");
-        let Some(generation) = gw.metadata.generation else {
-            tracing::warn!(
-                name,
-                ns,
-                "Skipping Gateway status patch: metadata.generation is unset"
-            );
-            return;
-        };
-        let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
-        let now = Time(k8s_openapi::jiff::Timestamp::now());
-        let patch = build_gateway_status_patch(gw, health, generation, &now, addr);
-        match api
-            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await
-        {
-            Ok(_) => tracing::info!(name, ns, "Gateway status patched"),
-            Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Gateway status"),
-        }
-    }
-
-    async fn mark_http_route_programmed(
-        client: &Client,
-        route: &HttpRoute,
-        controller_name: &str,
-        owned_gateways: &HashSet<ObjectKey>,
-        route_health: &HttpRouteHealthMap,
-    ) {
-        let name = match route.metadata.name.as_deref() {
-            Some(n) => n,
-            None => return,
-        };
-        let ns = route.metadata.namespace.as_deref().unwrap_or("default");
-        let parent_refs = match route.spec.parent_refs.as_deref() {
-            Some(refs) if !refs.is_empty() => refs,
-            _ => return,
-        };
-
-        let owned_refs = filter_owned_parent_refs(parent_refs, ns, owned_gateways);
-        if owned_refs.is_empty() {
-            tracing::debug!(name, ns, "Skipping status patch — no owned parentRefs");
-            return;
-        }
-
-        let api: Api<HttpRoute> = Api::namespaced(client.clone(), ns);
-        let now = Time(k8s_openapi::jiff::Timestamp::now());
-        let Some(observed_gen) = route.metadata.generation else {
-            tracing::warn!(
-                name,
-                ns,
-                "Skipping HttpRoute status patch: metadata.generation is unset"
-            );
-            return;
-        };
-
-        let default_health = RouteParentHealth::default();
-        let parents: Vec<HttpRouteStatusParents> = owned_refs
-            .iter()
-            .map(|p| {
-                let gw_ns = p.namespace.as_deref().unwrap_or(ns);
-                let section = p.section_name.as_deref().unwrap_or("").to_string();
-                let health_key = RouteParentKey::new(ns, name, gw_ns, &p.name, section);
-                let health = route_health.get(&health_key).unwrap_or(&default_health);
-
-                let (acc_status, acc_reason) = if health.accepted {
-                    ("True", health.accepted_reason)
-                } else {
-                    ("False", health.accepted_reason)
-                };
-                let (res_status, res_reason) = if health.resolved_refs {
-                    ("True", health.resolved_refs_reason)
-                } else {
-                    ("False", health.resolved_refs_reason)
-                };
-                let (prog_status, prog_reason) = if health.accepted {
-                    ("True", "Programmed")
-                } else {
-                    ("False", health.accepted_reason)
-                };
-
-                let accepted_cond = make_condition(
-                    "Accepted",
-                    acc_status,
-                    acc_reason,
-                    "",
-                    observed_gen,
-                    now.clone(),
-                );
-                let programmed_cond = make_condition(
-                    "Programmed",
-                    prog_status,
-                    prog_reason,
-                    "",
-                    observed_gen,
-                    now.clone(),
-                );
-                let resolved_refs_cond = make_condition(
-                    "ResolvedRefs",
-                    res_status,
-                    res_reason,
-                    "",
-                    observed_gen,
-                    now.clone(),
-                );
-
-                HttpRouteStatusParents {
-                    controller_name: controller_name.to_string(),
-                    parent_ref: HttpRouteStatusParentsParentRef {
-                        group: p.group.clone(),
-                        kind: p.kind.clone(),
-                        name: p.name.clone(),
-                        namespace: p.namespace.clone(),
-                        port: p.port,
-                        section_name: p.section_name.clone(),
-                    },
-                    conditions: vec![accepted_cond, programmed_cond, resolved_refs_cond],
-                }
-            })
-            .collect();
-
-        let patch = serde_json::json!({ "status": { "parents": parents } });
-        match api
-            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await
-        {
-            Ok(_) => tracing::info!(name, ns, "HttpRoute programmed"),
-            Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch HttpRoute status"),
-        }
-    }
-
-    async fn patch_ingress_status(client: &Client, ingress: &Ingress, addr: &StatusAddress) {
-        let name = match ingress.metadata.name.as_deref() {
-            Some(n) => n,
-            None => return,
-        };
-        let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
-        let api: Api<Ingress> = Api::namespaced(client.clone(), ns);
-        let patch = build_ingress_status_patch(addr);
-        match api
-            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await
-        {
-            Ok(_) => tracing::info!(name, ns, "Ingress loadBalancer status patched"),
-            Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Ingress status"),
-        }
-    }
 }
 
 #[async_trait]
@@ -583,8 +404,8 @@ impl BackgroundService for Controller {
 #[cfg(test)]
 mod tests {
     use super::conditions::{
-        gateway_accepted, gateway_class_accepted, gateway_programmed, has_condition,
-        http_route_programmed,
+        filter_owned_parent_refs, gateway_accepted, gateway_class_accepted, gateway_programmed,
+        has_condition, http_route_programmed,
     };
     use super::ingress_status::{build_ingress_status_patch, ingress_lb_already_matches};
     use super::*;
@@ -595,6 +416,7 @@ mod tests {
         HttpRouteParentRefs, HttpRouteStatus, HttpRouteStatusParents,
         HttpRouteStatusParentsParentRef,
     };
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
     fn stub_condition(
         type_: &str,

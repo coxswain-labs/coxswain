@@ -79,7 +79,7 @@ Work items are listed in execution order; each should be completed and merged be
 - ✅ ~~`#[non_exhaustive]`/`#[must_use]` sweep, `HttpRoute` alias, `BackendPool::next` guard — [#140](https://github.com/coxswain-labs/coxswain/issues/140)~~
 - ✅ ~~Cheap perf wins and structural cleanups — [#141](https://github.com/coxswain-labs/coxswain/issues/141)~~
 - ✅ ~~Eliminate per-request allocations (deep hot-path pass) — [#142](https://github.com/coxswain-labs/coxswain/issues/142)~~
-- ⬜ Split large production source files — [#143](https://github.com/coxswain-labs/coxswain/issues/143)
+- ✅ ~~Split large production source files — [#143](https://github.com/coxswain-labs/coxswain/issues/143)~~
 - ⬜ Split large test modules — [#144](https://github.com/coxswain-labs/coxswain/issues/144)
 - ⬜ E2E harness ergonomics — [#145](https://github.com/coxswain-labs/coxswain/issues/145)
 - ⬜ Workspace lint block and Cargo metadata hygiene — [#146](https://github.com/coxswain-labs/coxswain/issues/146)

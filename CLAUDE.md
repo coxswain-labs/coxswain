@@ -11,7 +11,7 @@ When the user says "start working on issue N":
 4. Once plan mode exits and implementation begins: ensure you're working on the latest code and create the branch: `git checkout main && git pull --ff-only origin main && git checkout -b issue-N`.
 5. Implement the issue per its acceptance criteria.
 6. Add or update e2e tests in `crates/coxswain-e2e/` that cover the new behaviour. Every issue that changes routing, status conditions, or proxy behaviour must have at least one new scenario in `tests/gateway_api.rs` or `tests/ingress.rs`. 
-7. ALWAYS run `cargo test -p coxswain-e2e --test <file> -- --test-threads=1` locally before pushing to ensure no regression.
+7. ALWAYS run `cargo test --workspace --exclude coxswain-e2e` (unit tests) before pushing. E2e tests (`cargo test -p coxswain-e2e --test <file> -- --test-threads=1`) require a live cluster and are run by CI — do not attempt them locally unless a cluster is available.
 8. If the issue implements a Gateway API conformance feature (check the issue body for a **Feature flags** line), add the corresponding `features.SupportXxx` constant(s) to `opts.SupportedFeatures` in `conformance/main_test.go`. Include a comment referencing the issue number. Run `go vet ./...` in `conformance/` to confirm the constant names are valid. Also add the bare feature name(s) to `SUPPORTED_FEATURES` in `crates/coxswain-controller/src/controller/gateway_class_status.rs` (keep sorted). Run `bash scripts/check-supported-features.sh` to confirm both lists match. See `docs/gateway-api-support.md` for the full feature promotion policy and instructions for bumping the Gateway API version.
 9. In `ROADMAP.md`, change the corresponding checklist item from `- ⬜` to `- ✅ ~~...~~` (swap the emoji and wrap the description in strikethrough). Only commit this change on the new branch with `Refs #N` at the end, when the issue is fully implemented.
 
@@ -44,8 +44,8 @@ cargo build
 # Build release
 cargo build --release
 
-# Run all tests
-cargo test
+# Run all unit tests (excludes coxswain-e2e which requires a live cluster)
+cargo test --workspace --exclude coxswain-e2e
 
 # Run tests for a single crate
 cargo test -p coxswain-core
