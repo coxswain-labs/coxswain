@@ -58,7 +58,7 @@ async fn default_backend() -> anyhow::Result<()> {
     })
     .await?;
     wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-    let http = HttpClient::new(controller.proxy_addr);
+    let http = HttpClient::new(controller.proxy_addr)?;
 
     // Apply the fixture: rule /api → echo-a, spec.defaultBackend → echo-b.
     fixtures::apply_fixture(ingress::DEFAULT_BACKEND, FixtureVars::new(&ns.name)).await?;

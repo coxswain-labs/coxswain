@@ -241,8 +241,9 @@ impl Service for ProxyAcceptor {
         let mut handles = Vec::new();
 
         for bound in self.listeners.drain(..) {
-            let tcp = tokio::net::TcpListener::from_std(bound.std_tcp)
-                .expect("pre-bound non-blocking std listener must convert — this is a bug");
+            let tcp = tokio::net::TcpListener::from_std(bound.std_tcp).unwrap_or_else(|e| {
+                panic!("pre-bound non-blocking std listener must convert — this is a bug: {e}")
+            });
             let config = bound.config;
             let local_addr = config.local_addr;
 
@@ -440,7 +441,7 @@ async fn parse_proxy_v2(
         (2, 1) if addr_len >= 36 => {
             let src_ip_bytes: [u8; 16] = addr_block[0..16]
                 .try_into()
-                .expect("guarded by addr_len >= 36 check above");
+                .unwrap_or_else(|_| panic!("guarded by addr_len >= 36 check above"));
             let src_ip = std::net::Ipv6Addr::from(src_ip_bytes);
             let src_port = u16::from_be_bytes([addr_block[32], addr_block[33]]);
             Ok(SocketAddr::new(src_ip.into(), src_port))
@@ -472,7 +473,7 @@ async fn parse_proxy_v1(
     // The loop only exits when `line` ends with \r\n.
     let header = line
         .strip_suffix(b"\r\n")
-        .expect("loop exits only when ends_with(\\r\\n)");
+        .unwrap_or_else(|| panic!("loop exits only when ends_with(\\r\\n)"));
     let s = std::str::from_utf8(header)?;
     let parts: Vec<&str> = s.split(' ').collect();
 

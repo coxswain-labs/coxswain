@@ -2,6 +2,8 @@
 name = "coxswain-e2e"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+description.workspace = true
 license.workspace = true
 publish = false
 
@@ -16,18 +18,18 @@ workspace = true
 anyhow.workspace = true
 ipnet.workspace = true
 futures.workspace = true
-base64 = "0.22"
+base64.workspace = true
 gateway-api.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
-rcgen = "0.13"
+rcgen.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

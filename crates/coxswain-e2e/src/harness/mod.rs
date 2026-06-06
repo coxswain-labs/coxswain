@@ -33,7 +33,7 @@ impl Harness {
         wait::wait_for_ready(controller.health_addr, std::time::Duration::from_secs(30))
             .await
             .context("readyz timeout")?;
-        let http = HttpClient::new(controller.proxy_addr);
+        let http = HttpClient::new(controller.proxy_addr).context("http client")?;
         let tls_addr = controller.tls_addr;
         Ok(Self {
             client,

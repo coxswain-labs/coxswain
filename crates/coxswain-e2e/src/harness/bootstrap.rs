@@ -8,7 +8,7 @@ use tokio::process::Command;
 const GATEWAY_API_VERSION: &str = include_str!("../../../../.gateway-api-version").trim_ascii();
 
 pub async fn bootstrap() -> anyhow::Result<()> {
-    let root = workspace_root();
+    let root = workspace_root().context("workspace root")?;
 
     // Purge any namespaces left over from a previous interrupted run.
     // --wait=false: don't block; the counter-based names ensure no collision with
@@ -195,9 +195,9 @@ async fn kubectl_apply_url(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn workspace_root() -> PathBuf {
+pub fn workspace_root() -> anyhow::Result<PathBuf> {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
-        .expect("workspace root")
+        .context("canonicalize workspace root")
 }

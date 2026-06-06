@@ -10,7 +10,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-arc-swap      = { workspace = true }
 async-trait   = { workspace = true }
 coxswain-core = { workspace = true }
 http          = { workspace = true }
