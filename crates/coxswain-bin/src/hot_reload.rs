@@ -2,23 +2,26 @@ use coxswain_controller::tls::SharedGatewayListenerHealth;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 /// Background service that watches for Gateway listener port changes and restarts
 /// the process to rebind sockets when new ports are required.
 ///
-/// On each routing-table rebuild, compares the set of ports declared across all
-/// owned Gateway listeners (plus the CLI-configured defaults) against the ports
-/// that were actually bound at startup. If any new port is needed, spawns a new
-/// child process with `COXSWAIN_RESTART_CHILD=1` and calls `process::exit(0)`
-/// so the parent releases its sockets and the child can bind the full updated set.
+/// # Restart handshake
 ///
-/// Ports that disappear (e.g. a Gateway is deleted) do NOT trigger a restart;
-/// the socket stays open but routes no traffic (the routing table has no entries
-/// for that port, so every request returns 404/503 as appropriate).
+/// When new ports are detected:
+/// 1. The parent spawns a child with `COXSWAIN_RESTART_CHILD=1` and
+///    `COXSWAIN_RESTART_PARENT_PID=<pid>`.
+/// 2. The parent calls `process::exit(0)`, releasing its listening sockets
+///    immediately. (Graceful drain is intentionally skipped — the child serves
+///    the same routes within seconds and a slow drain would delay port rebinding.)
+/// 3. The child polls `kill(<parent_pid>, 0)` every 100 ms (max 30 s) until the
+///    parent process is gone, then binds the full updated port set.
+///
+/// Ports that disappear (e.g. a Gateway is deleted) do NOT trigger a restart; the
+/// socket stays open but routes no traffic.
 pub struct HotReloader {
     tls_health: SharedGatewayListenerHealth,
-    currently_bound: Arc<HashSet<u16>>,
+    currently_bound: HashSet<u16>,
     cli_ports: HashSet<u16>,
 }
 
@@ -30,7 +33,7 @@ impl HotReloader {
     ) -> Self {
         Self {
             tls_health,
-            currently_bound: Arc::new(currently_bound),
+            currently_bound,
             cli_ports,
         }
     }
@@ -67,14 +70,12 @@ impl BackgroundService for HotReloader {
             }
 
             let desired = self.desired_ports();
-            if desired.is_subset(&*self.currently_bound) {
+            if desired.is_subset(&self.currently_bound) {
                 continue;
             }
 
-            let mut new_ports: Vec<u16> = desired
-                .difference(&*self.currently_bound)
-                .copied()
-                .collect();
+            let mut new_ports: Vec<u16> =
+                desired.difference(&self.currently_bound).copied().collect();
             new_ports.sort_unstable();
 
             tracing::info!(
@@ -90,6 +91,11 @@ impl BackgroundService for HotReloader {
                 continue;
             }
 
+            // Exit immediately so the OS closes our listening sockets and the child
+            // can bind the full updated port set as soon as we disappear.
+            // Graceful drain is intentionally skipped: the child inherits all routes
+            // and will serve traffic within seconds; a slow drain would prevent the
+            // child from binding the new ports within the conformance test window.
             std::process::exit(0);
         }
     }
@@ -101,6 +107,10 @@ fn spawn_restart_child() -> std::io::Result<()> {
     let child = std::process::Command::new(&exe)
         .args(&args)
         .env("COXSWAIN_RESTART_CHILD", "1")
+        .env(
+            "COXSWAIN_RESTART_PARENT_PID",
+            std::process::id().to_string(),
+        )
         .spawn()?;
     tracing::info!(pid = child.id(), "Spawned restart child process");
     Ok(())
