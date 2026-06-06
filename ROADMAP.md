@@ -72,7 +72,7 @@ The first fully usable version: all must-have features implemented, OCI image pu
 
 Work items are listed in execution order; each should be completed and merged before starting the next.
 
-- ⬜ `accept.rs` hardening: typed errors, TLS bundle invariant, connection semaphore, shutdown propagation — [#136](https://github.com/coxswain-labs/coxswain/issues/136)
+- ✅ ~~`accept.rs` hardening: typed errors, TLS bundle invariant, connection semaphore, shutdown propagation — [#136](https://github.com/coxswain-labs/coxswain/issues/136)~~
 - ⬜ Propagate typed errors in startup path — [#137](https://github.com/coxswain-labs/coxswain/issues/137)
 - ⬜ Eliminate `appProtocol` string round-trip (GEP-1911 cleanup) — [#138](https://github.com/coxswain-labs/coxswain/issues/138)
 - ⬜ `hot_reload` graceful shutdown via Pingora signal instead of `process::exit` — [#139](https://github.com/coxswain-labs/coxswain/issues/139)

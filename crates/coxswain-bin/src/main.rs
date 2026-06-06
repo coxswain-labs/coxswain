@@ -275,6 +275,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let Commands::Serve(args) = cli.command;
 
+    // Initialise logging first so that any subsequent error is emitted in the
+    // configured format (JSON in production, console in dev).
+    init_logger(args.log_format, &args.log_filter)?;
+
     let controller_config = ControllerConfig::new(
         args.controller_name.clone(),
         args.pod_name.clone(),
@@ -283,10 +287,7 @@ fn main() -> Result<()> {
         args.controller_lease_renew_interval,
         args.controller_watch_namespace.clone(),
         args.status_address.clone(),
-    )
-    .map_err(|e| anyhow::anyhow!(e))?;
-
-    init_logger(args.log_format, &args.log_filter)?;
+    )?;
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -364,7 +365,7 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("tokio runtime for startup Gateway port discovery");
+            .context("build tokio runtime for startup Gateway port discovery")?;
         let extra = rt.block_on(discover_gateway_ports(
             &args.controller_name,
             args.controller_watch_namespace.as_deref(),
@@ -409,7 +410,7 @@ fn main() -> Result<()> {
         let trusted = Arc::new(TrustedSources::new(args.proxy_trusted_sources.clone()));
         let sni_selector = SniCertSelector::new(tls_store);
         let acceptor = ProxyAcceptor::new(proxy, listeners, trusted, sni_selector)
-            .expect("build ProxyAcceptor");
+            .context("build ProxyAcceptor")?;
         server.add_service(acceptor);
     } else {
         let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
@@ -429,8 +430,8 @@ fn main() -> Result<()> {
                 ListenerProtocol::Https => {
                     let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
                         Box::new(SniCertSelector::new(tls_store.clone()));
-                    let tls_settings = TlsSettings::with_callbacks(callbacks)
-                        .expect("TlsSettings::with_callbacks");
+                    let tls_settings =
+                        TlsSettings::with_callbacks(callbacks).context("build TLS settings")?;
                     svc.add_tls_with_settings(&spec.addr.to_string(), None, tls_settings);
                 }
             }

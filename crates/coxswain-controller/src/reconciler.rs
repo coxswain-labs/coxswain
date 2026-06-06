@@ -31,8 +31,22 @@ use pingora_core::services::background::BackgroundService;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
+
+/// Error returned when parsing `--ingress-default-backend`.
+#[derive(Debug, Error)]
+pub enum IngressDefaultBackendParseError {
+    #[error("missing port; expected <namespace>/<service>:<port>")]
+    MissingPort,
+    #[error("missing namespace; expected <namespace>/<service>:<port>")]
+    MissingNamespace,
+    #[error("invalid port '{0}'; expected an integer")]
+    InvalidPort(String),
+    #[error("namespace and service name must not be empty")]
+    EmptyComponent,
+}
 
 /// A parsed reference to the controller-wide ingress default backend service.
 /// Set via `--ingress-default-backend=<namespace>/<service>:<port>`.
@@ -44,22 +58,20 @@ pub struct IngressDefaultBackend {
 }
 
 impl std::str::FromStr for IngressDefaultBackend {
-    type Err = String;
+    type Err = IngressDefaultBackendParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (ns_name, port_str) = s.rsplit_once(':').ok_or_else(|| {
-            format!("missing port in '{s}'; expected <namespace>/<service>:<port>")
-        })?;
-        let (namespace, name) = ns_name.split_once('/').ok_or_else(|| {
-            format!("missing namespace in '{s}'; expected <namespace>/<service>:<port>")
-        })?;
+        let (ns_name, port_str) = s
+            .rsplit_once(':')
+            .ok_or(IngressDefaultBackendParseError::MissingPort)?;
+        let (namespace, name) = ns_name
+            .split_once('/')
+            .ok_or(IngressDefaultBackendParseError::MissingNamespace)?;
         let port: i32 = port_str
             .parse()
-            .map_err(|_| format!("invalid port '{port_str}'; expected an integer"))?;
+            .map_err(|_| IngressDefaultBackendParseError::InvalidPort(port_str.to_owned()))?;
         if namespace.is_empty() || name.is_empty() {
-            return Err(format!(
-                "namespace and service name must not be empty in '{s}'"
-            ));
+            return Err(IngressDefaultBackendParseError::EmptyComponent);
         }
         Ok(IngressDefaultBackend {
             namespace: namespace.to_string(),
@@ -172,9 +184,13 @@ fn spawn_reflector<T>(
 #[async_trait]
 impl BackgroundService for Reconciler {
     async fn start(&self, mut shutdown: ShutdownWatch) {
-        let client = Client::try_default()
-            .await
-            .expect("K8s client for reconciler");
+        let client = match Client::try_default().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to initialise Kubernetes client; reconciler will not run");
+                return;
+            }
+        };
         let config = ReconcilerConfig {
             controller_name: self.controller_name.clone(),
             watch_namespace: self.opts.watch_namespace.clone(),

@@ -31,7 +31,7 @@ mod gateway_class_status;
 mod gateway_status;
 mod ingress_status;
 
-pub use config::{ControllerConfig, StatusAddress};
+pub use config::{ControllerConfig, ControllerConfigError, StatusAddress};
 
 use conditions::{
     filter_owned_parent_refs, gateway_accepted, http_route_programmed, make_condition,
@@ -84,9 +84,13 @@ impl Controller {
     }
 
     async fn start_watcher_loop(&self, mut shutdown: ShutdownWatch) {
-        let client = Client::try_default()
-            .await
-            .expect("Failed to init K8s client");
+        let client = match Client::try_default().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to initialise Kubernetes client; controller will not run");
+                return;
+            }
+        };
 
         let lease_lock = LeaseLock::new(
             client.clone(),
