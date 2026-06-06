@@ -30,12 +30,12 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    pub fn new(proxy_addr: SocketAddr) -> Self {
+    pub fn new(proxy_addr: SocketAddr) -> anyhow::Result<Self> {
         let inner = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
-            .expect("reqwest client");
-        Self { inner, proxy_addr }
+            .context("reqwest client")?;
+        Ok(Self { inner, proxy_addr })
     }
 
     /// Send an arbitrary request. `path` may include a `?query=...` suffix.
@@ -68,8 +68,7 @@ impl HttpClient {
 
     pub async fn get(&self, host: &str, path: &str) -> anyhow::Result<EchoResponse> {
         let (status, body) = self.request(Method::GET, host, path, &[]).await?;
-        anyhow::ensure!(body.is_some(), "GET {host}{path} returned {status}");
-        Ok(body.unwrap())
+        body.ok_or_else(|| anyhow::anyhow!("GET {host}{path} returned {status}"))
     }
 
     pub async fn get_status(&self, host: &str, path: &str) -> anyhow::Result<u16> {

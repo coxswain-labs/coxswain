@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use coxswain_core::routing::SharedRoutingTable;
-use http::Response;
+use http::{HeaderValue, Response, StatusCode, header};
 use pingora_core::apps::http_app::{HttpServer, ServeHttp};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::protocols::http::ServerSession;
@@ -33,10 +33,11 @@ impl ServeHttp for AdminServer {
             "/metrics" => metrics_response(),
             "/routes" => routes_response(&self.routes),
             "/status" => status_response(&self.synced, &self.leader, &self.routes),
-            _ => Response::builder()
-                .status(404)
-                .body(Vec::new())
-                .expect("infallible: static response headers are valid"),
+            _ => {
+                let mut r = Response::new(Vec::new());
+                *r.status_mut() = StatusCode::NOT_FOUND;
+                r
+            }
         }
     }
 }
@@ -46,16 +47,16 @@ fn metrics_response() -> Response<Vec<u8>> {
     let mut buffer = Vec::new();
     if let Err(e) = encoder.encode(&prometheus::gather(), &mut buffer) {
         tracing::warn!(error = %e, "Failed to encode Prometheus metrics");
-        return Response::builder()
-            .status(500)
-            .body(Vec::new())
-            .expect("infallible: static response headers are valid");
+        let mut r = Response::new(Vec::new());
+        *r.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        return r;
     }
-    Response::builder()
-        .status(200)
-        .header("content-type", encoder.format_type())
-        .body(buffer)
-        .expect("infallible: static response headers are valid")
+    let content_type = HeaderValue::from_str(encoder.format_type())
+        .unwrap_or_else(|_| HeaderValue::from_static("text/plain"));
+    let mut r = Response::new(buffer);
+    *r.status_mut() = StatusCode::OK;
+    r.headers_mut().insert(header::CONTENT_TYPE, content_type);
+    r
 }
 
 fn routes_response(routes: &SharedRoutingTable) -> Response<Vec<u8>> {
@@ -115,9 +116,11 @@ fn status_response(
 
 fn json_response(mut body: String) -> Response<Vec<u8>> {
     body.push('\n');
-    Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        .body(body.into_bytes())
-        .expect("infallible: static response headers are valid")
+    let mut r = Response::new(body.into_bytes());
+    *r.status_mut() = StatusCode::OK;
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    r
 }

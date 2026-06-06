@@ -7,7 +7,10 @@ use std::sync::Arc;
 fn make_group(name: &str, addr: &str) -> Arc<BackendGroup> {
     Arc::new(BackendGroup::new(
         name.to_string(),
-        vec![addr.parse::<SocketAddr>().unwrap()],
+        vec![
+            addr.parse::<SocketAddr>()
+                .unwrap_or_else(|e| panic!("{addr}: {e}")),
+        ],
     ))
 }
 
@@ -26,7 +29,7 @@ fn build_table() -> coxswain_core::routing::SharedRoutingTable {
         );
     }
     let shared = SharedRoutingTable::default();
-    shared.store(Arc::new(b.build().unwrap()));
+    shared.store(Arc::new(b.build().unwrap_or_else(|e| panic!("{e}"))));
     shared
 }
 

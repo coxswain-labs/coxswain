@@ -141,6 +141,34 @@ struct ReconcilerConfig {
     ingress_ports: IngressPorts,
 }
 
+struct ReflectorStores<'a> {
+    routes: &'a reflector::Store<HttpRoute>,
+    ingresses: &'a reflector::Store<Ingress>,
+    ingress_classes: &'a reflector::Store<IngressClass>,
+    gateways: &'a reflector::Store<Gateway>,
+    gateway_classes: &'a reflector::Store<GatewayClass>,
+    slices: &'a reflector::Store<EndpointSlice>,
+    services: &'a reflector::Store<Service>,
+    grants: &'a reflector::Store<ReferenceGrant>,
+    secrets: &'a reflector::Store<Secret>,
+}
+
+struct SharedOutputs<'a> {
+    routes: &'a SharedRoutingTable,
+    tls: &'a SharedTlsStore,
+    tls_health: &'a SharedGatewayListenerHealth,
+    route_health: &'a SharedHttpRouteHealth,
+}
+
+struct Ownership<'a> {
+    ingress_classes: &'a HashSet<String>,
+    default_ingress_class: Option<&'a str>,
+    gateways: &'a HashSet<ObjectKey>,
+    gateway_classes: &'a HashSet<String>,
+    backend_grants: &'a GrantSet,
+    cert_grants: &'a GrantSet,
+}
+
 fn spawn_reflector<T>(
     set: &mut JoinSet<()>,
     writer: reflector::store::Writer<T>,
@@ -327,24 +355,30 @@ async fn spawn_tasks(
                     _ = tokio::time::sleep(Duration::from_millis(500)) => break,
                 }
             }
+            let stores = ReflectorStores {
+                routes: &route_reader,
+                ingresses: &ingress_reader,
+                ingress_classes: &class_reader,
+                gateways: &gateway_reader,
+                gateway_classes: &gateway_class_reader,
+                slices: &slice_reader,
+                services: &service_reader,
+                grants: &grant_reader,
+                secrets: &secret_reader,
+            };
+            let outputs = SharedOutputs {
+                routes: &routes,
+                tls: &tls,
+                tls_health: &tls_health,
+                route_health: &route_health,
+            };
             rebuild(
-                &route_reader,
-                &ingress_reader,
-                &class_reader,
-                &gateway_reader,
-                &gateway_class_reader,
-                &slice_reader,
-                &service_reader,
-                &grant_reader,
-                &secret_reader,
+                &stores,
                 &controller_name,
                 &owned_gateways,
                 ingress_default_backend.as_ref(),
                 ingress_ports,
-                &routes,
-                &tls,
-                &tls_health,
-                &route_health,
+                &outputs,
             );
         }
     });
@@ -352,39 +386,27 @@ async fn spawn_tasks(
     set
 }
 
-#[allow(clippy::too_many_arguments)]
 fn rebuild(
-    route_store: &reflector::Store<HttpRoute>,
-    ingress_store: &reflector::Store<Ingress>,
-    class_store: &reflector::Store<IngressClass>,
-    gateway_store: &reflector::Store<Gateway>,
-    gateway_class_store: &reflector::Store<GatewayClass>,
-    slice_store: &reflector::Store<EndpointSlice>,
-    service_store: &reflector::Store<Service>,
-    grant_store: &reflector::Store<ReferenceGrant>,
-    secret_store: &reflector::Store<Secret>,
+    stores: &ReflectorStores<'_>,
     controller_name: &str,
     owned_gateways_handle: &OwnedGateways,
     ingress_default_backend: Option<&IngressDefaultBackend>,
     ingress_ports: IngressPorts,
-    shared: &SharedRoutingTable,
-    tls_shared: &SharedTlsStore,
-    tls_health_shared: &SharedGatewayListenerHealth,
-    route_health_shared: &SharedHttpRouteHealth,
+    outputs: &SharedOutputs<'_>,
 ) {
-    let routes = route_store.state();
-    let ingresses = ingress_store.state();
+    let routes = stores.routes.state();
+    let ingresses = stores.ingresses.state();
 
     let (owned_ingress_classes, owned_default_ingress_class, owned_gateway_classes, owned_gateways) =
         compute_ownership(
-            class_store,
-            gateway_class_store,
-            gateway_store,
+            stores.ingress_classes,
+            stores.gateway_classes,
+            stores.gateways,
             controller_name,
             owned_gateways_handle,
         );
 
-    let (backend_grants, cert_grants) = flatten_grants(&grant_store.state());
+    let (backend_grants, cert_grants) = flatten_grants(&stores.grants.state());
 
     tracing::debug!(
         http_routes = routes.len(),
@@ -394,45 +416,39 @@ fn rebuild(
         "Rebuilding routing table"
     );
 
+    let ownership = Ownership {
+        ingress_classes: &owned_ingress_classes,
+        default_ingress_class: owned_default_ingress_class.as_deref(),
+        gateways: &owned_gateways,
+        gateway_classes: &owned_gateway_classes,
+        backend_grants: &backend_grants,
+        cert_grants: &cert_grants,
+    };
+
     build_routes(
+        stores,
         &routes,
         &ingresses,
-        &owned_ingress_classes,
-        owned_default_ingress_class.as_deref(),
-        &owned_gateways,
-        &backend_grants,
-        gateway_store,
-        &owned_gateway_classes,
-        slice_store,
-        service_store,
+        &ownership,
         ingress_default_backend,
         ingress_ports,
-        shared,
+        outputs.routes,
     );
 
-    let mut gateway_tls_health = build_tls(
-        &ingresses,
-        gateway_store,
-        &owned_gateway_classes,
-        &owned_ingress_classes,
-        owned_default_ingress_class.as_deref(),
-        &cert_grants,
-        secret_store,
-        tls_shared,
-    );
+    let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, outputs.tls);
 
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
-    tls_health_shared.store_and_notify(gateway_tls_health);
+    outputs.tls_health.store_and_notify(gateway_tls_health);
 
-    let gateways = gateway_store.state();
+    let gateways = stores.gateways.state();
     let route_health_map = GatewayApiReconciler::compute_route_health(
         &routes,
         &gateways,
         &owned_gateways,
         &backend_grants,
-        service_store,
+        stores.services,
     );
-    route_health_shared.store_and_notify(route_health_map);
+    outputs.route_health.store_and_notify(route_health_map);
 }
 
 /// Compute which IngressClasses, GatewayClasses, and Gateways are owned by this controller.
@@ -554,27 +570,25 @@ fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
 }
 
 /// Build and publish the routing table from HTTPRoutes and Ingresses.
-#[allow(clippy::too_many_arguments)]
 fn build_routes(
+    stores: &ReflectorStores<'_>,
     routes: &[Arc<HttpRoute>],
     ingresses: &[Arc<Ingress>],
-    owned_ingress_classes: &HashSet<String>,
-    owned_default_ingress_class: Option<&str>,
-    owned_gateways: &HashSet<ObjectKey>,
-    backend_grants: &GrantSet,
-    gateway_store: &reflector::Store<Gateway>,
-    owned_gateway_classes: &HashSet<String>,
-    slice_store: &reflector::Store<EndpointSlice>,
-    service_store: &reflector::Store<Service>,
+    ownership: &Ownership<'_>,
     ingress_default_backend: Option<&IngressDefaultBackend>,
     ingress_ports: IngressPorts,
     shared: &SharedRoutingTable,
 ) {
     // Precompute ListenerKey → (hostname, port) from all owned gateway listeners.
-    let listener_info: HashMap<ListenerKey, ListenerBinding> = gateway_store
+    let listener_info: HashMap<ListenerKey, ListenerBinding> = stores
+        .gateways
         .state()
         .into_iter()
-        .filter(|g| owned_gateway_classes.contains(&g.spec.gateway_class_name))
+        .filter(|g| {
+            ownership
+                .gateway_classes
+                .contains(&g.spec.gateway_class_name)
+        })
         .flat_map(|g| {
             let ns = g.metadata.namespace.clone().unwrap_or_default();
             let name = g.metadata.name.clone().unwrap_or_default();
@@ -593,10 +607,10 @@ fn build_routes(
     for route in routes {
         GatewayApiReconciler::reconcile(
             route,
-            slice_store,
-            service_store,
-            owned_gateways,
-            backend_grants,
+            stores.slices,
+            stores.services,
+            ownership.gateways,
+            ownership.backend_grants,
             &listener_info,
             &mut builder,
         );
@@ -604,10 +618,10 @@ fn build_routes(
     for ingress in ingresses {
         IngressReconciler::reconcile(
             ingress,
-            slice_store,
-            service_store,
-            owned_ingress_classes,
-            owned_default_ingress_class,
+            stores.slices,
+            stores.services,
+            ownership.ingress_classes,
+            ownership.default_ingress_class,
             ingress_ports,
             &mut builder,
         );
@@ -617,8 +631,13 @@ fn build_routes(
     // Ingress port. Per-Ingress defaults always win because they are installed on the
     // host router (matched first).
     if let Some(db) = ingress_default_backend {
-        let resolved =
-            endpoints::resolve(&db.namespace, &db.name, db.port, slice_store, service_store);
+        let resolved = endpoints::resolve(
+            &db.namespace,
+            &db.name,
+            db.port,
+            stores.slices,
+            stores.services,
+        );
         if resolved.addrs.is_empty() {
             tracing::warn!(
                 svc = %format!("{}/{}", db.namespace, db.name),
@@ -661,8 +680,8 @@ fn build_routes(
             tracing::info!(
                 http_routes = routes.len(),
                 ingresses = ingresses.len(),
-                owned_ingress_classes = owned_ingress_classes.len(),
-                owned_gateways = owned_gateways.len(),
+                owned_ingress_classes = ownership.ingress_classes.len(),
+                owned_gateways = ownership.gateways.len(),
                 "Routing table rebuilt"
             );
         }
@@ -673,37 +692,39 @@ fn build_routes(
 }
 
 /// Build and publish the TLS cert store; returns per-gateway listener health for further use.
-#[allow(clippy::too_many_arguments)]
 fn build_tls(
+    stores: &ReflectorStores<'_>,
     ingresses: &[Arc<Ingress>],
-    gateway_store: &reflector::Store<Gateway>,
-    owned_gateway_classes: &HashSet<String>,
-    owned_ingress_classes: &HashSet<String>,
-    owned_default_ingress_class: Option<&str>,
-    cert_grants: &GrantSet,
-    secret_store: &reflector::Store<Secret>,
+    ownership: &Ownership<'_>,
     tls_shared: &SharedTlsStore,
 ) -> HashMap<ObjectKey, GatewayListenerHealth> {
     let mut tls_builder = TlsStoreBuilder::new();
     for ingress in ingresses {
         IngressReconciler::reconcile_tls(
             ingress,
-            secret_store,
-            owned_ingress_classes,
-            owned_default_ingress_class,
+            stores.secrets,
+            ownership.ingress_classes,
+            ownership.default_ingress_class,
             &mut tls_builder,
         );
     }
 
     let mut gateway_tls_health: HashMap<ObjectKey, GatewayListenerHealth> = HashMap::new();
-    for gw in gateway_store.state() {
-        if !owned_gateway_classes.contains(&gw.spec.gateway_class_name) {
+    for gw in stores.gateways.state() {
+        if !ownership
+            .gateway_classes
+            .contains(&gw.spec.gateway_class_name)
+        {
             continue;
         }
         let ns = gw.metadata.namespace.clone().unwrap_or_default();
         let name = gw.metadata.name.clone().unwrap_or_default();
-        let health =
-            GatewayApiReconciler::reconcile_tls(&gw, secret_store, cert_grants, &mut tls_builder);
+        let health = GatewayApiReconciler::reconcile_tls(
+            &gw,
+            stores.secrets,
+            ownership.cert_grants,
+            &mut tls_builder,
+        );
         gateway_tls_health.insert(ObjectKey::new(ns, name), health);
     }
 

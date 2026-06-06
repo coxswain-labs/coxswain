@@ -10,7 +10,7 @@ pub struct GeneratedCert {
 impl GeneratedCert {
     pub fn for_host(host: &str) -> Self {
         let certified = rcgen::generate_simple_self_signed(vec![host.to_string()])
-            .expect("rcgen self-signed cert");
+            .unwrap_or_else(|e| panic!("rcgen self-signed cert for {host}: {e}"));
         Self {
             cert_pem: certified.cert.pem(),
             key_pem: certified.key_pair.serialize_pem(),
