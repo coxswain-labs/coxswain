@@ -26,7 +26,10 @@ fn listener_isolation_empty_listener_route_not_accessible_via_more_specific_list
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &listener_info,
+        crate::gateway_api::RouteResolution {
+            listener_info: &listener_info,
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -60,7 +63,10 @@ fn parent_ref_port_filters_to_matching_listener() {
         &empty_svc_store(),
         &owned(&[("default", "gw")]),
         &HashSet::new(),
-        &listener_info,
+        crate::gateway_api::RouteResolution {
+            listener_info: &listener_info,
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -92,7 +98,10 @@ fn parent_ref_port_unset_attaches_to_all_listeners() {
         &empty_svc_store(),
         &owned(&[("default", "gw")]),
         &HashSet::new(),
-        &listener_info,
+        crate::gateway_api::RouteResolution {
+            listener_info: &listener_info,
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -124,7 +133,10 @@ fn parent_ref_port_no_match_drops_route() {
         &empty_svc_store(),
         &owned(&[("default", "gw")]),
         &HashSet::new(),
-        &listener_info,
+        crate::gateway_api::RouteResolution {
+            listener_info: &listener_info,
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -189,7 +201,10 @@ fn parent_ref_port_with_section_name_combined() {
         &empty_svc_store(),
         &owned_gw,
         &HashSet::new(),
-        &listener_info,
+        crate::gateway_api::RouteResolution {
+            listener_info: &listener_info,
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -207,7 +222,10 @@ fn parent_ref_port_with_section_name_combined() {
         &empty_svc_store(),
         &owned_gw,
         &HashSet::new(),
-        &listener_info,
+        crate::gateway_api::RouteResolution {
+            listener_info: &listener_info,
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();

@@ -1,0 +1,54 @@
+# BackendTLSPolicy test fixture.
+# Substitutions (see fixtures::gateway_api::BACKEND_TLS_POLICY callers):
+#   * the hostname used in the backend cert's SAN and the policy
+#   * raw PEM text of the CA certificate (must be indented for the block scalar below)
+#   * proxy HTTP listener port (filled by Harness::apply)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: echo-tls-ca
+data:
+  ca.crt: |
+    CA_PEM
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: backend-tls-gw
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: HTTP_PORT
+      protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend-tls-route
+spec:
+  parentRefs:
+    - name: backend-tls-gw
+  hostnames:
+    - backend-tls.TESTNS.local
+  rules:
+    - backendRefs:
+        - name: echo-tls
+          port: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: echo-tls-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-tls
+  validation:
+    hostname: TLS_HOSTNAME
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: echo-tls-ca

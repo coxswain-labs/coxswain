@@ -1,0 +1,76 @@
+# TLS echo backend exposing TWO named Service ports for section-name routing tests.
+# Both ports target the SAME container port (8443), so the pod-level cert (with
+# multi-SAN content) is reused — what differs is the SectionName the policy can
+# attach to.
+#
+# Substitutions (see tests applying backends::ECHO_TLS_DUAL_PORT):
+#   * base64-encoded server certificate PEM
+#   * base64-encoded server private key PEM
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: echo-tls-creds
+type: Opaque
+data:
+  tls.crt: TLS_SERVER_CERT_B64
+  tls.key: TLS_SERVER_KEY_B64
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-tls
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-tls
+  template:
+    metadata:
+      labels:
+        app: echo-tls
+    spec:
+      containers:
+        - name: echo
+          image: gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
+          ports:
+            - containerPort: 8443
+              name: https
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: TLS_SERVER_CERT
+              value: /certs/tls.crt
+            - name: TLS_SERVER_PRIVKEY
+              value: /certs/tls.key
+          volumeMounts:
+            - name: tls-creds
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: tls-creds
+          secret:
+            secretName: echo-tls-creds
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-tls
+spec:
+  selector:
+    app: echo-tls
+  ports:
+    - name: https-1
+      port: 443
+      targetPort: 8443
+      appProtocol: https
+    - name: https-2
+      port: 8443
+      targetPort: 8443
+      appProtocol: https

@@ -2,16 +2,22 @@
 //! and TLS tables whenever any of them change.
 
 use crate::gateway_api::hostnames_intersect;
+use crate::gateway_api::{
+    BackendTlsIndex, GatewayApiReconciler, ListenerBinding, build_backend_tls_index,
+};
+use crate::gw_types::BackendTlsPolicy;
 use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
 use crate::k8s_utils::scoped_api;
 use crate::keys::ListenerKey;
-use crate::tls::{GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth};
+use crate::tls::{
+    GatewayListenerHealth, SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth,
+    SharedHttpRouteHealth,
+};
 use crate::{
     endpoints,
-    gateway_api::{GatewayApiReconciler, ListenerBinding},
     ingress::{IngressPorts, IngressReconciler},
 };
 use async_trait::async_trait;
@@ -20,7 +26,7 @@ use coxswain_core::reference_grants::ReferenceGrantKey;
 use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, SharedRoutingTable};
 use coxswain_core::tls::{SharedTlsStore, TlsStoreBuilder};
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::{
@@ -106,15 +112,16 @@ pub struct ReconcilerOptions {
 }
 
 /// Pingora background service that maintains reflector-backed stores for
-/// `HTTPRoute`, `Ingress`, `IngressClass`, `Gateway`, `GatewayClass`, and
-/// `EndpointSlice`, and rebuilds the routing table whenever any of them change
-/// — with a 500 ms trailing-edge debounce to coalesce burst updates (e.g.
-/// rolling deploys).
+/// `HTTPRoute`, `Ingress`, `IngressClass`, `Gateway`, `GatewayClass`,
+/// `BackendTLSPolicy`, `ConfigMap`, and `EndpointSlice`, and rebuilds the routing
+/// table whenever any of them change — with a 500 ms trailing-edge debounce to
+/// coalesce burst updates (e.g. rolling deploys).
 pub struct Reconciler {
     routes: SharedRoutingTable,
     tls: SharedTlsStore,
     tls_health: SharedGatewayListenerHealth,
     route_health: SharedHttpRouteHealth,
+    policy_health: SharedBackendTlsPolicyHealth,
     owned_gateways: OwnedGateways,
     controller_name: String,
     opts: ReconcilerOptions,
@@ -135,6 +142,7 @@ impl Reconciler {
             tls,
             tls_health,
             route_health: SharedHttpRouteHealth::new(),
+            policy_health: SharedBackendTlsPolicyHealth::new(),
             owned_gateways,
             controller_name,
             opts,
@@ -145,6 +153,12 @@ impl Reconciler {
     /// can subscribe to updates published by this reconciler.
     pub fn route_health(&self) -> SharedHttpRouteHealth {
         self.route_health.clone()
+    }
+
+    /// Returns the shared `BackendTLSPolicy` health handle so the Controller can
+    /// write `status.ancestors[]` when leader.
+    pub fn policy_health(&self) -> SharedBackendTlsPolicyHealth {
+        self.policy_health.clone()
     }
 }
 
@@ -165,6 +179,13 @@ struct ReflectorStores<'a> {
     services: &'a reflector::Store<Service>,
     grants: &'a reflector::Store<ReferenceGrant>,
     secrets: &'a reflector::Store<Secret>,
+    /// `BackendTLSPolicy` resources in scope (namespaced per `watch_namespace`).
+    policies: &'a reflector::Store<BackendTlsPolicy>,
+    /// All ConfigMaps in scope — used to resolve `caCertificateRefs`.
+    /// Unlike the `Secret` reflector (which uses a type= field selector), ConfigMaps
+    /// have no equivalent filter; all CMs in scope are watched. A follow-up will
+    /// switch to per-policy informers to bound memory use in large clusters.
+    configmaps: &'a reflector::Store<ConfigMap>,
 }
 
 struct SharedOutputs<'a> {
@@ -172,6 +193,7 @@ struct SharedOutputs<'a> {
     tls: &'a SharedTlsStore,
     tls_health: &'a SharedGatewayListenerHealth,
     route_health: &'a SharedHttpRouteHealth,
+    policy_health: &'a SharedBackendTlsPolicyHealth,
 }
 
 struct Ownership<'a> {
@@ -181,6 +203,11 @@ struct Ownership<'a> {
     gateway_classes: &'a HashSet<String>,
     backend_grants: &'a GrantSet,
     cert_grants: &'a GrantSet,
+    /// Per-(Service, port) `BackendTLSPolicy` lookup table, built before this
+    /// `Ownership` is constructed. Carried alongside ownership data because
+    /// `build_routes` and the per-route `reconcile` both need it on the same
+    /// borrow pass — folding it in here keeps the function arities clippy-clean.
+    policy_index: &'a BackendTlsIndex,
 }
 
 fn spawn_reflector<T>(
@@ -228,16 +255,15 @@ impl BackgroundService for Reconciler {
             ingress_default_backend: self.opts.ingress_default_backend.clone(),
             ingress_ports: self.opts.ingress_ports,
         };
-        let mut set = spawn_tasks(
-            client,
-            self.routes.clone(),
-            self.tls.clone(),
-            self.tls_health.clone(),
-            self.route_health.clone(),
-            self.owned_gateways.clone(),
-            config,
-        )
-        .await;
+        let handles = SharedHandles {
+            routes: self.routes.clone(),
+            tls: self.tls.clone(),
+            tls_health: self.tls_health.clone(),
+            route_health: self.route_health.clone(),
+            policy_health: self.policy_health.clone(),
+            owned_gateways: self.owned_gateways.clone(),
+        };
+        let mut set = spawn_tasks(client, handles, config).await;
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
@@ -251,15 +277,32 @@ impl BackgroundService for Reconciler {
     }
 }
 
-async fn spawn_tasks(
-    client: Client,
+/// Owned bundle of shared state handles consumed by [`spawn_tasks`].
+///
+/// Groups every cross-task handle the reconciler clones into its background work
+/// so the function stays under the `clippy::too_many_arguments` threshold.
+struct SharedHandles {
     routes: SharedRoutingTable,
     tls: SharedTlsStore,
     tls_health: SharedGatewayListenerHealth,
     route_health: SharedHttpRouteHealth,
+    policy_health: SharedBackendTlsPolicyHealth,
     owned_gateways: OwnedGateways,
+}
+
+async fn spawn_tasks(
+    client: Client,
+    handles: SharedHandles,
     config: ReconcilerConfig,
 ) -> JoinSet<()> {
+    let SharedHandles {
+        routes,
+        tls,
+        tls_health,
+        route_health,
+        policy_health,
+        owned_gateways,
+    } = handles;
     let ReconcilerConfig {
         controller_name,
         watch_namespace,
@@ -275,6 +318,8 @@ async fn spawn_tasks(
     let (grant_reader, grant_writer) = reflector::store::<ReferenceGrant>();
     let (secret_reader, secret_writer) = reflector::store::<Secret>();
     let (service_reader, service_writer) = reflector::store::<Service>();
+    let (policy_reader, policy_writer) = reflector::store::<BackendTlsPolicy>();
+    let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
     let ns = watch_namespace.as_deref();
@@ -348,10 +393,29 @@ async fn spawn_tasks(
     spawn_reflector(
         &mut set,
         service_writer,
-        scoped_api::<Service>(client, ns),
+        scoped_api::<Service>(client.clone(), ns),
         watcher::Config::default(),
         Arc::clone(&notify),
         "Service",
+    );
+    spawn_reflector(
+        &mut set,
+        policy_writer,
+        scoped_api::<BackendTlsPolicy>(client.clone(), ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "BackendTlsPolicy",
+    );
+    // ConfigMaps have no type= field selector equivalent; all CMs in scope are
+    // watched so BackendTLSPolicy caCertificateRefs can be resolved. A follow-up
+    // will switch to per-policy informers to bound memory use in large clusters.
+    spawn_reflector(
+        &mut set,
+        configmap_writer,
+        scoped_api::<ConfigMap>(client, ns),
+        watcher::Config::default(),
+        Arc::clone(&notify),
+        "ConfigMap",
     );
 
     // --- Trailing-edge debounce + rebuild ---
@@ -379,12 +443,15 @@ async fn spawn_tasks(
                 services: &service_reader,
                 grants: &grant_reader,
                 secrets: &secret_reader,
+                policies: &policy_reader,
+                configmaps: &configmap_reader,
             };
             let outputs = SharedOutputs {
                 routes: &routes,
                 tls: &tls,
                 tls_health: &tls_health,
                 route_health: &route_health,
+                policy_health: &policy_health,
             };
             rebuild(
                 &stores,
@@ -430,6 +497,10 @@ fn rebuild(
         "Rebuilding routing table"
     );
 
+    // `policy_index` is built first because `Ownership` now carries a borrow of it.
+    let (policy_index, mut policy_health_map) =
+        build_backend_tls_index(stores.policies, stores.configmaps, stores.services);
+
     let ownership = Ownership {
         ingress_classes: &owned_ingress_classes,
         default_ingress_class: owned_default_ingress_class.as_deref(),
@@ -437,6 +508,7 @@ fn rebuild(
         gateway_classes: &owned_gateway_classes,
         backend_grants: &backend_grants,
         cert_grants: &cert_grants,
+        policy_index: &policy_index,
     };
 
     build_routes(
@@ -463,6 +535,19 @@ fn rebuild(
         stores.services,
     );
     outputs.route_health.store_and_notify(route_health_map);
+
+    // Compute per-policy ancestor lists and merge with the validity health from index build.
+    let ancestor_health = GatewayApiReconciler::compute_policy_health(
+        &policy_index,
+        stores.policies,
+        &routes,
+        &owned_gateways,
+    );
+    for (key, ah) in ancestor_health {
+        let entry = policy_health_map.entry(key).or_default();
+        entry.ancestors = ah.ancestors;
+    }
+    outputs.policy_health.store_and_notify(policy_health_map);
 }
 
 /// Compute which IngressClasses, GatewayClasses, and Gateways are owned by this controller.
@@ -625,7 +710,10 @@ fn build_routes(
             stores.services,
             ownership.gateways,
             ownership.backend_grants,
-            &listener_info,
+            crate::gateway_api::RouteResolution {
+                listener_info: &listener_info,
+                policy_index: ownership.policy_index,
+            },
             &mut builder,
         );
     }

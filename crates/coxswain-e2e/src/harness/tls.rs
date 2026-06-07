@@ -24,6 +24,20 @@ impl GeneratedCert {
         }
     }
 
+    /// Generate a self-signed certificate valid for every entry in `hosts`.
+    /// Used when one backend pod must satisfy verification by multiple distinct
+    /// SNI hostnames (e.g. the BackendTLSPolicy section-name routing test).
+    pub fn for_hosts(hosts: &[&str]) -> Self {
+        let owned: Vec<String> = hosts.iter().map(|h| (*h).to_string()).collect();
+        let certified = rcgen::generate_simple_self_signed(owned)
+            .unwrap_or_else(|e| panic!("rcgen self-signed cert for {hosts:?}: {e}"));
+        Self {
+            cert_pem: certified.cert.pem(),
+            key_pem: certified.key_pair.serialize_pem(),
+            host: hosts.first().map(|h| (*h).to_string()).unwrap_or_default(),
+        }
+    }
+
     /// PEM cert encoded as base64 for use in a Kubernetes Secret's `data` field.
     pub fn cert_b64(&self) -> String {
         base64::engine::general_purpose::STANDARD.encode(self.cert_pem.as_bytes())
@@ -32,5 +46,15 @@ impl GeneratedCert {
     /// PEM key encoded as base64 for use in a Kubernetes Secret's `data` field.
     pub fn key_b64(&self) -> String {
         base64::engine::general_purpose::STANDARD.encode(self.key_pem.as_bytes())
+    }
+
+    /// PEM cert with all continuation lines indented by `spaces` spaces, suitable for embedding
+    /// in a YAML `|` block scalar whose placeholder already carries the first-line indentation.
+    pub fn cert_pem_indented(&self, spaces: usize) -> String {
+        let indent = " ".repeat(spaces);
+        self.cert_pem
+            .lines()
+            .collect::<Vec<_>>()
+            .join(&format!("\n{indent}"))
     }
 }

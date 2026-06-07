@@ -1,6 +1,7 @@
 //! Polling helpers that retry until Kubernetes resources reach the desired state.
 
 use anyhow::Context as _;
+use gateway_api::apis::standard::backendtlspolicies::BackendTLSPolicy;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
@@ -491,4 +492,107 @@ fn condition_matches(conditions: &[Condition], type_: &str, status: &str) -> boo
     conditions
         .iter()
         .any(|c| c.type_ == type_ && c.status == status)
+}
+
+/// Poll until a `BackendTLSPolicy`'s `status.ancestors[]` contains a condition
+/// with the given type and status from our controller.
+pub async fn wait_for_backend_tls_policy_condition(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    controller_name: &str,
+    type_: &str,
+    status: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<BackendTLSPolicy> = Api::namespaced(client.clone(), namespace);
+    poll_until(
+        timeout,
+        POLL,
+        || {
+            format!(
+                "BackendTLSPolicy {namespace}/{name} to have ancestor condition {type_}={status}"
+            )
+        },
+        || async {
+            api.get(name)
+                .await
+                .ok()
+                .filter(|p| {
+                    p.status
+                        .as_ref()
+                        .map(|s| s.ancestors.as_slice())
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter(|a| a.controller_name == controller_name)
+                        .any(|a| condition_matches(&a.conditions, type_, status))
+                })
+                .map(|_| ())
+        },
+    )
+    .await
+}
+
+/// Condition expectation for [`wait_for_backend_tls_policy_condition_with_reason`].
+///
+/// Bundles the `(type, status, reason)` triple so the wait helper stays under
+/// the workspace `clippy::too_many_arguments` threshold.
+pub struct ExpectedCondition<'a> {
+    /// The condition `type_` we expect (e.g. `"Accepted"`).
+    pub type_: &'a str,
+    /// The condition `status` we expect (e.g. `"False"`).
+    pub status: &'a str,
+    /// The condition `reason` we expect (e.g. `"NoValidCACertificate"`).
+    pub reason: &'a str,
+}
+
+/// Poll until a `BackendTLSPolicy`'s `status.ancestors[]` contains a condition
+/// matching `expected` from our controller.
+///
+/// Stricter than [`wait_for_backend_tls_policy_condition`] — required when the
+/// test cares about the specific failure reason (e.g. `NoValidCACertificate`,
+/// `Conflicted`).
+pub async fn wait_for_backend_tls_policy_condition_with_reason(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    controller_name: &str,
+    expected: ExpectedCondition<'_>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<BackendTLSPolicy> = Api::namespaced(client.clone(), namespace);
+    let ExpectedCondition {
+        type_,
+        status,
+        reason,
+    } = expected;
+    poll_until(
+        timeout,
+        POLL,
+        || {
+            format!(
+                "BackendTLSPolicy {namespace}/{name} to have ancestor condition {type_}={status} reason={reason}"
+            )
+        },
+        || async {
+            api.get(name)
+                .await
+                .ok()
+                .filter(|p| {
+                    p.status
+                        .as_ref()
+                        .map(|s| s.ancestors.as_slice())
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter(|a| a.controller_name == controller_name)
+                        .any(|a| {
+                            a.conditions.iter().any(|c| {
+                                c.type_ == type_ && c.status == status && c.reason == reason
+                            })
+                        })
+                })
+                .map(|_| ())
+        },
+    )
+    .await
 }

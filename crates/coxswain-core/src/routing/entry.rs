@@ -7,6 +7,40 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
+/// CA certificate source for a [`BackendTLSPolicy`](https://gateway-api.sigs.k8s.io/references/spec/#gateway.networking.k8s.io/v1alpha3.BackendTLSPolicy) attachment.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub enum UpstreamCa {
+    /// `wellKnownCACertificates: System` — use the OS trust store.
+    System,
+    /// `caCertificateRefs` — raw PEM bytes from the referenced ConfigMap.
+    Bundle(Arc<[u8]>),
+}
+
+/// TLS configuration for upstream connections derived from a `BackendTLSPolicy` attachment.
+///
+/// When present on a [`BackendGroup`], the proxy overrides `appProtocol`-based TLS decisions
+/// and uses these settings for every connection to that backend.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct UpstreamTls {
+    /// Hostname used for SNI and certificate verification on the upstream connection.
+    pub sni: Arc<str>,
+    /// Certificate authority source for verifying the upstream cert.
+    pub ca: UpstreamCa,
+    /// Stable hash of `(sni, ca)` — folded into `HttpPeer.group_key` so distinct
+    /// CA bundles never share a Pingora connection pool slot, and used as the cache
+    /// key in the proxy-side parse cache.
+    pub group_key: u64,
+}
+
+impl UpstreamTls {
+    /// Construct an [`UpstreamTls`] from its components.
+    pub fn new(sni: Arc<str>, ca: UpstreamCa, group_key: u64) -> Self {
+        Self { sni, ca, group_key }
+    }
+}
+
 /// Wire protocol spoken by a backend, derived from `Service.spec.ports[].appProtocol`
 /// per [GEP-1911](https://gateway-api.sigs.k8s.io/geps/gep-1911/).
 #[non_exhaustive]
@@ -280,6 +314,9 @@ pub struct BackendGroup {
     addrs_snapshot: Box<[SocketAddr]>,
     /// Wire protocol for upstream connections, derived from `appProtocol`.
     protocol: BackendProtocol,
+    /// TLS configuration from an attached `BackendTLSPolicy`.
+    /// When `Some`, the proxy uses these settings instead of `protocol`-derived defaults.
+    tls: Option<Arc<UpstreamTls>>,
 }
 
 impl BackendGroup {
@@ -299,6 +336,7 @@ impl BackendGroup {
             slot_counter: AtomicUsize::new(0),
             addrs_snapshot,
             protocol: BackendProtocol::default(),
+            tls: None,
         }
     }
 
@@ -344,6 +382,7 @@ impl BackendGroup {
             slot_counter: AtomicUsize::new(0),
             addrs_snapshot,
             protocol: BackendProtocol::default(),
+            tls: None,
         }
     }
 
@@ -355,12 +394,22 @@ impl BackendGroup {
             slot_counter: AtomicUsize::new(0),
             addrs_snapshot: Box::new([]),
             protocol: BackendProtocol::default(),
+            tls: None,
         }
     }
 
     /// Set the upstream transport protocol (builder-style).
     pub fn with_protocol(mut self, protocol: BackendProtocol) -> Self {
         self.protocol = protocol;
+        self
+    }
+
+    /// Attach a `BackendTLSPolicy`-derived TLS configuration (builder-style).
+    ///
+    /// When set, the proxy uses `tls.sni` for SNI and `tls.ca` for upstream cert
+    /// verification, overriding `appProtocol`-based TLS defaults.
+    pub fn with_tls(mut self, tls: Arc<UpstreamTls>) -> Self {
+        self.tls = Some(tls);
         self
     }
 
@@ -372,6 +421,11 @@ impl BackendGroup {
     /// Wire protocol for upstream connections.
     pub fn protocol(&self) -> BackendProtocol {
         self.protocol
+    }
+
+    /// TLS configuration from an attached `BackendTLSPolicy`, if any.
+    pub fn upstream_tls(&self) -> Option<&Arc<UpstreamTls>> {
+        self.tls.as_ref()
     }
 
     /// Flat list of all pod addresses — used by the admin `/routes` endpoint.

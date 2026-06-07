@@ -50,3 +50,18 @@ pub const SERVING_DRAIN: &str = fixture!("serving_drain.yaml");
 pub const PARENT_REF_PORT: &str = fixture!("parent_ref_port.yaml");
 /// HTTPRoute backend using `kubernetes.io/h2c` app protocol.
 pub const BACKEND_PROTOCOL_H2C: &str = fixture!("backend_protocol_h2c.yaml");
+/// BackendTLSPolicy test: Gateway + HTTPRoute + ConfigMap CA + policy targeting the TLS echo Service.
+/// Requires `CA_PEM`, `TLS_HOSTNAME` substitutions.
+pub const BACKEND_TLS_POLICY: &str = fixture!("backend_tls_policy.yaml");
+
+/// BackendTLSPolicy with an invalid CA cert ref (ConfigMap that does NOT exist).
+/// Used to verify `Accepted=False/NoValidCACertificate` + 5xx routing.
+pub const BACKEND_TLS_POLICY_INVALID_CA: &str = fixture!("backend_tls_policy_invalid_ca.yaml");
+
+/// BackendTLSPolicy section-name routing: two policies (with + without `sectionName`)
+/// against a dual-port Service. Requires `SNI_PRIMARY`, `SNI_SECONDARY`, `CA_PEM`.
+pub const BACKEND_TLS_POLICY_SECTION_NAME: &str = fixture!("backend_tls_policy_section_name.yaml");
+
+/// BackendTLSPolicy conflict resolution: two policies on the same Service with NO
+/// `sectionName`. Requires `TLS_HOSTNAME`, `CA_PEM`.
+pub const BACKEND_TLS_POLICY_CONFLICT: &str = fixture!("backend_tls_policy_conflict.yaml");

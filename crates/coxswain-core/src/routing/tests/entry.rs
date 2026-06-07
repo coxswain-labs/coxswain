@@ -107,6 +107,50 @@ fn parse_app_protocol_defaults_to_http1() {
     );
 }
 
+// ── UpstreamTls / with_tls round-trip tests ───────────────────────────────────
+
+#[test]
+fn backend_group_with_tls_system_round_trip() {
+    let addr: SocketAddr = "10.0.0.1:443".parse().unwrap();
+    let sni: Arc<str> = Arc::from("backend.example.com");
+    let tls = Arc::new(UpstreamTls::new(sni.clone(), UpstreamCa::System, 42));
+    let group = BackendGroup::new("svc".to_string(), vec![addr]).with_tls(Arc::clone(&tls));
+
+    let got = group.upstream_tls().expect("TLS should be attached");
+    assert_eq!(&*got.sni, "backend.example.com");
+    assert_eq!(got.group_key, 42);
+    assert!(matches!(got.ca, UpstreamCa::System));
+}
+
+#[test]
+fn backend_group_with_tls_bundle_round_trip() {
+    let addr: SocketAddr = "10.0.0.1:443".parse().unwrap();
+    let pem: Arc<[u8]> = Arc::from(b"-----BEGIN CERTIFICATE-----\nfake\n".as_slice());
+    let tls = Arc::new(UpstreamTls::new(
+        Arc::from("backend.example.com"),
+        UpstreamCa::Bundle(Arc::clone(&pem)),
+        99,
+    ));
+    let group = BackendGroup::new("svc".to_string(), vec![addr]).with_tls(Arc::clone(&tls));
+
+    let got = group.upstream_tls().expect("TLS should be attached");
+    assert!(matches!(&got.ca, UpstreamCa::Bundle(p) if p.as_ref() == pem.as_ref()));
+}
+
+#[test]
+fn backend_group_without_tls_returns_none() {
+    let addr: SocketAddr = "10.0.0.1:80".parse().unwrap();
+    let group = BackendGroup::new("svc".to_string(), vec![addr]);
+    assert!(group.upstream_tls().is_none());
+}
+
+#[test]
+fn upstream_tls_size_unchanged() {
+    // BackendGroup now has one extra Option<Arc<UpstreamTls>> = 8 bytes;
+    // but RouteEntry holds Arc<BackendGroup>, so RouteEntry size is unaffected.
+    static_assertions::assert_eq_size!(RouteEntry, [u8; 176]);
+}
+
 #[test]
 fn upstream_with_protocol_round_trips() {
     let u = BackendGroup::new("ns/svc".to_string(), vec![]).with_protocol(BackendProtocol::H2c);

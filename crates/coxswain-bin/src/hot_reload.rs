@@ -57,18 +57,23 @@ impl HotReloader {
 #[async_trait::async_trait]
 impl BackgroundService for HotReloader {
     async fn start(&self, mut shutdown: ShutdownWatch) {
+        // Independent subscription — the Controller has its own Receiver too. Each
+        // `watch::Receiver` tracks its own last-seen generation, so neither consumer
+        // starves the other (unlike `Notify::notify_one`) and cancelled `changed()`
+        // futures don't lose wake-ups (unlike `Notify::notify_waiters`).
+        let mut tls_health_rx = self.tls_health.subscribe();
         loop {
             // Wait for any health-map update.
             tokio::select! {
                 _ = shutdown.changed() => return,
-                _ = self.tls_health.notified() => {}
+                _ = tls_health_rx.changed() => {}
             }
             // Trailing-edge 2 s debounce: absorb burst updates and give the Controller
             // a window to write Programmed=True before we exit.
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => return,
-                    _ = self.tls_health.notified() => {}
+                    _ = tls_health_rx.changed() => {}
                     _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => break,
                 }
             }

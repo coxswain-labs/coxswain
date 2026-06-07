@@ -2,6 +2,7 @@
 //! listener bindings and resolved backend groups.
 
 use super::GatewayApiReconciler;
+use super::backend_tls::{BackendTlsIndex, ResolvedPolicy};
 use super::bindings::{ListenerBinding, compute_listener_bindings};
 use crate::endpoints;
 use crate::gw_types::{
@@ -19,7 +20,7 @@ use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, FilterAction, HostRouterBuilder, MatchPredicates, RouteEntry,
-    RouteTimeouts, RoutingTableBuilder,
+    RouteTimeouts, RoutingTableBuilder, UpstreamTls,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -29,21 +30,44 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// Precomputed lookup tables consumed by [`GatewayApiReconciler::reconcile`].
+///
+/// Bundles the per-rebuild context that doesn't change between routes — the
+/// listener-binding table and the `BackendTLSPolicy` index — so the function
+/// stays under the workspace `clippy::too_many_arguments` threshold without
+/// each call site repeating the two-arg suffix.
+pub struct RouteResolution<'a> {
+    /// `(gw_ns, gw_name, listener_name) → (hostname, port)` mapping for every
+    /// listener on every Gateway we own.
+    pub listener_info: &'a HashMap<ListenerKey, ListenerBinding>,
+    /// Per-(Service, port) `BackendTLSPolicy` lookup table; lookups try
+    /// `(svc, Some(port))` first and fall back to `(svc, None)`.
+    pub policy_index: &'a BackendTlsIndex,
+}
+
 impl GatewayApiReconciler {
     /// Skips routes whose `spec.parentRefs` do not include at least one Gateway
     /// managed by this controller. Never queries the API server.
     ///
-    /// `listener_info` maps `(gw_ns, gw_name, listener_name) → (hostname, port)`, used
-    /// to scope routes to the correct per-port routing table slot and listener hostname.
+    /// `resolution` bundles the precomputed lookup tables used to resolve a route:
+    /// - `listener_info` maps `(gw_ns, gw_name, listener_name) → (hostname, port)`, used
+    ///   to scope routes to the correct per-port routing table slot and listener hostname.
+    /// - `policy_index` maps `(svc, port?)` to an `UpstreamTls` derived from an attached
+    ///   `BackendTLSPolicy`. When a backend ref matches, the group is forced to TLS and
+    ///   the policy's SNI / CA override is attached.
     pub fn reconcile(
         route: &HttpRoute,
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
         owned_gateways: &HashSet<ObjectKey>,
         grants: &HashSet<ReferenceGrantKey>,
-        listener_info: &HashMap<ListenerKey, ListenerBinding>,
+        resolution: RouteResolution<'_>,
         builder: &mut RoutingTableBuilder,
     ) {
+        let RouteResolution {
+            listener_info,
+            policy_index,
+        } = resolution;
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
         let route_id = format!("{route_ns}/{route_name}");
@@ -132,11 +156,35 @@ impl GatewayApiReconciler {
                 let group_name = backend_group_name(backend_refs, route_ns);
                 let protocols: Vec<BackendProtocol> =
                     resolved.iter().map(|(r, _)| r.app_protocol).collect();
-                let protocol = pick_route_protocol(&protocols, &group_name);
+                let mut protocol = pick_route_protocol(&protocols, &group_name);
                 let weighted = resolved.into_iter().map(|(r, w)| (r.addrs, w)).collect();
-                let group =
-                    Arc::new(BackendGroup::weighted(group_name, weighted).with_protocol(protocol));
-                if group.endpoints().is_empty() {
+
+                // Look up BackendTLSPolicy for this rule's backends. Highest-weight ref
+                // wins on conflicts (ties break by backendRefs array order).
+                let policy_match =
+                    pick_backend_tls(backend_refs, route_ns, protocol, policy_index, &group_name);
+                let invalid_policy = matches!(policy_match, PolicyMatch::Invalid);
+                let policy_tls = match policy_match {
+                    PolicyMatch::Valid(tls) => Some(tls),
+                    PolicyMatch::None | PolicyMatch::Invalid => None,
+                };
+                if policy_tls.is_some() {
+                    // Policy presence forces TLS regardless of appProtocol.
+                    protocol = BackendProtocol::Https;
+                }
+
+                let mut group =
+                    BackendGroup::weighted(group_name, weighted).with_protocol(protocol);
+                if let Some(tls) = policy_tls {
+                    group = group.with_tls(tls);
+                }
+                let group = Arc::new(group);
+                if invalid_policy {
+                    // GEP-1897: a backend covered by an invalid BackendTLSPolicy MUST
+                    // return 5xx, not silently fall back to plain HTTP. 502 reads as
+                    // "upstream not reachable" which matches the spec intent.
+                    (Some(group), Some(502u16))
+                } else if group.endpoints().is_empty() {
                     tracing::warn!(
                         route = ?route.metadata.name,
                         "No ready endpoints for rule — installing error route (500)"
@@ -374,6 +422,116 @@ fn pick_route_protocol(protocols: &[BackendProtocol], group_name: &str) -> Backe
             }
             *first
         }
+    }
+}
+
+/// Result of looking up a `BackendTLSPolicy` for a rule's backend refs.
+enum PolicyMatch {
+    /// No backend in this rule has an attached policy — route as normal.
+    None,
+    /// A valid policy is attached; install TLS to upstream with this configuration.
+    Valid(Arc<UpstreamTls>),
+    /// A policy is attached but invalid (e.g. CA cert ref unresolvable). Per
+    /// GEP-1897 the data plane MUST return 5xx instead of falling back to plain
+    /// HTTP; the caller installs a 502 error route for this rule.
+    Invalid,
+}
+
+/// Select the `BackendTLSPolicy` to attach to a rule's `BackendGroup`.
+///
+/// Scans `backend_refs` and looks each up in `policy_index`. If ANY backend has
+/// an invalid policy, the rule is blocked and the result is `PolicyMatch::Invalid`
+/// — this is conservative but correct per GEP-1897, which forbids silently
+/// falling back to plain HTTP when a policy was meant to apply.
+///
+/// Otherwise, when one or more backends have valid policies, the policy of the
+/// highest-weight ref wins (ties broken by array order). When the matched
+/// policies differ across backends, the winner is logged.
+fn pick_backend_tls(
+    backend_refs: &[HttpRouteRulesBackendRefs],
+    route_ns: &str,
+    current_protocol: BackendProtocol,
+    policy_index: &BackendTlsIndex,
+    group_name: &str,
+) -> PolicyMatch {
+    let mut best: Option<(Arc<UpstreamTls>, u16)> = None; // (tls, weight)
+    let mut saw_invalid = false;
+
+    // Per-port best-match lookup: try (svc, Some(port)) first (section-name policy
+    // applied to this specific port), then fall back to (svc, None) (catch-all
+    // policy covering the whole Service). This matches the GEP-1897 spec where
+    // section-name policies override the catch-all for their specific port.
+    let lookup = |svc_key: &ObjectKey, port: u16| -> Option<&ResolvedPolicy> {
+        policy_index
+            .get(&(svc_key.clone(), Some(port)))
+            .or_else(|| policy_index.get(&(svc_key.clone(), None)))
+    };
+
+    for b in backend_refs {
+        let b_ns = b.namespace.as_deref().unwrap_or(route_ns);
+        let svc_key = ObjectKey::new(b_ns, &b.name);
+        let Some(port) = b.port.and_then(|p| u16::try_from(p).ok()) else {
+            continue;
+        };
+        let Some(resolved) = lookup(&svc_key, port) else {
+            continue;
+        };
+        let Some(tls) = resolved.tls.as_ref() else {
+            saw_invalid = true;
+            continue;
+        };
+        let w = match b.weight {
+            None => 1u16,
+            Some(w) if w <= 0 => 0u16,
+            Some(w) => w.min(u16::MAX as i32) as u16,
+        };
+        match &best {
+            None => best = Some((Arc::clone(tls), w)),
+            Some((_, best_w)) if w > *best_w => best = Some((Arc::clone(tls), w)),
+            _ => {}
+        }
+    }
+
+    if saw_invalid {
+        tracing::warn!(
+            backend_group = group_name,
+            "BackendTLSPolicy attached to one of this rule's backends is invalid — \
+             rule will return 502 (GEP-1897)"
+        );
+        return PolicyMatch::Invalid;
+    }
+
+    if let Some((ref tls, _)) = best {
+        if !current_protocol.is_tls() {
+            tracing::debug!(
+                backend_group = group_name,
+                sni = %tls.sni,
+                "BackendTLSPolicy attached — forcing TLS to upstream"
+            );
+        }
+        let distinct = backend_refs
+            .iter()
+            .filter_map(|b| {
+                let b_ns = b.namespace.as_deref().unwrap_or(route_ns);
+                let svc_key = ObjectKey::new(b_ns, &b.name);
+                let port = b.port.and_then(|p| u16::try_from(p).ok())?;
+                lookup(&svc_key, port)
+            })
+            .map(|r| &r.policy_key)
+            .collect::<HashSet<_>>()
+            .len();
+        if distinct > 1 {
+            tracing::warn!(
+                backend_group = group_name,
+                "Multiple BackendTLSPolicies across backendRefs in one rule — \
+                 using highest-weight ref's policy"
+            );
+        }
+    }
+
+    match best {
+        Some((tls, _)) => PolicyMatch::Valid(tls),
+        None => PolicyMatch::None,
     }
 }
 

@@ -1,0 +1,53 @@
+# BackendTLSPolicy test fixture: invalid CA cert ref (missing ConfigMap).
+#
+# Substitutions:
+#   * proxy HTTP listener port (filled by Harness::apply)
+#   * test namespace (filled by Harness::apply via TESTNS)
+#
+# Differences from backend_tls_policy.yaml:
+#   - No ConfigMap is created.
+#   - The policy references a ConfigMap that DOES NOT exist.
+# The controller must surface Accepted=False/NoValidCACertificate +
+# ResolvedRefs=False/InvalidCACertificateRef and the data plane must return 5xx
+# (GEP-1897: invalid policy MUST NOT silently fall back to plain HTTP).
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: backend-tls-gw
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: HTTP_PORT
+      protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend-tls-route
+spec:
+  parentRefs:
+    - name: backend-tls-gw
+  hostnames:
+    - backend-tls.TESTNS.local
+  rules:
+    - backendRefs:
+        - name: echo-tls
+          port: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: echo-tls-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-tls
+  validation:
+    hostname: echo-tls.TESTNS.local
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: does-not-exist

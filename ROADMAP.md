@@ -44,7 +44,7 @@ The first fully usable version: all must-have features implemented, OCI image pu
 - ✅ ~~Finish `parentRef.port` traffic-routing path (GEP-957) — [#82](https://github.com/coxswain-labs/coxswain/issues/82)~~
 - ✅ ~~Honor `appProtocol` on Service ports for backend protocol selection (GEP-1911) — [#90](https://github.com/coxswain-labs/coxswain/issues/90) _(unlocks `SupportHTTPRouteBackendProtocolH2C` and `SupportHTTPRouteBackendProtocolWebSocket`; supersedes closed #12)_~~
 - ✅ ~~Weighted backend refs (`backendRefs[].weight`) — [#17](https://github.com/coxswain-labs/coxswain/issues/17)~~
-- ⬜ `BackendTLSPolicy` (GEP-1897) — [#16](https://github.com/coxswain-labs/coxswain/issues/16)
+- ✅ ~~`BackendTLSPolicy` (GEP-1897) — [#16](https://github.com/coxswain-labs/coxswain/issues/16)~~
 - ⬜ TLS Passthrough for Gateway API listeners (`tls.mode: Passthrough`, GEP-2643) — [#70](https://github.com/coxswain-labs/coxswain/issues/70)
 - ⬜ `BackendLBPolicy` (session persistence + timeouts per backend, GEP-1619) — [#15](https://github.com/coxswain-labs/coxswain/issues/15)
 - ⬜ `GatewayClass` `ParametersRef` with `CoxswainGatewayClassConfig` CRD — [#38](https://github.com/coxswain-labs/coxswain/issues/38)
