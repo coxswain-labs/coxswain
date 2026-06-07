@@ -58,6 +58,7 @@ pub async fn bootstrap() -> anyhow::Result<()> {
     kubectl_apply(&manifests.join("rbac.yaml")).await?;
     kubectl_apply(&manifests.join("gateway-class.yaml")).await?;
     kubectl_apply(&manifests.join("ingress-class.yaml")).await?;
+    kubectl_apply(&manifests.join("pdb.yaml")).await?;
 
     Ok(())
 }
