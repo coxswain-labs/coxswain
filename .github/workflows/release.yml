@@ -7,7 +7,7 @@ on:
 
 name: Release
 
-# Publishes coxswain OCI images to ghcr.io.
+# Publishes coxswain OCI images to ghcr.io and a rendered install.yaml to GitHub Releases.
 #
 # Tag policy (hybrid):
 #   push: main         → :main, :main-<sha7>            (rolling main snapshot)
@@ -28,6 +28,9 @@ name: Release
 #
 # Multi-arch build distributes across native runners (no QEMU) per
 # https://docs.docker.com/build/ci/github-actions/multi-platform/#distribute-build-across-multiple-runners
+#
+# Tag pushes additionally create a GitHub Release with install.yaml — a
+# pre-rendered Kustomize manifest pinned to the exact release tag.
 jobs:
   build:
     name: build (${{ matrix.platform }})
@@ -96,8 +99,8 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  merge:
-    name: merge
+  publish-image:
+    name: publish-image
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -150,3 +153,34 @@ jobs:
         run: |
           docker buildx imagetools inspect \
             ghcr.io/${{ github.repository_owner }}/coxswain:${{ steps.meta.outputs.version }}
+
+  publish-kustomize:
+    name: publish-kustomize
+    needs: publish-image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: imranismail/setup-kustomize@v2
+
+      - name: Pin image tag
+        working-directory: deploy/manifests
+        run: kustomize edit set image ghcr.io/coxswain-labs/coxswain=ghcr.io/coxswain-labs/coxswain:${GITHUB_REF_NAME}
+
+      - name: Render install.yaml
+        run: kustomize build deploy/manifests > install.yaml
+
+      - name: Sanity-check rendered output
+        run: |
+          grep -q "image: ghcr.io/coxswain-labs/coxswain:${GITHUB_REF_NAME}" install.yaml
+          grep -q "imagePullPolicy: IfNotPresent" install.yaml
+
+      - name: Create GitHub Release and attach install.yaml
+        uses: softprops/action-gh-release@v2
+        with:
+          files: install.yaml
+          generate_release_notes: true

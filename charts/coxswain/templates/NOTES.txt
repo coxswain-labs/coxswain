@@ -15,7 +15,7 @@ Check readiness and subsystem detail from inside the cluster:
 
 Get the external IP for the data-plane:
 
-  kubectl -n {{ .Values.namespace.name }} get svc {{ include "coxswain.fullname" . }}-gateway
+  kubectl -n {{ .Values.namespace.name }} get svc {{ include "coxswain.fullname" . }}-proxy
 {{- end }}
 
 {{- if .Values.security.rootless }}

@@ -5,7 +5,7 @@ metadata:
   namespace: {{ .Values.namespace.name }}
   labels:
     {{- include "coxswain.labels" . | nindent 4 }}
-    app.kubernetes.io/component: controller
+    app.kubernetes.io/component: proxy
   {{- with .Values.service.internal.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -14,7 +14,7 @@ spec:
   type: ClusterIP
   selector:
     {{- include "coxswain.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: gateway
+    app.kubernetes.io/component: proxy
   ports:
     - name: health
       port: {{ .Values.health.port }}

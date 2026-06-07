@@ -56,7 +56,19 @@ See [docs/tls-cert-manager.md](docs/tls-cert-manager.md) for a step-by-step guid
 
 ### In-cluster deployment
 
-**Helm (recommended):**
+**Quick install (single command):**
+
+```bash
+# Install Gateway API CRDs (prerequisite)
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/download/standard-install.yaml
+
+# Install Coxswain
+kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/latest/download/install.yaml
+```
+
+Each release publishes a pre-rendered `install.yaml` as a GitHub Release asset. It pins the image to the exact release tag and includes the Namespace, RBAC, GatewayClass, IngressClass, Services, PodDisruptionBudget, and Deployment. To target a specific version, replace `latest` in the URL with the tag name (e.g. `download/v0.1.0/install.yaml`).
+
+**Helm (values-driven):**
 
 ```bash
 # Install Gateway API CRDs
@@ -72,13 +84,16 @@ The chart exposes the full configuration surface via `values.yaml`. To inspect a
 helm show values charts/coxswain
 ```
 
-**Raw manifests (alternative):**
+**Raw manifests (development / resource inspection):**
 
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/download/standard-install.yaml
 kubectl apply -f deploy/manifests/namespace.yaml
 kubectl apply -f deploy/manifests/rbac.yaml
 kubectl apply -f deploy/manifests/gateway-class.yaml
+kubectl apply -f deploy/manifests/ingress-class.yaml
+kubectl apply -f deploy/manifests/service.yaml
+kubectl apply -f deploy/manifests/pdb.yaml
 kubectl apply -f deploy/manifests/deployment.yaml
 ```
 

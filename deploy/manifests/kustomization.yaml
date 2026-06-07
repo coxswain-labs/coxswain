@@ -1,0 +1,44 @@
+# Kustomize base for deploy/manifests/.
+#
+# Usage:
+#   kustomize build deploy/manifests
+#
+# The rendered output sets imagePullPolicy: IfNotPresent regardless of the
+# image tag (see patch below). The release workflow substitutes the exact
+# release tag via `kustomize edit set image` before building, producing the
+# published install.yaml. Running this build locally against the unmodified
+# base yields :latest + IfNotPresent — treat local output as for inspection
+# only, not for direct apply.
+#
+# Per-file apply (kubectl apply -f deploy/manifests/<file>.yaml) is still
+# supported for development; those files keep imagePullPolicy: Always so that
+# a pod restart on :latest automatically pulls the newest release.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - gateway-class.yaml
+  - ingress-class.yaml
+  - service.yaml
+  - pdb.yaml
+  - deployment.yaml
+
+images:
+  - name: ghcr.io/coxswain-labs/coxswain
+    # Overridden by `kustomize edit set image` in the release workflow to pin
+    # to the exact release tag (e.g. v0.1.0).
+    newTag: latest
+
+patches:
+  # Flip imagePullPolicy to IfNotPresent for the rendered install.yaml.
+  # The release workflow pins the image to an immutable tag before building,
+  # so Always would cause unnecessary pulls and defeat the pin.
+  - target:
+      kind: Deployment
+      name: coxswain-proxy
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
