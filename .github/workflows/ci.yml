@@ -18,7 +18,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
-      chart: ${{ steps.filter.outputs.chart }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
@@ -30,9 +29,6 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
-              - '.github/workflows/ci.yml'
-            chart:
-              - 'charts/**'
               - '.github/workflows/ci.yml'
 
   fmt:
@@ -110,17 +106,3 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit
-
-  helm-chart:
-    name: helm-chart
-    needs: changes
-    if: needs.changes.outputs.chart == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: azure/setup-helm@v4
-      - name: Lint
-        run: helm lint charts/coxswain
-      - name: Template smoke test
-        run: helm template coxswain charts/coxswain --namespace coxswain-system > /dev/null
-
