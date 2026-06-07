@@ -7,7 +7,7 @@ on:
 
 name: Release
 
-# Publishes coxswain OCI images to ghcr.io.
+# Publishes coxswain OCI images to ghcr.io and a rendered install.yaml to GitHub Releases.
 #
 # Tag policy (hybrid):
 #   push: main         → :main, :main-<sha7>            (rolling main snapshot)
@@ -151,8 +151,8 @@ jobs:
           docker buildx imagetools inspect \
             ghcr.io/${{ github.repository_owner }}/coxswain:${{ steps.meta.outputs.version }}
 
-  release-asset:
-    name: release-asset
+  publish-install-manifest:
+    name: publish-install-manifest
     needs: merge
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
