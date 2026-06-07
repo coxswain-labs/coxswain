@@ -21,6 +21,7 @@ use crate::{
     ingress::{IngressPorts, IngressReconciler},
 };
 use async_trait::async_trait;
+use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::reference_grants::ReferenceGrantKey;
 use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, SharedRoutingTable};
@@ -111,6 +112,28 @@ pub struct ReconcilerOptions {
     pub ingress_ports: IngressPorts,
 }
 
+/// Health-registry handles consumed by the [`Reconciler`].
+///
+/// Each reflector flips a per-source check on `controller` to `Ready` once it
+/// has emitted its first `InitDone` (the authoritative "initial sync complete"
+/// signal). After the first successful routing-table publish, the Reconciler
+/// also flips `controller.routing_table_built` and `proxy.routing_table_loaded`.
+#[non_exhaustive]
+pub struct ReconcilerHealth {
+    /// Handle for the `controller` subsystem (per-reflector + `routing_table_built`).
+    pub controller: SubsystemHandle,
+    /// Handle for the `proxy` subsystem (`routing_table_loaded`).
+    pub proxy: SubsystemHandle,
+}
+
+impl ReconcilerHealth {
+    /// Construct a `ReconcilerHealth` from the two subsystem handles.
+    #[must_use]
+    pub fn new(controller: SubsystemHandle, proxy: SubsystemHandle) -> Self {
+        Self { controller, proxy }
+    }
+}
+
 /// Pingora background service that maintains reflector-backed stores for
 /// `HTTPRoute`, `Ingress`, `IngressClass`, `Gateway`, `GatewayClass`,
 /// `BackendTLSPolicy`, `ConfigMap`, and `EndpointSlice`, and rebuilds the routing
@@ -123,6 +146,7 @@ pub struct Reconciler {
     route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
     owned_gateways: OwnedGateways,
+    health: ReconcilerHealth,
     controller_name: String,
     opts: ReconcilerOptions,
 }
@@ -134,6 +158,7 @@ impl Reconciler {
         tls: SharedTlsStore,
         tls_health: SharedGatewayListenerHealth,
         owned_gateways: OwnedGateways,
+        health: ReconcilerHealth,
         controller_name: String,
         opts: ReconcilerOptions,
     ) -> Self {
@@ -144,6 +169,7 @@ impl Reconciler {
             route_health: SharedHttpRouteHealth::new(),
             policy_health: SharedBackendTlsPolicyHealth::new(),
             owned_gateways,
+            health,
             controller_name,
             opts,
         }
@@ -210,12 +236,32 @@ struct Ownership<'a> {
     policy_index: &'a BackendTlsIndex,
 }
 
+/// Per-reflector side-effect channels: rebuild notification and readiness flip.
+///
+/// Grouped so [`spawn_reflector`] stays under `clippy::too_many_arguments`.
+struct ReflectorEffects {
+    notify: Arc<Notify>,
+    controller_health: SubsystemHandle,
+    /// Health-check name to flip Ready on first `Event::InitDone`.
+    check: &'static str,
+}
+
+impl ReflectorEffects {
+    fn new(notify: &Arc<Notify>, health: &SubsystemHandle, check: &'static str) -> Self {
+        Self {
+            notify: Arc::clone(notify),
+            controller_health: health.clone(),
+            check,
+        }
+    }
+}
+
 fn spawn_reflector<T>(
     set: &mut JoinSet<()>,
     writer: reflector::store::Writer<T>,
     api: Api<T>,
     config: watcher::Config,
-    notify: Arc<Notify>,
+    effects: ReflectorEffects,
     label: &'static str,
 ) where
     T: kube::Resource
@@ -227,11 +273,20 @@ fn spawn_reflector<T>(
         + 'static,
     T::DynamicType: Default + Clone + std::hash::Hash + Eq + Send + Sync + 'static,
 {
+    let ReflectorEffects {
+        notify,
+        controller_health,
+        check,
+    } = effects;
     set.spawn(async move {
         let stream = reflector::reflector(writer, watcher(api, config).default_backoff());
         tokio::pin!(stream);
         while let Some(event) = stream.next().await {
             match event {
+                Ok(watcher::Event::InitDone) => {
+                    notify.notify_one();
+                    controller_health.ready(check);
+                }
                 Ok(_) => notify.notify_one(),
                 Err(e) => tracing::warn!(error = %e, "{label} reflector error"),
             }
@@ -262,6 +317,8 @@ impl BackgroundService for Reconciler {
             route_health: self.route_health.clone(),
             policy_health: self.policy_health.clone(),
             owned_gateways: self.owned_gateways.clone(),
+            controller_health: self.health.controller.clone(),
+            proxy_health: self.health.proxy.clone(),
         };
         let mut set = spawn_tasks(client, handles, config).await;
         loop {
@@ -288,6 +345,8 @@ struct SharedHandles {
     route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
     owned_gateways: OwnedGateways,
+    controller_health: SubsystemHandle,
+    proxy_health: SubsystemHandle,
 }
 
 async fn spawn_tasks(
@@ -302,6 +361,8 @@ async fn spawn_tasks(
         route_health,
         policy_health,
         owned_gateways,
+        controller_health,
+        proxy_health,
     } = handles;
     let ReconcilerConfig {
         controller_name,
@@ -329,7 +390,7 @@ async fn spawn_tasks(
         route_writer,
         scoped_api::<HttpRoute>(client.clone(), ns),
         watcher::Config::default(),
-        Arc::clone(&notify),
+        ReflectorEffects::new(&notify, &controller_health, "httproute"),
         "HttpRoute",
     );
     spawn_reflector(
@@ -337,7 +398,7 @@ async fn spawn_tasks(
         ingress_writer,
         scoped_api::<Ingress>(client.clone(), ns),
         watcher::Config::default(),
-        Arc::clone(&notify),
+        ReflectorEffects::new(&notify, &controller_health, "ingress"),
         "Ingress",
     );
     spawn_reflector(
@@ -345,7 +406,7 @@ async fn spawn_tasks(
         class_writer,
         Api::<IngressClass>::all(client.clone()),
         watcher::Config::default(),
-        Arc::clone(&notify),
+        ReflectorEffects::new(&notify, &controller_health, "ingress_class"),
         "IngressClass",
     );
     spawn_reflector(
@@ -353,7 +414,7 @@ async fn spawn_tasks(
         gateway_writer,
         scoped_api::<Gateway>(client.clone(), ns),
         watcher::Config::default(),
-        Arc::clone(&notify),
+        ReflectorEffects::new(&notify, &controller_health, "gateway"),
         "Gateway",
     );
     spawn_reflector(
@@ -361,7 +422,7 @@ async fn spawn_tasks(
         gateway_class_writer,
         Api::<GatewayClass>::all(client.clone()),
         watcher::Config::default(),
-        Arc::clone(&notify),
+        ReflectorEffects::new(&notify, &controller_health, "gateway_class"),
         "GatewayClass",
     );
     spawn_reflector(
@@ -369,7 +430,7 @@ async fn spawn_tasks(
         slice_writer,
         scoped_api::<EndpointSlice>(client.clone(), ns),
         watcher::Config::default(),
-        Arc::clone(&notify),
+        ReflectorEffects::new(&notify, &controller_health, "endpoint_slice"),
         "EndpointSlice",
     );
     spawn_reflector(
@@ -377,7 +438,7 @@ async fn spawn_tasks(
         grant_writer,
         scoped_api::<ReferenceGrant>(client.clone(), ns),
         watcher::Config::default(),
-        Arc::clone(&notify),
+        ReflectorEffects::new(&notify, &controller_health, "reference_grant"),
         "ReferenceGrant",
     );
     // Field-selector scoped to `type=kubernetes.io/tls` to avoid pulling every Secret into memory.
@@ -386,7 +447,7 @@ async fn spawn_tasks(
         secret_writer,
         scoped_api::<Secret>(client.clone(), ns),
         watcher::Config::default().fields("type=kubernetes.io/tls"),
-        Arc::clone(&notify),
+        ReflectorEffects::new(&notify, &controller_health, "secret"),
         "Secret",
     );
     // Used to resolve targetPort for backends where servicePort ≠ targetPort.
@@ -395,7 +456,7 @@ async fn spawn_tasks(
         service_writer,
         scoped_api::<Service>(client.clone(), ns),
         watcher::Config::default(),
-        Arc::clone(&notify),
+        ReflectorEffects::new(&notify, &controller_health, "service"),
         "Service",
     );
     spawn_reflector(
@@ -403,7 +464,7 @@ async fn spawn_tasks(
         policy_writer,
         scoped_api::<BackendTlsPolicy>(client.clone(), ns),
         watcher::Config::default(),
-        Arc::clone(&notify),
+        ReflectorEffects::new(&notify, &controller_health, "backend_tls_policy"),
         "BackendTlsPolicy",
     );
     // ConfigMaps have no type= field selector equivalent; all CMs in scope are
@@ -414,7 +475,7 @@ async fn spawn_tasks(
         configmap_writer,
         scoped_api::<ConfigMap>(client, ns),
         watcher::Config::default(),
-        Arc::clone(&notify),
+        ReflectorEffects::new(&notify, &controller_health, "config_map"),
         "ConfigMap",
     );
 
@@ -425,6 +486,7 @@ async fn spawn_tasks(
     // the timer expires uninterrupted, the full routing table is rebuilt from
     // the current store snapshots — never from the API server.
     set.spawn(async move {
+        let mut routing_table_published = false;
         loop {
             notify.notified().await;
             loop {
@@ -453,7 +515,7 @@ async fn spawn_tasks(
                 route_health: &route_health,
                 policy_health: &policy_health,
             };
-            rebuild(
+            let published = rebuild(
                 &stores,
                 &controller_name,
                 &owned_gateways,
@@ -461,12 +523,23 @@ async fn spawn_tasks(
                 ingress_ports,
                 &outputs,
             );
+            // First successful publish: flip the readiness checks that gate
+            // `/readyz` on having an honest routing table. Subsequent rebuilds
+            // do not re-touch the checks — `Ready` is idempotent and there is
+            // no transient state we want to flag here.
+            if published && !routing_table_published {
+                controller_health.ready("routing_table_built");
+                proxy_health.ready("routing_table_loaded");
+                routing_table_published = true;
+            }
         }
     });
 
     set
 }
 
+/// Returns `true` if a new routing table was published (the rebuild succeeded).
+/// Used by the debounce loop to flip the first-publish readiness checks once.
 fn rebuild(
     stores: &ReflectorStores<'_>,
     controller_name: &str,
@@ -474,7 +547,7 @@ fn rebuild(
     ingress_default_backend: Option<&IngressDefaultBackend>,
     ingress_ports: IngressPorts,
     outputs: &SharedOutputs<'_>,
-) {
+) -> bool {
     let routes = stores.routes.state();
     let ingresses = stores.ingresses.state();
 
@@ -511,7 +584,7 @@ fn rebuild(
         policy_index: &policy_index,
     };
 
-    build_routes(
+    let routes_published = build_routes(
         stores,
         &routes,
         &ingresses,
@@ -548,6 +621,8 @@ fn rebuild(
         entry.ancestors = ah.ancestors;
     }
     outputs.policy_health.store_and_notify(policy_health_map);
+
+    routes_published
 }
 
 /// Compute which IngressClasses, GatewayClasses, and Gateways are owned by this controller.
@@ -669,6 +744,9 @@ fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
 }
 
 /// Build and publish the routing table from HTTPRoutes and Ingresses.
+///
+/// Returns `true` if `shared` was replaced with a newly built table, `false` if
+/// the build failed (in which case the previous snapshot is retained).
 fn build_routes(
     stores: &ReflectorStores<'_>,
     routes: &[Arc<HttpRoute>],
@@ -677,7 +755,7 @@ fn build_routes(
     ingress_default_backend: Option<&IngressDefaultBackend>,
     ingress_ports: IngressPorts,
     shared: &SharedRoutingTable,
-) {
+) -> bool {
     // Precompute ListenerKey → (hostname, port) from all owned gateway listeners.
     let listener_info: HashMap<ListenerKey, ListenerBinding> = stores
         .gateways
@@ -786,9 +864,11 @@ fn build_routes(
                 owned_gateways = ownership.gateways.len(),
                 "Routing table rebuilt"
             );
+            true
         }
         Err(e) => {
             tracing::error!(error = %e, "Routing table build failed — retaining previous table");
+            false
         }
     }
 }

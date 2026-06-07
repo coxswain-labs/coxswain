@@ -552,6 +552,7 @@ dependencies = [
  "http",
  "pingora-core",
  "prometheus 0.14.0",
+ "serde",
  "serde_json",
  "tracing",
 ]
@@ -613,6 +614,8 @@ dependencies = [
  "http",
  "matchit",
  "regex",
+ "serde",
+ "serde_json",
  "smallvec",
  "static_assertions",
  "thiserror 2.0.18",
@@ -649,6 +652,7 @@ name = "coxswain-health"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "coxswain-core",
  "http",
  "pingora-core",
 ]

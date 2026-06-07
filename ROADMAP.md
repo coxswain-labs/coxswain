@@ -61,7 +61,7 @@ First publishable, installable release. Gateway API conformant (33/33 core + 29/
 - ✅ ~~Code-quality pass: E2E harness ergonomics — [#145](https://github.com/coxswain-labs/coxswain/issues/145)~~
 - ✅ ~~Code-quality pass: workspace lint block and Cargo metadata hygiene — [#146](https://github.com/coxswain-labs/coxswain/issues/146)~~
 - ✅ ~~Code-quality pass: workspace-wide `//!` module docs and `///` public item coverage — [#147](https://github.com/coxswain-labs/coxswain/issues/147)~~
-- ⬜ Gate `synced`/`readyz` on Ingress `InitDone` in addition to HTTPRoute — [#158](https://github.com/coxswain-labs/coxswain/issues/158) _(bug: readyz can flip before Ingress sync completes)_
+- ✅ ~~Gate `synced`/`readyz` on Ingress `InitDone` in addition to HTTPRoute — [#158](https://github.com/coxswain-labs/coxswain/issues/158) _(delivered as a per-subsystem `HealthRegistry` in `coxswain-core` driving both `/readyz` and `/status`; fixes the same class of bug for every other watcher source)_~~
 - ⬜ Dockerfile + OCI image on public registry — [#26](https://github.com/coxswain-labs/coxswain/issues/26)
 - ⬜ PodDisruptionBudget + resource requests/limits — [#51](https://github.com/coxswain-labs/coxswain/issues/51)
 - ⬜ Helm chart — [#27](https://github.com/coxswain-labs/coxswain/issues/27)
