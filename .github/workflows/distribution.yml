@@ -35,8 +35,8 @@ jobs:
               - 'charts/**'
               - '.github/workflows/distribution.yml'
 
-  smoke:
-    name: smoke
+  docker-image:
+    name: docker-image
     needs: changes
     if: needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
