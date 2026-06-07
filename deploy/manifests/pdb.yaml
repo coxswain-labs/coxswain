@@ -1,7 +1,3 @@
-# maxUnavailable: 1 allows node drains to proceed on single-replica deployments
-# without --disable-eviction, while still capping voluntary disruption to one
-# pod at a time once replicas >= 2. minAvailable: 1 would block drains entirely
-# on a single-replica deployment, forcing operators to reach for --force.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
