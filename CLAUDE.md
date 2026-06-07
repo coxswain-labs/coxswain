@@ -4,8 +4,9 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 **Always read the following files at the start of every session:**
 - `DEVELOPMENT.md` — cluster setup, ports, deploy manifests, e2e and conformance test procedures, release process.
-- `ROADMAP.md` — current issue/milestone status; needed to tick items and understand what's in scope.
 - Any file in `docs/` that is relevant to the task at hand.
+
+The live roadmap is the [GitHub Project](https://github.com/orgs/coxswain-labs/projects/2). Use `gh project view 2 --owner coxswain-labs` and `gh issue list --milestone v0.1 --state all` to see what's in scope and what's done.
 
 ## Project Overview
 
@@ -143,7 +144,7 @@ Every `crates/*/Cargo.toml` must declare `[lints] workspace = true`. Without it,
 7. Implement the issue per its acceptance criteria, including:
    - **E2E tests**: add or update scenarios in `crates/coxswain-e2e/tests/gateway_api.rs` and/or `tests/ingress.rs` for any change to routing, status conditions, or proxy behaviour.
    - **Conformance** (only if the issue body has a **Feature flags** line): add the corresponding `features.SupportXxx` constant(s) to `opts.SupportedFeatures` in `conformance/main_test.go` (with a comment referencing `#N`), run `go vet ./...` to validate, add the bare feature name(s) to `SUPPORTED_FEATURES` in `crates/coxswain-controller/src/controller/gateway_class_status.rs` (keep sorted), and run `bash scripts/check-supported-features.sh`. See `docs/gateway-api-support.md` for the full promotion policy.
-   - **Roadmap**: once the issue is fully implemented (not before), change the corresponding `ROADMAP.md` item from `- ⬜` to `- ✅ ~~...~~`.
+   - Closing the issue (via `Fixes #N` in the commit footer, or `gh issue close N` later) automatically flips its `Status` to `Done` in the GitHub Project — no manual roadmap edit.
 8. At the end of each implementation or refinement cycle:
    - Run `cargo fmt` then `cargo test --workspace --exclude coxswain-e2e` and report results.
    - **Use `AskUserQuestion` with two simultaneous questions** to ask what to do next. Never commit, push, or close without the user explicitly selecting it here. The `AskUserQuestion` tool allows a maximum of 4 options per question, so split across two questions sent in one call:
@@ -154,10 +155,9 @@ Every `crates/*/Cargo.toml` must declare `[lints] workspace = true`. Without it,
 
 ### Closing an issue
 
-1. Run `gh issue close N --repo coxswain-labs/coxswain`.
-2. Confirm the `ROADMAP.md` item is `- ✅ ~~...~~`; if not, fix and commit with `Fixes #N`.
-3. Merge with `gh pr merge --squash --delete-branch`.
-4. Ask the user to confirm before pulling — then run `git checkout main && git pull --ff-only origin main` (requires user presence).
+1. Run `gh issue close N --repo coxswain-labs/coxswain` (the merge auto-closes if the commit footer is `Fixes #N`; this step is for paranoia).
+2. Merge with `gh pr merge --squash --delete-branch`.
+3. Ask the user to confirm before pulling — then run `git checkout main && git pull --ff-only origin main` (requires user presence).
 
 ### Commit message convention
 
@@ -171,19 +171,17 @@ Every commit on an issue branch must reference the issue in the footer:
 
 ## Issue and project management
 
+The single source of truth for scope and status is the [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2). New issues are auto-added at `Status: Todo`. Triage populates the Project's `Track` (single-select; cross-cutting workstream) and, for milestoned items, `Order` (numeric; intended execution sequence within the milestone).
+
 ### Milestones
 
-Plain version numbers only (`v0.1`, `v0.2`; create new milestones on demand as scope is committed). Never use special characters like em dashes, colons, or `&` in milestone titles — they break GitHub's issue filter URL parser. Issues not yet committed to a release carry no milestone assignment and the `status: backlog` label instead.
+Plain version numbers only (`v0.1`, `v0.2`; create new milestones on demand as scope is committed). Use the GitHub-native milestone field (`gh issue edit N --milestone vX.Y`) — there is no longer a mirror `milestone:` label. Never use special characters like em dashes, colons, or `&` in milestone titles — they break GitHub's issue filter URL parser. Issues not yet committed to a release carry no milestone assignment and the `status: backlog` label instead.
 
 ### Labels
 
-Every issue gets one label from each relevant group. At minimum: one `milestone:` OR `status: backlog`, one `type:`, and at least one `area:` or `api:`.
+Every issue gets one label from each relevant group. At minimum: one `type:` and at least one `area:` or `api:`. Use `status: backlog` for issues that are triaged but deliberately uncommitted to a milestone.
 
-**Milestone** — apply one alongside the GitHub milestone assignment:
-- `milestone: v0.1` — first release (release-readiness only)
-- `milestone: v0.2` — feature-complete release (extended conformance ratchet, Ingress value-adds, operator UX)
-
-**Status** — apply instead of a `milestone:` label when the issue is not committed to any release:
+**Status** — applies only when the issue is not committed to any milestone:
 - `status: backlog` — parked; promotion to a v0.N milestone happens when scope solidifies
 
 **Priority** — how urgent within its milestone (or, for backlog items, relative ordering when triage promotes to a milestone):

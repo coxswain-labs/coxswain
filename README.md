@@ -8,6 +8,8 @@ Coxswain watches Kubernetes `Ingress` and `HTTPRoute` resources and dynamically 
 
 > **Note**: This project is currently in early development and not accepting external contributions. Bug reports and feature requests in issues are welcome; we'll revisit contribution guidelines as the project matures.
 
+**Roadmap**: see the [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2) for current scope per milestone, with views by track, area, and status.
+
 ## Features
 
 - **Gateway API + Ingress** — supports both `HTTPRoute` (Gateway API) and classic `Ingress` resources side-by-side
