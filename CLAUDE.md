@@ -173,17 +173,20 @@ Every commit on an issue branch must reference the issue in the footer:
 
 ### Milestones
 
-Plain version numbers only (`v0.1`, `post-v0.1`; create new milestones on demand as scope is committed). Never use special characters like em dashes, colons, or `&` in milestone titles — they break GitHub's issue filter URL parser.
+Plain version numbers only (`v0.1`, `v0.2`; create new milestones on demand as scope is committed). Never use special characters like em dashes, colons, or `&` in milestone titles — they break GitHub's issue filter URL parser. Issues not yet committed to a release carry no milestone assignment and the `status: backlog` label instead.
 
 ### Labels
 
-Every issue gets one label from each relevant group. At minimum: one `milestone:`, one `type:`, and at least one `area:` or `api:`.
+Every issue gets one label from each relevant group. At minimum: one `milestone:` OR `status: backlog`, one `type:`, and at least one `area:` or `api:`.
 
-**Milestone** — always apply one alongside the milestone assignment:
-- `milestone: v0.1` — first usable release
-- `milestone: post-v0.1` — future work, grouped by priority
+**Milestone** — apply one alongside the GitHub milestone assignment:
+- `milestone: v0.1` — first release (release-readiness only)
+- `milestone: v0.2` — feature-complete release (extended conformance ratchet, Ingress value-adds, operator UX)
 
-**Priority** — how urgent within its milestone:
+**Status** — apply instead of a `milestone:` label when the issue is not committed to any release:
+- `status: backlog` — parked; promotion to a v0.N milestone happens when scope solidifies
+
+**Priority** — how urgent within its milestone (or, for backlog items, relative ordering when triage promotes to a milestone):
 - `priority: must-have` — v1.0 blocker; do not ship without it
 - `priority: should-have` — post-v1.0, high priority
 - `priority: nice-to-have` — future / community-driven

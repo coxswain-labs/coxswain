@@ -4,9 +4,9 @@
 
 Items within each milestone are listed in execution order: each item should be completed before starting the next.
 
-### v0.1 — First Usable Release
+### v0.1 — First Release
 
-The first fully usable version: all must-have features implemented, OCI image published, and Gateway API conformance test suite passing.
+First publishable, installable release. Gateway API conformant (33/33 core + 29/29 declared extended); basic Ingress support spec-complete; distributed as a signed OCI image and Helm chart with installation docs. Feature-enhancement work moved to v0.2.
 
 - ✅ ~~Basic GitHub Actions CI (fmt, clippy, test) — [#45](https://github.com/coxswain-labs/coxswain/issues/45)~~
 - ✅ ~~Cluster-backed integration test harness (`crates/coxswain-e2e`) — [#61](https://github.com/coxswain-labs/coxswain/issues/61)~~
@@ -45,21 +45,23 @@ The first fully usable version: all must-have features implemented, OCI image pu
 - ✅ ~~Honor `appProtocol` on Service ports for backend protocol selection (GEP-1911) — [#90](https://github.com/coxswain-labs/coxswain/issues/90) _(unlocks `SupportHTTPRouteBackendProtocolH2C` and `SupportHTTPRouteBackendProtocolWebSocket`; supersedes closed #12)_~~
 - ✅ ~~Weighted backend refs (`backendRefs[].weight`) — [#17](https://github.com/coxswain-labs/coxswain/issues/17)~~
 - ✅ ~~`BackendTLSPolicy` (GEP-1897) — [#16](https://github.com/coxswain-labs/coxswain/issues/16)~~
-- ⬜ `BackendTLSPolicy` `subjectAltNames` validation — [#133](https://github.com/coxswain-labs/coxswain/issues/133) _(unlocks `SupportBackendTLSPolicySANValidation`; depends on #16)_
 - ✅ ~~Per-backend `HTTPRoute` filters (`backendRefs[].filters`) — [#167](https://github.com/coxswain-labs/coxswain/issues/167) _(unlocks `SupportHTTPRouteBackendRequestHeaderModification`)_~~
 - ✅ ~~Declare `SupportReferenceGrant` in `opts.SupportedFeatures` — [#166](https://github.com/coxswain-labs/coxswain/issues/166) _(implementation already complete in `coxswain-core::reference_grants`; this is a paperwork claim)_~~
+- ✅ ~~Full Gateway API conformance test suite — all applicable tests passing — [#34](https://github.com/coxswain-labs/coxswain/issues/34)~~
+- ✅ ~~Code-quality pass: `accept.rs` hardening (typed errors, TLS bundle invariant, connection semaphore, shutdown propagation) — [#136](https://github.com/coxswain-labs/coxswain/issues/136)~~
+- ✅ ~~Code-quality pass: propagate typed errors in startup path — [#137](https://github.com/coxswain-labs/coxswain/issues/137)~~
+- ✅ ~~Code-quality pass: eliminate `appProtocol` string round-trip (GEP-1911 cleanup) — [#138](https://github.com/coxswain-labs/coxswain/issues/138)~~
+- ✅ ~~Code-quality pass: `hot_reload` graceful shutdown via Pingora signal instead of `process::exit` — [#139](https://github.com/coxswain-labs/coxswain/issues/139)~~
+- ✅ ~~Code-quality pass: `#[non_exhaustive]`/`#[must_use]` sweep, `HttpRoute` alias, `BackendPool::next` guard — [#140](https://github.com/coxswain-labs/coxswain/issues/140)~~
+- ✅ ~~Code-quality pass: cheap perf wins and structural cleanups — [#141](https://github.com/coxswain-labs/coxswain/issues/141)~~
+- ✅ ~~Code-quality pass: eliminate per-request allocations (deep hot-path pass) — [#142](https://github.com/coxswain-labs/coxswain/issues/142)~~
+- ✅ ~~Code-quality pass: split large production source files — [#143](https://github.com/coxswain-labs/coxswain/issues/143)~~
+- ✅ ~~Code-quality pass: split large test modules — [#144](https://github.com/coxswain-labs/coxswain/issues/144)~~
+- ✅ ~~Code-quality pass: test-structure alignment and pragmatic coverage gaps — [#159](https://github.com/coxswain-labs/coxswain/issues/159)~~
+- ✅ ~~Code-quality pass: E2E harness ergonomics — [#145](https://github.com/coxswain-labs/coxswain/issues/145)~~
+- ✅ ~~Code-quality pass: workspace lint block and Cargo metadata hygiene — [#146](https://github.com/coxswain-labs/coxswain/issues/146)~~
+- ✅ ~~Code-quality pass: workspace-wide `//!` module docs and `///` public item coverage — [#147](https://github.com/coxswain-labs/coxswain/issues/147)~~
 - ⬜ Gate `synced`/`readyz` on Ingress `InitDone` in addition to HTTPRoute — [#158](https://github.com/coxswain-labs/coxswain/issues/158) _(bug: readyz can flip before Ingress sync completes)_
-- ⬜ TLS Passthrough for Gateway API listeners (`tls.mode: Passthrough`, GEP-2643) — [#70](https://github.com/coxswain-labs/coxswain/issues/70)
-- ⬜ `BackendLBPolicy` (session persistence + timeouts per backend, GEP-1619) — [#15](https://github.com/coxswain-labs/coxswain/issues/15)
-- ⬜ `GatewayClass` `ParametersRef` with `CoxswainGatewayClassConfig` CRD — [#38](https://github.com/coxswain-labs/coxswain/issues/38)
-- ⬜ `coxswain-labs.dev/*` annotation namespace — [#18](https://github.com/coxswain-labs/coxswain/issues/18)
-- ⬜ Ingress annotations for header modifiers + redirects (HTTPRoute filter parity) — [#79](https://github.com/coxswain-labs/coxswain/issues/79)
-- ⬜ Nginx-compatible annotation aliases — [#19](https://github.com/coxswain-labs/coxswain/issues/19)
-- ⬜ Multi-namespace watch (comma-separated list + label selector) — [#59](https://github.com/coxswain-labs/coxswain/issues/59)
-- ⬜ Passive backend health checking — [#22](https://github.com/coxswain-labs/coxswain/issues/22)
-- ⬜ Custom per-route Prometheus metrics (latency, rps, errors) — [#20](https://github.com/coxswain-labs/coxswain/issues/20)
-- ⬜ Structured per-request access logs — [#21](https://github.com/coxswain-labs/coxswain/issues/21)
-- ⬜ `ValidatingAdmissionPolicy` for `coxswain-labs.dev/*` annotations (K8s 1.30+) — [#29](https://github.com/coxswain-labs/coxswain/issues/29)
 - ⬜ Dockerfile + OCI image on public registry — [#26](https://github.com/coxswain-labs/coxswain/issues/26)
 - ⬜ PodDisruptionBudget + resource requests/limits — [#51](https://github.com/coxswain-labs/coxswain/issues/51)
 - ⬜ Helm chart — [#27](https://github.com/coxswain-labs/coxswain/issues/27)
@@ -67,59 +69,90 @@ The first fully usable version: all must-have features implemented, OCI image pu
 - ⬜ Sign OCI images with cosign (Sigstore) — [#46](https://github.com/coxswain-labs/coxswain/issues/46)
 - ⬜ Docs site (getting started, config reference, architecture) — [#30](https://github.com/coxswain-labs/coxswain/issues/30)
 - ⬜ Contributing guide + issue templates — [#31](https://github.com/coxswain-labs/coxswain/issues/31)
-- ✅ ~~Full Gateway API conformance test suite — all applicable tests passing — [#34](https://github.com/coxswain-labs/coxswain/issues/34)~~
 - ⬜ Conformance badge + stable `coxswain-labs.dev/*` annotation API — [#35](https://github.com/coxswain-labs/coxswain/issues/35)
 
 ---
 
-### Refactor fixes (v0.1 code-quality pass)
+### v0.2 — Feature Complete
 
-Work items are listed in execution order; each should be completed and merged before starting the next.
+Feature parity with mature ingress controllers. Closes the extended Gateway API conformance ratchet, adds the Ingress value-add annotation surface (and the nginx-compat aliases that let users migrate without rewriting manifests), and ships the operator UX expected of a production controller (per-route metrics, access logs, passive health, multi-namespace watch, `ValidatingAdmissionPolicy` for the annotation surface).
 
-- ✅ ~~`accept.rs` hardening: typed errors, TLS bundle invariant, connection semaphore, shutdown propagation — [#136](https://github.com/coxswain-labs/coxswain/issues/136)~~
-- ✅ ~~Propagate typed errors in startup path — [#137](https://github.com/coxswain-labs/coxswain/issues/137)~~
-- ✅ ~~Eliminate `appProtocol` string round-trip (GEP-1911 cleanup) — [#138](https://github.com/coxswain-labs/coxswain/issues/138)~~
-- ✅ ~~`hot_reload` graceful shutdown via Pingora signal instead of `process::exit` — [#139](https://github.com/coxswain-labs/coxswain/issues/139)~~
-- ✅ ~~`#[non_exhaustive]`/`#[must_use]` sweep, `HttpRoute` alias, `BackendPool::next` guard — [#140](https://github.com/coxswain-labs/coxswain/issues/140)~~
-- ✅ ~~Cheap perf wins and structural cleanups — [#141](https://github.com/coxswain-labs/coxswain/issues/141)~~
-- ✅ ~~Eliminate per-request allocations (deep hot-path pass) — [#142](https://github.com/coxswain-labs/coxswain/issues/142)~~
-- ✅ ~~Split large production source files — [#143](https://github.com/coxswain-labs/coxswain/issues/143)~~
-- ✅ ~~Split large test modules — [#144](https://github.com/coxswain-labs/coxswain/issues/144)~~
-- ✅ ~~Test-structure alignment and pragmatic coverage gaps — [#159](https://github.com/coxswain-labs/coxswain/issues/159)~~
-- ✅ ~~E2E harness ergonomics — [#145](https://github.com/coxswain-labs/coxswain/issues/145)~~
-- ✅ ~~Workspace lint block and Cargo metadata hygiene — [#146](https://github.com/coxswain-labs/coxswain/issues/146)~~
-- ✅ ~~Workspace-wide `//!` module docs and `///` public item coverage — [#147](https://github.com/coxswain-labs/coxswain/issues/147)~~
+Extended Gateway API conformance ratchet:
+
+- ⬜ `BackendTLSPolicy` `subjectAltNames` validation — [#133](https://github.com/coxswain-labs/coxswain/issues/133) _(unlocks `SupportBackendTLSPolicySANValidation`; depends on #16)_
+- ⬜ HTTP/2 downstream (h2 ALPN + h2c prior knowledge) — [#32](https://github.com/coxswain-labs/coxswain/issues/32) _(unlocks `SupportHTTPRouteBackendProtocolH2C`; also unblocks backlog #33 GRPCRoute and #96 H/2 coalescing)_
+
+Gateway API extras:
+
+- ⬜ TLS Passthrough for Gateway API listeners (`tls.mode: Passthrough`, GEP-2643) — [#70](https://github.com/coxswain-labs/coxswain/issues/70)
+- ⬜ `BackendLBPolicy` (session persistence + timeouts per backend, GEP-1619) — [#15](https://github.com/coxswain-labs/coxswain/issues/15)
+- ⬜ `GatewayClass` `ParametersRef` with `CoxswainGatewayClassConfig` CRD — [#38](https://github.com/coxswain-labs/coxswain/issues/38)
+
+Ingress value-adds (spec-equivalent annotation surface):
+
+- ⬜ `coxswain-labs.dev/*` annotation namespace (timeouts, retries, rewrites) — [#18](https://github.com/coxswain-labs/coxswain/issues/18)
+- ⬜ Ingress annotations for header modifiers + redirects (HTTPRoute filter parity) — [#79](https://github.com/coxswain-labs/coxswain/issues/79)
+- ⬜ Nginx-compatible annotation aliases for migration — [#19](https://github.com/coxswain-labs/coxswain/issues/19)
+- ⬜ `ValidatingAdmissionPolicy` for `coxswain-labs.dev/*` annotations (K8s 1.30+) — [#29](https://github.com/coxswain-labs/coxswain/issues/29) _(depends on #18, #79)_
+
+Operator UX:
+
+- ⬜ Multi-namespace watch (comma-separated list + label selector) — [#59](https://github.com/coxswain-labs/coxswain/issues/59)
+- ⬜ Passive backend health checking — [#22](https://github.com/coxswain-labs/coxswain/issues/22)
+- ⬜ Custom per-route Prometheus metrics (latency, rps, errors) — [#20](https://github.com/coxswain-labs/coxswain/issues/20)
+- ⬜ Structured per-request access logs — [#21](https://github.com/coxswain-labs/coxswain/issues/21)
 
 ---
 
-### Post-v0.1 — Improvements
+## Backlog
 
-- ✅ ~~Per-listener `attachedRoutes` count in `Gateway.status.listeners[]` — [#73](https://github.com/coxswain-labs/coxswain/issues/73)~~
-- ⬜ HTTP/2 downstream (h2 ALPN + h2c) — [#32](https://github.com/coxswain-labs/coxswain/issues/32) _(unblocks #33, #96)_
-- ⬜ HTTPRoute retry policy (GEP-1731) — [#85](https://github.com/coxswain-labs/coxswain/issues/85)
-- ⬜ HTTPRoute retry budgets (GEP-3388) — [#95](https://github.com/coxswain-labs/coxswain/issues/95) _(depends on #85)_
-- ⬜ Active backend health probing — [#37](https://github.com/coxswain-labs/coxswain/issues/37) _(depends on #22)_
-- ⬜ CORS built-in filter (GEP-1767) — [#41](https://github.com/coxswain-labs/coxswain/issues/41)
-- ⬜ Traffic mirroring / shadow traffic (GEP-3171) — [#54](https://github.com/coxswain-labs/coxswain/issues/54) _(depends on #17, #20)_
-- ⬜ Canary deployments (progressive weight shifting) — [#53](https://github.com/coxswain-labs/coxswain/issues/53) _(depends on #17, #20)_
-- ⬜ Blue/green orchestration — [#55](https://github.com/coxswain-labs/coxswain/issues/55) _(depends on #17, #22)_
+Future / community-driven work. Items here have no GitHub milestone assignment and carry the `status: backlog` label; promotion to a v0.N milestone happens when scope solidifies. Grouped by theme — items within a theme are not strictly ordered (dependencies are annotated inline).
+
+Gateway API resources and extras:
+
 - ⬜ `GRPCRoute` + gRPC protocol support (GEP-1016) — [#33](https://github.com/coxswain-labs/coxswain/issues/33) _(depends on #32)_
-- ⬜ Frontend client certificate validation / mTLS at Gateway listeners (GEP-91) — [#86](https://github.com/coxswain-labs/coxswain/issues/86)
-- ⬜ Backend client certificate / mTLS to upstream pods (GEP-3155) — [#87](https://github.com/coxswain-labs/coxswain/issues/87) _(depends on #16)_
-- ⬜ Multi-certificate SNI per listener (GEP-851) — [#72](https://github.com/coxswain-labs/coxswain/issues/72)
-- ⬜ Prevent incorrect HTTP/2 connection coalescing on TLS listeners (GEP-3567) — [#96](https://github.com/coxswain-labs/coxswain/issues/96) _(depends on #32)_
 - ⬜ ListenerSet resource support (GEP-1713) — [#93](https://github.com/coxswain-labs/coxswain/issues/93)
 - ⬜ Per-Gateway Infrastructure (`spec.infrastructure`, GEP-1867) — [#92](https://github.com/coxswain-labs/coxswain/issues/92)
 - ⬜ Default Gateways for `parentRef`-less routes (GEP-3793) — [#94](https://github.com/coxswain-labs/coxswain/issues/94)
 - ⬜ Backend Resource in `backendRefs` (GEP-4894) — [#97](https://github.com/coxswain-labs/coxswain/issues/97)
-- ⬜ OpenTelemetry trace context propagation — [#36](https://github.com/coxswain-labs/coxswain/issues/36)
+- ⬜ Prevent incorrect HTTP/2 connection coalescing on TLS listeners (GEP-3567) — [#96](https://github.com/coxswain-labs/coxswain/issues/96) _(depends on #32)_
+
+Traffic management:
+
+- ⬜ HTTPRoute retry policy (GEP-1731) — [#85](https://github.com/coxswain-labs/coxswain/issues/85)
+- ⬜ HTTPRoute retry budgets (GEP-3388) — [#95](https://github.com/coxswain-labs/coxswain/issues/95) _(depends on #85)_
+- ⬜ Traffic mirroring / shadow traffic (GEP-3171) — [#54](https://github.com/coxswain-labs/coxswain/issues/54) _(depends on #17, #20)_
+- ⬜ Canary deployments (progressive weight shifting) — [#53](https://github.com/coxswain-labs/coxswain/issues/53) _(depends on #17, #20)_
+- ⬜ Blue/green orchestration — [#55](https://github.com/coxswain-labs/coxswain/issues/55) _(depends on #17, #22)_
+- ⬜ Session affinity / sticky sessions — [#39](https://github.com/coxswain-labs/coxswain/issues/39) _(depends on #15)_
+- ⬜ Response caching — [#40](https://github.com/coxswain-labs/coxswain/issues/40)
+
+TLS / mTLS:
+
+- ⬜ Frontend client certificate validation / mTLS at Gateway listeners (GEP-91) — [#86](https://github.com/coxswain-labs/coxswain/issues/86)
+- ⬜ Backend client certificate / mTLS to upstream pods (GEP-3155) — [#87](https://github.com/coxswain-labs/coxswain/issues/87) _(depends on #16)_
+- ⬜ Multi-certificate SNI per listener (GEP-851) — [#72](https://github.com/coxswain-labs/coxswain/issues/72)
+
+Auth and security:
+
 - ⬜ `SecurityPolicy` (Gateway API ext_authz, GEP-1494) — [#23](https://github.com/coxswain-labs/coxswain/issues/23)
-- ⬜ Design trait-based plugin extension architecture — [#56](https://github.com/coxswain-labs/coxswain/issues/56) _(extracted via #23)_
 - ⬜ `ext_authz` annotation for Ingress — [#24](https://github.com/coxswain-labs/coxswain/issues/24)
 - ⬜ Per-route, per-client rate limiting (both APIs) — [#25](https://github.com/coxswain-labs/coxswain/issues/25)
+
+Filters and extensibility:
+
+- ⬜ CORS built-in filter (GEP-1767) — [#41](https://github.com/coxswain-labs/coxswain/issues/41)
 - ⬜ Implementation-specific extension filters via `ExtensionRef` — [#77](https://github.com/coxswain-labs/coxswain/issues/77)
-- ⬜ Session affinity / sticky sessions — [#39](https://github.com/coxswain-labs/coxswain/issues/39) _(depends on #15)_
+- ⬜ Design trait-based plugin extension architecture — [#56](https://github.com/coxswain-labs/coxswain/issues/56) _(extracted via #23)_
+
+Observability:
+
+- ✅ ~~Per-listener `attachedRoutes` count in `Gateway.status.listeners[]` — [#73](https://github.com/coxswain-labs/coxswain/issues/73)~~
+- ⬜ Active backend health probing — [#37](https://github.com/coxswain-labs/coxswain/issues/37) _(depends on #22)_
+- ⬜ OpenTelemetry trace context propagation — [#36](https://github.com/coxswain-labs/coxswain/issues/36)
+
+Operations:
+
 - ⬜ IPv6 / dual-stack explicit handling — [#42](https://github.com/coxswain-labs/coxswain/issues/42)
-- ⬜ Response caching — [#40](https://github.com/coxswain-labs/coxswain/issues/40)
 - ⬜ Performance profiling on admin port — [#43](https://github.com/coxswain-labs/coxswain/issues/43)
 - ⬜ Dry-run mode for controller — [#44](https://github.com/coxswain-labs/coxswain/issues/44)
