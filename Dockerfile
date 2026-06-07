@@ -1,0 +1,73 @@
+# syntax=docker/dockerfile:1.7
+
+# Multi-stage build for coxswain.
+#
+# Stage 1 (planner): generate a cargo-chef recipe describing the dependency tree.
+# Stage 2 (builder): cook dependencies into a cached layer (BoringSSL builds here,
+#                    ~5-10 min on amd64) then compile the coxswain binary.
+# Stage 3 (runtime): copy the binary onto distroless/cc-debian12:nonroot.
+#
+# BoringSSL (vendored by pingora's boring-sys) is the dominant build cost.
+# cargo-chef caches it in the deps layer so PR rebuilds that don't touch
+# Cargo.lock skip recompiling it entirely.
+
+FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-bookworm AS chef
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+# BoringSSL build dependencies: cmake (CMake-based build), golang (BoringSSL
+# uses Go to generate assembly), perl (asm code generators), clang +
+# libclang-dev (bindgen FFI bindings). build-essential and pkg-config come
+# from the chef base but are listed for clarity.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake \
+        golang \
+        perl \
+        clang \
+        libclang-dev \
+        pkg-config \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=planner /app/recipe.json recipe.json
+# Cook only the deps reachable from the coxswain bin — skips the coxswain-e2e
+# dependency tree. Heaviest cached layer; invalidates on Cargo.lock changes only.
+RUN cargo chef cook --release --recipe-path recipe.json --bin coxswain
+COPY . .
+RUN cargo build --release --bin coxswain
+
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+COPY --from=builder /app/target/release/coxswain /usr/local/bin/coxswain
+
+# Static OCI image-spec annotations. Dynamic ones (created, revision, version,
+# ref.name) are added at build time by docker/metadata-action in CI.
+# org.opencontainers.image.source is load-bearing: ghcr.io uses it to auto-link
+# the package to the source repository.
+LABEL org.opencontainers.image.title="coxswain" \
+      org.opencontainers.image.description="A pure-Rust Kubernetes Ingress & Gateway API Controller built on Pingora" \
+      org.opencontainers.image.url="https://github.com/coxswain-labs/coxswain" \
+      org.opencontainers.image.source="https://github.com/coxswain-labs/coxswain" \
+      org.opencontainers.image.documentation="https://github.com/coxswain-labs/coxswain" \
+      org.opencontainers.image.vendor="Coxswain Labs" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.authors="Matteo Giaccone" \
+      org.opencontainers.image.base.name="gcr.io/distroless/cc-debian12:nonroot"
+
+# Defaults; the binary already defaults --log to "info" via clap so this is
+# primarily for discoverability via `docker inspect`.
+ENV COXSWAIN_LOG=info \
+    COXSWAIN_LOG_FORMAT=json
+
+# No EXPOSE — coxswain's port model is fully env-driven. Only the health
+# (8081) and admin (8082) ports have defaults; proxy 80/443 are off unless
+# COXSWAIN_PROXY_HTTP_PORT / _HTTPS_PORT are set. EXPOSE 80 443 would imply
+# a contract the bare image doesn't honor. README's `## Ports (default)`
+# table is the canonical documentation.
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/usr/local/bin/coxswain"]
+CMD ["serve"]

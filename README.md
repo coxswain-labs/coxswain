@@ -91,6 +91,10 @@ All flags have environment variable equivalents. Most use a `COXSWAIN_*` prefix 
 | `--proxy-threads` | `COXSWAIN_PROXY_THREADS` | `2` | Worker threads per proxy service; set to CPU core count for maximum throughput |
 | `--status-address` | `COXSWAIN_STATUS_ADDRESS` | _(none)_ | IP or hostname written to `Ingress.status` and `Gateway.status.addresses`; required for cert-manager HTTP-01 and external-dns |
 
+## Authors
+
+Created and maintained by Matteo Giaccone, under the Coxswain Labs banner.
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).

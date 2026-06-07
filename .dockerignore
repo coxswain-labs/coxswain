@@ -1,0 +1,34 @@
+# Cargo build artefacts.
+target/
+**/target/
+
+# VCS / editor / harness scratch.
+.git/
+.gitignore
+.gitattributes
+.github/
+.idea/
+.vscode/
+.claude/
+.wip/
+.cargo/config.toml
+
+# Docs, examples, dev-only manifests — not consumed by `cargo build`.
+*.md
+docs/
+deploy/dev/
+deploy/examples/
+
+# Gateway API conformance suite (Go test harness, not Rust).
+conformance/
+
+# E2E test sources. Keep crates/coxswain-e2e/Cargo.toml so cargo-chef can
+# resolve the workspace; the bin build doesn't pull e2e in as a dependency.
+crates/coxswain-e2e/src/
+crates/coxswain-e2e/tests/
+crates/coxswain-e2e/fixtures/
+
+# The Dockerfile is in the build context but doesn't need to be copied into
+# any image layer.
+Dockerfile
+.dockerignore
