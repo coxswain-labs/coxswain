@@ -1,0 +1,66 @@
+on:
+  pull_request:
+    branches:
+      - main
+
+name: Image
+
+# PR-only smoke test for the Dockerfile. Build the amd64 image with no push and
+# exercise the binary so a broken Dockerfile is caught at PR time instead of
+# breaking the next release. Multi-arch publishing lives in release.yml.
+#
+# Same gating pattern as ci.yml / e2e.yml: the workflow always starts so that
+# the `smoke` job (required status check) reports `skipped` success on PRs
+# that don't touch image-related files.
+jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/image.yml'
+
+  smoke:
+    name: smoke
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (amd64, local)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: coxswain:ci
+          cache-from: type=gha,scope=image-smoke
+          cache-to: type=gha,scope=image-smoke,mode=max
+
+      # Intentionally shallow checks — confirm the image is non-empty, the
+      # entrypoint resolves, and the binary parses argv. Deeper validation
+      # (in-cluster smoke, conformance against the image) is a follow-up.
+      - name: Smoke --help
+        run: docker run --rm coxswain:ci --help
+
+      - name: Smoke --version
+        run: docker run --rm coxswain:ci --version
+
+      - name: Report image size
+        run: docker images coxswain:ci --format '{{.Repository}}:{{.Tag}} {{.Size}}'

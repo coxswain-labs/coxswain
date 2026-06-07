@@ -26,8 +26,15 @@ spec:
           type: RuntimeDefault
       containers:
         - name: coxswain
-          image: coxswain-gateway:latest
-          imagePullPolicy: IfNotPresent
+          # :latest tracks the most recent versioned release. For production,
+          # pin to a specific version — :v0.1.5 / :0.1.5 are immutable patch
+          # pins; :0.1 floats to the latest patch in the 0.1 minor line; :0
+          # floats to the latest minor.patch in the 0.x major line.
+          # Combined with imagePullPolicy: Always below, a pod restart on
+          # :latest rolls onto the newest release. For pinned tags, switch
+          # imagePullPolicy back to IfNotPresent.
+          image: ghcr.io/coxswain-labs/coxswain:latest
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 80
