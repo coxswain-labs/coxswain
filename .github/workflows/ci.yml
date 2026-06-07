@@ -2,18 +2,39 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'deny.toml'
-      - '.github/workflows/ci.yml'
 
 name: CI
 
+# The workflow-level `paths:` filter was removed deliberately: the jobs below
+# are required status checks in the main-branch ruleset, and a filter that
+# excludes the entire workflow leaves those checks pending forever on PRs that
+# don't touch matching paths (e.g. docs-only PRs). Instead we always start the
+# workflow and gate each expensive job on the `changes` job's output. A job
+# whose `if:` evaluates to false reports `skipped`, which counts as success for
+# required-status-check enforcement.
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+              - '.github/workflows/ci.yml'
+
   fmt:
     name: fmt
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -24,6 +45,8 @@ jobs:
 
   clippy:
     name: clippy
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -42,6 +65,8 @@ jobs:
 
   test:
     name: test
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -58,6 +83,8 @@ jobs:
 
   deny:
     name: deny
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -69,6 +96,8 @@ jobs:
 
   audit:
     name: audit
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
