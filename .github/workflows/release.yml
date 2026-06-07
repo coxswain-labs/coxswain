@@ -96,8 +96,8 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  merge:
-    name: merge
+  publish-image:
+    name: publish-image
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -153,7 +153,7 @@ jobs:
 
   publish-install-manifest:
     name: publish-install-manifest
-    needs: merge
+    needs: publish-image
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
