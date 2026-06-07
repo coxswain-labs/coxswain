@@ -8,7 +8,7 @@ use crate::gw_types::{
     },
 };
 use coxswain_core::routing::UpstreamCa;
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::api::ObjectMeta;
 use kube::runtime::{reflector, watcher};
 use std::collections::BTreeMap;
@@ -29,6 +29,12 @@ fn configmap_store(cms: Vec<ConfigMap>) -> reflector::Store<ConfigMap> {
         writer.apply_watcher_event(&watcher::Event::Apply(c));
     }
     writer.as_reader()
+}
+
+/// Empty Service store — sectionName resolution lookups all miss in tests that
+/// don't exercise section names.
+fn empty_service_store() -> reflector::Store<Service> {
+    reflector::store::Writer::<Service>::default().as_reader()
 }
 
 fn make_policy(
@@ -108,12 +114,17 @@ fn index_builds_with_system_ca() {
     let store = policy_store(vec![policy]);
     let cms = configmap_store(vec![]);
 
-    let (index, health) = build_backend_tls_index(&store, &cms);
+    let (index, health) = build_backend_tls_index(&store, &cms, &empty_service_store());
 
     let key = ObjectKey::new("default", "echo");
-    let resolved = index.get(&key).expect("policy should be in index");
-    assert_eq!(&*resolved.tls.sni, "echo.example.com");
-    assert!(matches!(resolved.tls.ca, UpstreamCa::System));
+    let resolved = index
+        .get(&(key.clone(), None))
+        .expect("policy should be in index");
+    assert_eq!(&*resolved.tls.as_ref().unwrap().sni, "echo.example.com");
+    assert!(matches!(
+        resolved.tls.as_ref().unwrap().ca,
+        UpstreamCa::System
+    ));
 
     let hkey = ObjectKey::new("default", "btls");
     assert!(health.get(&hkey).map(|h| h.accepted).unwrap_or(true));
@@ -131,15 +142,20 @@ fn index_builds_with_configmap_ca() {
     let store = policy_store(vec![policy]);
     let cms = configmap_store(vec![cm]);
 
-    let (index, _) = build_backend_tls_index(&store, &cms);
+    let (index, _) = build_backend_tls_index(&store, &cms, &empty_service_store());
 
     let key = ObjectKey::new("default", "echo");
-    let resolved = index.get(&key).expect("policy should be in index");
-    assert!(matches!(resolved.tls.ca, UpstreamCa::Bundle(_)));
+    let resolved = index
+        .get(&(key.clone(), None))
+        .expect("policy should be in index");
+    assert!(matches!(
+        resolved.tls.as_ref().unwrap().ca,
+        UpstreamCa::Bundle(_)
+    ));
 }
 
 #[test]
-fn index_skips_policy_when_configmap_missing() {
+fn invalid_policy_with_missing_configmap_enters_index_with_no_tls() {
     let policy = make_policy(
         "default",
         "btls",
@@ -149,22 +165,26 @@ fn index_skips_policy_when_configmap_missing() {
     let store = policy_store(vec![policy]);
     let cms = configmap_store(vec![]);
 
-    let (index, health) = build_backend_tls_index(&store, &cms);
+    let (index, health) = build_backend_tls_index(&store, &cms, &empty_service_store());
 
-    assert!(
-        index.is_empty(),
-        "policy with missing CM should not enter index"
-    );
+    // Per GEP-1897 an invalid policy still occupies its target Service entry so the
+    // data plane returns 5xx instead of falling through as plain HTTP.
+    let key = ObjectKey::new("default", "echo");
+    let resolved = index
+        .get(&(key.clone(), None))
+        .expect("invalid policy must still claim its Service slot");
+    assert!(resolved.tls.is_none(), "invalid policy has no UpstreamTls");
+
     let hkey = ObjectKey::new("default", "btls");
-    let h = health
-        .get(&hkey)
-        .expect("health entry should still be written");
-    assert!(!h.resolved_refs, "resolved_refs should be false");
+    let h = health.get(&hkey).expect("health entry must be written");
+    assert!(!h.accepted, "Accepted must be False");
+    assert_eq!(h.accepted_reason, "NoValidCACertificate");
+    assert!(!h.resolved_refs);
     assert_eq!(h.resolved_refs_reason, "InvalidCACertificateRef");
 }
 
 #[test]
-fn index_skips_policy_when_configmap_lacks_ca_crt() {
+fn invalid_policy_with_configmap_lacking_ca_crt_enters_index_with_no_tls() {
     let policy = make_policy(
         "default",
         "btls",
@@ -183,15 +203,20 @@ fn index_skips_policy_when_configmap_lacks_ca_crt() {
     let store = policy_store(vec![policy]);
     let cms = configmap_store(vec![cm]);
 
-    let (index, health) = build_backend_tls_index(&store, &cms);
+    let (index, health) = build_backend_tls_index(&store, &cms, &empty_service_store());
 
-    assert!(index.is_empty());
+    let resolved = index
+        .get(&(ObjectKey::new("default", "echo"), None))
+        .unwrap();
+    assert!(resolved.tls.is_none());
     let h = health.get(&ObjectKey::new("default", "btls")).unwrap();
+    assert!(!h.accepted);
+    assert_eq!(h.accepted_reason, "NoValidCACertificate");
     assert_eq!(h.resolved_refs_reason, "InvalidCACertificateRef");
 }
 
 #[test]
-fn index_skips_policy_when_ref_kind_is_not_configmap() {
+fn invalid_policy_with_wrong_ref_kind_enters_index_with_no_tls() {
     let policy = make_policy(
         "default",
         "btls",
@@ -210,11 +235,146 @@ fn index_skips_policy_when_ref_kind_is_not_configmap() {
     let store = policy_store(vec![policy]);
     let cms = configmap_store(vec![]);
 
-    let (index, health) = build_backend_tls_index(&store, &cms);
+    let (index, health) = build_backend_tls_index(&store, &cms, &empty_service_store());
 
-    assert!(index.is_empty());
+    let resolved = index
+        .get(&(ObjectKey::new("default", "echo"), None))
+        .unwrap();
+    assert!(resolved.tls.is_none());
     let h = health.get(&ObjectKey::new("default", "btls")).unwrap();
+    assert!(!h.accepted);
+    assert_eq!(h.accepted_reason, "NoValidCACertificate");
     assert_eq!(h.resolved_refs_reason, "InvalidKind");
+}
+
+/// Build a Service with named ports so sectionName resolution can find them.
+fn service_with_ports(ns: &str, name: &str, ports: &[(&str, i32)]) -> Service {
+    use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
+    Service {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(ns.to_string()),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            ports: Some(
+                ports
+                    .iter()
+                    .map(|(n, p)| ServicePort {
+                        name: Some(n.to_string()),
+                        port: *p,
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+fn service_store(svcs: Vec<Service>) -> reflector::Store<Service> {
+    let mut writer = reflector::store::Writer::<Service>::default();
+    for s in svcs {
+        writer.apply_watcher_event(&watcher::Event::Apply(s));
+    }
+    writer.as_reader()
+}
+
+#[test]
+fn section_name_resolves_to_port_in_index() {
+    // Two policies on the same Service: one with sectionName "https-1" (port 443),
+    // one without sectionName (whole Service). Both should be Accepted; the index
+    // should carry both as distinct (svc, port) entries so lookups pick correctly.
+    let with_section = BackendTlsPolicy {
+        metadata: ObjectMeta {
+            name: Some("p-with".to_string()),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        },
+        spec: BackendTlsPolicySpec {
+            target_refs: vec![BackendTlsPolicyTargetRefs {
+                group: String::new(),
+                kind: "Service".to_string(),
+                name: "echo".to_string(),
+                section_name: Some("https-1".to_string()),
+            }],
+            validation: system_ca_validation("other.example.com"),
+            options: None,
+        },
+        status: None,
+    };
+    let without_section = make_policy(
+        "default",
+        "p-without",
+        "echo",
+        system_ca_validation("abc.example.com"),
+    );
+
+    let svc = service_with_ports("default", "echo", &[("https-1", 443), ("https-2", 8443)]);
+    let store = policy_store(vec![with_section, without_section]);
+    let cms = configmap_store(vec![]);
+    let svcs = service_store(vec![svc]);
+
+    let (index, health) = build_backend_tls_index(&store, &cms, &svcs);
+
+    let svc_key = ObjectKey::new("default", "echo");
+    let port_443 = index
+        .get(&(svc_key.clone(), Some(443)))
+        .expect("section-name policy should be indexed at (svc, Some(443))");
+    assert_eq!(&*port_443.tls.as_ref().unwrap().sni, "other.example.com");
+    let catch_all = index
+        .get(&(svc_key.clone(), None))
+        .expect("no-section-name policy should be indexed at (svc, None)");
+    assert_eq!(&*catch_all.tls.as_ref().unwrap().sni, "abc.example.com");
+
+    // Both policies are Accepted — different scopes do NOT conflict.
+    let h_with = health
+        .get(&ObjectKey::new("default", "p-with"))
+        .cloned()
+        .unwrap_or_default();
+    let h_without = health
+        .get(&ObjectKey::new("default", "p-without"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(h_with.accepted);
+    assert!(h_without.accepted);
+}
+
+#[test]
+fn section_name_unknown_to_service_drops_policy_from_index() {
+    // A sectionName that doesn't match any Service port is logged and dropped from
+    // the data plane (we still don't fail the user's policy outright — it just
+    // doesn't apply to any traffic until they fix the name).
+    let p = BackendTlsPolicy {
+        metadata: ObjectMeta {
+            name: Some("ghost".to_string()),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        },
+        spec: BackendTlsPolicySpec {
+            target_refs: vec![BackendTlsPolicyTargetRefs {
+                group: String::new(),
+                kind: "Service".to_string(),
+                name: "echo".to_string(),
+                section_name: Some("nonexistent".to_string()),
+            }],
+            validation: system_ca_validation("other.example.com"),
+            options: None,
+        },
+        status: None,
+    };
+    let svc = service_with_ports("default", "echo", &[("https-1", 443)]);
+    let store = policy_store(vec![p]);
+    let cms = configmap_store(vec![]);
+    let svcs = service_store(vec![svc]);
+
+    let (index, _) = build_backend_tls_index(&store, &cms, &svcs);
+
+    assert!(
+        index.is_empty(),
+        "policy with unresolvable sectionName should not appear in index"
+    );
 }
 
 #[test]
@@ -236,12 +396,14 @@ fn conflict_resolution_marks_loser_as_conflicted() {
     let store = policy_store(vec![winner, loser]);
     let cms = configmap_store(vec![]);
 
-    let (index, health) = build_backend_tls_index(&store, &cms);
+    let (index, health) = build_backend_tls_index(&store, &cms, &empty_service_store());
 
     // Winner is in the index.
     let key = ObjectKey::new("default", "echo");
-    let resolved = index.get(&key).expect("winner should be in index");
-    assert_eq!(&*resolved.tls.sni, "echo.example.com");
+    let resolved = index
+        .get(&(key.clone(), None))
+        .expect("winner should be in index");
+    assert_eq!(&*resolved.tls.as_ref().unwrap().sni, "echo.example.com");
 
     // Loser is marked Conflicted.
     let loser_key = ObjectKey::new("default", "zzz");
@@ -269,7 +431,7 @@ fn reconcile_attaches_tls_and_forces_https() {
     );
     let policy_store = policy_store(vec![policy]);
     let cms = configmap_store(vec![]);
-    let (index, _) = build_backend_tls_index(&policy_store, &cms);
+    let (index, _) = build_backend_tls_index(&policy_store, &cms, &empty_service_store());
 
     let mut builder = RoutingTableBuilder::new();
     GatewayApiReconciler::reconcile(

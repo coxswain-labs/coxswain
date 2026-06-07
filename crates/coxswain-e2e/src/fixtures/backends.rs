@@ -27,3 +27,11 @@ pub const ECHO_TLS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/backends/echo_tls.yaml"
 );
+
+/// TLS echo server exposing TWO named Service ports (`https-1`/443 and `https-2`/8443)
+/// — both targeting the same container — used for BackendTLSPolicy section-name routing tests.
+/// Requires `TLS_SERVER_CERT_B64`, `TLS_SERVER_KEY_B64` substitutions.
+pub const ECHO_TLS_DUAL_PORT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/echo_tls_dual_port.yaml"
+);

@@ -532,3 +532,51 @@ pub async fn wait_for_backend_tls_policy_condition(
     )
     .await
 }
+
+/// Poll until a `BackendTLSPolicy`'s `status.ancestors[]` contains a condition
+/// matching the given `(type, status, reason)` from our controller.
+///
+/// Stricter than [`wait_for_backend_tls_policy_condition`] — required when the
+/// test cares about the specific failure reason (e.g. `NoValidCACertificate`,
+/// `Conflicted`).
+pub async fn wait_for_backend_tls_policy_condition_with_reason(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    controller_name: &str,
+    type_: &str,
+    status: &str,
+    reason: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<BackendTLSPolicy> = Api::namespaced(client.clone(), namespace);
+    poll_until(
+        timeout,
+        POLL,
+        || {
+            format!(
+                "BackendTLSPolicy {namespace}/{name} to have ancestor condition {type_}={status} reason={reason}"
+            )
+        },
+        || async {
+            api.get(name)
+                .await
+                .ok()
+                .filter(|p| {
+                    p.status
+                        .as_ref()
+                        .map(|s| s.ancestors.as_slice())
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter(|a| a.controller_name == controller_name)
+                        .any(|a| {
+                            a.conditions.iter().any(|c| {
+                                c.type_ == type_ && c.status == status && c.reason == reason
+                            })
+                        })
+                })
+                .map(|_| ())
+        },
+    )
+    .await
+}

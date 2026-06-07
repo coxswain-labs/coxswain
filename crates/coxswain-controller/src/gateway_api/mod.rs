@@ -45,12 +45,13 @@ impl GatewayApiReconciler {
         )
     }
 
-    /// Compute per-policy health from the pre-built index.
+    /// Compute per-policy health from the pre-built index and the policy reflector.
     pub fn compute_policy_health(
         index: &BackendTlsIndex,
+        policies: &kube::runtime::reflector::Store<crate::gw_types::BackendTlsPolicy>,
         routes: &[Arc<HttpRoute>],
         owned_gateways: &HashSet<ObjectKey>,
     ) -> BackendTlsPolicyHealthMap {
-        backend_tls::compute_policy_health(index, routes, owned_gateways)
+        backend_tls::compute_policy_health(index, policies, routes, owned_gateways)
     }
 }

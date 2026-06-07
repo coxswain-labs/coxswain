@@ -146,12 +146,11 @@ Every `crates/*/Cargo.toml` must declare `[lints] workspace = true`. Without it,
    - **Roadmap**: once the issue is fully implemented (not before), change the corresponding `ROADMAP.md` item from `- ⬜` to `- ✅ ~~...~~`.
 8. At the end of each implementation or refinement cycle:
    - Run `cargo fmt` then `cargo test --workspace --exclude coxswain-e2e` and report results.
-   - **Ask the user** what to do next. Options:
-     - **Refine** — continue implementation.
-     - **Run e2e** `gateway_api` and/or `ingress` — requires a live cluster (~5 min each; see `DEVELOPMENT.md` for cluster reset and prep).
-     - **Run conformance** — expensive: requires cluster reset, cluster prep, and coxswain running in a separate terminal (~30–60 min; see `DEVELOPMENT.md`).
-     - **Commit only** — stages and commits, requires user presence.
-     - **Commit and push** — commits and pushes, requires user presence.
+   - **Use `AskUserQuestion` with two simultaneous questions** to ask what to do next. Never commit, push, or close without the user explicitly selecting it here. The `AskUserQuestion` tool allows a maximum of 4 options per question, so split across two questions sent in one call:
+     - Q1 (header "Next step"): **Refine implementation** / **Run e2e tests** / **Commit and push** / **Merge PR and close issue**
+     - Q2 (header "E2E suite", only relevant when Q1 = "Run e2e tests"): **ingress** / **gateway_api** / **conformance** / **N/A**
+   - Act on the combination: if Q1 = "Run e2e tests", use Q2 to pick the suite. If Q1 = "Merge PR and close issue", follow the closing procedure below. If Q1 = "Refine" or "Commit and push", ignore Q2.
+   - Keep presenting these questions after each action until the user selects **Merge PR and close issue** and the PR is merged.
 
 ### Closing an issue
 

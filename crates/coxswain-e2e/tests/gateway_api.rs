@@ -1296,7 +1296,7 @@ async fn backend_tls_policy_configmap() -> anyhow::Result<()> {
         gwa::BACKEND_TLS_POLICY,
         FixtureVars::new(&ns.name)
             .with("TLS_HOSTNAME", &tls_hostname)
-            .with("CA_PEM", &cert.cert_pem), // self-signed: cert IS the CA
+            .with("CA_PEM", cert.cert_pem.clone()), // self-signed: cert IS the CA
     )
     .await?;
 
@@ -1330,6 +1330,231 @@ async fn backend_tls_policy_configmap() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `BackendTLSPolicy` invalid CA cert ref (missing ConfigMap):
+/// - Policy gets `Accepted=False/NoValidCACertificate` and `ResolvedRefs=False/InvalidCACertificateRef`.
+/// - Traffic to the targeted backend returns 5xx (GEP-1897: invalid policy must NOT
+///   silently fall back to plain HTTP).
+#[tokio::test]
+async fn backend_tls_policy_invalid_ca() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-backend-tls-invalid").await?;
+
+    // Backend cert can be anything — the policy is invalid before we get to TLS.
+    let cert = GeneratedCert::for_host(&format!("echo-tls.{}.local", ns.name));
+    h.apply(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    h.apply(
+        gwa::BACKEND_TLS_POLICY_INVALID_CA,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("backend-tls.{}.local", ns.name);
+    // Traffic MUST return 5xx — never plain-HTTP-fallthrough success.
+    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    let controller_name = "coxswain-labs.dev/gateway-controller";
+    wait::wait_for_backend_tls_policy_condition_with_reason(
+        &h.client,
+        "echo-tls-policy",
+        &ns.name,
+        controller_name,
+        "Accepted",
+        "False",
+        "NoValidCACertificate",
+        Duration::from_secs(30),
+    )
+    .await?;
+    wait::wait_for_backend_tls_policy_condition_with_reason(
+        &h.client,
+        "echo-tls-policy",
+        &ns.name,
+        controller_name,
+        "ResolvedRefs",
+        "False",
+        "InvalidCACertificateRef",
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// `BackendTLSPolicy` section-name routing:
+/// - Two policies on the same Service: one with `sectionName=https-1`, one without.
+/// - The dual-port Service exposes both ports onto the same pod, whose cert is signed
+///   for both SNIs as SANs.
+/// - Traffic to port 443 (path `/port-443`) must use the section-name policy's SNI;
+///   traffic to port 8443 (path `/port-8443`) must use the no-section-name policy's SNI.
+/// - Both must succeed because the backend cert covers both SANs.
+#[tokio::test]
+async fn backend_tls_policy_section_name_routing() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-backend-tls-section").await?;
+
+    let sni_primary = format!("primary.{}.local", ns.name);
+    let sni_secondary = format!("secondary.{}.local", ns.name);
+    let cert = GeneratedCert::for_hosts(&[&sni_primary, &sni_secondary]);
+
+    // Apply the dual-port TLS echo backend.
+    h.apply(
+        backends::ECHO_TLS_DUAL_PORT,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    h.apply(
+        gwa::BACKEND_TLS_POLICY_SECTION_NAME,
+        FixtureVars::new(&ns.name)
+            .with("SNI_PRIMARY", &sni_primary)
+            .with("SNI_SECONDARY", &sni_secondary)
+            .with("CA_PEM", cert.cert_pem.clone()),
+    )
+    .await?;
+
+    let host = format!("backend-tls.{}.local", ns.name);
+
+    // Both routes must succeed. The section-name policy applies to port 443; the
+    // catch-all to port 8443. If per-port lookup is broken, one of these returns 5xx.
+    let resp = wait::wait_for_route(&h.http, &host, "/port-443/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-tls");
+    let resp = wait::wait_for_route(&h.http, &host, "/port-8443/", Duration::from_secs(30)).await?;
+    resp.assert_backend("echo-tls");
+
+    Ok(())
+}
+
+/// `BackendTLSPolicy` conflict resolution:
+/// - Two policies on the same Service with NO `sectionName`.
+/// - Name-tiebreak: "aaa-policy" < "zzz-policy", so "aaa-policy" wins.
+/// - Expected status: winner `Accepted=True`, loser `Accepted=False/Conflicted`,
+///   both with the test Gateway in `status.ancestors[]`.
+#[tokio::test]
+async fn backend_tls_policy_conflict_resolution() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-backend-tls-conflict").await?;
+
+    let tls_hostname = format!("echo-tls.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&tls_hostname);
+
+    h.apply(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    h.apply(
+        gwa::BACKEND_TLS_POLICY_CONFLICT,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", cert.cert_pem.clone()),
+    )
+    .await?;
+
+    let controller_name = "coxswain-labs.dev/gateway-controller";
+    // Winner — "aaa-policy" must be Accepted.
+    wait::wait_for_backend_tls_policy_condition(
+        &h.client,
+        "aaa-policy",
+        &ns.name,
+        controller_name,
+        "Accepted",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+    // Loser — "zzz-policy" must have Accepted=False/Conflicted.
+    wait::wait_for_backend_tls_policy_condition_with_reason(
+        &h.client,
+        "zzz-policy",
+        &ns.name,
+        controller_name,
+        "Accepted",
+        "False",
+        "Conflicted",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// `BackendTLSPolicy` ConfigMap CA mutation:
+/// - Apply happy-path fixture; verify traffic succeeds.
+/// - Replace `ca.crt` in the ConfigMap with an unrelated self-signed CA.
+/// - Backend cert no longer verifies → traffic must transition to 5xx, proving the
+///   controller reacted to the ConfigMap watch.
+#[tokio::test]
+async fn backend_tls_policy_configmap_mutation() -> anyhow::Result<()> {
+    use k8s_openapi::api::core::v1::ConfigMap;
+    use kube::api::{Patch, PatchParams};
+
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-backend-tls-cm-mutation").await?;
+
+    let tls_hostname = format!("echo-tls.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&tls_hostname);
+
+    h.apply(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    h.apply(
+        gwa::BACKEND_TLS_POLICY,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", cert.cert_pem.clone()),
+    )
+    .await?;
+
+    let host = format!("backend-tls.{}.local", ns.name);
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-tls");
+
+    // Swap the ConfigMap's ca.crt for an unrelated self-signed CA. The backend's cert
+    // (signed by the original CA) must now fail verification → proxy returns 5xx.
+    let unrelated = GeneratedCert::for_host("unrelated.invalid");
+    let cm_api: Api<ConfigMap> = Api::namespaced(h.client.clone(), &ns.name);
+    let patch = serde_json::json!({
+        "data": { "ca.crt": unrelated.cert_pem }
+    });
+    cm_api
+        .patch(
+            "echo-tls-ca",
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+
+    // The controller should observe the CM change, rebuild, and the proxy's UpstreamCaCache
+    // will surface a fresh CA. The cert no longer chains → 502.
+    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
 /// `BackendTLSPolicy` hostname-mismatch: the policy's `validation.hostname` does not
 /// match the SAN in the backend's certificate → TLS handshake fails → proxy returns 5xx.
 #[tokio::test]
@@ -1358,7 +1583,7 @@ async fn backend_tls_policy_hostname_mismatch() -> anyhow::Result<()> {
         gwa::BACKEND_TLS_POLICY,
         FixtureVars::new(&ns.name)
             .with("TLS_HOSTNAME", &wrong_hostname) // mismatch
-            .with("CA_PEM", &cert.cert_pem),
+            .with("CA_PEM", cert.cert_pem.clone()),
     )
     .await?;
 

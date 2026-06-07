@@ -1,16 +1,15 @@
-# BackendTLSPolicy test fixture.
-# Substitutions (see fixtures::gateway_api::BACKEND_TLS_POLICY callers):
-#   * the hostname used in the backend cert's SAN and the policy
-#   * raw PEM text of the CA certificate (must be indented for the block scalar below)
+# BackendTLSPolicy test fixture: invalid CA cert ref (missing ConfigMap).
+#
+# Substitutions:
 #   * proxy HTTP listener port (filled by Harness::apply)
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: echo-tls-ca
-data:
-  ca.crt: |
-    CA_PEM
+#   * test namespace (filled by Harness::apply via TESTNS)
+#
+# Differences from backend_tls_policy.yaml:
+#   - No ConfigMap is created.
+#   - The policy references a ConfigMap that DOES NOT exist.
+# The controller must surface Accepted=False/NoValidCACertificate +
+# ResolvedRefs=False/InvalidCACertificateRef and the data plane must return 5xx
+# (GEP-1897: invalid policy MUST NOT silently fall back to plain HTTP).
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -47,8 +46,8 @@ spec:
       kind: Service
       name: echo-tls
   validation:
-    hostname: TLS_HOSTNAME
+    hostname: echo-tls.TESTNS.local
     caCertificateRefs:
       - group: ""
         kind: ConfigMap
-        name: echo-tls-ca
+        name: does-not-exist

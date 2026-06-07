@@ -50,16 +50,16 @@ pub async fn apply_fixture(path: impl AsRef<Path>, vars: FixtureVars) -> anyhow:
 
     // Apply extra vars first so callers can override the standard substitutions.
     for (key, val) in &vars.extra {
-        content = content.replace(key.as_str(), val.as_str());
+        content = substitute(&content, key, val);
     }
     if vars.http_port != 0 {
         let p = vars.http_port.to_string();
-        content = content.replace("HTTP_PORT", &p);
+        content = substitute(&content, "HTTP_PORT", &p);
     }
     if vars.https_port != 0 {
-        content = content.replace("HTTPS_PORT", &vars.https_port.to_string());
+        content = substitute(&content, "HTTPS_PORT", &vars.https_port.to_string());
     }
-    content = content.replace("TESTNS", &vars.namespace);
+    content = substitute(&content, "TESTNS", &vars.namespace);
 
     let mut child = tokio::process::Command::new("kubectl")
         .args(["apply", "-n", &vars.namespace, "-f", "-"])
@@ -82,4 +82,125 @@ pub async fn apply_fixture(path: impl AsRef<Path>, vars: FixtureVars) -> anyhow:
         path.display()
     );
     Ok(())
+}
+
+/// Replace every occurrence of `key` in `content` with `val`, preserving the
+/// indentation prefix of the line containing each occurrence on continuation
+/// lines of `val`.
+///
+/// The "indentation prefix" is the leading whitespace of the placeholder's line,
+/// optionally extended with a leading `#` (and the whitespace immediately after it)
+/// so that `val` substituted into a comment header stays inside the comment block
+/// rather than producing bare-text lines that break YAML parsing.
+///
+/// This means callers can pass raw multi-line content (e.g. PEM bundles) and have
+/// the substitution Just Work whether the placeholder is in a YAML block scalar,
+/// a regular indented field, or a `#`-prefixed comment.
+fn substitute(content: &str, key: &str, val: &str) -> String {
+    if val.contains('\n') {
+        substitute_indent_aware(content, key, val)
+    } else {
+        // Single-line value: plain replace, identical to the historical behaviour.
+        content.replace(key, val)
+    }
+}
+
+fn substitute_indent_aware(content: &str, key: &str, val: &str) -> String {
+    let mut out = String::with_capacity(content.len() + val.len());
+    let mut cursor = 0;
+    while let Some(rel) = content[cursor..].find(key) {
+        let idx = cursor + rel;
+        // Append the chunk before the match.
+        out.push_str(&content[cursor..idx]);
+
+        // Compute the line prefix: leading whitespace plus an optional leading '#'
+        // (with the whitespace that follows it) from the placeholder's line.
+        let line_start = content[..idx].rfind('\n').map(|n| n + 1).unwrap_or(0);
+        let line_head = &content[line_start..idx];
+        let prefix = line_continuation_prefix(line_head);
+
+        // Append the value with each continuation line carrying the prefix.
+        let mut first = true;
+        for line in val.split('\n') {
+            if first {
+                out.push_str(line);
+                first = false;
+            } else {
+                out.push('\n');
+                out.push_str(&prefix);
+                out.push_str(line);
+            }
+        }
+
+        cursor = idx + key.len();
+    }
+    out.push_str(&content[cursor..]);
+    out
+}
+
+/// Compute the prefix to copy onto each continuation line of a multi-line value.
+///
+/// For a YAML body line like `    CA_PEM` the prefix is `"    "` (whitespace).
+/// For a comment line like `# Note CA_PEM does …` the prefix is `"# "` so the
+/// continuation lines remain part of the comment.
+fn line_continuation_prefix(line_head: &str) -> String {
+    let mut prefix = String::new();
+    let mut chars = line_head.chars().peekable();
+    // Capture leading whitespace.
+    while let Some(&c) = chars.peek() {
+        if c == ' ' || c == '\t' {
+            prefix.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    // If the first non-whitespace char is '#', capture it plus the single space
+    // that conventionally follows so continuation lines look like normal comment text.
+    if chars.peek().copied() == Some('#') {
+        prefix.push('#');
+        chars.next();
+        if chars.peek().copied() == Some(' ') {
+            prefix.push(' ');
+        }
+    }
+    prefix
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_line_value_round_trips() {
+        let out = substitute("hostname: TLS_HOSTNAME", "TLS_HOSTNAME", "example.com");
+        assert_eq!(out, "hostname: example.com");
+    }
+
+    #[test]
+    fn multi_line_value_in_yaml_block_scalar_keeps_indent() {
+        let template = "data:\n  ca.crt: |\n    CA_PEM\n";
+        let pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----";
+        let out = substitute(template, "CA_PEM", pem);
+        assert_eq!(
+            out,
+            "data:\n  ca.crt: |\n    -----BEGIN CERTIFICATE-----\n    AAAA\n    -----END CERTIFICATE-----\n"
+        );
+    }
+
+    #[test]
+    fn multi_line_value_inside_comment_stays_commented() {
+        let template = "# Note: CA_PEM is the bundle\n---\n";
+        let pem = "first\nsecond";
+        let out = substitute(template, "CA_PEM", pem);
+        assert_eq!(out, "# Note: first\n# second is the bundle\n---\n");
+    }
+
+    #[test]
+    fn multiple_occurrences_all_substituted() {
+        let template = "  A: CA_PEM\n  B: CA_PEM\n";
+        let pem = "one\ntwo";
+        let out = substitute(template, "CA_PEM", pem);
+        assert_eq!(out, "  A: one\n  two\n  B: one\n  two\n");
+    }
 }

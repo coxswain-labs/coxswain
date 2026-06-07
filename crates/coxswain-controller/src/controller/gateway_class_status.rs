@@ -10,6 +10,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 /// list whenever a new feature is implemented and add the matching constant to
 /// `opts.SupportedFeatures` in `conformance/main_test.go`.
 pub(super) const SUPPORTED_FEATURES: &[&str] = &[
+    "BackendTLSPolicy",
     "Gateway",
     "GatewayAddressEmpty",
     "GatewayHTTPListenerIsolation",

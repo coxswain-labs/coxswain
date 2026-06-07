@@ -9,7 +9,7 @@ use kube::runtime::reflector;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 #[derive(Debug, Error)]
 pub(crate) enum TlsLoadError {
@@ -103,12 +103,19 @@ pub struct GatewayListenerHealth {
 
 struct GatewayListenerHealthInner {
     map: ArcSwap<HashMap<ObjectKey, GatewayListenerHealth>>,
-    notify: Notify,
+    tx: watch::Sender<u64>,
 }
 
 /// Shared handle to the per-Gateway listener health map produced after each rebuild.
-/// Written by `Reconciler::rebuild` (via `store_and_notify`); read by `Controller`.
-/// Bundles the data map and a `Notify` so callers don't need to manage them separately.
+/// Written by `Reconciler::rebuild` (via `store_and_notify`); read by `Controller`
+/// and `HotReloader`.
+///
+/// Backed by a `tokio::sync::watch` channel carrying a monotonic generation counter:
+/// each consumer holds its own `Receiver` and awaits `changed()`. This is robust to
+/// `select!` cancellation (a missed wake is recovered by the next `changed()` call,
+/// which compares the receiver's last-seen generation to the sender's current one)
+/// and supports any number of consumers without starving — both requirements that
+/// `tokio::sync::Notify` cannot meet simultaneously.
 #[derive(Clone)]
 pub struct SharedGatewayListenerHealth(Arc<GatewayListenerHealthInner>);
 
@@ -119,11 +126,12 @@ impl Default for SharedGatewayListenerHealth {
 }
 
 impl SharedGatewayListenerHealth {
-    /// Construct a new shared health map (initially empty).
+    /// Construct a new shared health map (initially empty, generation 0).
     pub fn new() -> Self {
+        let (tx, _) = watch::channel(0u64);
         Self(Arc::new(GatewayListenerHealthInner {
             map: ArcSwap::from_pointee(HashMap::new()),
-            notify: Notify::new(),
+            tx,
         }))
     }
 
@@ -132,15 +140,21 @@ impl SharedGatewayListenerHealth {
         self.0.map.load()
     }
 
-    /// Store a new health map and wake any `notified()` waiters.
+    /// Store a new health map and notify every subscribed `Receiver` that the
+    /// generation has advanced.
     pub fn store_and_notify(&self, map: HashMap<ObjectKey, GatewayListenerHealth>) {
         self.0.map.store(Arc::new(map));
-        self.0.notify.notify_waiters();
+        self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
     }
 
-    /// Returns a future that resolves once `store_and_notify` is called.
-    pub async fn notified(&self) {
-        self.0.notify.notified().await;
+    /// Returns a `watch::Receiver` over the generation counter. The caller polls
+    /// `rx.changed().await` to await the next `store_and_notify` call.
+    ///
+    /// Subscribing returns a receiver whose "seen" generation equals the current
+    /// sender generation. Call `rx.mark_changed()` immediately after if you want
+    /// the first `changed()` to fire even when no publish has happened yet.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.tx.subscribe()
     }
 }
 
@@ -174,11 +188,14 @@ pub type HttpRouteHealthMap = HashMap<RouteParentKey, RouteParentHealth>;
 
 struct SharedHttpRouteHealthInner {
     map: ArcSwap<HttpRouteHealthMap>,
-    notify: Notify,
+    tx: watch::Sender<u64>,
 }
 
 /// Shared handle to per-(route, parent) health, produced after each reconciler rebuild.
 /// The controller reads this to set accurate `Accepted` and `ResolvedRefs` conditions.
+///
+/// See [`SharedGatewayListenerHealth`] for the rationale behind the `watch`-based
+/// notification scheme.
 #[derive(Clone)]
 pub struct SharedHttpRouteHealth(Arc<SharedHttpRouteHealthInner>);
 
@@ -189,11 +206,12 @@ impl Default for SharedHttpRouteHealth {
 }
 
 impl SharedHttpRouteHealth {
-    /// Construct a new shared route health map (initially empty).
+    /// Construct a new shared route health map (initially empty, generation 0).
     pub fn new() -> Self {
+        let (tx, _) = watch::channel(0u64);
         Self(Arc::new(SharedHttpRouteHealthInner {
             map: ArcSwap::from_pointee(HashMap::new()),
-            notify: Notify::new(),
+            tx,
         }))
     }
 
@@ -202,15 +220,16 @@ impl SharedHttpRouteHealth {
         self.0.map.load()
     }
 
-    /// Store a new health map and wake any `notified()` waiters.
+    /// Store a new health map and notify subscribers via the generation counter.
     pub fn store_and_notify(&self, map: HttpRouteHealthMap) {
         self.0.map.store(Arc::new(map));
-        self.0.notify.notify_one();
+        self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
     }
 
-    /// Returns a future that resolves once `store_and_notify` is called.
-    pub async fn notified(&self) {
-        self.0.notify.notified().await;
+    /// Returns a `watch::Receiver` for subscribing to change notifications.
+    /// See [`SharedGatewayListenerHealth::subscribe`].
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.tx.subscribe()
     }
 }
 
@@ -250,11 +269,14 @@ pub type BackendTlsPolicyHealthMap = HashMap<ObjectKey, BackendTlsPolicyHealth>;
 
 struct SharedBackendTlsPolicyHealthInner {
     map: ArcSwap<BackendTlsPolicyHealthMap>,
-    notify: Notify,
+    tx: watch::Sender<u64>,
 }
 
 /// Shared handle to per-`BackendTLSPolicy` health, produced after each reconciler rebuild.
 /// The controller reads this to write `status.ancestors[]` when leader.
+///
+/// See [`SharedGatewayListenerHealth`] for the rationale behind the `watch`-based
+/// notification scheme.
 #[derive(Clone)]
 pub struct SharedBackendTlsPolicyHealth(Arc<SharedBackendTlsPolicyHealthInner>);
 
@@ -265,11 +287,12 @@ impl Default for SharedBackendTlsPolicyHealth {
 }
 
 impl SharedBackendTlsPolicyHealth {
-    /// Construct a new shared policy health map (initially empty).
+    /// Construct a new shared policy health map (initially empty, generation 0).
     pub fn new() -> Self {
+        let (tx, _) = watch::channel(0u64);
         Self(Arc::new(SharedBackendTlsPolicyHealthInner {
             map: ArcSwap::from_pointee(HashMap::new()),
-            notify: Notify::new(),
+            tx,
         }))
     }
 
@@ -278,15 +301,16 @@ impl SharedBackendTlsPolicyHealth {
         self.0.map.load()
     }
 
-    /// Store a new health map and wake any `notified()` waiters.
+    /// Store a new health map and notify subscribers via the generation counter.
     pub fn store_and_notify(&self, map: BackendTlsPolicyHealthMap) {
         self.0.map.store(Arc::new(map));
-        self.0.notify.notify_one();
+        self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
     }
 
-    /// Returns a future that resolves once `store_and_notify` is called.
-    pub async fn notified(&self) {
-        self.0.notify.notified().await;
+    /// Returns a `watch::Receiver` for subscribing to change notifications.
+    /// See [`SharedGatewayListenerHealth::subscribe`].
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.tx.subscribe()
     }
 }
 

@@ -1,14 +1,11 @@
-# TLS echo backend for BackendTLSPolicy e2e tests.
-# Uses the same gcr.io/k8s-staging-gateway-api/echo-basic image as the upstream
-# Gateway API conformance suite. The image listens on HTTPS port 8443 when
-# TLS_SERVER_CERT and TLS_SERVER_PRIVKEY point to certificate/key files
-# (see conformance/echo-basic/echo-basic.go — the vars are file paths, not PEM).
+# TLS echo backend exposing TWO named Service ports for section-name routing tests.
+# Both ports target the SAME container port (8443), so the pod-level cert (with
+# multi-SAN content) is reused — what differs is the SectionName the policy can
+# attach to.
 #
-# Substitutions (see tests applying backends::ECHO_TLS):
-#   * base64-encoded server certificate PEM (single-line, no wrapping)
-#   * base64-encoded server private key PEM (single-line, no wrapping)
-#
-# Applied per-test-namespace via apply_fixture(backends::ECHO_TLS, &vars).
+# Substitutions (see tests applying backends::ECHO_TLS_DUAL_PORT):
+#   * base64-encoded server certificate PEM
+#   * base64-encoded server private key PEM
 ---
 apiVersion: v1
 kind: Secret
@@ -37,8 +34,6 @@ spec:
         - name: echo
           image: gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
           ports:
-            - containerPort: 3000
-              name: http
             - containerPort: 8443
               name: https
           env:
@@ -71,7 +66,11 @@ spec:
   selector:
     app: echo-tls
   ports:
-    - port: 8443
+    - name: https-1
+      port: 443
       targetPort: 8443
-      name: https
+      appProtocol: https
+    - name: https-2
+      port: 8443
+      targetPort: 8443
       appProtocol: https

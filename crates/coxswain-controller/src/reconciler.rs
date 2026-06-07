@@ -488,7 +488,7 @@ fn rebuild(
     };
 
     let (policy_index, mut policy_health_map) =
-        build_backend_tls_index(stores.policies, stores.configmaps);
+        build_backend_tls_index(stores.policies, stores.configmaps, stores.services);
 
     build_routes(
         stores,
@@ -517,8 +517,12 @@ fn rebuild(
     outputs.route_health.store_and_notify(route_health_map);
 
     // Compute per-policy ancestor lists and merge with the validity health from index build.
-    let ancestor_health =
-        GatewayApiReconciler::compute_policy_health(&policy_index, &routes, &owned_gateways);
+    let ancestor_health = GatewayApiReconciler::compute_policy_health(
+        &policy_index,
+        stores.policies,
+        &routes,
+        &owned_gateways,
+    );
     for (key, ah) in ancestor_health {
         let entry = policy_health_map.entry(key).or_default();
         entry.ancestors = ah.ancestors;

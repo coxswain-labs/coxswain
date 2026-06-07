@@ -169,6 +169,15 @@ impl Controller {
             self.config.lease_renew_interval,
         );
 
+        // Subscribe to the three health channels. Each `watch::Receiver` tracks its
+        // own last-seen generation; a `changed().await` future that is cancelled by
+        // `select!` simply re-checks the generation on the next poll, so wake-ups
+        // cannot be lost across cancellation. (Compare with `Notify`, which drops
+        // wakes delivered while no waiter is registered.)
+        let mut tls_health_rx = self.tls_health.subscribe();
+        let mut route_health_rx = self.route_health.subscribe();
+        let mut policy_health_rx = self.policy_health.subscribe();
+
         tracing::info!(pod = %self.config.pod_name, is_leader, "Watch streams active");
 
         loop {
@@ -308,7 +317,7 @@ impl Controller {
                     }
                 }
 
-                _ = self.tls_health.notified() => {
+                _ = tls_health_rx.changed() => {
                     if !is_leader || !self.synced.load(Ordering::Acquire) {
                         continue;
                     }
@@ -327,7 +336,7 @@ impl Controller {
                     }
                 }
 
-                _ = self.route_health.notified() => {
+                _ = route_health_rx.changed() => {
                     if !is_leader {
                         continue;
                     }
@@ -418,7 +427,7 @@ impl Controller {
                     }
                 }
 
-                _ = self.policy_health.notified() => {
+                _ = policy_health_rx.changed() => {
                     if !is_leader {
                         continue;
                     }
