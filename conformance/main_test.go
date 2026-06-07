@@ -37,9 +37,8 @@ func TestConformance(t *testing.T) {
 		// Extended: matching (#7)
 		features.SupportHTTPRouteQueryParamMatching,
 		features.SupportHTTPRouteMethodMatching,
-		// Extended: header modification (#13)
-		// SupportHTTPRouteBackendRequestHeaderModification requires per-backend
-		// filters + weighted routing; deferred to a future issue.
+		// Extended: header modification (#13, #167)
+		features.SupportHTTPRouteBackendRequestHeaderModification,
 		features.SupportHTTPRouteResponseHeaderModification,
 		// Extended: redirect and rewrite (#13)
 		features.SupportHTTPRoutePortRedirect,

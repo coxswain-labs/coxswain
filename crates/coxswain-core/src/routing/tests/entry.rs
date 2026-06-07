@@ -162,3 +162,61 @@ fn upstream_default_protocol_is_http1() {
     let u = BackendGroup::new("ns/svc".to_string(), vec![]);
     assert_eq!(u.protocol(), BackendProtocol::Http1);
 }
+
+#[test]
+fn per_backend_filters_returned_with_selected_backend() {
+    use crate::routing::{FilterAction, HeaderMod};
+    let a: SocketAddr = "10.0.0.1:80".parse().unwrap();
+    let b: SocketAddr = "10.0.0.2:80".parse().unwrap();
+    let hm_a = HeaderMod::parse(&[("x-backend", "a")], &[], &[]).unwrap();
+    let hm_b = HeaderMod::parse(&[("x-backend", "b")], &[], &[]).unwrap();
+    let group = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a], 1), (vec![b], 1)])
+        .with_per_backend_filters(vec![
+            vec![FilterAction::RequestHeaderModifier(hm_a)],
+            vec![FilterAction::RequestHeaderModifier(hm_b)],
+        ]);
+    // Round-robin between the two equally-weighted backends. Every endpoint we
+    // pick should carry the matching per-backend filter slice.
+    let mut saw_a = false;
+    let mut saw_b = false;
+    for _ in 0..10 {
+        let (addr, filters) = group.next_endpoint_with_filters().unwrap();
+        let filters = filters.expect("per-backend filter slice must be attached");
+        assert_eq!(filters.len(), 1);
+        let expected_value = if addr == a { "a" } else { "b" };
+        match &filters[0] {
+            FilterAction::RequestHeaderModifier(hm) => {
+                let entry = hm
+                    .add
+                    .iter()
+                    .find(|(name, _)| name == "x-backend")
+                    .expect("x-backend header must be present");
+                assert_eq!(entry.1, expected_value);
+            }
+            other => panic!("unexpected filter action: {other:?}"),
+        }
+        saw_a |= addr == a;
+        saw_b |= addr == b;
+    }
+    assert!(saw_a && saw_b, "both backends should have been selected");
+}
+
+#[test]
+fn per_backend_filters_all_empty_normalises_to_none() {
+    let a: SocketAddr = "10.0.0.1:80".parse().unwrap();
+    let group = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a], 1)])
+        .with_per_backend_filters(vec![vec![]]);
+    let (_addr, filters) = group.next_endpoint_with_filters().unwrap();
+    assert!(
+        filters.is_none(),
+        "empty per-backend filters must surface as None"
+    );
+}
+
+#[test]
+fn next_endpoint_without_per_backend_filters_returns_none() {
+    let a: SocketAddr = "10.0.0.1:80".parse().unwrap();
+    let group = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a], 1)]);
+    let (_addr, filters) = group.next_endpoint_with_filters().unwrap();
+    assert!(filters.is_none());
+}

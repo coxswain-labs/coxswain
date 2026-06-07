@@ -291,6 +291,11 @@ pub struct RouteTimeouts {
     pub backend_request: Option<Duration>,
 }
 
+/// Per-backend filter slot: `None` for backends without filters (the common
+/// case); `Some(Arc<[FilterAction]>)` shares the slice cheaply with each
+/// request that selects this backend.
+type PerBackendFilterSlot = Option<Arc<[FilterAction]>>;
+
 /// A named group of pod endpoints with two-level weighted round-robin selection.
 ///
 /// Level 1 — backend selection: a GCD-reduced slot array maps request indices to
@@ -317,6 +322,12 @@ pub struct BackendGroup {
     /// TLS configuration from an attached `BackendTLSPolicy`.
     /// When `Some`, the proxy uses these settings instead of `protocol`-derived defaults.
     tls: Option<Arc<UpstreamTls>>,
+    /// Per-backend request filters from `HTTPRoute.spec.rules[].backendRefs[].filters`.
+    /// Index-aligned with `backends`. `None` for the common case where no backend
+    /// declares per-backend filters; when `Some`, each slot is `None` for backends
+    /// without filters and `Some(filters)` otherwise. Applied AFTER rule-level
+    /// filters in the proxy's `upstream_request_filter` hook.
+    per_backend_filters: Option<Box<[PerBackendFilterSlot]>>,
 }
 
 impl BackendGroup {
@@ -337,6 +348,7 @@ impl BackendGroup {
             addrs_snapshot,
             protocol: BackendProtocol::default(),
             tls: None,
+            per_backend_filters: None,
         }
     }
 
@@ -383,6 +395,7 @@ impl BackendGroup {
             addrs_snapshot,
             protocol: BackendProtocol::default(),
             tls: None,
+            per_backend_filters: None,
         }
     }
 
@@ -395,6 +408,7 @@ impl BackendGroup {
             addrs_snapshot: Box::new([]),
             protocol: BackendProtocol::default(),
             tls: None,
+            per_backend_filters: None,
         }
     }
 
@@ -410,6 +424,49 @@ impl BackendGroup {
     /// verification, overriding `appProtocol`-based TLS defaults.
     pub fn with_tls(mut self, tls: Arc<UpstreamTls>) -> Self {
         self.tls = Some(tls);
+        self
+    }
+
+    /// Attach per-backend `RequestHeaderModifier` filter actions (builder-style).
+    ///
+    /// `per_backend` is index-aligned with the constructor's backendRefs list — one
+    /// entry per non-zero-weight backend ref. An empty `Vec<FilterAction>` for a
+    /// backend is normalised to `None` so the proxy can short-circuit the common
+    /// no-filter case. Constructor side-effects:
+    /// - When every entry normalises to `None`, the whole `per_backend_filters`
+    ///   field stays `None` (no allocation, no proxy-side overhead).
+    /// - When at least one entry is non-empty, the full per-backend slice is
+    ///   stored so `next_endpoint_with_filters` can return it.
+    ///
+    /// Length of `per_backend` MUST match `self.backends.len()` — supplied by the
+    /// reconciler from the same `weighted` list that built the backend pools.
+    /// Mismatch panics in debug builds and is silently ignored in release.
+    #[must_use]
+    pub fn with_per_backend_filters(mut self, per_backend: Vec<Vec<FilterAction>>) -> Self {
+        debug_assert_eq!(
+            per_backend.len(),
+            self.backends.len(),
+            "per-backend filter list must match the number of pooled backends"
+        );
+        if per_backend.len() != self.backends.len() {
+            return self;
+        }
+        let any_set = per_backend.iter().any(|f| !f.is_empty());
+        if !any_set {
+            self.per_backend_filters = None;
+            return self;
+        }
+        let normalised: Box<[Option<Arc<[FilterAction]>>]> = per_backend
+            .into_iter()
+            .map(|f| {
+                if f.is_empty() {
+                    None
+                } else {
+                    Some(Arc::from(f.into_boxed_slice()))
+                }
+            })
+            .collect();
+        self.per_backend_filters = Some(normalised);
         self
     }
 
@@ -438,12 +495,30 @@ impl BackendGroup {
     /// Returns `None` when there are no active endpoints.
     #[must_use]
     pub fn next_endpoint(&self) -> Option<SocketAddr> {
+        self.next_endpoint_with_filters().map(|(addr, _)| addr)
+    }
+
+    /// Returns the next endpoint AND any per-backend filters attached to that
+    /// specific backend ref.
+    ///
+    /// The filter slice is `None` when no per-backend filters were configured for
+    /// the rule (the common case — single round-robin tick, no extra indirection)
+    /// OR when the specific backend that won this round has no filters of its own.
+    /// The proxy applies the returned filters in `upstream_request_filter` after
+    /// the rule-level filters from `RouteEntry::filters`.
+    #[must_use]
+    pub fn next_endpoint_with_filters(&self) -> Option<(SocketAddr, Option<Arc<[FilterAction]>>)> {
         if self.slots.is_empty() {
             return None;
         }
         let slot = self.slot_counter.fetch_add(1, Ordering::Relaxed) % self.slots.len();
-        let pool = &self.backends[self.slots[slot] as usize];
-        Some(pool.next())
+        let backend_idx = self.slots[slot] as usize;
+        let pool = &self.backends[backend_idx];
+        let filters = self
+            .per_backend_filters
+            .as_ref()
+            .and_then(|all| all.get(backend_idx).cloned().flatten());
+        Some((pool.next(), filters))
     }
 }
 

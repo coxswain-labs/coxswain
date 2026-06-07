@@ -1,8 +1,9 @@
 //! Translates `HTTPRouteRule` filter specs into [`FilterAction`][coxswain_core::routing::FilterAction]s.
 
 use crate::gw_types::v::httproutes::{
-    HttpRouteRulesFilters, HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType,
-    HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesQueryParamsType,
+    HttpRouteRulesBackendRefsFilters, HttpRouteRulesBackendRefsFiltersType, HttpRouteRulesFilters,
+    HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
+    HttpRouteRulesMatchesQueryParamsType,
 };
 use coxswain_core::routing::{
     FilterAction, HeaderMod, HeaderPredicate, MatchPredicates, PathModifier, QueryPredicate,
@@ -264,4 +265,101 @@ pub(super) fn build_predicates(
         headers,
         query,
     })
+}
+
+/// Translate `HTTPBackendRef.filters` (per-backend filters) into `FilterAction`s.
+///
+/// Per Gateway API GEP-1492, backendRef-scope filters may only be
+/// `RequestHeaderModifier` or `ResponseHeaderModifier`. Other types
+/// (`RequestRedirect`, `URLRewrite`, `RequestMirror`, `ExtensionRef`, `CORS`)
+/// are spec-invalid at backend-ref scope and are logged + skipped here. The
+/// returned `Vec` is index-aligned with the caller's backendRef list.
+pub(super) fn build_backend_ref_filters(
+    filters: &[HttpRouteRulesBackendRefsFilters],
+) -> Vec<FilterAction> {
+    let mut out = Vec::new();
+    for f in filters {
+        match f.r#type {
+            HttpRouteRulesBackendRefsFiltersType::RequestHeaderModifier => {
+                let Some(m) = &f.request_header_modifier else {
+                    tracing::warn!(
+                        "Skipping per-backend RequestHeaderModifier filter — payload is missing"
+                    );
+                    continue;
+                };
+                let add: Vec<(&str, &str)> = m
+                    .add
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|h| (h.name.as_str(), h.value.as_str()))
+                    .collect();
+                let set: Vec<(&str, &str)> = m
+                    .set
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|h| (h.name.as_str(), h.value.as_str()))
+                    .collect();
+                let remove: Vec<&str> = m
+                    .remove
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                match HeaderMod::parse(&add, &set, &remove) {
+                    Ok(hm) => out.push(FilterAction::RequestHeaderModifier(hm)),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "Skipping per-backend RequestHeaderModifier — invalid header"
+                    ),
+                }
+            }
+            HttpRouteRulesBackendRefsFiltersType::ResponseHeaderModifier => {
+                let Some(m) = &f.response_header_modifier else {
+                    tracing::warn!(
+                        "Skipping per-backend ResponseHeaderModifier filter — payload is missing"
+                    );
+                    continue;
+                };
+                let add: Vec<(&str, &str)> = m
+                    .add
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|h| (h.name.as_str(), h.value.as_str()))
+                    .collect();
+                let set: Vec<(&str, &str)> = m
+                    .set
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|h| (h.name.as_str(), h.value.as_str()))
+                    .collect();
+                let remove: Vec<&str> = m
+                    .remove
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                match HeaderMod::parse(&add, &set, &remove) {
+                    Ok(hm) => out.push(FilterAction::ResponseHeaderModifier(hm)),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "Skipping per-backend ResponseHeaderModifier — invalid header"
+                    ),
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    filter_type = ?f.r#type,
+                    "Skipping spec-invalid per-backend filter type \
+                     (only RequestHeaderModifier and ResponseHeaderModifier are allowed at backendRef scope)"
+                );
+            }
+        }
+    }
+    out
 }

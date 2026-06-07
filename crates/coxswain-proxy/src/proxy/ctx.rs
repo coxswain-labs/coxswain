@@ -62,8 +62,14 @@ pub struct ProxyCtx {
     /// map ConnectTimedout and ReadTimedout/WriteTimedout to 504 (Gateway API spec requires 504
     /// for both request and backendRequest timeout expiry).
     pub backend_request_timeout_active: bool,
+    /// Per-backend `RequestHeaderModifier` filters from
+    /// `HTTPRoute.spec.rules[].backendRefs[].filters`, attached to whichever backend
+    /// won weighted selection in `upstream_peer`. Applied AFTER the rule-level
+    /// filters in `upstream_request_filter`. `None` for the common case where no
+    /// per-backend filters apply to this request.
+    pub selected_backend_filters: Option<Arc<[FilterAction]>>,
 }
 
 // Hot types — review with the team before bumping these numbers.
 const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 88);
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 160);
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 176);
