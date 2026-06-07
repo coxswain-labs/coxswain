@@ -33,6 +33,7 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteRequestTimeout",
     "HTTPRouteResponseHeaderModification",
     "HTTPRouteSchemeRedirect",
+    "ReferenceGrant",
 ];
 
 /// Returns true when the GatewayClass status needs to be (re-)patched.

@@ -74,6 +74,11 @@ func TestConformance(t *testing.T) {
 		// Core: BackendTLSPolicy — GEP-1897 (#16)
 		// SupportBackendTLSPolicySANValidation is Extended and not yet implemented.
 		features.SupportBackendTLSPolicy,
+		// Standard: ReferenceGrant — GEP-709 (#3, declaration: #166)
+		// Implementation in coxswain-core/src/reference_grants.rs is already complete;
+		// previously omitted from the SupportedFeatures set, so the GatewayClass status
+		// did not advertise it. This declaration is paperwork only.
+		features.SupportReferenceGrant,
 	)
 
 	conformance.RunConformanceWithOptions(t, opts)
