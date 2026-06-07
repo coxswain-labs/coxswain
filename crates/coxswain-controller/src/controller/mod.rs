@@ -9,6 +9,7 @@ use crate::tls::{
     SharedHttpRouteHealth,
 };
 use async_trait::async_trait;
+use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use futures::StreamExt;
 use k8s_openapi::api::networking::v1::Ingress;
@@ -52,7 +53,7 @@ const LEASE_NAME: &str = "coxswain-leader-lock";
 /// Kubernetes watch loop for leader election and writing status conditions
 /// back to `HTTPRoute`, `Gateway`, `GatewayClass`, and `BackendTLSPolicy` resources.
 pub struct Controller {
-    synced: Arc<AtomicBool>,
+    health: HealthRegistry,
     leader: Arc<AtomicBool>,
     owned_gateways: OwnedGateways,
     tls_health: SharedGatewayListenerHealth,
@@ -64,7 +65,7 @@ pub struct Controller {
 impl Controller {
     /// Construct a new controller instance (does not start the watch loop).
     pub fn new(
-        synced: Arc<AtomicBool>,
+        health: HealthRegistry,
         leader: Arc<AtomicBool>,
         owned_gateways: OwnedGateways,
         tls_health: SharedGatewayListenerHealth,
@@ -73,7 +74,7 @@ impl Controller {
         config: ControllerConfig,
     ) -> Self {
         Self {
-            synced,
+            health,
             leader,
             owned_gateways,
             tls_health,
@@ -197,10 +198,6 @@ impl Controller {
 
                 Some(event) = route_watcher.next() => {
                     match event {
-                        Ok(watcher::Event::InitDone) => {
-                            self.synced.store(true, Ordering::Release);
-                            tracing::info!("HttpRoute initial sync complete");
-                        }
                         Ok(watcher::Event::Apply(route) | watcher::Event::InitApply(route)) => {
                             let ns = route.metadata.namespace.clone().unwrap_or_default();
                             let name = route.metadata.name.clone().unwrap_or_default();
@@ -285,8 +282,8 @@ impl Controller {
                             let name = gw.metadata.name.clone().unwrap_or_default();
                             known_gateways.insert(ObjectKey::new(ns, name), gw.clone());
 
-                            let synced = self.synced.load(Ordering::Acquire);
-                            if is_leader && synced {
+                            let controller_ready = self.health.is_subsystem_ready("controller");
+                            if is_leader && controller_ready {
                                 let health_map = self.tls_health.load();
                                 let key = ObjectKey::new(
                                     gw.metadata.namespace.clone().unwrap_or_default(),
@@ -318,7 +315,7 @@ impl Controller {
                 }
 
                 _ = tls_health_rx.changed() => {
-                    if !is_leader || !self.synced.load(Ordering::Acquire) {
+                    if !is_leader || !self.health.is_subsystem_ready("controller") {
                         continue;
                     }
                     let health_map = self.tls_health.load();

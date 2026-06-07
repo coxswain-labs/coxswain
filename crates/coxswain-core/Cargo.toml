@@ -15,6 +15,7 @@ form_urlencoded      = { workspace = true }
 http                 = { workspace = true }
 matchit              = { workspace = true }
 regex                = { workspace = true }
+serde                = { workspace = true, features = ["rc"] }
 smallvec             = { workspace = true }
 static_assertions    = { workspace = true }
 thiserror            = { workspace = true }
@@ -22,6 +23,7 @@ tracing              = { workspace = true }
 
 [dev-dependencies]
 criterion    = { workspace = true }
+serde_json   = { workspace = true }
 tracing-test = { workspace = true }
 
 [[bench]]

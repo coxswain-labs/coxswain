@@ -10,6 +10,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-async-trait  = { workspace = true }
-http         = { workspace = true }
-pingora-core = { workspace = true }
+async-trait   = { workspace = true }
+coxswain-core = { workspace = true }
+http          = { workspace = true }
+pingora-core  = { workspace = true }

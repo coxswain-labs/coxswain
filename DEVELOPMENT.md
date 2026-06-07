@@ -86,10 +86,10 @@ The bind address for all listeners defaults to `0.0.0.0`. Pass `--proxy-bind-add
 ```bash
 # Health
 curl -s http://localhost:8081/healthz      # ok
-curl -s http://localhost:8081/readyz       # ok (after initial sync completes)
+curl -s http://localhost:8081/readyz       # ok (after every subsystem check is Ready)
 
 # Admin diagnostics
-curl -s http://localhost:8082/status       # {"version":"...","synced":true,"host_count":0}
+curl -s http://localhost:8082/status       # {"version":"...","synced":true,"leader":false,"host_count":0,"subsystems":{...}}
 curl -s http://localhost:8082/routes       # {"hosts":[]}
 curl -s http://localhost:8082/metrics      # Prometheus text
 
@@ -97,7 +97,9 @@ curl -s http://localhost:8082/metrics      # Prometheus text
 kubectl get gatewayclass                   # should show "coxswain" accepted
 ```
 
-`synced` in `/status` flips to `true` once the HTTPRoute watch stream completes its initial LIST. You will see `HttpRoute initial sync complete` in the logs when this happens. Note: the Ingress stream's `InitDone` is not yet gated — tracked in #158.
+`/readyz` returns 200 iff every registered subsystem check is `Ready` or `Degraded` (`Pending` and `Failed` flip it to 503). `/status.subsystems` exposes the full per-subsystem detail. The `controller` subsystem flips each per-reflector check (`httproute`, `ingress`, `gateway`, …) to `Ready` on the reflector's first `InitDone`, then `routing_table_built` on the first successful rebuild. The `proxy` subsystem flips `routing_table_loaded` on the same event. The top-level `synced` field is retained as a derived alias for `is_ready()` so dashboards predating the per-subsystem model keep working.
+
+> **CRD prerequisites and `/readyz`.** If the Gateway API CRDs (or RBAC for any watched resource) are missing, the corresponding reflector errors out instead of emitting `InitDone`, so its check stays `Pending` and `/readyz` stays 503. This is intentional: the pod is not actually ready until its dependencies are installed. Inspect `/status` to see which check is `Pending`.
 
 ---
 

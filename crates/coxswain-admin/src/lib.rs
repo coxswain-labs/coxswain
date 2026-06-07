@@ -1,6 +1,7 @@
 //! Admin HTTP endpoints for Coxswain: `/metrics` (Prometheus), `/routes`, and `/status`.
 
 use async_trait::async_trait;
+use coxswain_core::health::{HealthRegistry, SubsystemSnapshot};
 use coxswain_core::routing::SharedRoutingTable;
 use http::{HeaderValue, Response, StatusCode, header};
 use pingora_core::apps::http_app::{HttpServer, ServeHttp};
@@ -8,14 +9,16 @@ use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::protocols::http::ServerSession;
 use pingora_core::services::listening::Service;
 use prometheus::{Encoder, TextEncoder};
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Pingora HTTP app serving `/metrics`, `/routes`, and `/status`.
 pub struct AdminServer {
-    /// Flipped to `true` by the reconciler once the initial resource list completes.
-    pub synced: Arc<AtomicBool>,
+    /// Shared health registry surfaced under `/status.subsystems`.
+    pub health: HealthRegistry,
     /// Flipped to `true` while this replica holds the leader-election lease.
     pub leader: Arc<AtomicBool>,
     /// Live routing table snapshot used by `/routes`.
@@ -24,6 +27,7 @@ pub struct AdminServer {
 
 impl AdminServer {
     /// Wraps `self` in a Pingora [`Service`] bound to `addr`.
+    #[must_use]
     pub fn into_service(self, addr: SocketAddr) -> Service<HttpServer<Self>> {
         let mut http_server = HttpServer::new_app(self);
         http_server.add_module(ResponseCompressionBuilder::enable(7));
@@ -39,7 +43,7 @@ impl ServeHttp for AdminServer {
         match session.req_header().uri.path() {
             "/metrics" => metrics_response(),
             "/routes" => routes_response(&self.routes),
-            "/status" => status_response(&self.synced, &self.leader, &self.routes),
+            "/status" => status_response(&self.health, &self.leader, &self.routes),
             _ => {
                 let mut r = Response::new(Vec::new());
                 *r.status_mut() = StatusCode::NOT_FOUND;
@@ -105,20 +109,41 @@ fn routes_response(routes: &SharedRoutingTable) -> Response<Vec<u8>> {
     json_response(body)
 }
 
+/// Typed `/status` response. `synced` is retained as a derived top-level alias
+/// of `health.is_ready()` so external consumers that pre-date the per-subsystem
+/// model keep working; new tooling should read `subsystems`.
+#[derive(Serialize)]
+struct StatusResponse {
+    version: &'static str,
+    synced: bool,
+    leader: bool,
+    host_count: usize,
+    subsystems: BTreeMap<Arc<str>, SubsystemSnapshot>,
+}
+
 fn status_response(
-    synced: &Arc<AtomicBool>,
+    health: &HealthRegistry,
     leader: &Arc<AtomicBool>,
     routes: &SharedRoutingTable,
 ) -> Response<Vec<u8>> {
     let table = routes.load();
-    let body = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "synced": synced.load(Ordering::Acquire),
-        "leader": leader.load(Ordering::Acquire),
-        "host_count": table.host_count(),
-    })
-    .to_string();
-    json_response(body)
+    let snapshot = health.snapshot();
+    let resp = StatusResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        synced: health.is_ready(),
+        leader: leader.load(Ordering::Acquire),
+        host_count: table.host_count(),
+        subsystems: snapshot.subsystems,
+    };
+    match serde_json::to_string(&resp) {
+        Ok(body) => json_response(body),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to encode /status response");
+            let mut r = Response::new(Vec::new());
+            *r.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            r
+        }
+    }
 }
 
 fn json_response(mut body: String) -> Response<Vec<u8>> {

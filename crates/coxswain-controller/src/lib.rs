@@ -21,7 +21,8 @@ mod tests;
 pub use controller::{Controller, ControllerConfig, ControllerConfigError, StatusAddress};
 pub use ingress::IngressPorts;
 pub use reconciler::{
-    IngressDefaultBackend, IngressDefaultBackendParseError, Reconciler, ReconcilerOptions,
+    IngressDefaultBackend, IngressDefaultBackendParseError, Reconciler, ReconcilerHealth,
+    ReconcilerOptions,
 };
 pub use tls::{
     GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, SharedBackendTlsPolicyHealth,

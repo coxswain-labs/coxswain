@@ -1,16 +1,21 @@
-//! Health HTTP endpoints: `/healthz` (always 200) and `/readyz` (gated on sync).
+//! Health HTTP endpoints: `/healthz` (always 200) and `/readyz` (gated on the
+//! aggregate of every subsystem registered in the shared [`HealthRegistry`]).
 
 use async_trait::async_trait;
+use coxswain_core::health::HealthRegistry;
 use http::{HeaderValue, Response, StatusCode, header};
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Pingora HTTP app serving `/healthz` (always 200) and `/readyz` (gated on `synced`).
+/// Pingora HTTP app serving `/healthz` (always 200) and `/readyz`.
+///
+/// `/readyz` returns 200 iff every registered subsystem is `Ready` or
+/// `Degraded`; otherwise 503. A `Degraded` subsystem keeps the pod in
+/// kubelet's endpoints because the data plane is still functional — only
+/// `Pending` and `Failed` subsystems flip the probe to 503.
 pub struct HealthServer {
-    /// Flipped to `true` by the reconciler once the initial resource list completes.
-    pub synced: Arc<AtomicBool>,
+    /// Shared health registry inspected on every `/readyz` request.
+    pub registry: HealthRegistry,
 }
 
 fn text_response(status: StatusCode, body: &'static [u8]) -> Response<Vec<u8>> {
@@ -27,7 +32,7 @@ impl ServeHttp for HealthServer {
         match session.req_header().uri.path() {
             "/healthz" => text_response(StatusCode::OK, b"ok\n"),
             "/readyz" => {
-                if self.synced.load(Ordering::Acquire) {
+                if self.registry.is_ready() {
                     text_response(StatusCode::OK, b"ok\n")
                 } else {
                     text_response(StatusCode::SERVICE_UNAVAILABLE, b"not ready\n")

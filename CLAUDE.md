@@ -34,8 +34,8 @@ Per-crate responsibilities (see each crate's `src/lib.rs` for the up-to-date mod
 - **`coxswain-core`** — shared routing-table types, atomic `Shared<T>` snapshot primitive, TLS store, ownership and reference-grant helpers.
 - **`coxswain-controller`** — Kubernetes reflectors and a debounced reconciler that rebuilds the routing and TLS tables; separate status writer with `kube-leader-election`-based leader election.
 - **`coxswain-proxy`** — Pingora-based reverse proxy: lock-free routing lookup, request/response filter application, in-process SNI TLS termination, optional HAProxy PROXY-protocol acceptor.
-- **`coxswain-health`** — `/healthz` (always 200) and `/readyz` (gated on `synced`).
-- **`coxswain-admin`** — `/metrics` (Prometheus), `/routes`, `/status`.
+- **`coxswain-health`** — `/healthz` (always 200) and `/readyz` (gated on `HealthRegistry::is_ready`: every registered subsystem must be `Ready` or `Degraded`).
+- **`coxswain-admin`** — `/metrics` (Prometheus), `/routes`, `/status` (full per-subsystem check detail).
 - **`coxswain-bin`** — entry point: CLI parsing, shared-state wiring, Pingora runtime bootstrap.
 - **`coxswain-e2e`** — black-box integration tests against a live cluster (kind/Orb); not a runtime dependency.
 

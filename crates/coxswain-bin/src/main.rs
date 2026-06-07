@@ -7,8 +7,9 @@ use clap::{Parser, ValueEnum};
 use coxswain_admin::AdminServer;
 use coxswain_controller::{
     Controller, ControllerConfig, IngressDefaultBackend, IngressPorts, Reconciler,
-    ReconcilerOptions, SharedGatewayListenerHealth,
+    ReconcilerHealth, ReconcilerOptions, SharedGatewayListenerHealth,
 };
+use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::RouteTimeouts;
 use coxswain_core::routing::SharedRoutingTable;
@@ -311,9 +312,32 @@ fn main() -> Result<()> {
     let routing_table = SharedRoutingTable::new();
     let tls_store = SharedTlsStore::new();
     let gateway_tls_health = SharedGatewayListenerHealth::new();
-    let synced = Arc::new(AtomicBool::new(false));
     let leader = Arc::new(AtomicBool::new(false));
     let owned_gateways = OwnedGateways::new();
+
+    // Per-subsystem readiness model. Each Reconciler reflector flips its named
+    // check on first `InitDone`; the first successful routing-table publish
+    // flips `controller.routing_table_built` and `proxy.routing_table_loaded`.
+    // `/readyz` is 200 iff every check across both subsystems is Ready/Degraded.
+    let health = HealthRegistry::new();
+    let controller_handle = health.register(
+        "controller",
+        &[
+            "httproute",
+            "ingress",
+            "ingress_class",
+            "gateway",
+            "gateway_class",
+            "endpoint_slice",
+            "reference_grant",
+            "secret",
+            "service",
+            "backend_tls_policy",
+            "config_map",
+            "routing_table_built",
+        ],
+    );
+    let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
     // Clone before move into Controller so HotReloader can subscribe to the same health map.
     let hot_reload_health = gateway_tls_health.clone();
@@ -323,6 +347,7 @@ fn main() -> Result<()> {
         tls_store.clone(),
         gateway_tls_health.clone(),
         owned_gateways.clone(),
+        ReconcilerHealth::new(controller_handle, proxy_handle),
         args.controller_name.clone(),
         {
             let mut opts = ReconcilerOptions::default();
@@ -338,7 +363,7 @@ fn main() -> Result<()> {
     server.add_service(background_service(
         "controller",
         Controller::new(
-            synced.clone(),
+            health.clone(),
             leader.clone(),
             owned_gateways,
             gateway_tls_health,
@@ -468,7 +493,7 @@ fn main() -> Result<()> {
         let mut svc = Service::new(
             "health".to_string(),
             HealthServer {
-                synced: synced.clone(),
+                registry: health.clone(),
             },
         );
         svc.add_tcp(&health_addr.to_string());
@@ -478,7 +503,7 @@ fn main() -> Result<()> {
     let admin_addr = SocketAddr::new(args.proxy_bind_address, args.admin_port);
     server.add_service(
         AdminServer {
-            synced,
+            health,
             leader,
             routes: routing_table,
         }
