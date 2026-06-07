@@ -53,7 +53,7 @@ kubectl apply -f deploy/manifests/gateway-class.yaml
 
 `deploy/` is split into three subdirectories:
 
-- **`deploy/manifests/`** — production Kubernetes manifests (namespace, RBAC, GatewayClass, Deployment).
+- **`deploy/manifests/`** — production Kubernetes manifests (namespace, RBAC, GatewayClass, IngressClass, PodDisruptionBudget, Deployment).
 - **`deploy/dev/`** — local dev fixtures for manual testing (echo backends, sample HTTPRoute and Ingress objects, cross-namespace scenarios). Not applied to production.
 - **`deploy/examples/`** — user-facing example configurations shipped as documentation (e.g. cert-manager TLS setup).
 
