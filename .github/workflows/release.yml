@@ -11,9 +11,15 @@ name: Release
 #
 # Tag policy (hybrid):
 #   push: main         → :main, :main-<sha7>            (rolling main snapshot)
-#   push: tag v0.1.0   → :v0.1.0, :0.1.0, :0.1, :0,    (versioned release;
-#                        :latest                          :latest tracks the
-#                                                         most recent release)
+#   push: tag v0.1.5   → :v0.1.5, :0.1.5,              (versioned release;
+#                        :0.1, :0,                       :v* and :X.Y.Z are
+#                        :latest                         immutable patch pins;
+#                                                        :0.1 and :0 float to
+#                                                        the latest patch and
+#                                                        latest minor.patch
+#                                                        respectively; :latest
+#                                                        tracks the most recent
+#                                                        versioned release)
 #
 # `cargo release` is the canonical trigger for the tag path — it bumps the
 # version, commits, and pushes the v* tag, which lights up this workflow.
