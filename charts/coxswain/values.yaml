@@ -1,0 +1,204 @@
+# Helm chart for Coxswain — Kubernetes Ingress & Gateway API controller.
+#
+# Every COXSWAIN_* environment variable documented in the binary maps to a
+# value here; see crates/coxswain-bin/src/main.rs for the full reference.
+# Empty strings are treated as "omit the env var; use the binary's default."
+
+nameOverride: ""
+fullnameOverride: ""
+
+# -- Namespace to deploy into.
+namespace:
+  # Create the namespace as part of this release.
+  create: true
+  name: coxswain-system
+
+# -- Container image.
+image:
+  repository: ghcr.io/coxswain-labs/coxswain
+  # Defaults to .Chart.AppVersion when empty.
+  tag: ""
+  # Use Always when tag is "latest" or a mutable rolling tag.
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+replicaCount: 1
+
+# -- CPU / memory resource requests and limits.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# -- ServiceAccount settings.
+serviceAccount:
+  # Create a dedicated ServiceAccount for coxswain.
+  create: true
+  # Defaults to the chart fullname when empty.
+  name: ""
+  annotations: {}
+
+# -- Whether to create the ClusterRole, ClusterRoleBinding, and leader-election
+# Role + RoleBinding. Disable only if you manage RBAC externally.
+rbac:
+  create: true
+
+# -- PodDisruptionBudget to protect rolling upgrades.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# -- Pod-level security context.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Security mode.
+# rootless: false (default) — container binds ports ≤1024 directly via
+#   CAP_NET_BIND_SERVICE. Works on PSS "baseline" and "privileged".
+# rootless: true — container binds 8080/8443 instead of 80/443, and
+#   NET_BIND_SERVICE is dropped from capabilities. The gateway Service still
+#   exposes 80/443, mapping to the higher container ports. Required for PSS
+#   "restricted" namespaces.
+security:
+  rootless: false
+
+# -- Container-level security context.
+# When security.rootless is true, capabilities.add is overridden to [] regardless
+# of what is set here.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+    add:
+      - NET_BIND_SERVICE
+
+# -- Extra labels and annotations added to each pod.
+podAnnotations: {}
+podLabels: {}
+
+# -- Scheduling constraints.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+# -- Liveness probe. Calls /healthz on the health port (always 200).
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: health
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+# -- Readiness probe. Calls /readyz; 503 until all subsystem checks are Ready/Degraded.
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 6
+
+# -- Controller settings.
+controller:
+  # COXSWAIN_CONTROLLER_NAME — GatewayClass controllerName this instance claims.
+  name: coxswain-labs.dev/gateway-controller
+  # COXSWAIN_CONTROLLER_WATCH_NAMESPACE — restrict to a single namespace; empty = cluster-wide.
+  watchNamespace: ""
+  # COXSWAIN_CONTROLLER_LEASE_TTL — how long a leader lease stays valid without renewal.
+  leaseTtl: 15s
+  # COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL — how often the leader renews its lease.
+  leaseRenewInterval: 5s
+  # COXSWAIN_STATUS_ADDRESS — external IP/hostname written to Ingress and Gateway status.
+  statusAddress: ""
+  # COXSWAIN_INGRESS_DEFAULT_BACKEND — fallback backend for unmatched Ingress traffic.
+  # Format: <namespace>/<service>:<port>, e.g. default/my-404-page:80
+  ingressDefaultBackend: ""
+
+# -- Proxy settings.
+proxy:
+  # COXSWAIN_PROXY_THREADS — worker threads per proxy service.
+  threads: 2
+  # COXSWAIN_PROXY_BIND_ADDRESS — IP address all proxy listeners bind to.
+  bindAddress: "0.0.0.0"
+
+  # HTTP listener. Clients always connect on `port`; the container binds on
+  # `port` normally, or 8080 when security.rootless is true.
+  http:
+    enabled: true
+    port: 80  # COXSWAIN_PROXY_HTTP_PORT
+
+  # HTTPS / TLS listener. Clients always connect on `port`; the container binds
+  # on `port` normally, or 8443 when security.rootless is true.
+  https:
+    enabled: true
+    port: 443  # COXSWAIN_PROXY_HTTPS_PORT
+
+  # COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD — drain window before final shutdown.
+  shutdownGracePeriod: 30s
+  # COXSWAIN_PROXY_SHUTDOWN_TIMEOUT — hard deadline after grace period expires.
+  shutdownTimeout: 5s
+
+  # COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL — enable HAProxy PROXY protocol v1/v2.
+  acceptProxyProtocol: false
+  # COXSWAIN_PROXY_TRUSTED_SOURCES — CIDRs allowed to send PROXY headers (comma-joined).
+  trustedSources: []
+
+  # COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT — global default total request timeout.
+  # Empty = disabled. Human-readable: "30s", "1m".
+  defaultRequestTimeout: ""
+  # COXSWAIN_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT — global default backend timeout.
+  # Empty = disabled.
+  defaultBackendRequestTimeout: ""
+
+# -- Health endpoint port (COXSWAIN_HEALTH_PORT). Serves /healthz and /readyz.
+health:
+  port: 8081
+
+# -- Admin endpoint port (COXSWAIN_ADMIN_PORT). Serves /metrics, /routes, /status.
+admin:
+  port: 8082
+
+# -- COXSWAIN_LOG_FORMAT — "json" for production; "console" for development.
+logFormat: json
+
+# -- COXSWAIN_LOG — log verbosity / per-crate filter (RUST_LOG syntax).
+logFilter: "info,coxswain_proxy=debug"
+
+# -- GatewayClass resource. Set create: false if you manage it externally.
+gatewayClass:
+  create: true
+  # Must match controller.name above.
+  name: coxswain
+
+# -- IngressClass resource. Set create: false if you manage it externally.
+ingressClass:
+  create: true
+  name: coxswain
+
+# -- Service settings.
+service:
+  # Gateway service exposes the data-plane ports (80/443) to external traffic.
+  gateway:
+    type: LoadBalancer
+    annotations: {}
+    # Pin the load-balancer to a specific IP (cloud-provider dependent).
+    loadBalancerIP: ""
+    loadBalancerSourceRanges: []
+    # Set to Local to preserve client IPs at the cost of uneven load distribution.
+    externalTrafficPolicy: ""
+    # Pre-declare additional ports for Gateway API listeners beyond the defaults.
+    # Each entry follows the ServicePort schema: name, port, targetPort, protocol.
+    additionalPorts: []
+
+  # Internal service exposes health (8081) and admin (8082) as ClusterIP only.
+  internal:
+    annotations: {}

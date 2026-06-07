@@ -1,0 +1,11 @@
+{{- if .Values.ingressClass.create -}}
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: {{ .Values.ingressClass.name }}
+  labels:
+    {{- include "coxswain.labels" . | nindent 4 }}
+spec:
+  # Must match controller.name (COXSWAIN_CONTROLLER_NAME) in the Deployment.
+  controller: {{ .Values.controller.name }}
+{{- end }}

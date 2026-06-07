@@ -1,0 +1,21 @@
+apiVersion: v2
+name: coxswain
+description: >-
+  Kubernetes Ingress & Gateway API controller backed by Pingora.
+  Watches Ingress and Gateway API resources and dynamically routes traffic
+  without a full reload. Supports multi-replica leader election.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/coxswain-labs/coxswain
+sources:
+  - https://github.com/coxswain-labs/coxswain
+keywords:
+  - ingress
+  - gateway
+  - networking
+  - kubernetes
+  - proxy
+maintainers:
+  - name: Coxswain Labs
+    url: https://github.com/coxswain-labs
