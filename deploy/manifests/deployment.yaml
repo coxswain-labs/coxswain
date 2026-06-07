@@ -58,7 +58,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: COXSWAIN_LOG
-              value: "info,coxswain_proxy=debug"
+              value: "info"
             - name: COXSWAIN_LOG_FORMAT
               value: "json"
             - name: COXSWAIN_PROXY_THREADS

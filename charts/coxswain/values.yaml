@@ -171,7 +171,7 @@ admin:
 logFormat: json
 
 # -- COXSWAIN_LOG — log verbosity / per-crate filter (RUST_LOG syntax).
-logFilter: "info,coxswain_proxy=debug"
+logFilter: info
 
 # -- GatewayClass resource. Set create: false if you manage it externally.
 gatewayClass:
