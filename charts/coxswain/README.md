@@ -144,7 +144,10 @@ Clients still connect to ports 80/443. The container binds 8080/8443 without
 
 ### Extra Gateway listener ports
 
-Pre-declare ports for Gateway resources that use non-standard ports:
+Coxswain dynamically binds new Gateway listener ports at runtime via HotReloader,
+but the Kubernetes Service is static. A port bound by the pod is not reachable
+externally until it is also declared in `additionalPorts` and `helm upgrade` is run.
+Use this for ports you know in advance:
 
 ```yaml
 service:
@@ -155,6 +158,10 @@ service:
         targetPort: 8080
         protocol: TCP
 ```
+
+Automatic Service port management (patching `spec.ports` when Gateway listeners
+change without a manual upgrade) is tracked in
+[#180](https://github.com/coxswain-labs/coxswain/issues/180).
 
 ### Namespace-scoped watch
 

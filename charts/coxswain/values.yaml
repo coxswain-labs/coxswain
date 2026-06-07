@@ -195,8 +195,14 @@ service:
     loadBalancerSourceRanges: []
     # Set to Local to preserve client IPs at the cost of uneven load distribution.
     externalTrafficPolicy: ""
-    # Pre-declare additional ports for Gateway API listeners beyond the defaults.
+    # Pre-declare additional fixed ports for known Gateway API listeners.
     # Each entry follows the ServicePort schema: name, port, targetPort, protocol.
+    #
+    # Note: Coxswain dynamically binds new Gateway listener ports at runtime
+    # (via HotReloader), but the Kubernetes Service is static — a new port bound
+    # by the pod is not reachable externally until it is also added here and
+    # `helm upgrade` is run. Automatic Service port management (patching spec.ports
+    # when Gateway listeners change) is tracked as a follow-up issue.
     additionalPorts: []
 
   # Internal service exposes health (8081) and admin (8082) as ClusterIP only.
