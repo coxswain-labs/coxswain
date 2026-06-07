@@ -12,6 +12,7 @@ mod timeouts;
 pub use backend_tls::{BackendTlsIndex, build_backend_tls_index};
 pub use bindings::ListenerBinding;
 pub(crate) use hostnames::hostnames_intersect;
+pub use reconcile::RouteResolution;
 
 #[cfg(test)]
 mod tests;

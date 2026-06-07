@@ -1367,9 +1367,11 @@ async fn backend_tls_policy_invalid_ca() -> anyhow::Result<()> {
         "echo-tls-policy",
         &ns.name,
         controller_name,
-        "Accepted",
-        "False",
-        "NoValidCACertificate",
+        wait::ExpectedCondition {
+            type_: "Accepted",
+            status: "False",
+            reason: "NoValidCACertificate",
+        },
         Duration::from_secs(30),
     )
     .await?;
@@ -1378,9 +1380,11 @@ async fn backend_tls_policy_invalid_ca() -> anyhow::Result<()> {
         "echo-tls-policy",
         &ns.name,
         controller_name,
-        "ResolvedRefs",
-        "False",
-        "InvalidCACertificateRef",
+        wait::ExpectedCondition {
+            type_: "ResolvedRefs",
+            status: "False",
+            reason: "InvalidCACertificateRef",
+        },
         Duration::from_secs(10),
     )
     .await?;
@@ -1485,9 +1489,11 @@ async fn backend_tls_policy_conflict_resolution() -> anyhow::Result<()> {
         "zzz-policy",
         &ns.name,
         controller_name,
-        "Accepted",
-        "False",
-        "Conflicted",
+        wait::ExpectedCondition {
+            type_: "Accepted",
+            status: "False",
+            reason: "Conflicted",
+        },
         Duration::from_secs(30),
     )
     .await?;

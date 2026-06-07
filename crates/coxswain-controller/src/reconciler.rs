@@ -203,6 +203,11 @@ struct Ownership<'a> {
     gateway_classes: &'a HashSet<String>,
     backend_grants: &'a GrantSet,
     cert_grants: &'a GrantSet,
+    /// Per-(Service, port) `BackendTLSPolicy` lookup table, built before this
+    /// `Ownership` is constructed. Carried alongside ownership data because
+    /// `build_routes` and the per-route `reconcile` both need it on the same
+    /// borrow pass — folding it in here keeps the function arities clippy-clean.
+    policy_index: &'a BackendTlsIndex,
 }
 
 fn spawn_reflector<T>(
@@ -250,17 +255,15 @@ impl BackgroundService for Reconciler {
             ingress_default_backend: self.opts.ingress_default_backend.clone(),
             ingress_ports: self.opts.ingress_ports,
         };
-        let mut set = spawn_tasks(
-            client,
-            self.routes.clone(),
-            self.tls.clone(),
-            self.tls_health.clone(),
-            self.route_health.clone(),
-            self.policy_health.clone(),
-            self.owned_gateways.clone(),
-            config,
-        )
-        .await;
+        let handles = SharedHandles {
+            routes: self.routes.clone(),
+            tls: self.tls.clone(),
+            tls_health: self.tls_health.clone(),
+            route_health: self.route_health.clone(),
+            policy_health: self.policy_health.clone(),
+            owned_gateways: self.owned_gateways.clone(),
+        };
+        let mut set = spawn_tasks(client, handles, config).await;
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
@@ -274,16 +277,32 @@ impl BackgroundService for Reconciler {
     }
 }
 
-async fn spawn_tasks(
-    client: Client,
+/// Owned bundle of shared state handles consumed by [`spawn_tasks`].
+///
+/// Groups every cross-task handle the reconciler clones into its background work
+/// so the function stays under the `clippy::too_many_arguments` threshold.
+struct SharedHandles {
     routes: SharedRoutingTable,
     tls: SharedTlsStore,
     tls_health: SharedGatewayListenerHealth,
     route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
     owned_gateways: OwnedGateways,
+}
+
+async fn spawn_tasks(
+    client: Client,
+    handles: SharedHandles,
     config: ReconcilerConfig,
 ) -> JoinSet<()> {
+    let SharedHandles {
+        routes,
+        tls,
+        tls_health,
+        route_health,
+        policy_health,
+        owned_gateways,
+    } = handles;
     let ReconcilerConfig {
         controller_name,
         watch_namespace,
@@ -478,6 +497,10 @@ fn rebuild(
         "Rebuilding routing table"
     );
 
+    // `policy_index` is built first because `Ownership` now carries a borrow of it.
+    let (policy_index, mut policy_health_map) =
+        build_backend_tls_index(stores.policies, stores.configmaps, stores.services);
+
     let ownership = Ownership {
         ingress_classes: &owned_ingress_classes,
         default_ingress_class: owned_default_ingress_class.as_deref(),
@@ -485,10 +508,8 @@ fn rebuild(
         gateway_classes: &owned_gateway_classes,
         backend_grants: &backend_grants,
         cert_grants: &cert_grants,
+        policy_index: &policy_index,
     };
-
-    let (policy_index, mut policy_health_map) =
-        build_backend_tls_index(stores.policies, stores.configmaps, stores.services);
 
     build_routes(
         stores,
@@ -497,7 +518,6 @@ fn rebuild(
         &ownership,
         ingress_default_backend,
         ingress_ports,
-        &policy_index,
         outputs.routes,
     );
 
@@ -656,7 +676,6 @@ fn build_routes(
     ownership: &Ownership<'_>,
     ingress_default_backend: Option<&IngressDefaultBackend>,
     ingress_ports: IngressPorts,
-    policy_index: &BackendTlsIndex,
     shared: &SharedRoutingTable,
 ) {
     // Precompute ListenerKey → (hostname, port) from all owned gateway listeners.
@@ -691,8 +710,10 @@ fn build_routes(
             stores.services,
             ownership.gateways,
             ownership.backend_grants,
-            &listener_info,
-            policy_index,
+            crate::gateway_api::RouteResolution {
+                listener_info: &listener_info,
+                policy_index: ownership.policy_index,
+            },
             &mut builder,
         );
     }

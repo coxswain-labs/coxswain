@@ -91,8 +91,10 @@ fn reconcile_timeouts_stored_and_round_trip() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -113,8 +115,10 @@ fn reconcile_timeouts_missing_field_falls_back_to_none() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();

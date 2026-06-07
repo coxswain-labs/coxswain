@@ -2,7 +2,7 @@ use super::*;
 use crate::gateway_api::backend_tls::build_backend_tls_index;
 use crate::gw_types::{
     BackendTlsPolicy,
-    v::backendtlspolicies::{
+    backendtlspolicies::{
         BackendTlsPolicySpec, BackendTlsPolicyTargetRefs, BackendTlsPolicyValidation,
         BackendTlsPolicyValidationCaCertificateRefs,
     },
@@ -440,8 +440,10 @@ fn reconcile_attaches_tls_and_forces_https() {
         &crate::tests::fixtures::empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listener_info(),
-        &index,
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &index,
+        },
         &mut builder,
     );
 

@@ -30,26 +30,44 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// Precomputed lookup tables consumed by [`GatewayApiReconciler::reconcile`].
+///
+/// Bundles the per-rebuild context that doesn't change between routes — the
+/// listener-binding table and the `BackendTLSPolicy` index — so the function
+/// stays under the workspace `clippy::too_many_arguments` threshold without
+/// each call site repeating the two-arg suffix.
+pub struct RouteResolution<'a> {
+    /// `(gw_ns, gw_name, listener_name) → (hostname, port)` mapping for every
+    /// listener on every Gateway we own.
+    pub listener_info: &'a HashMap<ListenerKey, ListenerBinding>,
+    /// Per-(Service, port) `BackendTLSPolicy` lookup table; lookups try
+    /// `(svc, Some(port))` first and fall back to `(svc, None)`.
+    pub policy_index: &'a BackendTlsIndex,
+}
+
 impl GatewayApiReconciler {
     /// Skips routes whose `spec.parentRefs` do not include at least one Gateway
     /// managed by this controller. Never queries the API server.
     ///
-    /// `listener_info` maps `(gw_ns, gw_name, listener_name) → (hostname, port)`, used
-    /// to scope routes to the correct per-port routing table slot and listener hostname.
-    ///
-    /// `policy_index` maps `(svc_ns, svc_name)` to an `UpstreamTls` derived from an
-    /// attached `BackendTLSPolicy`. When a backend ref matches, the group is forced to
-    /// TLS and the policy's SNI / CA override is attached.
+    /// `resolution` bundles the precomputed lookup tables used to resolve a route:
+    /// - `listener_info` maps `(gw_ns, gw_name, listener_name) → (hostname, port)`, used
+    ///   to scope routes to the correct per-port routing table slot and listener hostname.
+    /// - `policy_index` maps `(svc, port?)` to an `UpstreamTls` derived from an attached
+    ///   `BackendTLSPolicy`. When a backend ref matches, the group is forced to TLS and
+    ///   the policy's SNI / CA override is attached.
     pub fn reconcile(
         route: &HttpRoute,
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
         owned_gateways: &HashSet<ObjectKey>,
         grants: &HashSet<ReferenceGrantKey>,
-        listener_info: &HashMap<ListenerKey, ListenerBinding>,
-        policy_index: &BackendTlsIndex,
+        resolution: RouteResolution<'_>,
         builder: &mut RoutingTableBuilder,
     ) {
+        let RouteResolution {
+            listener_info,
+            policy_index,
+        } = resolution;
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
         let route_id = format!("{route_ns}/{route_name}");

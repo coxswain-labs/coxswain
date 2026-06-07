@@ -84,8 +84,10 @@ fn reconcile_request_header_modifier_stored() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -129,8 +131,10 @@ fn reconcile_response_header_modifier_stored() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -172,8 +176,10 @@ fn reconcile_request_redirect_stored() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -221,8 +227,10 @@ fn reconcile_url_rewrite_replace_prefix_stored() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();

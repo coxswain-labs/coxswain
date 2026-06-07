@@ -22,8 +22,10 @@ fn reconcile_exact_path() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -54,8 +56,10 @@ fn reconcile_prefix_path() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -86,8 +90,10 @@ fn reconcile_regex_path() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -110,8 +116,10 @@ fn reconcile_no_matches_defaults_to_root_prefix() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -133,8 +141,10 @@ fn reconcile_skips_route_without_owned_parent() {
         &empty_svc_store(),
         &owned(&[("other", "gw")]),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -195,8 +205,10 @@ fn reconcile_header_exact_routes_to_correct_backend() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -233,8 +245,10 @@ fn reconcile_header_regex_routes_to_correct_backend() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -296,8 +310,10 @@ fn reconcile_method_routes_to_correct_backend() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -370,8 +386,10 @@ fn reconcile_query_param_routes_to_correct_backend() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -419,8 +437,10 @@ fn reconcile_invalid_regex_skips_match_entry() {
         &empty_svc_store(),
         &default_owned(),
         &grants,
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -501,8 +521,10 @@ fn weighted_backends_80_20_split() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -540,8 +562,10 @@ fn zero_weight_backend_gets_no_traffic() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -571,8 +595,10 @@ fn all_zero_weights_installs_error_route() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();
@@ -601,8 +627,10 @@ fn absent_weight_defaults_to_1() {
         &empty_svc_store(),
         &default_owned(),
         &HashSet::new(),
-        &no_listener_info(),
-        &HashMap::new(),
+        crate::gateway_api::RouteResolution {
+            listener_info: &no_listener_info(),
+            policy_index: &HashMap::new(),
+        },
         &mut builder,
     );
     let table = builder.build().unwrap();

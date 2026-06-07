@@ -5,9 +5,7 @@
 
 use crate::gw_types::{
     BackendTlsPolicy, HttpRoute,
-    v::backendtlspolicies::{
-        BackendTlsPolicyTargetRefs, BackendTlsPolicyValidationCaCertificateRefs,
-    },
+    backendtlspolicies::{BackendTlsPolicyTargetRefs, BackendTlsPolicyValidationCaCertificateRefs},
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::tls::{BackendTlsPolicyHealth, BackendTlsPolicyHealthMap};
@@ -298,7 +296,7 @@ fn is_service_ref(target: &BackendTlsPolicyTargetRefs) -> bool {
 /// reference cannot be resolved and the policy should be skipped.
 fn resolve_ca(
     policy_ns: &str,
-    validation: &crate::gw_types::v::backendtlspolicies::BackendTlsPolicyValidation,
+    validation: &crate::gw_types::backendtlspolicies::BackendTlsPolicyValidation,
     configmaps: &reflector::Store<ConfigMap>,
 ) -> (Option<UpstreamCa>, &'static str) {
     if let Some(refs) = validation.ca_certificate_refs.as_deref()

@@ -533,8 +533,21 @@ pub async fn wait_for_backend_tls_policy_condition(
     .await
 }
 
+/// Condition expectation for [`wait_for_backend_tls_policy_condition_with_reason`].
+///
+/// Bundles the `(type, status, reason)` triple so the wait helper stays under
+/// the workspace `clippy::too_many_arguments` threshold.
+pub struct ExpectedCondition<'a> {
+    /// The condition `type_` we expect (e.g. `"Accepted"`).
+    pub type_: &'a str,
+    /// The condition `status` we expect (e.g. `"False"`).
+    pub status: &'a str,
+    /// The condition `reason` we expect (e.g. `"NoValidCACertificate"`).
+    pub reason: &'a str,
+}
+
 /// Poll until a `BackendTLSPolicy`'s `status.ancestors[]` contains a condition
-/// matching the given `(type, status, reason)` from our controller.
+/// matching `expected` from our controller.
 ///
 /// Stricter than [`wait_for_backend_tls_policy_condition`] — required when the
 /// test cares about the specific failure reason (e.g. `NoValidCACertificate`,
@@ -544,12 +557,15 @@ pub async fn wait_for_backend_tls_policy_condition_with_reason(
     name: &str,
     namespace: &str,
     controller_name: &str,
-    type_: &str,
-    status: &str,
-    reason: &str,
+    expected: ExpectedCondition<'_>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let api: Api<BackendTLSPolicy> = Api::namespaced(client.clone(), namespace);
+    let ExpectedCondition {
+        type_,
+        status,
+        reason,
+    } = expected;
     poll_until(
         timeout,
         POLL,

@@ -5,7 +5,7 @@
 
 use super::conditions::make_condition;
 use crate::gw_types::BackendTlsPolicy;
-use crate::gw_types::v::backendtlspolicies::{
+use crate::gw_types::backendtlspolicies::{
     BackendTlsPolicyStatusAncestors, BackendTlsPolicyStatusAncestorsAncestorRef,
 };
 use crate::tls::{BackendTlsPolicyHealth, BackendTlsPolicyHealthMap};
