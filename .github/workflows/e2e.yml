@@ -13,20 +13,45 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - 'crates/**'
-      - 'deploy/manifests/**'
-      - 'conformance/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.gateway-api-version'
-      - '.github/workflows/e2e.yml'
 
 name: E2E
 
+# The `pull_request` trigger has no workflow-level `paths:` filter (the `push:`
+# trigger keeps its filter — main-branch pushes aren't ruleset-gated). Three of
+# the jobs below (`e2e-ingress`, `e2e-gateway-api`, `e2e-gateway-api-conformance`)
+# are required status checks; a workflow-level path filter that excludes the
+# whole workflow leaves those checks pending forever on docs-only PRs. Instead
+# we always start on PRs and gate the heavy jobs on the `changes` job. A job
+# whose `if:` evaluates to false reports `skipped`, which counts as success for
+# required-status-check enforcement.
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    # On `push:` events the workflow-level `paths:` filter has already gated
+    # us, so treat `code` as true. On `pull_request:` events run the filter.
+    outputs:
+      code: ${{ steps.filter.outputs.code || 'true' }}
+    steps:
+      - uses: actions/checkout@v6
+      - if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'crates/**'
+              - 'deploy/manifests/**'
+              - 'conformance/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.gateway-api-version'
+              - '.github/workflows/e2e.yml'
+
   build:
     name: build
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
