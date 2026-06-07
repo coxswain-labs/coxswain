@@ -3,39 +3,42 @@ on:
     branches:
       - main
 
-name: Image
+name: Distribution
 
-# PR-only smoke test for the Dockerfile. Build the amd64 image with no push and
-# exercise the binary so a broken Dockerfile is caught at PR time instead of
-# breaking the next release. Multi-arch publishing lives in release.yml.
+# PR-time validation for distribution artifacts: Docker image and Helm chart.
+# Multi-arch image publishing lives in release.yml; OCI chart publishing in #28.
 #
 # Same gating pattern as ci.yml / e2e.yml: the workflow always starts so that
-# the `smoke` job (required status check) reports `skipped` success on PRs
-# that don't touch image-related files.
+# required status checks (smoke, helm-chart) report `skipped` success on PRs
+# that don't touch the relevant paths.
 jobs:
   changes:
     name: changes
     runs-on: ubuntu-latest
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      docker: ${{ steps.filter.outputs.docker }}
+      chart: ${{ steps.filter.outputs.chart }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
-            code:
+            docker:
               - 'Dockerfile'
               - '.dockerignore'
               - 'crates/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
-              - '.github/workflows/image.yml'
+              - '.github/workflows/distribution.yml'
+            chart:
+              - 'charts/**'
+              - '.github/workflows/distribution.yml'
 
-  smoke:
-    name: smoke
+  docker-image:
+    name: docker-image
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -64,3 +67,16 @@ jobs:
 
       - name: Report image size
         run: docker images coxswain:ci --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+
+  helm-chart:
+    name: helm-chart
+    needs: changes
+    if: needs.changes.outputs.chart == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: azure/setup-helm@v4
+      - name: Lint
+        run: helm lint charts/coxswain
+      - name: Template smoke test
+        run: helm template coxswain charts/coxswain --namespace coxswain-system > /dev/null

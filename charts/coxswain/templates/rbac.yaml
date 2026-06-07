@@ -1,0 +1,80 @@
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "coxswain.fullname" . }}-role
+  labels:
+    {{- include "coxswain.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "pods", "secrets", "configmaps"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "ingressclasses"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses/status"]
+    verbs: ["patch", "update"]
+
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses", "gateways", "httproutes", "referencegrants", "backendtlspolicies"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status", "backendtlspolicies/status"]
+    verbs: ["patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "coxswain.fullname" . }}-binding
+  labels:
+    {{- include "coxswain.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "coxswain.serviceAccountName" . }}
+    namespace: {{ .Values.namespace.name }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "coxswain.fullname" . }}-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Namespace-scoped Role for leader-election Lease objects.
+# Kept separate from the ClusterRole to limit Lease access to the install namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "coxswain.fullname" . }}-leader-election-role
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "coxswain.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "coxswain.fullname" . }}-leader-election-binding
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "coxswain.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "coxswain.serviceAccountName" . }}
+    namespace: {{ .Values.namespace.name }}
+roleRef:
+  kind: Role
+  name: {{ include "coxswain.fullname" . }}-leader-election-role
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

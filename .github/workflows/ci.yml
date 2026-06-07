@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      parity: ${{ steps.filter.outputs.parity }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
@@ -29,6 +30,11 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+              - '.github/workflows/ci.yml'
+            parity:
+              - 'crates/coxswain-controller/src/controller/gateway_class_status.rs'
+              - 'conformance/main_test.go'
+              - 'scripts/check-supported-features.sh'
               - '.github/workflows/ci.yml'
 
   fmt:
@@ -107,3 +113,12 @@ jobs:
           tool: cargo-audit
       - run: cargo audit
 
+  supported-features-parity:
+    name: supported-features-parity
+    needs: changes
+    if: needs.changes.outputs.parity == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check Rust SUPPORTED_FEATURES matches Go opts.SupportedFeatures
+        run: bash scripts/check-supported-features.sh

@@ -1,0 +1,45 @@
+{{- if or .Values.proxy.http.enabled .Values.proxy.https.enabled .Values.service.gateway.additionalPorts -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "coxswain.fullname" . }}-gateway
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "coxswain.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+  {{- with .Values.service.gateway.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.gateway.type }}
+  selector:
+    {{- include "coxswain.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+  {{- if .Values.service.gateway.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ .Values.service.gateway.externalTrafficPolicy }}
+  {{- end }}
+  {{- if .Values.service.gateway.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.service.gateway.loadBalancerIP }}
+  {{- end }}
+  {{- if .Values.service.gateway.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml .Values.service.gateway.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  ports:
+    {{- if .Values.proxy.http.enabled }}
+    - name: http
+      port: {{ .Values.proxy.http.port }}
+      targetPort: http
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.proxy.https.enabled }}
+    - name: https
+      port: {{ .Values.proxy.https.port }}
+      targetPort: https
+      protocol: TCP
+    {{- end }}
+    {{- with .Values.service.gateway.additionalPorts }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

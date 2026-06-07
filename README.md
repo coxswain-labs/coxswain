@@ -56,11 +56,26 @@ See [docs/tls-cert-manager.md](docs/tls-cert-manager.md) for a step-by-step guid
 
 ### In-cluster deployment
 
+**Helm (recommended):**
+
 ```bash
 # Install Gateway API CRDs
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/download/standard-install.yaml
 
-# Apply Coxswain manifests
+# Install Coxswain
+helm install coxswain charts/coxswain --namespace coxswain-system --create-namespace
+```
+
+The chart exposes the full configuration surface via `values.yaml`. To inspect available options:
+
+```bash
+helm show values charts/coxswain
+```
+
+**Raw manifests (alternative):**
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/download/standard-install.yaml
 kubectl apply -f deploy/manifests/namespace.yaml
 kubectl apply -f deploy/manifests/rbac.yaml
 kubectl apply -f deploy/manifests/gateway-class.yaml

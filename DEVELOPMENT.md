@@ -51,6 +51,14 @@ kubectl apply -f deploy/manifests/rbac.yaml
 kubectl apply -f deploy/manifests/gateway-class.yaml
 ```
 
+Alternatively, use the Helm chart (installs all resources including the Deployment; then stop Helm managing the pod and run the binary locally instead):
+
+```bash
+helm install coxswain charts/coxswain --namespace coxswain-system --create-namespace
+# Scale the in-cluster pod to 0 if you want the local binary to be the only instance:
+kubectl -n coxswain-system scale deployment/coxswain --replicas=0
+```
+
 `deploy/` is split into three subdirectories:
 
 - **`deploy/manifests/`** — production Kubernetes manifests (namespace, RBAC, GatewayClass, IngressClass, PodDisruptionBudget, Deployment).

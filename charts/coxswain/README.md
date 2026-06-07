@@ -1,0 +1,184 @@
+# Coxswain Helm Chart
+
+Helm chart for [Coxswain](https://github.com/coxswain-labs/coxswain) — a pure-Rust
+Kubernetes Ingress & Gateway API controller backed by Pingora.
+
+## Prerequisites
+
+- Kubernetes 1.25+
+- Helm 3.10+
+- [Gateway API CRDs](https://gateway-api.sigs.k8s.io/guides/#installing-gateway-api) installed
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/download/standard-install.yaml
+```
+
+## Quick start
+
+```bash
+helm install coxswain charts/coxswain \
+  --namespace coxswain-system \
+  --create-namespace
+```
+
+Verify the controller is ready:
+
+```bash
+kubectl -n coxswain-system get pods
+kubectl get gatewayclass coxswain
+```
+
+## Configuration
+
+All values can be overridden with `--set key=value` or a custom `values.yaml`.
+
+### Core settings
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `replicaCount` | `1` | Number of pod replicas |
+| `image.repository` | `ghcr.io/coxswain-labs/coxswain` | Container image repository |
+| `image.tag` | `""` (uses Chart.AppVersion) | Container image tag |
+| `image.pullPolicy` | `IfNotPresent` | Image pull policy |
+
+### Controller settings
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `controller.name` | `coxswain-labs.dev/gateway-controller` | GatewayClass controllerName to claim |
+| `controller.watchNamespace` | `""` (cluster-wide) | Restrict to a single namespace |
+| `controller.statusAddress` | `""` | External IP/hostname written to Ingress/Gateway status |
+| `controller.ingressDefaultBackend` | `""` | Fallback backend (`<ns>/<svc>:<port>`) |
+| `controller.leaseTtl` | `15s` | Leader lease validity duration |
+| `controller.leaseRenewInterval` | `5s` | Leader lease renewal interval |
+
+### Proxy settings
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `proxy.threads` | `2` | Worker threads per proxy service |
+| `proxy.bindAddress` | `0.0.0.0` | IP address all listeners bind to |
+| `proxy.http.enabled` | `true` | Enable HTTP listener |
+| `proxy.http.port` | `80` | HTTP listener service port |
+| `proxy.https.enabled` | `true` | Enable HTTPS/TLS listener |
+| `proxy.https.port` | `443` | HTTPS listener service port |
+| `proxy.shutdownGracePeriod` | `30s` | Drain window before final shutdown |
+| `proxy.shutdownTimeout` | `5s` | Hard deadline after grace period |
+| `proxy.acceptProxyProtocol` | `false` | Accept HAProxy PROXY protocol v1/v2 |
+| `proxy.trustedSources` | `[]` | CIDRs allowed to send PROXY headers |
+| `proxy.defaultRequestTimeout` | `""` | Global default total request timeout |
+| `proxy.defaultBackendRequestTimeout` | `""` | Global default backend request timeout |
+
+### Observability
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `health.port` | `8081` | Health endpoint port (`/healthz`, `/readyz`) |
+| `admin.port` | `8082` | Admin endpoint port (`/metrics`, `/routes`, `/status`) |
+| `logFormat` | `json` | Log format: `json` or `console` |
+| `logFilter` | `info,coxswain_proxy=debug` | Log verbosity (RUST_LOG syntax) |
+
+### Security
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `security.rootless` | `false` | Enable rootless mode for PSS `restricted` namespaces |
+
+When `security.rootless: true`, the container binds 8080/8443 instead of 80/443 and
+`NET_BIND_SERVICE` is dropped from capabilities. The gateway Service still exposes
+80/443, mapping to the higher container ports via named `targetPort`.
+
+### Services
+
+Two Services are created:
+
+- **`<release>-gateway`** — exposes data-plane ports (80/443). Type is configurable
+  via `service.gateway.type` (default `LoadBalancer`).
+- **`<release>-internal`** — exposes health (8081) and admin (8082) as `ClusterIP`.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `service.gateway.type` | `LoadBalancer` | Service type for the data-plane service |
+| `service.gateway.annotations` | `{}` | Annotations for the gateway Service |
+| `service.gateway.loadBalancerIP` | `""` | Pin LB to a specific IP (cloud-dependent) |
+| `service.gateway.loadBalancerSourceRanges` | `[]` | Restrict LB to source CIDRs |
+| `service.gateway.externalTrafficPolicy` | `""` | Set `Local` to preserve client IPs |
+| `service.gateway.additionalPorts` | `[]` | Extra ports for Gateway API listeners |
+| `service.internal.annotations` | `{}` | Annotations for the internal Service |
+
+### Resources
+
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+```
+
+## Examples
+
+### Gateway API only (no static proxy ports)
+
+```yaml
+proxy:
+  http:
+    enabled: false
+  https:
+    enabled: false
+```
+
+Coxswain will discover listener ports from Gateway resources at startup.
+
+### Rootless mode (PSS restricted)
+
+```yaml
+security:
+  rootless: true
+```
+
+Clients still connect to ports 80/443. The container binds 8080/8443 without
+`NET_BIND_SERVICE`.
+
+### Extra Gateway listener ports
+
+Coxswain dynamically binds new Gateway listener ports at runtime via HotReloader,
+but the Kubernetes Service is static. A port bound by the pod is not reachable
+externally until it is also declared in `additionalPorts` and `helm upgrade` is run.
+Use this for ports you know in advance:
+
+```yaml
+service:
+  gateway:
+    additionalPorts:
+      - name: alt-http
+        port: 8080
+        targetPort: 8080
+        protocol: TCP
+```
+
+Automatic Service port management (patching `spec.ports` when Gateway listeners
+change without a manual upgrade) is tracked in
+[#180](https://github.com/coxswain-labs/coxswain/issues/180).
+
+### Namespace-scoped watch
+
+```yaml
+controller:
+  watchNamespace: my-namespace
+```
+
+### Custom resource limits
+
+```yaml
+replicaCount: 3
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+```
