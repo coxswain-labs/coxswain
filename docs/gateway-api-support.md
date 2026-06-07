@@ -16,7 +16,7 @@ Each Gateway API feature goes through one or more of these stages before coxswai
 
 | Stage | Meaning |
 |-------|---------|
-| **Planned** | GitHub issue open, ROADMAP item checked off, no code yet |
+| **Planned** | GitHub issue open and milestoned to a v0.N release, no code yet |
 | **Implemented (unverified)** | Code landed but conformance tests not yet passing — NOT in `SUPPORTED_FEATURES` |
 | **Conformance-passing** | Conformance tests pass; added to `SUPPORTED_FEATURES` and `conformance/main_test.go` in the **same PR** |
 | **Experimental-only** | Behind `--features experimental`; never advertised in standard builds |
