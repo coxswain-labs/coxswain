@@ -37,7 +37,7 @@ patches:
   # so Always would cause unnecessary pulls and defeat the pin.
   - target:
       kind: Deployment
-      name: coxswain-gateway
+      name: coxswain-proxy
     patch: |-
       - op: replace
         path: /spec/template/spec/containers/0/imagePullPolicy

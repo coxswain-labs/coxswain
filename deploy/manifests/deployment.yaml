@@ -1,22 +1,22 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: coxswain-gateway
+  name: coxswain-proxy
   namespace: coxswain-system
   labels:
     app.kubernetes.io/name: coxswain
-    app.kubernetes.io/component: gateway
+    app.kubernetes.io/component: proxy
 spec:
   replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: coxswain
-      app.kubernetes.io/component: gateway
+      app.kubernetes.io/component: proxy
   template:
     metadata:
       labels:
         app.kubernetes.io/name: coxswain
-        app.kubernetes.io/component: gateway
+        app.kubernetes.io/component: proxy
     spec:
       serviceAccountName: coxswain-controller
       automountServiceAccountToken: true

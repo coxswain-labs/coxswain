@@ -2,11 +2,11 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "coxswain.fullname" . }}-gateway
+  name: {{ include "coxswain.fullname" . }}-proxy
   namespace: {{ .Values.namespace.name }}
   labels:
     {{- include "coxswain.labels" . | nindent 4 }}
-    app.kubernetes.io/component: gateway
+    app.kubernetes.io/component: proxy
   {{- with .Values.service.gateway.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -15,7 +15,7 @@ spec:
   type: {{ .Values.service.gateway.type }}
   selector:
     {{- include "coxswain.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: gateway
+    app.kubernetes.io/component: proxy
   {{- if .Values.service.gateway.externalTrafficPolicy }}
   externalTrafficPolicy: {{ .Values.service.gateway.externalTrafficPolicy }}
   {{- end }}

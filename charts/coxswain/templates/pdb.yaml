@@ -6,11 +6,11 @@ metadata:
   namespace: {{ .Values.namespace.name }}
   labels:
     {{- include "coxswain.labels" . | nindent 4 }}
-    app.kubernetes.io/component: gateway
+    app.kubernetes.io/component: proxy
 spec:
   maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
   selector:
     matchLabels:
       {{- include "coxswain.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: gateway
+      app.kubernetes.io/component: proxy
 {{- end }}

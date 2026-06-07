@@ -5,18 +5,18 @@ metadata:
   namespace: {{ .Values.namespace.name }}
   labels:
     {{- include "coxswain.labels" . | nindent 4 }}
-    app.kubernetes.io/component: gateway
+    app.kubernetes.io/component: proxy
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
       {{- include "coxswain.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: gateway
+      app.kubernetes.io/component: proxy
   template:
     metadata:
       labels:
         {{- include "coxswain.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: gateway
+        app.kubernetes.io/component: proxy
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
