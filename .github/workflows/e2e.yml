@@ -302,7 +302,15 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           RUN_NUMBER: ${{ github.run_number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          # PR_HEAD_SHA is the commit the PR's branch currently points at — what
+          # reviewers see in the PR UI. MERGE_SHA is the synthetic
+          # `refs/pull/N/merge` commit GitHub creates for pull_request events,
+          # which is what actions/checkout actually checked out and what
+          # `git describe` inside the conformance step reports as the tested
+          # version. Showing both makes the relationship explicit so the
+          # report's `version:` field stops looking like a mystery hash.
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ github.sha }}
           REPORT_FILE: conformance/${{ steps.conformance.outputs.report_file }}
         run: |
           set -euo pipefail
@@ -310,14 +318,17 @@ jobs:
             echo "No conformance report at $REPORT_FILE; skipping PR comment."
             exit 0
           fi
-          # Single-quoted heredoc on the report content so YAML/Markdown
-          # syntax inside it cannot trip command substitution. The outer
-          # body is built with printf so we still get env var interpolation
-          # in the header but never inside the fenced report block.
+          PR_HEAD_SHORT="${PR_HEAD_SHA:0:7}"
+          MERGE_SHORT="${MERGE_SHA:0:7}"
+          # Body built with printf for the header (so env vars interpolate)
+          # and a literal `cat` of the report content (so its markdown
+          # backticks / `$` chars cannot trip word-splitting or command
+          # substitution). Written to a temp file because PR-comment bodies
+          # can exceed shell argv length limits.
           {
             printf '## Gateway API conformance report\n\n'
-            printf 'Run [#%s](%s) for commit `%s`.\n\n' \
-              "$RUN_NUMBER" "$RUN_URL" "$COMMIT_SHA"
+            printf 'Run [#%s](%s) for PR head `%s` (tested merge into main as `%s`).\n\n' \
+              "$RUN_NUMBER" "$RUN_URL" "$PR_HEAD_SHORT" "$MERGE_SHORT"
             printf '```yaml\n'
             cat "$REPORT_FILE"
             printf '```\n'
