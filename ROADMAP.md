@@ -45,6 +45,10 @@ The first fully usable version: all must-have features implemented, OCI image pu
 - ✅ ~~Honor `appProtocol` on Service ports for backend protocol selection (GEP-1911) — [#90](https://github.com/coxswain-labs/coxswain/issues/90) _(unlocks `SupportHTTPRouteBackendProtocolH2C` and `SupportHTTPRouteBackendProtocolWebSocket`; supersedes closed #12)_~~
 - ✅ ~~Weighted backend refs (`backendRefs[].weight`) — [#17](https://github.com/coxswain-labs/coxswain/issues/17)~~
 - ✅ ~~`BackendTLSPolicy` (GEP-1897) — [#16](https://github.com/coxswain-labs/coxswain/issues/16)~~
+- ⬜ `BackendTLSPolicy` `subjectAltNames` validation — [#133](https://github.com/coxswain-labs/coxswain/issues/133) _(unlocks `SupportBackendTLSPolicySANValidation`; depends on #16)_
+- ⬜ Per-backend `HTTPRoute` filters (`backendRefs[].filters`) — [#167](https://github.com/coxswain-labs/coxswain/issues/167) _(unlocks `SupportHTTPRouteBackendRequestHeaderModification`)_
+- ✅ ~~Declare `SupportReferenceGrant` in `opts.SupportedFeatures` — [#166](https://github.com/coxswain-labs/coxswain/issues/166) _(implementation already complete in `coxswain-core::reference_grants`; this is a paperwork claim)_~~
+- ⬜ Gate `synced`/`readyz` on Ingress `InitDone` in addition to HTTPRoute — [#158](https://github.com/coxswain-labs/coxswain/issues/158) _(bug: readyz can flip before Ingress sync completes)_
 - ⬜ TLS Passthrough for Gateway API listeners (`tls.mode: Passthrough`, GEP-2643) — [#70](https://github.com/coxswain-labs/coxswain/issues/70)
 - ⬜ `BackendLBPolicy` (session persistence + timeouts per backend, GEP-1619) — [#15](https://github.com/coxswain-labs/coxswain/issues/15)
 - ⬜ `GatewayClass` `ParametersRef` with `CoxswainGatewayClassConfig` CRD — [#38](https://github.com/coxswain-labs/coxswain/issues/38)
