@@ -190,6 +190,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # `contents: read` is needed by actions/checkout and the test step's
+    # `git describe`; `pull-requests: write` lets the "Post conformance
+    # report as PR comment" step append the report via `gh pr comment`.
+    # Declaring a `permissions:` block makes unlisted scopes default to
+    # `none`, so list every scope the job actually uses.
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
 
@@ -286,6 +294,46 @@ jobs:
           name: conformance-report
           path: conformance/reports/
           if-no-files-found: ignore
+
+      - name: Post conformance report as PR comment
+        if: ${{ always() && github.event_name == 'pull_request' && steps.conformance.outputs.report_file != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # PR_HEAD_SHA is the commit the PR's branch currently points at — what
+          # reviewers see in the PR UI. MERGE_SHA is the synthetic
+          # `refs/pull/N/merge` commit GitHub creates for pull_request events,
+          # which is what actions/checkout actually checked out and what
+          # `git describe` inside the conformance step reports as the tested
+          # version. Showing both makes the relationship explicit so the
+          # report's `version:` field stops looking like a mystery hash.
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ github.sha }}
+          REPORT_FILE: conformance/${{ steps.conformance.outputs.report_file }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$REPORT_FILE" ]; then
+            echo "No conformance report at $REPORT_FILE; skipping PR comment."
+            exit 0
+          fi
+          PR_HEAD_SHORT="${PR_HEAD_SHA:0:7}"
+          MERGE_SHORT="${MERGE_SHA:0:7}"
+          # Body built with printf for the header (so env vars interpolate)
+          # and a literal `cat` of the report content (so its markdown
+          # backticks / `$` chars cannot trip word-splitting or command
+          # substitution). Written to a temp file because PR-comment bodies
+          # can exceed shell argv length limits.
+          {
+            printf '## Gateway API conformance report\n\n'
+            printf 'Run [#%s](%s) for PR head `%s` (tested merge into main as `%s`).\n\n' \
+              "$RUN_NUMBER" "$RUN_URL" "$PR_HEAD_SHORT" "$MERGE_SHORT"
+            printf '```yaml\n'
+            cat "$REPORT_FILE"
+            printf '```\n'
+          } > /tmp/conformance-comment.md
+          gh pr comment "$PR_NUMBER" --body-file /tmp/conformance-comment.md
 
       - name: Dump cluster state on failure
         if: failure()

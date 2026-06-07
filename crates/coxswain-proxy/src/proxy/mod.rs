@@ -152,6 +152,7 @@ impl ProxyHttp for Proxy {
                 request_deadline: None,
                 request_timeout_is_controlling: false,
                 backend_request_timeout_active: false,
+                selected_backend_filters: None,
             })
             .unwrap_or_default()
     }
@@ -253,9 +254,16 @@ impl ProxyHttp for Proxy {
             ));
         }
 
-        let addr = resolved.backend_group.next_endpoint().ok_or_else(|| {
-            pingora_core::Error::explain(HTTPStatus(503), "no active endpoints for backend group")
-        })?;
+        let (addr, per_backend_filters) = resolved
+            .backend_group
+            .next_endpoint_with_filters()
+            .ok_or_else(|| {
+                pingora_core::Error::explain(
+                    HTTPStatus(503),
+                    "no active endpoints for backend group",
+                )
+            })?;
+        ctx.selected_backend_filters = per_backend_filters;
 
         let protocol = resolved.backend_group.protocol();
 
@@ -354,7 +362,21 @@ impl ProxyHttp for Proxy {
             original_host,
             original_path,
             ctx,
-        )
+        )?;
+        // Per-backend `RequestHeaderModifier` filters from
+        // `HTTPRoute.spec.rules[].backendRefs[].filters` apply AFTER rule-level
+        // filters, per GEP-1492. Cloning the Arc here is cheap; we hold a separate
+        // reference because `apply_request_filters` borrows `ctx` mutably.
+        if let Some(per_backend) = ctx.selected_backend_filters.clone() {
+            TrafficFilter::apply_request_filters(
+                upstream_request,
+                &per_backend,
+                original_host,
+                original_path,
+                ctx,
+            )?;
+        }
+        Ok(())
     }
 
     async fn upstream_response_filter(

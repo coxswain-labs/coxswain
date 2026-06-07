@@ -27,6 +27,7 @@ use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -157,7 +158,26 @@ impl GatewayApiReconciler {
                 let protocols: Vec<BackendProtocol> =
                     resolved.iter().map(|(r, _)| r.app_protocol).collect();
                 let mut protocol = pick_route_protocol(&protocols, &group_name);
-                let weighted = resolved.into_iter().map(|(r, w)| (r.addrs, w)).collect();
+                // Per-backend filters from `backendRefs[].filters` — index-aligned
+                // with the `resolved` list so they match the order `BackendGroup`
+                // stores backends in. Backends that were dropped from `resolved`
+                // (zero weight, missing addrs) also contribute nothing here.
+                let per_backend_filters: Vec<Vec<FilterAction>> = resolved
+                    .iter()
+                    .zip(backend_refs.iter())
+                    .filter(|((r, w), _)| *w > 0 && !r.addrs.is_empty())
+                    .map(|((_, _), bref)| {
+                        bref.filters
+                            .as_deref()
+                            .map(super::filters::build_backend_ref_filters)
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let weighted: Vec<(Vec<SocketAddr>, u16)> = resolved
+                    .into_iter()
+                    .filter(|(r, w)| *w > 0 && !r.addrs.is_empty())
+                    .map(|(r, w)| (r.addrs, w))
+                    .collect();
 
                 // Look up BackendTLSPolicy for this rule's backends. Highest-weight ref
                 // wins on conflicts (ties break by backendRefs array order).
@@ -173,8 +193,9 @@ impl GatewayApiReconciler {
                     protocol = BackendProtocol::Https;
                 }
 
-                let mut group =
-                    BackendGroup::weighted(group_name, weighted).with_protocol(protocol);
+                let mut group = BackendGroup::weighted(group_name, weighted)
+                    .with_protocol(protocol)
+                    .with_per_backend_filters(per_backend_filters);
                 if let Some(tls) = policy_tls {
                     group = group.with_tls(tls);
                 }
