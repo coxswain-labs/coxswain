@@ -72,4 +72,5 @@ helm uninstall coxswain --namespace coxswain-system
 kubectl delete namespace coxswain-system
 ```
 
-The Gateway API CRDs are not removed — uninstalling them would delete all `Gateway` and `HTTPRoute` objects in the cluster.
+!!! warning
+    The Gateway API CRDs are not removed — uninstalling them would delete all `Gateway` and `HTTPRoute` objects in the cluster.
