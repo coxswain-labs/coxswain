@@ -26,6 +26,11 @@ runs:
         cluster-name: coxswain-conformance
         include-busybox: 'false'
 
+    - name: Read Gateway API version
+      id: gw-version
+      shell: bash
+      run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
+
     - name: Bootstrap cluster (CRDs, RBAC, GatewayClass)
       shell: bash
       run: |

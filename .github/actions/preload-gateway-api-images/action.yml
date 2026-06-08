@@ -37,5 +37,9 @@ runs:
       if: ${{ inputs.include-busybox == 'true' }}
       shell: bash
       run: |
-        docker pull busybox:1.37
+        for i in 1 2 3; do
+          docker pull busybox:1.37 && break
+          echo "docker pull busybox:1.37 failed (attempt $i/3), retrying in 15s..."
+          sleep 15
+        done
         kind load docker-image busybox:1.37 --name ${{ inputs.cluster-name }}
