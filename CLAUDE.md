@@ -143,7 +143,7 @@ Every `crates/*/Cargo.toml` must declare `[lints] workspace = true`. Without it,
 6. Once plan mode exits, create the branch: `git checkout -b issue-N`.
 7. Implement the issue per its acceptance criteria, including:
    - **E2E tests**: add or update scenarios in `crates/coxswain-e2e/tests/gateway_api.rs` and/or `tests/ingress.rs` for any change to routing, status conditions, or proxy behaviour.
-   - **Conformance** (only if the issue body has a **Feature flags** line): add the corresponding `features.SupportXxx` constant(s) to `opts.SupportedFeatures` in `conformance/main_test.go` (with a comment referencing `#N`), run `go vet ./...` to validate, add the bare feature name(s) to `SUPPORTED_FEATURES` in `crates/coxswain-controller/src/controller/gateway_class_status.rs` (keep sorted), and run `bash scripts/check-supported-features.sh`. See `docs/gateway-api-support.md` for the full promotion policy.
+   - **Conformance** (only if the issue body has a **Feature flags** line): add the corresponding `features.SupportXxx` constant(s) to `opts.SupportedFeatures` in `conformance/main_test.go` (with a comment referencing `#N`), run `go vet ./...` to validate, add the bare feature name(s) to `SUPPORTED_FEATURES` in `crates/coxswain-controller/src/controller/gateway_class_status.rs` (keep sorted), and run `bash scripts/check-supported-features.sh`. See `docs/guides/gateway-api.md` for the full promotion policy.
    - Closing the issue (via `Fixes #N` in the commit footer, or `gh issue close N` later) automatically flips its `Status` to `Done` in the GitHub Project — no manual roadmap edit.
 8. At the end of each implementation or refinement cycle:
    - Run `cargo fmt` then `cargo test --workspace --exclude coxswain-e2e` and report results.
