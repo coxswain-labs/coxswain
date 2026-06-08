@@ -92,6 +92,17 @@ spec:
           port: 80
 ```
 
+### Wildcard hostnames
+
+Gateway API wildcard matching follows the spec: `*.example.com` matches any number of DNS labels, so both `foo.example.com` and `foo.bar.example.com` match.
+
+```yaml
+hostnames:
+  - "*.example.com"
+```
+
+This differs from Ingress wildcard behaviour, which matches exactly one label per the Kubernetes spec.
+
 ### Path matching types
 
 | `type` | Description |

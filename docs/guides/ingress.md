@@ -78,7 +78,7 @@ The Secret must have `type: kubernetes.io/tls` with `tls.crt` and `tls.key`. Cox
 
 ## Wildcard hostnames
 
-Coxswain supports multi-label wildcard hostnames (`*.example.com` matches `foo.example.com`, `bar.example.com` — not `foo.bar.example.com`). This is Gateway API semantics; it is intentional and applies to both `Ingress` and `HTTPRoute`.
+Coxswain follows the Kubernetes Ingress spec for wildcard matching: `*.example.com` matches exactly one DNS label, so `foo.example.com` matches but `foo.bar.example.com` does not.
 
 ```yaml
 rules:
