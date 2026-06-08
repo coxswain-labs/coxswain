@@ -17,18 +17,7 @@ Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io
 |----------|-------------|
 | v0.1     | v1.5.x      |
 
-Install matching CRDs when upgrading Coxswain. See [Bumping the Gateway API version](#bumping-the-gateway-api-version).
-
-## Feature lifecycle
-
-| Stage | Meaning |
-|-------|---------|
-| **Planned** | GitHub issue open and milestoned, no code yet |
-| **Implemented (unverified)** | Code landed, conformance tests not yet passing — NOT in `SUPPORTED_FEATURES` |
-| **Conformance-passing** | Conformance tests pass; added to `SUPPORTED_FEATURES` in the **same PR** |
-| **Experimental-only** | Behind `--features experimental`; never in standard builds |
-
-A feature enters `GatewayClass.status.supportedFeatures` (the public contract users see) **only** when it reaches _Conformance-passing_.
+Install matching CRDs when upgrading Coxswain.
 
 ## GatewayClass
 
@@ -192,25 +181,3 @@ Inspect conditions when traffic is not flowing:
 kubectl describe httproute my-route
 ```
 
-## Experimental channel
-
-The `experimental` Cargo feature enables alpha Gateway API resources (e.g. `GRPCRoute` before promotion). Experimental builds are never published as standard releases and are for contributors and CI preview only.
-
-```bash
-cargo build -p coxswain-bin --features experimental
-```
-
-## Bumping the Gateway API version
-
-When upgrading to a new Gateway API upstream release:
-
-1. Update `.gateway-api-version` at the repo root.
-2. Bump `gateway-api = "..."` in `Cargo.toml`.
-3. Run `cargo check` and `cargo check --features experimental`.
-4. Add any new `features.SupportXxx` constants to:
-   - `SUPPORTED_FEATURES` in `crates/coxswain-controller/src/controller/gateway_class_status.rs`
-   - `opts.SupportedFeatures` in `conformance/main_test.go`
-   - Run `bash scripts/check-supported-features.sh`
-5. Update echo-basic image tags in `crates/coxswain-e2e/fixtures/`.
-6. Update the compatibility matrix above.
-7. Run `cd conformance && go vet ./...`.

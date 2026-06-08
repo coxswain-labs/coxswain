@@ -6,9 +6,9 @@
 
 Several popular controllers (nginx Ingress, HAProxy Ingress, Envoy Gateway) are a Go control plane wrapping a C/C++ proxy. Configuration changes typically require a reload or restart — even nginx's "graceful reload" creates a new worker process and drains the old one, which briefly increases memory usage and can drop connections under high load. Traefik is a native Go proxy and avoids that particular reload problem, but it still mutates its routing state rather than swapping an immutable snapshot.
 
-Coxswain's routing table is an immutable snapshot swapped atomically via `arc-swap`. There is no reload, no worker restart, and no brief connection drop. The hot path allocates nothing beyond the three captures at request entry.
+Coxswain's routing table is an immutable snapshot swapped atomically on every change. There is no reload, no worker restart, and no brief connection drop.
 
-It is written in Rust for memory safety without garbage collection — no GC pauses on the hot path.
+It is written in Rust for memory safety without garbage collection — no GC pauses on the request path.
 
 ### Is Coxswain production-ready?
 

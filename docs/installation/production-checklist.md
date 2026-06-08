@@ -29,7 +29,7 @@ The default requests (`100m` CPU / `64Mi` memory) are conservative for evaluatio
 | Medium (1k–10k rps) | 500m–1 | 128Mi–256Mi | 4 |
 | Heavy (> 10k rps) | 2–4 | 256Mi–512Mi | ≥ CPU core count |
 
-Set `proxy.threads` to match the number of CPU cores allocated to the container. Each thread handles one Pingora worker.
+Set `proxy.threads` to match the number of CPU cores allocated to the container.
 
 ```bash
 helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \

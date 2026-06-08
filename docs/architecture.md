@@ -2,9 +2,7 @@
 
 ## Zero-reload routing
 
-The routing table is an immutable snapshot, not a mutable config file. When Kubernetes objects change, the controller builds a **complete new table** from scratch and swaps it in atomically. The proxy reads the current table on every request via a single atomic pointer load — no mutex, no lock, no channel.
-
-The result: routing changes take effect on the next request after the swap, with no process restart, no graceful reload window, and no brief connection drop.
+The routing table is an immutable snapshot, not a mutable config file. When Kubernetes objects change, the controller builds a complete new table from scratch and swaps it in atomically. Routing changes take effect on the next request after the swap — no process restart, no graceful reload window, no dropped connections.
 
 ## Multi-replica and leader election
 
@@ -26,15 +24,12 @@ Coxswain watches all `kubernetes.io/tls` Secrets. When a Secret is created, upda
 ```
 1. Proxy accepts TCP connection
 2. If HTTPS: SNI TLS handshake selects certificate from TLS store
-3. request_filter: read host, path, query from request (≤ 3 allocations)
-4. Atomic load of current routing table snapshot (~2 ns)
+3. Host, path, and query are read from the request
+4. Current routing table snapshot is loaded atomically
 5. Host lookup → rule matching (Exact before Prefix; longer before shorter)
 6. Round-robin pick from the upstream address set
-7. upstream_peer: return selected address
-8. Response forwarded back to client
+7. Response forwarded back to client
 ```
-
-The routing lookup and upstream selection allocate nothing. The only allocations per request are the three captures at step 3 — host, path, and query.
 
 ## Readiness
 

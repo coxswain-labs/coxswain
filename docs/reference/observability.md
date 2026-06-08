@@ -49,7 +49,7 @@ Coxswain exposes Prometheus metrics at `http://<admin-address>:<admin-port>/metr
 | `/healthz` | `8081` | Always `200 ok` while the process is running |
 | `/readyz` | `8081` | `200` once all subsystems are Ready or Degraded; `503` otherwise |
 
-`/readyz` gates on `HealthRegistry::is_ready`: every registered subsystem must reach `Ready` or `Degraded` before the endpoint returns 200. During startup, it returns 503 until:
+`/readyz` returns 503 during startup until:
 
 1. All Kubernetes reflectors emit their first `InitDone` event (CRDs must be installed)
 2. The routing table is built for the first time
@@ -88,7 +88,7 @@ Example output:
 }
 ```
 
-The `synced` field is a derived alias for `is_ready()` and is preserved for dashboards predating the per-subsystem model.
+The `synced` field is `true` when all subsystems are ready and is provided for dashboard compatibility.
 
 ## Routes endpoint
 
