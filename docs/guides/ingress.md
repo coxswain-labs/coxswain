@@ -113,8 +113,13 @@ rules:
 
 ## Supported annotations
 
+| Annotation | Scope | Description |
+|------------|-------|-------------|
+| `kubernetes.io/ingress.class` | `Ingress` | Legacy class selection; takes effect when `spec.ingressClassName` is absent. Use `spec.ingressClassName` on Kubernetes 1.18+ |
+| `ingressclass.kubernetes.io/is-default-class` | `IngressClass` | Makes Coxswain the cluster default — handles `Ingress` objects with no class specified |
+
 !!! note
-    No annotations are defined yet. The `coxswain-labs.dev/` namespace is reserved for future per-Ingress configuration. Standard `kubernetes.io/ingress.*` annotations are not supported.
+    No `coxswain-labs.dev/*` annotations are defined yet. That namespace is reserved for future per-Ingress configuration such as rewrites and redirects.
 
 ## Status
 
