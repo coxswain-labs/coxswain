@@ -20,7 +20,7 @@ use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, FilterAction, HostRouterBuilder, MatchPredicates, RouteEntry,
-    RouteTimeouts, RoutingTableBuilder, UpstreamTls,
+    RouteTimeouts, RoutingTableBuilder, UpstreamTls, WildcardKind,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -227,7 +227,7 @@ impl GatewayApiReconciler {
                 let pb = builder.for_port(*port);
                 let hb = match hostname_opt {
                     None => pb.catchall(),
-                    Some(h) if h.starts_with("*.") => pb.wildcard_host(h),
+                    Some(h) if h.starts_with("*.") => pb.wildcard_host(h, WildcardKind::MultiLabel),
                     Some(h) => pb.exact_host(h),
                 };
                 apply_rule(hb, rule, group.as_ref(), &ctx);

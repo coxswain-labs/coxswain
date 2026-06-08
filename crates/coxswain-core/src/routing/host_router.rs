@@ -284,22 +284,44 @@ impl HostRouterBuilder {
     }
 }
 
-/// Returns `true` when `host` matches the wildcard pattern `*.{suffix}`.
+/// How a wildcard hostname pattern matches incoming request hosts.
 ///
-/// Per the Gateway API `Hostname` type definition, the wildcard label `*.`
-/// matches **any number** of subdomain labels. So `*.example.com` matches
-/// `a.example.com`, `a.b.example.com`, and `a.b.c.example.com` alike.
-/// `example.com` itself does not match (the prefix must be non-empty).
+/// The two mainstream specs disagree on wildcard semantics:
+/// - **Gateway API** `Hostname` type: `*.example.com` matches any number of
+///   subdomain labels (`a.example.com`, `a.b.example.com`, `a.b.c.example.com`).
+/// - **Kubernetes Ingress** spec: `*.example.com` matches exactly one DNS label
+///   (`a.example.com` only; `a.b.example.com` does not match).
+///
+/// Routes registered from Ingress resources use `SingleLabel`; routes from
+/// Gateway API resources use `MultiLabel`.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WildcardKind {
+    /// Ingress spec: the wildcard matches exactly one subdomain label.
+    SingleLabel,
+    /// Gateway API spec: the wildcard matches any number of subdomain labels.
+    MultiLabel,
+}
+
+/// Returns `true` when `host` matches the wildcard pattern `*.{suffix}` under the given semantics.
+///
+/// Both kinds require `host` to end with `.{suffix}` and the prefix to be non-empty.
+/// `SingleLabel` additionally requires the prefix to contain no dots (one label only).
+/// `MultiLabel` accepts any non-empty prefix.
 ///
 /// Listener isolation still works correctly because `wildcard_hosts` is sorted
 /// longest-suffix-first: the more specific `*.foo.example.com` is checked
 /// before `*.example.com`, so `bar.foo.example.com` hits the more-specific
 /// entry first and never falls through to the less-specific one.
-pub(super) fn wildcard_matches(host: &str, suffix: &str) -> bool {
+pub(super) fn wildcard_matches(host: &str, suffix: &str, kind: WildcardKind) -> bool {
     if let Some(rest) = host.strip_suffix(suffix)
         && let Some(prefix) = rest.strip_suffix('.')
+        && !prefix.is_empty()
     {
-        return !prefix.is_empty();
+        return match kind {
+            WildcardKind::SingleLabel => !prefix.contains('.'),
+            WildcardKind::MultiLabel => true,
+        };
     }
     false
 }

@@ -51,7 +51,7 @@ fn wildcard_host_routes_matching_subdomains() {
     let g = make_group("svc", "10.0.0.1:80");
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
-        .wildcard_host("*.example.com")
+        .wildcard_host("*.example.com", WildcardKind::MultiLabel)
         .add_prefix_route("/", entry(g));
     let table = b.build().unwrap();
     assert!(
@@ -66,6 +66,50 @@ fn wildcard_host_routes_matching_subdomains() {
     );
     assert!(table.route(PORT, "example.com", "/", &ctx_get()).is_none());
     assert!(table.route(PORT, "other.io", "/", &ctx_get()).is_none());
+}
+
+#[test]
+fn same_suffix_different_kinds_are_independent_entries() {
+    let gw = make_group("gw", "10.0.0.1:80");
+    let ing = make_group("ing", "10.0.0.2:80");
+    let mut b = RoutingTableBuilder::new();
+    let pb = b.for_port(PORT);
+    pb.wildcard_host("*.example.com", WildcardKind::MultiLabel)
+        .add_prefix_route("/gw", entry(gw.clone()));
+    pb.wildcard_host("*.example.com", WildcardKind::SingleLabel)
+        .add_prefix_route("/ing", entry(ing.clone()));
+    let table = b.build().unwrap();
+
+    // For a single-label subdomain, SingleLabel sorts first, so the Ingress router wins.
+    // It has /ing → returns `ing`.
+    assert_eq!(
+        table
+            .route(PORT, "sub.example.com", "/ing", &ctx_get())
+            .unwrap()
+            .name(),
+        "ing"
+    );
+    // The SingleLabel entry matched `sub.example.com` but has no /gw — no fallthrough to
+    // the MultiLabel router, so this returns None (lookup stops at first wildcard match).
+    assert!(
+        table
+            .route(PORT, "sub.example.com", "/gw", &ctx_get())
+            .is_none()
+    );
+    // For a multi-label subdomain, only the MultiLabel (GW-API) entry matches.
+    assert_eq!(
+        table
+            .route(PORT, "a.b.example.com", "/gw", &ctx_get())
+            .unwrap()
+            .name(),
+        "gw"
+    );
+    // Multi-label host + path only in Ingress router → no route (SingleLabel doesn't match).
+    assert!(
+        table
+            .route(PORT, "a.b.example.com", "/ing", &ctx_get())
+            .is_none()
+    );
 }
 
 #[test]
@@ -91,11 +135,12 @@ fn host_for_dispatches_exact_wildcard_and_catchall() {
     let g = make_group("svc", "10.0.0.1:80");
     let mut b = RoutingTableBuilder::new();
     let pb = b.for_port(PORT);
-    pb.host_for(Some("exact.com"))
+    pb.host_for(Some("exact.com"), WildcardKind::MultiLabel)
         .add_prefix_route("/e", entry(g.clone()));
-    pb.host_for(Some("*.wild.com"))
+    pb.host_for(Some("*.wild.com"), WildcardKind::MultiLabel)
         .add_prefix_route("/w", entry(g.clone()));
-    pb.host_for(None).add_prefix_route("/c", entry(g.clone()));
+    pb.host_for(None, WildcardKind::MultiLabel)
+        .add_prefix_route("/c", entry(g.clone()));
     let table = b.build().unwrap();
     assert!(table.route(PORT, "exact.com", "/e", &ctx_get()).is_some());
     assert!(

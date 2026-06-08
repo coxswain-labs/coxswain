@@ -11,7 +11,7 @@ fn exact_host_beats_wildcard() {
         .exact_host("example.com")
         .add_exact_route("/", entry(exact_up));
     b.for_port(PORT)
-        .wildcard_host("*.com")
+        .wildcard_host("*.com", WildcardKind::MultiLabel)
         .add_exact_route("/", entry(wildcard_up));
 
     let table = b.build().unwrap();
@@ -95,7 +95,7 @@ fn route_falls_through_to_catchall_on_wildcard_host_path_miss() {
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
-        .wildcard_host("*.example.com")
+        .wildcard_host("*.example.com", WildcardKind::MultiLabel)
         .add_prefix_route("/api", entry(host_up));
     b.for_port(PORT)
         .catchall()

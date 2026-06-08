@@ -668,6 +668,8 @@ fn reconcile_wildcard_hostname() {
 
     assert!(table.route(80, "api.example.com", "/", &ctx).is_some());
     assert!(table.route(80, "example.com", "/", &ctx).is_none());
+    // Ingress spec: multi-label subdomains must NOT match `*.example.com`.
+    assert!(table.route(80, "v2.api.example.com", "/", &ctx).is_none());
 }
 
 #[test]

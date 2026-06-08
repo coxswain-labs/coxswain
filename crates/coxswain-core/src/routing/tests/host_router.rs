@@ -2,22 +2,46 @@ use super::*;
 use std::sync::Arc;
 
 #[test]
-fn wildcard_host_matches() {
+fn wildcard_host_multi_label_matches() {
     let up = make_group("svc", "10.0.0.1:80");
 
     let mut b = RoutingTableBuilder::new();
     b.for_port(PORT)
-        .wildcard_host("*.test.com")
+        .wildcard_host("*.test.com", WildcardKind::MultiLabel)
         .add_exact_route("/", entry(up));
 
     let table = b.build().unwrap();
+    // Single-label subdomain always matches.
     assert!(table.route(PORT, "api.test.com", "/", &ctx_get()).is_some());
+    // Bare suffix does not match (prefix must be non-empty).
     assert!(table.route(PORT, "test.com", "/", &ctx_get()).is_none());
-    // Per Gateway API spec, `*` matches any number of subdomain labels.
+    // Gateway API spec: `*` matches any number of subdomain labels.
     assert!(
         table
             .route(PORT, "nested.api.test.com", "/", &ctx_get())
             .is_some()
+    );
+}
+
+#[test]
+fn wildcard_host_single_label_matches() {
+    let up = make_group("svc", "10.0.0.1:80");
+
+    let mut b = RoutingTableBuilder::new();
+    b.for_port(PORT)
+        .wildcard_host("*.test.com", WildcardKind::SingleLabel)
+        .add_exact_route("/", entry(up));
+
+    let table = b.build().unwrap();
+    // Single-label subdomain matches.
+    assert!(table.route(PORT, "api.test.com", "/", &ctx_get()).is_some());
+    // Bare suffix does not match.
+    assert!(table.route(PORT, "test.com", "/", &ctx_get()).is_none());
+    // Ingress spec: multi-label subdomain must NOT match.
+    assert!(
+        table
+            .route(PORT, "nested.api.test.com", "/", &ctx_get())
+            .is_none()
     );
 }
 

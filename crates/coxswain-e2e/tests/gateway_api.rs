@@ -100,6 +100,12 @@ async fn wildcard_host() -> anyhow::Result<()> {
     let resp2 = h.http.get(&host2, "/").await?;
     resp2.assert_backend("echo-c");
 
+    // Gateway API spec: `*` matches any number of subdomain labels, so multi-label
+    // subdomains must also reach echo-c.
+    let multi = format!("a.b.foo.wildcard.{}.local", ns.name);
+    let resp3 = h.http.get(&multi, "/").await?;
+    resp3.assert_backend("echo-c");
+
     Ok(())
 }
 

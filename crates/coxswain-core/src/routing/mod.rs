@@ -18,7 +18,7 @@ pub use entry::{
     RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts, UpstreamCa, UpstreamTls,
     parse_app_protocol,
 };
-pub use host_router::{HostRouter, HostRouterBuilder};
+pub use host_router::{HostRouter, HostRouterBuilder, WildcardKind};
 pub use predicate::{HeaderPredicate, MatchPredicates, QueryPredicate, RequestContext, ValueMatch};
 
 #[cfg(test)]
@@ -57,8 +57,8 @@ pub enum RouteOutcome {
 /// This is the content that `RoutingTable` used to hold directly at the top level.
 pub(crate) struct PortRoutingTable {
     pub(crate) exact_hosts: HashMap<String, HostRouter>,
-    /// Sorted most-specific (longest suffix) first.
-    pub(crate) wildcard_hosts: Vec<(String, HostRouter)>,
+    /// Sorted most-specific (longest suffix) first; `SingleLabel` before `MultiLabel` on ties.
+    pub(crate) wildcard_hosts: Vec<(String, WildcardKind, HostRouter)>,
     pub(crate) catchall: Option<HostRouter>,
 }
 
@@ -66,10 +66,10 @@ impl PortRoutingTable {
     fn find(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> RouteOutcome {
         let router = if let Some(r) = self.exact_hosts.get(host) {
             r
-        } else if let Some((_, r)) = self
+        } else if let Some((_, _, r)) = self
             .wildcard_hosts
             .iter()
-            .find(|(s, _)| host_router::wildcard_matches(host, s))
+            .find(|(s, k, _)| host_router::wildcard_matches(host, s, *k))
         {
             r
         } else if let Some(r) = self.catchall.as_ref() {
@@ -90,8 +90,8 @@ impl PortRoutingTable {
         } else {
             self.wildcard_hosts
                 .iter()
-                .find(|(s, _)| host_router::wildcard_matches(host, s))
-                .map(|(_, r)| r)
+                .find(|(s, k, _)| host_router::wildcard_matches(host, s, *k))
+                .map(|(_, _, r)| r)
         };
         if let Some(r) = router
             && let Some((group, _, _, _)) = r.route(path, ctx)
@@ -109,7 +109,7 @@ impl PortRoutingTable {
         for (host, router) in &self.exact_hosts {
             result.push((host.clone(), router));
         }
-        for (suffix, router) in &self.wildcard_hosts {
+        for (suffix, _kind, router) in &self.wildcard_hosts {
             result.push((format!("*.{suffix}"), router));
         }
         if let Some(router) = &self.catchall {
