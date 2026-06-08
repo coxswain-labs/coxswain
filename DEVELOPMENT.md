@@ -265,10 +265,14 @@ The docs site source lives in `docs/` with `mkdocs.yml` at the repo root. It is 
 ### Preview locally
 
 ```bash
+uv venv .venv
 uv pip install -r requirements-docs.txt
+source .venv/bin/activate
 mkdocs serve          # live-reload at http://localhost:8000
 mike serve            # serves the versioned site (requires a prior mike deploy)
 ```
+
+`.venv/` is gitignored. The `--system` flag used in CI does not work on Homebrew-managed Python.
 
 ### How versioning works
 

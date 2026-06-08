@@ -1,10 +1,11 @@
 # Coxswain
 
-[![E2E & Conformance](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml/badge.svg)](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml)
+!!! warning "Early development"
+    Coxswain is under active development and not yet ready for external contributions. Contribution guidelines will follow as the project matures.
 
 A pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine.
 
-Coxswain watches Kubernetes `Ingress` and `HTTPRoute` resources and dynamically updates its routing table without a process restart or config reload. Multiple replicas can run simultaneously using Kubernetes Lease-based leader election — all replicas maintain a hot routing table, but only the active leader writes status back to the API server.
+Coxswain aims to be a lightweight, operationally simple ingress controller for teams that want reliable, zero-downtime routing without configuration file generation or process restarts. Routing updates are applied atomically as Kubernetes resources change, TLS certificates are hot-reloaded from Secrets, and multiple replicas can run simultaneously without coordination overhead.
 
 ## Why Coxswain?
 
@@ -29,8 +30,6 @@ kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/latest/downl
 
 See [Getting started](getting-started.md) for the complete walkthrough, or [Installation](installation/index.md) for all install methods.
 
-## Project status
+## Roadmap
 
-> **Early development.** Not yet accepting external contributions. Bug reports and feature requests in issues are welcome; contribution guidelines will be added as the project matures.
-
-The [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2) tracks current scope per milestone.
+The [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2){target=_blank} tracks current scope per milestone.

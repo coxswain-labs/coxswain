@@ -25,6 +25,14 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/
       --namespace coxswain-system --create-namespace
     ```
 
+=== "Kustomize"
+
+    ```bash
+    kubectl apply -k github.com/coxswain-labs/coxswain//deploy/manifests?ref=v0.1.0
+    ```
+
+    Replace `v0.1.0` with the desired release tag. For local customisation, clone the repo and use `deploy/manifests/` as a Kustomize base.
+
 === "Raw manifests"
 
     ```bash
@@ -144,7 +152,7 @@ The proxy port depends on your cluster and install method. For a local cluster w
 
 ```bash
 # Find the proxy service address
-kubectl -n coxswain-system get svc coxswain
+kubectl -n coxswain-system get svc coxswain-proxy
 
 # Test via Host header
 curl -H "Host: echo.example.com" http://<proxy-address>/

@@ -20,6 +20,8 @@ theme:
         icon: material/brightness-4
         name: Switch to light mode
   features:
+    - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.instant
     - navigation.instant.progress
     - navigation.sections
@@ -69,9 +71,10 @@ nav:
     - Gateway API: guides/gateway-api.md
     - TLS: guides/tls.md
     - Verifying releases: guides/verifying-releases.md
+    - Troubleshooting: guides/troubleshooting.md
   - Reference:
     - Configuration: reference/configuration.md
     - Observability: reference/observability.md
   - Architecture: architecture.md
   - FAQ: faq.md
-  - Troubleshooting: troubleshooting.md
+

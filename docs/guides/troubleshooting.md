@@ -1,6 +1,12 @@
 # Troubleshooting
 
-Most commands below query the admin port. Open a port-forward in a separate terminal first: `kubectl -n coxswain-system port-forward svc/coxswain 8082:8082`
+## Port forward
+
+Most commands below query the admin port. Open a port-forward in a separate terminal first: 
+
+```bash
+kubectl -n coxswain-system port-forward svc/coxswain 8082:8082
+```
 
 ## `/readyz` returns 503 on startup
 
