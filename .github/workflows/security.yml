@@ -10,7 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust-with-cache
+        with:
+          cache-key-prefix: security-audit
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit

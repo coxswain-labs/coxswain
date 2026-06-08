@@ -1,0 +1,35 @@
+name: Set up Rust toolchain with cargo cache
+description: >
+  Installs the stable Rust toolchain with optional extra components and
+  restores the cargo registry/git/target cache. The cache key is scoped to
+  the caller-supplied prefix so that jobs with different build profiles do
+  not evict each other's caches.
+
+inputs:
+  cache-key-prefix:
+    description: >
+      Prefix for the cache key, e.g. "ci-clippy" or "release-conformance".
+      The full key is "<prefix>-<Cargo.lock hash>".
+    required: true
+  components:
+    description: >
+      Space-separated list of additional toolchain components to install,
+      e.g. "rustfmt clippy". Leave empty for the default stable toolchain.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+
+    - uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/
+        key: ${{ runner.os }}-cargo-${{ inputs.cache-key-prefix }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-${{ inputs.cache-key-prefix }}-

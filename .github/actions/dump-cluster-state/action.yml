@@ -1,0 +1,22 @@
+name: Dump cluster state
+description: >
+  Dumps diagnostic cluster state for post-failure inspection. Intended to be
+  called with `if: failure()`. Covers the union of resources relevant to both
+  the e2e and conformance test suites.
+
+runs:
+  using: composite
+  steps:
+    - name: Dump cluster state
+      shell: bash
+      run: |
+        echo "=== Namespaces ==="
+        kubectl get namespaces
+        echo "=== Events (last 50) ==="
+        kubectl get events -A --sort-by=.lastTimestamp | tail -50
+        echo "=== Gateways ==="
+        kubectl get gateways -A -o wide
+        echo "=== HTTPRoutes ==="
+        kubectl get httproutes -A
+        echo "=== Ingresses ==="
+        kubectl get ingresses -A

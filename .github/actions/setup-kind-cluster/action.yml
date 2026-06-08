@@ -1,0 +1,28 @@
+name: Set up kind cluster
+description: >
+  Creates a kind cluster with the given name and routes the pod CIDR to the
+  kind node so that test pods are reachable from the runner.
+
+inputs:
+  cluster-name:
+    description: Name of the kind cluster to create.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Create kind cluster
+      uses: helm/kind-action@v1
+      with:
+        cluster_name: ${{ inputs.cluster-name }}
+
+    - name: Route pod CIDR to kind node
+      shell: bash
+      run: |
+        KIND_NODE_IP=$(docker inspect ${{ inputs.cluster-name }}-control-plane \
+          --format '{{ (index .NetworkSettings.Networks "kind").IPAddress }}')
+        POD_CIDR=$(kubectl get node ${{ inputs.cluster-name }}-control-plane \
+          -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
+        POD_CIDR=${POD_CIDR:-10.244.0.0/16}
+        echo "Routing $POD_CIDR via $KIND_NODE_IP"
+        sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"

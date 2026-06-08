@@ -44,8 +44,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust-with-cache
         with:
+          cache-key-prefix: ci-fmt
           components: rustfmt
       - run: cargo fmt --check
 
@@ -56,17 +57,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust-with-cache
         with:
+          cache-key-prefix: ci-clippy
           components: clippy
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-clippy-
       - run: cargo clippy -- -D warnings
 
   test:
@@ -76,15 +70,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v5
+      - uses: ./.github/actions/setup-rust-with-cache
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
+          cache-key-prefix: ci-test
       - run: cargo test
 
   deny:
@@ -94,7 +82,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust-with-cache
+        with:
+          cache-key-prefix: ci-deny
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
@@ -107,7 +97,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust-with-cache
+        with:
+          cache-key-prefix: ci-audit
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
