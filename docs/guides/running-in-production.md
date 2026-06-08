@@ -105,7 +105,7 @@ Set `--log-format=json` for structured log ingestion and `--log=warn` in product
 
 The default ClusterRole grants Coxswain read access to `Ingress`, `Gateway`, `HTTPRoute`, `Secret`, `Service`, `EndpointSlice`, and `ReferenceGrant` resources cluster-wide, plus write access to status sub-resources and `Lease` objects. Review this against your security policy before deploying.
 
-If Coxswain should only manage resources in a single namespace, use a namespace-scoped install. See the [Helm install guide](helm.md#namespace-scoped-install).
+If Coxswain should only manage resources in a single namespace, use a namespace-scoped install. See the [Helm install guide](../installation/helm.md#namespace-scoped-install).
 
 ## Signed image verification
 

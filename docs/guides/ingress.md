@@ -4,21 +4,39 @@ Coxswain supports the standard Kubernetes `Ingress` resource (networking.k8s.io/
 
 ## IngressClass
 
-Coxswain registers an `IngressClass` named `coxswain`. Reference it via `spec.ingressClassName`:
+An `IngressClass` tells Kubernetes which controller owns a given class name. Coxswain registers one named `coxswain`; reference it from any `Ingress` via `spec.ingressClassName: coxswain`.
+
+### Example
 
 ```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: coxswain
 spec:
-  ingressClassName: coxswain
+  controller: coxswain-labs.dev/gateway-controller  # must match --controller-name
 ```
 
-To make Coxswain the cluster default (handles `Ingress` objects without an explicit class):
+### Annotations
+
+| Annotation | Description |
+|------------|-------------|
+| `ingressclass.kubernetes.io/is-default-class` | Makes Coxswain the cluster default — handles `Ingress` objects with no class specified |
+
+### Making Coxswain the cluster default
+
+To handle `Ingress` objects that do not specify a class:
 
 ```bash
 kubectl annotate ingressclass coxswain \
   ingressclass.kubernetes.io/is-default-class=true
 ```
 
-## Basic example
+## Ingress
+
+An `Ingress` resource defines host- and path-based routing rules that map incoming HTTP(S) requests to backend Services.
+
+### Example
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -26,9 +44,9 @@ kind: Ingress
 metadata:
   name: my-app
 spec:
-  ingressClassName: coxswain
+  ingressClassName: coxswain          # routes this Ingress to Coxswain
   rules:
-    - host: app.example.com
+    - host: app.example.com           # only matches this hostname
       http:
         paths:
           - path: /
@@ -40,98 +58,16 @@ spec:
                   number: 80
 ```
 
-## Path matching
+### Annotations
 
-`pathType` controls how the path is matched:
-
-| `pathType` | Behaviour |
-|------------|-----------|
-| `Prefix` | Matches any request path with the given prefix. `/foo` matches `/foo`, `/foo/`, `/foo/bar`. |
-| `Exact` | Matches only the exact path. `/foo` does not match `/foo/`. |
-| `ImplementationSpecific` | Treated as `Prefix` by Coxswain. |
-
-## TLS
-
-Add a `spec.tls` block and reference a `kubernetes.io/tls` Secret in the same namespace:
-
-```yaml
-spec:
-  ingressClassName: coxswain
-  tls:
-    - hosts:
-        - app.example.com
-      secretName: app-tls
-  rules:
-    - host: app.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: my-service
-                port:
-                  number: 80
-```
-
-The Secret must have `type: kubernetes.io/tls` with `tls.crt` and `tls.key`. Coxswain reloads the cert automatically when the Secret changes. See the [TLS guide](tls.md) for cert-manager integration.
-
-## Wildcard hostnames
-
-Coxswain follows the Kubernetes Ingress spec for wildcard matching: `*.example.com` matches exactly one DNS label, so `foo.example.com` matches but `foo.bar.example.com` does not.
-
-```yaml
-rules:
-  - host: "*.example.com"
-    http:
-      paths:
-        - path: /
-          pathType: Prefix
-          backend:
-            service:
-              name: wildcard-service
-              port:
-                number: 80
-```
-
-## Default backend
-
-A rule without a `host` field matches any hostname not matched by a more specific rule:
-
-```yaml
-rules:
-  - http:
-      paths:
-        - path: /
-          pathType: Prefix
-          backend:
-            service:
-              name: catch-all
-              port:
-                number: 80
-```
-
-## Supported annotations
-
-| Annotation | Scope | Description |
-|------------|-------|-------------|
-| `kubernetes.io/ingress.class` | `Ingress` | Legacy class selection; takes effect when `spec.ingressClassName` is absent. Use `spec.ingressClassName` on Kubernetes 1.18+ |
-| `ingressclass.kubernetes.io/is-default-class` | `IngressClass` | Makes Coxswain the cluster default — handles `Ingress` objects with no class specified |
+| Annotation | Description |
+|------------|-------------|
+| `kubernetes.io/ingress.class` | Legacy class selection; takes effect when `spec.ingressClassName` is absent. Use `spec.ingressClassName` on Kubernetes 1.18+ |
 
 !!! note
     No `coxswain-labs.dev/*` annotations are defined yet. That namespace is reserved for future per-Ingress configuration such as rewrites and redirects.
 
-## Status
-
-Coxswain writes the proxy's external address to `status.loadBalancer.ingress` once the `--status-address` flag is set. Without it, status is left empty (cert-manager HTTP-01 will not work).
-
-```bash
-kubectl get ingress my-app
-# NAME     CLASS     HOSTS             ADDRESS         PORTS   AGE
-# my-app   coxswain  app.example.com   203.0.113.10    80      1m
-```
-
-## Supported fields
+### Supported fields
 
 | Field | Support |
 |-------|---------|
@@ -143,3 +79,133 @@ kubectl get ingress my-app
 | `spec.tls[].secretName` | Full |
 | `spec.defaultBackend` | Service backends only; Resource backends are skipped |
 | `spec.rules[].http.paths[].backend.resource` | Not supported |
+
+### Load balancer address
+
+Set `--status-address` to the external IP or hostname of your load balancer. Coxswain writes it to `status.loadBalancer.ingress` on every managed Ingress. Without it, `ADDRESS` stays empty and cert-manager HTTP-01 challenges will not work.
+
+```bash
+kubectl get ingress my-app
+# NAME     CLASS     HOSTS             ADDRESS         PORTS   AGE
+# my-app   coxswain  app.example.com   203.0.113.10    80      1m
+```
+
+### Default backend
+
+`spec.defaultBackend` defines a backend that receives any request that matches no rule at all. It is a top-level field on the `Ingress`, not part of `spec.rules`:
+
+```yaml
+spec:
+  ingressClassName: coxswain
+  defaultBackend:
+    service:
+      name: catch-all               # receives requests that match no rule
+      port:
+        number: 80
+```
+
+Only Service backends are supported; Resource backends are ignored.
+
+### Path matching
+
+`pathType` controls how the path is matched:
+
+| `pathType` | Behaviour |
+|------------|-----------|
+| `Prefix` | Matches any request path with the given prefix. `/foo` matches `/foo`, `/foo/`, `/foo/bar`. |
+| `Exact` | Matches only the exact path. `/foo` does not match `/foo/`. |
+| `ImplementationSpecific` | Treated as `Prefix` by Coxswain. |
+
+```yaml
+rules:
+  - host: app.example.com
+    http:
+      paths:
+        - path: /api
+          pathType: Prefix        # matches /api, /api/users, /api/v2/...
+          backend:
+            service:
+              name: api-service
+              port:
+                number: 80
+        - path: /healthz
+          pathType: Exact         # matches only /healthz
+          backend:
+            service:
+              name: health-service
+              port:
+                number: 8080
+```
+
+### Wildcard hostnames
+
+Coxswain follows the Kubernetes Ingress spec for wildcard matching: `*.example.com` matches exactly one DNS label, so `foo.example.com` matches but `foo.bar.example.com` does not.
+
+```yaml
+rules:
+  - host: "*.example.com"           # matches foo.example.com, not foo.bar.example.com
+    http:
+      paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: wildcard-service
+              port:
+                number: 80
+```
+
+### Catch-all rule
+
+A rule with no `host` field matches any hostname that is not claimed by a more specific host rule. Unlike `spec.defaultBackend`, path matching still applies — the request must match the rule's `path`:
+
+```yaml
+rules:
+  - http:                           # no host — matches any unmatched hostname
+      paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: catch-all
+              port:
+                number: 80
+```
+
+### TLS
+
+Add a `spec.tls` block and reference a `kubernetes.io/tls` Secret in the same namespace. Coxswain reloads the cert automatically when the Secret changes. See the [TLS guide](tls.md) for cert-manager integration.
+
+```yaml
+spec:
+  ingressClassName: coxswain
+  tls:
+    - hosts:
+        - app.example.com
+      secretName: app-tls           # must exist in the same namespace
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-service
+                port:
+                  number: 80
+```
+
+The referenced Secret must have `type: kubernetes.io/tls` with `tls.crt` and `tls.key`:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-tls
+  namespace: default
+type: kubernetes.io/tls
+data:
+  tls.crt: <base64-encoded certificate>
+  tls.key: <base64-encoded private key>
+```
