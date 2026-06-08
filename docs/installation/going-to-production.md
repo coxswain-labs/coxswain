@@ -1,27 +1,27 @@
 # Going to production
 
-Work through this list before directing production traffic to Coxswain.
+Review each section below before directing production traffic to Coxswain.
 
 ## Replicas and availability
 
-- [ ] **Run at least 2 replicas.** A single replica is a single point of failure; leader election ensures only one replica writes status, but all replicas serve traffic.
+Run at least two replicas. A single replica is a single point of failure — leader election only coordinates status writes, so both replicas serve traffic independently.
 
-  ```bash
-  helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
-    --set replicaCount=2
-  ```
+```bash
+helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
+  --namespace coxswain-system \
+  --set replicaCount=2
+```
 
-- [ ] **PodDisruptionBudget is configured.** The default Helm chart ships a PDB with `maxUnavailable: 1`. Verify it exists:
+The default Helm chart includes a `PodDisruptionBudget` (`maxUnavailable: 1`) and pod anti-affinity to spread replicas across nodes. Verify both are in place:
 
-  ```bash
-  kubectl -n coxswain-system get pdb
-  ```
-
-- [ ] **Pod anti-affinity is set.** The default chart prefers spreading replicas across nodes. Verify with `kubectl -n coxswain-system get deploy coxswain -o yaml | grep -A20 affinity`.
+```bash
+kubectl -n coxswain-system get pdb
+kubectl -n coxswain-system get deploy coxswain -o jsonpath='{.spec.template.spec.affinity}'
+```
 
 ## Resource requests and limits
 
-The default requests (`100m` CPU / `64Mi` memory) are conservative for evaluation. Size for your expected traffic:
+The default requests (`100m` CPU / `64Mi` memory) are sized for evaluation. Adjust for your expected traffic:
 
 | Traffic level | CPU request | Memory request | Proxy threads |
 |---------------|-------------|----------------|---------------|
@@ -29,10 +29,11 @@ The default requests (`100m` CPU / `64Mi` memory) are conservative for evaluatio
 | Medium (1k–10k rps) | 500m–1 | 128Mi–256Mi | 4 |
 | Heavy (> 10k rps) | 2–4 | 256Mi–512Mi | ≥ CPU core count |
 
-Set `proxy.threads` to match the number of CPU cores allocated to the container.
+Set `proxy.threads` to match the CPU cores allocated to the container:
 
 ```bash
 helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
+  --namespace coxswain-system \
   --set resources.requests.cpu=500m \
   --set resources.requests.memory=128Mi \
   --set resources.limits.cpu=2 \
@@ -40,32 +41,36 @@ helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --set proxy.threads=4
 ```
 
-## Readiness and health
+## Health probes
 
-- [ ] **Readiness probe is configured.** The default Helm chart wires `/readyz` on port `8081`. Coxswain reports `Ready` only after the initial routing table is built — do not skip this probe.
+The default Helm chart wires both probes automatically. Do not disable them:
 
-- [ ] **Liveness probe is configured.** `/healthz` always returns 200 as long as the process is running. Confirm the probe is present:
+- **Readiness** (`/readyz`, port `8081`) — Coxswain reports `Ready` only after the initial routing table is built. Kubernetes will not send traffic to the pod until this probe passes.
+- **Liveness** (`/healthz`, port `8081`) — always 200 while the process is running.
 
-  ```bash
-  kubectl -n coxswain-system get deploy coxswain -o jsonpath='{.spec.template.spec.containers[0].livenessProbe}'
-  ```
+Verify the probes are present on the deployed pod:
+
+```bash
+kubectl -n coxswain-system get deploy coxswain \
+  -o jsonpath='{.spec.template.spec.containers[0].readinessProbe}'
+```
 
 ## Graceful shutdown
 
-By default Coxswain drains connections for 30 seconds before shutting down (`--proxy-shutdown-grace-period`). Verify this aligns with your load balancer's connection draining setting. Kubernetes sends `SIGTERM` when evicting a pod; the proxy accepts no new connections after the signal and waits for in-flight requests to complete.
+Coxswain drains connections for 30 seconds after receiving `SIGTERM` before shutting down (`--proxy-shutdown-grace-period`). Make sure this aligns with your load balancer's connection draining timeout.
 
-If you have long-lived connections (WebSocket, SSE), increase the grace period:
+For long-lived connections (WebSocket, SSE), increase the grace period:
 
 ```bash
 --proxy-shutdown-grace-period=60s
 --proxy-shutdown-timeout=10s
 ```
 
-The hard timeout (`--proxy-shutdown-timeout`) fires after the grace period and forcibly closes remaining connections.
+`--proxy-shutdown-timeout` is the hard deadline after the grace period — any remaining connections are forcibly closed.
 
 ## Status address
 
-Cert-manager HTTP-01 challenges and external-dns require Coxswain to write a routable address to `Ingress.status.loadBalancer.ingress` and `Gateway.status.addresses`. Set this to the IP or hostname of your load balancer:
+Set `--status-address` to the external IP or hostname of your load balancer. Without it, `Ingress.status` and `Gateway.status.addresses` are left empty, which breaks cert-manager HTTP-01 challenges and external-dns.
 
 ```bash
 --status-address=203.0.113.10
@@ -73,33 +78,25 @@ Cert-manager HTTP-01 challenges and external-dns require Coxswain to write a rou
 --status-address=lb.example.com
 ```
 
-Without this, cert-manager will not be able to solve HTTP-01 challenges.
-
 ## TLS
 
-- [ ] **Secrets are in the correct namespace.** For `Ingress`, the TLS Secret must be in the same namespace as the `Ingress` object. For `Gateway`, the Secret must be in the `Gateway`'s namespace unless a `ReferenceGrant` allows cross-namespace access.
-
-- [ ] **Cert-manager is installed and has an issuer.** See the [TLS guide](../guides/tls.md).
+TLS Secrets must be in the correct namespace — for `Ingress`, the same namespace as the `Ingress` object; for `Gateway`, the same namespace as the `Gateway` unless a `ReferenceGrant` permits cross-namespace access. See the [TLS guide](../guides/tls.md) for cert-manager setup.
 
 ## Observability
 
-- [ ] **Prometheus scrape is configured.** The admin port (`8082`) exposes `/metrics` in Prometheus text format. Add a `ServiceMonitor` or a Prometheus scrape config pointing at the service.
+Configure a Prometheus scrape against the admin port (`8082`) — see the [Observability reference](../reference/observability.md) for the ServiceMonitor and scrape_config examples. Alert on `/readyz` returning non-200 for more than one scrape interval.
 
-- [ ] **Log level is set appropriately.** Default is `info`; set `--log=warn` in production if you want to reduce noise. Use `--log-format=json` for structured log ingestion.
-
-- [ ] **Monitor `/readyz`.** Alert if `/readyz` returns non-200 for more than one scrape interval — it means a subsystem is not ready and traffic may be misdirected.
-
-See the [Observability reference](../reference/observability.md) for available metrics.
+Set `--log-format=json` for structured log ingestion and `--log=warn` in production to reduce noise.
 
 ## RBAC
 
-- [ ] **Review the ClusterRole.** The default RBAC grants Coxswain read access to `Ingress`, `Gateway`, `HTTPRoute`, `Secret`, `Service`, `Endpoints`, and `ReferenceGrant` resources cluster-wide, plus write access to `Lease` objects and status sub-resources.
+The default ClusterRole grants Coxswain read access to `Ingress`, `Gateway`, `HTTPRoute`, `Secret`, `Service`, `EndpointSlice`, and `ReferenceGrant` resources cluster-wide, plus write access to status sub-resources and `Lease` objects. Review this against your security policy before deploying.
 
-- [ ] **Consider namespace-scoped install** if Coxswain should only manage resources in a single namespace. See the [Helm install guide](helm.md#namespace-scoped-install).
+If Coxswain should only manage resources in a single namespace, use a namespace-scoped install. See the [Helm install guide](helm.md#namespace-scoped-install).
 
 ## Signed image verification
 
-Every release image is signed with cosign. Enforce this in your cluster with a policy engine:
+Every release image is signed with cosign. Verify the signature before deploying to a production cluster:
 
 ```bash
 cosign verify \
