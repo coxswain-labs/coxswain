@@ -67,7 +67,5 @@ ENV COXSWAIN_LOG=info \
 # a contract the bare image doesn't honor. README's `## Ports (default)`
 # table is the canonical documentation.
 
-USER nonroot:nonroot
-
 ENTRYPOINT ["/usr/local/bin/coxswain"]
 CMD ["serve"]
