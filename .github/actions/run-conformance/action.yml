@@ -17,34 +17,14 @@ runs:
         go-version-file: conformance/go.mod
         cache-dependency-path: conformance/go.sum
 
-    - name: Create kind cluster
-      uses: helm/kind-action@v1
+    - uses: ./.github/actions/setup-kind-cluster
       with:
-        cluster_name: coxswain-conformance
+        cluster-name: coxswain-conformance
 
-    - name: Route pod CIDR to kind node
-      shell: bash
-      run: |
-        KIND_NODE_IP=$(docker inspect coxswain-conformance-control-plane \
-          --format '{{ (index .NetworkSettings.Networks "kind").IPAddress }}')
-        POD_CIDR=$(kubectl get node coxswain-conformance-control-plane \
-          -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
-        POD_CIDR=${POD_CIDR:-10.244.0.0/16}
-        echo "Routing $POD_CIDR via $KIND_NODE_IP"
-        sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
-
-    - name: Read Gateway API version
-      id: gw-version
-      shell: bash
-      run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
-
-    - name: Pre-pull conformance backend images into kind
-      shell: bash
-      run: |
-        GW_VER=${{ steps.gw-version.outputs.version }}
-        docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER}
-        kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER} \
-          --name coxswain-conformance
+    - uses: ./.github/actions/preload-gateway-api-images
+      with:
+        cluster-name: coxswain-conformance
+        include-busybox: 'false'
 
     - name: Bootstrap cluster (CRDs, RBAC, GatewayClass)
       shell: bash
@@ -96,15 +76,5 @@ runs:
           --cleanup-base-resources=true
         echo "report-file=conformance/${REPORT_FILE}" >> "$GITHUB_OUTPUT"
 
-    - name: Dump cluster state on failure
+    - uses: ./.github/actions/dump-cluster-state
       if: failure()
-      shell: bash
-      run: |
-        echo "=== Namespaces ==="
-        kubectl get namespaces
-        echo "=== Events (last 50) ==="
-        kubectl get events -A --sort-by=.lastTimestamp | tail -50
-        echo "=== Gateways ==="
-        kubectl get gateways -A -o wide
-        echo "=== HTTPRoutes ==="
-        kubectl get httproutes -A

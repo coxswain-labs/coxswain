@@ -41,16 +41,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/cache@v5
+      - uses: ./.github/actions/setup-rust-with-cache
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-e2e-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-e2e-build-
+          cache-key-prefix: e2e-build
 
       - name: Build coxswain binary
         run: cargo build --bin coxswain
@@ -78,32 +71,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Create kind cluster
-        uses: helm/kind-action@v1
+      - uses: ./.github/actions/setup-kind-cluster
         with:
-          cluster_name: coxswain-e2e-gateway-api
+          cluster-name: coxswain-e2e-gateway-api
 
-      - name: Route pod CIDR to kind node
-        run: |
-          KIND_NODE_IP=$(docker inspect coxswain-e2e-gateway-api-control-plane \
-            --format '{{ (index .NetworkSettings.Networks "kind").IPAddress }}')
-          POD_CIDR=$(kubectl get node coxswain-e2e-gateway-api-control-plane \
-            -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
-          POD_CIDR=${POD_CIDR:-10.244.0.0/16}
-          echo "Routing $POD_CIDR via $KIND_NODE_IP"
-          sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
-
-      - name: Read Gateway API version
-        id: gw-version
-        run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
-
-      - name: Pre-pull backend images into kind
-        run: |
-          GW_VER=${{ steps.gw-version.outputs.version }}
-          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER}
-          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER} --name coxswain-e2e-gateway-api
-          docker pull busybox:1.37
-          kind load docker-image busybox:1.37 --name coxswain-e2e-gateway-api
+      - uses: ./.github/actions/preload-gateway-api-images
+        with:
+          cluster-name: coxswain-e2e-gateway-api
+          include-busybox: 'true'
 
       - name: Download e2e binaries
         uses: actions/download-artifact@v7
@@ -120,17 +95,8 @@ jobs:
           COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
           RUST_LOG: coxswain_e2e=debug,warn
 
-      - name: Dump cluster state on failure
+      - uses: ./.github/actions/dump-cluster-state
         if: failure()
-        run: |
-          echo "=== Namespaces ==="
-          kubectl get namespaces -l coxswain-e2e=true
-          echo "=== Events ==="
-          kubectl get events -A --sort-by=.lastTimestamp | tail -50
-          echo "=== HTTPRoutes ==="
-          kubectl get httproutes -A
-          echo "=== Ingresses ==="
-          kubectl get ingresses -A
 
   e2e-ingress:
     name: e2e-ingress
@@ -140,32 +106,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Create kind cluster
-        uses: helm/kind-action@v1
+      - uses: ./.github/actions/setup-kind-cluster
         with:
-          cluster_name: coxswain-e2e-ingress
+          cluster-name: coxswain-e2e-ingress
 
-      - name: Route pod CIDR to kind node
-        run: |
-          KIND_NODE_IP=$(docker inspect coxswain-e2e-ingress-control-plane \
-            --format '{{ (index .NetworkSettings.Networks "kind").IPAddress }}')
-          POD_CIDR=$(kubectl get node coxswain-e2e-ingress-control-plane \
-            -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
-          POD_CIDR=${POD_CIDR:-10.244.0.0/16}
-          echo "Routing $POD_CIDR via $KIND_NODE_IP"
-          sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
-
-      - name: Read Gateway API version
-        id: gw-version
-        run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
-
-      - name: Pre-pull backend images into kind
-        run: |
-          GW_VER=${{ steps.gw-version.outputs.version }}
-          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER}
-          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER} --name coxswain-e2e-ingress
-          docker pull busybox:1.37
-          kind load docker-image busybox:1.37 --name coxswain-e2e-ingress
+      - uses: ./.github/actions/preload-gateway-api-images
+        with:
+          cluster-name: coxswain-e2e-ingress
+          include-busybox: 'true'
 
       - name: Download e2e binaries
         uses: actions/download-artifact@v7
@@ -182,17 +130,8 @@ jobs:
           COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
           RUST_LOG: coxswain_e2e=debug,warn
 
-      - name: Dump cluster state on failure
+      - uses: ./.github/actions/dump-cluster-state
         if: failure()
-        run: |
-          echo "=== Namespaces ==="
-          kubectl get namespaces -l coxswain-e2e=true
-          echo "=== Events ==="
-          kubectl get events -A --sort-by=.lastTimestamp | tail -50
-          echo "=== HTTPRoutes ==="
-          kubectl get httproutes -A
-          echo "=== Ingresses ==="
-          kubectl get ingresses -A
 
   e2e-gateway-api-conformance:
     name: e2e-gateway-api-conformance

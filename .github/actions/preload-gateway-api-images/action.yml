@@ -1,0 +1,41 @@
+name: Preload Gateway API images into kind
+description: >
+  Reads the Gateway API version from .gateway-api-version, pulls the
+  conformance echo-basic backend image, and loads it into the named kind
+  cluster. Optionally also loads busybox:1.37, which is required by the
+  e2e (non-conformance) test suites.
+
+inputs:
+  cluster-name:
+    description: Name of the kind cluster to load images into.
+    required: true
+  include-busybox:
+    description: >
+      Set to 'true' to also pull and load busybox:1.37. Required by the
+      e2e-ingress and e2e-gateway-api suites; not needed for conformance.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Read Gateway API version
+      id: gw-version
+      shell: bash
+      run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
+
+    - name: Pull and load echo-basic into kind
+      shell: bash
+      run: |
+        GW_VER=${{ steps.gw-version.outputs.version }}
+        docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER}
+        kind load docker-image \
+          gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER} \
+          --name ${{ inputs.cluster-name }}
+
+    - name: Pull and load busybox into kind
+      if: ${{ inputs.include-busybox == 'true' }}
+      shell: bash
+      run: |
+        docker pull busybox:1.37
+        kind load docker-image busybox:1.37 --name ${{ inputs.cluster-name }}
