@@ -331,11 +331,13 @@ jobs:
           name: conformance-report
           path: ./conformance-report/
 
-      - name: Resolve conformance report path
+      - name: Stage conformance report for release
         id: report
         run: |
+          set -euo pipefail
           REPORT=$(ls ./conformance-report/gateway-api-conformance-*.yaml | head -1)
-          echo "path=${REPORT}" >> "$GITHUB_OUTPUT"
+          cp "${REPORT}" ./gw-api-conf-report.yaml
+          echo "path=./gw-api-conf-report.yaml" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release and attach install.yaml + conformance report
         uses: softprops/action-gh-release@v3
