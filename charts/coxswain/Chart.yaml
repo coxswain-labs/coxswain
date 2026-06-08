@@ -5,8 +5,8 @@ description: >-
   Watches Ingress and Gateway API resources and dynamically routes traffic
   without a full reload. Supports multi-replica leader election.
 type: application
-version: 0.0.3
-appVersion: "0.0.3"
+version: 0.0.4
+appVersion: "0.0.4"
 home: https://github.com/coxswain-labs/coxswain
 sources:
   - https://github.com/coxswain-labs/coxswain
