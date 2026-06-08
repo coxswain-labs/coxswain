@@ -8,7 +8,7 @@ metadata:
     app.kubernetes.io/component: controller
 rules:
   - apiGroups: [""]
-    resources: ["services", "endpoints", "pods", "secrets", "configmaps"]
+    resources: ["services", "endpoints", "secrets", "configmaps"]
     verbs: ["get", "list", "watch"]
 
   - apiGroups: ["discovery.k8s.io"]

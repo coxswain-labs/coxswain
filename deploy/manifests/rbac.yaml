@@ -22,7 +22,7 @@ rules:
     # configmaps: needed to resolve BackendTLSPolicy caCertificateRefs (#16).
     # Unlike Secrets (type=kubernetes.io/tls filter), ConfigMaps have no equivalent
     # field selector — all ConfigMaps in scope are watched (follow-up: per-policy informers).
-    resources: ["services", "endpoints", "pods", "secrets", "configmaps"]
+    resources: ["services", "endpoints", "secrets", "configmaps"]
     verbs: ["get", "list", "watch"]
 
   - apiGroups: ["discovery.k8s.io"]
