@@ -29,10 +29,10 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/
 === "Kustomize"
 
     ```bash
-    kubectl apply -k github.com/coxswain-labs/coxswain//deploy/manifests?ref=v0.1.0
+    kubectl apply -k "github.com/coxswain-labs/coxswain//deploy/manifests?ref=main"
     ```
 
-    Replace `v0.1.0` with the desired release tag. For local customisation, clone the repo and use `deploy/manifests/` as a Kustomize base.
+    This installs from the `main` branch. For a version-pinned install, use the **Raw manifests** tab — the published `install.yaml` is built from a specific release tag. For local customisation, clone the repo and use `deploy/manifests/` as a Kustomize base.
 
 === "Raw manifests"
 
@@ -43,7 +43,8 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/
 Wait for the controller to become ready:
 
 ```bash
-kubectl -n coxswain-system rollout status deployment/coxswain
+kubectl -n coxswain-system wait pod -l app.kubernetes.io/name=coxswain \
+  --for=condition=Ready --timeout=90s
 ```
 
 Verify the `GatewayClass` is accepted:
@@ -101,7 +102,7 @@ spec:
         - name: echo
           image: gcr.io/k8s-staging-gateway-api/echo-basic:latest
           ports:
-            - containerPort: 8080
+            - containerPort: 3000
 ---
 apiVersion: v1
 kind: Service
@@ -112,7 +113,7 @@ spec:
     app: echo
   ports:
     - port: 80
-      targetPort: 8080
+      targetPort: 3000
 ```
 
 ```bash
@@ -144,7 +145,9 @@ spec:
 
 ```bash
 kubectl apply -f route.yaml
-kubectl wait httproute/echo-route --for=condition=Accepted --timeout=30s
+kubectl get httproute echo-route
+# NAME         HOSTNAMES            AGE
+# echo-route   ["echo.example.com"]   5s
 ```
 
 ## Step 6 — Verify traffic
