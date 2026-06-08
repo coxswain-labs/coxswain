@@ -74,14 +74,15 @@ Each release publishes a pre-rendered `install.yaml` as a GitHub Release asset. 
 # Install Gateway API CRDs
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/download/standard-install.yaml
 
-# Install Coxswain
-helm install coxswain charts/coxswain --namespace coxswain-system --create-namespace
+# Install Coxswain from the OCI registry
+helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
+  --namespace coxswain-system --create-namespace
 ```
 
-The chart exposes the full configuration surface via `values.yaml`. To inspect available options:
+To pin a specific version, add `--version X.Y.Z`. To inspect available options:
 
 ```bash
-helm show values charts/coxswain
+helm show values oci://ghcr.io/coxswain-labs/charts/coxswain
 ```
 
 **Raw manifests (development / resource inspection):**
@@ -120,6 +121,32 @@ All flags have environment variable equivalents. Most use a `COXSWAIN_*` prefix 
 | `--proxy-shutdown-timeout` | `COXSWAIN_PROXY_SHUTDOWN_TIMEOUT` | `5s` | Hard deadline for the final shutdown step after the grace period expires |
 | `--proxy-threads` | `COXSWAIN_PROXY_THREADS` | `2` | Worker threads per proxy service; set to CPU core count for maximum throughput |
 | `--status-address` | `COXSWAIN_STATUS_ADDRESS` | _(none)_ | IP or hostname written to `Ingress.status` and `Gateway.status.addresses`; required for cert-manager HTTP-01 and external-dns |
+
+## Verifying releases
+
+Every released image and Helm chart is signed with [cosign](https://github.com/sigstore/cosign) using keyless Sigstore signing (GitHub Actions OIDC — no long-lived keys).
+
+**Verify the OCI image:**
+
+```bash
+cosign verify \
+  --certificate-identity-regexp \
+    "https://github.com/coxswain-labs/coxswain/.github/workflows/release.yml" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  ghcr.io/coxswain-labs/coxswain:v0.1.0
+```
+
+**Verify the Helm chart:**
+
+```bash
+cosign verify \
+  --certificate-identity-regexp \
+    "https://github.com/coxswain-labs/coxswain/.github/workflows/release.yml" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  ghcr.io/coxswain-labs/charts/coxswain:0.1.0
+```
+
+See [docs/verifying-releases.md](docs/verifying-releases.md) for full verification details, including SBOMs and policy enforcement with `cosign verify-blob`.
 
 ## Authors
 

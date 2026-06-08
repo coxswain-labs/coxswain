@@ -20,6 +20,10 @@ const GATEWAY_API_VERSION: &str = include_str!("../../../../.gateway-api-version
 /// Returns an error if any `kubectl apply` step fails or a required component
 /// does not become available within its timeout.
 pub async fn bootstrap() -> anyhow::Result<()> {
+    // reqwest 0.13 uses `rustls-no-provider`; install ring explicitly so the
+    // process has exactly one crypto provider regardless of transitive deps.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let root = workspace_root().context("workspace root")?;
 
     // Purge any namespaces left over from a previous interrupted run.
