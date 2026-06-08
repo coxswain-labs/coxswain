@@ -102,7 +102,3 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
-
-[workspace.metadata.release]
-push = true
-tag = true

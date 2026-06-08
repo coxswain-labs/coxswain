@@ -1,3 +1,7 @@
 publish = false
+shared-version = "workspace"
+consolidate-commits = true
 tag-name = "v{{version}}"
+push = true
+tag = true
 pre-release-hook = ["bash", "-c", "cd \"$(git rev-parse --show-toplevel)\" && bash ./scripts/bump-helm-version.sh \"{{version}}\""]
