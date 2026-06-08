@@ -38,6 +38,6 @@ Default resource requests in the Helm chart:
 | Resource | Request | Limit |
 |----------|---------|-------|
 | CPU | 100m | 500m |
-| Memory | 64Mi | 256Mi |
+| Memory | 128Mi | 256Mi |
 
 See [Running in production](../guides/running-in-production.md) for tuning guidance.

@@ -155,6 +155,9 @@ rules:
                 number: 80
 ```
 
+!!! note
+    Gateway API wildcards differ: `*.example.com` in a `Gateway` listener or `HTTPRoute` matches any number of labels, including `foo.bar.example.com`. See the [Gateway API guide](gateway-api.md#wildcard-hostnames) if you also use `HTTPRoute` objects in the cluster.
+
 ### Catch-all rule
 
 A rule with no `host` field matches any hostname that is not claimed by a more specific host rule. Unlike `spec.defaultBackend`, path matching still applies — the request must match the rule's `path`:

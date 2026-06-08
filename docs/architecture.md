@@ -72,9 +72,11 @@ flowchart LR
 
 ## Readiness
 
-`/readyz` returns 200 only after every subsystem has reported ready. On a freshly started pod this requires:
+`/readyz` returns 200 once every subsystem reports `Ready` or `Degraded`. On a freshly started pod this requires:
 
 - All Kubernetes reflectors have completed their initial list — CRDs must be installed and RBAC must be correct.
 - The routing table has been built at least once.
 
-If `/readyz` returns 503 on a running pod, something is wrong. Inspect `/status` to see which subsystem is blocked.
+Subsystems have four states: `Pending` (still initialising — keeps `/readyz` at 503), `Ready`, `Degraded` (partial fault but still serving), and `Failed`. `Ready` and `Degraded` both pass the readiness gate; `Pending` and `Failed` block it.
+
+If `/readyz` returns 503 on a running pod, inspect `/status` to see which subsystem is blocked.

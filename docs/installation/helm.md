@@ -13,11 +13,11 @@ helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --namespace coxswain-system --create-namespace
 ```
 
-To pin a specific version:
+To pin a specific version (replace `X.Y.Z` with the release you want):
 
 ```bash
 helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
-  --version 0.1.0 \
+  --version X.Y.Z \
   --namespace coxswain-system --create-namespace
 ```
 
@@ -38,15 +38,15 @@ helm show values oci://ghcr.io/coxswain-labs/charts/coxswain
 
 | Value | Default | Description |
 |-------|---------|-------------|
-| `replicaCount` | `2` | Number of controller replicas |
+| `replicaCount` | `1` | Number of controller replicas (run `≥ 2` in production) |
 | `image.tag` | _(chart appVersion)_ | Image tag to deploy |
 | `controller.name` | `coxswain-labs.dev/gateway-controller` | GatewayClass `controllerName` to claim |
 | `controller.watchNamespace` | `""` | Restrict watch to a single namespace; empty = cluster-wide |
-| `proxy.httpPort` | `80` | HTTP proxy listener port |
-| `proxy.httpsPort` | `443` | HTTPS proxy listener port |
+| `proxy.http.port` | `80` | HTTP proxy listener port |
+| `proxy.https.port` | `443` | HTTPS proxy listener port |
 | `proxy.threads` | `2` | Worker threads per proxy service |
 | `resources.requests.cpu` | `100m` | CPU request |
-| `resources.requests.memory` | `64Mi` | Memory request |
+| `resources.requests.memory` | `128Mi` | Memory request |
 | `resources.limits.cpu` | `500m` | CPU limit |
 | `resources.limits.memory` | `256Mi` | Memory limit |
 
@@ -63,7 +63,7 @@ helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
 ```
 
 !!! note
-    This changes the RBAC from a `ClusterRole`/`ClusterRoleBinding` to a namespaced `Role`/`RoleBinding` plus a residual `ClusterRole` for `GatewayClass` and `IngressClass` (cluster-scoped resources). Review the generated manifests with `helm template` before applying.
+    `controller.watchNamespace` only narrows what the controller reads — the chart still installs the cluster-wide `ClusterRole`/`ClusterRoleBinding`. To scope RBAC as well, render the manifests with `helm template` and edit them by hand before applying.
 
 ## Uninstall
 

@@ -3,19 +3,19 @@
 !!! warning "Early development"
     Coxswain is under active development and not yet ready for external contributions. Contribution guidelines will follow as the project matures.
 
-A pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine.
+A Rust Kubernetes Ingress and Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine.
 
-Coxswain aims to be a lightweight, operationally simple ingress controller for teams that want reliable, zero-downtime routing without configuration file generation or process restarts. Routing updates are applied atomically as Kubernetes resources change, TLS certificates are hot-reloaded from Secrets, and multiple replicas can run simultaneously without coordination overhead.
+Coxswain combines controller and proxy in a single binary. Routing updates from Kubernetes watch events are published to the proxy as an immutable snapshot behind an atomic pointer, so routes change without a config reload or process restart. TLS certificates from `kubernetes.io/tls` Secrets are picked up the same way. Multiple replicas can run concurrently — every replica serves traffic, and a Kubernetes `Lease` coordinates only which replica writes status conditions back to the API server.
 
-## Why Coxswain?
+## What Coxswain does
 
 | Feature | Detail |
 |---------|--------|
-| **Routing without restarts** | Routes update instantly as Kubernetes resources change — no config reload, no process restart, no dropped connections |
-| **Gateway API + Ingress** | Both `HTTPRoute` and classic `Ingress` resources, side-by-side in the same cluster |
-| **Multi-replica safe** | Lease-based leader election coordinates status writes; standby replicas serve traffic without writing to the API server |
-| **TLS hot-reload** | New and renewed certificates are picked up automatically from `kubernetes.io/tls` Secrets |
-| **Prometheus metrics** | Live metrics via `/metrics` on the admin port |
+| **Routing updates** | Routes are applied via an immutable-snapshot atomic-pointer swap on every reconcile — no config reload, no process restart |
+| **Gateway API + Ingress** | Both `HTTPRoute` and classic `Ingress` resources in the same binary; both contribute to the same routing table |
+| **Multi-replica** | All replicas reconcile and serve traffic; a Kubernetes `Lease` coordinates which replica writes status conditions |
+| **TLS hot-reload** | New and renewed certificates are picked up from `kubernetes.io/tls` Secrets without a restart |
+| **Prometheus metrics** | `/metrics` on the admin port |
 | **Structured logging** | JSON (production) or human-readable console format |
 
 ## Quick install

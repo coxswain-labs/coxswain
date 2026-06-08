@@ -4,7 +4,7 @@ Review each section below before directing production traffic to Coxswain.
 
 ## Replicas and availability
 
-Run at least two replicas. A single replica is a single point of failure — leader election only coordinates status writes, so both replicas serve traffic independently.
+The Helm chart defaults to `replicaCount: 1`, which is fine for evaluation but inadequate for production: a single replica is a single point of failure, and the default `PodDisruptionBudget` (`maxUnavailable: 1`) combined with one replica means a voluntary disruption can take the entire data plane offline. Run at least two replicas. Leader election only coordinates status writes, so all replicas serve traffic independently.
 
 ```bash
 helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
@@ -12,7 +12,7 @@ helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --set replicaCount=2
 ```
 
-The default Helm chart includes a `PodDisruptionBudget` (`maxUnavailable: 1`). Verify it is in place:
+Verify the `PodDisruptionBudget` is in place:
 
 ```bash
 kubectl -n coxswain-system get pdb
@@ -34,11 +34,11 @@ affinity:
 
 ## Resource requests and limits
 
-The default requests (`100m` CPU / `64Mi` memory) are sized for evaluation. Adjust for your expected traffic:
+The Helm chart defaults are sized for evaluation: requests `100m` CPU / `128Mi` memory, limits `500m` CPU / `256Mi` memory. Adjust for your expected traffic:
 
 | Traffic level | CPU request | Memory request | Proxy threads |
 |---------------|-------------|----------------|---------------|
-| Light (< 1k rps) | 100m–250m | 64Mi–128Mi | 2 |
+| Light (< 1k rps) | 100m–250m | 128Mi | 2 |
 | Medium (1k–10k rps) | 500m–1 | 128Mi–256Mi | 4 |
 | Heavy (> 10k rps) | 2–4 | 256Mi–512Mi | ≥ CPU core count |
 
@@ -70,7 +70,7 @@ kubectl -n coxswain-system get deploy coxswain \
 
 ## Graceful shutdown
 
-Coxswain drains connections for 30 seconds after receiving `SIGTERM` before shutting down (`--proxy-shutdown-grace-period`). Make sure this aligns with your load balancer's connection draining timeout.
+On `SIGTERM`, Coxswain drains in-flight connections for `--proxy-shutdown-grace-period` (default `30s`), then forcibly closes any remaining connections after `--proxy-shutdown-timeout` (default `5s`). Make sure the grace period aligns with your load balancer's connection draining timeout.
 
 For long-lived connections (WebSocket, SSE), increase the grace period:
 
@@ -78,8 +78,6 @@ For long-lived connections (WebSocket, SSE), increase the grace period:
 --proxy-shutdown-grace-period=60s
 --proxy-shutdown-timeout=10s
 ```
-
-`--proxy-shutdown-timeout` is the hard deadline after the grace period — any remaining connections are forcibly closed.
 
 ## Status address
 
@@ -103,9 +101,16 @@ Set `--log-format=json` for structured log ingestion and `--log=warn` in product
 
 ## RBAC
 
-The default ClusterRole grants Coxswain read access to `Ingress`, `Gateway`, `HTTPRoute`, `Secret`, `Service`, `EndpointSlice`, and `ReferenceGrant` resources cluster-wide, plus write access to status sub-resources and `Lease` objects. Review this against your security policy before deploying.
+The default `ClusterRole` grants Coxswain cluster-wide:
 
-If Coxswain should only manage resources in a single namespace, use a namespace-scoped install. See the [Helm install guide](../installation/helm.md#namespace-scoped-install).
+- Read on `services`, `endpoints`, `endpointslices`, `secrets`, `configmaps` (core API group).
+- Read on `ingresses`, `ingressclasses` (`networking.k8s.io`).
+- Read on `gatewayclasses`, `gateways`, `httproutes`, `referencegrants`, `backendtlspolicies` (`gateway.networking.k8s.io`).
+- Status writes (`*/status`) on `ingresses`, `gateways`, `httproutes`, `backendtlspolicies`, and `gatewayclasses`.
+
+A separate namespaced `Role` (in `coxswain-system`) grants `get`, `create`, `patch` on `coordination.k8s.io/leases` — used only for leader election. Review the rendered manifests with `helm template` or read `deploy/manifests/rbac.yaml` before deploying.
+
+If Coxswain should only manage resources in a single namespace, set `controller.watchNamespace`. Note that this only restricts what the controller reads; the chart still installs the cluster-wide `ClusterRole`/`ClusterRoleBinding`. To scope RBAC as well, edit the rendered manifests by hand.
 
 ## Signed image verification
 
@@ -119,4 +124,4 @@ cosign verify \
   ghcr.io/coxswain-labs/coxswain:vX.Y.Z
 ```
 
-See [Verifying releases](../guides/verifying-releases.md) for full details including SBOM verification.
+See [Verifying releases](../guides/verifying-releases.md) for the cosign verification flow for both the image and the Helm chart.

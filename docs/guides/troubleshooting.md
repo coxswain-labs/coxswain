@@ -93,14 +93,14 @@ Check if the Lease exists and who holds it:
 
 ```bash
 kubectl -n coxswain-system get lease
-# NAME       HOLDER                                   AGE
-# coxswain   coxswain-7d9f6b5c8-xk2pn                5m
+# NAME        HOLDER                          AGE
+# <name>      coxswain-7d9f6b5c8-xk2pn        5m
 ```
 
 If the `HOLDER` column is empty or the lease is expired, no replica has claimed leadership. Common causes:
 
 - All replicas are crashing before they can acquire the lease — check `kubectl -n coxswain-system logs -l app.kubernetes.io/name=coxswain`.
-- Clock skew between nodes — a Lease TTL of 15 s assumes clocks are synchronised within a few seconds.
+- Clock skew between nodes — the default lease TTL (`--controller-lease-ttl=15s`) assumes clocks are synchronised within a few seconds.
 
 ## High memory usage
 

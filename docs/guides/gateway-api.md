@@ -10,9 +10,10 @@ Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io
 | `Gateway` | `gateway.networking.k8s.io/v1` | HTTP and HTTPS listeners only |
 | `HTTPRoute` | `gateway.networking.k8s.io/v1` | Path, header, method, and query matching; weighted traffic split |
 | `ReferenceGrant` | `gateway.networking.k8s.io/v1beta1` | Cross-namespace backend and certificate access |
+| `BackendTLSPolicy` | `gateway.networking.k8s.io/v1` | Upstream TLS configuration referencing a CA `ConfigMap` or `Secret` |
 
 !!! warning "Not supported"
-    `TCPRoute`, `TLSRoute`, `UDPRoute`, and `GRPCRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected. The `RequestMirror`, `ExtensionRef`, and `CORS` filters are silently skipped.
+    `TCPRoute`, `TLSRoute`, `UDPRoute`, and `GRPCRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected. The `RequestMirror`, `ExtensionRef`, and `CORS` filters are skipped with a WARN log line.
 
 ## GatewayClass
 
@@ -26,7 +27,7 @@ kind: GatewayClass
 metadata:
   name: coxswain
 spec:
-  controller: coxswain-labs.dev/gateway-controller  # must match --controller-name
+  controllerName: coxswain-labs.dev/gateway-controller  # must match --controller-name
 ```
 
 ### Verifying the controller claimed it
@@ -143,7 +144,7 @@ The `hostname` field on a listener filters which requests reach its attached rou
 An empty `hostname` accepts requests for any hostname. For SNI-based TLS termination, the listener `hostname` is also used to select the correct certificate when multiple HTTPS listeners share the same port.
 
 !!! note
-    Gateway listener wildcard semantics differ from Ingress: `*.example.com` on an `Ingress` matches only a single label (`foo.example.com` yes, `foo.bar.example.com` no). See the [Ingress guide](ingress.md#wildcard-hostnames) for details.
+    Gateway API wildcards (both listener and HTTPRoute hostnames) match any number of labels. Classic `Ingress` is more restrictive: `*.example.com` on an `Ingress` matches only a single label (`foo.example.com` yes, `foo.bar.example.com` no). See the [Ingress guide](ingress.md#wildcard-hostnames) for the Ingress semantics.
 
 ### Load balancer address
 
@@ -225,9 +226,9 @@ spec:
 | `ResponseHeaderModifier` | Supported (rule-level and per-backendRef) |
 | `URLRewrite` | Supported (hostname and path rewrite) |
 | `RequestRedirect` | Supported (scheme, hostname, port, path, status code) |
-| `RequestMirror` | Not supported — silently skipped |
-| `ExtensionRef` | Not supported — silently skipped |
-| `CORS` | Not supported — silently skipped |
+| `RequestMirror` | Not supported — skipped with a WARN log line |
+| `ExtensionRef` | Not supported — skipped with a WARN log line |
+| `CORS` | Not supported — skipped with a WARN log line |
 
 ### Attaching to a Gateway
 
@@ -345,14 +346,15 @@ An HTTPRoute with a syntactically invalid regex pattern is rejected: Coxswain se
 
 ### Wildcard hostnames
 
-`*.example.com` in `spec.hostnames` matches a single DNS label: `foo.example.com` matches but `foo.bar.example.com` does not.
-
-This is more restrictive than Gateway listener wildcard behaviour, which matches any number of labels. A route with `*.example.com` will only attach to a listener whose hostname intersects — it will not match a listener with `hostname: "*.bar.example.com"` unless the labels overlap.
+`*.example.com` in `spec.hostnames` matches any number of leading DNS labels: both `foo.example.com` and `foo.bar.example.com` match. This is the same semantics applied to listener `hostname` fields — Gateway API treats wildcards uniformly across listeners and routes.
 
 ```yaml
 hostnames:
-  - "*.example.com"             # matches foo.example.com, not foo.bar.example.com
+  - "*.example.com"             # matches foo.example.com and foo.bar.example.com
 ```
+
+!!! note
+    Classic `Ingress` wildcards are more restrictive (single-label only). See the [Ingress guide](ingress.md#wildcard-hostnames) if you also use `Ingress` objects in the cluster.
 
 ### Traffic splitting
 

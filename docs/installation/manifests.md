@@ -12,10 +12,15 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/
 kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/latest/download/install.yaml
 ```
 
+!!! note
+    The `releases/latest/download/install.yaml` URL resolves only after the first tagged release. It returns 404 if no `v*` tag has been published yet.
+
 ## Pin a specific version
 
+Replace `vX.Y.Z` with the release tag you want to install:
+
 ```bash
-kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/download/v0.1.0/install.yaml
+kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/download/vX.Y.Z/install.yaml
 ```
 
 ## Upgrade

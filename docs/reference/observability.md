@@ -1,11 +1,11 @@
 # Observability reference
 
-!!! warning "Work in progress"
-    The metrics listed below are the intended v0.2 reference. The `/metrics` endpoint exists but currently exposes only a minimal set. Full per-request and routing-table metrics land in [#20](https://github.com/coxswain-labs/coxswain/issues/20); access logging in [#21](https://github.com/coxswain-labs/coxswain/issues/21). This page will be updated as each issue is closed.
+!!! warning "Planned catalog — not yet implemented"
+    The metrics tables below describe the **planned v0.2 catalog**. They are not emitted by the current build. The `/metrics` endpoint is reachable today but only exposes the default `prometheus` collector. Per-request and routing-table metrics land in [#20](https://github.com/coxswain-labs/coxswain/issues/20); access logging in [#21](https://github.com/coxswain-labs/coxswain/issues/21). Treat this page as a design preview, not a runtime reference.
 
 ## Metrics
 
-Coxswain exposes Prometheus metrics at `http://<admin-address>:<admin-port>/metrics` (default port `8082`).
+Coxswain exposes the Prometheus endpoint at `http://<admin-address>:<admin-port>/metrics` (default port `8082`). The catalog below is the **planned** shape for v0.2 — none of these series are emitted by the current build.
 
 ### HTTP proxy metrics
 
@@ -54,7 +54,7 @@ Coxswain exposes Prometheus metrics at `http://<admin-address>:<admin-port>/metr
 1. All Kubernetes reflectors emit their first `InitDone` event (CRDs must be installed)
 2. The routing table is built for the first time
 
-Inspect the per-subsystem detail via the admin port (open `kubectl -n coxswain-system port-forward svc/coxswain 8082:8082` in a separate terminal first):
+Inspect the per-subsystem detail via the admin port (open `kubectl -n coxswain-system port-forward svc/coxswain-internal 8082:8082` in a separate terminal first; Helm installs use the Service name `<release>-internal`):
 
 ```bash
 curl -s http://localhost:8082/status | jq .
@@ -127,6 +127,8 @@ Use `RUST_LOG` directive syntax for per-crate control:
 
 === "Prometheus operator (ServiceMonitor)"
 
+    Coxswain installs two Services that share the `app.kubernetes.io/name: coxswain` label: the proxy Service (`http`, `https` ports) and the internal Service (`health`, `admin` ports). The ServiceMonitor below selects both, but `port: admin` only matches the internal Service, so the proxy Service produces no scrape targets and is silently ignored.
+
     ```yaml
     apiVersion: monitoring.coreos.com/v1
     kind: ServiceMonitor
@@ -145,11 +147,13 @@ Use `RUST_LOG` directive syntax for per-crate control:
 
 === "Prometheus scrape_configs"
 
+    Replace `<release>` with the Helm release name (or use `coxswain-internal` for raw-manifest installs):
+
     ```yaml
     scrape_configs:
       - job_name: coxswain
         static_configs:
-          - targets: ['coxswain.coxswain-system.svc:8082']
+          - targets: ['<release>-internal.coxswain-system.svc:8082']
         metrics_path: /metrics
     ```
 
