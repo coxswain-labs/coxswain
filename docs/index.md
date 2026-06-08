@@ -11,10 +11,10 @@ Coxswain aims to be a lightweight, operationally simple ingress controller for t
 
 | Feature | Detail |
 |---------|--------|
-| **Zero-reload routing** | The routing table is swapped atomically via `arc-swap`; no locks or channels on the hot path |
+| **Routing without restarts** | Routes update instantly as Kubernetes resources change — no config reload, no process restart, no dropped connections |
 | **Gateway API + Ingress** | Both `HTTPRoute` and classic `Ingress` resources, side-by-side in the same cluster |
-| **Multi-replica safe** | Lease-based leader election coordinates status writes; standby replicas serve traffic without feedback loops |
-| **TLS hot-reload** | Watches `kubernetes.io/tls` Secrets and reloads cert material without restarts |
+| **Multi-replica safe** | Lease-based leader election coordinates status writes; standby replicas serve traffic without writing to the API server |
+| **TLS hot-reload** | New and renewed certificates are picked up automatically from `kubernetes.io/tls` Secrets |
 | **Prometheus metrics** | Live metrics via `/metrics` on the admin port |
 | **Structured logging** | JSON (production) or human-readable console format |
 
