@@ -31,6 +31,19 @@ CI picks up the tag and runs the release pipeline automatically:
 
 The release pipeline blocks publication if `cargo deny check` finds a disallowed license or advisory, or if `trivy image` detects a HIGH or CRITICAL CVE in the published image.
 
+## Recovering from a failed release
+
+Where the failure happens determines what you can do:
+
+| Stage | What's out | Recovery |
+|-------|-----------|----------|
+| Pre-release hook crashes (before commit) | Nothing — `cargo-release` aborts cleanly | Fix the hook, re-run the same version |
+| Tag pushed, **transient** CI failure (network, timeout) | Tag only; artifact missing | Use **Re-run failed jobs** in GitHub Actions |
+| Tag pushed, `cargo-deny` fails | Tag only; no image | Delete the remote tag (`git push origin :refs/tags/vX.Y.Z`), fix the advisory/license, re-run the same version |
+| Tag pushed, `trivy-scan` fails (real CVE) | Image published and signed; no chart or GitHub Release | Fix the vulnerability and cut a **new patch version** — the vulnerable image is already at that digest and reusing the tag would break the cosign signature |
+
+**Never force-push or move a tag that already has a published, cosign-signed image.** The signature is bound to the digest, not the tag, so the signed artifact remains in the registry regardless.
+
 ## Dry run
 
 ```bash
