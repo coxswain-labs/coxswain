@@ -1,0 +1,26 @@
+on:
+  schedule:
+    - cron: '0 3 * * 1'   # Every Monday at 03:00 UTC
+  workflow_dispatch:        # Allow manual trigger for ad-hoc runs
+
+name: GHCR cleanup
+
+# Deletes old :main-<sha7> container image versions from GHCR, keeping the
+# 20 most recent snapshots. Versioned releases (:v*, :0.*, :latest) are
+# never touched — any version whose tags include a match for '^(v\d|[0-9]|latest)'
+# is excluded from deletion.
+
+jobs:
+  cleanup:
+    name: cleanup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: coxswain
+          package-type: container
+          min-versions-to-keep: 20
+          ignore-versions: '^(v\d|[0-9]|latest)'
