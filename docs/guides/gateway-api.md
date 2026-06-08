@@ -14,14 +14,6 @@ Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io
 !!! warning "Not supported"
     `TCPRoute`, `TLSRoute`, `UDPRoute`, and `GRPCRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected. The `RequestMirror`, `ExtensionRef`, and `CORS` filters are silently skipped.
 
-## Compatibility matrix
-
-| Coxswain | Gateway API |
-|----------|-------------|
-| v0.1     | v1.5.x      |
-
-Install matching CRDs when upgrading Coxswain.
-
 ## GatewayClass
 
 A `GatewayClass` identifies a controller implementation. Coxswain claims the class whose `spec.controllerName` matches `coxswain-labs.dev/gateway-controller`.
@@ -54,9 +46,7 @@ kubectl get gatewayclass coxswain \
   -o jsonpath='{.status.supportedFeatures}' | tr ',' '\n'
 ```
 
-Features notably absent from the advertised list: `HTTPRouteRequestMirror`, `TLSRoute`, `TCPRoute`, `UDPRoute`, `GRPCRoute`.
-
-Implementation-specific capabilities such as `RegularExpression` path, header, and query matching are not advertised through `supportedFeatures` — the Gateway API spec does not define conformance flags for them. See the [path matching](#path-matching) section for Coxswain's regex dialect and anchoring semantics.
+Implementation-specific capabilities — such as `RegularExpression` path, header, and query matching — are not listed in `supportedFeatures`. The Gateway API spec does not define conformance flags for them; they are supported under Coxswain's own dialect. See [Implementation-specific matching](#implementation-specific-matching).
 
 ## Gateway
 
@@ -260,7 +250,7 @@ The route must be in the same namespace as the Gateway, or the Gateway must set 
 |--------|-----------|
 | `PathPrefix` | Matches requests whose path starts with the given value |
 | `Exact` | Matches only the exact path |
-| `RegularExpression` | Anchored full-path match; dialect: Rust `regex` crate (RE2-like — no backreferences, no lookaround). Implementation-specific per Gateway API spec. |
+| `RegularExpression` | Anchored full-path match. Implementation-specific — see [below](#implementation-specific-matching). |
 
 ```yaml
 rules:
@@ -303,6 +293,55 @@ rules:
       - name: read-service
         port: 80
 ```
+
+### Implementation-specific matching
+
+`RegularExpression` is supported for path, header, and query-parameter matching. These match types are not covered by the Gateway API conformance suite — the spec marks them as implementation-specific and defines no feature flag for them.
+
+**Dialect:** Rust [`regex`](https://docs.rs/regex) crate — RE2-like syntax. No backreferences, no lookaround. Patterns are case-sensitive by default.
+
+**Path regex** — anchored to the full request path (`^(?:pattern)$` internally). Does not match the query string.
+
+```yaml
+rules:
+  - matches:
+      - path:
+          type: RegularExpression
+          value: "/item/[0-9]+"     # matches /item/42, not /item/abc or /prefix/item/42
+    backendRefs:
+      - name: api-service
+        port: 8080
+```
+
+**Header regex** — tested against the full header value, unanchored (matches if the pattern appears anywhere in the value). Use `^` and `$` to anchor explicitly.
+
+```yaml
+rules:
+  - matches:
+      - headers:
+          - name: X-Tenant
+            type: RegularExpression
+            value: "^(acme|globex)$"   # matches exactly "acme" or "globex"
+    backendRefs:
+      - name: multi-tenant-service
+        port: 80
+```
+
+**Query param regex** — same unanchored semantics as header regex.
+
+```yaml
+rules:
+  - matches:
+      - queryParams:
+          - name: version
+            type: RegularExpression
+            value: "v[0-9]+"           # matches v1, v2, v12, ...
+    backendRefs:
+      - name: versioned-service
+        port: 80
+```
+
+An HTTPRoute with a syntactically invalid regex pattern is rejected: Coxswain sets `Accepted: False` with reason `UnsupportedValue` on the affected parentRef.
 
 ### Wildcard hostnames
 
