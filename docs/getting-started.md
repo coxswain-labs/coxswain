@@ -2,6 +2,9 @@
 
 This guide installs Coxswain into an existing cluster, creates a `GatewayClass`, deploys a test `HTTPRoute`, and verifies traffic flows end-to-end. It takes about 10 minutes.
 
+!!! warning "Early development"
+    Coxswain is under active development and not yet ready for production. Use this walkthrough on a sandbox cluster.
+
 ## Prerequisites
 
 - Kubernetes 1.30 or later
