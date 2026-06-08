@@ -54,7 +54,9 @@ kubectl get gatewayclass coxswain \
   -o jsonpath='{.status.supportedFeatures}' | tr ',' '\n'
 ```
 
-Features notably absent from the advertised list: `HTTPRouteRegularExpressionPathMatch`, `HTTPRouteRequestMirror`, `TLSRoute`, `TCPRoute`, `UDPRoute`, `GRPCRoute`.
+Features notably absent from the advertised list: `HTTPRouteRequestMirror`, `TLSRoute`, `TCPRoute`, `UDPRoute`, `GRPCRoute`.
+
+Implementation-specific capabilities such as `RegularExpression` path, header, and query matching are not advertised through `supportedFeatures` — the Gateway API spec does not define conformance flags for them. See the [path matching](#path-matching) section for Coxswain's regex dialect and anchoring semantics.
 
 ## Gateway
 
