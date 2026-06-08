@@ -66,8 +66,14 @@ jobs:
           ALIASES="${{ steps.version.outputs.aliases }}"
           if [ -n "$ALIASES" ]; then
             mike deploy --branch _staging --update-aliases "$VERSION" $ALIASES
+            # Tagged release: 'stable' alias now exists; make it the landing page
+            mike set-default --branch _staging stable
           else
             mike deploy --branch _staging "$VERSION"
+            # Pre-release: only point root at 'dev' if no 'stable' has shipped yet
+            if ! mike list --branch _staging | grep -q '\[stable\]'; then
+              mike set-default --branch _staging dev
+            fi
           fi
 
       - name: Export staged docs
@@ -75,7 +81,7 @@ jobs:
           set -euo pipefail
           git worktree add /tmp/staged _staging
 
-      - name: Checkout org-level Pages repo
+      - name: Checkout org-level pages repo
         uses: actions/checkout@v6
         with:
           repository: coxswain-labs/coxswain-labs.github.io
