@@ -66,11 +66,11 @@ nav:
     - Helm: installation/helm.md
     - Kustomize: installation/kustomize.md
     - Raw manifests: installation/manifests.md
-    - Going to production: installation/going-to-production.md
   - Guides:
     - Ingress: guides/ingress.md
     - Gateway API: guides/gateway-api.md
     - TLS: guides/tls.md
+    - Running in production: guides/running-in-production.md
     - Verifying releases: guides/verifying-releases.md
     - Troubleshooting: guides/troubleshooting.md
   - Reference:

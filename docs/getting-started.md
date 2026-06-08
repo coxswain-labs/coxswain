@@ -159,4 +159,4 @@ curl -H "Host: echo.example.com" http://<proxy-address>/
 
 - **Ingress** — see the [Ingress guide](guides/ingress.md) to use classic `Ingress` resources alongside Gateway API.
 - **TLS** — see the [TLS guide](guides/tls.md) to add HTTPS with cert-manager or a manual Secret.
-- **Production** — see [Going to production](installation/going-to-production.md) before going live.
+- **Production** — see [Running in production](guides/running-in-production.md) before going live.
