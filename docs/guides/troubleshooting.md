@@ -5,7 +5,7 @@
 Most commands below query the admin port. Open a port-forward in a separate terminal first: 
 
 ```bash
-kubectl -n coxswain-system port-forward svc/coxswain 8082:8082
+kubectl -n coxswain-system port-forward svc/coxswain-internal 8082:8082
 ```
 
 ## `/readyz` returns 503 on startup
@@ -45,7 +45,7 @@ A subsystem stuck in `Pending` looks like this — `httproute` hasn't seen its f
 
 Common causes:
 - Gateway API CRDs not installed — install with `kubectl apply -f .../standard-install.yaml`
-- RBAC is missing a permission — check `kubectl -n coxswain-system logs deploy/coxswain` for `forbidden` errors
+- RBAC is missing a permission — check `kubectl -n coxswain-system logs -l app.kubernetes.io/name=coxswain` for `forbidden` errors
 
 ## Routes are not being picked up
 
@@ -99,7 +99,7 @@ kubectl -n coxswain-system get lease
 
 If the `HOLDER` column is empty or the lease is expired, no replica has claimed leadership. Common causes:
 
-- All replicas are crashing before they can acquire the lease — check `kubectl -n coxswain-system logs deploy/coxswain`.
+- All replicas are crashing before they can acquire the lease — check `kubectl -n coxswain-system logs -l app.kubernetes.io/name=coxswain`.
 - Clock skew between nodes — a Lease TTL of 15 s assumes clocks are synchronised within a few seconds.
 
 ## High memory usage

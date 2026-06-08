@@ -72,4 +72,9 @@ flowchart LR
 
 ## Readiness
 
-`/readyz` returns 200 only after every subsystem has reported ready. During startup this means: all Kubernetes reflectors have completed their initial list (CRDs must be installed and RBAC must be correct), and the routing table has been built at least once. `/readyz` returning 503 on a running pod is a signal that something is wrong — inspect `/status` to see which subsystem is blocked.
+`/readyz` returns 200 only after every subsystem has reported ready. On a freshly started pod this requires:
+
+- All Kubernetes reflectors have completed their initial list — CRDs must be installed and RBAC must be correct.
+- The routing table has been built at least once.
+
+If `/readyz` returns 503 on a running pod, something is wrong. Inspect `/status` to see which subsystem is blocked.

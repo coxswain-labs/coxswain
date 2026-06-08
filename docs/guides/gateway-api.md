@@ -98,7 +98,7 @@ This differs from Ingress wildcard behaviour, which matches exactly one label pe
 |--------|-------------|
 | `PathPrefix` | Matches requests starting with the given path |
 | `Exact` | Matches only the exact path |
-| `RegularExpression` | Not supported in v0.1 |
+| `RegularExpression` | Full |
 
 ### Header matching
 

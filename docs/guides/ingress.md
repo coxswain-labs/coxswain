@@ -113,9 +113,8 @@ rules:
 
 ## Supported annotations
 
-Coxswain respects the following `coxswain-labs.dev/*` annotations on `Ingress` objects:
-
-_(No annotations are defined yet for v0.1. The annotation namespace `coxswain-labs.dev/` is reserved for future per-Ingress configuration. Standard `kubernetes.io/ingress.*` annotations are not supported.)_
+!!! note
+    No annotations are defined yet. The `coxswain-labs.dev/` namespace is reserved for future per-Ingress configuration. Standard `kubernetes.io/ingress.*` annotations are not supported.
 
 ## Status
 
@@ -146,5 +145,5 @@ Most `nginx.ingress.kubernetes.io/` annotations have no direct Coxswain equivale
 | `spec.rules[].http.paths[].pathType` | `Prefix`, `Exact`, `ImplementationSpecific` |
 | `spec.tls[].hosts` | Full |
 | `spec.tls[].secretName` | Full |
-| `spec.defaultBackend` | Not yet supported (v0.1) |
+| `spec.defaultBackend` | Service backends only; Resource backends are skipped |
 | `spec.rules[].http.paths[].backend.resource` | Not supported |

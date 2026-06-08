@@ -12,11 +12,24 @@ helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --set replicaCount=2
 ```
 
-The default Helm chart includes a `PodDisruptionBudget` (`maxUnavailable: 1`) and pod anti-affinity to spread replicas across nodes. Verify both are in place:
+The default Helm chart includes a `PodDisruptionBudget` (`maxUnavailable: 1`). Verify it is in place:
 
 ```bash
 kubectl -n coxswain-system get pdb
-kubectl -n coxswain-system get deploy coxswain -o jsonpath='{.spec.template.spec.affinity}'
+```
+
+Pod anti-affinity is not set by default. Add it via your `values.yaml` to spread replicas across nodes:
+
+```yaml
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: coxswain
 ```
 
 ## Resource requests and limits
