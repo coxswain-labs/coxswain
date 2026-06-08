@@ -59,15 +59,15 @@ Coxswain watches all `kubernetes.io/tls` Secrets. When a Secret is created, upda
 
 ```mermaid
 flowchart LR
-    A([TCP connection]) --> B{HTTPS?}
-    B -->|yes| C[SNI handshake]
+    A([TCP\nconnection]) --> B{HTTPS?}
+    B -->|yes| C[SNI handshake\nselects certificate]
     B -->|no| D
-    C --> D[Read host/path/query]
-    D --> E[Load routing table]
-    E --> F[Host + rule matching]
+    C --> D[Read host,\npath and query]
+    D --> E[Load routing\ntable snapshot]
+    E --> F[Host + rule\nmatching]
     F -->|no match| G([404 / 503])
-    F -->|match| H[Round-robin upstream]
-    H --> I([Forward & respond])
+    F -->|match| H[Round-robin\nupstream pick]
+    H --> I([Forward request\nreturn response])
 ```
 
 ## Readiness
