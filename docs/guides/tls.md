@@ -105,10 +105,10 @@ A ready-to-apply example with a self-signed issuer lives in [`deploy/examples/tl
 
 #### HTTP-01 challenge passthrough
 
-When using an ACME HTTP-01 solver, cert-manager temporarily creates an `Ingress` with the challenge path `/.well-known/acme-challenge/<token>`. Coxswain picks up this Ingress, routes the challenge to cert-manager's solver pod, and removes the route once the challenge completes. No manual configuration is required.
+When using an ACME HTTP-01 solver, cert-manager temporarily creates an `Ingress` with the challenge path `/.well-known/acme-challenge/<token>`. Coxswain should pick up this `Ingress` and route the challenge to cert-manager's solver pod automatically.
 
-!!! important
-    Set `--status-address` to the proxy's external IP or hostname. Without it, cert-manager cannot resolve the HTTP-01 challenge because `Ingress.status` is empty.
+!!! warning "Not yet verified"
+    HTTP-01 passthrough is architecturally expected to work but has not been explicitly tested against a real ACME CA. Tracked in [#184](https://github.com/coxswain-labs/coxswain/issues/184). `--status-address` is a hard requirement — without it `Ingress.status` is empty and cert-manager cannot locate the challenge endpoint.
 
 ### Gateway API with cert-manager
 

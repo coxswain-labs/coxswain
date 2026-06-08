@@ -1,5 +1,8 @@
 # Observability reference
 
+!!! warning "Work in progress"
+    The metrics listed below are the intended v0.2 reference. The `/metrics` endpoint exists but currently exposes only a minimal set. Full per-request and routing-table metrics land in [#20](https://github.com/coxswain-labs/coxswain/issues/20); access logging in [#21](https://github.com/coxswain-labs/coxswain/issues/21). This page will be updated as each issue is closed.
+
 ## Metrics
 
 Coxswain exposes Prometheus metrics at `http://<admin-address>:<admin-port>/metrics` (default port `8082`).
@@ -51,7 +54,7 @@ Coxswain exposes Prometheus metrics at `http://<admin-address>:<admin-port>/metr
 1. All Kubernetes reflectors emit their first `InitDone` event (CRDs must be installed)
 2. The routing table is built for the first time
 
-Inspect the per-subsystem detail via the admin port:
+Inspect the per-subsystem detail via the admin port (open `kubectl -n coxswain-system port-forward svc/coxswain 8082:8082` in a separate terminal first):
 
 ```bash
 curl -s http://localhost:8082/status | jq .

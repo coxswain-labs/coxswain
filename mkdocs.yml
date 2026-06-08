@@ -74,3 +74,4 @@ nav:
     - Observability: reference/observability.md
   - Architecture: architecture.md
   - FAQ: faq.md
+  - Troubleshooting: troubleshooting.md
