@@ -496,14 +496,9 @@ async fn proxy_protocol_strict_drop() -> anyhow::Result<()> {
 
 /// Verifies wildcard Ingress (`*.wildcard.{ns}.local`) routing behavior.
 ///
-/// Per the Gateway API `Hostname` type spec (which coxswain uses for all
-/// hostname matching), `*.wildcard.local` matches any number of subdomain
-/// labels, not just one.  This means both `api.wildcard.local` (single-label)
-/// and `nested.api.wildcard.local` (multi-label) are served by the same rule.
-///
-/// Note: the Kubernetes Ingress spec says `*` occupies exactly one DNS label,
-/// but Gateway API requires multi-level matching for its CORE conformance
-/// tests.  Coxswain's shared routing table uses multi-level semantics.
+/// The Kubernetes Ingress spec requires `*.example.com` to match exactly one DNS label,
+/// so `api.wildcard.{ns}.local` (single-label) is served but
+/// `nested.api.wildcard.{ns}.local` (multi-label) must return 404.
 #[tokio::test]
 async fn wildcard_host() -> anyhow::Result<()> {
     common::init_tracing();
@@ -518,15 +513,18 @@ async fn wildcard_host() -> anyhow::Result<()> {
     )
     .await?;
 
+    // Single-label subdomain must match per both Ingress spec and Gateway API spec.
     let host = format!("api.wildcard.{}.local", ns.name);
     let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-c");
 
-    // Multi-label prefixes also match — per Gateway API spec, `*` matches any
-    // number of labels.  Both single- and multi-level subdomains are served.
+    // Multi-label subdomain must NOT match — Ingress spec restricts `*` to one label.
     let nested = format!("nested.api.wildcard.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.http, &nested, "/", Duration::from_secs(30)).await?;
-    resp.assert_backend("echo-c");
+    let status = h.http.get_status(&nested, "/").await?;
+    assert_eq!(
+        status, 404,
+        "Ingress wildcard must not match multi-label subdomains"
+    );
 
     Ok(())
 }

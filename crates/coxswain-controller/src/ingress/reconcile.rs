@@ -6,7 +6,7 @@ use super::class::claimed_ingress_class;
 use super::ports::IngressPorts;
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
-use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder};
+use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, WildcardKind};
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
@@ -125,7 +125,7 @@ impl IngressReconciler {
                 for &listener_port in &ports {
                     let host_builder = builder
                         .for_port(listener_port)
-                        .host_for(rule.host.as_deref());
+                        .host_for(rule.host.as_deref(), WildcardKind::SingleLabel);
                     match path_rule.path_type.as_str() {
                         "Exact" => {
                             host_builder.add_exact_route(path, Arc::clone(&e));
@@ -175,12 +175,12 @@ impl IngressReconciler {
                             for rule in rules {
                                 builder
                                     .for_port(listener_port)
-                                    .host_for(rule.host.as_deref())
+                                    .host_for(rule.host.as_deref(), WildcardKind::SingleLabel)
                                     .add_prefix_route("/", make_entry());
                             }
                             builder
                                 .for_port(listener_port)
-                                .host_for(None)
+                                .host_for(None, WildcardKind::SingleLabel)
                                 .add_prefix_route("/", make_entry());
                         }
                     }

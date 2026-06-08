@@ -1,7 +1,7 @@
 //! Builders for [`RoutingTable`][super::RoutingTable] and per-port/host routers.
 
 use crate::routing::entry::RouteConflict;
-use crate::routing::host_router::{HostRouter, HostRouterBuilder};
+use crate::routing::host_router::{HostRouter, HostRouterBuilder, WildcardKind};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
@@ -11,8 +11,9 @@ use super::{PortRoutingTable, RouterError, RoutingTable};
 #[derive(Default)]
 pub struct PortTableBuilder {
     exact_hosts: HashMap<String, HostRouterBuilder>,
-    /// Keyed by suffix (e.g. `"example.com"` for the pattern `"*.example.com"`).
-    wildcard_hosts: HashMap<String, HostRouterBuilder>,
+    /// Keyed by `(suffix, WildcardKind)` so the same suffix can be registered
+    /// with Ingress (single-label) and Gateway API (multi-label) semantics independently.
+    wildcard_hosts: HashMap<(String, WildcardKind), HostRouterBuilder>,
     catchall: Option<HostRouterBuilder>,
 }
 
@@ -22,12 +23,15 @@ impl PortTableBuilder {
         self.exact_hosts.entry(hostname.to_string()).or_default()
     }
 
-    /// Returns the `HostRouterBuilder` for a wildcard hostname pattern.
+    /// Returns the `HostRouterBuilder` for a wildcard hostname pattern with the given semantics.
     ///
     /// `pattern` must be in `*.example.com` form; the `*.` prefix is stripped internally.
-    pub fn wildcard_host(&mut self, pattern: &str) -> &mut HostRouterBuilder {
+    /// The same suffix registered with different `WildcardKind` values produces separate entries.
+    pub fn wildcard_host(&mut self, pattern: &str, kind: WildcardKind) -> &mut HostRouterBuilder {
         let suffix = pattern.trim_start_matches("*.");
-        self.wildcard_hosts.entry(suffix.to_string()).or_default()
+        self.wildcard_hosts
+            .entry((suffix.to_string(), kind))
+            .or_default()
     }
 
     /// Returns the `HostRouterBuilder` for the catch-all domain (`*`).
@@ -37,11 +41,12 @@ impl PortTableBuilder {
 
     /// Dispatches to `exact_host`, `wildcard_host`, or `catchall` based on `host`.
     ///
-    /// `None` → catchall, `Some("*.foo.com")` → wildcard, `Some("foo.com")` → exact.
-    pub fn host_for(&mut self, host: Option<&str>) -> &mut HostRouterBuilder {
+    /// `None` → catchall, `Some("*.foo.com")` → wildcard with `kind`, `Some("foo.com")` → exact.
+    /// `kind` is only used for wildcard patterns; it is ignored for exact and catchall entries.
+    pub fn host_for(&mut self, host: Option<&str>, kind: WildcardKind) -> &mut HostRouterBuilder {
         match host {
             None => self.catchall(),
-            Some(h) if h.starts_with("*.") => self.wildcard_host(h),
+            Some(h) if h.starts_with("*.") => self.wildcard_host(h, kind),
             Some(h) => self.exact_host(h),
         }
     }
@@ -62,16 +67,23 @@ impl PortTableBuilder {
             })
             .collect::<Result<HashMap<_, _>, RouterError>>()?;
 
-        let mut wildcard_hosts: Vec<(String, HostRouter)> = self
+        let mut wildcard_hosts: Vec<(String, WildcardKind, HostRouter)> = self
             .wildcard_hosts
             .into_iter()
-            .map(|(suffix, b)| {
+            .map(|((suffix, kind), b)| {
                 let (router, cs) = b.build()?;
                 conflicts.extend(cs.into_iter().map(|c| RouteConflict { port, ..c }));
-                Ok((suffix, router))
+                Ok((suffix, kind, router))
             })
             .collect::<Result<Vec<_>, RouterError>>()?;
-        wildcard_hosts.sort_by_key(|e| Reverse(e.0.len()));
+        // Longest suffix first for specificity. Among equal-length suffixes, SingleLabel sorts
+        // before MultiLabel so the more-restrictive Ingress entry wins on ties.
+        wildcard_hosts.sort_by_key(|(s, k, _)| {
+            (
+                Reverse(s.len()),
+                matches!(k, WildcardKind::MultiLabel) as u8,
+            )
+        });
 
         let catchall = match self.catchall {
             Some(b) => {
