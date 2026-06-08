@@ -15,7 +15,7 @@ workspace = true
 
 [features]
 # Expose alpha Gateway API resources and experimental fields. For contributor/CI
-# use only — never enabled in release builds. See docs/gateway-api-support.md.
+# use only — never enabled in release builds. See docs/guides/gateway-api.md.
 experimental = ["coxswain-controller/experimental", "gateway-api/experimental"]
 
 [dependencies]
