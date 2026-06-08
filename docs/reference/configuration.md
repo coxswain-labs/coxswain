@@ -66,10 +66,12 @@ Coxswain is configured via environment variables. Every setting has a `COXSWAIN_
 
 | Port | Default | Env var | Endpoints |
 |------|---------|---------|-----------|
-| HTTP proxy | `80` | `COXSWAIN_PROXY_HTTP_PORT` | Inbound HTTP data plane |
-| HTTPS proxy | `443` | `COXSWAIN_PROXY_HTTPS_PORT` | Inbound HTTPS data plane (SNI TLS) |
+| HTTP proxy | _(none)_ | `COXSWAIN_PROXY_HTTP_PORT` | Inbound HTTP data plane |
+| HTTPS proxy | _(none)_ | `COXSWAIN_PROXY_HTTPS_PORT` | Inbound HTTPS data plane (SNI TLS) |
 | Health | `8081` | `COXSWAIN_HEALTH_PORT` | `/healthz`, `/readyz` |
 | Admin | `8082` | `COXSWAIN_ADMIN_PORT` | `/metrics`, `/routes`, `/status` |
+
+The proxy listeners are disabled unless their port is explicitly set. The Helm chart defaults `proxy.httpPort` to `80` and `proxy.httpsPort` to `443`.
 
 !!! note
     There is currently one bind address (`COXSWAIN_PROXY_BIND_ADDRESS`) shared by all listeners. Separate bind addresses for proxy vs. admin/health will be added in a future release.
