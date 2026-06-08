@@ -25,8 +25,8 @@ name: Release
 # `cargo release` is the canonical trigger for the tag path — it bumps the
 # version, runs the pre-release hook (bump-helm-version.sh), commits, and
 # pushes the v* tag, which lights up this workflow.
-# Main pushes publish a continuously-updated :main image for nightly testing
-# without overwriting :latest with possibly-broken commits.
+# Main pushes publish a :main snapshot on every merge so downstream consumers
+# always have a fresh image without overwriting :latest with unreleased code.
 #
 # Multi-arch build distributes across native runners (no QEMU) per
 # https://docs.docker.com/build/ci/github-actions/multi-platform/#distribute-build-across-multiple-runners
@@ -202,7 +202,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Scan image for HIGH/CRITICAL CVEs
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ghcr.io/${{ github.repository_owner }}/coxswain:${{ github.ref_name }}
           format: sarif
