@@ -5,8 +5,8 @@ Coxswain can be installed three ways. Choose the one that fits your workflow:
 | Method | When to use |
 |--------|-------------|
 | [Helm](helm.md) | Production; values-driven configuration, easy upgrades |
-| [Raw manifests](manifests.md) | Quick evaluations, GitOps without Helm, resource inspection |
-| [Local development](../getting-started.md) | Running the binary directly against a local cluster |
+| [Kustomize](kustomize.md) | GitOps without Helm; customise with overlays |
+| [Raw manifests](manifests.md) | Quick evaluations; no tooling beyond `kubectl` |
 
 ## Prerequisites
 
@@ -40,4 +40,4 @@ Default resource requests in the Helm chart:
 | CPU | 100m | 500m |
 | Memory | 64Mi | 256Mi |
 
-See the [Production checklist](production-checklist.md) for tuning guidance.
+See [Going to production](going-to-production.md) for tuning guidance.

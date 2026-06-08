@@ -57,6 +57,8 @@ markdown_extensions:
   - md_in_html
   - toc:
       permalink: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
 
 nav:
   - Home: index.md
@@ -64,8 +66,9 @@ nav:
   - Installation:
     - Overview: installation/index.md
     - Helm: installation/helm.md
+    - Kustomize: installation/kustomize.md
     - Raw manifests: installation/manifests.md
-    - Production checklist: installation/production-checklist.md
+    - Going to production: installation/going-to-production.md
   - Guides:
     - Ingress: guides/ingress.md
     - Gateway API: guides/gateway-api.md

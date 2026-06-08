@@ -26,14 +26,6 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/
       --namespace coxswain-system --create-namespace
     ```
 
-=== "Kustomize"
-
-    ```bash
-    kubectl apply -k "github.com/coxswain-labs/coxswain//deploy/manifests?ref=main"
-    ```
-
-    This installs from the `main` branch. For a version-pinned install, use the **Raw manifests** tab — the published `install.yaml` is built from a specific release tag. For local customisation, clone the repo and use `deploy/manifests/` as a Kustomize base.
-
 === "Raw manifests"
 
     ```bash
@@ -167,4 +159,4 @@ curl -H "Host: echo.example.com" http://<proxy-address>/
 
 - **Ingress** — see the [Ingress guide](guides/ingress.md) to use classic `Ingress` resources alongside Gateway API.
 - **TLS** — see the [TLS guide](guides/tls.md) to add HTTPS with cert-manager or a manual Secret.
-- **Production** — see the [Production checklist](installation/production-checklist.md) before going live.
+- **Production** — see [Going to production](installation/going-to-production.md) before going live.

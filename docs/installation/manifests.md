@@ -18,23 +18,6 @@ kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/latest/downl
 kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/download/v0.1.0/install.yaml
 ```
 
-## Apply individual manifests
-
-For GitOps workflows or when you need to review each resource:
-
-```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/download/standard-install.yaml
-kubectl apply -f deploy/manifests/namespace.yaml
-kubectl apply -f deploy/manifests/rbac.yaml
-kubectl apply -f deploy/manifests/gateway-class.yaml
-kubectl apply -f deploy/manifests/ingress-class.yaml
-kubectl apply -f deploy/manifests/service.yaml
-kubectl apply -f deploy/manifests/pdb.yaml
-kubectl apply -f deploy/manifests/deployment.yaml
-```
-
-`deploy/manifests/` is the canonical source; `install.yaml` is generated from it at release time.
-
 ## Upgrade
 
 ```bash
