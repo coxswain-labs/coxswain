@@ -6,6 +6,12 @@
 set -euo pipefail
 
 VERSION="${1:?usage: bump-helm-version.sh <version>}"
+
+if [[ "${DRY_RUN:-false}" == "true" ]]; then
+  echo "[dry-run] would bump charts/coxswain/Chart.yaml → version: ${VERSION}, appVersion: \"${VERSION}\""
+  exit 0
+fi
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CHART="$REPO_ROOT/charts/coxswain/Chart.yaml"
 
