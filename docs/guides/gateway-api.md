@@ -12,7 +12,7 @@ Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io
 | `ReferenceGrant` | `gateway.networking.k8s.io/v1beta1` | Cross-namespace backend and certificate access |
 
 !!! warning "Not supported"
-    `TCPRoute`, `TLSRoute`, `UDPRoute`, and `GRPCRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected. The `RequestMirror`, `ExtensionRef`, and `CORS` filters are silently skipped. `RegularExpression` path matching works but is not yet conformance-advertised (tracked in [#195](https://github.com/coxswain-labs/coxswain/issues/195)).
+    `TCPRoute`, `TLSRoute`, `UDPRoute`, and `GRPCRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected. The `RequestMirror`, `ExtensionRef`, and `CORS` filters are silently skipped.
 
 ## Compatibility matrix
 
@@ -258,7 +258,7 @@ The route must be in the same namespace as the Gateway, or the Gateway must set 
 |--------|-----------|
 | `PathPrefix` | Matches requests whose path starts with the given value |
 | `Exact` | Matches only the exact path |
-| `RegularExpression` | Works but not yet conformance-advertised ([#195](https://github.com/coxswain-labs/coxswain/issues/195)) |
+| `RegularExpression` | Anchored full-path match; dialect: Rust `regex` crate (RE2-like — no backreferences, no lookaround). Implementation-specific per Gateway API spec. |
 
 ```yaml
 rules:
