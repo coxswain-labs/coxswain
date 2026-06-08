@@ -32,9 +32,11 @@ name: Release
 # https://docs.docker.com/build/ci/github-actions/multi-platform/#distribute-build-across-multiple-runners
 #
 # Tag-push job graph:
-#   cargo-deny ──► build ──► publish-image ──► trivy-scan ──┬──► publish-kustomize
-#                                                           └──► publish-chart
-#   (cargo-deny gates all publishing; trivy-scan gates both release artifacts)
+#   cargo-deny ──┬──► build       ──┐
+#               └──► conformance ──┴──► publish-image ──► trivy-scan ──┬──► publish-kustomize
+#                                                                       └──► publish-chart
+#   (cargo-deny gates all publishing; conformance gates image publish;
+#    trivy-scan gates both release artifacts)
 jobs:
   cargo-deny:
     name: cargo-deny
@@ -116,9 +118,45 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  conformance:
+    name: conformance
+    needs: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-release-conformance-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-conformance-
+
+      - name: Build coxswain release binary
+        run: |
+          mkdir -p bin
+          cargo build --release --bin coxswain
+          cp target/release/coxswain bin/coxswain
+
+      - uses: ./.github/actions/run-conformance
+        id: conformance
+
+      - name: Upload conformance report as artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-report
+          path: conformance/reports/
+          if-no-files-found: ignore
+
   publish-image:
     name: publish-image
-    needs: build
+    needs: [build, conformance]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -292,8 +330,22 @@ jobs:
           grep -q "image: ghcr.io/coxswain-labs/coxswain:${GITHUB_REF_NAME}" install.yaml
           grep -q "imagePullPolicy: IfNotPresent" install.yaml
 
-      - name: Create GitHub Release and attach install.yaml
+      - name: Download conformance report
+        uses: actions/download-artifact@v7
+        with:
+          name: conformance-report
+          path: ./conformance-report/
+
+      - name: Resolve conformance report path
+        id: report
+        run: |
+          REPORT=$(ls ./conformance-report/gateway-api-conformance-*.yaml | head -1)
+          echo "path=${REPORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release and attach install.yaml + conformance report
         uses: softprops/action-gh-release@v3
         with:
-          files: install.yaml
+          files: |
+            install.yaml
+            ${{ steps.report.outputs.path }}
           generate_release_notes: true

@@ -1,25 +1,12 @@
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'crates/**'
-      - 'deploy/manifests/**'
-      - 'conformance/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.gateway-api-version'
-      - '.github/workflows/e2e.yml'
   pull_request:
     branches:
       - main
 
 name: E2E
 
-# The `pull_request` trigger has no workflow-level `paths:` filter (the `push:`
-# trigger keeps its filter — main-branch pushes aren't ruleset-gated). Three of
-# the jobs below (`e2e-ingress`, `e2e-gateway-api`, `e2e-gateway-api-conformance`)
-# are required status checks; a workflow-level path filter that excludes the
+# Three jobs below (`e2e-ingress`, `e2e-gateway-api`, `e2e-gateway-api-conformance`)
+# are required status checks. A workflow-level path filter that excludes the
 # whole workflow leaves those checks pending forever on docs-only PRs. Instead
 # we always start on PRs and gate the heavy jobs on the `changes` job. A job
 # whose `if:` evaluates to false reports `skipped`, which counts as success for
@@ -28,14 +15,11 @@ jobs:
   changes:
     name: changes
     runs-on: ubuntu-latest
-    # On `push:` events the workflow-level `paths:` filter has already gated
-    # us, so treat `code` as true. On `pull_request:` events run the filter.
     outputs:
-      code: ${{ steps.filter.outputs.code || 'true' }}
+      code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v6
-      - if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
@@ -215,9 +199,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # `contents: read` is needed by actions/checkout and the test step's
-    # `git describe`; `pull-requests: write` lets the "Post conformance
-    # report as PR comment" step append the report via `gh pr comment`.
+    # `contents: read` is needed by actions/checkout and the composite action's
+    # `git describe`; `pull-requests: write` lets the "Post conformance report
+    # as PR comment" step append the report via `gh pr comment`.
     # Declaring a `permissions:` block makes unlisted scopes default to
     # `none`, so list every scope the job actually uses.
     permissions:
@@ -226,91 +210,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: conformance/go.mod
-          cache-dependency-path: conformance/go.sum
-
-      - name: Create kind cluster
-        uses: helm/kind-action@v1
-        with:
-          cluster_name: coxswain-conformance
-
-      - name: Route pod CIDR to kind node
-        run: |
-          KIND_NODE_IP=$(docker inspect coxswain-conformance-control-plane \
-            --format '{{ (index .NetworkSettings.Networks "kind").IPAddress }}')
-          POD_CIDR=$(kubectl get node coxswain-conformance-control-plane \
-            -o jsonpath='{.spec.podCIDR}' 2>/dev/null)
-          POD_CIDR=${POD_CIDR:-10.244.0.0/16}
-          echo "Routing $POD_CIDR via $KIND_NODE_IP"
-          sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
-
-      - name: Read Gateway API version
-        id: gw-version
-        run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
-
-      - name: Pre-pull conformance backend images into kind
-        run: |
-          GW_VER=${{ steps.gw-version.outputs.version }}
-          docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER}
-          kind load docker-image gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER} \
-            --name coxswain-conformance
-
-      - name: Bootstrap cluster (CRDs, RBAC, GatewayClass)
-        run: |
-          kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/${{ steps.gw-version.outputs.version }}/standard-install.yaml
-          kubectl apply -f deploy/manifests/namespace.yaml
-          kubectl apply -f deploy/manifests/rbac.yaml
-          kubectl apply -f deploy/manifests/gateway-class.yaml
-          kubectl wait --for=condition=Established crd/gatewayclasses.gateway.networking.k8s.io --timeout=60s
-          kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io --timeout=60s
-
       - name: Download e2e binaries
         uses: actions/download-artifact@v7
         with:
           name: e2e-bins
           path: bin/
 
-      - name: Make coxswain executable
-        run: chmod +x bin/coxswain
-
-      - name: Start coxswain proxy
-        run: |
-          sudo KUBECONFIG="$HOME/.kube/config" ./bin/coxswain serve \
-            --proxy-bind-address 0.0.0.0 \
-            --proxy-http-port 80 \
-            --proxy-https-port 443 \
-            --health-port 8081 \
-            --admin-port 8082 \
-            --status-address 127.0.0.1 \
-            --log-format console \
-            --pod-name coxswain-conformance \
-            --pod-namespace coxswain-system \
-            --controller-lease-ttl 15s \
-            --controller-lease-renew-interval 5s \
-            &
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8081/readyz && break || true
-            sleep 2
-          done
-          curl -sf http://localhost:8081/readyz
-
-      - name: Run Gateway API conformance suite
+      - uses: ./.github/actions/run-conformance
         id: conformance
-        run: |
-          cd conformance
-          go mod tidy
-          REPORT_FILE="reports/standard-$(git describe --tags --always --dirty)-report.yaml"
-          go test -v -timeout 55m -run TestConformance \
-            -args \
-            --organization=coxswain-labs \
-            --project=coxswain \
-            --url=https://github.com/coxswain-labs/coxswain \
-            --version=$(git describe --tags --always --dirty) \
-            --report-output="${REPORT_FILE}" \
-            --cleanup-base-resources=true
-          echo "report_file=${REPORT_FILE}" >> "$GITHUB_OUTPUT"
 
       - name: Upload conformance report as artifact
         if: always()
@@ -321,7 +228,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Post conformance report as PR comment
-        if: ${{ always() && github.event_name == 'pull_request' && steps.conformance.outputs.report_file != '' }}
+        if: ${{ always() && steps.conformance.outputs.report-file != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -336,7 +243,7 @@ jobs:
           # report's `version:` field stops looking like a mystery hash.
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           MERGE_SHA: ${{ github.sha }}
-          REPORT_FILE: conformance/${{ steps.conformance.outputs.report_file }}
+          REPORT_FILE: ${{ steps.conformance.outputs.report-file }}
         run: |
           set -euo pipefail
           if [ ! -f "$REPORT_FILE" ]; then
@@ -359,15 +266,3 @@ jobs:
             printf '```\n'
           } > /tmp/conformance-comment.md
           gh pr comment "$PR_NUMBER" --body-file /tmp/conformance-comment.md
-
-      - name: Dump cluster state on failure
-        if: failure()
-        run: |
-          echo "=== Namespaces ==="
-          kubectl get namespaces
-          echo "=== Events (last 50) ==="
-          kubectl get events -A --sort-by=.lastTimestamp | tail -50
-          echo "=== Gateways ==="
-          kubectl get gateways -A -o wide
-          echo "=== HTTPRoutes ==="
-          kubectl get httproutes -A
