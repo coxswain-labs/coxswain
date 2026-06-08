@@ -1,0 +1,104 @@
+name: Docs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "requirements-docs.txt"
+      - ".github/workflows/docs.yml"
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build and publish docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv pip install --system -r requirements-docs.txt
+
+      - name: Determine version and aliases
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${{ github.ref_name }}"
+            # Strip leading 'v' and extract MAJOR.MINOR
+            VERSION="$(echo "$TAG" | sed 's/^v//' | cut -d. -f1-2)"
+            ALIASES="stable latest"
+          else
+            VERSION="dev"
+            ALIASES=""
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "aliases=$ALIASES" >> "$GITHUB_OUTPUT"
+
+      - name: Configure git for mike
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Build docs with mike (local staging branch)
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          ALIASES="${{ steps.version.outputs.aliases }}"
+          if [ -n "$ALIASES" ]; then
+            mike deploy --branch _staging --update-aliases "$VERSION" $ALIASES
+          else
+            mike deploy --branch _staging "$VERSION"
+          fi
+
+      - name: Export staged docs
+        run: |
+          set -euo pipefail
+          git worktree add /tmp/staged _staging
+
+      - name: Checkout org-level Pages repo
+        uses: actions/checkout@v6
+        with:
+          repository: coxswain-labs/coxswain-labs.github.io
+          token: ${{ secrets.GH_DOCS_PAT }}
+          path: org-pages
+
+      - name: Sync docs into coxswain/ subdirectory
+        run: |
+          # Remove the old coxswain/ subtree (preserves CNAME, index.html, other projects)
+          rm -rf org-pages/coxswain
+
+          # Copy the freshly built site
+          cp -r /tmp/staged/. org-pages/coxswain/
+
+          # Ensure the versions.json mike manifest is at the correct path
+          if [ -f /tmp/staged/versions.json ]; then
+            cp /tmp/staged/versions.json org-pages/coxswain/versions.json
+          fi
+
+      - name: Commit and push to org-level Pages repo
+        run: |
+          cd org-pages
+          git add coxswain/
+          if git diff --cached --quiet; then
+            echo "No documentation changes to publish."
+            exit 0
+          fi
+          git commit -m "docs(coxswain): publish ${{ steps.version.outputs.version }} from ${{ github.sha }}"
+          git push

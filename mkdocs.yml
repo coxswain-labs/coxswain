@@ -1,0 +1,81 @@
+site_name: Coxswain
+site_url: https://docs.coxswain-labs.dev/coxswain/
+site_description: A pure-Rust Kubernetes Ingress & Gateway API controller backed by Pingora.
+repo_name: coxswain-labs/coxswain
+repo_url: https://github.com/coxswain-labs/coxswain
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.sections
+    - navigation.top
+    - toc.integrate
+    - content.code.copy
+    - content.tabs.link
+
+plugins:
+  - search
+  - mike:
+      version_selector: true
+      canonical_version: stable
+
+extra:
+  version:
+    provider: mike
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/coxswain-labs/coxswain
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Installation:
+    - Overview: installation/index.md
+    - Helm: installation/helm.md
+    - Kustomize: installation/kustomize.md
+    - Raw manifests: installation/manifests.md
+  - Guides:
+    - Ingress: guides/ingress.md
+    - Gateway API: guides/gateway-api.md
+    - TLS: guides/tls.md
+    - Running in production: guides/running-in-production.md
+    - Verifying releases: guides/verifying-releases.md
+    - Troubleshooting: guides/troubleshooting.md
+  - Reference:
+    - Configuration: reference/configuration.md
+    - Observability: reference/observability.md
+  - Architecture: architecture.md
+  - FAQ: faq.md
+

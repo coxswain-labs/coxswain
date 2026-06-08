@@ -7,3 +7,6 @@
 .wip/
 conformance/reports/*.yaml
 target/
+site/
+_staging/
+.venv/

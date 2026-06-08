@@ -258,26 +258,64 @@ cd conformance && go vet ./...
 
 ---
 
-## CI secrets
+## Documentation site
 
-### `GH_LABELER_PAT` — PR labeler
+The docs site source lives in `docs/` with `mkdocs.yml` at the repo root. It is built with [mkdocs-material](https://squidfunk.github.io/mkdocs-material/) and versioned with [mike](https://github.com/jimporter/mike).
+
+### Preview locally
+
+```bash
+uv venv .venv
+uv pip install -r requirements-docs.txt
+source .venv/bin/activate
+mkdocs serve          # live-reload at http://localhost:8000
+mike serve            # serves the versioned site (requires a prior mike deploy)
+```
+
+`.venv/` is gitignored. The `--system` flag used in CI does not work on Homebrew-managed Python.
+
+### How versioning works
+
+- **Push to `main`** → publishes under the `dev` alias (always the latest unreleased docs).
+- **Push a tag `vX.Y.Z`** → publishes under the `X.Y` key and updates the `stable` alias.
+- Patches overwrite their minor version key (`0.1.1` → `0.1`, same as `0.1.0`).
+- The site root redirects to `stable`.
+
+Publishing happens automatically via `.github/workflows/docs.yml`. The workflow pushes into the `coxswain/` subdirectory of the `coxswain-labs/coxswain-labs.github.io` org-level Pages repo using a cross-repo PAT.
+
+### CI secrets
+
+All PAT secrets are managed through a single script:
+
+```bash
+./scripts/refresh-pat.sh [labeler|docs]
+```
+
+Run without arguments to select interactively. The script prints the required PAT permissions before opening the GitHub token creation page.
+
+#### `GH_LABELER_PAT` — PR labeler
 
 The labeler workflow (`.github/workflows/label.yml`) uses a fine-grained PAT instead of `GITHUB_TOKEN` so that label events fired by the labeler can propagate to any downstream workflows. (`GITHUB_TOKEN`-generated events are deliberately blocked from triggering downstream workflows.) Label rules live in `.github/labeler.yml`.
 
-**Initial setup or renewal:**
-
-```bash
-./scripts/refresh-labeler-pat.sh
-```
-
-The script opens the GitHub PAT creation page in your browser, then updates the `GH_LABELER_PAT` repo secret via `gh secret set` once you paste the new token.
+**Initial setup or renewal:** `./scripts/refresh-pat.sh labeler`
 
 PAT settings:
 - Resource owner: `coxswain-labs`
 - Repository access: `coxswain-labs/coxswain` only
 - Permission: Pull requests → Read and write
 
-GitHub sends an email before the token expires. When you get it, run the script above to rotate it.
+#### `GH_DOCS_PAT` — docs publish
+
+The docs workflow (`.github/workflows/docs.yml`) needs write access to the org-level Pages repo to push the built site.
+
+**Initial setup or renewal:** `./scripts/refresh-pat.sh docs`
+
+PAT settings:
+- Resource owner: `coxswain-labs`
+- Repository access: `coxswain-labs/coxswain-labs.github.io` only
+- Permission: Contents → Read and write
+
+GitHub sends an email before tokens expire. When you get it, run the script above to rotate it.
 
 ---
 

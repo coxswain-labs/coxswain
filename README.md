@@ -8,6 +8,8 @@ Coxswain watches Kubernetes `Ingress` and `HTTPRoute` resources and dynamically 
 
 > **Note**: This project is currently in early development and not accepting external contributions. Bug reports and feature requests in issues are welcome; we'll revisit contribution guidelines as the project matures.
 
+**Documentation**: [docs.coxswain-labs.dev/coxswain](https://docs.coxswain-labs.dev/coxswain/) — installation guides, configuration reference, architecture overview, and FAQ.
+
 **Roadmap**: see the [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2) for current scope per milestone, with views by track, area, and status.
 
 ## Features
@@ -52,7 +54,7 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for the full local dev setup, including how
 ### TLS with cert-manager
 
 Coxswain integrates with cert-manager out of the box for both Ingress and Gateway API.
-See [docs/tls-cert-manager.md](docs/tls-cert-manager.md) for a step-by-step guide and ready-to-apply example manifests.
+See [docs/guides/tls.md](docs/guides/tls.md) for a step-by-step guide and ready-to-apply example manifests.
 
 ### In-cluster deployment
 
@@ -146,7 +148,7 @@ cosign verify \
   ghcr.io/coxswain-labs/charts/coxswain:0.1.0
 ```
 
-See [docs/verifying-releases.md](docs/verifying-releases.md) for full verification details, including SBOMs and policy enforcement with `cosign verify-blob`.
+See [docs/guides/verifying-releases.md](docs/guides/verifying-releases.md) for full verification details, including SBOMs and policy enforcement with `cosign verify-blob`.
 
 ## Authors
 
