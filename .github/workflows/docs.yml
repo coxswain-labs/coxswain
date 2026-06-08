@@ -56,8 +56,8 @@ jobs:
 
       - name: Configure git for mike
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Build docs with mike (local staging branch)
         run: |
@@ -90,12 +90,11 @@ jobs:
           # Copy the freshly built site
           cp -r /tmp/staged/. org-pages/coxswain/
 
-          # Ensure the versions.json mike manifest is at the correct path
-          if [ -f /tmp/staged/versions.json ]; then
-            cp /tmp/staged/versions.json org-pages/coxswain/versions.json
-          fi
+          # Strip the worktree's .git pointer — leaving it makes the parent repo
+          # treat coxswain/ as a nested git repository
+          rm -rf org-pages/coxswain/.git
 
-      - name: Commit and push to org-level Pages repo
+      - name: Commit and push to org-level pages repo
         run: |
           cd org-pages
           git add coxswain/
