@@ -19,7 +19,7 @@ impl GeneratedCert {
             .unwrap_or_else(|e| panic!("rcgen self-signed cert for {host}: {e}"));
         Self {
             cert_pem: certified.cert.pem(),
-            key_pem: certified.key_pair.serialize_pem(),
+            key_pem: certified.signing_key.serialize_pem(),
             host: host.to_string(),
         }
     }
@@ -33,7 +33,7 @@ impl GeneratedCert {
             .unwrap_or_else(|e| panic!("rcgen self-signed cert for {hosts:?}: {e}"));
         Self {
             cert_pem: certified.cert.pem(),
-            key_pem: certified.key_pair.serialize_pem(),
+            key_pem: certified.signing_key.serialize_pem(),
             host: hosts.first().map(|h| (*h).to_string()).unwrap_or_default(),
         }
     }
