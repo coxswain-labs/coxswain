@@ -6,7 +6,7 @@ on:
 name: Distribution
 
 # PR-time validation for distribution artifacts: Docker image and Helm chart.
-# Multi-arch image publishing lives in release.yml; OCI chart publishing in #28.
+# Multi-arch image and Helm chart OCI publishing live in release.yml (publish-image, publish-chart).
 #
 # Same gating pattern as ci.yml / e2e.yml: the workflow always starts so that
 # required status checks (smoke, helm-chart) report `skipped` success on PRs

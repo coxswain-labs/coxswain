@@ -7,7 +7,8 @@ on:
 
 name: Release
 
-# Publishes coxswain OCI images to ghcr.io and a rendered install.yaml to GitHub Releases.
+# Publishes coxswain OCI images and the Helm chart to ghcr.io, and attaches
+# a rendered install.yaml to every GitHub Release.
 #
 # Tag policy (hybrid):
 #   push: main         → :main, :main-<sha7>            (rolling main snapshot)
@@ -22,18 +23,34 @@ name: Release
 #                                                        versioned release)
 #
 # `cargo release` is the canonical trigger for the tag path — it bumps the
-# version, commits, and pushes the v* tag, which lights up this workflow.
+# version, runs the pre-release hook (bump-helm-version.sh), commits, and
+# pushes the v* tag, which lights up this workflow.
 # Main pushes publish a continuously-updated :main image for nightly testing
 # without overwriting :latest with possibly-broken commits.
 #
 # Multi-arch build distributes across native runners (no QEMU) per
 # https://docs.docker.com/build/ci/github-actions/multi-platform/#distribute-build-across-multiple-runners
 #
-# Tag pushes additionally create a GitHub Release with install.yaml — a
-# pre-rendered Kustomize manifest pinned to the exact release tag.
+# Tag-push job graph:
+#   cargo-deny ──► build ──► publish-image ──► trivy-scan ──┬──► publish-kustomize
+#                                                           └──► publish-chart
+#   (cargo-deny gates all publishing; trivy-scan gates both release artifacts)
 jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
   build:
     name: build (${{ matrix.platform }})
+    needs: cargo-deny
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -107,6 +124,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v6
 
@@ -154,9 +172,98 @@ jobs:
           docker buildx imagetools inspect \
             ghcr.io/${{ github.repository_owner }}/coxswain:${{ steps.meta.outputs.version }}
 
+      - name: Install cosign
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with cosign
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ github.repository_owner }}/coxswain:${{ github.ref_name }}
+
+  trivy-scan:
+    name: trivy-scan
+    needs: publish-image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan image for HIGH/CRITICAL CVEs
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/coxswain:${{ github.ref_name }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Upload scan results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+  publish-chart:
+    name: publish-chart
+    needs: [publish-image, trivy-scan]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: azure/setup-helm@v4
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Package chart
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          helm package charts/coxswain --version "${VERSION}" --app-version "${VERSION}"
+
+      - name: Push chart and sign
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PUSH_OUTPUT=$(helm push "coxswain-${VERSION}.tgz" \
+            "oci://ghcr.io/${{ github.repository_owner }}/charts" 2>&1)
+          echo "${PUSH_OUTPUT}"
+          DIGEST=$(echo "${PUSH_OUTPUT}" | grep "Digest:" | awk '{print $2}')
+          cosign sign --yes \
+            "ghcr.io/${{ github.repository_owner }}/charts/coxswain@${DIGEST}"
+
+      - name: Verify chart is pullable
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          helm show chart \
+            "oci://ghcr.io/${{ github.repository_owner }}/charts/coxswain" \
+            --version "${VERSION}"
+
   publish-kustomize:
     name: publish-kustomize
-    needs: publish-image
+    needs: [publish-image, trivy-scan]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
