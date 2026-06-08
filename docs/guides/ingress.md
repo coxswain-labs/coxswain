@@ -126,15 +126,6 @@ kubectl get ingress my-app
 # my-app   coxswain  app.example.com   203.0.113.10    80      1m
 ```
 
-## Migrating from nginx Ingress
-
-Most `nginx.ingress.kubernetes.io/` annotations have no direct Coxswain equivalent at v0.1. The migration path is:
-
-1. Replace `kubernetes.io/ingress.class: nginx` with `spec.ingressClassName: coxswain`.
-2. Remove nginx-specific annotations — Coxswain ignores them without error.
-3. For advanced features (rate limiting, custom headers, rewrites), use Gateway API `HTTPRoute` with policy attachments instead. See the [Gateway API guide](gateway-api.md).
-4. Test with a canary deployment before switching DNS.
-
 ## Supported fields
 
 | Field | Support |
