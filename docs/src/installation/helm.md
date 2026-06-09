@@ -13,7 +13,7 @@ helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --namespace coxswain-system --create-namespace
 ```
 
-To pin a specific version (replace `X.Y.Z` with the release you want):
+To pin a specific version:
 
 ```bash
 helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \

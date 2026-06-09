@@ -6,8 +6,6 @@ on:
       - main
     paths:
       - "docs/**"
-      - "mkdocs.yml"
-      - "requirements-docs.txt"
       - ".github/workflows/docs.yml"
     tags:
       - "v*.*.*"
@@ -37,7 +35,7 @@ jobs:
       - name: Install dependencies
         run: |
           uv venv
-          uv pip install -r requirements-docs.txt
+          uv pip install -r docs/requirements.txt
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Determine version and aliases
@@ -45,14 +43,19 @@ jobs:
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG="${{ github.ref_name }}"
-            # Strip leading 'v' and extract MAJOR.MINOR
-            VERSION="$(echo "$TAG" | sed 's/^v//' | cut -d. -f1-2)"
+            # Strip leading 'v'. PACKAGE is the full SemVer fed to the docs
+            # hook for placeholder substitution; VERSION is the MAJOR.MINOR
+            # snapshot label mike publishes under.
+            PACKAGE="${TAG#v}"
+            VERSION="$(echo "$PACKAGE" | cut -d. -f1-2)"
             ALIASES="stable latest"
           else
+            PACKAGE="main"
             VERSION="dev"
             ALIASES=""
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
           echo "aliases=$ALIASES" >> "$GITHUB_OUTPUT"
 
       - name: Configure git for mike
@@ -61,8 +64,11 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Build docs with mike (local staging branch)
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.package }}
         run: |
           set -euo pipefail
+          cd docs
           VERSION="${{ steps.version.outputs.version }}"
           ALIASES="${{ steps.version.outputs.aliases }}"
           if [ -n "$ALIASES" ]; then

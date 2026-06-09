@@ -260,19 +260,32 @@ cd conformance && go vet ./...
 
 ## Documentation site
 
-The docs site source lives in `docs/` with `mkdocs.yml` at the repo root. It is built with [mkdocs-material](https://squidfunk.github.io/mkdocs-material/) and versioned with [mike](https://github.com/jimporter/mike).
+The docs site is self-contained under `docs/`: pages live in `docs/src/`, the mkdocs config is `docs/mkdocs.yml`, Python deps are `docs/requirements.txt`, and the page hooks (currently just the `PACKAGE_VERSION` substitution) live under `docs/hooks/`. It is built with [mkdocs-material](https://squidfunk.github.io/mkdocs-material/) and versioned with [mike](https://github.com/jimporter/mike).
 
 ### Preview locally
 
 ```bash
+cd docs
 uv venv .venv
-uv pip install -r requirements-docs.txt
+uv pip install -r requirements.txt
 source .venv/bin/activate
 mkdocs serve          # live-reload at http://localhost:8000
 mike serve            # serves the versioned site (requires a prior mike deploy)
 ```
 
 `.venv/` is gitignored. The `--system` flag used in CI does not work on Homebrew-managed Python.
+
+The `PACKAGE_VERSION` env var drives a page hook that rewrites the `X.Y.Z`
+placeholders found in install and verification pages. Substitution only fires
+when `PACKAGE_VERSION` parses as a SemVer (e.g. `0.1.2`); on the `main` default
+(or any non-SemVer value) the placeholders are left literal, because several of
+the substituted commands (`helm --version`, GitHub release-asset URLs, signed
+chart tags) only have valid values for tagged releases. Set a SemVer to preview
+what a tagged release will render:
+
+```bash
+PACKAGE_VERSION=0.1.2 mkdocs serve
+```
 
 ### How versioning works
 

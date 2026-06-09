@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+
+{% block announce %}
+  {% if config.extra.dev_banner %}
+    &#9888; You are viewing development docs built from the <code>main</code> branch.
+    Install and verification examples use placeholder versions; see the
+    <a href="https://github.com/coxswain-labs/coxswain/releases/latest">latest release</a>
+    for stable instructions.
+  {% endif %}
+{% endblock %}

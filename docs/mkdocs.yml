@@ -4,8 +4,14 @@ site_description: A pure-Rust Kubernetes Ingress & Gateway API controller backed
 repo_name: coxswain-labs/coxswain
 repo_url: https://github.com/coxswain-labs/coxswain
 
+docs_dir: src
+
+hooks:
+  - hooks/version.py
+
 theme:
   name: material
+  custom_dir: overrides
   palette:
     - scheme: default
       primary: indigo

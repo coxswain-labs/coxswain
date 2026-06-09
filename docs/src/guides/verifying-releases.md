@@ -5,9 +5,6 @@ Every Coxswain release artifact — the OCI image and the Helm chart — is sign
 signing. Signing happens inside the GitHub Actions release workflow using the job's OIDC
 identity token; no long-lived private key is stored anywhere.
 
-The examples below use `vX.Y.Z` (image tag) and `X.Y.Z` (chart version) as placeholders.
-Substitute the release you are verifying.
-
 !!! note "Scope of attestation"
     Only image and chart signatures are produced today. SBOM attestation is not yet
     emitted by the release pipeline; treat absence of an SBOM as expected, not as
@@ -38,7 +35,7 @@ image is unsigned or the signature does not match the expected workflow identity
 ## Verify the Helm chart
 
 The Helm chart is published as an OCI artifact and signed at the same digest level. Note that the
-chart version does not carry the `v` prefix (e.g. `X.Y.Z`, not `vX.Y.Z`):
+chart tag does not carry the `v` prefix that the image tag uses:
 
 ```bash
 cosign verify \

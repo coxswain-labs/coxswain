@@ -10,3 +10,4 @@ target/
 site/
 _staging/
 .venv/
+__pycache__/
