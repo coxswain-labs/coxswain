@@ -38,7 +38,7 @@ concurrency:
 # Multi-arch build distributes across native runners (no QEMU) per
 # https://docs.docker.com/build/ci/github-actions/multi-platform/#distribute-build-across-multiple-runners
 #
-# Tag-push job graph:
+# Job graph (main: up to trivy-scan; tag: full pipeline):
 #   cargo-deny ──┬──► build       ──┐
 #               └──► conformance ──┴──► publish-image ──► trivy-scan ──┬──► publish-kustomize ──┐
 #                                                                       └──► publish-chart    ──┴──► publish-docs
@@ -227,7 +227,6 @@ jobs:
   trivy-scan:
     name: trivy-scan
     needs: publish-image
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -358,12 +357,12 @@ jobs:
 
   publish-docs:
     name: publish-docs
-    # Gating: skipped needs are treated as satisfied, failed needs block.
-    # On main: trivy-scan/publish-chart/publish-kustomize are skipped (their
-    # if: gate), so publish-docs runs after publish-image succeeds and
-    # publishes the dev snapshot. On tag: every needed job must succeed;
-    # a release break skips publish-docs and leaves the site unchanged.
+    # Run whenever no needed job failed and the workflow wasn't cancelled —
+    # skipped needs (publish-chart/publish-kustomize on main) don't block the
+    # unstable docs snapshot. A failure in publish-image or trivy-scan still
+    # skips publish-docs so a broken release never promotes the docs site.
     needs: [publish-image, trivy-scan, publish-chart, publish-kustomize]
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -396,7 +395,7 @@ jobs:
             ALIASES="stable latest"
           else
             PACKAGE="main"
-            VERSION="dev"
+            VERSION="unstable"
             ALIASES=""
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -422,9 +421,9 @@ jobs:
             mike set-default --branch _staging stable
           else
             mike deploy --branch _staging "$VERSION"
-            # Pre-release: only point root at 'dev' if no 'stable' has shipped yet
+            # Pre-release: only point root at 'unstable' if no 'stable' has shipped yet
             if ! mike list --branch _staging | grep -q '\[stable\]'; then
-              mike set-default --branch _staging dev
+              mike set-default --branch _staging unstable
             fi
           fi
 
