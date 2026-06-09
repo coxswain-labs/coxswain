@@ -26,7 +26,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: HTTP_PORT
+      port: GATEWAY_HTTP_PORT
       protocol: HTTP
 ---
 apiVersion: gateway.networking.k8s.io/v1

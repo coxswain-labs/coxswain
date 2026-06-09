@@ -39,7 +39,7 @@ mod route_events;
 #[cfg(test)]
 mod tests;
 
-pub use config::{ControllerConfig, ControllerConfigError, StatusAddress};
+pub use config::{ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress};
 
 use conditions::{gateway_accepted, http_route_programmed};
 use gateway_class_status::gateway_class_needs_status_patch;
@@ -99,7 +99,7 @@ impl Controller {
             LeaseLockParams {
                 holder_id: self.config.pod_name.clone(),
                 lease_name: LEASE_NAME.to_string(),
-                lease_ttl: self.config.lease_ttl,
+                lease_ttl: self.config.lease.ttl,
             },
         );
 
@@ -166,8 +166,8 @@ impl Controller {
 
         // interval_at delays the first tick so we don't double-acquire immediately.
         let mut renewal_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + self.config.lease_renew_interval,
-            self.config.lease_renew_interval,
+            tokio::time::Instant::now() + self.config.lease.renew_interval,
+            self.config.lease.renew_interval,
         );
 
         // Subscribe to the three health channels. Each `watch::Receiver` tracks its
@@ -294,13 +294,13 @@ impl Controller {
                                     .cloned()
                                     .unwrap_or_default();
                                 if gateway_needs_status_patch(&gw, &health) {
-                                    gateway_events::patch_gateway_status(&client, &gw, &health, self.config.status_address.as_ref()).await;
+                                    gateway_events::patch_gateway_status(&client, &gw, &health, self.config.status_address.as_ref(), self.config.ingress_ports).await;
                                 }
                             } else if is_leader && !gateway_accepted(&gw) {
                                 // Before synced: only ensure Accepted is set; defer Programmed.
                                 let empty_health = GatewayListenerHealth::default();
                                 if gateway_needs_status_patch(&gw, &empty_health) {
-                                    gateway_events::patch_gateway_status(&client, &gw, &empty_health, self.config.status_address.as_ref()).await;
+                                    gateway_events::patch_gateway_status(&client, &gw, &empty_health, self.config.status_address.as_ref(), self.config.ingress_ports).await;
                                 }
                             }
                         }
@@ -328,7 +328,7 @@ impl Controller {
                             .cloned()
                             .unwrap_or_default();
                         if gateway_needs_status_patch(gw, &health) {
-                            gateway_events::patch_gateway_status(&client, gw, &health, self.config.status_address.as_ref()).await;
+                            gateway_events::patch_gateway_status(&client, gw, &health, self.config.status_address.as_ref(), self.config.ingress_ports).await;
                         }
                     }
                 }

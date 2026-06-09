@@ -1,18 +1,61 @@
-use super::super::redirect::build_redirect_location;
-use super::*;
+//! Tests for the typed [`RoutingEngine`][crate::common::engine::RoutingEngine]
+//! and the redirect `Location` builder. The engine is structurally identical
+//! for Ingress and Gateway — these tests pin to the Gateway-flavored
+//! instantiation, which is sufficient since the lookup code is shared.
+
+use crate::common::engine::RoutingEngine;
+use crate::common::redirect::{RedirectOrigin, build_redirect_location};
 use coxswain_core::routing::{
-    FilterAction, HeaderMod, PathModifier, RequestContext, RouteEntry, RouteOutcome,
+    BackendGroup, FilterAction, GatewayRoutingTableBuilder, HeaderMod, PathModifier,
+    RequestContext, RouteEntry, RouteOutcome, SharedGatewayRoutingTable,
 };
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+const PORT: u16 = 80;
+
+fn make_group(name: &str, addr: &str) -> Arc<BackendGroup> {
+    Arc::new(BackendGroup::new(
+        name.to_string(),
+        vec![addr.parse::<SocketAddr>().unwrap()],
+    ))
+}
+
+fn entry(g: Arc<BackendGroup>) -> Arc<RouteEntry> {
+    Arc::new(RouteEntry::path_only(g, "default/svc".to_string(), None))
+}
+
+fn engine_with_table(
+    shared: SharedGatewayRoutingTable,
+) -> RoutingEngine<coxswain_core::routing::Gateway> {
+    RoutingEngine::new(shared)
+}
+
+fn origin(
+    scheme: &'static str,
+    host: &'static str,
+    port: u16,
+    path: &'static str,
+    query: Option<&'static str>,
+) -> RedirectOrigin<'static> {
+    RedirectOrigin {
+        scheme,
+        host,
+        port,
+        path,
+        query,
+    }
+}
 
 #[test]
 fn route_resolves_matched_host_and_path() {
     let upstream = make_group("default/backend", "10.0.0.1:8080");
-    let mut builder = RoutingTableBuilder::new();
+    let mut builder = GatewayRoutingTableBuilder::new();
     builder
         .for_port(PORT)
         .exact_host("example.com")
         .add_prefix_route("/", entry(upstream));
-    let shared = SharedRoutingTable::new();
+    let shared = SharedGatewayRoutingTable::new();
     shared.store(Arc::new(builder.build().unwrap()));
 
     let engine = engine_with_table(shared);
@@ -25,12 +68,12 @@ fn route_resolves_matched_host_and_path() {
 #[test]
 fn route_returns_none_for_unknown_host() {
     let upstream = make_group("default/backend", "10.0.0.1:8080");
-    let mut builder = RoutingTableBuilder::new();
+    let mut builder = GatewayRoutingTableBuilder::new();
     builder
         .for_port(PORT)
         .exact_host("example.com")
         .add_prefix_route("/", entry(upstream));
-    let shared = SharedRoutingTable::new();
+    let shared = SharedGatewayRoutingTable::new();
     shared.store(Arc::new(builder.build().unwrap()));
 
     let engine = engine_with_table(shared);
@@ -40,7 +83,7 @@ fn route_returns_none_for_unknown_host() {
 
 #[test]
 fn route_returns_none_on_empty_table() {
-    let engine = engine_with_table(SharedRoutingTable::new());
+    let engine = engine_with_table(SharedGatewayRoutingTable::new());
     let ctx = RequestContext::default();
     assert!(engine.route(PORT, "example.com", "/", &ctx).is_none());
 }
@@ -48,12 +91,12 @@ fn route_returns_none_on_empty_table() {
 #[test]
 fn upstream_with_no_endpoints_returns_none_from_next_endpoint() {
     let upstream = Arc::new(BackendGroup::new("default/empty".to_string(), vec![]));
-    let mut builder = RoutingTableBuilder::new();
+    let mut builder = GatewayRoutingTableBuilder::new();
     builder
         .for_port(PORT)
         .exact_host("example.com")
         .add_exact_route("/", entry(upstream));
-    let shared = SharedRoutingTable::new();
+    let shared = SharedGatewayRoutingTable::new();
     shared.store(Arc::new(builder.build().unwrap()));
 
     let engine = engine_with_table(shared);
@@ -193,12 +236,12 @@ fn find_returns_filters_alongside_upstream() {
         "default/svc".to_string(),
         None,
     ));
-    let mut builder = RoutingTableBuilder::new();
+    let mut builder = GatewayRoutingTableBuilder::new();
     builder
         .for_port(PORT)
         .exact_host("example.com")
         .add_prefix_route("/", entry);
-    let shared = SharedRoutingTable::new();
+    let shared = SharedGatewayRoutingTable::new();
     shared.store(Arc::new(builder.build().unwrap()));
 
     let engine = engine_with_table(shared);

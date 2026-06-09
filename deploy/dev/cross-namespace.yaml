@@ -8,12 +8,15 @@
 # Apply:
 #   kubectl apply -f deploy/dev/cross-namespace.yaml
 #
-# Test (coxswain proxy on localhost:80):
-#   curl -H "Host: cross-ns.local" http://localhost/   # hello from echo-d
+# The route attaches to the Gateway from deploy/dev/httproute.yaml, which now
+# listens on port 8000 (see that file's header for the rationale).
+#
+# Test (coxswain proxy with --proxy-http-port 80 plus Gateway on port 8000):
+#   curl -H "Host: cross-ns.local" http://localhost:8000/   # hello from echo-d
 #
 # Delete the grant to confirm denial:
 #   kubectl delete referencegrant allow-httproute-from-default -n echo-tenant
-#   curl -H "Host: cross-ns.local" http://localhost/   # 502 Bad Gateway
+#   curl -H "Host: cross-ns.local" http://localhost:8000/   # 502 Bad Gateway
 #
 # Restore the grant:
 #   kubectl apply -f deploy/dev/cross-namespace.yaml

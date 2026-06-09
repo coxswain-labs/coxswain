@@ -1,5 +1,7 @@
 #![allow(missing_docs)]
-use coxswain_core::routing::{BackendGroup, RequestContext, RouteEntry, RoutingTableBuilder};
+use coxswain_core::routing::{
+    BackendGroup, GatewayRoutingTableBuilder, RequestContext, RouteEntry, SharedGatewayRoutingTable,
+};
 use criterion::{Criterion, criterion_group, criterion_main};
 use http::{HeaderMap, Method};
 use std::net::SocketAddr;
@@ -19,9 +21,8 @@ fn make_entry(g: Arc<BackendGroup>) -> Arc<RouteEntry> {
     Arc::new(RouteEntry::path_only(g, "default/svc".to_string(), None))
 }
 
-fn build_table() -> coxswain_core::routing::SharedRoutingTable {
-    use coxswain_core::routing::SharedRoutingTable;
-    let mut b = RoutingTableBuilder::new();
+fn build_table() -> SharedGatewayRoutingTable {
+    let mut b = GatewayRoutingTableBuilder::new();
     let host = b.for_port(80).exact_host("example.com");
     for i in 0..20 {
         host.add_prefix_route(
@@ -29,7 +30,7 @@ fn build_table() -> coxswain_core::routing::SharedRoutingTable {
             make_entry(make_group(&format!("svc-{i}"), "10.0.0.1:80")),
         );
     }
-    let shared = SharedRoutingTable::default();
+    let shared = SharedGatewayRoutingTable::default();
     shared.store(Arc::new(b.build().unwrap_or_else(|e| panic!("{e}"))));
     shared
 }

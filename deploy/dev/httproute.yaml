@@ -12,16 +12,21 @@
 # *.wildcard.local — wildcard hostname; any subdomain routes to echo-c:
 #   /   → echo-c
 #
+# The Gateway listener uses port 8000 rather than 80 because, since the
+# IngressProxy and GatewayProxy split (issue #201), the two data planes bind
+# disjoint port sets. Ingress takes --proxy-http-port (conventionally 80);
+# Gateway listeners take whatever they declare.
+#
 # Apply:
 #   kubectl apply -f deploy/dev/httproute.yaml
 #
-# Test (coxswain proxy on localhost:80):
-#   curl -H "Host: echo.local" http://localhost/a         # hello from echo-a
-#   curl -H "Host: echo.local" http://localhost/b         # hello from echo-b
-#   curl -H "Host: echo.local" http://localhost/          # hello from echo-a
-#   curl -H "Host: split.local" http://localhost/         # alternates a/b
-#   curl -H "Host: split.local" http://localhost/         # alternates a/b
-#   curl -H "Host: foo.wildcard.local" http://localhost/  # hello from echo-c
+# Test (coxswain proxy with --proxy-http-port 80 plus Gateway on port 8000):
+#   curl -H "Host: echo.local" http://localhost:8000/a         # hello from echo-a
+#   curl -H "Host: echo.local" http://localhost:8000/b         # hello from echo-b
+#   curl -H "Host: echo.local" http://localhost:8000/          # hello from echo-a
+#   curl -H "Host: split.local" http://localhost:8000/         # alternates a/b
+#   curl -H "Host: split.local" http://localhost:8000/         # alternates a/b
+#   curl -H "Host: foo.wildcard.local" http://localhost:8000/  # hello from echo-c
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -32,7 +37,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: 80
+      port: 8000
       protocol: HTTP
       allowedRoutes:
         namespaces:

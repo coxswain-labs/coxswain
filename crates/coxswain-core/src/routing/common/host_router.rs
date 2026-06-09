@@ -1,9 +1,9 @@
 //! Per-host path router: exact, prefix, and regex path matching with predicate filtering.
 
-use crate::routing::entry::{
+use super::entry::{
     BackendGroup, FilterAction, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts,
 };
-use crate::routing::predicate::RequestContext;
+use super::predicate::RequestContext;
 use matchit::Router;
 use regex::RegexSet;
 use std::cmp::Reverse;
@@ -163,7 +163,9 @@ impl HostRouterBuilder {
         self
     }
 
-    pub(crate) fn build(self) -> Result<(HostRouter, Vec<RouteConflict>), super::RouterError> {
+    pub(crate) fn build(
+        self,
+    ) -> Result<(HostRouter, Vec<RouteConflict>), super::table::RouterError> {
         let mut router: Router<Box<[Arc<RouteEntry>]>> = Router::new();
         let mut route_info: Vec<RouteInfo> = Vec::new();
         let mut has_query_predicates = false;

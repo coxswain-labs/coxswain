@@ -6,7 +6,7 @@ use super::class::claimed_ingress_class;
 use super::ports::IngressPorts;
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
-use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, WildcardKind};
+use coxswain_core::routing::{BackendGroup, IngressRoutingTableBuilder, RouteEntry, WildcardKind};
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
@@ -29,7 +29,7 @@ impl IngressReconciler {
         owned_classes: &HashSet<String>,
         owned_default_class: Option<&str>,
         ports: IngressPorts,
-        builder: &mut RoutingTableBuilder,
+        builder: &mut IngressRoutingTableBuilder,
     ) {
         let claimed_class = claimed_ingress_class(ingress);
 

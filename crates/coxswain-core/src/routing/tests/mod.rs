@@ -7,6 +7,12 @@ mod routing;
 use super::*;
 use http::{HeaderMap, HeaderName};
 use std::net::SocketAddr;
+use std::sync::Arc;
+
+// Routing-logic tests are spec-agnostic — the per-rule machinery is identical
+// for Ingress and Gateway. Pin the tests to the Gateway-flavored builder so
+// the existing assertions on multi-label wildcards continue to make sense.
+type RoutingTableBuilder = GatewayRoutingTableBuilder;
 
 const PORT: u16 = 80;
 

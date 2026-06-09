@@ -33,7 +33,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
 use crate::SniCertSelector;
-use crate::proxy::{CONN_INFO, ConnectionInfo, Proxy};
+use crate::common::ctx::{CONN_INFO, ConnectionInfo};
+use pingora_proxy::ProxyHttp;
 
 /// Maximum number of in-flight per-connection tasks (PROXY header read + TLS handshake).
 /// Connections beyond this limit are dropped with a warning rather than queued.
@@ -170,22 +171,40 @@ impl ListenerSpec {
 /// Listens on one or more `(addr, protocol)` pairs, reads HAProxy PROXY protocol
 /// v1/v2 headers, and hands the resulting sessions to a shared [`HttpProxy`].
 ///
+/// Generic over the `ProxyHttp` implementation so that
+/// [`IngressProxy`][crate::ingress::IngressProxy] and
+/// [`GatewayProxy`][crate::gateway::GatewayProxy] each get their own acceptor
+/// instance with disjoint listeners.
+///
 /// Activated only when `--proxy-accept-proxy-protocol` is set. When the flag is
 /// off, the standard `http_proxy_service_with_name` path is used instead.
-pub struct ProxyAcceptor {
-    proxy: Arc<HttpProxy<Proxy>>,
+pub struct ProxyAcceptor<P>
+where
+    P: ProxyHttp + Send + Sync + 'static,
+    <P as ProxyHttp>::CTX: Send + Sync,
+{
+    proxy: Arc<HttpProxy<P>>,
     listeners: Vec<BoundListener>,
     trusted: Arc<TrustedSources>,
 }
 
-impl ProxyAcceptor {
+impl<P> ProxyAcceptor<P>
+where
+    P: ProxyHttp + Send + Sync + 'static,
+    <P as ProxyHttp>::CTX: Send + Sync,
+{
     /// Bind all listener sockets and build the TLS context.
     ///
     /// Binding is synchronous so that port-in-use and permission errors surface as
     /// a structured [`AcceptorBuildError`] before the Pingora runtime starts, rather
     /// than panicking inside an async task.
+    ///
+    /// # Errors
+    /// Returns [`AcceptorBuildError::BindFailed`] when a listen address cannot
+    /// be bound, or [`AcceptorBuildError::TlsAcceptorBuild`] when the TLS
+    /// acceptor builder cannot be initialised.
     pub fn new(
-        proxy: Arc<HttpProxy<Proxy>>,
+        proxy: Arc<HttpProxy<P>>,
         specs: Vec<ListenerSpec>,
         trusted: Arc<TrustedSources>,
         tls_selector: SniCertSelector,
@@ -240,7 +259,11 @@ impl ProxyAcceptor {
 }
 
 #[async_trait]
-impl Service for ProxyAcceptor {
+impl<P> Service for ProxyAcceptor<P>
+where
+    P: ProxyHttp + Send + Sync + 'static,
+    <P as ProxyHttp>::CTX: Send + Sync,
+{
     async fn start_service(
         &mut self,
         #[cfg(unix)] _fds: Option<pingora_core::server::ListenFds>,
@@ -308,14 +331,17 @@ impl Service for ProxyAcceptor {
     }
 }
 
-async fn handle_connection(
+async fn handle_connection<P>(
     mut tcp: TcpStream,
     peer_addr: SocketAddr,
-    proxy: Arc<HttpProxy<Proxy>>,
+    proxy: Arc<HttpProxy<P>>,
     trusted: Arc<TrustedSources>,
     cfg: ListenerConfig,
     mut shutdown: ShutdownWatch,
-) {
+) where
+    P: ProxyHttp + Send + Sync + 'static,
+    <P as ProxyHttp>::CTX: Send + Sync,
+{
     if !trusted.contains(&peer_addr.ip()) {
         tracing::debug!(peer = %peer_addr, "rejecting connection from untrusted source");
         return;

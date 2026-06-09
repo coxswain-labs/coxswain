@@ -6,18 +6,17 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use coxswain_admin::AdminServer;
 use coxswain_controller::{
-    Controller, ControllerConfig, IngressDefaultBackend, IngressPorts, Reconciler,
-    ReconcilerHealth, ReconcilerOptions, SharedGatewayListenerHealth,
+    Controller, ControllerConfig, IngressDefaultBackend, IngressPorts, LeaseSettings, Reconciler,
+    ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs, SharedGatewayListenerHealth,
 };
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::OwnedGateways;
-use coxswain_core::routing::RouteTimeouts;
-use coxswain_core::routing::SharedRoutingTable;
+use coxswain_core::routing::{RouteTimeouts, SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_core::tls::SharedTlsStore;
 use coxswain_health::HealthServer;
 use coxswain_proxy::{
-    ListenerProtocol, ListenerSpec, Proxy, ProxyAcceptor, RoutingEngine, SniCertSelector,
-    TrustedSources, UpstreamCaCache,
+    GatewayProxy, IngressProxy, KubernetesSource, ListenerProtocol, ListenerSpec, ProxyAcceptor,
+    RoutingEngine, RoutingSource, SniCertSelector, TrustedSources, UpstreamCaCache,
 };
 use ipnet::IpNet;
 use pingora_core::listeners::tls::TlsSettings;
@@ -295,10 +294,13 @@ fn main() -> Result<()> {
         args.controller_name.clone(),
         args.pod_name.clone(),
         args.pod_namespace.clone(),
-        args.controller_lease_ttl,
-        args.controller_lease_renew_interval,
+        LeaseSettings::new(
+            args.controller_lease_ttl,
+            args.controller_lease_renew_interval,
+        ),
         args.controller_watch_namespace.clone(),
         args.status_address.clone(),
+        IngressPorts::new(args.proxy_http_port, args.proxy_https_port),
     )?;
 
     tracing::info!(
@@ -309,7 +311,8 @@ fn main() -> Result<()> {
 
     let mut server = build_server(&args);
 
-    let routing_table = SharedRoutingTable::new();
+    let ingress_routes = SharedIngressRoutingTable::new();
+    let gateway_routes = SharedGatewayRoutingTable::new();
     let tls_store = SharedTlsStore::new();
     let gateway_tls_health = SharedGatewayListenerHealth::new();
     let leader = Arc::new(AtomicBool::new(false));
@@ -343,9 +346,12 @@ fn main() -> Result<()> {
     let hot_reload_health = gateway_tls_health.clone();
 
     let reconciler = Reconciler::new(
-        routing_table.clone(),
-        tls_store.clone(),
-        gateway_tls_health.clone(),
+        ReconcilerOutputs::new(
+            ingress_routes.clone(),
+            gateway_routes.clone(),
+            tls_store.clone(),
+            gateway_tls_health.clone(),
+        ),
         owned_gateways.clone(),
         ReconcilerHealth::new(controller_handle, proxy_handle),
         args.controller_name.clone(),
@@ -380,57 +386,93 @@ fn main() -> Result<()> {
         backend_request: args.proxy_default_backend_request_timeout,
     };
 
-    // Build the list of (addr, protocol) pairs from the configured port flags.
-    let mut listeners: Vec<ListenerSpec> = Vec::new();
+    // Ingress and Gateway proxies bind disjoint port sets. Ingress takes the
+    // statically-configured `--proxy-http-port` / `--proxy-https-port`; Gateway
+    // takes whatever Gateway `spec.listeners` declares, minus the Ingress set.
+    let mut ingress_listeners: Vec<ListenerSpec> = Vec::new();
     if let Some(port) = args.proxy_http_port {
-        listeners.push(ListenerSpec::http(SocketAddr::new(
+        ingress_listeners.push(ListenerSpec::http(SocketAddr::new(
             args.proxy_bind_address,
             port,
         )));
     }
     if let Some(port) = args.proxy_https_port {
-        listeners.push(ListenerSpec::https(SocketAddr::new(
+        ingress_listeners.push(ListenerSpec::https(SocketAddr::new(
             args.proxy_bind_address,
             port,
         )));
     }
+    let ingress_ports: HashSet<u16> = ingress_listeners.iter().map(|l| l.addr.port()).collect();
 
-    // CLI-configured ports are always included in the "desired" set used by HotReloader.
-    let cli_ports: HashSet<u16> = listeners.iter().map(|l| l.addr.port()).collect();
-
-    // Discover additional Gateway listener ports from the cluster's current state so
-    // that, if Gateways already exist when coxswain restarts, we bind their ports
-    // immediately rather than waiting for the first reconcile + restart cycle.
-    {
+    // Discover Gateway listener ports from the cluster's current state so that, if
+    // Gateways already exist when coxswain restarts, we bind their ports immediately
+    // rather than waiting for the first reconcile + restart cycle. Ports already
+    // reserved by Ingress flags are filtered out — those Gateway listeners are
+    // surfaced as `Programmed=False, reason=PortUnavailable` by the controller.
+    //
+    // Gateway-discovered ports are also probe-bound up front: a port we cannot bind
+    // (privileged port without capability, in use by another process) is dropped from
+    // the discovery set with a warning, instead of taking the whole process down.
+    // Unlike `--proxy-http-port` / `--proxy-https-port` (operator-explicit and strict),
+    // Gateway listener ports come from user-deployed resources and should not be able
+    // to crash the controller.
+    let gateway_listeners: Vec<ListenerSpec> = {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("build tokio runtime for startup Gateway port discovery")?;
-        let extra = rt.block_on(discover_gateway_ports(
+        let discovered = rt.block_on(discover_gateway_ports(
             &args.controller_name,
             args.controller_watch_namespace.as_deref(),
             args.proxy_bind_address,
-            &cli_ports,
+            &ingress_ports,
         ));
-        if !extra.is_empty() {
-            let ports: Vec<u16> = extra.iter().map(|l| l.addr.port()).collect();
+        let discovered = discovered
+            .into_iter()
+            .filter(|spec| match std::net::TcpListener::bind(spec.addr) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        addr = %spec.addr,
+                        error = %e,
+                        "Cannot bind Gateway-discovered port; skipping listener",
+                    );
+                    false
+                }
+            })
+            .collect::<Vec<_>>();
+        if !discovered.is_empty() {
+            let ports: Vec<u16> = discovered.iter().map(|l| l.addr.port()).collect();
             tracing::info!(
                 ?ports,
-                "Adding listener ports discovered from existing Gateway specs"
+                "Adding Gateway listener ports discovered from existing Gateway specs"
             );
         }
-        listeners.extend(extra);
-    }
+        discovered
+    };
 
-    if listeners.is_empty() {
+    if ingress_listeners.is_empty() && gateway_listeners.is_empty() {
         tracing::warn!(
             "No proxy listener ports configured (--proxy-http-port / --proxy-https-port) \
              and no Gateway listeners found. No traffic will be served until ports are added."
         );
     }
 
-    // Track the full set of ports we actually bind, so HotReloader can detect additions.
-    let currently_bound: HashSet<u16> = listeners.iter().map(|l| l.addr.port()).collect();
+    // Track every port we actually bind so HotReloader can detect additions.
+    let currently_bound: HashSet<u16> = ingress_listeners
+        .iter()
+        .chain(gateway_listeners.iter())
+        .map(|l| l.addr.port())
+        .collect();
+
+    // Single `KubernetesSource` exposes both shared handles; per-proxy engines
+    // pull their typed snapshot via the trait getters.
+    let source = KubernetesSource::new(
+        ingress_routes.clone(),
+        gateway_routes.clone(),
+        tls_store.clone(),
+    );
+    let ca_cache = Arc::new(UpstreamCaCache::new());
 
     if args.proxy_accept_proxy_protocol {
         if args.proxy_trusted_sources.is_empty() {
@@ -439,53 +481,93 @@ fn main() -> Result<()> {
                  all connections will be rejected"
             );
         }
-        let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
-        let ca_cache = Arc::new(UpstreamCaCache::new());
-        let proxy = Arc::new(http_proxy(
-            &server.configuration,
-            Proxy {
-                engine,
-                default_timeouts: default_timeouts.clone(),
-                ca_cache,
-            },
-        ));
         let trusted = Arc::new(TrustedSources::new(args.proxy_trusted_sources.clone()));
-        let sni_selector = SniCertSelector::new(tls_store);
-        let acceptor = ProxyAcceptor::new(proxy, listeners, trusted, sni_selector)
-            .context("build ProxyAcceptor")?;
-        server.add_service(acceptor);
+        if !ingress_listeners.is_empty() {
+            let proxy = Arc::new(http_proxy(
+                &server.configuration,
+                IngressProxy::new(
+                    Arc::new(RoutingEngine::new(source.ingress_routes())),
+                    default_timeouts.clone(),
+                    ca_cache.clone(),
+                ),
+            ));
+            let selector = SniCertSelector::new(source.tls_store());
+            let acceptor = ProxyAcceptor::new(proxy, ingress_listeners, trusted.clone(), selector)
+                .context("build IngressProxy acceptor")?;
+            server.add_service(acceptor);
+        }
+        if !gateway_listeners.is_empty() {
+            let proxy = Arc::new(http_proxy(
+                &server.configuration,
+                GatewayProxy::new(
+                    Arc::new(RoutingEngine::new(source.gateway_routes())),
+                    default_timeouts.clone(),
+                    ca_cache.clone(),
+                ),
+            ));
+            let selector = SniCertSelector::new(source.tls_store());
+            let acceptor = ProxyAcceptor::new(proxy, gateway_listeners, trusted, selector)
+                .context("build GatewayProxy acceptor")?;
+            server.add_service(acceptor);
+        }
     } else {
-        let engine = Arc::new(RoutingEngine::new(routing_table.clone()));
-        let ca_cache = Arc::new(UpstreamCaCache::new());
-        let mut svc = http_proxy_service_with_name(
-            &server.configuration,
-            Proxy {
-                engine,
-                default_timeouts,
-                ca_cache,
-            },
-            "proxy",
-        );
-        for spec in &listeners {
-            match spec.protocol {
-                ListenerProtocol::Http => {
-                    svc.add_tcp(&spec.addr.to_string());
-                }
-                ListenerProtocol::Https => {
-                    let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
-                        Box::new(SniCertSelector::new(tls_store.clone()));
-                    let tls_settings =
-                        TlsSettings::with_callbacks(callbacks).context("build TLS settings")?;
-                    svc.add_tls_with_settings(&spec.addr.to_string(), None, tls_settings);
+        if !ingress_listeners.is_empty() {
+            let mut svc = http_proxy_service_with_name(
+                &server.configuration,
+                IngressProxy::new(
+                    Arc::new(RoutingEngine::new(source.ingress_routes())),
+                    default_timeouts.clone(),
+                    ca_cache.clone(),
+                ),
+                "ingress-proxy",
+            );
+            for spec in &ingress_listeners {
+                match spec.protocol {
+                    ListenerProtocol::Http => {
+                        svc.add_tcp(&spec.addr.to_string());
+                    }
+                    ListenerProtocol::Https => {
+                        let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
+                            Box::new(SniCertSelector::new(source.tls_store()));
+                        let tls_settings = TlsSettings::with_callbacks(callbacks)
+                            .context("build Ingress TLS settings")?;
+                        svc.add_tls_with_settings(&spec.addr.to_string(), None, tls_settings);
+                    }
                 }
             }
+            server.add_service(svc);
         }
-        server.add_service(svc);
+        if !gateway_listeners.is_empty() {
+            let mut svc = http_proxy_service_with_name(
+                &server.configuration,
+                GatewayProxy::new(
+                    Arc::new(RoutingEngine::new(source.gateway_routes())),
+                    default_timeouts.clone(),
+                    ca_cache.clone(),
+                ),
+                "gateway-proxy",
+            );
+            for spec in &gateway_listeners {
+                match spec.protocol {
+                    ListenerProtocol::Http => {
+                        svc.add_tcp(&spec.addr.to_string());
+                    }
+                    ListenerProtocol::Https => {
+                        let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
+                            Box::new(SniCertSelector::new(source.tls_store()));
+                        let tls_settings = TlsSettings::with_callbacks(callbacks)
+                            .context("build Gateway TLS settings")?;
+                        svc.add_tls_with_settings(&spec.addr.to_string(), None, tls_settings);
+                    }
+                }
+            }
+            server.add_service(svc);
+        }
     }
 
     server.add_service(background_service(
         "hot-reloader",
-        hot_reload::HotReloader::new(hot_reload_health, currently_bound, cli_ports),
+        hot_reload::HotReloader::new(hot_reload_health, currently_bound, ingress_ports),
     ));
 
     let health_addr = SocketAddr::new(args.proxy_bind_address, args.health_port);
@@ -502,12 +584,7 @@ fn main() -> Result<()> {
 
     let admin_addr = SocketAddr::new(args.proxy_bind_address, args.admin_port);
     server.add_service(
-        AdminServer {
-            health,
-            leader,
-            routes: routing_table,
-        }
-        .into_service(admin_addr),
+        AdminServer::new(health, leader, ingress_routes, gateway_routes).into_service(admin_addr),
     );
 
     tracing::info!(
@@ -624,25 +701,26 @@ fn build_server(args: &ServeArgs) -> Server {
     server
 }
 
-/// Polls until `parent_pid` is no longer visible to the OS, up to 30 s.
+/// Polls until the parent process has exited, up to 30 s.
 ///
 /// Used by restart children to avoid binding ports before the parent has
 /// released them. Runs synchronously before the async runtime starts.
-fn wait_for_parent_exit(parent_pid: i32) {
-    use nix::errno::Errno;
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-
-    let pid = Pid::from_raw(parent_pid);
+///
+/// The implementation uses `getppid()` rather than `kill(parent_pid, 0)`:
+/// when the parent exits, the kernel reparents the child to PID 1 (`init` /
+/// `launchd`) immediately, regardless of whether the parent's zombie has been
+/// reaped. `kill(pid, 0)` returns success for an un-reaped zombie and can
+/// stall the wait for the full deadline whenever the parent's grand-parent
+/// (e.g. a test harness) doesn't actively `waitpid()` — observed in the
+/// `coxswain-e2e` harness, where tokio holds the parent `Child` without
+/// awaiting it.
+fn wait_for_parent_exit(_parent_pid: i32) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        if let Err(Errno::ESRCH) = kill(pid, None) {
-            return;
-        }
+    while nix::unistd::getppid().as_raw() != 1 {
         if std::time::Instant::now() >= deadline {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

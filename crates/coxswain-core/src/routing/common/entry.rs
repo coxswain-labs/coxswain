@@ -1,6 +1,6 @@
 //! Route entry types: backend groups, filter actions, route timeouts, and path-rule metadata.
 
-use crate::routing::predicate::MatchPredicates;
+use super::predicate::MatchPredicates;
 use http::{HeaderName, HeaderValue};
 use std::net::SocketAddr;
 use std::sync::Arc;

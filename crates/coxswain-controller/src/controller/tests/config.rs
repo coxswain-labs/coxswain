@@ -1,4 +1,5 @@
-use super::super::config::{ControllerConfig, ControllerConfigError, StatusAddress};
+use super::super::config::{ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress};
+use crate::ingress::IngressPorts;
 use std::time::Duration;
 
 fn cfg(ttl_secs: u64, renew_secs: u64) -> Result<ControllerConfig, ControllerConfigError> {
@@ -6,10 +7,13 @@ fn cfg(ttl_secs: u64, renew_secs: u64) -> Result<ControllerConfig, ControllerCon
         "ctrl".to_string(),
         "pod".to_string(),
         "ns".to_string(),
-        Duration::from_secs(ttl_secs),
-        Duration::from_secs(renew_secs),
+        LeaseSettings::new(
+            Duration::from_secs(ttl_secs),
+            Duration::from_secs(renew_secs),
+        ),
         None,
         None,
+        IngressPorts::new(Some(80), Some(443)),
     )
 }
 
@@ -36,10 +40,10 @@ fn empty_status_address_is_error() {
         "ctrl".to_string(),
         "pod".to_string(),
         "ns".to_string(),
-        Duration::from_secs(15),
-        Duration::from_secs(5),
+        LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
         None,
         Some("  ".to_string()),
+        IngressPorts::new(Some(80), Some(443)),
     )
     .unwrap_err();
     assert!(matches!(err, ControllerConfigError::EmptyStatusAddress));
@@ -51,10 +55,10 @@ fn ip_status_address() {
         "ctrl".to_string(),
         "pod".to_string(),
         "ns".to_string(),
-        Duration::from_secs(15),
-        Duration::from_secs(5),
+        LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
         None,
         Some("127.0.0.1".to_string()),
+        IngressPorts::new(Some(80), Some(443)),
     )
     .unwrap();
     assert!(matches!(cfg.status_address, Some(StatusAddress::Ip(_))));
@@ -66,10 +70,10 @@ fn hostname_status_address() {
         "ctrl".to_string(),
         "pod".to_string(),
         "ns".to_string(),
-        Duration::from_secs(15),
-        Duration::from_secs(5),
+        LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
         None,
         Some("my-host.example.com".to_string()),
+        IngressPorts::new(Some(80), Some(443)),
     )
     .unwrap();
     assert!(matches!(

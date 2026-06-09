@@ -19,8 +19,8 @@ use crate::tls::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, load_t
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
-    BackendGroup, BackendProtocol, FilterAction, HostRouterBuilder, MatchPredicates, RouteEntry,
-    RouteTimeouts, RoutingTableBuilder, UpstreamTls, WildcardKind,
+    BackendGroup, BackendProtocol, FilterAction, GatewayRoutingTableBuilder, HostRouterBuilder,
+    MatchPredicates, RouteEntry, RouteTimeouts, UpstreamTls, WildcardKind,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -63,7 +63,7 @@ impl GatewayApiReconciler {
         owned_gateways: &HashSet<ObjectKey>,
         grants: &HashSet<ReferenceGrantKey>,
         resolution: RouteResolution<'_>,
-        builder: &mut RoutingTableBuilder,
+        builder: &mut GatewayRoutingTableBuilder,
     ) {
         let RouteResolution {
             listener_info,

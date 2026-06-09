@@ -10,9 +10,15 @@ use tokio::io::AsyncWriteExt as _;
 
 /// Template variables for [`apply_fixture`].
 ///
-/// `TESTNS` is always replaced with `namespace`. The `http_port` and
-/// `https_port` fields substitute `HTTP_PORT` and `HTTPS_PORT` respectively
-/// when non-zero. Use [`FixtureVars::with`] to add extra substitutions.
+/// `TESTNS` is always replaced with `namespace`. The four port fields
+/// substitute the placeholders below when non-zero:
+///
+/// - `http_port` → `HTTP_PORT` (Ingress HTTP listener)
+/// - `https_port` → `HTTPS_PORT` (Ingress HTTPS listener)
+/// - `gateway_http_port` → `GATEWAY_HTTP_PORT` (Gateway HTTP listener)
+/// - `gateway_https_port` → `GATEWAY_HTTPS_PORT` (Gateway HTTPS listener)
+///
+/// Use [`FixtureVars::with`] to add extra substitutions.
 pub struct FixtureVars {
     /// Substituted for `TESTNS` in the YAML template.
     pub namespace: String,
@@ -20,6 +26,10 @@ pub struct FixtureVars {
     pub http_port: u16,
     /// Substituted for `HTTPS_PORT` in the YAML template. `0` means skip.
     pub https_port: u16,
+    /// Substituted for `GATEWAY_HTTP_PORT` in the YAML template. `0` means skip.
+    pub gateway_http_port: u16,
+    /// Substituted for `GATEWAY_HTTPS_PORT` in the YAML template. `0` means skip.
+    pub gateway_https_port: u16,
     /// Additional `(placeholder, replacement)` pairs applied before the standard substitutions.
     pub extra: Vec<(String, String)>,
 }
@@ -31,6 +41,8 @@ impl FixtureVars {
             namespace: namespace.into(),
             http_port: 0,
             https_port: 0,
+            gateway_http_port: 0,
+            gateway_https_port: 0,
             extra: Vec::new(),
         }
     }
@@ -51,6 +63,23 @@ pub async fn apply_fixture(path: impl AsRef<Path>, vars: FixtureVars) -> anyhow:
     // Apply extra vars first so callers can override the standard substitutions.
     for (key, val) in &vars.extra {
         content = substitute(&content, key, val);
+    }
+    // Substitute Gateway placeholders before Ingress ones; `GATEWAY_HTTP_PORT`
+    // is a superstring of `HTTP_PORT` and a literal-replace pass over `HTTP_PORT`
+    // first would corrupt the Gateway placeholder.
+    if vars.gateway_http_port != 0 {
+        content = substitute(
+            &content,
+            "GATEWAY_HTTP_PORT",
+            &vars.gateway_http_port.to_string(),
+        );
+    }
+    if vars.gateway_https_port != 0 {
+        content = substitute(
+            &content,
+            "GATEWAY_HTTPS_PORT",
+            &vars.gateway_https_port.to_string(),
+        );
     }
     if vars.http_port != 0 {
         let p = vars.http_port.to_string();

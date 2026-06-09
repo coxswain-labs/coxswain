@@ -5,7 +5,7 @@ use http::header;
 use pingora_http::RequestHeader;
 
 /// Extract the bare hostname from a request (strips port suffix, prefers URI host over Host header).
-pub(super) fn extract_host<'a>(req: &'a RequestHeader, host_hdr: &'a mut String) -> &'a str {
+pub(crate) fn extract_host<'a>(req: &'a RequestHeader, host_hdr: &'a mut String) -> &'a str {
     if let Some(h) = req.uri.host() {
         return h;
     }
@@ -19,7 +19,7 @@ pub(super) fn extract_host<'a>(req: &'a RequestHeader, host_hdr: &'a mut String)
 }
 
 /// Request-context fields needed to build a redirect `Location` URL.
-pub(super) struct RedirectOrigin<'a> {
+pub(crate) struct RedirectOrigin<'a> {
     pub scheme: &'a str,
     pub host: &'a str,
     pub port: u16,
@@ -28,7 +28,7 @@ pub(super) struct RedirectOrigin<'a> {
 }
 
 /// Build the `Location` URL for a `RequestRedirect` filter.
-pub(super) fn build_redirect_location(
+pub(crate) fn build_redirect_location(
     filter_scheme: Option<&str>,
     filter_hostname: Option<&str>,
     filter_port: Option<u16>,

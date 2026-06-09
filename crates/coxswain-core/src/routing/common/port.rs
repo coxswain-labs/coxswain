@@ -1,13 +1,100 @@
-//! Builders for [`RoutingTable`][super::RoutingTable] and per-port/host routers.
+//! Per-port routing bucket and its associated builder.
+//!
+//! A [`PortRoutingTable`] is the immutable host+path+predicate router for one
+//! listener port. A [`PortTableBuilder`] accumulates host entries and freezes
+//! them into the compiled `PortRoutingTable` at table-build time.
 
-use crate::routing::entry::RouteConflict;
-use crate::routing::host_router::{HostRouter, HostRouterBuilder, WildcardKind};
+use super::entry::RouteConflict;
+use super::host_router::{HostRouter, HostRouterBuilder, WildcardKind, wildcard_matches};
+use super::predicate::RequestContext;
+use super::table::{RouteOutcome, RouterError};
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use super::{PortRoutingTable, RouterError, RoutingTable};
+use super::entry::BackendGroup;
 
-/// Per-port route builder, mirroring the entry points of the old flat builder.
+/// Per-port routing bucket: the host+path+predicate logic for one listener port.
+///
+/// Shared between Ingress and Gateway-API top-level routing tables — the per-rule
+/// matching machinery is identical; only the top-level container distinguishes
+/// the two specs at the type level.
+pub(crate) struct PortRoutingTable {
+    pub(crate) exact_hosts: HashMap<String, HostRouter>,
+    /// Sorted most-specific (longest suffix) first; `SingleLabel` before `MultiLabel` on ties.
+    pub(crate) wildcard_hosts: Vec<(String, WildcardKind, HostRouter)>,
+    pub(crate) catchall: Option<HostRouter>,
+}
+
+impl PortRoutingTable {
+    pub(super) fn find(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> RouteOutcome {
+        let router = if let Some(r) = self.exact_hosts.get(host) {
+            r
+        } else if let Some((_, _, r)) = self
+            .wildcard_hosts
+            .iter()
+            .find(|(s, k, _)| wildcard_matches(host, s, *k))
+        {
+            r
+        } else if let Some(r) = self.catchall.as_ref() {
+            r
+        } else {
+            return RouteOutcome::NoHost;
+        };
+        match router.route(path, ctx) {
+            Some((_, _, _, Some(status))) => RouteOutcome::Error(status),
+            Some((u, f, t, None)) => RouteOutcome::Found(u, f, t),
+            None => RouteOutcome::NoPath,
+        }
+    }
+
+    pub(super) fn route(
+        &self,
+        host: &str,
+        path: &str,
+        ctx: &RequestContext<'_>,
+    ) -> Option<Arc<BackendGroup>> {
+        let router = if let Some(r) = self.exact_hosts.get(host) {
+            Some(r)
+        } else {
+            self.wildcard_hosts
+                .iter()
+                .find(|(s, k, _)| wildcard_matches(host, s, *k))
+                .map(|(_, _, r)| r)
+        };
+        if let Some(r) = router
+            && let Some((group, _, _, _)) = r.route(path, ctx)
+        {
+            return Some(group);
+        }
+        self.catchall
+            .as_ref()?
+            .route(path, ctx)
+            .map(|(u, _, _, _)| u)
+    }
+
+    pub(super) fn host_routes(&self) -> Vec<(String, &HostRouter)> {
+        let mut result: Vec<(String, &HostRouter)> = Vec::new();
+        for (host, router) in &self.exact_hosts {
+            result.push((host.clone(), router));
+        }
+        for (suffix, _kind, router) in &self.wildcard_hosts {
+            result.push((format!("*.{suffix}"), router));
+        }
+        if let Some(router) = &self.catchall {
+            result.push(("*".to_string(), router));
+        }
+        result
+    }
+}
+
+/// Per-port route builder.
+///
+/// Use [`exact_host`](Self::exact_host), [`wildcard_host`](Self::wildcard_host),
+/// or [`catchall`](Self::catchall) (or the dispatch helper
+/// [`host_for`](Self::host_for)) to obtain a [`HostRouterBuilder`] for the
+/// hostname class you want, then call its `add_*_route` methods to register
+/// path rules.
 #[derive(Default)]
 pub struct PortTableBuilder {
     exact_hosts: HashMap<String, HostRouterBuilder>,
@@ -102,42 +189,5 @@ impl PortTableBuilder {
             },
             conflicts,
         ))
-    }
-}
-
-/// Builds an immutable [`RoutingTable`] keyed by listener port.
-///
-/// Use [`for_port`](Self::for_port) to obtain a [`PortTableBuilder`] for a
-/// specific port, then call its host-level methods to register routes.
-#[derive(Default)]
-pub struct RoutingTableBuilder {
-    by_port: HashMap<u16, PortTableBuilder>,
-}
-
-impl RoutingTableBuilder {
-    /// Construct an empty routing table builder.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns the [`PortTableBuilder`] for `port`, creating it if absent.
-    #[must_use]
-    pub fn for_port(&mut self, port: u16) -> &mut PortTableBuilder {
-        self.by_port.entry(port).or_default()
-    }
-
-    /// Compiles all registered routes into an immutable [`RoutingTable`].
-    pub fn build(self) -> Result<RoutingTable, RouterError> {
-        let mut conflicts: Vec<RouteConflict> = Vec::new();
-        let mut by_port: HashMap<u16, PortRoutingTable> = HashMap::new();
-
-        for (port, pb) in self.by_port {
-            let (table, cs) = pb.build(port)?;
-            conflicts.extend(cs);
-            by_port.insert(port, table);
-        }
-
-        Ok(RoutingTable { by_port, conflicts })
     }
 }

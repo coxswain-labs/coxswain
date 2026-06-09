@@ -44,7 +44,7 @@ fn make_route_with_filters(
 }
 
 fn find_filters(
-    table: &coxswain_core::routing::RoutingTable,
+    table: &coxswain_core::routing::GatewayRoutingTable,
     host: &str,
     path: &str,
 ) -> std::sync::Arc<[FilterAction]> {

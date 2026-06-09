@@ -123,6 +123,7 @@ pub(super) fn build_gateway_status_patch(
     generation: i64,
     now: &Time,
     addr: Option<&StatusAddress>,
+    ingress_ports: crate::ingress::IngressPorts,
 ) -> serde_json::Value {
     // Gateway-level Programmed is always True once the controller has processed the
     // Gateway. Per-listener conditions (ListenerConditionProgrammed, ResolvedRefs)
@@ -166,12 +167,23 @@ pub(super) fn build_gateway_status_patch(
                 } else {
                     ("False", outcome.reason(), outcome.message())
                 };
-            let (listener_prog_status, listener_prog_reason, listener_prog_msg) =
-                if outcome.is_healthy() {
-                    ("True", "Programmed", "")
-                } else {
-                    ("False", outcome.reason(), outcome.message())
-                };
+            // Port-conflict detection (issue #201): a Gateway listener whose port is
+            // reserved by the Ingress data plane (--proxy-http-port / --proxy-https-port)
+            // cannot be bound by GatewayProxy. Surface a Programmed=False condition with
+            // reason=PortUnavailable so operators see the conflict without trawling logs.
+            let listener_port = u16::try_from(l.port).unwrap_or(0);
+            let port_conflict = ingress_ports.http == Some(listener_port)
+                || ingress_ports.https == Some(listener_port);
+            let port_conflict_msg = format!(
+                "port {listener_port} is reserved by the Ingress proxy (set via --proxy-http-port or --proxy-https-port)"
+            );
+            let (listener_prog_status, listener_prog_reason, listener_prog_msg) = if port_conflict {
+                ("False", "PortUnavailable", port_conflict_msg.as_str())
+            } else if outcome.is_healthy() {
+                ("True", "Programmed", "")
+            } else {
+                ("False", outcome.reason(), outcome.message())
+            };
             let attached = health.listeners.get(&l.name).map(|i| i.attached_routes).unwrap_or(0);
             tracing::debug!(
                 listener = %l.name,

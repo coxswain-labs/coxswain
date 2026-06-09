@@ -18,11 +18,13 @@ mod tls;
 #[cfg(test)]
 mod tests;
 
-pub use controller::{Controller, ControllerConfig, ControllerConfigError, StatusAddress};
+pub use controller::{
+    Controller, ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress,
+};
 pub use ingress::IngressPorts;
 pub use reconciler::{
     IngressDefaultBackend, IngressDefaultBackendParseError, Reconciler, ReconcilerHealth,
-    ReconcilerOptions,
+    ReconcilerOptions, ReconcilerOutputs,
 };
 pub use tls::{
     GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, SharedBackendTlsPolicyHealth,

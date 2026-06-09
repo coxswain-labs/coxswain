@@ -4,7 +4,7 @@ mod reconcile;
 mod tls;
 
 use super::*;
-use coxswain_core::routing::RoutingTableBuilder;
+use coxswain_core::routing::IngressRoutingTableBuilder;
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -27,7 +27,7 @@ pub(super) fn reconcile_no_default(
     slices: &reflector::Store<EndpointSlice>,
     svcs: &reflector::Store<Service>,
     owned: &HashSet<String>,
-    b: &mut RoutingTableBuilder,
+    b: &mut IngressRoutingTableBuilder,
 ) {
     IngressReconciler::reconcile(
         ing,

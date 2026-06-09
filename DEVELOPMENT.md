@@ -130,20 +130,24 @@ kubectl apply -f deploy/dev/ingress.yaml
 
 ### Test Gateway API routes
 
+Gateway listeners declare their own ports independently of the Ingress entry
+points. The `deploy/dev/httproute.yaml` fixture binds the Gateway listener to
+port `8000` (see that file's header for why); test against that port.
+
 ```bash
 # echo.local — path-based routing, single backend per rule
-curl -H "Host: echo.local" http://localhost/a          # hello from echo-a
-curl -H "Host: echo.local" http://localhost/b          # hello from echo-b
-curl -H "Host: echo.local" http://localhost/           # hello from echo-a (catchall)
+curl -H "Host: echo.local" http://localhost:8000/a          # hello from echo-a
+curl -H "Host: echo.local" http://localhost:8000/b          # hello from echo-b
+curl -H "Host: echo.local" http://localhost:8000/           # hello from echo-a (catchall)
 
 # split.local — both echo-a and echo-b are pooled into one upstream;
 # coxswain round-robins across all ready pod addresses from both services
-curl -H "Host: split.local" http://localhost/          # hello from echo-a
-curl -H "Host: split.local" http://localhost/          # hello from echo-b
+curl -H "Host: split.local" http://localhost:8000/          # hello from echo-a
+curl -H "Host: split.local" http://localhost:8000/          # hello from echo-b
 
 # *.wildcard.local — any subdomain matches
-curl -H "Host: foo.wildcard.local" http://localhost/   # hello from echo-c
-curl -H "Host: bar.wildcard.local" http://localhost/   # hello from echo-c
+curl -H "Host: foo.wildcard.local" http://localhost:8000/   # hello from echo-c
+curl -H "Host: bar.wildcard.local" http://localhost:8000/   # hello from echo-c
 ```
 
 ### Test classic Ingress routes
@@ -167,15 +171,15 @@ kubectl apply -f deploy/dev/cross-namespace.yaml
 ```
 
 ```bash
-# Route resolves when the grant is present
-curl -H "Host: cross-ns.local" http://localhost/   # hello from echo-d
+# Route resolves when the grant is present (Gateway listener on port 8000)
+curl -H "Host: cross-ns.local" http://localhost:8000/   # hello from echo-d
 ```
 
 Delete the grant to confirm enforcement:
 
 ```bash
 kubectl delete referencegrant allow-httproute-from-default -n echo-tenant
-curl -H "Host: cross-ns.local" http://localhost/   # 503 Service Unavailable
+curl -H "Host: cross-ns.local" http://localhost:8000/   # 503 Service Unavailable
 
 # Restore
 kubectl apply -f deploy/dev/cross-namespace.yaml
@@ -211,13 +215,13 @@ cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
 
 ### conformance
 
-The Gateway API conformance suite (`conformance/`) connects to a coxswain instance you start manually on fixed ports. Start coxswain in a separate terminal first:
+The Gateway API conformance suite (`conformance/`) connects to a coxswain instance you start manually on fixed ports. Start coxswain in a separate terminal first.
+
+The launch command deliberately omits `--proxy-http-port` and `--proxy-https-port`: those flags reserve ports for the `IngressProxy` data plane (issue #201), and the conformance Gateway resources declare listeners on 80/443 themselves. Leaving the Ingress flags off lets the `GatewayProxy` bind 80/443 from the test Gateway specs without conflict.
 
 ```bash
 # Terminal 1 — keep running
 cargo run --bin coxswain -- serve \
-  --proxy-http-port 80 \
-  --proxy-https-port 443 \
   --health-port 8081 \
   --admin-port 8082 \
   --status-address 127.0.0.1 \
