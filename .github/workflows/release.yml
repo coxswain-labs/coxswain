@@ -7,6 +7,13 @@ on:
 
 name: Release
 
+# Serialise per-ref so two near-simultaneous pushes to the same branch/tag
+# can't race on the `_staging` mike branch or the org-pages push. We don't
+# cancel in-progress runs because each is publishing artifacts.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 # Publishes coxswain OCI images and the Helm chart to ghcr.io, and attaches
 # a rendered install.yaml to every GitHub Release.
 #
@@ -33,10 +40,12 @@ name: Release
 #
 # Tag-push job graph:
 #   cargo-deny ──┬──► build       ──┐
-#               └──► conformance ──┴──► publish-image ──► trivy-scan ──┬──► publish-kustomize
-#                                                                       └──► publish-chart
+#               └──► conformance ──┴──► publish-image ──► trivy-scan ──┬──► publish-kustomize ──┐
+#                                                                       └──► publish-chart    ──┴──► publish-docs
 #   (cargo-deny gates all publishing; conformance gates image publish;
-#    trivy-scan gates both release artifacts)
+#    trivy-scan gates both release artifacts; publish-docs is the last step
+#    and is skipped if any prior release job fails, so a broken release
+#    never promotes the docs site to a tag that lacks signed artifacts.)
 jobs:
   cargo-deny:
     name: cargo-deny
@@ -346,3 +355,110 @@ jobs:
             install.yaml
             ${{ steps.report.outputs.path }}
           generate_release_notes: true
+
+  publish-docs:
+    name: publish-docs
+    # Gating: skipped needs are treated as satisfied, failed needs block.
+    # On main: trivy-scan/publish-chart/publish-kustomize are skipped (their
+    # if: gate), so publish-docs runs after publish-image succeeds and
+    # publishes the dev snapshot. On tag: every needed job must succeed;
+    # a release break skips publish-docs and leaves the site unchanged.
+    needs: [publish-image, trivy-scan, publish-chart, publish-kustomize]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        # v8.x is immutable per release; no floating @v8 tag is published.
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -r docs/requirements.txt
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Determine version and aliases
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${{ github.ref_name }}"
+            # PACKAGE is the full SemVer fed to the docs hook for placeholder
+            # substitution; VERSION is the MAJOR.MINOR snapshot label mike
+            # publishes under.
+            PACKAGE="${TAG#v}"
+            VERSION="$(echo "$PACKAGE" | cut -d. -f1-2)"
+            ALIASES="stable latest"
+          else
+            PACKAGE="main"
+            VERSION="dev"
+            ALIASES=""
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
+          echo "aliases=$ALIASES" >> "$GITHUB_OUTPUT"
+
+      - name: Configure git for mike
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Build docs with mike (local staging branch)
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.package }}
+        run: |
+          set -euo pipefail
+          cd docs
+          VERSION="${{ steps.version.outputs.version }}"
+          ALIASES="${{ steps.version.outputs.aliases }}"
+          if [ -n "$ALIASES" ]; then
+            mike deploy --branch _staging --update-aliases "$VERSION" $ALIASES
+            # Tagged release: 'stable' alias now exists; make it the landing page
+            mike set-default --branch _staging stable
+          else
+            mike deploy --branch _staging "$VERSION"
+            # Pre-release: only point root at 'dev' if no 'stable' has shipped yet
+            if ! mike list --branch _staging | grep -q '\[stable\]'; then
+              mike set-default --branch _staging dev
+            fi
+          fi
+
+      - name: Export staged docs
+        run: |
+          set -euo pipefail
+          git worktree add /tmp/staged _staging
+
+      - name: Checkout org-level pages repo
+        uses: actions/checkout@v6
+        with:
+          repository: coxswain-labs/coxswain-labs.github.io
+          token: ${{ secrets.GH_DOCS_PAT }}
+          path: org-pages
+
+      - name: Sync docs into coxswain/ subdirectory
+        run: |
+          # Remove the old coxswain/ subtree (preserves CNAME, index.html, other projects)
+          rm -rf org-pages/coxswain
+
+          # Copy the freshly built site
+          cp -r /tmp/staged/. org-pages/coxswain/
+
+          # Strip the worktree's .git pointer — leaving it makes the parent repo
+          # treat coxswain/ as a nested git repository
+          rm -rf org-pages/coxswain/.git
+
+      - name: Commit and push to org-level pages repo
+        run: |
+          cd org-pages
+          git add coxswain/
+          if git diff --cached --quiet; then
+            echo "No documentation changes to publish."
+            exit 0
+          fi
+          git commit -m "docs(coxswain): publish ${{ steps.version.outputs.version }} from ${{ github.sha }}"
+          git push

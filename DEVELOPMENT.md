@@ -294,7 +294,7 @@ PACKAGE_VERSION=0.1.2 mkdocs serve
 - Patches overwrite their minor version key (`0.1.1` → `0.1`, same as `0.1.0`).
 - The site root redirects to `stable`.
 
-Publishing happens automatically via `.github/workflows/docs.yml`. The workflow pushes into the `coxswain/` subdirectory of the `coxswain-labs/coxswain-labs.github.io` org-level Pages repo using a cross-repo PAT.
+Publishing happens automatically as the `publish-docs` job at the tail of `.github/workflows/release.yml`. It runs after `publish-image`, `trivy-scan`, `publish-chart`, and `publish-kustomize`, so a failed release step skips the docs promotion and leaves the site unchanged. The job pushes into the `coxswain/` subdirectory of the `coxswain-labs/coxswain-labs.github.io` org-level Pages repo using a cross-repo PAT. PR-time validation (`mkdocs build --strict`) lives alongside the Docker and Helm checks in `.github/workflows/distribution.yml` as the `docs-build` job.
 
 ### CI secrets
 
@@ -319,7 +319,7 @@ PAT settings:
 
 #### `GH_DOCS_PAT` — docs publish
 
-The docs workflow (`.github/workflows/docs.yml`) needs write access to the org-level Pages repo to push the built site.
+The `publish-docs` job in `.github/workflows/release.yml` needs write access to the org-level Pages repo to push the built site.
 
 **Initial setup or renewal:** `./scripts/refresh-pat.sh docs`
 
