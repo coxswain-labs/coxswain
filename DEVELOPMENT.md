@@ -260,19 +260,32 @@ cd conformance && go vet ./...
 
 ## Documentation site
 
-The docs site source lives in `docs/` with `mkdocs.yml` at the repo root. It is built with [mkdocs-material](https://squidfunk.github.io/mkdocs-material/) and versioned with [mike](https://github.com/jimporter/mike).
+The docs site is self-contained under `docs/`: pages live in `docs/src/`, the mkdocs config is `docs/mkdocs.yml`, Python deps are `docs/requirements.txt`, and the page hooks (currently just the `PACKAGE_VERSION` substitution) live under `docs/hooks/`. It is built with [mkdocs-material](https://squidfunk.github.io/mkdocs-material/) and versioned with [mike](https://github.com/jimporter/mike).
 
 ### Preview locally
 
 ```bash
+cd docs
 uv venv .venv
-uv pip install -r requirements-docs.txt
+uv pip install -r requirements.txt
 source .venv/bin/activate
 mkdocs serve          # live-reload at http://localhost:8000
 mike serve            # serves the versioned site (requires a prior mike deploy)
 ```
 
 `.venv/` is gitignored. The `--system` flag used in CI does not work on Homebrew-managed Python.
+
+The `PACKAGE_VERSION` env var drives a page hook that rewrites the `X.Y.Z`
+placeholders found in install and verification pages. Substitution only fires
+when `PACKAGE_VERSION` parses as a SemVer (e.g. `0.1.2`); on the `main` default
+(or any non-SemVer value) the placeholders are left literal, because several of
+the substituted commands (`helm --version`, GitHub release-asset URLs, signed
+chart tags) only have valid values for tagged releases. Set a SemVer to preview
+what a tagged release will render:
+
+```bash
+PACKAGE_VERSION=0.1.2 mkdocs serve
+```
 
 ### How versioning works
 
@@ -281,7 +294,7 @@ mike serve            # serves the versioned site (requires a prior mike deploy)
 - Patches overwrite their minor version key (`0.1.1` → `0.1`, same as `0.1.0`).
 - The site root redirects to `stable`.
 
-Publishing happens automatically via `.github/workflows/docs.yml`. The workflow pushes into the `coxswain/` subdirectory of the `coxswain-labs/coxswain-labs.github.io` org-level Pages repo using a cross-repo PAT.
+Publishing happens automatically as the `publish-docs` job at the tail of `.github/workflows/release.yml`. It runs after `publish-image`, `trivy-scan`, `publish-chart`, and `publish-kustomize`, so a failed release step skips the docs promotion and leaves the site unchanged. The job pushes into the `coxswain/` subdirectory of the `coxswain-labs/coxswain-labs.github.io` org-level Pages repo using a cross-repo PAT. PR-time validation (`mkdocs build --strict`) lives alongside the Docker and Helm checks in `.github/workflows/distribution.yml` as the `docs-build` job.
 
 ### CI secrets
 
@@ -306,7 +319,7 @@ PAT settings:
 
 #### `GH_DOCS_PAT` — docs publish
 
-The docs workflow (`.github/workflows/docs.yml`) needs write access to the org-level Pages repo to push the built site.
+The `publish-docs` job in `.github/workflows/release.yml` needs write access to the org-level Pages repo to push the built site.
 
 **Initial setup or renewal:** `./scripts/refresh-pat.sh docs`
 

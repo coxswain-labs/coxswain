@@ -38,9 +38,9 @@ Settings for the new PAT (GH_DOCS_PAT):
   Repository     : coxswain-labs/coxswain-labs.github.io (only)
   Permission     : Contents → Read and write
 
-Used by .github/workflows/docs.yml to push built documentation into the
-org-level Pages repo under the coxswain/ subdirectory.  Do NOT add the
-main coxswain repo to the access list.
+Used by the publish-docs job in .github/workflows/release.yml to push
+built documentation into the org-level Pages repo under the coxswain/
+subdirectory.  Do NOT add the main coxswain repo to the access list.
 EOF
       ;;
     *)

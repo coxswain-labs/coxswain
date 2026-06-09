@@ -16,7 +16,7 @@ kubectl apply -k "github.com/coxswain-labs/coxswain//deploy/manifests?ref=main"
 
 ## Install a specific version
 
-The remote base always uses `image: ...:latest`. To pin both the manifests and the image to a specific release, create a local overlay (replace `vX.Y.Z` with the release tag you want):
+The remote base always uses `image: ...:latest`. To pin both the manifests and the image to a specific release, create a local overlay:
 
 ```bash
 mkdir coxswain-install && cd coxswain-install

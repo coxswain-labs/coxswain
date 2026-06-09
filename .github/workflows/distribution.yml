@@ -5,12 +5,13 @@ on:
 
 name: Distribution
 
-# PR-time validation for distribution artifacts: Docker image and Helm chart.
-# Multi-arch image and Helm chart OCI publishing live in release.yml (publish-image, publish-chart).
+# PR-time validation for distribution artifacts: Docker image, Helm chart,
+# and the docs site. Multi-arch image, Helm chart OCI, and docs publishing
+# all live in release.yml (publish-image, publish-chart, publish-docs).
 #
 # Same gating pattern as ci.yml / e2e.yml: the workflow always starts so that
-# required status checks (smoke, helm-chart) report `skipped` success on PRs
-# that don't touch the relevant paths.
+# required status checks (smoke, helm-chart, docs-build) report `skipped`
+# success on PRs that don't touch the relevant paths.
 jobs:
   changes:
     name: changes
@@ -18,6 +19,7 @@ jobs:
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
       chart: ${{ steps.filter.outputs.chart }}
+      docs: ${{ steps.filter.outputs.docs }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
@@ -33,6 +35,9 @@ jobs:
               - '.github/workflows/distribution.yml'
             chart:
               - 'charts/**'
+              - '.github/workflows/distribution.yml'
+            docs:
+              - 'docs/**'
               - '.github/workflows/distribution.yml'
 
   docker-image:
@@ -80,3 +85,29 @@ jobs:
         run: helm lint charts/coxswain
       - name: Template smoke test
         run: helm template coxswain charts/coxswain --namespace coxswain-system > /dev/null
+
+  docs-build:
+    name: docs-build
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        # v8.x is immutable per release; no floating @v8 tag is published.
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -r docs/requirements.txt
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      # No PACKAGE_VERSION set — validates the dev/main build, which is
+      # what the PR is preparing. --strict catches broken nav, missing
+      # pages, and hook errors.
+      - name: Build docs (strict)
+        run: |
+          cd docs
+          mkdocs build --strict

@@ -17,8 +17,6 @@ kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/latest/downl
 
 ## Pin a specific version
 
-Replace `vX.Y.Z` with the release tag you want to install:
-
 ```bash
 kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/download/vX.Y.Z/install.yaml
 ```
