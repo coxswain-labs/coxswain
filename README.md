@@ -4,6 +4,8 @@
 
 A pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine.
 
+Coxswain runs as a controller pod plus a horizontally-scalable pool of read-only Pingora proxy pods. The controller is the sole Kubernetes writer (status conditions, provisioning); proxy pods build their routing table directly from Kubernetes watch events and serve traffic with no inter-replica coordination. Gateways can be opted into dedicated per-Gateway proxy pods for stricter tenant isolation — see [Architecture](https://docs.coxswain-labs.dev/coxswain/latest/architecture/).
+
 > **Note**: This project is currently in early development and not accepting external contributions. Bug reports and feature requests in issues are welcome; we'll revisit contribution guidelines as the project matures.
 
 **Documentation**: [docs.coxswain-labs.dev/coxswain](https://docs.coxswain-labs.dev/coxswain/) — installation guides, configuration reference, architecture overview, and FAQ.

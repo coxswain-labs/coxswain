@@ -58,8 +58,22 @@ helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
 
 The default Helm chart wires both probes automatically. Do not disable them:
 
-- **Readiness** (`/readyz`, port `8081`) — Coxswain reports `Ready` only after the initial routing table is built. Kubernetes will not send traffic to the pod until this probe passes.
 - **Liveness** (`/healthz`, port `8081`) — always 200 while the process is running.
+- **Readiness** (`/readyz`, port `8081`) — returns 200 only once every subsystem in the pod reaches `Ready` or `Degraded`.
+
+Subsystems have four states:
+
+| State | Meaning | Effect on `/readyz` |
+|---|---|---|
+| `Pending` | Still initialising | 503 |
+| `Ready` | Fully operational | passes |
+| `Degraded` | Partial fault, still serving | passes |
+| `Failed` | Fatal error | 503 |
+
+Readiness gates differ by mode:
+
+- **Controller pod** — all Kubernetes reflectors must complete their initial list and the controller must have acquired (or be in standby for) the Lease.
+- **Shared-proxy and gateway-proxy pods** — all Kubernetes reflectors must complete their initial list and the routing table must be built at least once. Proxy pods do not participate in leader election and do not wait for the controller.
 
 Verify the probes are present on the deployed pod:
 
@@ -67,6 +81,8 @@ Verify the probes are present on the deployed pod:
 kubectl -n coxswain-system get deploy coxswain \
   -o jsonpath='{.spec.template.spec.containers[0].readinessProbe}'
 ```
+
+If `/readyz` returns 503 on a running pod, inspect `/status` to see which subsystem is blocked — see [Troubleshooting](troubleshooting.md#readyz-returns-503-on-startup).
 
 ## Graceful shutdown
 
