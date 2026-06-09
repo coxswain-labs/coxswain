@@ -452,8 +452,11 @@ jobs:
             mike set-default --branch _staging stable
           else
             mike deploy --branch _staging "$VERSION"
-            # Pre-release: only point root at 'unstable' if no 'stable' has shipped yet
-            if ! mike list --branch _staging | grep -q '\[stable'; then
+            # Always set the root default explicitly so a stale seeded index.html
+            # can't persist: stable takes priority over unstable when it exists.
+            if mike list --branch _staging | grep -q '\[stable'; then
+              mike set-default --branch _staging stable
+            else
               mike set-default --branch _staging unstable
             fi
           fi
