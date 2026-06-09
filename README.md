@@ -73,7 +73,7 @@ spec:
 curl -H "Host: echo.example.com" http://<proxy-address>/
 ```
 
-For the complete walkthrough — including a test backend, TLS, and Ingress — see [Getting started](https://docs.coxswain-labs.dev/coxswain/getting-started/).
+For the complete walkthrough — including a test backend, TLS, and Ingress — see [Getting started](https://docs.coxswain-labs.dev/coxswain/latest/getting-started/).
 
 ## Authors
 
