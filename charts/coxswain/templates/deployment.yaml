@@ -96,6 +96,8 @@ spec:
               value: {{ .Values.admin.port | quote }}
             - name: COXSWAIN_PROXY_BIND_ADDRESS
               value: {{ .Values.proxy.bindAddress | quote }}
+            - name: COXSWAIN_MANAGEMENT_BIND_ADDRESS
+              value: {{ .Values.management.bindAddress | quote }}
             {{- if .Values.proxy.http.enabled }}
             - name: COXSWAIN_PROXY_HTTP_PORT
               value: {{ include "coxswain.httpContainerPort" . | quote }}
