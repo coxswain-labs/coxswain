@@ -49,6 +49,10 @@ concurrency:
 jobs:
   cargo-deny:
     name: cargo-deny
+    # Skip the duplicate run that a `cargo release` push-to-main triggers
+    # alongside the v* tag push; the tag-triggered workflow does the real
+    # release. Matches cargo-release's default consolidated commit title.
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: Release')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -361,8 +365,11 @@ jobs:
     # skipped needs (publish-chart/publish-kustomize on main) don't block the
     # unstable docs snapshot. A failure in publish-image or trivy-scan still
     # skips publish-docs so a broken release never promotes the docs site.
+    # Also skip the duplicate run triggered by a `cargo release` push-to-main;
+    # skipped upstreams evaluate as neither failure nor cancellation, so the
+    # release-commit guard must be repeated here explicitly.
     needs: [publish-image, trivy-scan, publish-chart, publish-kustomize]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: Release')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -407,6 +414,30 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
+      - name: Checkout org-level pages repo
+        uses: actions/checkout@v6
+        with:
+          repository: coxswain-labs/coxswain-labs.github.io
+          token: ${{ secrets.GH_DOCS_PAT }}
+          path: org-pages
+
+      - name: Seed _staging from current org-pages state
+        # Mike deploys onto _staging, which is auto-created empty in each
+        # runner. Without this seed, mike emits a versions.json containing
+        # only the version being published this run, and the downstream sync
+        # wipes every prior published version from the live site. Seeding
+        # _staging from org-pages/coxswain/ lets mike merge the new version
+        # into the existing versions.json instead of replacing it.
+        run: |
+          set -euo pipefail
+          git worktree add --orphan -b _staging /tmp/_staging-seed
+          if [ -d org-pages/coxswain ] && [ -n "$(ls -A org-pages/coxswain 2>/dev/null)" ]; then
+            cp -a org-pages/coxswain/. /tmp/_staging-seed/
+            git -C /tmp/_staging-seed add -A
+            git -C /tmp/_staging-seed commit -m "seed _staging from org-pages/coxswain"
+          fi
+          git worktree remove --force /tmp/_staging-seed
+
       - name: Build docs with mike (local staging branch)
         env:
           PACKAGE_VERSION: ${{ steps.version.outputs.package }}
@@ -431,13 +462,6 @@ jobs:
         run: |
           set -euo pipefail
           git worktree add /tmp/staged _staging
-
-      - name: Checkout org-level pages repo
-        uses: actions/checkout@v6
-        with:
-          repository: coxswain-labs/coxswain-labs.github.io
-          token: ${{ secrets.GH_DOCS_PAT }}
-          path: org-pages
 
       - name: Sync docs into coxswain/ subdirectory
         run: |
