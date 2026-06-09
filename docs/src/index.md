@@ -10,7 +10,7 @@ A Rust Kubernetes Ingress and Gateway API controller backed by [Pingora](https:/
 | Feature | Detail |
 |---------|--------|
 | **Routing updates** | Routes are applied via an immutable-snapshot atomic-pointer swap on every reconcile — no config reload, no process restart |
-| **Gateway API + Ingress** | Both `HTTPRoute` and classic `Ingress` resources in the same binary; both contribute to the same routing table |
+| **Gateway API + Ingress** | Both `HTTPRoute` and classic `Ingress` resources are served by the same controller and proxy fleet; both contribute to the same routing table |
 | **Multi-replica** | All replicas reconcile and serve traffic; a Kubernetes `Lease` coordinates which replica writes status conditions |
 | **TLS hot-reload** | New and renewed certificates are picked up from `kubernetes.io/tls` Secrets without a restart |
 | **Prometheus metrics** | `/metrics` on the admin port |
