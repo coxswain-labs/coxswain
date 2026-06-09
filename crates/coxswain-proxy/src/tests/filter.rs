@@ -1,4 +1,4 @@
-use crate::filter::{apply_header_mod, rewrite_path};
+use crate::common::filter::{apply_header_mod, rewrite_path};
 use coxswain_core::routing::HeaderMod;
 use pingora_http::{RequestHeader, ResponseHeader};
 

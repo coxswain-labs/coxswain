@@ -32,14 +32,14 @@ async fn path_matching() -> anyhow::Result<()> {
     let host = format!("echo.{}.local", ns.name);
 
     // Wait for the route to become live before asserting individual paths.
-    let resp = wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&h.gateway_http, &host, "/a", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
-    let resp = h.http.get(&host, "/b").await?;
+    let resp = h.gateway_http.get(&host, "/b").await?;
     resp.assert_backend("echo-b");
 
     // Catch-all rule routes to echo-a.
-    let resp = h.http.get(&host, "/").await?;
+    let resp = h.gateway_http.get(&host, "/").await?;
     resp.assert_backend("echo-a");
 
     Ok(())
@@ -56,13 +56,13 @@ async fn host_pool() -> anyhow::Result<()> {
     h.apply(gwa::HOST_POOL, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("pool.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
 
     // Round-robin across echo-a and echo-b — collect enough responses to see both.
     let mut saw_a = false;
     let mut saw_b = false;
     for _ in 0..20 {
-        let resp = h.http.get(&host, "/").await?;
+        let resp = h.gateway_http.get(&host, "/").await?;
         let pod = resp.pod.as_deref().unwrap_or("");
         if pod.starts_with("echo-a-") {
             saw_a = true;
@@ -93,17 +93,17 @@ async fn wildcard_host() -> anyhow::Result<()> {
 
     // Any subdomain of *.wildcard.TESTNS.local should reach echo-c.
     let host = format!("foo.wildcard.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-c");
 
     let host2 = format!("bar.wildcard.{}.local", ns.name);
-    let resp2 = h.http.get(&host2, "/").await?;
+    let resp2 = h.gateway_http.get(&host2, "/").await?;
     resp2.assert_backend("echo-c");
 
     // Gateway API spec: `*` matches any number of subdomain labels, so multi-label
     // subdomains must also reach echo-c.
     let multi = format!("a.b.foo.wildcard.{}.local", ns.name);
-    let resp3 = h.http.get(&multi, "/").await?;
+    let resp3 = h.gateway_http.get(&multi, "/").await?;
     resp3.assert_backend("echo-c");
 
     Ok(())
@@ -132,7 +132,7 @@ async fn cross_namespace_with_grant() -> anyhow::Result<()> {
     .await?;
 
     let host = format!("cross-ns.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-d");
 
     Ok(())
@@ -204,7 +204,7 @@ async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
 
     // Bump .metadata.generation with a harmless spec change (allowedRoutes.namespaces.from
     // changes from Same to All — the HTTPRoute is in the same namespace so it still attaches).
-    let http_port = h.controller.proxy_addr.port();
+    let http_port = h.controller.gateway_http_addr.port();
     let bump_patch = serde_json::json!({
         "spec": {
             "listeners": [{"name": "http", "port": http_port, "protocol": "HTTP",
@@ -298,11 +298,11 @@ async fn header_matching() -> anyhow::Result<()> {
         .await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
 
     // Exact header match → echo-a
     let (status, body) = h
-        .http
+        .gateway_http
         .request(Method::GET, &host, "/hdr", &[("X-Tenant", "a")])
         .await?;
     assert_eq!(status, 200, "expected 200 for exact header match");
@@ -310,14 +310,17 @@ async fn header_matching() -> anyhow::Result<()> {
 
     // Regex header match → echo-b
     let (status, body) = h
-        .http
+        .gateway_http
         .request(Method::GET, &host, "/hdr", &[("X-Tenant", "beta")])
         .await?;
     assert_eq!(status, 200, "expected 200 for regex header match");
     body.unwrap().assert_backend("echo-b");
 
     // No matching header → no route
-    let (status, _) = h.http.request(Method::GET, &host, "/hdr", &[]).await?;
+    let (status, _) = h
+        .gateway_http
+        .request(Method::GET, &host, "/hdr", &[])
+        .await?;
     assert_ne!(
         status, 200,
         "expected non-200 when header predicate not satisfied"
@@ -338,15 +341,21 @@ async fn method_matching() -> anyhow::Result<()> {
         .await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
 
     // GET → echo-a
-    let (status, body) = h.http.request(Method::GET, &host, "/method", &[]).await?;
+    let (status, body) = h
+        .gateway_http
+        .request(Method::GET, &host, "/method", &[])
+        .await?;
     assert_eq!(status, 200, "expected 200 for GET");
     body.unwrap().assert_backend("echo-a");
 
     // POST → echo-b
-    let (status, body) = h.http.request(Method::POST, &host, "/method", &[]).await?;
+    let (status, body) = h
+        .gateway_http
+        .request(Method::POST, &host, "/method", &[])
+        .await?;
     assert_eq!(status, 200, "expected 200 for POST");
     body.unwrap().assert_backend("echo-b");
 
@@ -365,11 +374,11 @@ async fn query_param_matching() -> anyhow::Result<()> {
         .await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
 
     // Exact query param match → echo-a
     let (status, body) = h
-        .http
+        .gateway_http
         .request(Method::GET, &host, "/query?version=v1", &[])
         .await?;
     assert_eq!(status, 200, "expected 200 for exact query param match");
@@ -377,14 +386,17 @@ async fn query_param_matching() -> anyhow::Result<()> {
 
     // Regex query param match → echo-b
     let (status, body) = h
-        .http
+        .gateway_http
         .request(Method::GET, &host, "/query?version=v2.5", &[])
         .await?;
     assert_eq!(status, 200, "expected 200 for regex query param match");
     body.unwrap().assert_backend("echo-b");
 
     // No matching query param → no route
-    let (status, _) = h.http.request(Method::GET, &host, "/query", &[]).await?;
+    let (status, _) = h
+        .gateway_http
+        .request(Method::GET, &host, "/query", &[])
+        .await?;
     assert_ne!(
         status, 200,
         "expected non-200 when query predicate not satisfied"
@@ -405,11 +417,11 @@ async fn combined_matching() -> anyhow::Result<()> {
         .await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
 
     // AND semantics: GET + X-Env: prod → echo-a
     let (status, body) = h
-        .http
+        .gateway_http
         .request(Method::GET, &host, "/combined", &[("X-Env", "prod")])
         .await?;
     assert_eq!(status, 200, "expected 200 for GET + X-Env: prod");
@@ -417,7 +429,7 @@ async fn combined_matching() -> anyhow::Result<()> {
 
     // OR semantics: second match (POST + X-Env: staging) also routes to echo-a
     let (status, body) = h
-        .http
+        .gateway_http
         .request(Method::POST, &host, "/combined", &[("X-Env", "staging")])
         .await?;
     assert_eq!(status, 200, "expected 200 for POST + X-Env: staging");
@@ -425,7 +437,7 @@ async fn combined_matching() -> anyhow::Result<()> {
 
     // AND semantics failure: correct method, wrong header value → no match
     let (status, _) = h
-        .http
+        .gateway_http
         .request(Method::GET, &host, "/combined", &[("X-Env", "dev")])
         .await?;
     assert_ne!(
@@ -474,15 +486,10 @@ async fn cross_namespace_without_grant() -> anyhow::Result<()> {
 
     let host = format!("cross-ns.{}.local", ns.name);
 
-    // Give the controller time to reconcile; without the grant the backend
-    // cannot be resolved so an error-sentinel route is installed, returning 500.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let status = h.http.get_status(&host, "/").await?;
-    assert_eq!(
-        status, 500,
-        "expected 500 without ReferenceGrant, got {status}"
-    );
+    // Without the grant the backend cannot be resolved so an error-sentinel
+    // route is installed, returning 500. Poll until the route is live —
+    // a fixed sleep raced HotReloader's restart cycle on slow runs.
+    wait::wait_for_route_status(&h.gateway_http, &host, "/", 500, Duration::from_secs(60)).await?;
 
     Ok(())
 }
@@ -520,16 +527,18 @@ async fn tls_termination_with_sni() -> anyhow::Result<()> {
     .await?;
 
     let resp_a =
-        wait::wait_for_https_route(h.tls_addr, &host_a, "/", Duration::from_secs(60)).await?;
+        wait::wait_for_https_route(h.gateway_tls_addr, &host_a, "/", Duration::from_secs(60))
+            .await?;
     resp_a.assert_backend("echo-a");
 
     let resp_b =
-        wait::wait_for_https_route(h.tls_addr, &host_b, "/", Duration::from_secs(60)).await?;
+        wait::wait_for_https_route(h.gateway_tls_addr, &host_b, "/", Duration::from_secs(60))
+            .await?;
     resp_b.assert_backend("echo-b");
 
     // Unknown SNI must cause a TLS handshake failure (no cert installed).
     let unknown = format!("unknown.{}.local", ns.name);
-    let result = http::https_get(&unknown, "/", h.tls_addr).await;
+    let result = http::https_get(&unknown, "/", h.gateway_tls_addr).await;
     assert!(
         result.is_err(),
         "expected TLS error for unknown SNI, got: {result:?}"
@@ -668,7 +677,8 @@ async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
     )
     .await?;
 
-    let resp = wait::wait_for_https_route(h.tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    let resp =
+        wait::wait_for_https_route(h.gateway_tls_addr, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
     Ok(())
@@ -710,11 +720,11 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
     )
     .await?;
 
-    wait::wait_for_https_route(h.tls_addr, &host_a, "/", Duration::from_secs(60)).await?;
-    wait::wait_for_https_route(h.tls_addr, &host_b, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_https_route(h.gateway_tls_addr, &host_a, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_https_route(h.gateway_tls_addr, &host_b, "/", Duration::from_secs(60)).await?;
 
-    let old_der_a = http::https_peer_leaf_der(&host_a, "/", h.tls_addr).await?;
-    let old_der_b = http::https_peer_leaf_der(&host_b, "/", h.tls_addr).await?;
+    let old_der_a = http::https_peer_leaf_der(&host_a, "/", h.gateway_tls_addr).await?;
+    let old_der_b = http::https_peer_leaf_der(&host_b, "/", h.gateway_tls_addr).await?;
 
     // Rotate only Secret A; Secret B data is unchanged.
     h.apply(
@@ -732,22 +742,27 @@ async fn tls_certificate_hot_rotation() -> anyhow::Result<()> {
     .await?;
 
     // Listener A must pick up the new cert.
-    wait::wait_for_tls_cert_rotation(h.tls_addr, &host_a, &old_der_a, Duration::from_secs(15))
-        .await?;
+    wait::wait_for_tls_cert_rotation(
+        h.gateway_tls_addr,
+        &host_a,
+        &old_der_a,
+        Duration::from_secs(15),
+    )
+    .await?;
 
     // Listener B must still serve the original cert (no spurious swap).
-    let new_der_b = http::https_peer_leaf_der(&host_b, "/", h.tls_addr).await?;
+    let new_der_b = http::https_peer_leaf_der(&host_b, "/", h.gateway_tls_addr).await?;
     assert_eq!(old_der_b, new_der_b, "listener B cert must not change");
 
     // Both listeners must still route correctly.
-    let resp_a = http::https_get(&host_a, "/", h.tls_addr).await?;
+    let resp_a = http::https_get(&host_a, "/", h.gateway_tls_addr).await?;
     assert!(
         resp_a.1.is_some(),
         "expected response from listener A after rotation"
     );
     resp_a.1.unwrap().assert_backend("echo-a");
 
-    let resp_b = http::https_get(&host_b, "/", h.tls_addr).await?;
+    let resp_b = http::https_get(&host_b, "/", h.gateway_tls_addr).await?;
     assert!(
         resp_b.1.is_some(),
         "expected response from listener B after rotation"
@@ -787,7 +802,8 @@ async fn cert_manager_gateway_provisioning() -> anyhow::Result<()> {
     wait::wait_for_tls_secret(&h.client, secret_name, &ns.name, Duration::from_secs(120)).await?;
 
     // Coxswain picks up the Secret via its Secret watch; wait for HTTPS to become live.
-    let resp = wait::wait_for_https_route(h.tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    let resp =
+        wait::wait_for_https_route(h.gateway_tls_addr, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
     Ok(())
@@ -812,10 +828,15 @@ async fn websocket_passthrough() -> anyhow::Result<()> {
     let host = format!("ws.{}.local", ns.name);
 
     // Poll until the proxy returns a 101 for this virtual host.
-    wait::wait_for_ws_route(h.controller.proxy_addr, &host, Duration::from_secs(60)).await?;
+    wait::wait_for_ws_route(
+        h.controller.gateway_http_addr,
+        &host,
+        Duration::from_secs(60),
+    )
+    .await?;
 
     // Open a fresh WebSocket connection and verify the echo round-trip.
-    let uri = format!("ws://{}/", h.controller.proxy_addr);
+    let uri = format!("ws://{}/", h.controller.gateway_http_addr);
     let req = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(&uri)
         .header("Host", &host)
@@ -869,7 +890,7 @@ async fn backend_protocol_h2c() -> anyhow::Result<()> {
 
     let host = format!("h2c.{}.local", ns.name);
 
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("h2c-echo");
     Ok(())
 }
@@ -887,11 +908,17 @@ async fn filters() -> anyhow::Result<()> {
     let host = format!("echo.{}.local", ns.name);
 
     // Wait for the HTTPRoute to become live using the dedicated probe path.
-    wait::wait_for_route(&h.http, &host, "/filter/probe", Duration::from_secs(60)).await?;
+    wait::wait_for_route(
+        &h.gateway_http,
+        &host,
+        "/filter/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
 
     // ── RequestHeaderModifier ────────────────────────────────────────────────
     // The echo backend reflects request headers in the response body JSON.
-    let resp = h.http.get(&host, "/filter/req-header").await?;
+    let resp = h.gateway_http.get(&host, "/filter/req-header").await?;
     // echo-basic returns headers as Title-Case keys with JSON array values.
     let injected = resp
         .headers
@@ -904,7 +931,10 @@ async fn filters() -> anyhow::Result<()> {
     );
 
     // ── ResponseHeaderModifier ───────────────────────────────────────────────
-    let (status, resp_headers, _) = h.http.get_full(&host, "/filter/resp-header").await?;
+    let (status, resp_headers, _) = h
+        .gateway_http
+        .get_full(&host, "/filter/resp-header")
+        .await?;
     assert_eq!(status, 200, "ResponseHeaderModifier: expected 200");
     let hdr_val = resp_headers
         .get("x-test-response")
@@ -917,7 +947,7 @@ async fn filters() -> anyhow::Result<()> {
 
     // ── RequestRedirect ──────────────────────────────────────────────────────
     // The redirect client follows redirects by default; disable that to see the 302.
-    let url = format!("http://{}{}", h.http.proxy_addr, "/filter/redirect");
+    let url = format!("http://{}{}", h.gateway_http.proxy_addr, "/filter/redirect");
     let redirect_resp = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
@@ -943,7 +973,7 @@ async fn filters() -> anyhow::Result<()> {
 
     // ── URLRewrite ───────────────────────────────────────────────────────────
     // The echo backend returns the path it received; we expect the rewritten path.
-    let resp = h.http.get(&host, "/filter/old/resource").await?;
+    let resp = h.gateway_http.get(&host, "/filter/old/resource").await?;
     let echo_path = resp.path.as_deref().unwrap_or("");
     assert_eq!(
         echo_path, "/filter/new/resource",
@@ -969,7 +999,7 @@ async fn timeouts_request_returns_504() -> anyhow::Result<()> {
     // Wait until the route is programmed. /request-timeout always returns 504 so we
     // can't use it as a readiness probe; use /backend-timeout (also 504) instead.
     wait::wait_for_route_status(
-        &h.http,
+        &h.gateway_http,
         &host,
         "/backend-timeout",
         504,
@@ -977,7 +1007,7 @@ async fn timeouts_request_returns_504() -> anyhow::Result<()> {
     )
     .await?;
 
-    let status = h.http.get_status(&host, "/request-timeout").await?;
+    let status = h.gateway_http.get_status(&host, "/request-timeout").await?;
     assert_eq!(
         status, 504,
         "expected 504 from request timeout, got {status}"
@@ -1002,7 +1032,7 @@ async fn timeouts_backend_request_returns_504() -> anyhow::Result<()> {
     // Wait until the route is registered. Both rules time out so we cannot use
     // wait_for_route; instead we poll until the 504 appears.
     wait::wait_for_route_status(
-        &h.http,
+        &h.gateway_http,
         &host,
         "/backend-timeout",
         504,
@@ -1010,7 +1040,7 @@ async fn timeouts_backend_request_returns_504() -> anyhow::Result<()> {
     )
     .await?;
 
-    let status = h.http.get_status(&host, "/backend-timeout").await?;
+    let status = h.gateway_http.get_status(&host, "/backend-timeout").await?;
     assert_eq!(
         status, 504,
         "expected 504 from backend request timeout, got {status}"
@@ -1048,7 +1078,7 @@ async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
     // Wait until the probe path is reachable over HTTPS (confirms TLS is set up and
     // the route is programmed).
     wait::wait_for_https_route(
-        h.tls_addr,
+        h.gateway_tls_addr,
         &host,
         "/tls-redirect/probe",
         Duration::from_secs(60),
@@ -1060,10 +1090,14 @@ async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(5))
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none())
-        .resolve(&host, h.tls_addr)
+        .resolve(&host, h.gateway_tls_addr)
         .build()?;
 
-    let url = format!("https://{}:{}/tls-redirect", host, h.tls_addr.port());
+    let url = format!(
+        "https://{}:{}/tls-redirect",
+        host,
+        h.gateway_tls_addr.port()
+    );
     let resp = client.get(&url).send().await?;
 
     assert_eq!(resp.status().as_u16(), 302, "expected 302 redirect");
@@ -1094,10 +1128,10 @@ async fn weighted_split() -> anyhow::Result<()> {
         .await?;
 
     let host = format!("weighted.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/probe", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
 
     // /zero: echo-a has weight 0 → all traffic must go to echo-b.
-    let counts = http::count_backends(&h.http, &host, "/zero", 40).await?;
+    let counts = http::count_backends(&h.gateway_http, &host, "/zero", 40).await?;
     assert_eq!(
         counts.get("echo-a").copied().unwrap_or(0),
         0,
@@ -1111,7 +1145,7 @@ async fn weighted_split() -> anyhow::Result<()> {
     // /skewed: echo-a weight 4, echo-b weight 1 → ~80% to echo-a.
     // Send 200 requests; allow ±10pp tolerance to stay robust under scheduling noise.
     let n = 200usize;
-    let counts = http::count_backends(&h.http, &host, "/skewed", n).await?;
+    let counts = http::count_backends(&h.gateway_http, &host, "/skewed", n).await?;
     let a = counts.get("echo-a").copied().unwrap_or(0);
     let ratio = a as f64 / n as f64;
     assert!(
@@ -1173,12 +1207,12 @@ async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
     h.apply(gwa::SERVING_DRAIN, FixtureVars::new(&ns.name))
         .await?;
     let host = format!("serving.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
 
     // All 30 requests must reach echo-a. If the serving:false endpoint were
     // selected, ~50% of requests would fail with a connection error to 192.0.2.1,
     // causing count_backends to return Err and the test to fail.
-    let counts = http::count_backends(&h.http, &host, "/", 30).await?;
+    let counts = http::count_backends(&h.gateway_http, &host, "/", 30).await?;
     assert_eq!(
         counts.get("echo-a").copied().unwrap_or(0),
         30,
@@ -1211,19 +1245,30 @@ async fn parent_ref_port_matching() -> anyhow::Result<()> {
 
     // route-pinned (parentRef.port=HTTP_PORT) must attach only to the HTTP listener.
     let pinned_host = format!("pinned.{}.local", ns.name);
-    let resp =
-        wait::wait_for_route(&h.http, &pinned_host, "/probe", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(
+        &h.gateway_http,
+        &pinned_host,
+        "/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
     resp.assert_backend("echo-a");
 
     // route-unpinned (no parentRef.port) must attach to BOTH listeners.
     let both_host = format!("both.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.http, &both_host, "/probe", Duration::from_secs(30)).await?;
+    let resp = wait::wait_for_route(
+        &h.gateway_http,
+        &both_host,
+        "/probe",
+        Duration::from_secs(30),
+    )
+    .await?;
     resp.assert_backend("echo-a");
 
     // route-wrong-port (parentRef.port=WRONG_PORT) must NOT be routable on HTTP_PORT:
     // the route is scoped to the alt listener, which coxswain doesn't bind.
     let wrong_host = format!("wrong.{}.local", ns.name);
-    let status = h.http.get_status(&wrong_host, "/").await?;
+    let status = h.gateway_http.get_status(&wrong_host, "/").await?;
     assert_ne!(
         status, 200,
         "route-wrong-port must not be routable on HTTP_PORT"
@@ -1231,10 +1276,15 @@ async fn parent_ref_port_matching() -> anyhow::Result<()> {
 
     // Verify routing-table isolation via admin /routes.
     // Once pinned.* and both.* are live the table is fully settled.
+    //
+    // Since the IngressProxy/GatewayProxy split (#201), `/routes` reports the
+    // two tables under separate keys; this test only inspects Gateway-API routes.
     let routes: serde_json::Value = reqwest::get(h.admin_url("/routes")).await?.json().await?;
-    let hosts = routes["hosts"].as_array().expect("hosts array");
+    let hosts = routes["gateway"]["hosts"]
+        .as_array()
+        .expect("gateway.hosts array");
 
-    let http_port = u64::from(h.controller.proxy_addr.port());
+    let http_port = u64::from(h.controller.gateway_http_addr.port());
     let wrong_port_u64: u64 = wrong_port.parse().unwrap();
 
     let ports_for = |host: &str| -> std::collections::BTreeSet<u64> {
@@ -1307,7 +1357,7 @@ async fn backend_tls_policy_configmap() -> anyhow::Result<()> {
     .await?;
 
     // The route should come up once the controller reconciles and the proxy verifies the cert.
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-tls");
 
     // Controller must have written Accepted=True / ResolvedRefs=True on the policy.
@@ -1365,7 +1415,7 @@ async fn backend_tls_policy_invalid_ca() -> anyhow::Result<()> {
 
     let host = format!("backend-tls.{}.local", ns.name);
     // Traffic MUST return 5xx — never plain-HTTP-fallthrough success.
-    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+    wait::wait_for_route_status(&h.gateway_http, &host, "/", 502, Duration::from_secs(60)).await?;
 
     let controller_name = "coxswain-labs.dev/gateway-controller";
     wait::wait_for_backend_tls_policy_condition_with_reason(
@@ -1438,9 +1488,21 @@ async fn backend_tls_policy_section_name_routing() -> anyhow::Result<()> {
 
     // Both routes must succeed. The section-name policy applies to port 443; the
     // catch-all to port 8443. If per-port lookup is broken, one of these returns 5xx.
-    let resp = wait::wait_for_route(&h.http, &host, "/port-443/", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(
+        &h.gateway_http,
+        &host,
+        "/port-443/",
+        Duration::from_secs(60),
+    )
+    .await?;
     resp.assert_backend("echo-tls");
-    let resp = wait::wait_for_route(&h.http, &host, "/port-8443/", Duration::from_secs(30)).await?;
+    let resp = wait::wait_for_route(
+        &h.gateway_http,
+        &host,
+        "/port-8443/",
+        Duration::from_secs(30),
+    )
+    .await?;
     resp.assert_backend("echo-tls");
 
     Ok(())
@@ -1542,7 +1604,7 @@ async fn backend_tls_policy_configmap_mutation() -> anyhow::Result<()> {
     .await?;
 
     let host = format!("backend-tls.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-tls");
 
     // Swap the ConfigMap's ca.crt for an unrelated self-signed CA. The backend's cert
@@ -1562,7 +1624,7 @@ async fn backend_tls_policy_configmap_mutation() -> anyhow::Result<()> {
 
     // The controller should observe the CM change, rebuild, and the proxy's UpstreamCaCache
     // will surface a fresh CA. The cert no longer chains → 502.
-    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+    wait::wait_for_route_status(&h.gateway_http, &host, "/", 502, Duration::from_secs(60)).await?;
 
     Ok(())
 }
@@ -1603,7 +1665,7 @@ async fn backend_tls_policy_hostname_mismatch() -> anyhow::Result<()> {
 
     // Wait for the route to appear in the routing table (reconciler must have processed it).
     // Then assert that requests fail with 5xx (TLS verification error from Pingora).
-    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+    wait::wait_for_route_status(&h.gateway_http, &host, "/", 502, Duration::from_secs(60)).await?;
 
     Ok(())
 }

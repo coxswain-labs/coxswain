@@ -17,15 +17,24 @@ pub use tls::GeneratedCert;
 
 /// Top-level test harness: wraps a running controller subprocess with a Kubernetes
 /// client, an HTTP test client, and fixture application helpers.
+///
+/// `http` and `tls_addr` point at the Ingress data plane; `gateway_http` and
+/// `gateway_tls_addr` point at the Gateway data plane. Since the IngressProxy
+/// / GatewayProxy split (#201) the two bind disjoint port sets, so tests must
+/// pick the correct pair for the route under test.
 pub struct Harness {
     /// Kubernetes client pre-configured from the default kubeconfig.
     pub client: kube::Client,
     /// Running coxswain subprocess (killed on drop).
     pub controller: ControllerProcess,
-    /// HTTP test client pre-pointed at the controller's HTTP proxy port.
+    /// HTTP test client pre-pointed at the Ingress HTTP proxy port.
     pub http: HttpClient,
-    /// Bound address of the controller's HTTPS/TLS proxy port.
+    /// Bound address of the Ingress HTTPS/TLS proxy port.
     pub tls_addr: std::net::SocketAddr,
+    /// HTTP test client pre-pointed at the Gateway HTTP listener port.
+    pub gateway_http: HttpClient,
+    /// Bound address of the Gateway HTTPS listener port.
+    pub gateway_tls_addr: std::net::SocketAddr,
 }
 
 impl Harness {
@@ -46,11 +55,16 @@ impl Harness {
             .context("readyz timeout")?;
         let http = HttpClient::new(controller.proxy_addr).context("http client")?;
         let tls_addr = controller.tls_addr;
+        let gateway_http =
+            HttpClient::new(controller.gateway_http_addr).context("gateway http client")?;
+        let gateway_tls_addr = controller.gateway_https_addr;
         Ok(Self {
             client,
             controller,
             http,
             tls_addr,
+            gateway_http,
+            gateway_tls_addr,
         })
     }
 
@@ -59,8 +73,9 @@ impl Harness {
         format!("http://{}{path}", self.controller.admin_addr)
     }
 
-    /// Apply a fixture YAML. Automatically substitutes `HTTP_PORT` and `HTTPS_PORT`
-    /// from the controller's bound addresses; use `vars.with(key, val)` for extras.
+    /// Apply a fixture YAML. Automatically substitutes the four port placeholders
+    /// (`HTTP_PORT`, `HTTPS_PORT`, `GATEWAY_HTTP_PORT`, `GATEWAY_HTTPS_PORT`) from
+    /// the controller's bound addresses; use `vars.with(key, val)` for extras.
     pub async fn apply(
         &self,
         path: impl AsRef<std::path::Path>,
@@ -69,6 +84,8 @@ impl Harness {
         let vars = crate::fixtures::FixtureVars {
             http_port: self.controller.proxy_addr.port(),
             https_port: self.tls_addr.port(),
+            gateway_http_port: self.controller.gateway_http_addr.port(),
+            gateway_https_port: self.controller.gateway_https_addr.port(),
             ..vars
         };
         crate::fixtures::apply_fixture(path, vars).await

@@ -1,7 +1,7 @@
 //! Request and response filter application: header modifiers, URL rewrites, and the
 //! `Forwarded` header injection for PROXY-protocol connections.
 
-use crate::proxy::ProxyCtx;
+use super::ctx::ProxyCtx;
 use coxswain_core::routing::{FilterAction, HeaderMod, PathModifier};
 use http::{HeaderName, HeaderValue};
 use std::sync::LazyLock;
@@ -11,9 +11,20 @@ static X_PROXY_ENGINE: LazyLock<HeaderValue> =
 use pingora_core::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 
+/// Applies Gateway-API and Ingress filter actions to the in-flight request
+/// and response headers, plus the fixed `X-Proxy-Engine` and RFC-7239
+/// `Forwarded` infrastructure headers.
 pub struct TrafficFilter;
 
 impl TrafficFilter {
+    /// Apply request-side filters (header modifiers and URL rewrites), then
+    /// stamp the fixed infrastructure headers.
+    ///
+    /// `original_host` and `original_path` carry the pre-rewrite Host and path
+    /// so a `UrlRewrite` filter can compose against the user-visible request.
+    ///
+    /// # Errors
+    /// Propagates Pingora header-mutation errors from the fixed-header inserts.
     pub fn apply_request_filters(
         upstream_request: &mut RequestHeader,
         filters: &[FilterAction],
@@ -60,6 +71,7 @@ impl TrafficFilter {
         Ok(())
     }
 
+    /// Apply response-side filters (header modifiers only).
     pub fn apply_response_filters(
         upstream_response: &mut ResponseHeader,
         filters: &[FilterAction],

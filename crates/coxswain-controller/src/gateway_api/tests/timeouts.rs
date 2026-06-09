@@ -7,7 +7,7 @@ use gateway_api::apis::standard::httproutes::HttpRouteRulesTimeouts;
 use std::time::Duration;
 
 fn find_timeouts(
-    table: &coxswain_core::routing::RoutingTable,
+    table: &coxswain_core::routing::GatewayRoutingTable,
     host: &str,
     path: &str,
 ) -> coxswain_core::routing::RouteTimeouts {

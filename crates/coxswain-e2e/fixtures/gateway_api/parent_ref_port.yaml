@@ -1,13 +1,13 @@
 # parentRef.port matching fixture.
 #
-# One Gateway with two HTTP listeners: one on HTTP_PORT (coxswain-bound) and
+# One Gateway with two HTTP listeners: one on GATEWAY_HTTP_PORT (coxswain-bound) and
 # one on WRONG_PORT (declared but coxswain is NOT listening on it).
 #
-# route-pinned:   parentRef.port=HTTP_PORT  → routes to echo-a   (should be routable)
+# route-pinned:   parentRef.port=GATEWAY_HTTP_PORT  → routes to echo-a   (should be routable)
 # route-wrong:    parentRef.port=WRONG_PORT → routes to echo-b   (coxswain not listening, unreachable)
 # route-unpinned: no parentRef.port         → routes to echo-a   (attaches to both listeners)
 #
-# TESTNS and HTTP_PORT are substituted at runtime.
+# TESTNS and GATEWAY_HTTP_PORT are substituted at runtime.
 # WRONG_PORT is substituted at runtime with a port that coxswain is NOT listening on.
 ---
 apiVersion: gateway.networking.k8s.io/v1
@@ -18,7 +18,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: HTTP_PORT
+      port: GATEWAY_HTTP_PORT
       protocol: HTTP
       allowedRoutes:
         namespaces:
@@ -38,7 +38,7 @@ metadata:
 spec:
   parentRefs:
     - name: port-gw
-      port: HTTP_PORT
+      port: GATEWAY_HTTP_PORT
   hostnames:
     - "pinned.TESTNS.local"
   rules:
@@ -53,7 +53,7 @@ spec:
         - name: echo-a
           port: 3000
 ---
-# Route bound to the alt listener port — should NOT be routable on HTTP_PORT.
+# Route bound to the alt listener port — should NOT be routable on GATEWAY_HTTP_PORT.
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:

@@ -2,6 +2,9 @@
 
 use anyhow::Context as _;
 use ipnet::IpNet;
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+use std::os::unix::process::CommandExt as _;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
@@ -11,12 +14,25 @@ use tokio::process::{Child, Command};
 const BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// Handle to a running coxswain subprocess spawned for e2e tests.
+///
+/// Since the IngressProxy / GatewayProxy split (issue #201), Ingress and
+/// Gateway traffic bind disjoint port sets. `proxy_addr` / `tls_addr` are the
+/// Ingress entry points and are passed to coxswain via `--proxy-http-port` /
+/// `--proxy-https-port`. `gateway_http_addr` / `gateway_https_addr` are
+/// pre-allocated for Gateway listeners — tests apply Gateway resources whose
+/// listeners declare these ports, and the controller's HotReloader detects
+/// them and binds them on restart.
 pub struct ControllerProcess {
     child: Child,
-    /// Bound address of the HTTP proxy listener.
+    /// Bound address of the Ingress HTTP proxy listener (`--proxy-http-port`).
     pub proxy_addr: SocketAddr,
-    /// Bound address of the HTTPS/TLS proxy listener.
+    /// Bound address of the Ingress HTTPS/TLS proxy listener (`--proxy-https-port`).
     pub tls_addr: SocketAddr,
+    /// Pre-allocated address for tests that need a Gateway HTTP listener port.
+    /// Not passed as a CLI flag; tests declare it in their Gateway specs.
+    pub gateway_http_addr: SocketAddr,
+    /// Pre-allocated address for tests that need a Gateway HTTPS listener port.
+    pub gateway_https_addr: SocketAddr,
     /// Bound address of the `/healthz`/`/readyz` endpoint.
     pub health_addr: SocketAddr,
     /// Bound address of the `/metrics`/`/routes`/`/status` endpoint.
@@ -47,11 +63,15 @@ impl ControllerProcess {
     pub async fn start_with_options(opts: ControllerOptions) -> anyhow::Result<Self> {
         let http_port = free_port()?;
         let https_port = free_port()?;
+        let gateway_http_port = free_port()?;
+        let gateway_https_port = free_port()?;
         let health_port = free_port()?;
         let admin_port = free_port()?;
 
         let proxy_addr = SocketAddr::new(BIND_ADDR, http_port);
         let tls_addr = SocketAddr::new(BIND_ADDR, https_port);
+        let gateway_http_addr = SocketAddr::new(BIND_ADDR, gateway_http_port);
+        let gateway_https_addr = SocketAddr::new(BIND_ADDR, gateway_https_port);
         let health_addr = SocketAddr::new(BIND_ADDR, health_port);
         let admin_addr = SocketAddr::new(BIND_ADDR, admin_port);
 
@@ -106,8 +126,15 @@ impl ControllerProcess {
             );
         }
 
-        let child = Command::new(&binary)
-            .args(&args)
+        // Make the spawned coxswain its own process-group leader so we can reap
+        // any restart-children together with the original child on Drop. The bin
+        // implements port-rebinding by `fork+exec` of a restart-child then exiting
+        // the parent (`coxswain-bin::hot_reload`); the restart-child inherits the
+        // group, so killing the group covers both.
+        let mut cmd = Command::new(&binary);
+        cmd.args(&args);
+        cmd.as_std_mut().process_group(0);
+        let child = cmd
             .spawn()
             .with_context(|| format!("spawn {}", binary.display()))?;
 
@@ -115,6 +142,8 @@ impl ControllerProcess {
             child,
             proxy_addr,
             tls_addr,
+            gateway_http_addr,
+            gateway_https_addr,
             health_addr,
             admin_addr,
         })
@@ -123,6 +152,15 @@ impl ControllerProcess {
 
 impl Drop for ControllerProcess {
     fn drop(&mut self) {
+        // The HotReloader's restart model is fork+exec of a child followed by the
+        // parent calling `process::exit(0)`. The restart-child is in the same
+        // process group as the parent (we set `process_group(0)` at spawn), so
+        // killing the group sweeps every coxswain instance the test ever produced.
+        // `start_kill` on the directly-tracked child remains as a belt-and-braces
+        // fallback in case the group setup failed.
+        if let Some(pid) = self.child.id() {
+            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        }
         let _ = self.child.start_kill();
     }
 }

@@ -24,7 +24,11 @@ use async_trait::async_trait;
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::reference_grants::ReferenceGrantKey;
-use coxswain_core::routing::{BackendGroup, RouteEntry, RoutingTableBuilder, SharedRoutingTable};
+use coxswain_core::routing::{
+    BackendGroup, GatewayRoutingTableBuilder, IngressRoutingTableBuilder, RouteEntry, RoutingTable,
+    RoutingTableBuilder, SharedGatewayRoutingTable, SharedIngressRoutingTable,
+};
+use coxswain_core::shared::Shared;
 use coxswain_core::tls::{SharedTlsStore, TlsStoreBuilder};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
@@ -140,7 +144,8 @@ impl ReconcilerHealth {
 /// table whenever any of them change — with a 500 ms trailing-edge debounce to
 /// coalesce burst updates (e.g. rolling deploys).
 pub struct Reconciler {
-    routes: SharedRoutingTable,
+    ingress_routes: SharedIngressRoutingTable,
+    gateway_routes: SharedGatewayRoutingTable,
     tls: SharedTlsStore,
     tls_health: SharedGatewayListenerHealth,
     route_health: SharedHttpRouteHealth,
@@ -151,19 +156,59 @@ pub struct Reconciler {
     opts: ReconcilerOptions,
 }
 
+/// The four `Shared<T>` outputs the [`Reconciler`] writes into on each rebuild.
+///
+/// Bundling them lets [`Reconciler::new`] stay under the workspace
+/// `clippy::too_many_arguments` threshold; callers pass one
+/// `ReconcilerOutputs` struct instead of four positional handles.
+#[non_exhaustive]
+pub struct ReconcilerOutputs {
+    /// Ingress-flavored routing table snapshot, updated on every successful Ingress build.
+    pub ingress_routes: SharedIngressRoutingTable,
+    /// Gateway-API-flavored routing table snapshot, updated on every successful Gateway build.
+    pub gateway_routes: SharedGatewayRoutingTable,
+    /// TLS certificate store snapshot, updated whenever a `kubernetes.io/tls` Secret changes.
+    pub tls: SharedTlsStore,
+    /// Per-listener Gateway health used by status writes and the hot-reloader.
+    pub tls_health: SharedGatewayListenerHealth,
+}
+
+impl ReconcilerOutputs {
+    /// Construct a `ReconcilerOutputs` bundle from its four shared handles.
+    #[must_use]
+    pub fn new(
+        ingress_routes: SharedIngressRoutingTable,
+        gateway_routes: SharedGatewayRoutingTable,
+        tls: SharedTlsStore,
+        tls_health: SharedGatewayListenerHealth,
+    ) -> Self {
+        Self {
+            ingress_routes,
+            gateway_routes,
+            tls,
+            tls_health,
+        }
+    }
+}
+
 impl Reconciler {
     /// Construct a new reconciler (does not start the watch loop).
     pub fn new(
-        routes: SharedRoutingTable,
-        tls: SharedTlsStore,
-        tls_health: SharedGatewayListenerHealth,
+        outputs: ReconcilerOutputs,
         owned_gateways: OwnedGateways,
         health: ReconcilerHealth,
         controller_name: String,
         opts: ReconcilerOptions,
     ) -> Self {
+        let ReconcilerOutputs {
+            ingress_routes,
+            gateway_routes,
+            tls,
+            tls_health,
+        } = outputs;
         Self {
-            routes,
+            ingress_routes,
+            gateway_routes,
             tls,
             tls_health,
             route_health: SharedHttpRouteHealth::new(),
@@ -215,7 +260,8 @@ struct ReflectorStores<'a> {
 }
 
 struct SharedOutputs<'a> {
-    routes: &'a SharedRoutingTable,
+    ingress_routes: &'a SharedIngressRoutingTable,
+    gateway_routes: &'a SharedGatewayRoutingTable,
     tls: &'a SharedTlsStore,
     tls_health: &'a SharedGatewayListenerHealth,
     route_health: &'a SharedHttpRouteHealth,
@@ -311,7 +357,8 @@ impl BackgroundService for Reconciler {
             ingress_ports: self.opts.ingress_ports,
         };
         let handles = SharedHandles {
-            routes: self.routes.clone(),
+            ingress_routes: self.ingress_routes.clone(),
+            gateway_routes: self.gateway_routes.clone(),
             tls: self.tls.clone(),
             tls_health: self.tls_health.clone(),
             route_health: self.route_health.clone(),
@@ -339,7 +386,8 @@ impl BackgroundService for Reconciler {
 /// Groups every cross-task handle the reconciler clones into its background work
 /// so the function stays under the `clippy::too_many_arguments` threshold.
 struct SharedHandles {
-    routes: SharedRoutingTable,
+    ingress_routes: SharedIngressRoutingTable,
+    gateway_routes: SharedGatewayRoutingTable,
     tls: SharedTlsStore,
     tls_health: SharedGatewayListenerHealth,
     route_health: SharedHttpRouteHealth,
@@ -355,7 +403,8 @@ async fn spawn_tasks(
     config: ReconcilerConfig,
 ) -> JoinSet<()> {
     let SharedHandles {
-        routes,
+        ingress_routes,
+        gateway_routes,
         tls,
         tls_health,
         route_health,
@@ -509,7 +558,8 @@ async fn spawn_tasks(
                 configmaps: &configmap_reader,
             };
             let outputs = SharedOutputs {
-                routes: &routes,
+                ingress_routes: &ingress_routes,
+                gateway_routes: &gateway_routes,
                 tls: &tls,
                 tls_health: &tls_health,
                 route_health: &route_health,
@@ -591,7 +641,7 @@ fn rebuild(
         &ownership,
         ingress_default_backend,
         ingress_ports,
-        outputs.routes,
+        outputs,
     );
 
     let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, outputs.tls);
@@ -743,10 +793,14 @@ fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
     (backend_grants, cert_grants)
 }
 
-/// Build and publish the routing table from HTTPRoutes and Ingresses.
+/// Build and publish the Ingress and Gateway routing tables from their
+/// respective source resources.
 ///
-/// Returns `true` if `shared` was replaced with a newly built table, `false` if
-/// the build failed (in which case the previous snapshot is retained).
+/// Two independent build pipelines run, each with its own typed builder. The
+/// two `Shared` outputs are swapped independently: a failure in one cannot
+/// disrupt or partially clear the other. Returns `true` only when BOTH builds
+/// publish successfully — the proxy is not considered "fully synchronised"
+/// until each table has had at least one honest publish.
 fn build_routes(
     stores: &ReflectorStores<'_>,
     routes: &[Arc<HttpRoute>],
@@ -754,7 +808,27 @@ fn build_routes(
     ownership: &Ownership<'_>,
     ingress_default_backend: Option<&IngressDefaultBackend>,
     ingress_ports: IngressPorts,
-    shared: &SharedRoutingTable,
+    outputs: &SharedOutputs<'_>,
+) -> bool {
+    let gateway_published = build_gateway_routes(stores, routes, ownership, outputs.gateway_routes);
+    let ingress_published = build_ingress_routes(
+        stores,
+        ingresses,
+        ownership,
+        ingress_default_backend,
+        ingress_ports,
+        outputs.ingress_routes,
+    );
+    gateway_published && ingress_published
+}
+
+/// Build the Gateway-API routing table from `HTTPRoute` resources and publish
+/// it to `shared`. Returns `true` if the publish succeeded.
+fn build_gateway_routes(
+    stores: &ReflectorStores<'_>,
+    routes: &[Arc<HttpRoute>],
+    ownership: &Ownership<'_>,
+    shared: &SharedGatewayRoutingTable,
 ) -> bool {
     // Precompute ListenerKey → (hostname, port) from all owned gateway listeners.
     let listener_info: HashMap<ListenerKey, ListenerBinding> = stores
@@ -780,7 +854,7 @@ fn build_routes(
         })
         .collect();
 
-    let mut builder = RoutingTableBuilder::new();
+    let mut builder = GatewayRoutingTableBuilder::new();
     for route in routes {
         GatewayApiReconciler::reconcile(
             route,
@@ -795,6 +869,28 @@ fn build_routes(
             &mut builder,
         );
     }
+
+    publish_routes(
+        shared,
+        builder,
+        "gateway",
+        routes.len(),
+        ownership.gateways.len(),
+    )
+}
+
+/// Build the Ingress routing table from `Ingress` resources (plus the
+/// controller-wide default backend, if configured) and publish it to `shared`.
+/// Returns `true` if the publish succeeded.
+fn build_ingress_routes(
+    stores: &ReflectorStores<'_>,
+    ingresses: &[Arc<Ingress>],
+    ownership: &Ownership<'_>,
+    ingress_default_backend: Option<&IngressDefaultBackend>,
+    ingress_ports: IngressPorts,
+    shared: &SharedIngressRoutingTable,
+) -> bool {
+    let mut builder = IngressRoutingTableBuilder::new();
     for ingress in ingresses {
         IngressReconciler::reconcile(
             ingress,
@@ -844,6 +940,26 @@ fn build_routes(
         }
     }
 
+    publish_routes(
+        shared,
+        builder,
+        "ingress",
+        ingresses.len(),
+        ownership.ingress_classes.len(),
+    )
+}
+
+/// Generic publish step: compile a builder, log conflicts, swap the snapshot.
+///
+/// Returns `true` if the build succeeded; `false` leaves the previous snapshot
+/// in place and lets the failure surface in logs without taking the proxy down.
+fn publish_routes<K>(
+    shared: &Shared<RoutingTable<K>>,
+    builder: RoutingTableBuilder<K>,
+    table_label: &'static str,
+    source_count: usize,
+    owned_owner_count: usize,
+) -> bool {
     match builder.build() {
         Ok(table) => {
             for c in table.conflicts() {
@@ -853,21 +969,25 @@ fn build_routes(
                     path = %c.path,
                     kind = c.kind.as_str(),
                     rejected_group = %c.rejected_group,
+                    table = table_label,
                     "Route conflict: path already claimed by an earlier rule — ignoring"
                 );
             }
             shared.store(Arc::new(table));
             tracing::info!(
-                http_routes = routes.len(),
-                ingresses = ingresses.len(),
-                owned_ingress_classes = ownership.ingress_classes.len(),
-                owned_gateways = ownership.gateways.len(),
+                table = table_label,
+                sources = source_count,
+                owners = owned_owner_count,
                 "Routing table rebuilt"
             );
             true
         }
         Err(e) => {
-            tracing::error!(error = %e, "Routing table build failed — retaining previous table");
+            tracing::error!(
+                error = %e,
+                table = table_label,
+                "Routing table build failed — retaining previous table"
+            );
             false
         }
     }

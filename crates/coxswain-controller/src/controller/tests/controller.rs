@@ -342,15 +342,17 @@ fn lb_already_matches_returns_false_when_status_empty() {
 
 #[test]
 fn controller_config_parses_ip_address() {
+    use crate::controller::LeaseSettings;
+    use crate::ingress::IngressPorts;
     use std::time::Duration;
     let cfg = ControllerConfig::new(
         "ctrl".into(),
         "pod".into(),
         "ns".into(),
-        Duration::from_secs(15),
-        Duration::from_secs(5),
+        LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
         None,
         Some("203.0.113.1".into()),
+        IngressPorts::new(Some(80), Some(443)),
     )
     .unwrap();
     assert!(matches!(cfg.status_address, Some(StatusAddress::Ip(_))));
@@ -358,15 +360,17 @@ fn controller_config_parses_ip_address() {
 
 #[test]
 fn controller_config_parses_hostname() {
+    use crate::controller::LeaseSettings;
+    use crate::ingress::IngressPorts;
     use std::time::Duration;
     let cfg = ControllerConfig::new(
         "ctrl".into(),
         "pod".into(),
         "ns".into(),
-        Duration::from_secs(15),
-        Duration::from_secs(5),
+        LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
         None,
         Some("coxswain.example.com".into()),
+        IngressPorts::new(Some(80), Some(443)),
     )
     .unwrap();
     assert!(matches!(
@@ -377,30 +381,34 @@ fn controller_config_parses_hostname() {
 
 #[test]
 fn controller_config_rejects_empty_status_address() {
+    use crate::controller::LeaseSettings;
+    use crate::ingress::IngressPorts;
     use std::time::Duration;
     let result = ControllerConfig::new(
         "ctrl".into(),
         "pod".into(),
         "ns".into(),
-        Duration::from_secs(15),
-        Duration::from_secs(5),
+        LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
         None,
         Some("   ".into()),
+        IngressPorts::new(Some(80), Some(443)),
     );
     assert!(result.is_err());
 }
 
 #[test]
 fn controller_config_none_address_is_ok() {
+    use crate::controller::LeaseSettings;
+    use crate::ingress::IngressPorts;
     use std::time::Duration;
     let cfg = ControllerConfig::new(
         "ctrl".into(),
         "pod".into(),
         "ns".into(),
-        Duration::from_secs(15),
-        Duration::from_secs(5),
+        LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
         None,
         None,
+        IngressPorts::new(Some(80), Some(443)),
     )
     .unwrap();
     assert!(cfg.status_address.is_none());

@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use coxswain_core::health::{HealthRegistry, SubsystemSnapshot};
-use coxswain_core::routing::SharedRoutingTable;
+use coxswain_core::routing::{RoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use http::{HeaderValue, Response, StatusCode, header};
 use pingora_core::apps::http_app::{HttpServer, ServeHttp};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
@@ -16,16 +16,35 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Pingora HTTP app serving `/metrics`, `/routes`, and `/status`.
+#[non_exhaustive]
 pub struct AdminServer {
     /// Shared health registry surfaced under `/status.subsystems`.
     pub health: HealthRegistry,
     /// Flipped to `true` while this replica holds the leader-election lease.
     pub leader: Arc<AtomicBool>,
-    /// Live routing table snapshot used by `/routes`.
-    pub routes: SharedRoutingTable,
+    /// Live Ingress routing table snapshot used by `/routes` and `/status`.
+    pub ingress_routes: SharedIngressRoutingTable,
+    /// Live Gateway-API routing table snapshot used by `/routes` and `/status`.
+    pub gateway_routes: SharedGatewayRoutingTable,
 }
 
 impl AdminServer {
+    /// Construct an `AdminServer` from its runtime collaborators.
+    #[must_use]
+    pub fn new(
+        health: HealthRegistry,
+        leader: Arc<AtomicBool>,
+        ingress_routes: SharedIngressRoutingTable,
+        gateway_routes: SharedGatewayRoutingTable,
+    ) -> Self {
+        Self {
+            health,
+            leader,
+            ingress_routes,
+            gateway_routes,
+        }
+    }
+
     /// Wraps `self` in a Pingora [`Service`] bound to `addr`.
     #[must_use]
     pub fn into_service(self, addr: SocketAddr) -> Service<HttpServer<Self>> {
@@ -42,8 +61,13 @@ impl ServeHttp for AdminServer {
     async fn response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
         match session.req_header().uri.path() {
             "/metrics" => metrics_response(),
-            "/routes" => routes_response(&self.routes),
-            "/status" => status_response(&self.health, &self.leader, &self.routes),
+            "/routes" => routes_response(&self.ingress_routes, &self.gateway_routes),
+            "/status" => status_response(
+                &self.health,
+                &self.leader,
+                &self.ingress_routes,
+                &self.gateway_routes,
+            ),
             _ => {
                 let mut r = Response::new(Vec::new());
                 *r.status_mut() = StatusCode::NOT_FOUND;
@@ -70,8 +94,12 @@ fn metrics_response() -> Response<Vec<u8>> {
     r
 }
 
-fn routes_response(routes: &SharedRoutingTable) -> Response<Vec<u8>> {
-    let table = routes.load();
+/// Build the per-spec block of the `/routes` payload from a typed table.
+///
+/// Generic over `Kind` so the same body serialises both the Ingress and the
+/// Gateway-API tables; the type parameter prevents the caller from passing the
+/// wrong table to the wrong block label.
+fn routes_block<K>(table: &RoutingTable<K>) -> serde_json::Value {
     let hosts: Vec<serde_json::Value> = table
         .host_routes()
         .into_iter()
@@ -105,7 +133,18 @@ fn routes_response(routes: &SharedRoutingTable) -> Response<Vec<u8>> {
             })
         })
         .collect();
-    let body = serde_json::json!({ "hosts": hosts, "conflicts": conflicts }).to_string();
+    serde_json::json!({ "hosts": hosts, "conflicts": conflicts })
+}
+
+fn routes_response(
+    ingress: &SharedIngressRoutingTable,
+    gateway: &SharedGatewayRoutingTable,
+) -> Response<Vec<u8>> {
+    let body = serde_json::json!({
+        "ingress": routes_block(ingress.load().as_ref()),
+        "gateway": routes_block(gateway.load().as_ref()),
+    })
+    .to_string();
     json_response(body)
 }
 
@@ -124,15 +163,16 @@ struct StatusResponse {
 fn status_response(
     health: &HealthRegistry,
     leader: &Arc<AtomicBool>,
-    routes: &SharedRoutingTable,
+    ingress: &SharedIngressRoutingTable,
+    gateway: &SharedGatewayRoutingTable,
 ) -> Response<Vec<u8>> {
-    let table = routes.load();
+    let host_count = ingress.load().host_count() + gateway.load().host_count();
     let snapshot = health.snapshot();
     let resp = StatusResponse {
         version: env!("CARGO_PKG_VERSION"),
         synced: health.is_ready(),
         leader: leader.load(Ordering::Acquire),
-        host_count: table.host_count(),
+        host_count,
         subsystems: snapshot.subsystems,
     };
     match serde_json::to_string(&resp) {
