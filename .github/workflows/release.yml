@@ -52,7 +52,7 @@ jobs:
     # Skip the duplicate run that a `cargo release` push-to-main triggers
     # alongside the v* tag push; the tag-triggered workflow does the real
     # release. Matches cargo-release's default consolidated commit title.
-    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: Release')) }}
+    if: "${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: Release')) }}"
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -369,7 +369,7 @@ jobs:
     # skipped upstreams evaluate as neither failure nor cancellation, so the
     # release-commit guard must be repeated here explicitly.
     needs: [publish-image, trivy-scan, publish-chart, publish-kustomize]
-    if: ${{ !failure() && !cancelled() && !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: Release')) }}
+    if: "${{ !failure() && !cancelled() && !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: Release')) }}"
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
