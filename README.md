@@ -67,10 +67,22 @@ spec:
           port: 80
 ```
 
-**4. Verify traffic** (replace `<proxy-address>` with your service's external IP or NodePort):
+**4. Get the proxy address:**
 
 ```bash
-curl -H "Host: echo.example.com" http://<proxy-address>/
+kubectl get svc coxswain-proxy -n coxswain-system
+```
+
+Wait until `EXTERNAL-IP` is assigned, then set it as a variable:
+
+```bash
+PROXY=$(kubectl get svc coxswain-proxy -n coxswain-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+```
+
+**5. Verify traffic:**
+
+```bash
+curl -H "Host: echo.example.com" http://$PROXY/
 ```
 
 For the complete walkthrough — including a test backend, TLS, and Ingress — see [Getting started](https://docs.coxswain-labs.dev/coxswain/latest/getting-started/).
