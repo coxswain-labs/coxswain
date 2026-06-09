@@ -159,11 +159,20 @@ proxy:
   # Empty = disabled.
   defaultBackendRequestTimeout: ""
 
+# -- Bind address shared by the health and admin servers.
+# COXSWAIN_MANAGEMENT_BIND_ADDRESS — set to a management-network IP to restrict
+# /healthz, /readyz, /metrics, /routes, /status access; leave as 0.0.0.0 to keep
+# kubelet probes and Prometheus scraping working out of the box.
+management:
+  bindAddress: "0.0.0.0"
+
 # -- Health endpoint port (COXSWAIN_HEALTH_PORT). Serves /healthz and /readyz.
+# The bind address is controlled by management.bindAddress.
 health:
   port: 8081
 
 # -- Admin endpoint port (COXSWAIN_ADMIN_PORT). Serves /metrics, /routes, /status.
+# The bind address is controlled by management.bindAddress.
 admin:
   port: 8082
 

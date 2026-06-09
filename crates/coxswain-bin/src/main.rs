@@ -1,13 +1,14 @@
 //! Coxswain binary entry point: CLI parsing, shared-state wiring, and Pingora runtime bootstrap.
 
+mod args;
 mod hot_reload;
 
-use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use anyhow::{Context, Result, bail};
+use clap::Parser;
 use coxswain_admin::AdminServer;
 use coxswain_controller::{
-    Controller, ControllerConfig, IngressDefaultBackend, IngressPorts, LeaseSettings, Reconciler,
-    ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs, SharedGatewayListenerHealth,
+    Controller, ControllerConfig, IngressPorts, LeaseSettings, Reconciler, ReconcilerHealth,
+    ReconcilerOptions, ReconcilerOutputs, SharedGatewayListenerHealth,
 };
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::OwnedGateways;
@@ -18,7 +19,6 @@ use coxswain_proxy::{
     GatewayProxy, IngressProxy, KubernetesSource, ListenerProtocol, ListenerSpec, ProxyAcceptor,
     RoutingEngine, RoutingSource, SniCertSelector, TrustedSources, UpstreamCaCache,
 };
-use ipnet::IpNet;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt, ServerConf};
@@ -29,249 +29,11 @@ use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-/// Log output format selector.
-#[derive(ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
-pub enum LogFormat {
-    /// Human-readable output for local development.
-    Console,
-    /// Structured JSON output for production environments.
-    Json,
-}
-
-/// Coxswain: a Kubernetes Ingress & Gateway API Controller built on Pingora.
-#[derive(Parser, Debug)]
-#[command(
-    name = "coxswain",
-    version,
-    about = "A Kubernetes Ingress & Gateway API Controller built on Pingora",
-    arg_required_else_help = true
-)]
-pub struct Cli {
-    /// Subcommand to run.
-    #[command(subcommand)]
-    pub command: Commands,
-}
-
-/// Top-level subcommands.
-#[derive(clap::Subcommand, Debug)]
-pub enum Commands {
-    /// Start the controller and proxy.
-    Serve(ServeArgs),
-}
-
-/// Arguments for the `serve` subcommand.
-#[derive(Parser, Debug)]
-pub struct ServeArgs {
-    /// GatewayClass `spec.controllerName` this instance claims.
-    ///
-    /// Must match exactly; resources belonging to other controllers are silently ignored.
-    #[arg(
-        long,
-        env = "COXSWAIN_CONTROLLER_NAME",
-        default_value = "coxswain-labs.dev/gateway-controller"
-    )]
-    pub controller_name: String,
-
-    /// Kubernetes namespace to watch. Omit for cluster-wide scope.
-    #[arg(long, env = "COXSWAIN_CONTROLLER_WATCH_NAMESPACE")]
-    pub controller_watch_namespace: Option<String>,
-
-    /// Name of this pod, used as the leader-election holder identity.
-    ///
-    /// Injected automatically by Kubernetes via the Downward API in production.
-    #[arg(long, env = "POD_NAME", default_value = "coxswain-local")]
-    pub pod_name: String,
-
-    /// Namespace of this pod, used to scope the leader-election Lease resource.
-    ///
-    /// Injected automatically by Kubernetes via the Downward API in production.
-    #[arg(long, env = "POD_NAMESPACE", default_value = "coxswain-system")]
-    pub pod_namespace: String,
-
-    /// Log output format: `json` (default) or `console`.
-    ///
-    /// Use `json` in production environments; `console` for local development.
-    #[arg(long, env = "COXSWAIN_LOG_FORMAT", default_value = "json")]
-    pub log_format: LogFormat,
-
-    /// Log verbosity level: `trace`, `debug`, `info`, `warn`, or `error`.
-    ///
-    /// Supports the `RUST_LOG` directive syntax for per-crate overrides (e.g. `info,coxswain=debug`).
-    #[arg(long = "log", env = "COXSWAIN_LOG", default_value = "info")]
-    pub log_filter: String,
-
-    /// Worker threads per proxy service.
-    ///
-    /// Threads are not shared across services. Set to the available CPU core count for maximum throughput.
-    #[arg(long, env = "COXSWAIN_PROXY_THREADS", default_value_t = 2)]
-    pub proxy_threads: usize,
-
-    /// Drain window before the final shutdown step.
-    ///
-    /// After a shutdown signal, existing connections are given this long to complete
-    /// before the final runtime-shutdown step begins.
-    /// Accepts human-readable durations: `30s`, `1m`, `1m30s`. Set to `0s` to disable.
-    /// Maps to Pingora's `grace_period_seconds`.
-    #[arg(
-        long,
-        env = "COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD",
-        default_value = "30s",
-        value_parser = humantime::parse_duration,
-    )]
-    pub proxy_shutdown_grace_period: Duration,
-
-    /// Hard deadline for the final runtime-shutdown step after the grace period expires.
-    ///
-    /// Accepts human-readable durations: `5s`, `10s`. Set to `0s` to disable.
-    /// Maps to Pingora's `graceful_shutdown_timeout_seconds`.
-    #[arg(
-        long,
-        env = "COXSWAIN_PROXY_SHUTDOWN_TIMEOUT",
-        default_value = "5s",
-        value_parser = humantime::parse_duration,
-    )]
-    pub proxy_shutdown_timeout: Duration,
-
-    /// How long a leader lease stays valid without renewal.
-    ///
-    /// Determines how quickly a standby replica can take over after the leader dies.
-    /// Must be at least 3× `--controller-lease-renew-interval`.
-    #[arg(
-        long,
-        env = "COXSWAIN_CONTROLLER_LEASE_TTL",
-        default_value = "15s",
-        value_parser = humantime::parse_duration,
-    )]
-    pub controller_lease_ttl: Duration,
-
-    /// How often the active leader renews its lease.
-    ///
-    /// Must be at most 1/3 of `--controller-lease-ttl`.
-    #[arg(
-        long,
-        env = "COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL",
-        default_value = "5s",
-        value_parser = humantime::parse_duration,
-    )]
-    pub controller_lease_renew_interval: Duration,
-
-    /// Port to listen on for the admin, metrics, and diagnostics endpoints.
-    ///
-    /// The bind address is controlled by `--proxy-bind-address`.
-    #[arg(long, env = "COXSWAIN_ADMIN_PORT", default_value_t = 8082)]
-    pub admin_port: u16,
-
-    /// Port to listen on for liveness and readiness health endpoints.
-    ///
-    /// The bind address is controlled by `--proxy-bind-address`.
-    #[arg(long, env = "COXSWAIN_HEALTH_PORT", default_value_t = 8081)]
-    pub health_port: u16,
-
-    /// IP address to bind all proxy listeners to.
-    ///
-    /// Shared by both HTTP and HTTPS listeners. Combine with `--proxy-http-port`
-    /// and/or `--proxy-https-port` to form the full bind address for each listener.
-    #[arg(long, env = "COXSWAIN_PROXY_BIND_ADDRESS", default_value = "0.0.0.0")]
-    pub proxy_bind_address: IpAddr,
-
-    /// Port to listen on for inbound HTTP traffic.
-    ///
-    /// When omitted, no default HTTP listener is bound; coxswain relies on
-    /// Gateway `spec.listeners` to discover which ports to serve.
-    #[arg(long, env = "COXSWAIN_PROXY_HTTP_PORT")]
-    pub proxy_http_port: Option<u16>,
-
-    /// Port to listen on for inbound HTTPS traffic.
-    ///
-    /// SNI selects the certificate from each Ingress's `spec.tls` block.
-    /// Handshakes with no matching SNI fail cleanly.
-    ///
-    /// When omitted, no default HTTPS listener is bound; coxswain relies on
-    /// Gateway `spec.listeners` to discover which ports to serve.
-    #[arg(long, env = "COXSWAIN_PROXY_HTTPS_PORT")]
-    pub proxy_https_port: Option<u16>,
-
-    /// External address written to every owned `Ingress.status.loadBalancer.ingress[0]`
-    /// and `Gateway.status.addresses[0]`.
-    ///
-    /// Accepts either a bare IP (`203.0.113.1`) or a DNS hostname
-    /// (`coxswain.example.com`). IP values are written to `.ip`;
-    /// hostname values are written to `.hostname`.
-    ///
-    /// Required for cert-manager HTTP-01 challenge resolution and
-    /// external-dns DNS record creation. When omitted, status is
-    /// not patched (backward-compatible default).
-    #[arg(long, env = "COXSWAIN_STATUS_ADDRESS")]
-    pub status_address: Option<String>,
-
-    /// Controller-wide default backend for Ingress traffic that does not match any rule.
-    ///
-    /// Format: `<namespace>/<service>:<port>` — e.g. `default/my-404-page:80`.
-    ///
-    /// When set, requests to hosts with no matching path (and requests to entirely
-    /// unknown hosts) are forwarded to this service. A per-Ingress `spec.defaultBackend`
-    /// always overrides this setting within that Ingress's rule hosts.
-    ///
-    /// The backing service is re-resolved on every routing-table rebuild; the default
-    /// disappears automatically if its endpoints become unavailable and reappears when
-    /// they recover.
-    #[arg(long, env = "COXSWAIN_INGRESS_DEFAULT_BACKEND")]
-    pub ingress_default_backend: Option<IngressDefaultBackend>,
-
-    /// Enable HAProxy PROXY protocol v1/v2 on the proxy listeners.
-    ///
-    /// When set, every accepted connection MUST carry a valid PROXY header.
-    /// Connections from sources not listed in `--proxy-trusted-sources` are
-    /// dropped immediately. Connections that omit or malform the header are
-    /// also dropped (strict mode).
-    ///
-    /// The real client address is propagated upstream via the RFC 7239
-    /// `Forwarded` header.
-    #[arg(
-        long,
-        env = "COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL",
-        default_value_t = false
-    )]
-    pub proxy_accept_proxy_protocol: bool,
-
-    /// Comma-separated list of CIDR ranges that are permitted to send PROXY headers.
-    ///
-    /// Only meaningful when `--proxy-accept-proxy-protocol` is set. Connections
-    /// from addresses outside this list are rejected at the TCP level.
-    ///
-    /// Example: `10.0.0.0/8,172.16.0.0/12,127.0.0.1/32`
-    #[arg(long, env = "COXSWAIN_PROXY_TRUSTED_SOURCES", value_delimiter = ',')]
-    pub proxy_trusted_sources: Vec<IpNet>,
-
-    /// Global default for the total request timeout (client → proxy → upstream → client).
-    ///
-    /// Applied to routes that do not set `HTTPRouteRule.timeouts.request`. A route-level
-    /// setting always overrides this value.
-    /// Accepts human-readable durations: `30s`, `1m`, `1m30s`. Omit to disable.
-    #[arg(
-        long,
-        env = "COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT",
-        value_parser = humantime::parse_duration,
-    )]
-    pub proxy_default_request_timeout: Option<Duration>,
-
-    /// Global default for the upstream-only (backend) request timeout.
-    ///
-    /// Applied to routes that do not set `HTTPRouteRule.timeouts.backendRequest`. A
-    /// route-level setting always overrides this value.
-    /// Accepts human-readable durations: `10s`, `500ms`. Omit to disable.
-    #[arg(
-        long,
-        env = "COXSWAIN_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT",
-        value_parser = humantime::parse_duration,
-    )]
-    pub proxy_default_backend_request_timeout: Option<Duration>,
-}
+use crate::args::{Cli, Commands, DevRoleArgs, LogFormat, ProxyScope, Role};
 
 fn main() -> Result<()> {
     // When spawned as a restart child, wait for the parent process to exit so
@@ -284,28 +46,76 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    let Commands::Serve(args) = cli.command;
+    let Commands::Serve(serve) = cli.command;
 
-    // Initialise logging first so that any subsequent error is emitted in the
-    // configured format (JSON in production, console in dev).
-    init_logger(args.log_format, &args.log_filter)?;
+    // Bare `coxswain serve` (no role) falls back to `dev` with a deprecation
+    // warning. This keeps today's Helm chart and Dockerfile (CMD = ["serve"])
+    // working through v0.2.0; Step 5 of the architecture plan removes this
+    // fallback once the chart sets the role explicitly.
+    let role_was_explicit = serve.role.is_some();
+    let role = match serve.role {
+        Some(r) => r,
+        None => implicit_dev_role()?,
+    };
+
+    match role {
+        Role::Dev(dev_args) => run_dev(dev_args, role_was_explicit),
+        Role::Controller(_) => {
+            bail!(
+                "role 'controller' is not yet implemented (issue #202 scaffolding only; see Step 5)"
+            )
+        }
+        Role::Proxy(proxy_args) => match proxy_args.scope() {
+            ProxyScope::Shared => {
+                bail!("role 'proxy --shared' is not yet implemented (see Step 5)")
+            }
+            ProxyScope::Gateway { .. } => {
+                bail!("role 'proxy --gateway' is not yet implemented (see Step 7)")
+            }
+        },
+    }
+}
+
+/// Constructs a [`Role::Dev`] populated with `coxswain serve dev` defaults
+/// (including env-var overrides). Used when bare `coxswain serve` is invoked
+/// without a role subcommand.
+fn implicit_dev_role() -> Result<Role> {
+    let cli = Cli::try_parse_from(["coxswain", "serve", "dev"])
+        .context("constructing implicit-dev fallback")?;
+    let Commands::Serve(serve) = cli.command;
+    let Some(role @ Role::Dev(_)) = serve.role else {
+        unreachable!("invariant: re-parsing ['serve', 'dev'] must yield Role::Dev")
+    };
+    Ok(role)
+}
+
+fn run_dev(args: DevRoleArgs, role_was_explicit: bool) -> Result<()> {
+    init_logger(args.common.log_format, &args.common.log_filter)?;
+
+    if !role_was_explicit {
+        tracing::warn!(
+            "no role specified; defaulting to 'dev' (deprecated; production deployments must \
+             pick `controller` or `proxy` explicitly — implicit default will be removed once the \
+             Helm chart sets the role)"
+        );
+    }
 
     let controller_config = ControllerConfig::new(
-        args.controller_name.clone(),
-        args.pod_name.clone(),
-        args.pod_namespace.clone(),
+        args.common.controller_name.clone(),
+        args.common.pod_name.clone(),
+        args.common.pod_namespace.clone(),
         LeaseSettings::new(
-            args.controller_lease_ttl,
-            args.controller_lease_renew_interval,
+            args.controller.controller_lease_ttl,
+            args.controller.controller_lease_renew_interval,
         ),
-        args.controller_watch_namespace.clone(),
-        args.status_address.clone(),
-        IngressPorts::new(args.proxy_http_port, args.proxy_https_port),
+        args.controller.controller_watch_namespace.clone(),
+        args.controller.status_address.clone(),
+        IngressPorts::new(args.proxy.proxy_http_port, args.proxy.proxy_https_port),
     )?;
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        controller_name = %args.controller_name,
+        controller_name = %args.common.controller_name,
         "Starting"
     );
 
@@ -354,12 +164,13 @@ fn main() -> Result<()> {
         ),
         owned_gateways.clone(),
         ReconcilerHealth::new(controller_handle, proxy_handle),
-        args.controller_name.clone(),
+        args.common.controller_name.clone(),
         {
             let mut opts = ReconcilerOptions::default();
-            opts.watch_namespace = args.controller_watch_namespace.clone();
-            opts.ingress_default_backend = args.ingress_default_backend;
-            opts.ingress_ports = IngressPorts::new(args.proxy_http_port, args.proxy_https_port);
+            opts.watch_namespace = args.controller.controller_watch_namespace.clone();
+            opts.ingress_default_backend = args.controller.ingress_default_backend.clone();
+            opts.ingress_ports =
+                IngressPorts::new(args.proxy.proxy_http_port, args.proxy.proxy_https_port);
             opts
         },
     );
@@ -382,23 +193,23 @@ fn main() -> Result<()> {
     server.add_service(background_service("reconciler", reconciler));
 
     let default_timeouts = RouteTimeouts {
-        request: args.proxy_default_request_timeout,
-        backend_request: args.proxy_default_backend_request_timeout,
+        request: args.proxy.proxy_default_request_timeout,
+        backend_request: args.proxy.proxy_default_backend_request_timeout,
     };
 
     // Ingress and Gateway proxies bind disjoint port sets. Ingress takes the
     // statically-configured `--proxy-http-port` / `--proxy-https-port`; Gateway
     // takes whatever Gateway `spec.listeners` declares, minus the Ingress set.
     let mut ingress_listeners: Vec<ListenerSpec> = Vec::new();
-    if let Some(port) = args.proxy_http_port {
+    if let Some(port) = args.proxy.proxy_http_port {
         ingress_listeners.push(ListenerSpec::http(SocketAddr::new(
-            args.proxy_bind_address,
+            args.proxy.proxy_bind_address,
             port,
         )));
     }
-    if let Some(port) = args.proxy_https_port {
+    if let Some(port) = args.proxy.proxy_https_port {
         ingress_listeners.push(ListenerSpec::https(SocketAddr::new(
-            args.proxy_bind_address,
+            args.proxy.proxy_bind_address,
             port,
         )));
     }
@@ -422,9 +233,9 @@ fn main() -> Result<()> {
             .build()
             .context("build tokio runtime for startup Gateway port discovery")?;
         let discovered = rt.block_on(discover_gateway_ports(
-            &args.controller_name,
-            args.controller_watch_namespace.as_deref(),
-            args.proxy_bind_address,
+            &args.common.controller_name,
+            args.controller.controller_watch_namespace.as_deref(),
+            args.proxy.proxy_bind_address,
             &ingress_ports,
         ));
         let discovered = discovered
@@ -474,14 +285,16 @@ fn main() -> Result<()> {
     );
     let ca_cache = Arc::new(UpstreamCaCache::new());
 
-    if args.proxy_accept_proxy_protocol {
-        if args.proxy_trusted_sources.is_empty() {
+    if args.proxy.proxy_accept_proxy_protocol {
+        if args.proxy.proxy_trusted_sources.is_empty() {
             tracing::warn!(
                 "--proxy-accept-proxy-protocol is set but --proxy-trusted-sources is empty; \
                  all connections will be rejected"
             );
         }
-        let trusted = Arc::new(TrustedSources::new(args.proxy_trusted_sources.clone()));
+        let trusted = Arc::new(TrustedSources::new(
+            args.proxy.proxy_trusted_sources.clone(),
+        ));
         if !ingress_listeners.is_empty() {
             let proxy = Arc::new(http_proxy(
                 &server.configuration,
@@ -570,7 +383,7 @@ fn main() -> Result<()> {
         hot_reload::HotReloader::new(hot_reload_health, currently_bound, ingress_ports),
     ));
 
-    let health_addr = SocketAddr::new(args.proxy_bind_address, args.health_port);
+    let health_addr = SocketAddr::new(args.common.management_bind_address, args.common.health_port);
     server.add_service({
         let mut svc = Service::new(
             "health".to_string(),
@@ -582,19 +395,20 @@ fn main() -> Result<()> {
         svc
     });
 
-    let admin_addr = SocketAddr::new(args.proxy_bind_address, args.admin_port);
+    let admin_addr = SocketAddr::new(args.common.management_bind_address, args.common.admin_port);
     server.add_service(
         AdminServer::new(health, leader, ingress_routes, gateway_routes).into_service(admin_addr),
     );
 
     tracing::info!(
-        proxy_bind_address = %args.proxy_bind_address,
-        proxy_http_port = ?args.proxy_http_port,
-        proxy_https_port = ?args.proxy_https_port,
-        health_port = args.health_port,
-        admin_port = args.admin_port,
-        proxy_shutdown_grace_period = ?args.proxy_shutdown_grace_period,
-        proxy_shutdown_timeout = ?args.proxy_shutdown_timeout,
+        proxy_bind_address = %args.proxy.proxy_bind_address,
+        proxy_http_port = ?args.proxy.proxy_http_port,
+        proxy_https_port = ?args.proxy.proxy_https_port,
+        management_bind_address = %args.common.management_bind_address,
+        health_port = args.common.health_port,
+        admin_port = args.common.admin_port,
+        proxy_shutdown_grace_period = ?args.proxy.proxy_shutdown_grace_period,
+        proxy_shutdown_timeout = ?args.proxy.proxy_shutdown_timeout,
         "Listening"
     );
     server.run_forever();
@@ -688,11 +502,11 @@ async fn discover_gateway_ports(
     result
 }
 
-fn build_server(args: &ServeArgs) -> Server {
+fn build_server(args: &DevRoleArgs) -> Server {
     let conf = ServerConf {
-        threads: args.proxy_threads,
-        grace_period_seconds: Some(args.proxy_shutdown_grace_period.as_secs()),
-        graceful_shutdown_timeout_seconds: Some(args.proxy_shutdown_timeout.as_secs()),
+        threads: args.proxy.proxy_threads,
+        grace_period_seconds: Some(args.proxy.proxy_shutdown_grace_period.as_secs()),
+        graceful_shutdown_timeout_seconds: Some(args.proxy.proxy_shutdown_timeout.as_secs()),
         ..Default::default()
     };
 
