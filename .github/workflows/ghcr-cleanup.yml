@@ -9,6 +9,13 @@ name: GHCR cleanup
 # 20 most recent snapshots. Versioned releases (:v*, :0.*, :latest) are
 # never touched — any version whose tags include a match for '^(v\d|[0-9]|latest)'
 # is excluded from deletion.
+#
+# Replaced `actions/delete-package-versions@v5` (Node.js 20, upstream hadn't
+# shipped a node24 release) with `dataaxiom/ghcr-cleanup-action@v1.2.2`
+# (node24, native GHCR). `exclude-tags` + `use-regex: true` preserves the
+# original protection regex verbatim. The default `${{ github.token }}` is
+# sufficient because we name `package` exactly (no wildcards / regex on the
+# package field, which would require a PAT per dataaxiom's docs).
 
 jobs:
   cleanup:
@@ -18,9 +25,10 @@ jobs:
     permissions:
       packages: write
     steps:
-      - uses: actions/delete-package-versions@v5
+      - uses: dataaxiom/ghcr-cleanup-action@v1.2.2
         with:
-          package-name: coxswain
-          package-type: container
-          min-versions-to-keep: 20
-          ignore-versions: '^(v\d|[0-9]|latest)'
+          package: coxswain
+          keep-n-tagged: 20
+          exclude-tags: '^(v\d|[0-9]|latest)'
+          use-regex: true
+          delete-untagged: true
