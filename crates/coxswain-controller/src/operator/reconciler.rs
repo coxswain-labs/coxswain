@@ -237,6 +237,41 @@ impl BackgroundService for Operator {
             }
         });
 
+        // Wait for every dependency reflector to complete its initial sync
+        // before exposing the stores to the reconcile loop. Without this,
+        // the first reconcile after pod start (or controller restart) can
+        // fire while `routes_store` / `grants_store` are still empty —
+        // producing a transient render whose `--proxy-watch-namespaces`
+        // arg list is missing every cross-namespace backend ns. SSA with
+        // `force=true` accepts the transient render, then a second reconcile
+        // with the full stores SSAs again — net effect: every controller
+        // restart bumps the proxy Deployment's `resourceVersion` twice
+        // (and triggers an unnecessary rolling update).
+        //
+        // The wait is bounded at 30 s so a misconfigured RBAC (which would
+        // cause the watches to 403 forever) doesn't hang the operator
+        // indefinitely; the controller logs and proceeds, so partial
+        // observability is preferable to a stuck reconcile loop.
+        let sync_timeout = Duration::from_secs(30);
+        let sync = tokio::time::timeout(sync_timeout, async {
+            // Errors here mean the writer was dropped — operator is shutting
+            // down. The match-arms below silently log; if any of them fire
+            // we abandon the wait and let the controller proceed.
+            let _ = class_reader.wait_until_ready().await;
+            let _ = params_reader.wait_until_ready().await;
+            let _ = routes_reader.wait_until_ready().await;
+            let _ = grants_reader.wait_until_ready().await;
+        })
+        .await;
+        if sync.is_err() {
+            tracing::warn!(
+                timeout = ?sync_timeout,
+                "operator: dependency reflectors did not complete initial sync within timeout; \
+                 proceeding with partial state — first reconciles may bump resourceVersion until \
+                 watches catch up"
+            );
+        }
+
         let ctx = Arc::new(ReconcileContext {
             controller_name: self.config.controller_name.clone(),
             controller_image: self.config.controller_image.clone(),

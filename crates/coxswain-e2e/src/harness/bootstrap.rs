@@ -2,7 +2,6 @@
 
 use anyhow::Context as _;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use tokio::process::Command;
 
 /// Single source of truth for the Gateway API CRD version installed in tests.
@@ -27,31 +26,30 @@ pub async fn bootstrap() -> anyhow::Result<()> {
 
     let root = workspace_root().context("workspace root")?;
 
-    // Purge any namespaces left over from a previous interrupted run. Runs at
-    // most once per process — tests that restart the harness mid-run (e.g.
-    // `restart_controller_does_not_bump_resource_version`) need their
-    // in-flight namespaces preserved across the second `Harness::start()`.
-    // The counter-based naming inside one process guarantees no collision
-    // with Terminating namespaces from a previous run; cross-process cleanup
-    // is what this purge is for.
-    static PURGED: Once = Once::new();
-    let mut should_purge = false;
-    PURGED.call_once(|| {
-        should_purge = true;
-    });
-    if should_purge {
-        let _ = Command::new("kubectl")
-            .args([
-                "delete",
-                "ns",
-                "-l",
-                "coxswain-e2e=true",
-                "--ignore-not-found",
-                "--wait=false",
-            ])
-            .status()
-            .await;
-    }
+    // Purge any namespaces left over from a previous run AND from
+    // already-completed tests inside the current run. This runs on EVERY
+    // `Harness::start()` call. Without it, a terminating namespace from a
+    // previous test can keep its `Ingress` resources in the proxy's routing
+    // table briefly — long enough that the next test's HTTP requests hit
+    // (and assert against) the wrong backend, especially when the lingering
+    // Ingress is the `*`-host catchall used by `default_backend_only`.
+    //
+    // Tests that need a namespace to survive across multiple
+    // `Harness::start()` calls within the same test function (i.e. the
+    // controller-restart idempotency test) MUST use
+    // [`crate::NamespaceGuard::create_persistent`] to opt out of the
+    // `coxswain-e2e=true` label that this purge keys on.
+    let _ = Command::new("kubectl")
+        .args([
+            "delete",
+            "ns",
+            "-l",
+            "coxswain-e2e=true",
+            "--ignore-not-found",
+            "--wait=false",
+        ])
+        .status()
+        .await;
 
     if !gateway_v1_crds_installed().await {
         tracing::info!("Gateway API CRDs absent or pre-v1, installing {GATEWAY_API_VERSION}");

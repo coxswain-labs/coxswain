@@ -19,16 +19,43 @@ pub struct NamespaceGuard {
 
 impl NamespaceGuard {
     /// Create a uniquely-named namespace with the given `prefix` and return its guard.
+    ///
+    /// Carries the `coxswain-e2e=true` label so the bootstrap's "purge
+    /// leftover e2e namespaces" step removes it between tests if the
+    /// `NamespaceGuard`'s `Drop` deletion hasn't completed yet. Use
+    /// [`Self::create_persistent`] when the namespace must survive a
+    /// `Harness::start()` mid-test (controller-restart-idempotency tests).
     pub async fn create(client: &Client, prefix: &str) -> anyhow::Result<Self> {
+        Self::create_inner(client, prefix, /* purgeable = */ true).await
+    }
+
+    /// Same as [`Self::create`] but omits the `coxswain-e2e=true` label so
+    /// the bootstrap purge does not target this namespace. Intended for
+    /// tests that call `Harness::start()` more than once and need the
+    /// namespace's resources to persist across the second start (i.e. the
+    /// SSA-idempotency test for controller restarts). Cleanup still runs on
+    /// `Drop`, so a normal end-of-test path deletes the namespace; a panic
+    /// or interrupt leaves it behind until the next manual cleanup
+    /// (`kubectl delete ns <name>`).
+    pub async fn create_persistent(client: &Client, prefix: &str) -> anyhow::Result<Self> {
+        Self::create_inner(client, prefix, /* purgeable = */ false).await
+    }
+
+    async fn create_inner(client: &Client, prefix: &str, purgeable: bool) -> anyhow::Result<Self> {
         // Include the process ID so names are unique across test runs even when
         // a previous run left namespaces in Terminating state.
         let pid = std::process::id();
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let name = format!("{prefix}-{pid}-{id}");
+        let labels = if purgeable {
+            Some([("coxswain-e2e".to_string(), "true".to_string())].into())
+        } else {
+            None
+        };
         let ns = Namespace {
             metadata: ObjectMeta {
                 name: Some(name.clone()),
-                labels: Some([("coxswain-e2e".to_string(), "true".to_string())].into()),
+                labels,
                 ..Default::default()
             },
             ..Default::default()
