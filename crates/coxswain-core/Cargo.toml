@@ -13,9 +13,13 @@ workspace = true
 arc-swap             = { workspace = true }
 form_urlencoded      = { workspace = true }
 http                 = { workspace = true }
+k8s-openapi          = { workspace = true }
+kube                 = { workspace = true }
 matchit              = { workspace = true }
 regex                = { workspace = true }
+schemars             = { workspace = true }
 serde                = { workspace = true, features = ["rc"] }
+serde_json           = { workspace = true }
 smallvec             = { workspace = true }
 static_assertions    = { workspace = true }
 thiserror            = { workspace = true }
@@ -23,7 +27,7 @@ tracing              = { workspace = true }
 
 [dev-dependencies]
 criterion    = { workspace = true }
-serde_json   = { workspace = true }
+serde_yaml   = { workspace = true }
 tracing-test = { workspace = true }
 
 [[bench]]

@@ -19,6 +19,7 @@ kind: Kustomization
 resources:
   - namespace.yaml
   - rbac.yaml
+  - crds/coxswaingatewayparameters.yaml
   - gateway-class.yaml
   - ingress-class.yaml
   - service.yaml

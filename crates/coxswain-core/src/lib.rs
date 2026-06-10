@@ -4,6 +4,7 @@
 //! Kubernetes ownership helpers, and `ReferenceGrant` evaluation logic used by both
 //! the controller and proxy crates.
 
+pub mod crd;
 pub mod health;
 pub mod ownership;
 pub mod reference_grants;
