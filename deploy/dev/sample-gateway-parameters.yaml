@@ -1,0 +1,41 @@
+# Sample CoxswainGatewayParameters resource.
+#
+# Demonstrates every field of the v1alpha1 schema. The CRD is inert at this
+# stage: the controller does not yet read these values — applying this object
+# only proves the CRD installs and the schema accepts a populated spec.
+#
+# Apply:
+#   kubectl apply -f deploy/dev/sample-gateway-parameters.yaml
+#
+# Inspect:
+#   kubectl get coxswaingatewayparameters -n default
+#   kubectl describe coxswaingatewayparameters/sample -n default
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: sample
+  namespace: default
+spec:
+  replicas: 2
+  image: ghcr.io/coxswain-labs/coxswain:latest
+  serviceType: LoadBalancer
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  podTemplate:
+    metadata:
+      labels:
+        coxswain.example/tier: edge
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: gateway
+          effect: NoSchedule
