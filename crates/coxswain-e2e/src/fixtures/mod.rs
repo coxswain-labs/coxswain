@@ -1,7 +1,7 @@
 //! Fixture YAML path constants and the template-variable substitutor for `kubectl apply`.
 
 pub mod backends;
-pub mod dedicated_gateway;
+pub mod dedicated_proxy;
 pub mod gateway_api;
 pub mod ingress;
 

@@ -4,7 +4,7 @@ macro_rules! fixture {
     ($path:literal) => {
         concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/fixtures/dedicated_gateway/",
+            "/fixtures/dedicated_proxy/",
             $path
         )
     };

@@ -123,10 +123,10 @@ jobs:
           path: bin/
 
       - name: Make binaries executable
-        run: chmod +x bin/coxswain bin/dedicated_gateway
+        run: chmod +x bin/coxswain bin/dedicated_proxy
 
-      - name: Run e2e tests (dedicated_gateway)
-        run: bin/dedicated_gateway --test-threads=1
+      - name: Run e2e tests (dedicated_proxy)
+        run: bin/dedicated_proxy --test-threads=1
         env:
           COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
           RUST_LOG: coxswain_e2e=debug,warn
