@@ -5,7 +5,7 @@ on:
 
 name: E2E
 
-# `e2e` (matrix) and `e2e-gateway-api-conformance` are required status checks.
+# `e2e` (matrix) and `e2e-conformance` are required status checks.
 # A workflow-level path filter that excludes the whole workflow leaves those
 # checks pending forever on docs-only PRs. Instead we always start on PRs and
 # gate the heavy jobs on the `changes` job. A job whose `if:` evaluates to
@@ -114,8 +114,8 @@ jobs:
       - uses: ./.github/actions/dump-cluster-state
         if: failure()
 
-  e2e-gateway-api-conformance:
-    name: e2e-gateway-api-conformance
+  e2e-conformance:
+    name: e2e-conformance
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 60
