@@ -260,7 +260,7 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
         health.clone(),
     )?;
 
-    // Dev mode shares the single Reconciler from the status writer between
+    // Dev mode shares the single SharedProxyReconciler from the status writer between
     // the controller-side status path and the proxy-side data plane: routes,
     // tls store, and tls_health all come from the same in-process publish.
     // This preserves today's behaviour and avoids paying for two K8s watch

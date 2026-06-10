@@ -1,5 +1,18 @@
-//! Debounced reconciler: watches all Kubernetes resources and rebuilds the routing
-//! and TLS tables whenever any of them change.
+//! Shared-proxy reconciler: cluster-wide watches feeding the shared-pool data
+//! plane (`serve proxy --shared` and `serve dev`).
+//!
+//! Owns the debounced watch + rebuild pipeline that turns reflector snapshots
+//! into the full set of outputs the shared pool needs: Ingress + Gateway
+//! routing tables, the TLS cert store, the per-listener health map (consumed
+//! by `HotReloader`), the per-route and per-policy health maps (consumed by
+//! the controller's status writer in `dev` mode), and the cluster summary.
+//!
+//! Sibling reconcilers in this module narrow the scope:
+//!
+//! - `DedicatedProxyReconciler` (Step 7) — one Gateway, dynamic per-namespace
+//!   reflectors.
+//! - `ControllerReconciler` (Step 7) — cluster-wide watches but no routing
+//!   tables or TLS store; status-only output set.
 
 use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
 use crate::gateway_api::hostnames_intersect;
@@ -107,7 +120,7 @@ impl std::str::FromStr for IngressDefaultBackend {
     }
 }
 
-/// Optional configuration for a [`Reconciler`].
+/// Optional configuration for a [`SharedProxyReconciler`].
 #[non_exhaustive]
 #[derive(Default)]
 pub struct ReconcilerOptions {
@@ -119,11 +132,11 @@ pub struct ReconcilerOptions {
     pub ingress_ports: IngressPorts,
 }
 
-/// Health-registry handles consumed by the [`Reconciler`].
+/// Health-registry handles consumed by the [`SharedProxyReconciler`].
 ///
 /// Each reflector flips a per-source check on `controller` to `Ready` once it
 /// has emitted its first `InitDone` (the authoritative "initial sync complete"
-/// signal). After the first successful routing-table publish, the Reconciler
+/// signal). After the first successful routing-table publish, the reconciler
 /// also flips `controller.routing_table_built` and `proxy.routing_table_loaded`.
 #[non_exhaustive]
 pub struct ReconcilerHealth {
@@ -146,7 +159,7 @@ impl ReconcilerHealth {
 /// `BackendTLSPolicy`, `ConfigMap`, and `EndpointSlice`, and rebuilds the routing
 /// table whenever any of them change — with a 500 ms trailing-edge debounce to
 /// coalesce burst updates (e.g. rolling deploys).
-pub struct Reconciler {
+pub struct SharedProxyReconciler {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
     tls: SharedTlsStore,
@@ -161,9 +174,9 @@ pub struct Reconciler {
     opts: ReconcilerOptions,
 }
 
-/// The `Shared<T>` outputs the [`Reconciler`] writes into on each rebuild.
+/// The `Shared<T>` outputs the [`SharedProxyReconciler`] writes into on each rebuild.
 ///
-/// Bundling them lets [`Reconciler::new`] stay under the workspace
+/// Bundling them lets [`SharedProxyReconciler::new`] stay under the workspace
 /// `clippy::too_many_arguments` threshold; callers pass one
 /// `ReconcilerOutputs` struct instead of several positional handles.
 #[non_exhaustive]
@@ -201,7 +214,7 @@ impl ReconcilerOutputs {
     }
 }
 
-impl Reconciler {
+impl SharedProxyReconciler {
     /// Construct a new reconciler (does not start the watch loop).
     ///
     /// `leader` is the shared leader-election flag the controller pod owns; the
@@ -361,7 +374,7 @@ fn spawn_reflector<T>(
 }
 
 #[async_trait]
-impl BackgroundService for Reconciler {
+impl BackgroundService for SharedProxyReconciler {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         let client = match Client::try_default().await {
             Ok(c) => c,
@@ -394,8 +407,8 @@ impl BackgroundService for Reconciler {
             tokio::select! {
                 _ = shutdown.changed() => break,
                 res = set.join_next() => match res {
-                    Some(Ok(())) => tracing::warn!("Reconciler task exited unexpectedly"),
-                    Some(Err(e)) => tracing::error!(error = %e, "Reconciler task panicked"),
+                    Some(Ok(())) => tracing::warn!("SharedProxyReconciler task exited unexpectedly"),
+                    Some(Err(e)) => tracing::error!(error = %e, "SharedProxyReconciler task panicked"),
                     None => break,
                 },
             }

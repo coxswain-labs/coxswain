@@ -78,7 +78,7 @@ pub(crate) struct ServeArgs {
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub(crate) enum Role {
-    /// Reconciler and status writer pod.
+    /// Reconciler + status writer pod.
     Controller(ControllerRoleArgs),
     /// Read-only data plane pod. Use `--shared` for the shared pool or
     /// `--gateway` for a per-Gateway pod.
@@ -343,7 +343,7 @@ pub(crate) struct DevRoleArgs {
     /// Proxy data-plane flags.
     #[command(flatten)]
     pub proxy: ProxyArgs,
-    /// Reconciler / status writer flags.
+    /// Reconciler + status writer flags.
     #[command(flatten)]
     pub controller: ControllerArgs,
 }
@@ -357,7 +357,7 @@ pub(crate) struct ControllerRoleArgs {
     /// Flags shared by every role.
     #[command(flatten)]
     pub common: CommonArgs,
-    /// Reconciler / status writer flags.
+    /// Reconciler + status writer flags.
     #[command(flatten)]
     pub controller: ControllerArgs,
 }

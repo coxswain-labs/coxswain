@@ -31,7 +31,7 @@ use std::sync::Arc;
 ///
 /// The actual translation logic lives in submodules ([`backend_tls`],
 /// [`reconcile`], [`status`]); this struct exposes the surfaces that consumers
-/// (the [`crate::reconciler::Reconciler`] rebuild loop, the controller crate's
+/// (the [`crate::reconciler::SharedProxyReconciler`] rebuild loop, the controller crate's
 /// status writer) call into.
 pub struct GatewayApiReconciler;
 

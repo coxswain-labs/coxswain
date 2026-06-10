@@ -7,7 +7,7 @@
 //! adaptor that constructs and exposes those primitives in the shape the
 //! proxy data plane expects.
 //!
-//! The proxy pod has zero K8s write permissions. The [`Reconciler`] returned
+//! The proxy pod has zero K8s write permissions. The [`SharedProxyReconciler`] returned
 //! here calls only `list` and `watch` on the Kubernetes API; status writes
 //! live exclusively in [`coxswain_controller`], which the proxy crate does
 //! not import.
@@ -17,8 +17,8 @@ use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_core::tls::SharedTlsStore;
 use coxswain_reflector::{
-    IngressDefaultBackend, IngressPorts, Reconciler, ReconcilerHealth, ReconcilerOptions,
-    ReconcilerOutputs, SharedGatewayListenerHealth,
+    IngressDefaultBackend, IngressPorts, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
+    SharedGatewayListenerHealth, SharedProxyReconciler,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -54,14 +54,14 @@ pub struct ProxyReflectorConfig {
 /// Spawned routing-table-build pipeline.
 ///
 /// Holds the [`KubernetesSource`] the Pingora proxy services consume from,
-/// the shared TLS handles, and the [`Reconciler`] background service the
-/// caller must register with the Pingora server.
+/// the shared TLS handles, and the [`SharedProxyReconciler`] background
+/// service the caller must register with the Pingora server.
 pub struct ProxyReflector {
     /// Source the proxy services read routing tables from.
     pub source: KubernetesSource,
     /// Reflector + rebuild background service. Register with the server via
     /// `pingora_core::services::background::background_service`.
-    pub reconciler: Reconciler,
+    pub reconciler: SharedProxyReconciler,
     /// Shared listener-health handle. Today this is consumed by
     /// `HotReloader` to know when new ports need binding; future cleanup
     /// can switch `HotReloader` to read `SharedGatewayRoutingTable` directly
@@ -74,8 +74,8 @@ pub struct ProxyReflector {
 ///
 /// # Errors
 ///
-/// None. Constructing the [`Reconciler`] is infallible; failures surface
-/// later, at run-time, via the health-registry checks.
+/// None. Constructing the [`SharedProxyReconciler`] is infallible; failures
+/// surface later, at run-time, via the health-registry checks.
 #[must_use]
 pub fn spawn_routing_table_builder(config: ProxyReflectorConfig) -> ProxyReflector {
     let ProxyReflectorConfig {
@@ -97,7 +97,7 @@ pub fn spawn_routing_table_builder(config: ProxyReflectorConfig) -> ProxyReflect
     // The summary the proxy writes here is unused (proxy doesn't serve `/cluster`).
     let leader = Arc::new(AtomicBool::new(false));
 
-    let reconciler = Reconciler::new(
+    let reconciler = SharedProxyReconciler::new(
         ReconcilerOutputs::new(
             ingress_routes.clone(),
             gateway_routes.clone(),

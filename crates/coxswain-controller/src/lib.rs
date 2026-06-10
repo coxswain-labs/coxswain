@@ -27,10 +27,11 @@ pub use coxswain_reflector::{
     gateway_api_crds_present,
 };
 
-// The status writer no longer instantiates a Reconciler directly — bin owns
+// The status writer no longer instantiates a reconciler directly — bin owns
 // the wiring — but the types it produces still need to be reachable from the
 // controller crate's API surface for the dev role's combined startup.
 pub use coxswain_reflector::reconciler::{
-    Reconciler, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
+    ControllerReconciler, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
+    SharedProxyReconciler,
 };
 pub use coxswain_reflector::{IngressDefaultBackend, IngressDefaultBackendParseError};
