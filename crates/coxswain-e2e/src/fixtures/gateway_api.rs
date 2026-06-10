@@ -65,3 +65,7 @@ pub const BACKEND_TLS_POLICY_SECTION_NAME: &str = fixture!("backend_tls_policy_s
 /// BackendTLSPolicy conflict resolution: two policies on the same Service with NO
 /// `sectionName`. Requires `TLS_HOSTNAME`, `CA_PEM`.
 pub const BACKEND_TLS_POLICY_CONFLICT: &str = fixture!("backend_tls_policy_conflict.yaml");
+
+/// Minimal single-listener Gateway used by the listener-drain traffic tests (#231).
+/// Declares one HTTP listener on `GATEWAY_HTTP_PORT`.
+pub const LISTENER_DRAIN: &str = fixture!("listener_drain.yaml");

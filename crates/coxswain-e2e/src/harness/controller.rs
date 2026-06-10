@@ -28,10 +28,11 @@ pub struct ControllerProcess {
     pub proxy_addr: SocketAddr,
     /// Bound address of the Ingress HTTPS/TLS proxy listener (`--proxy-https-port`).
     pub tls_addr: SocketAddr,
-    /// Pre-allocated address for tests that need a Gateway HTTP listener port.
-    /// Not passed as a CLI flag; tests declare it in their Gateway specs.
+    /// Pre-allocated address for tests that declare a Gateway HTTP listener.
+    /// The port is passed via `GATEWAY_HTTP_PORT` in fixture templates.
     pub gateway_http_addr: SocketAddr,
-    /// Pre-allocated address for tests that need a Gateway HTTPS listener port.
+    /// Pre-allocated address for tests that declare a Gateway HTTPS listener.
+    /// The port is passed via `GATEWAY_HTTPS_PORT` in fixture templates.
     pub gateway_https_addr: SocketAddr,
     /// Bound address of the `/healthz`/`/readyz` endpoint.
     pub health_addr: SocketAddr,
@@ -131,11 +132,9 @@ impl ControllerProcess {
             );
         }
 
-        // Make the spawned coxswain its own process-group leader so we can reap
-        // any restart-children together with the original child on Drop. The bin
-        // implements port-rebinding by `fork+exec` of a restart-child then exiting
-        // the parent (`coxswain-bin::hot_reload`); the restart-child inherits the
-        // group, so killing the group covers both.
+        // Make the spawned coxswain its own process-group leader so SIGKILL on
+        // Drop always terminates the correct process, even when the test runner
+        // is itself inside a process group.
         let mut cmd = Command::new(&binary);
         cmd.args(&args);
         cmd.as_std_mut().process_group(0);
@@ -157,12 +156,9 @@ impl ControllerProcess {
 
 impl Drop for ControllerProcess {
     fn drop(&mut self) {
-        // The HotReloader's restart model is fork+exec of a child followed by the
-        // parent calling `process::exit(0)`. The restart-child is in the same
-        // process group as the parent (we set `process_group(0)` at spawn), so
-        // killing the group sweeps every coxswain instance the test ever produced.
-        // `start_kill` on the directly-tracked child remains as a belt-and-braces
-        // fallback in case the group setup failed.
+        // Kill the process group so the whole coxswain process tree is cleaned up.
+        // `start_kill` on the directly-tracked child is a belt-and-braces fallback
+        // in case the process-group setup failed.
         if let Some(pid) = self.child.id() {
             let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
         }

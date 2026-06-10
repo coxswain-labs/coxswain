@@ -1,0 +1,36 @@
+# Minimal Gateway + HTTPRoute used by the listener-drain traffic tests (#231).
+#
+# Declares a single HTTP listener on GATEWAY_HTTP_PORT.  The test suite patches
+# the Gateway mid-flight to add or remove a second listener; this fixture
+# establishes the baseline single-listener state.
+#
+# TESTNS is substituted at runtime; GATEWAY_HTTP_PORT is substituted from the
+# controller's pre-allocated Gateway HTTP port.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: drain-gw
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http-a
+      port: GATEWAY_HTTP_PORT
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: drain-route
+spec:
+  parentRefs:
+    - name: drain-gw
+  hostnames:
+    - "drain.TESTNS.local"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000

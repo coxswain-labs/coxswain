@@ -22,6 +22,7 @@ pingora = { workspace = true, features = ["boringssl"] }
 pingora-core = { workspace = true, features = ["boringssl"] }
 pingora-http = { workspace = true }
 pingora-proxy = { workspace = true, features = ["boringssl"] }
+prometheus = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

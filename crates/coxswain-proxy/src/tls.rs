@@ -11,6 +11,9 @@ use pingora_core::tls::{ext, pkey::PKey, ssl::NameType, x509::X509};
 /// Loaded on every TLS handshake from the live [`SharedTlsStore`] — no locks,
 /// no channels. If no cert matches the client's SNI, the handshake is allowed
 /// to fail naturally (OpenSSL/BoringSSL sends `unrecognized_name`).
+///
+/// Cheaply clonable: the underlying [`SharedTlsStore`] is `Arc`-backed.
+#[derive(Clone)]
 pub struct SniCertSelector {
     tls: SharedTlsStore,
 }
