@@ -203,7 +203,7 @@ fn service_ports(gateway: &Gateway) -> Vec<ServicePort> {
     let mut seen: BTreeSet<(i32, &'static str)> = BTreeSet::new();
     let mut out = Vec::new();
     for listener in &gateway.spec.listeners {
-        let port = i32::from(listener.port);
+        let port = listener.port;
         let protocol = "TCP";
         if !seen.insert((port, protocol)) {
             continue;
@@ -304,7 +304,7 @@ fn container_ports(gateway: &Gateway) -> Vec<ContainerPort> {
     let mut seen: BTreeSet<i32> = BTreeSet::new();
     let mut out = Vec::new();
     for listener in &gateway.spec.listeners {
-        let port = i32::from(listener.port);
+        let port = listener.port;
         if !seen.insert(port) {
             continue;
         }
