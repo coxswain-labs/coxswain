@@ -218,6 +218,30 @@ pub(crate) struct ProxyArgs {
     )]
     pub proxy_shutdown_timeout: Duration,
 
+    /// Time budget for draining in-flight connections when a listener is
+    /// added or removed at runtime.
+    ///
+    /// When a Gateway listener is removed, the acceptor stops accepting new
+    /// connections on that port and waits up to this long for all in-flight
+    /// requests to complete.  If any connections remain after the timeout,
+    /// they are force-closed (TCP abort), the
+    /// `coxswain_proxy_requests_force_closed_total` counter is incremented,
+    /// and a `WARN` log is emitted.
+    ///
+    /// Distinct from `--proxy-shutdown-grace-period`, which controls the
+    /// whole-process shutdown window on SIGTERM/SIGQUIT.
+    ///
+    /// Accepts human-readable durations: `30s`, `1m`. Set to `0s` to
+    /// force-close immediately on listener removal (not recommended for
+    /// production).
+    #[arg(
+        long,
+        env = "COXSWAIN_PROXY_LISTENER_DRAIN_TIMEOUT",
+        default_value = "30s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub proxy_listener_drain_timeout: Duration,
+
     /// IP address to bind all proxy listeners to.
     ///
     /// Shared by both HTTP and HTTPS listeners; combine with

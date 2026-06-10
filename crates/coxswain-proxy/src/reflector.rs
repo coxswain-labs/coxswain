@@ -63,10 +63,9 @@ pub struct ProxyReflector {
     /// Reflector + rebuild background service. Register with the server via
     /// `pingora_core::services::background::background_service`.
     pub reconciler: SharedProxyReconciler,
-    /// Shared listener-health handle. Today this is consumed by
-    /// `HotReloader` to know when new ports need binding; future cleanup
-    /// can switch `HotReloader` to read `SharedGatewayRoutingTable` directly
-    /// and drop this field.
+    /// Shared listener-health handle. Consumed by `ListenerSpecsAdapter` in
+    /// `coxswain-bin` to derive the desired `HashSet<ListenerSpec>` and feed
+    /// it to the `ProxyAcceptor` for dynamic port bind/unbind.
     pub tls_health: SharedGatewayListenerHealth,
 }
 
@@ -168,8 +167,8 @@ pub struct DedicatedProxyReflector {
     pub source: KubernetesSource,
     /// Reflector + rebuild background service.
     pub reconciler: DedicatedProxyReconciler,
-    /// Shared per-listener health. Consumed by `HotReloader` and the admin
-    /// `/status` endpoint.
+    /// Shared per-listener health. Consumed by `ListenerSpecsAdapter` for
+    /// dynamic port management and the admin `/status` endpoint.
     pub tls_health: SharedGatewayListenerHealth,
 }
 

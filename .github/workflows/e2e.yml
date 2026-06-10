@@ -5,12 +5,16 @@ on:
 
 name: E2E
 
-# Three jobs below (`e2e-ingress`, `e2e-gateway-api`, `e2e-gateway-api-conformance`)
-# are required status checks. A workflow-level path filter that excludes the
-# whole workflow leaves those checks pending forever on docs-only PRs. Instead
-# we always start on PRs and gate the heavy jobs on the `changes` job. A job
-# whose `if:` evaluates to false reports `skipped`, which counts as success for
-# required-status-check enforcement.
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+# `e2e-*` matrix entries and `e2e-conformance` are required status checks.
+# A workflow-level path filter that excludes the whole workflow leaves those
+# checks pending forever on docs-only PRs. Instead we always start on PRs and
+# gate the heavy jobs on the `changes` job. A job whose `if:` evaluates to
+# false reports `skipped`, which counts as success for required-status-check
+# enforcement.
 jobs:
   changes:
     name: changes
@@ -63,21 +67,37 @@ jobs:
           path: bin/
           retention-days: 1
 
-  e2e-gateway-api:
-    name: e2e-gateway-api
+  e2e:
+    name: e2e-${{ matrix.suite }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: ingress
+            binary: ingress
+          - suite: gateway-api
+            binary: gateway_api
+          - suite: dedicated-proxy
+            binary: dedicated_proxy
+          - suite: proxy-listener-drain
+            binary: proxy_listener_drain
+          - suite: health
+            binary: health
+          - suite: rbac-read-only-proxy
+            binary: rbac_read_only_proxy
     steps:
       - uses: actions/checkout@v6
 
       - uses: ./.github/actions/setup-kind-cluster
         with:
-          cluster-name: coxswain-e2e-gateway-api
+          cluster-name: coxswain-e2e-${{ matrix.suite }}
 
       - uses: ./.github/actions/preload-gateway-api-images
         with:
-          cluster-name: coxswain-e2e-gateway-api
+          cluster-name: coxswain-e2e-${{ matrix.suite }}
           include-busybox: 'true'
 
       - name: Download e2e binaries
@@ -87,10 +107,10 @@ jobs:
           path: bin/
 
       - name: Make binaries executable
-        run: chmod +x bin/coxswain bin/gateway_api
+        run: chmod +x bin/coxswain bin/${{ matrix.binary }}
 
-      - name: Run e2e tests (gateway_api)
-        run: bin/gateway_api --test-threads=1
+      - name: Run e2e tests (${{ matrix.suite }})
+        run: bin/${{ matrix.binary }} --test-threads=1
         env:
           COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
           RUST_LOG: coxswain_e2e=debug,warn
@@ -98,43 +118,8 @@ jobs:
       - uses: ./.github/actions/dump-cluster-state
         if: failure()
 
-  e2e-ingress:
-    name: e2e-ingress
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: ./.github/actions/setup-kind-cluster
-        with:
-          cluster-name: coxswain-e2e-ingress
-
-      - uses: ./.github/actions/preload-gateway-api-images
-        with:
-          cluster-name: coxswain-e2e-ingress
-          include-busybox: 'true'
-
-      - name: Download e2e binaries
-        uses: actions/download-artifact@v8
-        with:
-          name: e2e-bins
-          path: bin/
-
-      - name: Make binaries executable
-        run: chmod +x bin/coxswain bin/ingress
-
-      - name: Run e2e tests (ingress)
-        run: bin/ingress --test-threads=1
-        env:
-          COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
-          RUST_LOG: coxswain_e2e=debug,warn
-
-      - uses: ./.github/actions/dump-cluster-state
-        if: failure()
-
-  e2e-gateway-api-conformance:
-    name: e2e-gateway-api-conformance
+  e2e-conformance:
+    name: e2e-conformance
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 60

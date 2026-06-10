@@ -144,8 +144,8 @@ Clients still connect to ports 80/443. The container binds 8080/8443 without
 
 ### Extra Gateway listener ports
 
-Coxswain dynamically binds new Gateway listener ports at runtime via HotReloader,
-but the Kubernetes Service is static. A port bound by the pod is not reachable
+Coxswain dynamically binds and drains Gateway listener ports in-process without
+restarting, but the Kubernetes Service is static. A port bound by the pod is not reachable
 externally until it is also declared in `additionalPorts` and `helm upgrade` is run.
 Use this for ports you know in advance:
 

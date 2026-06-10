@@ -116,6 +116,8 @@ spec:
               value: {{ .Values.proxy.shared.shutdownGracePeriod | quote }}
             - name: COXSWAIN_PROXY_SHUTDOWN_TIMEOUT
               value: {{ .Values.proxy.shared.shutdownTimeout | quote }}
+            - name: COXSWAIN_PROXY_LISTENER_DRAIN_TIMEOUT
+              value: {{ .Values.proxy.shared.listenerDrainTimeout | quote }}
             {{- if .Values.proxy.shared.acceptProxyProtocol }}
             - name: COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL
               value: "true"

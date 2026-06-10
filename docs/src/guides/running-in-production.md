@@ -95,6 +95,18 @@ For long-lived connections (WebSocket, SSE), increase the grace period:
 --proxy-shutdown-timeout=10s
 ```
 
+## Live Gateway listener changes
+
+When a Gateway's listener set changes (port added or removed), Coxswain reconciles listeners in-process without restarting. New ports are bound immediately; removed ports enter a drain window (`--proxy-listener-drain-timeout`, default `30s`) during which in-flight requests complete normally before the socket is released.
+
+Tune the drain timeout to cover your longest expected upstream latency:
+
+```bash
+--proxy-listener-drain-timeout=60s
+```
+
+The `coxswain_proxy_requests_force_closed_total{reason="drain_exceeded"}` metric increments for any connection that could not finish within the window. It should remain at 0 under normal operation; a non-zero value means the drain timeout is too short for your workload.
+
 ## Status address
 
 Set `--status-address` to the external IP or hostname of your load balancer. Without it, `Ingress.status` and `Gateway.status.addresses` are left empty, which breaks cert-manager HTTP-01 challenges and external-dns.

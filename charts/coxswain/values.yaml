@@ -248,6 +248,11 @@ proxy:
     shutdownGracePeriod: 30s
     # COXSWAIN_PROXY_SHUTDOWN_TIMEOUT — hard deadline after grace period expires.
     shutdownTimeout: 5s
+    # COXSWAIN_PROXY_LISTENER_DRAIN_TIMEOUT — per-listener drain window when a
+    # Gateway port is removed; connections in flight are given this long to
+    # complete before being force-closed.  Distinct from shutdownGracePeriod
+    # (process-wide) — tune based on your longest expected upstream latency.
+    listenerDrainTimeout: 30s
 
     # COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL — enable HAProxy PROXY protocol v1/v2.
     acceptProxyProtocol: false

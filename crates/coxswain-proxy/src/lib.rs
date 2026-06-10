@@ -12,6 +12,7 @@ pub(crate) mod accept;
 pub(crate) mod common;
 mod gateway;
 mod ingress;
+pub(crate) mod metrics;
 pub mod reflector;
 mod source;
 mod tls;

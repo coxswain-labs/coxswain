@@ -19,7 +19,7 @@
 //!
 //! [`FIELD_MANAGER`] is `"coxswain-controller"`. The e2e suite asserts this
 //! literal on `metadata.managedFields[].manager`; renaming it requires a
-//! coordinated change to `dedicated_gateway.rs`.
+//! coordinated change to `dedicated_proxy.rs`.
 
 use super::render::RenderedSpecs;
 use coxswain_reflector::gw_types::v::gateways::Gateway;

@@ -317,13 +317,22 @@ cargo build --bin coxswain
 cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
 ```
 
-### dedicated_gateway
+### dedicated_proxy
 
 Covers the dedicated-mode provisioning operator (#208): a Gateway with `spec.infrastructure.parametersRef` produces a `Deployment` / `Service` / `ServiceAccount` in its namespace; Gateway deletion garbage-collects them; controller restart is idempotent.
 
 ```bash
 cargo build --bin coxswain
-cargo test -p coxswain-e2e --test dedicated_gateway -- --test-threads=1
+cargo test -p coxswain-e2e --test dedicated_proxy -- --test-threads=1
+```
+
+### proxy_listener_drain
+
+Covers zero-drop Gateway listener add/remove (#231): runs 2 000 requests through a live listener while a port is added or removed mid-flight and asserts zero non-2xx responses and zero connection errors.
+
+```bash
+cargo build --bin coxswain
+cargo test -p coxswain-e2e --test proxy_listener_drain -- --test-threads=1
 ```
 
 ### conformance

@@ -7,9 +7,7 @@
 //! those land in #209), so these tests assert **resource provisioning only**,
 //! never traffic flow.
 
-use coxswain_e2e::{
-    FixtureVars, Harness, NamespaceGuard, fixtures::dedicated_gateway as dedicated,
-};
+use coxswain_e2e::{FixtureVars, Harness, NamespaceGuard, fixtures::dedicated_proxy as dedicated};
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
@@ -23,7 +21,7 @@ mod common;
 /// Gateway `metadata.name` declared in the fixture — chosen to keep the
 /// rendered resource name (`<gw>-<class>`) stable across test runs without
 /// TESTNS substitution leaking into it. See
-/// `crates/coxswain-e2e/fixtures/dedicated_gateway/dedicated_gateway.yaml`.
+/// `crates/coxswain-e2e/fixtures/dedicated_proxy/dedicated_gateway.yaml`.
 const GATEWAY_NAME: &str = "dedicated-gw";
 /// Rendered resource name per GEP-1762 — `<gateway-name>-<gateway-class>`.
 const RESOURCE_NAME: &str = "dedicated-gw-coxswain";
@@ -95,7 +93,7 @@ where
 ///    correct owner reference back to the Gateway, and the SSA field manager
 ///    set to `"coxswain-controller"`.
 #[tokio::test]
-async fn provisions_resources_for_dedicated_gateway() -> anyhow::Result<()> {
+async fn provisions_resources_for_dedicated_proxy() -> anyhow::Result<()> {
     common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-create").await?;
