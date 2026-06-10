@@ -17,7 +17,8 @@ use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_core::tls::SharedTlsStore;
 use coxswain_reflector::{
-    IngressDefaultBackend, IngressPorts, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
+    DedicatedConfig, DedicatedOutputs, DedicatedProxyReconciler, IngressDefaultBackend,
+    IngressPorts, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
     SharedGatewayListenerHealth, SharedProxyReconciler,
 };
 use std::sync::Arc;
@@ -121,6 +122,103 @@ pub fn spawn_routing_table_builder(config: ProxyReflectorConfig) -> ProxyReflect
     let source = KubernetesSource::new(ingress_routes, gateway_routes, tls_store);
 
     ProxyReflector {
+        source,
+        reconciler,
+        tls_health,
+    }
+}
+
+/// Configuration bundle for the dedicated-proxy routing-table-build pipeline.
+///
+/// Parallel to [`ProxyReflectorConfig`] but carrying the dedicated-mode
+/// identifiers + RBAC opt-in flags instead of the shared pool's
+/// `IngressDefaultBackend` / `watch_namespace`. Constructed by the bin layer
+/// from `serve proxy --gateway` args.
+pub struct DedicatedProxyReflectorConfig {
+    /// `GatewayClass`/`HTTPRoute` `controllerName` claim.
+    pub controller_name: String,
+    /// Name of the target Gateway.
+    pub gateway_name: String,
+    /// Namespace of the target Gateway.
+    pub gateway_namespace: String,
+    /// Permit cluster-wide HTTPRoute reads (gates listeners with
+    /// `allowedRoutes.namespaces.from: All`).
+    pub allow_cluster_wide_route_read: bool,
+    /// Permit cluster-wide Namespace reads (gates listeners with
+    /// `allowedRoutes.namespaces.from: Selector`).
+    pub allow_cluster_wide_namespace_read: bool,
+    /// Health-registry handles produced by the bin's `HealthRegistry::register`
+    /// calls.
+    pub health: ReconcilerHealth,
+}
+
+/// Spawned dedicated-proxy routing-table-build pipeline.
+///
+/// Holds the [`KubernetesSource`] consumed by the Pingora `GatewayProxy`
+/// service (the dedicated pod registers no `IngressProxy`), the shared TLS
+/// handles, and the [`DedicatedProxyReconciler`] the caller registers with
+/// the Pingora server.
+pub struct DedicatedProxyReflector {
+    /// Source the `GatewayProxy` service reads its routing table from.
+    pub source: KubernetesSource,
+    /// Reflector + rebuild background service.
+    pub reconciler: DedicatedProxyReconciler,
+    /// Shared per-listener health. Consumed by `HotReloader` and the admin
+    /// `/status` endpoint.
+    pub tls_health: SharedGatewayListenerHealth,
+}
+
+/// Build the dedicated-proxy reflector pipeline.
+///
+/// # Errors
+///
+/// None. Failures surface at run-time via the health-registry checks.
+#[must_use]
+pub fn spawn_dedicated_routing_table_builder(
+    config: DedicatedProxyReflectorConfig,
+) -> DedicatedProxyReflector {
+    let DedicatedProxyReflectorConfig {
+        controller_name,
+        gateway_name,
+        gateway_namespace,
+        allow_cluster_wide_route_read,
+        allow_cluster_wide_namespace_read,
+        health,
+    } = config;
+
+    // The Ingress routing table is constructed but never written: the
+    // dedicated pod registers no `IngressProxy`. Keeping a placeholder
+    // `SharedIngressRoutingTable` here lets `KubernetesSource` stay
+    // identically-shaped across the two proxy modes.
+    let ingress_routes = SharedIngressRoutingTable::new();
+    let gateway_routes = SharedGatewayRoutingTable::new();
+    let tls_store = SharedTlsStore::new();
+    let tls_health = SharedGatewayListenerHealth::new();
+    let owned_gateways = OwnedGateways::new();
+    let _leader: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    let mut dedicated_config = DedicatedConfig::new(
+        controller_name,
+        gateway_name.clone(),
+        gateway_namespace.clone(),
+    );
+    dedicated_config.allow_cluster_wide_route_read = allow_cluster_wide_route_read;
+    dedicated_config.allow_cluster_wide_namespace_read = allow_cluster_wide_namespace_read;
+
+    let reconciler = DedicatedProxyReconciler::new(
+        dedicated_config,
+        DedicatedOutputs::new(
+            gateway_routes.clone(),
+            tls_store.clone(),
+            tls_health.clone(),
+        ),
+        owned_gateways,
+        health,
+    );
+
+    let source = KubernetesSource::new(ingress_routes, gateway_routes, tls_store);
+
+    DedicatedProxyReflector {
         source,
         reconciler,
         tls_health,

@@ -45,8 +45,9 @@ pub use cluster::{ClusterSummaryInputs, build_cluster_summary};
 pub use crds::gateway_api_crds_present;
 pub use ingress::IngressPorts;
 pub use reconciler::{
-    ControllerReconciler, IngressDefaultBackend, IngressDefaultBackendParseError, ReconcilerHealth,
-    ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler,
+    ControllerReconciler, DedicatedConfig, DedicatedOutputs, DedicatedProxyReconciler,
+    IngressDefaultBackend, IngressDefaultBackendParseError, ReconcilerHealth, ReconcilerOptions,
+    ReconcilerOutputs, SharedProxyReconciler,
 };
 pub use tls::{
     GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, SharedBackendTlsPolicyHealth,

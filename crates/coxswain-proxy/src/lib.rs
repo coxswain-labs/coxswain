@@ -27,7 +27,10 @@ pub use common::ctx::{ProxyCtx, ResolvedRoute};
 pub use common::engine::RoutingEngine;
 pub use gateway::{GatewayEngine, GatewayProxy};
 pub use ingress::{IngressEngine, IngressProxy};
-pub use reflector::{ProxyReflector, ProxyReflectorConfig, spawn_routing_table_builder};
+pub use reflector::{
+    DedicatedProxyReflector, DedicatedProxyReflectorConfig, ProxyReflector, ProxyReflectorConfig,
+    spawn_dedicated_routing_table_builder, spawn_routing_table_builder,
+};
 pub use source::{KubernetesSource, RoutingSource};
 pub use tls::SniCertSelector;
 pub use upstream_ca::UpstreamCaCache;

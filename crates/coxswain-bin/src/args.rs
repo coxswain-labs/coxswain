@@ -11,7 +11,7 @@
 //!   Not yet implemented — exits with "not yet implemented".
 //! - `proxy --shared`: read-only data plane for Ingress + non-dedicated Gateways.
 //!   Not yet implemented.
-//! - `proxy --gateway --gateway-name=NAME --gateway-namespace=NS`: read-only
+//! - `proxy --dedicated --gateway-name=NAME --gateway-namespace=NS`: read-only
 //!   data plane scoped to a single Gateway. Not yet implemented.
 //! - `dev` (hidden from `--help`): monolithic single-process pod for local
 //!   development. Equivalent to today's behaviour.
@@ -81,7 +81,7 @@ pub(crate) enum Role {
     /// Reconciler + status writer pod.
     Controller(ControllerRoleArgs),
     /// Read-only data plane pod. Use `--shared` for the shared pool or
-    /// `--gateway` for a per-Gateway pod.
+    /// `--dedicated` for a per-Gateway pod.
     Proxy(ProxyRoleArgs),
     /// Hidden: monolithic single-process pod for local development. Production
     /// deployments must pick `controller` or `proxy` explicitly.
@@ -364,9 +364,9 @@ pub(crate) struct ControllerRoleArgs {
 
 /// Arguments accepted by the `proxy` role.
 ///
-/// Exactly one of `--shared` (serve the shared pool) or `--gateway` (serve a
+/// Exactly one of `--shared` (serve the shared pool) or `--dedicated` (serve a
 /// single dedicated Gateway) must be set; clap's `scope` argument group
-/// enforces this at parse time. When `--gateway` is set, `--gateway-name`
+/// enforces this at parse time. When `--dedicated` is set, `--gateway-name`
 /// and `--gateway-namespace` are required; when `--shared` is set, they are
 /// rejected.
 #[derive(Args, Debug)]
@@ -386,29 +386,62 @@ pub(crate) struct ProxyRoleArgs {
     /// Serve a single dedicated Gateway. Requires `--gateway-name` and
     /// `--gateway-namespace`.
     #[arg(long, group = "scope")]
-    pub gateway: bool,
+    pub dedicated: bool,
 
     /// Name of the Gateway this proxy is scoped to.
     ///
-    /// Required with `--gateway`; rejected with `--shared`.
+    /// Required with `--dedicated`; rejected with `--shared`.
     #[arg(
         long,
         env = "COXSWAIN_GATEWAY_NAME",
-        required_if_eq("gateway", "true"),
+        required_if_eq("dedicated", "true"),
         conflicts_with = "shared"
     )]
     pub gateway_name: Option<String>,
 
     /// Namespace of the Gateway this proxy is scoped to.
     ///
-    /// Required with `--gateway`; rejected with `--shared`.
+    /// Required with `--dedicated`; rejected with `--shared`.
     #[arg(
         long,
         env = "COXSWAIN_GATEWAY_NAMESPACE",
-        required_if_eq("gateway", "true"),
+        required_if_eq("dedicated", "true"),
         conflicts_with = "shared"
     )]
     pub gateway_namespace: Option<String>,
+
+    /// Permit cluster-wide HTTPRoute reads — required when the target Gateway
+    /// has any listener with `allowedRoutes.namespaces.from: All`.
+    ///
+    /// Defaults to `false` (precise least-privilege opt-in). When the target
+    /// Gateway has such a listener and this flag is `false`, the reconciler
+    /// logs a warning today (Step 7); Step 10 will add an `Accepted=false`
+    /// listener condition.
+    ///
+    /// Only meaningful with `--dedicated`; rejected with `--shared`.
+    #[arg(
+        long,
+        env = "COXSWAIN_ALLOW_CLUSTER_WIDE_ROUTE_READ",
+        default_value_t = false,
+        conflicts_with = "shared"
+    )]
+    pub allow_cluster_wide_route_read: bool,
+
+    /// Permit cluster-wide Namespace reads — required when the target Gateway
+    /// has any listener with `allowedRoutes.namespaces.from: Selector`.
+    ///
+    /// Defaults to `false`. Same semantics as `--allow-cluster-wide-route-read`
+    /// but for the Namespace resource (selector-based attachment uses
+    /// `Namespace` labels).
+    ///
+    /// Only meaningful with `--dedicated`; rejected with `--shared`.
+    #[arg(
+        long,
+        env = "COXSWAIN_ALLOW_CLUSTER_WIDE_NAMESPACE_READ",
+        default_value_t = false,
+        conflicts_with = "shared"
+    )]
+    pub allow_cluster_wide_namespace_read: bool,
 }
 
 /// Resolved scope for a `proxy` role invocation.
@@ -422,6 +455,10 @@ pub(crate) enum ProxyScope {
         name: String,
         /// Gateway namespace.
         namespace: String,
+        /// Whether the operator opted into cluster-wide HTTPRoute reads.
+        allow_cluster_wide_route_read: bool,
+        /// Whether the operator opted into cluster-wide Namespace reads.
+        allow_cluster_wide_namespace_read: bool,
     },
 }
 
@@ -433,17 +470,22 @@ impl ProxyRoleArgs {
             ProxyScope::Shared
         } else {
             // Invariant: clap's `scope` ArgGroup guarantees exactly one of
-            // `shared`/`gateway` is set, and `required_if_eq` guarantees the
-            // identifiers are present whenever `gateway` is.
+            // `shared`/`dedicated` is set, and `required_if_eq` guarantees the
+            // identifiers are present whenever `dedicated` is.
             let name = self.gateway_name.clone().unwrap_or_else(|| {
                 panic!(
-                    "invariant: --gateway-name required by clap scope group when --gateway is set"
+                    "invariant: --gateway-name required by clap scope group when --dedicated is set"
                 )
             });
             let namespace = self.gateway_namespace.clone().unwrap_or_else(|| {
-                panic!("invariant: --gateway-namespace required by clap scope group when --gateway is set")
+                panic!("invariant: --gateway-namespace required by clap scope group when --dedicated is set")
             });
-            ProxyScope::Gateway { name, namespace }
+            ProxyScope::Gateway {
+                name,
+                namespace,
+                allow_cluster_wide_route_read: self.allow_cluster_wide_route_read,
+                allow_cluster_wide_namespace_read: self.allow_cluster_wide_namespace_read,
+            }
         }
     }
 }
@@ -495,7 +537,7 @@ mod tests {
         assert_eq!(args.scope(), ProxyScope::Shared);
     }
 
-    /// `coxswain serve proxy --gateway --gateway-name=NAME
+    /// `coxswain serve proxy --dedicated --gateway-name=NAME
     /// --gateway-namespace=NS` resolves to `ProxyScope::Gateway`.
     #[test]
     fn serve_proxy_gateway_parses() {
@@ -503,7 +545,7 @@ mod tests {
             "coxswain",
             "serve",
             "proxy",
-            "--gateway",
+            "--dedicated",
             "--gateway-name=my-gw",
             "--gateway-namespace=tenant-a",
         ])
@@ -517,8 +559,53 @@ mod tests {
             ProxyScope::Gateway {
                 name: "my-gw".to_string(),
                 namespace: "tenant-a".to_string(),
+                allow_cluster_wide_route_read: false,
+                allow_cluster_wide_namespace_read: false,
             }
         );
+    }
+
+    /// Both opt-in flags parse and propagate through to the resolved scope.
+    #[test]
+    fn serve_proxy_gateway_opt_in_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "proxy",
+            "--dedicated",
+            "--gateway-name=my-gw",
+            "--gateway-namespace=tenant-a",
+            "--allow-cluster-wide-route-read",
+            "--allow-cluster-wide-namespace-read",
+        ])
+        .expect("parses");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Proxy(args)) = serve.role else {
+            panic!("expected Role::Proxy");
+        };
+        assert_eq!(
+            args.scope(),
+            ProxyScope::Gateway {
+                name: "my-gw".to_string(),
+                namespace: "tenant-a".to_string(),
+                allow_cluster_wide_route_read: true,
+                allow_cluster_wide_namespace_read: true,
+            }
+        );
+    }
+
+    /// The opt-in flags conflict with `--shared`.
+    #[test]
+    fn shared_rejects_opt_in_flags() {
+        let err = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "proxy",
+            "--shared",
+            "--allow-cluster-wide-route-read",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     /// `serve proxy` with no scope flag fails the ArgGroup `required` rule.
@@ -529,27 +616,27 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
-    /// `serve proxy --shared --gateway` fails the ArgGroup `multiple = false`
+    /// `serve proxy --shared --dedicated` fails the ArgGroup `multiple = false`
     /// rule.
     #[test]
     fn serve_proxy_rejects_both_scopes() {
-        let err = Cli::try_parse_from(["coxswain", "serve", "proxy", "--shared", "--gateway"])
+        let err = Cli::try_parse_from(["coxswain", "serve", "proxy", "--shared", "--dedicated"])
             .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
-    /// `serve proxy --gateway` without identifiers fails the `required_if_eq`
+    /// `serve proxy --dedicated` without identifiers fails the `required_if_eq`
     /// rule.
     #[test]
     fn serve_proxy_gateway_requires_identifiers() {
-        let err = Cli::try_parse_from(["coxswain", "serve", "proxy", "--gateway"]).unwrap_err();
+        let err = Cli::try_parse_from(["coxswain", "serve", "proxy", "--dedicated"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
 
         let err = Cli::try_parse_from([
             "coxswain",
             "serve",
             "proxy",
-            "--gateway",
+            "--dedicated",
             "--gateway-name=my-gw",
         ])
         .unwrap_err();
@@ -651,7 +738,11 @@ mod tests {
             .expect("proxy subcommand exists");
         let help = proxy.render_help().to_string();
         assert!(help.contains("--shared"), "proxy help lists --shared");
-        assert!(help.contains("--gateway"), "proxy help lists --gateway");
+        assert!(help.contains("--dedicated"), "proxy help lists --dedicated");
+        assert!(
+            help.contains("--gateway-name"),
+            "proxy help lists --gateway-name"
+        );
     }
 
     /// `--management-bind-address` defaults to `0.0.0.0` when neither the CLI

@@ -94,6 +94,60 @@ cargo run --bin coxswain -- serve proxy --shared --log-format console \
   --ingress-http-port 80 --ingress-https-port 443
 ```
 
+### Run a dedicated-mode proxy locally
+
+`serve proxy --dedicated` is the per-Gateway data plane mode (issue #206). It runs the same image, watches the same K8s resources, but filters the routing-table build to one named Gateway — exactly the shape the controller will provision automatically once Step 9 of the architecture plan lands.
+
+Before reaching for this, apply the dev Gateway fixture so there's something to attach to:
+
+```bash
+kubectl apply -f deploy/dev/echo-backends.yaml
+kubectl apply -f deploy/dev/httproute.yaml   # creates the `coxswain-test` Gateway
+```
+
+Then start the dedicated proxy in its own terminal alongside the controller:
+
+```bash
+# Terminal 3 — dedicated proxy for one Gateway
+cargo run --bin coxswain -- serve proxy --dedicated \
+  --gateway-name coxswain-test \
+  --gateway-namespace default \
+  --log-format console
+```
+
+Verify only that Gateway's routes are loaded:
+
+```bash
+curl -s http://localhost:8082/routes | jq .
+```
+
+The output lists exactly the hosts the target Gateway's HTTPRoutes serve; Ingress routes and routes attached to other Gateways do not appear.
+
+#### Opt-in flags for cross-namespace route attachment
+
+By default, dedicated mode treats listeners with `allowedRoutes.namespaces.from: All` or `from: Selector` as needing operator consent to broader RBAC scope. Today the watches are still cluster-wide (Step 7 keeps the shared-proxy RBAC profile); the opt-in flags govern a startup warning only. Once Step 10 lands, listeners using a non-`Same` `from` without the matching opt-in will be marked `Accepted=false`.
+
+| Flag | Gates listeners with |
+|---|---|
+| `--allow-cluster-wide-route-read` | `allowedRoutes.namespaces.from: All` |
+| `--allow-cluster-wide-namespace-read` | `allowedRoutes.namespaces.from: Selector` |
+
+Both default to false. Set them only on Gateways that genuinely accept cross-namespace route attachment:
+
+```bash
+cargo run --bin coxswain -- serve proxy --dedicated \
+  --gateway-name coxswain-test \
+  --gateway-namespace default \
+  --allow-cluster-wide-route-read \
+  --log-format console
+```
+
+#### Known limitations (deferred)
+
+- **Watch scope is cluster-wide today.** True per-namespace narrowed watches land with Step 10 (per-Gateway-proxy `RoleBinding` reconciliation) — the two need to ship together because the runtime narrowing has no value without the matching RBAC narrowing.
+- **Listener refusal is a warning today.** A listener with `from: All` or `from: Selector` and no matching opt-in logs a warning at startup but still serves traffic. Step 10 promotes this to an `Accepted=false` listener condition.
+- **`ControllerReconciler` is a type alias for `SharedProxyReconciler`.** The narrower controller-only output set (skipping routing-table builds, skipping TLS store) is deferred to a follow-up; the controller pod runs the full shared-proxy reconciler today. The type-level distinction exists so the future split is a purely internal refactor.
+
 | Port   | Purpose                                          |
 |--------|--------------------------------------------------|
 | `80`   | HTTP proxy (data plane)                          |

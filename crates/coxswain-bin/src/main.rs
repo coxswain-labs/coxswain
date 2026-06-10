@@ -3,7 +3,7 @@
 mod args;
 mod hot_reload;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use coxswain_admin::AdminServer;
 use coxswain_controller::{
@@ -14,9 +14,10 @@ use coxswain_core::health::HealthRegistry;
 use coxswain_core::routing::{RouteTimeouts, SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_health::HealthServer;
 use coxswain_proxy::{
-    GatewayProxy, IngressProxy, KubernetesSource, ListenerProtocol, ListenerSpec, ProxyAcceptor,
-    ProxyReflector, ProxyReflectorConfig, RoutingEngine, RoutingSource, SniCertSelector,
-    TrustedSources, UpstreamCaCache, spawn_routing_table_builder,
+    DedicatedProxyReflector, DedicatedProxyReflectorConfig, GatewayProxy, IngressProxy,
+    KubernetesSource, ListenerProtocol, ListenerSpec, ProxyAcceptor, ProxyReflector,
+    ProxyReflectorConfig, RoutingEngine, RoutingSource, SniCertSelector, TrustedSources,
+    UpstreamCaCache, spawn_dedicated_routing_table_builder, spawn_routing_table_builder,
 };
 use coxswain_reflector::ReconcilerHealth;
 use pingora_core::listeners::tls::TlsSettings;
@@ -57,7 +58,7 @@ fn main() -> Result<()> {
     // (via `arg_required_else_help` on the `serve` parser).
     let role = serve.role.ok_or_else(|| {
         anyhow::anyhow!(
-            "missing role: pick one of `controller`, `proxy --shared`, `proxy --gateway`, \
+            "missing role: pick one of `controller`, `proxy --shared`, `proxy --dedicated`, \
              or `dev` (hidden, for local development)"
         )
     })?;
@@ -67,9 +68,7 @@ fn main() -> Result<()> {
         Role::Controller(controller_args) => run_controller(controller_args),
         Role::Proxy(proxy_args) => match proxy_args.scope() {
             ProxyScope::Shared => run_proxy_shared(proxy_args),
-            ProxyScope::Gateway { .. } => {
-                bail!("role 'proxy --gateway' is not yet implemented (see Step 7)")
-            }
+            ProxyScope::Gateway { .. } => run_proxy_gateway(proxy_args),
         },
     }
 }
@@ -224,6 +223,328 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
         "Listening"
     );
     server.run_forever();
+}
+
+/// Wire and run the `proxy --gateway` pod role: read-only data plane scoped
+/// to one named Gateway. Same RBAC profile as `proxy --shared` today
+/// (cluster-wide reads, zero writes); Step 10 narrows the reads to only the
+/// namespaces the target Gateway routes traffic into.
+fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
+    init_logger(args.common.log_format, &args.common.log_filter)?;
+
+    let (
+        gateway_name,
+        gateway_namespace,
+        allow_cluster_wide_route_read,
+        allow_cluster_wide_namespace_read,
+    ) = match args.scope() {
+        ProxyScope::Gateway {
+            name,
+            namespace,
+            allow_cluster_wide_route_read,
+            allow_cluster_wide_namespace_read,
+        } => (
+            name,
+            namespace,
+            allow_cluster_wide_route_read,
+            allow_cluster_wide_namespace_read,
+        ),
+        ProxyScope::Shared => {
+            // Invariant: this arm is only entered when the caller already
+            // confirmed `ProxyScope::Gateway` via the match in `main`.
+            panic!("invariant: run_proxy_gateway must be invoked with ProxyScope::Gateway");
+        }
+    };
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        role = "proxy",
+        scope = "gateway",
+        gateway = %format!("{gateway_namespace}/{gateway_name}"),
+        controller_name = %args.common.controller_name,
+        allow_cluster_wide_route_read,
+        allow_cluster_wide_namespace_read,
+        "Starting"
+    );
+
+    let mut server = build_server(&args.proxy);
+
+    let health = HealthRegistry::new();
+    // Same check set as the shared-proxy pod: DedicatedProxyReconciler flips
+    // `ingress` and `ingress_class` to Ready immediately (it doesn't watch
+    // those resources), so `/readyz` does not get stuck waiting on them.
+    let controller_handle = health.register(
+        "controller",
+        &[
+            "httproute",
+            "ingress",
+            "ingress_class",
+            "gateway",
+            "gateway_class",
+            "endpoint_slice",
+            "reference_grant",
+            "secret",
+            "service",
+            "backend_tls_policy",
+            "config_map",
+            "routing_table_built",
+        ],
+    );
+    let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
+
+    let reflector = spawn_dedicated_routing_table_builder(DedicatedProxyReflectorConfig {
+        controller_name: args.common.controller_name.clone(),
+        gateway_name: gateway_name.clone(),
+        gateway_namespace: gateway_namespace.clone(),
+        allow_cluster_wide_route_read,
+        allow_cluster_wide_namespace_read,
+        health: ReconcilerHealth::new(controller_handle, proxy_handle),
+    });
+
+    let DedicatedProxyReflector {
+        source,
+        reconciler,
+        tls_health,
+    } = reflector;
+
+    server.add_service(background_service("reconciler", reconciler));
+
+    wire_gateway_only_proxy_services(
+        &mut server,
+        &args.common,
+        &args.proxy,
+        &source,
+        &tls_health,
+        &gateway_name,
+        &gateway_namespace,
+        &args.common.controller_name,
+    )?;
+
+    let leader = Arc::new(AtomicBool::new(false));
+    wire_management_servers(
+        &mut server,
+        &args.common,
+        health,
+        leader,
+        source.ingress_routes(),
+        source.gateway_routes(),
+        None,
+    );
+
+    tracing::info!(
+        proxy_bind_address = %args.proxy.proxy_bind_address,
+        management_bind_address = %args.common.management_bind_address,
+        health_port = args.common.health_port,
+        admin_port = args.common.admin_port,
+        proxy_shutdown_grace_period = ?args.proxy.proxy_shutdown_grace_period,
+        proxy_shutdown_timeout = ?args.proxy.proxy_shutdown_timeout,
+        "Listening"
+    );
+    server.run_forever();
+}
+
+/// Wire only the `GatewayProxy` Pingora service (no `IngressProxy`) for the
+/// `serve proxy --gateway` pod. Ports are discovered from the target
+/// Gateway's `spec.listeners` only — the shared-pool union discovery is
+/// inappropriate here since this pod must not bind ports declared by other
+/// Gateways.
+#[allow(clippy::too_many_arguments)]
+fn wire_gateway_only_proxy_services(
+    server: &mut Server,
+    common: &CommonArgs,
+    proxy: &ProxyArgs,
+    source: &KubernetesSource,
+    tls_health: &SharedGatewayListenerHealth,
+    gateway_name: &str,
+    gateway_namespace: &str,
+    controller_name: &str,
+) -> Result<()> {
+    let default_timeouts = RouteTimeouts {
+        request: proxy.proxy_default_request_timeout,
+        backend_request: proxy.proxy_default_backend_request_timeout,
+    };
+    let ca_cache = Arc::new(UpstreamCaCache::new());
+
+    let gateway_listeners: Vec<ListenerSpec> = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime for startup Gateway port discovery")?;
+        let discovered = rt.block_on(discover_dedicated_gateway_ports(
+            controller_name,
+            gateway_name,
+            gateway_namespace,
+            proxy.proxy_bind_address,
+        ));
+        discovered
+            .into_iter()
+            .filter(|spec| match std::net::TcpListener::bind(spec.addr) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        addr = %spec.addr,
+                        error = %e,
+                        "Cannot bind Gateway-discovered port; skipping listener",
+                    );
+                    false
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if gateway_listeners.is_empty() {
+        tracing::warn!(
+            gateway = %format!("{gateway_namespace}/{gateway_name}"),
+            "No bindable listener ports discovered for the target Gateway. No traffic will be served until its spec.listeners produce reachable ports."
+        );
+    } else {
+        let ports: Vec<u16> = gateway_listeners.iter().map(|l| l.addr.port()).collect();
+        tracing::info!(?ports, "Binding ports discovered from target Gateway");
+    }
+
+    let currently_bound: HashSet<u16> = gateway_listeners.iter().map(|l| l.addr.port()).collect();
+
+    if proxy.proxy_accept_proxy_protocol {
+        if proxy.proxy_trusted_sources.is_empty() {
+            tracing::warn!(
+                "--proxy-accept-proxy-protocol is set but --proxy-trusted-sources is empty; \
+                 all connections will be rejected"
+            );
+        }
+        let trusted = Arc::new(TrustedSources::new(proxy.proxy_trusted_sources.clone()));
+        if !gateway_listeners.is_empty() {
+            let p = Arc::new(pingora_proxy::http_proxy(
+                &server.configuration,
+                GatewayProxy::new(
+                    Arc::new(RoutingEngine::new(source.gateway_routes())),
+                    default_timeouts.clone(),
+                    ca_cache.clone(),
+                ),
+            ));
+            let selector = SniCertSelector::new(source.tls_store());
+            let acceptor = ProxyAcceptor::new(p, gateway_listeners, trusted, selector)
+                .context("build GatewayProxy acceptor")?;
+            server.add_service(acceptor);
+        }
+    } else if !gateway_listeners.is_empty() {
+        let mut svc = http_proxy_service_with_name(
+            &server.configuration,
+            GatewayProxy::new(
+                Arc::new(RoutingEngine::new(source.gateway_routes())),
+                default_timeouts.clone(),
+                ca_cache.clone(),
+            ),
+            "gateway-proxy",
+        );
+        for spec in &gateway_listeners {
+            match spec.protocol {
+                ListenerProtocol::Http => {
+                    svc.add_tcp(&spec.addr.to_string());
+                }
+                ListenerProtocol::Https => {
+                    let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
+                        Box::new(SniCertSelector::new(source.tls_store()));
+                    let tls_settings = TlsSettings::with_callbacks(callbacks)
+                        .context("build Gateway TLS settings")?;
+                    svc.add_tls_with_settings(&spec.addr.to_string(), None, tls_settings);
+                }
+            }
+        }
+        server.add_service(svc);
+    }
+
+    // The dedicated pod has no ingress listeners; `currently_bound` ports are
+    // all Gateway-listener ports and the empty `ingress_ports` set tells
+    // HotReloader not to try to re-bind ingress entry points.
+    server.add_service(background_service(
+        "hot-reloader",
+        hot_reload::HotReloader::new(tls_health.clone(), currently_bound, HashSet::new()),
+    ));
+    let _ = common;
+    Ok(())
+}
+
+/// List the target Gateway's listener ports for the dedicated proxy.
+///
+/// Unlike [`discover_gateway_ports`] (which unions across every owned
+/// Gateway for the shared pool), this looks up exactly one Gateway by name
+/// and namespace. Soft-fails to an empty Vec on any API error.
+async fn discover_dedicated_gateway_ports(
+    controller_name: &str,
+    gateway_name: &str,
+    gateway_namespace: &str,
+    bind_address: IpAddr,
+) -> Vec<ListenerSpec> {
+    use gateway_api::apis::standard::gatewayclasses::GatewayClass;
+    use gateway_api::apis::standard::gateways::Gateway;
+    use kube::{Api, Client};
+
+    let client = match Client::try_default().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Cannot connect to Kubernetes at startup; skipping dedicated Gateway port discovery"
+            );
+            return vec![];
+        }
+    };
+
+    let gw_api: Api<Gateway> = Api::namespaced(client.clone(), gateway_namespace);
+    let gw = match gw_api.get(gateway_name).await {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                gateway = %format!("{gateway_namespace}/{gateway_name}"),
+                error = %e,
+                "Target Gateway not found at startup; will pick up listener ports on next HotReloader cycle"
+            );
+            return vec![];
+        }
+    };
+
+    let gc_api = Api::<GatewayClass>::all(client);
+    let gc = match gc_api.get(&gw.spec.gateway_class_name).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                class = %gw.spec.gateway_class_name,
+                error = %e,
+                "Target Gateway's GatewayClass not found; skipping port discovery"
+            );
+            return vec![];
+        }
+    };
+    if gc.spec.controller_name != controller_name {
+        tracing::warn!(
+            class = %gw.spec.gateway_class_name,
+            class_controller = %gc.spec.controller_name,
+            this_controller = controller_name,
+            "Target Gateway's GatewayClass is not owned by this controller; skipping port discovery"
+        );
+        return vec![];
+    }
+
+    let mut result: Vec<ListenerSpec> = Vec::new();
+    let mut seen: HashSet<u16> = HashSet::new();
+    for listener in &gw.spec.listeners {
+        let port = listener.port as u16;
+        if !seen.insert(port) {
+            continue;
+        }
+        match listener.protocol.as_str() {
+            "HTTP" => result.push(ListenerSpec::http(SocketAddr::new(bind_address, port))),
+            "HTTPS" | "TLS" => {
+                result.push(ListenerSpec::https(SocketAddr::new(bind_address, port)))
+            }
+            other => tracing::debug!(
+                protocol = other,
+                port,
+                "Skipping non-HTTP/HTTPS Gateway listener at startup"
+            ),
+        }
+    }
+    result
 }
 
 /// Wire and run the hidden `dev` pod role: single-process all-in-one for local

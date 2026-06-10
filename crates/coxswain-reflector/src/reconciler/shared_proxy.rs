@@ -272,23 +272,23 @@ struct ReconcilerConfig {
     ingress_ports: IngressPorts,
 }
 
-struct ReflectorStores<'a> {
-    routes: &'a reflector::Store<HttpRoute>,
-    ingresses: &'a reflector::Store<Ingress>,
-    ingress_classes: &'a reflector::Store<IngressClass>,
-    gateways: &'a reflector::Store<Gateway>,
-    gateway_classes: &'a reflector::Store<GatewayClass>,
-    slices: &'a reflector::Store<EndpointSlice>,
-    services: &'a reflector::Store<Service>,
-    grants: &'a reflector::Store<ReferenceGrant>,
-    secrets: &'a reflector::Store<Secret>,
+pub(super) struct ReflectorStores<'a> {
+    pub(super) routes: &'a reflector::Store<HttpRoute>,
+    pub(super) ingresses: &'a reflector::Store<Ingress>,
+    pub(super) ingress_classes: &'a reflector::Store<IngressClass>,
+    pub(super) gateways: &'a reflector::Store<Gateway>,
+    pub(super) gateway_classes: &'a reflector::Store<GatewayClass>,
+    pub(super) slices: &'a reflector::Store<EndpointSlice>,
+    pub(super) services: &'a reflector::Store<Service>,
+    pub(super) grants: &'a reflector::Store<ReferenceGrant>,
+    pub(super) secrets: &'a reflector::Store<Secret>,
     /// `BackendTLSPolicy` resources in scope (namespaced per `watch_namespace`).
-    policies: &'a reflector::Store<BackendTlsPolicy>,
+    pub(super) policies: &'a reflector::Store<BackendTlsPolicy>,
     /// All ConfigMaps in scope — used to resolve `caCertificateRefs`.
     /// Unlike the `Secret` reflector (which uses a type= field selector), ConfigMaps
     /// have no equivalent filter; all CMs in scope are watched. A follow-up will
     /// switch to per-policy informers to bound memory use in large clusters.
-    configmaps: &'a reflector::Store<ConfigMap>,
+    pub(super) configmaps: &'a reflector::Store<ConfigMap>,
 }
 
 struct SharedOutputs<'a> {
@@ -301,24 +301,24 @@ struct SharedOutputs<'a> {
     policy_health: &'a SharedBackendTlsPolicyHealth,
 }
 
-struct Ownership<'a> {
-    ingress_classes: &'a HashSet<String>,
-    default_ingress_class: Option<&'a str>,
-    gateways: &'a HashSet<ObjectKey>,
-    gateway_classes: &'a HashSet<String>,
-    backend_grants: &'a GrantSet,
-    cert_grants: &'a GrantSet,
+pub(super) struct Ownership<'a> {
+    pub(super) ingress_classes: &'a HashSet<String>,
+    pub(super) default_ingress_class: Option<&'a str>,
+    pub(super) gateways: &'a HashSet<ObjectKey>,
+    pub(super) gateway_classes: &'a HashSet<String>,
+    pub(super) backend_grants: &'a GrantSet,
+    pub(super) cert_grants: &'a GrantSet,
     /// Per-(Service, port) `BackendTLSPolicy` lookup table, built before this
     /// `Ownership` is constructed. Carried alongside ownership data because
     /// `build_routes` and the per-route `reconcile` both need it on the same
     /// borrow pass — folding it in here keeps the function arities clippy-clean.
-    policy_index: &'a BackendTlsIndex,
+    pub(super) policy_index: &'a BackendTlsIndex,
 }
 
 /// Per-reflector side-effect channels: rebuild notification and readiness flip.
 ///
 /// Grouped so [`spawn_reflector`] stays under `clippy::too_many_arguments`.
-struct ReflectorEffects {
+pub(super) struct ReflectorEffects {
     notify: Arc<Notify>,
     controller_health: SubsystemHandle,
     /// Health-check name to flip Ready on first `Event::InitDone`.
@@ -326,7 +326,7 @@ struct ReflectorEffects {
 }
 
 impl ReflectorEffects {
-    fn new(notify: &Arc<Notify>, health: &SubsystemHandle, check: &'static str) -> Self {
+    pub(super) fn new(notify: &Arc<Notify>, health: &SubsystemHandle, check: &'static str) -> Self {
         Self {
             notify: Arc::clone(notify),
             controller_health: health.clone(),
@@ -335,7 +335,7 @@ impl ReflectorEffects {
     }
 }
 
-fn spawn_reflector<T>(
+pub(super) fn spawn_reflector<T>(
     set: &mut JoinSet<()>,
     writer: reflector::store::Writer<T>,
     api: Api<T>,
@@ -736,7 +736,7 @@ fn rebuild(
 /// Compute which IngressClasses, GatewayClasses, and Gateways are owned by this controller.
 /// Publishes the owned-gateways snapshot to `owned_gateways_handle` as a side effect.
 /// The fourth element of the returned tuple is the name of the owned default IngressClass (if any).
-fn compute_ownership(
+pub(super) fn compute_ownership(
     class_store: &reflector::Store<IngressClass>,
     gateway_class_store: &reflector::Store<GatewayClass>,
     gateway_store: &reflector::Store<Gateway>,
@@ -802,12 +802,12 @@ fn compute_ownership(
     )
 }
 
-type GrantSet = HashSet<ReferenceGrantKey>;
+pub(super) type GrantSet = HashSet<ReferenceGrantKey>;
 
 /// Flatten `ReferenceGrant` objects into two O(1) sets for cross-namespace ref checks:
 /// - `backend_grants`: HTTPRoute → Service (used by `GatewayApiReconciler::reconcile`)
 /// - `cert_grants`: Gateway → Secret (used by `GatewayApiReconciler::reconcile_tls`)
-fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
+pub(super) fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
     fn flatten(grants: &[Arc<ReferenceGrant>], from_kind: &str, to_kind: &str) -> GrantSet {
         grants
             .iter()
@@ -882,7 +882,7 @@ fn build_routes(
 
 /// Build the Gateway-API routing table from `HTTPRoute` resources and publish
 /// it to `shared`. Returns `true` if the publish succeeded.
-fn build_gateway_routes(
+pub(super) fn build_gateway_routes(
     stores: &ReflectorStores<'_>,
     routes: &[Arc<HttpRoute>],
     ownership: &Ownership<'_>,
@@ -1052,7 +1052,7 @@ fn publish_routes<K>(
 }
 
 /// Build and publish the TLS cert store; returns per-gateway listener health for further use.
-fn build_tls(
+pub(super) fn build_tls(
     stores: &ReflectorStores<'_>,
     ingresses: &[Arc<Ingress>],
     ownership: &Ownership<'_>,
@@ -1103,7 +1103,7 @@ fn build_tls(
 
 /// Increment `attached_routes` counters for each gateway listener whose hostname
 /// intersects with the route's hostnames. Only owned gateways are counted.
-fn count_attached_routes(
+pub(super) fn count_attached_routes(
     routes: &[Arc<HttpRoute>],
     owned_gateways: &HashSet<ObjectKey>,
     gateway_tls_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
