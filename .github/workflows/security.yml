@@ -3,6 +3,9 @@ on:
     - cron: "0 3 * * *"
 
 name: Security audit
+concurrency:
+  group: Security audit
+  cancel-in-progress: false
 
 jobs:
   audit:

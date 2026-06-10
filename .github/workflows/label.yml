@@ -6,6 +6,10 @@ on:
 
 name: Label
 
+concurrency:
+  group: Label-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   apply-labels:
     name: apply-labels

@@ -5,6 +5,10 @@ on:
 
 name: CI
 
+concurrency:
+  group: CI-${{ github.ref }}
+  cancel-in-progress: true
+
 # The workflow-level `paths:` filter was removed deliberately: the jobs below
 # are required status checks in the main-branch ruleset, and a filter that
 # excludes the entire workflow leaves those checks pending forever on PRs that

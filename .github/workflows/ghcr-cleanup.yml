@@ -5,6 +5,10 @@ on:
 
 name: GHCR cleanup
 
+concurrency:
+  group: GHCR cleanup
+  cancel-in-progress: false
+
 # Deletes old :main-<sha7> container image versions from GHCR, keeping the
 # 20 most recent snapshots. Versioned releases (:v*, :0.*, :latest) are
 # never touched — any version whose tags include a match for '^(v\d|[0-9]|latest)'

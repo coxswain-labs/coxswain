@@ -5,6 +5,10 @@ on:
 
 name: E2E
 
+concurrency:
+  group: E2E-${{ github.ref }}
+  cancel-in-progress: true
+
 # `e2e-*` matrix entries and `e2e-conformance` are required status checks.
 # A workflow-level path filter that excludes the whole workflow leaves those
 # checks pending forever on docs-only PRs. Instead we always start on PRs and

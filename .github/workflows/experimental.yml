@@ -6,6 +6,10 @@ on:
 
 name: Experimental
 
+concurrency:
+  group: Experimental-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   experimental-build:
     name: experimental-build
