@@ -31,10 +31,20 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
+#[derive(Default)]
 pub struct CoxswainGatewayParametersSpec {
-    /// Desired replica count for the provisioned proxy Deployment. Defaults to `1`.
-    #[serde(default = "default_replicas")]
-    pub replicas: u32,
+    /// Desired replica count for the provisioned proxy Deployment. When
+    /// omitted, falls back to a layer-up default (GatewayClass-level params or
+    /// the controller's built-in default of `1`).
+    ///
+    /// Every field on this spec is `Option` so a per-field overlay between
+    /// the GatewayClass's and Gateway's `parametersRef`s can distinguish
+    /// "operator omitted this field" from "operator set it to the default
+    /// value". Without the `Option` wrap, a Gateway-level override silently
+    /// masks the class's setting whenever the override's value happens to
+    /// equal the type's natural default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<u32>,
 
     /// Optional resource requests/limits applied to the proxy container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -45,10 +55,10 @@ pub struct CoxswainGatewayParametersSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 
-    /// Service type for the provisioned proxy Service. Defaults to
-    /// [`ServiceType::LoadBalancer`].
-    #[serde(default)]
-    pub service_type: ServiceType,
+    /// Service type for the provisioned proxy Service. When omitted, falls
+    /// back to [`ServiceType::LoadBalancer`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<ServiceType>,
 
     /// Raw partial PodTemplateSpec applied on top of the controller-rendered
     /// template — escape hatch for fields not yet first-classed above
@@ -59,18 +69,6 @@ pub struct CoxswainGatewayParametersSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "preserve_unknown_fields_schema")]
     pub pod_template: Option<serde_json::Value>,
-}
-
-impl Default for CoxswainGatewayParametersSpec {
-    fn default() -> Self {
-        Self {
-            replicas: default_replicas(),
-            resources: None,
-            image: None,
-            service_type: ServiceType::default(),
-            pod_template: None,
-        }
-    }
 }
 
 /// Service type for the provisioned proxy Service.
@@ -85,10 +83,6 @@ pub enum ServiceType {
     /// Cluster-internal only; no external address allocated.
     #[serde(rename = "ClusterIP")]
     ClusterIp,
-}
-
-fn default_replicas() -> u32 {
-    1
 }
 
 fn preserve_unknown_fields_schema(_: &mut SchemaGenerator) -> Schema {

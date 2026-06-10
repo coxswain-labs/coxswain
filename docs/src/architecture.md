@@ -28,6 +28,10 @@ flowchart LR
 
 Watches Ingress, GatewayClass, Gateway, HTTPRoute, and related resources cluster-wide; writes status conditions back to them; provisions per-Gateway proxy `Deployment` and `Service` objects when a Gateway opts into dedicated mode. Leader-elected via a Kubernetes `Lease` in `coxswain-system` — status writes pause for up to one Lease TTL during a leader transition; traffic is unaffected. Scales vertically (one active replica + optional warm standby).
 
+The provisioning operator runs as a kube-rs `Controller` alongside the status writer in the same pod. Its reconcile loop resolves each Gateway's effective `CoxswainGatewayParameters` (per-field overlay: Gateway's `parametersRef` wins per-field, GatewayClass's fills the rest; `podTemplate` strategic-merges across both layers) and renders the desired `Deployment` / `Service` / `ServiceAccount`. The `podTemplate` escape hatch is merged onto the rendered Deployment with `kubectl apply` strategic-merge semantics — `containers` merges by `name`, `tolerations` by `(key, operator)`, container-level `env` by `name`, and so on — so sidecar injection and env overlays behave the way operators expect from native K8s tooling.
+
+As of issue #207 the operator runs in *log-only* mode: it hashes the rendered specs and logs the YAML at `INFO` whenever they change. No cluster writes happen — the controller's RBAC at this stage carries `get/list/watch` on `CoxswainGatewayParameters` but no create/update on `Deployment` / `Service` / `ServiceAccount`. Step 9 (#208) promotes the operator to server-side-apply and adds the matching RBAC.
+
 ### `serve proxy --shared`
 
 Stateless read-only Pingora data plane. Serves every `Ingress` and every `Gateway` not opted into dedicated mode. Scales horizontally with no leader election and no inter-replica coordination.
