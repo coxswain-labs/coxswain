@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet};
 /// apply listener hostname filtering when the route has no `spec.hostnames` of its own.
 #[derive(Clone, Debug)]
 pub struct ListenerBinding {
+    /// Listener `hostname` (empty string = match all).
     pub hostname: String,
+    /// Listener port number.
     pub port: u16,
 }
 

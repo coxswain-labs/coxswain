@@ -2,8 +2,11 @@
 
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 
+/// Annotation that marks an `IngressClass` as the cluster-default; Ingresses
+/// without an explicit class are claimed by the owner of a default class.
 pub const IS_DEFAULT_CLASS_ANNOTATION: &str = "ingressclass.kubernetes.io/is-default-class";
 
+/// Returns `true` when `ic` is annotated as the cluster-default IngressClass.
 pub fn is_default_ingress_class(ic: &IngressClass) -> bool {
     ic.metadata
         .annotations

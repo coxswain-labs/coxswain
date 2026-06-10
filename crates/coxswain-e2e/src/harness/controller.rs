@@ -82,12 +82,17 @@ impl ControllerProcess {
 
         let binary = coxswain_bin()?;
         let mut args = vec![
+            // E2E uses the hidden `dev` role for single-process all-in-one,
+            // matching today's combined-process behaviour. Production split
+            // (`controller` + `proxy --shared`) is covered by chart-based
+            // installs in the cluster-side suite.
             "serve".to_string(),
+            "dev".to_string(),
             "--proxy-bind-address".to_string(),
             BIND_ADDR.to_string(),
-            "--proxy-http-port".to_string(),
+            "--ingress-http-port".to_string(),
             http_port.to_string(),
-            "--proxy-https-port".to_string(),
+            "--ingress-https-port".to_string(),
             https_port.to_string(),
             "--health-port".to_string(),
             health_port.to_string(),

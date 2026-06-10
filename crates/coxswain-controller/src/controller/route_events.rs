@@ -1,13 +1,13 @@
 //! Kubernetes API calls that write `HTTPRoute` status patches.
 
 use super::conditions::{filter_owned_parent_refs, make_condition};
-use crate::gw_types::{
+use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::gw_types::{
     HttpRoute,
     v::httproutes::{HttpRouteStatusParents, HttpRouteStatusParentsParentRef},
 };
-use crate::keys::RouteParentKey;
-use crate::tls::{HttpRouteHealthMap, RouteParentHealth};
-use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::keys::RouteParentKey;
+use coxswain_reflector::tls::{HttpRouteHealthMap, RouteParentHealth};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
     Client,

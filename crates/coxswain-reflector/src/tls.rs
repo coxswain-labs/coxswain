@@ -53,11 +53,15 @@ pub enum ListenerTlsOutcome {
 }
 
 impl ListenerTlsOutcome {
-    pub(crate) fn is_healthy(&self) -> bool {
+    /// Returns `true` for outcomes the controller should treat as healthy.
+    /// `NotApplicable` (non-HTTPS listener) and `Resolved` are healthy; every
+    /// failure variant is unhealthy.
+    pub fn is_healthy(&self) -> bool {
         matches!(self, Self::NotApplicable | Self::Resolved)
     }
 
-    pub(crate) fn reason(&self) -> &'static str {
+    /// Stable reason string for the `Programmed` listener condition.
+    pub fn reason(&self) -> &'static str {
         match self {
             Self::RefNotPermitted { .. } => "RefNotPermitted",
             Self::InvalidCertificateRef { .. } => "InvalidCertificateRef",
@@ -66,7 +70,9 @@ impl ListenerTlsOutcome {
         }
     }
 
-    pub(crate) fn message(&self) -> &str {
+    /// Human-readable message attached to the `Programmed` listener condition.
+    /// Empty for healthy outcomes.
+    pub fn message(&self) -> &str {
         match self {
             Self::RefNotPermitted { message }
             | Self::InvalidCertificateRef { message }

@@ -4,8 +4,8 @@ use super::super::conditions::{
 };
 use super::super::ingress_status::{build_ingress_status_patch, ingress_lb_already_matches};
 use super::super::{ControllerConfig, StatusAddress};
-use crate::gw_types::HttpRoute;
 use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::gw_types::HttpRoute;
 use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassStatus};
 use gateway_api::apis::standard::gateways::{Gateway, GatewayStatus};
 use gateway_api::apis::standard::httproutes::{
@@ -343,7 +343,7 @@ fn lb_already_matches_returns_false_when_status_empty() {
 #[test]
 fn controller_config_parses_ip_address() {
     use crate::controller::LeaseSettings;
-    use crate::ingress::IngressPorts;
+    use coxswain_reflector::ingress::IngressPorts;
     use std::time::Duration;
     let cfg = ControllerConfig::new(
         "ctrl".into(),
@@ -361,7 +361,7 @@ fn controller_config_parses_ip_address() {
 #[test]
 fn controller_config_parses_hostname() {
     use crate::controller::LeaseSettings;
-    use crate::ingress::IngressPorts;
+    use coxswain_reflector::ingress::IngressPorts;
     use std::time::Duration;
     let cfg = ControllerConfig::new(
         "ctrl".into(),
@@ -382,7 +382,7 @@ fn controller_config_parses_hostname() {
 #[test]
 fn controller_config_rejects_empty_status_address() {
     use crate::controller::LeaseSettings;
-    use crate::ingress::IngressPorts;
+    use coxswain_reflector::ingress::IngressPorts;
     use std::time::Duration;
     let result = ControllerConfig::new(
         "ctrl".into(),
@@ -399,7 +399,7 @@ fn controller_config_rejects_empty_status_address() {
 #[test]
 fn controller_config_none_address_is_ok() {
     use crate::controller::LeaseSettings;
-    use crate::ingress::IngressPorts;
+    use coxswain_reflector::ingress::IngressPorts;
     use std::time::Duration;
     let cfg = ControllerConfig::new(
         "ctrl".into(),

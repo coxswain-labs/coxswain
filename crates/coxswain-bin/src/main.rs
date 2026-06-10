@@ -7,18 +7,18 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use coxswain_admin::AdminServer;
 use coxswain_controller::{
-    Controller, ControllerConfig, IngressPorts, LeaseSettings, Reconciler, ReconcilerHealth,
-    ReconcilerOptions, ReconcilerOutputs, SharedGatewayListenerHealth,
+    ControllerConfig, IngressPorts, LeaseSettings, SharedGatewayListenerHealth, StatusWriterConfig,
+    spawn_status_writer,
 };
 use coxswain_core::health::HealthRegistry;
-use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::{RouteTimeouts, SharedGatewayRoutingTable, SharedIngressRoutingTable};
-use coxswain_core::tls::SharedTlsStore;
 use coxswain_health::HealthServer;
 use coxswain_proxy::{
     GatewayProxy, IngressProxy, KubernetesSource, ListenerProtocol, ListenerSpec, ProxyAcceptor,
-    RoutingEngine, RoutingSource, SniCertSelector, TrustedSources, UpstreamCaCache,
+    ProxyReflector, ProxyReflectorConfig, RoutingEngine, RoutingSource, SniCertSelector,
+    TrustedSources, UpstreamCaCache, spawn_routing_table_builder,
 };
+use coxswain_reflector::ReconcilerHealth;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt, ServerConf};
@@ -33,7 +33,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use crate::args::{Cli, Commands, DevRoleArgs, LogFormat, ProxyScope, Role};
+use crate::args::{
+    Cli, Commands, CommonArgs, ControllerArgs, ControllerRoleArgs, DevRoleArgs, LogFormat,
+    ProxyArgs, ProxyRoleArgs, ProxyScope, Role,
+};
 
 fn main() -> Result<()> {
     // When spawned as a restart child, wait for the parent process to exit so
@@ -48,27 +51,22 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let Commands::Serve(serve) = cli.command;
 
-    // Bare `coxswain serve` (no role) falls back to `dev` with a deprecation
-    // warning. This keeps today's Helm chart and Dockerfile (CMD = ["serve"])
-    // working through v0.2.0; Step 5 of the architecture plan removes this
-    // fallback once the chart sets the role explicitly.
-    let role_was_explicit = serve.role.is_some();
-    let role = match serve.role {
-        Some(r) => r,
-        None => implicit_dev_role()?,
-    };
+    // No implicit-dev fallback: every production deployment picks `controller`
+    // or `proxy` explicitly; the hidden `dev` role exists for local development.
+    // Bare `coxswain serve` (with no role subcommand) is rejected by clap
+    // (via `arg_required_else_help` on the `serve` parser).
+    let role = serve.role.ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing role: pick one of `controller`, `proxy --shared`, `proxy --gateway`, \
+             or `dev` (hidden, for local development)"
+        )
+    })?;
 
     match role {
-        Role::Dev(dev_args) => run_dev(dev_args, role_was_explicit),
-        Role::Controller(_) => {
-            bail!(
-                "role 'controller' is not yet implemented (issue #202 scaffolding only; see Step 5)"
-            )
-        }
+        Role::Dev(dev_args) => run_dev(dev_args),
+        Role::Controller(controller_args) => run_controller(controller_args),
         Role::Proxy(proxy_args) => match proxy_args.scope() {
-            ProxyScope::Shared => {
-                bail!("role 'proxy --shared' is not yet implemented (see Step 5)")
-            }
+            ProxyScope::Shared => run_proxy_shared(proxy_args),
             ProxyScope::Gateway { .. } => {
                 bail!("role 'proxy --gateway' is not yet implemented (see Step 7)")
             }
@@ -76,62 +74,91 @@ fn main() -> Result<()> {
     }
 }
 
-/// Constructs a [`Role::Dev`] populated with `coxswain serve dev` defaults
-/// (including env-var overrides). Used when bare `coxswain serve` is invoked
-/// without a role subcommand.
-fn implicit_dev_role() -> Result<Role> {
-    let cli = Cli::try_parse_from(["coxswain", "serve", "dev"])
-        .context("constructing implicit-dev fallback")?;
-    let Commands::Serve(serve) = cli.command;
-    let Some(role @ Role::Dev(_)) = serve.role else {
-        unreachable!("invariant: re-parsing ['serve', 'dev'] must yield Role::Dev")
-    };
-    Ok(role)
-}
-
-fn run_dev(args: DevRoleArgs, role_was_explicit: bool) -> Result<()> {
+/// Wire and run the `controller` pod role: leader-elected status writer, no
+/// data-plane services. Watches the cluster, computes per-resource health, and
+/// patches `*/status` subresources via [`coxswain_controller::Controller`].
+fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     init_logger(args.common.log_format, &args.common.log_filter)?;
-
-    if !role_was_explicit {
-        tracing::warn!(
-            "no role specified; defaulting to 'dev' (deprecated; production deployments must \
-             pick `controller` or `proxy` explicitly — implicit default will be removed once the \
-             Helm chart sets the role)"
-        );
-    }
-
-    let controller_config = ControllerConfig::new(
-        args.common.controller_name.clone(),
-        args.common.pod_name.clone(),
-        args.common.pod_namespace.clone(),
-        LeaseSettings::new(
-            args.controller.controller_lease_ttl,
-            args.controller.controller_lease_renew_interval,
-        ),
-        args.controller.controller_watch_namespace.clone(),
-        args.controller.status_address.clone(),
-        IngressPorts::new(args.proxy.proxy_http_port, args.proxy.proxy_https_port),
-    )?;
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        role = "controller",
         controller_name = %args.common.controller_name,
         "Starting"
     );
 
-    let mut server = build_server(&args);
+    let controller_config = build_controller_config(&args.common, &args.controller)?;
 
-    let ingress_routes = SharedIngressRoutingTable::new();
-    let gateway_routes = SharedGatewayRoutingTable::new();
-    let tls_store = SharedTlsStore::new();
-    let gateway_tls_health = SharedGatewayListenerHealth::new();
-    let leader = Arc::new(AtomicBool::new(false));
-    let owned_gateways = OwnedGateways::new();
+    let mut server = build_minimal_server();
+    let health = HealthRegistry::new();
 
-    // Per-subsystem readiness model. Each Reconciler reflector flips its named
-    // check on first `InitDone`; the first successful routing-table publish
-    // flips `controller.routing_table_built` and `proxy.routing_table_loaded`.
-    // `/readyz` is 200 iff every check across both subsystems is Ready/Degraded.
+    let status_writer = spawn_status_writer(
+        StatusWriterConfig {
+            controller: controller_config,
+            watch_namespace: args.common.watch_namespace.clone(),
+            controller_name: args.common.controller_name.clone(),
+            ingress_default_backend: None,
+            ingress_ports: IngressPorts::new(
+                args.common.ingress_http_port,
+                args.common.ingress_https_port,
+            ),
+        },
+        health.clone(),
+    )?;
+
+    server.add_service(background_service("controller", status_writer.controller));
+    server.add_service(background_service("reconciler", status_writer.reconciler));
+
+    let health_addr = SocketAddr::new(args.common.management_bind_address, args.common.health_port);
+    server.add_service({
+        let mut svc = Service::new(
+            "health".to_string(),
+            HealthServer {
+                registry: health.clone(),
+            },
+        );
+        svc.add_tcp(&health_addr.to_string());
+        svc
+    });
+
+    let admin_addr = SocketAddr::new(args.common.management_bind_address, args.common.admin_port);
+    server.add_service(
+        AdminServer::new(
+            health,
+            status_writer.leader,
+            status_writer.outputs.ingress_routes,
+            status_writer.outputs.gateway_routes,
+        )
+        .into_service(admin_addr),
+    );
+
+    tracing::info!(
+        management_bind_address = %args.common.management_bind_address,
+        health_port = args.common.health_port,
+        admin_port = args.common.admin_port,
+        "Listening"
+    );
+    server.run_forever();
+}
+
+/// Wire and run the `proxy --shared` pod role: read-only data plane for
+/// Ingress + non-dedicated Gateway traffic. No status writes, no leader
+/// election, no `Controller`. The proxy ServiceAccount has zero K8s write
+/// verbs; this binary path holds the same property structurally — nothing
+/// in the call graph touches [`coxswain_controller::Controller`].
+fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
+    init_logger(args.common.log_format, &args.common.log_filter)?;
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        role = "proxy",
+        scope = "shared",
+        controller_name = %args.common.controller_name,
+        "Starting"
+    );
+
+    let mut server = build_server(&args.proxy);
+
     let health = HealthRegistry::new();
     let controller_handle = health.register(
         "controller",
@@ -152,93 +179,197 @@ fn run_dev(args: DevRoleArgs, role_was_explicit: bool) -> Result<()> {
     );
     let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
-    // Clone before move into Controller so HotReloader can subscribe to the same health map.
-    let hot_reload_health = gateway_tls_health.clone();
-
-    let reconciler = Reconciler::new(
-        ReconcilerOutputs::new(
-            ingress_routes.clone(),
-            gateway_routes.clone(),
-            tls_store.clone(),
-            gateway_tls_health.clone(),
+    let reflector = spawn_routing_table_builder(ProxyReflectorConfig {
+        controller_name: args.common.controller_name.clone(),
+        watch_namespace: args.common.watch_namespace.clone(),
+        ingress_ports: IngressPorts::new(
+            args.common.ingress_http_port,
+            args.common.ingress_https_port,
         ),
-        owned_gateways.clone(),
-        ReconcilerHealth::new(controller_handle, proxy_handle),
-        args.common.controller_name.clone(),
-        {
-            let mut opts = ReconcilerOptions::default();
-            opts.watch_namespace = args.controller.controller_watch_namespace.clone();
-            opts.ingress_default_backend = args.controller.ingress_default_backend.clone();
-            opts.ingress_ports =
-                IngressPorts::new(args.proxy.proxy_http_port, args.proxy.proxy_https_port);
-            opts
-        },
-    );
-    let route_health = reconciler.route_health();
-    let policy_health = reconciler.policy_health();
+        ingress_default_backend: args.proxy.ingress_default_backend.clone(),
+        health: ReconcilerHealth::new(controller_handle, proxy_handle),
+    });
 
-    server.add_service(background_service(
-        "controller",
-        Controller::new(
-            health.clone(),
-            leader.clone(),
-            owned_gateways,
-            gateway_tls_health,
-            route_health,
-            policy_health,
-            controller_config,
-        ),
-    ));
+    let ProxyReflector {
+        source,
+        reconciler,
+        tls_health,
+    } = reflector;
 
     server.add_service(background_service("reconciler", reconciler));
 
-    let default_timeouts = RouteTimeouts {
-        request: args.proxy.proxy_default_request_timeout,
-        backend_request: args.proxy.proxy_default_backend_request_timeout,
-    };
+    wire_proxy_services(&mut server, &args.common, &args.proxy, &source, &tls_health)?;
 
-    // Ingress and Gateway proxies bind disjoint port sets. Ingress takes the
-    // statically-configured `--proxy-http-port` / `--proxy-https-port`; Gateway
-    // takes whatever Gateway `spec.listeners` declares, minus the Ingress set.
+    let leader = Arc::new(AtomicBool::new(false));
+    wire_management_servers(
+        &mut server,
+        &args.common,
+        health,
+        leader,
+        source.ingress_routes(),
+        source.gateway_routes(),
+    );
+
+    tracing::info!(
+        proxy_bind_address = %args.proxy.proxy_bind_address,
+        ingress_http_port = ?args.common.ingress_http_port,
+        ingress_https_port = ?args.common.ingress_https_port,
+        management_bind_address = %args.common.management_bind_address,
+        health_port = args.common.health_port,
+        admin_port = args.common.admin_port,
+        proxy_shutdown_grace_period = ?args.proxy.proxy_shutdown_grace_period,
+        proxy_shutdown_timeout = ?args.proxy.proxy_shutdown_timeout,
+        "Listening"
+    );
+    server.run_forever();
+}
+
+/// Wire and run the hidden `dev` pod role: single-process all-in-one for local
+/// development. Wires both the status-writer and the routing-table-build
+/// pipelines in the same Pingora server, accepting the cost of two
+/// independent reflector pipelines running side-by-side (each watching the
+/// same K8s resources). The cost is a local-dev convenience trade-off; the
+/// production split is `controller` + `proxy --shared`.
+fn run_dev(args: DevRoleArgs) -> Result<()> {
+    init_logger(args.common.log_format, &args.common.log_filter)?;
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        role = "dev",
+        controller_name = %args.common.controller_name,
+        "Starting"
+    );
+
+    let controller_config = build_controller_config(&args.common, &args.controller)?;
+    let mut server = build_server(&args.proxy);
+
+    let health = HealthRegistry::new();
+    let status_writer = spawn_status_writer(
+        StatusWriterConfig {
+            controller: controller_config,
+            watch_namespace: args.common.watch_namespace.clone(),
+            controller_name: args.common.controller_name.clone(),
+            ingress_default_backend: args.proxy.ingress_default_backend.clone(),
+            ingress_ports: IngressPorts::new(
+                args.common.ingress_http_port,
+                args.common.ingress_https_port,
+            ),
+        },
+        health.clone(),
+    )?;
+
+    // Dev mode shares the single Reconciler from the status writer between
+    // the controller-side status path and the proxy-side data plane: routes,
+    // tls store, and tls_health all come from the same in-process publish.
+    // This preserves today's behaviour and avoids paying for two K8s watch
+    // sets in local dev.
+    let source = KubernetesSource::new(
+        status_writer.outputs.ingress_routes.clone(),
+        status_writer.outputs.gateway_routes.clone(),
+        status_writer.outputs.tls.clone(),
+    );
+    let tls_health = status_writer.outputs.tls_health.clone();
+
+    server.add_service(background_service("controller", status_writer.controller));
+    server.add_service(background_service("reconciler", status_writer.reconciler));
+
+    wire_proxy_services(&mut server, &args.common, &args.proxy, &source, &tls_health)?;
+
+    wire_management_servers(
+        &mut server,
+        &args.common,
+        health,
+        status_writer.leader,
+        source.ingress_routes(),
+        source.gateway_routes(),
+    );
+
+    tracing::info!(
+        proxy_bind_address = %args.proxy.proxy_bind_address,
+        ingress_http_port = ?args.common.ingress_http_port,
+        ingress_https_port = ?args.common.ingress_https_port,
+        management_bind_address = %args.common.management_bind_address,
+        health_port = args.common.health_port,
+        admin_port = args.common.admin_port,
+        proxy_shutdown_grace_period = ?args.proxy.proxy_shutdown_grace_period,
+        proxy_shutdown_timeout = ?args.proxy.proxy_shutdown_timeout,
+        "Listening"
+    );
+    server.run_forever();
+}
+
+/// Build a [`ControllerConfig`] from the parsed CLI args of any role that
+/// runs the status writer (`controller`, `dev`).
+fn build_controller_config(
+    common: &CommonArgs,
+    controller: &ControllerArgs,
+) -> Result<ControllerConfig> {
+    ControllerConfig::new(
+        common.controller_name.clone(),
+        common.pod_name.clone(),
+        common.pod_namespace.clone(),
+        LeaseSettings::new(
+            controller.controller_lease_ttl,
+            controller.controller_lease_renew_interval,
+        ),
+        common.watch_namespace.clone(),
+        controller.status_address.clone(),
+        IngressPorts::new(common.ingress_http_port, common.ingress_https_port),
+    )
+    .map_err(Into::into)
+}
+
+/// Construct the listener-spec set for the proxy role from CLI args plus
+/// (in dev mode) Gateway listener discovery.
+fn build_ingress_listeners(common: &CommonArgs, proxy: &ProxyArgs) -> Vec<ListenerSpec> {
     let mut ingress_listeners: Vec<ListenerSpec> = Vec::new();
-    if let Some(port) = args.proxy.proxy_http_port {
+    if let Some(port) = common.ingress_http_port {
         ingress_listeners.push(ListenerSpec::http(SocketAddr::new(
-            args.proxy.proxy_bind_address,
+            proxy.proxy_bind_address,
             port,
         )));
     }
-    if let Some(port) = args.proxy.proxy_https_port {
+    if let Some(port) = common.ingress_https_port {
         ingress_listeners.push(ListenerSpec::https(SocketAddr::new(
-            args.proxy.proxy_bind_address,
+            proxy.proxy_bind_address,
             port,
         )));
     }
+    ingress_listeners
+}
+
+/// Register both the Ingress and Gateway Pingora services + hot reloader on
+/// the supplied server. Shared between `run_proxy_shared` and `run_dev` so
+/// the data-plane wiring matches one-to-one.
+fn wire_proxy_services(
+    server: &mut Server,
+    common: &CommonArgs,
+    proxy: &ProxyArgs,
+    source: &KubernetesSource,
+    tls_health: &SharedGatewayListenerHealth,
+) -> Result<()> {
+    let default_timeouts = RouteTimeouts {
+        request: proxy.proxy_default_request_timeout,
+        backend_request: proxy.proxy_default_backend_request_timeout,
+    };
+    let ca_cache = Arc::new(UpstreamCaCache::new());
+
+    let ingress_listeners = build_ingress_listeners(common, proxy);
     let ingress_ports: HashSet<u16> = ingress_listeners.iter().map(|l| l.addr.port()).collect();
 
-    // Discover Gateway listener ports from the cluster's current state so that, if
-    // Gateways already exist when coxswain restarts, we bind their ports immediately
-    // rather than waiting for the first reconcile + restart cycle. Ports already
-    // reserved by Ingress flags are filtered out — those Gateway listeners are
-    // surfaced as `Programmed=False, reason=PortUnavailable` by the controller.
-    //
-    // Gateway-discovered ports are also probe-bound up front: a port we cannot bind
-    // (privileged port without capability, in use by another process) is dropped from
-    // the discovery set with a warning, instead of taking the whole process down.
-    // Unlike `--proxy-http-port` / `--proxy-https-port` (operator-explicit and strict),
-    // Gateway listener ports come from user-deployed resources and should not be able
-    // to crash the controller.
+    // Discover Gateway listener ports from the cluster's current state.
     let gateway_listeners: Vec<ListenerSpec> = {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("build tokio runtime for startup Gateway port discovery")?;
         let discovered = rt.block_on(discover_gateway_ports(
-            &args.common.controller_name,
-            args.controller.controller_watch_namespace.as_deref(),
-            args.proxy.proxy_bind_address,
+            &common.controller_name,
+            common.watch_namespace.as_deref(),
+            proxy.proxy_bind_address,
             &ingress_ports,
         ));
-        let discovered = discovered
+        discovered
             .into_iter()
             .filter(|spec| match std::net::TcpListener::bind(spec.addr) {
                 Ok(_) => true,
@@ -251,52 +382,39 @@ fn run_dev(args: DevRoleArgs, role_was_explicit: bool) -> Result<()> {
                     false
                 }
             })
-            .collect::<Vec<_>>();
-        if !discovered.is_empty() {
-            let ports: Vec<u16> = discovered.iter().map(|l| l.addr.port()).collect();
-            tracing::info!(
-                ?ports,
-                "Adding Gateway listener ports discovered from existing Gateway specs"
-            );
-        }
-        discovered
+            .collect::<Vec<_>>()
     };
+    if !gateway_listeners.is_empty() {
+        let ports: Vec<u16> = gateway_listeners.iter().map(|l| l.addr.port()).collect();
+        tracing::info!(
+            ?ports,
+            "Adding Gateway listener ports discovered from existing Gateway specs"
+        );
+    }
 
     if ingress_listeners.is_empty() && gateway_listeners.is_empty() {
         tracing::warn!(
-            "No proxy listener ports configured (--proxy-http-port / --proxy-https-port) \
+            "No proxy listener ports configured (--ingress-http-port / --ingress-https-port) \
              and no Gateway listeners found. No traffic will be served until ports are added."
         );
     }
 
-    // Track every port we actually bind so HotReloader can detect additions.
     let currently_bound: HashSet<u16> = ingress_listeners
         .iter()
         .chain(gateway_listeners.iter())
         .map(|l| l.addr.port())
         .collect();
 
-    // Single `KubernetesSource` exposes both shared handles; per-proxy engines
-    // pull their typed snapshot via the trait getters.
-    let source = KubernetesSource::new(
-        ingress_routes.clone(),
-        gateway_routes.clone(),
-        tls_store.clone(),
-    );
-    let ca_cache = Arc::new(UpstreamCaCache::new());
-
-    if args.proxy.proxy_accept_proxy_protocol {
-        if args.proxy.proxy_trusted_sources.is_empty() {
+    if proxy.proxy_accept_proxy_protocol {
+        if proxy.proxy_trusted_sources.is_empty() {
             tracing::warn!(
                 "--proxy-accept-proxy-protocol is set but --proxy-trusted-sources is empty; \
                  all connections will be rejected"
             );
         }
-        let trusted = Arc::new(TrustedSources::new(
-            args.proxy.proxy_trusted_sources.clone(),
-        ));
+        let trusted = Arc::new(TrustedSources::new(proxy.proxy_trusted_sources.clone()));
         if !ingress_listeners.is_empty() {
-            let proxy = Arc::new(http_proxy(
+            let p = Arc::new(http_proxy(
                 &server.configuration,
                 IngressProxy::new(
                     Arc::new(RoutingEngine::new(source.ingress_routes())),
@@ -305,12 +423,12 @@ fn run_dev(args: DevRoleArgs, role_was_explicit: bool) -> Result<()> {
                 ),
             ));
             let selector = SniCertSelector::new(source.tls_store());
-            let acceptor = ProxyAcceptor::new(proxy, ingress_listeners, trusted.clone(), selector)
+            let acceptor = ProxyAcceptor::new(p, ingress_listeners, trusted.clone(), selector)
                 .context("build IngressProxy acceptor")?;
             server.add_service(acceptor);
         }
         if !gateway_listeners.is_empty() {
-            let proxy = Arc::new(http_proxy(
+            let p = Arc::new(http_proxy(
                 &server.configuration,
                 GatewayProxy::new(
                     Arc::new(RoutingEngine::new(source.gateway_routes())),
@@ -319,7 +437,7 @@ fn run_dev(args: DevRoleArgs, role_was_explicit: bool) -> Result<()> {
                 ),
             ));
             let selector = SniCertSelector::new(source.tls_store());
-            let acceptor = ProxyAcceptor::new(proxy, gateway_listeners, trusted, selector)
+            let acceptor = ProxyAcceptor::new(p, gateway_listeners, trusted, selector)
                 .context("build GatewayProxy acceptor")?;
             server.add_service(acceptor);
         }
@@ -380,10 +498,21 @@ fn run_dev(args: DevRoleArgs, role_was_explicit: bool) -> Result<()> {
 
     server.add_service(background_service(
         "hot-reloader",
-        hot_reload::HotReloader::new(hot_reload_health, currently_bound, ingress_ports),
+        hot_reload::HotReloader::new(tls_health.clone(), currently_bound, ingress_ports),
     ));
+    Ok(())
+}
 
-    let health_addr = SocketAddr::new(args.common.management_bind_address, args.common.health_port);
+/// Register the health and admin HTTP servers on the supplied server.
+fn wire_management_servers(
+    server: &mut Server,
+    common: &CommonArgs,
+    health: HealthRegistry,
+    leader: Arc<AtomicBool>,
+    ingress_routes: SharedIngressRoutingTable,
+    gateway_routes: SharedGatewayRoutingTable,
+) {
+    let health_addr = SocketAddr::new(common.management_bind_address, common.health_port);
     server.add_service({
         let mut svc = Service::new(
             "health".to_string(),
@@ -395,23 +524,10 @@ fn run_dev(args: DevRoleArgs, role_was_explicit: bool) -> Result<()> {
         svc
     });
 
-    let admin_addr = SocketAddr::new(args.common.management_bind_address, args.common.admin_port);
+    let admin_addr = SocketAddr::new(common.management_bind_address, common.admin_port);
     server.add_service(
         AdminServer::new(health, leader, ingress_routes, gateway_routes).into_service(admin_addr),
     );
-
-    tracing::info!(
-        proxy_bind_address = %args.proxy.proxy_bind_address,
-        proxy_http_port = ?args.proxy.proxy_http_port,
-        proxy_https_port = ?args.proxy.proxy_https_port,
-        management_bind_address = %args.common.management_bind_address,
-        health_port = args.common.health_port,
-        admin_port = args.common.admin_port,
-        proxy_shutdown_grace_period = ?args.proxy.proxy_shutdown_grace_period,
-        proxy_shutdown_timeout = ?args.proxy.proxy_shutdown_timeout,
-        "Listening"
-    );
-    server.run_forever();
 }
 
 /// List all owned Gateway objects from the cluster and return listener specs for
@@ -502,15 +618,26 @@ async fn discover_gateway_ports(
     result
 }
 
-fn build_server(args: &DevRoleArgs) -> Server {
+/// Build a Pingora server with proxy-tuned defaults (threads + shutdown
+/// timings). Used by `run_proxy_shared` and `run_dev`.
+fn build_server(args: &ProxyArgs) -> Server {
     let conf = ServerConf {
-        threads: args.proxy.proxy_threads,
-        grace_period_seconds: Some(args.proxy.proxy_shutdown_grace_period.as_secs()),
-        graceful_shutdown_timeout_seconds: Some(args.proxy.proxy_shutdown_timeout.as_secs()),
+        threads: args.proxy_threads,
+        grace_period_seconds: Some(args.proxy_shutdown_grace_period.as_secs()),
+        graceful_shutdown_timeout_seconds: Some(args.proxy_shutdown_timeout.as_secs()),
         ..Default::default()
     };
 
     let mut server = Server::new_with_opt_and_conf(Some(Opt::default()), conf);
+    server.bootstrap();
+    server
+}
+
+/// Build a Pingora server with defaults sized for the controller role: no
+/// proxy-thread tuning, no shutdown grace period required (no traffic to
+/// drain). Used by `run_controller`.
+fn build_minimal_server() -> Server {
+    let mut server = Server::new_with_opt_and_conf(Some(Opt::default()), ServerConf::default());
     server.bootstrap();
     server
 }

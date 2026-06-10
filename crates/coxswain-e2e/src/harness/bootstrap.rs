@@ -59,10 +59,15 @@ pub async fn bootstrap() -> anyhow::Result<()> {
 
     let manifests = root.join("deploy/manifests");
     kubectl_apply(&manifests.join("namespace.yaml")).await?;
-    kubectl_apply(&manifests.join("rbac.yaml")).await?;
+    // Both RBAC files install ServiceAccounts + ClusterRoles. The e2e harness
+    // runs coxswain as a local subprocess against the cluster, so it doesn't
+    // actually exercise either ServiceAccount, but applying them keeps the
+    // installed cluster in the same shape production would see — and matters
+    // for the `rbac_read_only_proxy.rs` test which audits the proxy SA.
+    kubectl_apply(&manifests.join("controller-rbac.yaml")).await?;
+    kubectl_apply(&manifests.join("shared-proxy-rbac.yaml")).await?;
     kubectl_apply(&manifests.join("gateway-class.yaml")).await?;
     kubectl_apply(&manifests.join("ingress-class.yaml")).await?;
-    kubectl_apply(&manifests.join("pdb.yaml")).await?;
 
     Ok(())
 }

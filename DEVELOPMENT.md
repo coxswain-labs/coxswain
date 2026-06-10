@@ -7,8 +7,10 @@ cargo build                                    # build
 cargo test --workspace --exclude coxswain-e2e  # unit tests (no cluster)
 cargo check && cargo clippy -- -D warnings     # check + lint
 cargo fmt                                      # format
-cargo run --bin coxswain -- serve --log-format console  # run locally
+cargo run --bin coxswain -- serve dev --log-format console  # run locally (all-in-one)
 ```
+
+The `dev` role runs both the status writer and the proxy data plane in one process — convenient for local development. In production, Coxswain ships as two cooperating pods: `serve controller` (writer) and `serve proxy --shared` (read-only data plane). The Helm chart and `deploy/manifests/` render both Deployments by default.
 
 For the release procedure, see `RELEASE.md`.
 
@@ -43,20 +45,21 @@ kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/downlo
 
 ### 2. Apply the cluster manifests
 
-Apply everything except the Deployment — the binary runs on your machine instead:
+Apply everything except the Deployments — the binary runs on your machine instead:
 
 ```bash
 kubectl apply -f deploy/manifests/namespace.yaml
-kubectl apply -f deploy/manifests/rbac.yaml
+kubectl apply -f deploy/manifests/controller-rbac.yaml
+kubectl apply -f deploy/manifests/shared-proxy-rbac.yaml
 kubectl apply -f deploy/manifests/gateway-class.yaml
 ```
 
-Alternatively, use the Helm chart (installs all resources including the Deployment; then stop Helm managing the pod and run the binary locally instead):
+Alternatively, use the Helm chart (installs all resources including both Deployments; then scale the in-cluster pods to 0 so the local binary is the only instance):
 
 ```bash
 helm install coxswain charts/coxswain --namespace coxswain-system --create-namespace
-# Scale the in-cluster pod to 0 if you want the local binary to be the only instance:
-kubectl -n coxswain-system scale deployment/coxswain --replicas=0
+kubectl -n coxswain-system scale deployment/coxswain-controller --replicas=0
+kubectl -n coxswain-system scale deployment/coxswain-shared-proxy --replicas=0
 ```
 
 `deploy/` is split into three subdirectories:
@@ -65,20 +68,31 @@ kubectl -n coxswain-system scale deployment/coxswain --replicas=0
 - **`deploy/dev/`** — local dev fixtures for manual testing (echo backends, sample HTTPRoute and Ingress objects, cross-namespace scenarios). Not applied to production.
 - **`deploy/examples/`** — user-facing example configurations shipped as documentation (e.g. cert-manager TLS setup).
 
-> The RBAC grants are scoped to the `coxswain-controller` ServiceAccount inside the cluster. When running locally, your kubeconfig identity is used instead, which typically has cluster-admin on local distributions.
+> Two ServiceAccounts are installed: `coxswain-controller` (cluster-wide reads + `*/status` writes) and `coxswain-shared-proxy` (cluster-wide reads, zero writes). When running locally, your kubeconfig identity is used instead, which typically has cluster-admin on local distributions.
 
-> **Namespace-scoped install**: `deploy/manifests/rbac.yaml` contains a commented-out example showing how to replace the default ClusterRole with a namespaced Role + a residual ClusterRole (for GatewayClass/IngressClass only). Use this when running Coxswain with `COXSWAIN_CONTROLLER_WATCH_NAMESPACE=<ns>` to minimise RBAC surface.
+> **Namespace-scoped install**: pass `--watch-namespace=<ns>` (or `COXSWAIN_WATCH_NAMESPACE=<ns>`) to either pod to scope its reflectors to a single namespace. The controller-rbac and shared-proxy-rbac files are cluster-scoped by default; replace the ClusterRole/ClusterRoleBinding with a namespaced Role/RoleBinding when running scoped.
 
 ### 3. Run the binary
 
 ```bash
-cargo run --bin coxswain -- serve \
+cargo run --bin coxswain -- serve dev \
   --log-format console \
-  --proxy-http-port 80 \
-  --proxy-https-port 443
+  --ingress-http-port 80 \
+  --ingress-https-port 443
 ```
 
-`--log-format console` produces human-readable output instead of JSON. `--proxy-http-port` and `--proxy-https-port` are required to bind proxy listeners; omitting both logs a warning and starts no listeners.
+`serve dev` is the hidden all-in-one role for local development: same process as production but wiring both the status writer and the proxy data plane. `--log-format console` produces human-readable output instead of JSON. `--ingress-http-port` and `--ingress-https-port` are required to bind proxy listeners; omitting both logs a warning and starts no listeners.
+
+To exercise the production split locally, run two terminals:
+
+```bash
+# Terminal 1 — controller (writer)
+cargo run --bin coxswain -- serve controller --log-format console
+
+# Terminal 2 — shared-proxy (read-only data plane)
+cargo run --bin coxswain -- serve proxy --shared --log-format console \
+  --ingress-http-port 80 --ingress-https-port 443
+```
 
 | Port   | Purpose                                          |
 |--------|--------------------------------------------------|
@@ -217,11 +231,11 @@ cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
 
 The Gateway API conformance suite (`conformance/`) connects to a coxswain instance you start manually on fixed ports. Start coxswain in a separate terminal first.
 
-The launch command deliberately omits `--proxy-http-port` and `--proxy-https-port`: those flags reserve ports for the `IngressProxy` data plane (issue #201), and the conformance Gateway resources declare listeners on 80/443 themselves. Leaving the Ingress flags off lets the `GatewayProxy` bind 80/443 from the test Gateway specs without conflict.
+The launch command deliberately omits `--ingress-http-port` and `--ingress-https-port`: those flags reserve ports for the `IngressProxy` data plane (issue #201), and the conformance Gateway resources declare listeners on 80/443 themselves. Leaving the Ingress flags off lets the `GatewayProxy` bind 80/443 from the test Gateway specs without conflict.
 
 ```bash
 # Terminal 1 — keep running
-cargo run --bin coxswain -- serve \
+cargo run --bin coxswain -- serve dev \
   --health-port 8081 \
   --admin-port 8082 \
   --status-address 127.0.0.1 \

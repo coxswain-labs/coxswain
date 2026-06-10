@@ -1,7 +1,7 @@
 //! `GatewayClass` status patch builder and staleness check.
 
 use super::conditions::{gateway_class_accepted, make_condition};
-use crate::gw_types::v::gatewayclasses::GatewayClass;
+use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
 /// All Gateway API feature names Coxswain advertises support for.

@@ -74,14 +74,14 @@ spec:
 On a cloud cluster, wait until `EXTERNAL-IP` is assigned and capture it:
 
 ```bash
-kubectl get svc coxswain-proxy -n coxswain-system
-PROXY=$(kubectl get svc coxswain-proxy -n coxswain-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+kubectl get svc coxswain-shared-proxy -n coxswain-system
+PROXY=$(kubectl get svc coxswain-shared-proxy -n coxswain-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 ```
 
 On a local cluster (kind, minikube, OrbStack) where no LoadBalancer is available, use port-forward instead:
 
 ```bash
-kubectl port-forward -n coxswain-system svc/coxswain-proxy 8080:80 &
+kubectl port-forward -n coxswain-system svc/coxswain-shared-proxy 8080:80 &
 PROXY=localhost:8080
 ```
 

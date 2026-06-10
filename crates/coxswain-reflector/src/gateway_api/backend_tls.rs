@@ -18,7 +18,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 /// Resolved TLS configuration for one Service, ready for the routing table.
-pub(crate) struct ResolvedPolicy {
+pub struct ResolvedPolicy {
     /// The `UpstreamTls` to attach to `BackendGroup`. `None` when the winning policy
     /// is invalid (e.g. CA cert ref missing) — in that case the route must serve 5xx
     /// instead of falling through as plain HTTP (GEP-1897).

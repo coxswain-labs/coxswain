@@ -1,16 +1,16 @@
 //! Leader-elected status writer: watches resource events and patches Gateway API
 //! status conditions back to the Kubernetes API server.
 
-use crate::gw_types::v::gatewayclasses::GatewayClass;
-use crate::gw_types::v::gateways::Gateway;
-use crate::gw_types::{BackendTlsPolicy, HttpRoute};
-use crate::tls::{
-    GatewayListenerHealth, SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth,
-    SharedHttpRouteHealth,
-};
 use async_trait::async_trait;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
+use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
+use coxswain_reflector::gw_types::v::gateways::Gateway;
+use coxswain_reflector::gw_types::{BackendTlsPolicy, HttpRoute};
+use coxswain_reflector::tls::{
+    GatewayListenerHealth, SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth,
+    SharedHttpRouteHealth,
+};
 use futures::StreamExt;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::{
@@ -46,7 +46,7 @@ use gateway_class_status::gateway_class_needs_status_patch;
 use gateway_status::gateway_needs_status_patch;
 use ingress_status::ingress_lb_already_matches;
 
-use crate::k8s_utils::scoped_api;
+use coxswain_reflector::k8s_utils::scoped_api;
 
 const LEASE_NAME: &str = "coxswain-leader-lock";
 
@@ -357,7 +357,7 @@ impl Controller {
                             let name = ic.metadata.name.clone().unwrap_or_default();
                             let is_owned = ic.spec.as_ref().and_then(|s| s.controller.as_deref())
                                 == Some(self.config.controller_name.as_str());
-                            let is_default = crate::ingress::is_default_ingress_class(&ic);
+                            let is_default = coxswain_reflector::ingress::is_default_ingress_class(&ic);
                             if is_owned {
                                 owned_ingress_classes.insert(name.clone());
                             } else {
@@ -383,7 +383,7 @@ impl Controller {
                     if let Some(addr) = &self.config.status_address {
                         match event {
                             Ok(watcher::Event::Apply(ing) | watcher::Event::InitApply(ing)) => {
-                                let owned = match crate::ingress::claimed_ingress_class(&ing) {
+                                let owned = match coxswain_reflector::ingress::claimed_ingress_class(&ing) {
                                     Some(c) => owned_ingress_classes.contains(c),
                                     None => !owned_default_ingress_classes.is_empty(),
                                 };

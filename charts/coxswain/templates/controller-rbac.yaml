@@ -1,0 +1,92 @@
+{{- if and .Values.controller.enabled .Values.controller.rbac.create -}}
+{{- if .Values.controller.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "coxswain.controller.serviceAccountName" . }}
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+  {{- with .Values.controller.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: true
+---
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "coxswain.controller.fullname" . }}
+  labels:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+rules:
+  # Reads needed for status computation: backend-existence checks (Services),
+  # endpoint resolution (EndpointSlices), TLS termination (Secrets), and
+  # BackendTLSPolicy CA resolution (ConfigMaps).
+  - apiGroups: [""]
+    resources: ["services", "secrets", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "ingressclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses/status"]
+    verbs: ["patch", "update"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      ["gatewayclasses", "gateways", "httproutes", "referencegrants", "backendtlspolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      ["gatewayclasses/status", "gateways/status", "httproutes/status", "backendtlspolicies/status"]
+    verbs: ["patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "coxswain.controller.fullname" . }}
+  labels:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "coxswain.controller.serviceAccountName" . }}
+    namespace: {{ .Values.namespace.name }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "coxswain.controller.fullname" . }}
+  apiGroup: rbac.authorization.k8s.io
+---
+# Namespace-scoped Role for leader-election Lease objects.
+# Kept separate from the ClusterRole to limit Lease access to the install namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "coxswain.controller.fullname" . }}-leader-election
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "coxswain.controller.fullname" . }}-leader-election
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "coxswain.controller.serviceAccountName" . }}
+    namespace: {{ .Values.namespace.name }}
+roleRef:
+  kind: Role
+  name: {{ include "coxswain.controller.fullname" . }}-leader-election
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

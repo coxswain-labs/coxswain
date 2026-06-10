@@ -22,6 +22,7 @@ experimental = ["coxswain-controller/experimental", "gateway-api/experimental"]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 coxswain-core = { workspace = true }
+coxswain-reflector = { workspace = true }
 ipnet = { workspace = true }
 coxswain-admin = { workspace = true }
 coxswain-controller = { workspace = true }

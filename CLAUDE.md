@@ -10,19 +10,28 @@ The live roadmap is the [GitHub Project](https://github.com/orgs/coxswain-labs/p
 
 ## Project Overview
 
-**Coxswain** is a pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine. 
-It watches Kubernetes `Ingress` and `Gateway API` resources and dynamically routes traffic without a full reload. 
-Multiple replicas can run simultaneously using Kubernetes Lease-based leader election: all replicas maintain a hot data-plane routing table, but only the active leader writes status back to the API server.
+**Coxswain** is a pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine.
+It watches Kubernetes `Ingress` and `Gateway API` resources and dynamically routes traffic without a full reload.
+
+Coxswain ships as two cooperating pod roles since v0.2 (issue #204):
+- `serve controller` — leader-elected writer pod; all status patches; cluster-wide reads + `*/status` writes.
+- `serve proxy --shared` — read-only data plane for Ingress and non-dedicated Gateway traffic; the ServiceAccount holds zero write verbs.
+
+The hidden `serve dev` subcommand runs both pipelines in one process for local development. Production deployments always pick a role explicitly; bare `coxswain serve` errors with clap help. The Dockerfile has no `CMD`.
 
 ## Architecture
 
-The workspace has seven crates under `crates/` with a strict dependency order:
+The workspace has eight crates under `crates/` with a strict dependency order:
 
 ```
 coxswain-bin
   ├── coxswain-controller
-  │     └── coxswain-core
+  │     ├── coxswain-core
+  │     └── coxswain-reflector
   ├── coxswain-proxy
+  │     ├── coxswain-core
+  │     └── coxswain-reflector
+  ├── coxswain-reflector
   │     └── coxswain-core
   ├── coxswain-health
   ├── coxswain-admin
@@ -30,15 +39,18 @@ coxswain-bin
   └── (coxswain-e2e — black-box tests, not a runtime dep)
 ```
 
+`coxswain-proxy` and `coxswain-controller` do NOT depend on each other. The read-only-proxy invariant is enforced both at RBAC (proxy SA has zero write verbs) and structurally at the crate graph (the proxy binary path never touches `coxswain-controller`).
+
 Per-crate responsibilities (see each crate's `src/lib.rs` for the up-to-date module layout):
 
-- **`coxswain-core`** — shared routing-table types, atomic `Shared<T>` snapshot primitive, TLS store, ownership and reference-grant helpers.
-- **`coxswain-controller`** — Kubernetes reflectors and a debounced reconciler that rebuilds the routing and TLS tables; separate status writer with `kube-leader-election`-based leader election.
-- **`coxswain-proxy`** — Pingora-based reverse proxy: lock-free routing lookup, request/response filter application, in-process SNI TLS termination, optional HAProxy PROXY-protocol acceptor.
+- **`coxswain-core`** — shared routing-table types, atomic `Shared<T>` snapshot primitive, TLS store, ownership and reference-grant helpers. No `kube` dep.
+- **`coxswain-reflector`** — K8s watch streams, reflector spawn machinery, `gw_types` aliases, `scoped_api`, `IngressDefaultBackend`, endpoint resolution, the debounced rebuild loop (`Reconciler`), and the `gateway_api_crds_present` CRD probe. Both `coxswain-proxy` and `coxswain-controller` depend on it; neither depends on the other.
+- **`coxswain-controller`** — leader-elected status writer (`Controller`) + `spawn_status_writer` wiring helper consumed by `coxswain-bin`. Holds the `*/status` write rights. Does not own reflectors directly — drives them via `coxswain-reflector::Reconciler`.
+- **`coxswain-proxy`** — Pingora-based reverse proxy: lock-free routing lookup, request/response filter application, in-process SNI TLS termination, optional HAProxy PROXY-protocol acceptor. `reflector` module exposes `spawn_routing_table_builder` — the proxy-pod entry point that constructs a `coxswain-reflector::Reconciler` and publishes its outputs to the Pingora data plane.
 - **`coxswain-health`** — `/healthz` (always 200) and `/readyz` (gated on `HealthRegistry::is_ready`: every registered subsystem must be `Ready` or `Degraded`).
 - **`coxswain-admin`** — `/metrics` (Prometheus), `/routes`, `/status` (full per-subsystem check detail).
-- **`coxswain-bin`** — entry point: CLI parsing, shared-state wiring, Pingora runtime bootstrap.
-- **`coxswain-e2e`** — black-box integration tests against a live cluster (kind/Orb); not a runtime dependency.
+- **`coxswain-bin`** — entry point: CLI parsing per role (`serve controller` / `serve proxy --shared` / hidden `serve dev`), shared-state wiring, Pingora runtime bootstrap.
+- **`coxswain-e2e`** — black-box integration tests against a live cluster (kind/Orb); not a runtime dependency. The `tests/rbac_read_only_proxy.rs` binary asserts the proxy SA has zero write verbs by parsing `kubectl auth can-i --list`.
 
 ## Code Quality
 

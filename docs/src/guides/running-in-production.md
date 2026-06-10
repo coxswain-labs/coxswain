@@ -124,7 +124,7 @@ The default `ClusterRole` grants Coxswain cluster-wide:
 - Read on `gatewayclasses`, `gateways`, `httproutes`, `referencegrants`, `backendtlspolicies` (`gateway.networking.k8s.io`).
 - Status writes (`*/status`) on `ingresses`, `gateways`, `httproutes`, `backendtlspolicies`, and `gatewayclasses`.
 
-A separate namespaced `Role` (in `coxswain-system`) grants `get`, `create`, `patch` on `coordination.k8s.io/leases` — used only for leader election. Review the rendered manifests with `helm template` or read `deploy/manifests/rbac.yaml` before deploying.
+A separate namespaced `Role` (in `coxswain-system`) grants `get`, `create`, `patch` on `coordination.k8s.io/leases` — used only by the controller pod for leader election. Review the rendered manifests with `helm template` or read `deploy/manifests/controller-rbac.yaml` and `deploy/manifests/shared-proxy-rbac.yaml` before deploying. The shared-proxy ServiceAccount has zero write verbs; verify with `kubectl auth can-i --list --as=system:serviceaccount:coxswain-system:coxswain-shared-proxy`.
 
 If Coxswain should only manage resources in a single namespace, set `controller.watchNamespace`. Note that this only restricts what the controller reads; the chart still installs the cluster-wide `ClusterRole`/`ClusterRoleBinding`. To scope RBAC as well, edit the rendered manifests by hand.
 
