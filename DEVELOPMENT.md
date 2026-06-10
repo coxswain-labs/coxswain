@@ -235,7 +235,7 @@ The launch command deliberately omits `--ingress-http-port` and `--ingress-https
 
 ```bash
 # Terminal 1 — keep running
-cargo run --bin coxswain -- serve \
+cargo run --bin coxswain -- serve dev \
   --health-port 8081 \
   --admin-port 8082 \
   --status-address 127.0.0.1 \

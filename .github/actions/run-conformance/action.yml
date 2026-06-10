@@ -46,10 +46,13 @@ runs:
       shell: bash
       run: |
         chmod +x bin/coxswain
+        # Deliberately omit --ingress-http-port / --ingress-https-port: those
+        # flags reserve ports for IngressProxy, but the conformance Gateway
+        # resources declare listeners on 80/443 themselves. Leaving the Ingress
+        # flags off lets GatewayProxy bind 80/443 dynamically from the test
+        # Gateway specs without conflict.
         sudo KUBECONFIG="$HOME/.kube/config" ./bin/coxswain serve dev \
           --proxy-bind-address 0.0.0.0 \
-          --ingress-http-port 80 \
-          --ingress-https-port 443 \
           --health-port 8081 \
           --admin-port 8082 \
           --status-address 127.0.0.1 \
