@@ -3,7 +3,7 @@
 //! This crate is the K8s side of Coxswain — it owns the reflector spawn helpers,
 //! the Gateway API type aliases, the namespace-scoping helper, the
 //! `IngressDefaultBackend` type, the endpoint resolution helper, the route /
-//! TLS table rebuild pipeline ([`Reconciler`]), and the CRD-presence probe.
+//! TLS table rebuild pipeline ([`SharedProxyReconciler`]), and the CRD-presence probe.
 //!
 //! Both [`coxswain_proxy`] and [`coxswain_controller`] depend on this crate.
 //! Neither depends on the other — the read-only-proxy invariant is enforced at
@@ -45,8 +45,9 @@ pub use cluster::{ClusterSummaryInputs, build_cluster_summary};
 pub use crds::gateway_api_crds_present;
 pub use ingress::IngressPorts;
 pub use reconciler::{
-    IngressDefaultBackend, IngressDefaultBackendParseError, Reconciler, ReconcilerHealth,
-    ReconcilerOptions, ReconcilerOutputs,
+    ControllerReconciler, DedicatedConfig, DedicatedOutputs, DedicatedProxyReconciler,
+    IngressDefaultBackend, IngressDefaultBackendParseError, ReconcilerHealth, ReconcilerOptions,
+    ReconcilerOutputs, SharedProxyReconciler,
 };
 pub use tls::{
     GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, SharedBackendTlsPolicyHealth,

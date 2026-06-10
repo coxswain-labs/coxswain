@@ -113,7 +113,7 @@ struct GatewayListenerHealthInner {
 }
 
 /// Shared handle to the per-Gateway listener health map produced after each rebuild.
-/// Written by `Reconciler::rebuild` (via `store_and_notify`); read by `Controller`
+/// Written by `SharedProxyReconciler::rebuild` (via `store_and_notify`); read by `Controller`
 /// and `HotReloader`.
 ///
 /// Backed by a `tokio::sync::watch` channel carrying a monotonic generation counter:

@@ -19,7 +19,7 @@ use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_reflector::{
-    Reconciler, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
+    ControllerReconciler, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
     SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
 };
 use std::sync::Arc;
@@ -67,7 +67,7 @@ pub enum StatusWriterError {
 
 /// Output bundle from [`spawn_status_writer`].
 ///
-/// Holds the `Reconciler` and `Controller` background services that the caller
+/// Holds the `ControllerReconciler` and `Controller` background services that the caller
 /// registers with the Pingora server, plus the shared handles the bin needs to
 /// expose via the admin server (the leader flag and the routing-table snapshots,
 /// which the controller pod does not serve traffic from but does aggregate
@@ -75,7 +75,7 @@ pub enum StatusWriterError {
 /// [`StatusWriterConfig`] for the lack of `#[non_exhaustive]`.
 pub struct SpawnedStatusWriter {
     /// Reflector + rebuild background service.
-    pub reconciler: Reconciler,
+    pub reconciler: ControllerReconciler,
     /// Leader-elected status-writer background service.
     pub controller: Controller,
     /// Leader flag — `true` when this pod is the elected leader.
@@ -140,7 +140,7 @@ pub fn spawn_status_writer(
         cluster_summary,
     );
 
-    let reconciler = Reconciler::new(
+    let reconciler = ControllerReconciler::new(
         ReconcilerOutputs::new(
             outputs.ingress_routes.clone(),
             outputs.gateway_routes.clone(),

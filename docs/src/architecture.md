@@ -1,6 +1,6 @@
 # Architecture
 
-Coxswain runs as one or more pods, each in one of four `--mode` values. The controller is the sole Kubernetes writer; proxies are read-only data planes that build their routing table directly from Kubernetes watch events and scale horizontally with no coordination.
+Coxswain runs as one or more pods, each invoked with a `serve <role>` subcommand. The controller is the sole Kubernetes writer; proxies are read-only data planes that build their routing table directly from Kubernetes watch events and scale horizontally with no coordination.
 
 ```mermaid
 flowchart LR
@@ -22,23 +22,25 @@ flowchart LR
     C -->|status writes\nleader only| K8s
 ```
 
-## Modes
+## Roles
 
-### `--mode=controller`
+### `serve controller`
 
 Watches Ingress, GatewayClass, Gateway, HTTPRoute, and related resources cluster-wide; writes status conditions back to them; provisions per-Gateway proxy `Deployment` and `Service` objects when a Gateway opts into dedicated mode. Leader-elected via a Kubernetes `Lease` in `coxswain-system` — status writes pause for up to one Lease TTL during a leader transition; traffic is unaffected. Scales vertically (one active replica + optional warm standby).
 
-### `--mode=shared-proxy`
+### `serve proxy --shared`
 
 Stateless read-only Pingora data plane. Serves every `Ingress` and every `Gateway` not opted into dedicated mode. Scales horizontally with no leader election and no inter-replica coordination.
 
-### `--mode=gateway-proxy`
+### `serve proxy --dedicated`
 
-Read-only proxy scoped to a single Gateway. Provisioned by the controller in the Gateway's namespace (or a namespace specified via `parametersRef`) with namespace-scoped RBAC. Has its own rollout, failure domain, and `/metrics`.
+Read-only proxy scoped to a single Gateway (identified by `--gateway-name` and `--gateway-namespace`). Provisioned by the controller in the Gateway's namespace (or a namespace specified via `parametersRef`) — see Step 9 of the architecture plan. Has its own rollout, failure domain, and `/metrics`. As of issue #206 (v0.2), the dedicated proxy runs with the same cluster-wide-reads RBAC profile as the shared proxy; per-namespace read narrowing is paired with Step 10's per-Gateway-proxy `RoleBinding` reconciliation.
 
-### `--mode=dev`
+When the target Gateway has any listener with `allowedRoutes.namespaces.from: All` or `Selector`, the operator must explicitly opt in to broader RBAC via `--allow-cluster-wide-route-read` (for `from: All`) or `--allow-cluster-wide-namespace-read` (for `from: Selector`). Today these flags govern a startup warning only; once Step 10 lands, listeners using a non-`Same` `from` without the matching opt-in will be marked `Accepted=false`.
 
-Single-process all-in-one combining controller and proxy in one binary, for local development and conformance against `kind` / OrbStack.
+### `serve dev`
+
+Hidden single-process all-in-one combining controller and proxy in one binary, for local development and conformance against `kind` / OrbStack.
 
 !!! warning "Never rendered by Helm"
     Dev mode is a contributor convenience; do not run it in production.
@@ -148,24 +150,24 @@ flowchart LR
 Each proxy pod self-watches Kubernetes directly:
 
 - A **shared-proxy** uses a broad cluster-wide filter covering all routing CRs (HTTPRoute, Ingress, Gateway, Service, EndpointSlice).
-- A **gateway-proxy** uses a narrow filter scoped to a single Gateway's label and namespace.
+- A **dedicated proxy** (`--dedicated`) narrows its routing-table build to a single named Gateway; cross-namespace backends and TLS Secrets resolve via `ReferenceGrant` as usual. Per-namespace watch narrowing (and the matching RBAC narrowing) is paired with Step 10 of the architecture plan; until then the dedicated proxy uses cluster-wide reads with zero write verbs, identical to the shared-proxy RBAC profile.
 
 There is no xDS server and no IPC between the controller and any proxy — the controller never pushes data, and a controller crash never disrupts proxy traffic. A future `--source=xds` mode could be added behind the same `RoutingSource` trait boundary without touching proxy code.
 
 ## RBAC by mode
 
-| Resource | Verb | `controller` | `shared-proxy` | `gateway-proxy` |
+| Resource | Verb | `controller` | `shared-proxy` | `dedicated-proxy` |
 |---|---|:-:|:-:|:-:|
-| HTTPRoute, Gateway, GatewayClass, Ingress, IngressClass | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (namespace) |
-| Service, EndpointSlice | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (namespace) |
-| Secret (`kubernetes.io/tls`) | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (namespace) |
+| HTTPRoute, Gateway, GatewayClass, Ingress, IngressClass | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (cluster today; namespace after Step 10) |
+| Service, EndpointSlice | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (cluster today; namespace after Step 10) |
+| Secret (`kubernetes.io/tls`) | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (cluster today; namespace after Step 10) |
 | HTTPRoute, Gateway, Ingress `/status` | update, patch | ✓ (cluster) | — | — |
 | Deployment, Service | create, update, delete | ✓ (scoped) | — | — |
 | Lease | create, update, get | ✓ (`coxswain-system`) | — | — |
 
 ## Admin endpoints by mode
 
-| Endpoint | Controller | Shared-proxy | Per-Gateway proxy |
+| Endpoint | Controller | Shared-proxy | Dedicated-proxy |
 |---|:-:|:-:|:-:|
 | `/healthz`, `/readyz` | ✓ | ✓ | ✓ |
 | `/metrics` | ✓ (reconcile counts, leader status) | ✓ (traffic, errors) | ✓ (scoped to this Gateway) |
