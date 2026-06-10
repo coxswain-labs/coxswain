@@ -1,0 +1,37 @@
+# Dedicated-mode Gateway: `parametersRef` points at the
+# `CoxswainGatewayParameters` in the same namespace, which opts this Gateway
+# in to operator provisioning (Deployment / Service / ServiceAccount land in
+# `tenant-a` on apply).
+#
+# Note: the dedicated proxy pod will boot but stay in CrashLoopBackOff until
+# Step 10 (#209) provisions the per-namespace RBAC bindings its
+# ServiceAccount needs. This is the documented half-functional state for
+# #208 — `kubectl get gateway -n tenant-a` shows `Programmed=False`,
+# `kubectl get pods -n tenant-a` shows the proxy retrying. Resource
+# provisioning, owner-ref cascade, and SSA idempotency are all observable;
+# traffic flow is not.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: tenant-a-gw
+  namespace: tenant-a
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    labels:
+      team: platform
+    annotations:
+      coxswain.example/owner: tenant-a-team
+    parametersRef:
+      group: gateway.coxswain-labs.dev
+      kind: CoxswainGatewayParameters
+      name: tenant-a-defaults
+  listeners:
+    - name: http
+      port: 8100
+      protocol: HTTP
+      hostname: tenant-a.local
+      allowedRoutes:
+        namespaces:
+          from: Same

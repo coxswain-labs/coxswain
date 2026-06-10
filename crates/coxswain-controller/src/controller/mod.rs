@@ -34,12 +34,14 @@ mod gateway_status;
 mod gatewayclass_events;
 mod ingress_events;
 mod ingress_status;
+mod overrides;
 mod route_events;
 
 #[cfg(test)]
 mod tests;
 
 pub use config::{ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress};
+pub use overrides::{AcceptedOverrides, AcceptedReason};
 
 use conditions::{gateway_accepted, http_route_programmed};
 use gateway_class_status::gateway_class_needs_status_patch;
@@ -293,14 +295,20 @@ impl Controller {
                                     .get(&key)
                                     .cloned()
                                     .unwrap_or_default();
-                                if gateway_needs_status_patch(&gw, &health) {
-                                    gateway_events::patch_gateway_status(&client, &gw, &health, self.config.status_address.as_ref(), self.config.ingress_ports).await;
+                                let accepted_override = self.config.accepted_overrides.get(&key);
+                                if gateway_needs_status_patch(&gw, &health, accepted_override) {
+                                    gateway_events::patch_gateway_status(&client, &gw, &health, self.config.status_address.as_ref(), self.config.ingress_ports, accepted_override).await;
                                 }
                             } else if is_leader && !gateway_accepted(&gw) {
                                 // Before synced: only ensure Accepted is set; defer Programmed.
                                 let empty_health = GatewayListenerHealth::default();
-                                if gateway_needs_status_patch(&gw, &empty_health) {
-                                    gateway_events::patch_gateway_status(&client, &gw, &empty_health, self.config.status_address.as_ref(), self.config.ingress_ports).await;
+                                let key = ObjectKey::new(
+                                    gw.metadata.namespace.clone().unwrap_or_default(),
+                                    gw.metadata.name.clone().unwrap_or_default(),
+                                );
+                                let accepted_override = self.config.accepted_overrides.get(&key);
+                                if gateway_needs_status_patch(&gw, &empty_health, accepted_override) {
+                                    gateway_events::patch_gateway_status(&client, &gw, &empty_health, self.config.status_address.as_ref(), self.config.ingress_ports, accepted_override).await;
                                 }
                             }
                         }
@@ -327,8 +335,9 @@ impl Controller {
                             .get(key)
                             .cloned()
                             .unwrap_or_default();
-                        if gateway_needs_status_patch(gw, &health) {
-                            gateway_events::patch_gateway_status(&client, gw, &health, self.config.status_address.as_ref(), self.config.ingress_ports).await;
+                        let accepted_override = self.config.accepted_overrides.get(key);
+                        if gateway_needs_status_patch(gw, &health, accepted_override) {
+                            gateway_events::patch_gateway_status(&client, gw, &health, self.config.status_address.as_ref(), self.config.ingress_ports, accepted_override).await;
                         }
                     }
                 }

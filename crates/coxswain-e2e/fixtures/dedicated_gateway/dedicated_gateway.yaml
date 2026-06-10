@@ -1,0 +1,40 @@
+# Dedicated-mode Gateway fixture for the Step 9 (#208) provisioning e2e.
+# TESTNS is substituted with the test namespace at runtime.
+#
+# Applies a CoxswainGatewayParameters object and a Gateway referencing it via
+# `infrastructure.parametersRef`. The provisioning operator renders and
+# server-side-applies a Deployment/Service/ServiceAccount in the same
+# namespace, owner-referenced to the Gateway. The dedicated proxy pod is
+# expected to CrashLoopBackOff until Step 10 (#209) provisions per-namespace
+# RBAC — the test does NOT wait on the pod or assert traffic.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: dedicated-params
+spec:
+  replicas: 2
+  serviceType: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: dedicated-gw
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    labels:
+      team: platform
+    annotations:
+      coxswain.example/owner: tenant-team
+    parametersRef:
+      group: gateway.coxswain-labs.dev
+      kind: CoxswainGatewayParameters
+      name: dedicated-params
+  listeners:
+    - name: http
+      port: 8100
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

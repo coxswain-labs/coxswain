@@ -14,7 +14,8 @@ mod operator;
 mod status_writer;
 
 pub use controller::{
-    Controller, ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress,
+    AcceptedOverrides, AcceptedReason, Controller, ControllerConfig, ControllerConfigError,
+    LeaseSettings, StatusAddress,
 };
 pub use operator::{Operator, OperatorConfig};
 pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writer};

@@ -2,6 +2,7 @@
 
 use super::config::StatusAddress;
 use super::gateway_status::build_gateway_status_patch;
+use super::overrides::AcceptedReason;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::ingress::IngressPorts;
 use coxswain_reflector::tls::GatewayListenerHealth;
@@ -20,6 +21,7 @@ pub(super) async fn patch_gateway_status(
     health: &GatewayListenerHealth,
     addr: Option<&StatusAddress>,
     ingress_ports: IngressPorts,
+    accepted_override: Option<AcceptedReason>,
 ) {
     let name = match gw.metadata.name.as_deref() {
         Some(n) => n,
@@ -36,7 +38,15 @@ pub(super) async fn patch_gateway_status(
     };
     let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
     let now = Time(k8s_openapi::jiff::Timestamp::now());
-    let patch = build_gateway_status_patch(gw, health, generation, &now, addr, ingress_ports);
+    let patch = build_gateway_status_patch(
+        gw,
+        health,
+        generation,
+        &now,
+        addr,
+        ingress_ports,
+        accepted_override,
+    );
     match api
         .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
         .await

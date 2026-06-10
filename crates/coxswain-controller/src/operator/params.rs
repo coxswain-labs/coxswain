@@ -12,8 +12,9 @@
 //!
 //! Missing parametersRef target (the reference exists but the
 //! `CoxswainGatewayParameters` object does not) surfaces as
-//! [`ParamsError::NotFound`]; the reconciler translates this into a
-//! `ResolvedRefs=False, reason=InvalidParameters` Gateway condition.
+//! [`ParamsError::NotFound`]; the reconciler translates this into an
+//! `Accepted=False, reason=InvalidParameters` Gateway condition via the
+//! shared [`crate::AcceptedOverrides`] map (Gateway API spec).
 
 use super::merge::strategic_merge_pod_template;
 use coxswain_core::crd::{CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType};
@@ -35,8 +36,9 @@ pub(super) struct ParamsRef {
 #[derive(Debug, Error, PartialEq)]
 pub(super) enum ParamsError {
     /// A `parametersRef` is set but the target object does not exist in the
-    /// reflector store. The reconciler surfaces this as an `Accepted=False`
-    /// Gateway condition with `reason=InvalidParameters` (Gateway API spec).
+    /// reflector store. The reconciler surfaces this as `Accepted=False,
+    /// reason=InvalidParameters` on the Gateway via the shared
+    /// [`crate::AcceptedOverrides`] map (Gateway API spec).
     #[error("parametersRef target {0}/{1} not found")]
     NotFound(String, String),
 }

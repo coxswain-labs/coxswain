@@ -1,0 +1,31 @@
+# Trivy CVE suppressions for the runtime image scan in .github/workflows/release.yml.
+#
+# Format: one CVE ID per line; lines starting with `#` are comments.
+# trivy-action picks this file up from the workspace root automatically.
+#
+# Each entry MUST cite:
+#   - the package the CVE lives in,
+#   - why it is unreachable from the coxswain binary,
+#   - the issue tracking the entry's eventual removal.
+# Stop-gap entries belong here; durable fixes belong in the Dockerfile.
+
+# CVE-2026-45447 — HIGH — libssl3 3.0.20-1~deb12u1 (Debian bookworm)
+# Use-after-free in OpenSSL's PKCS7_verify() with a crafted empty-set
+# digestAlgorithms field. Lives in libssl3.so.3, bundled by
+# gcr.io/distroless/cc-debian12:nonroot as part of the cc-runtime package set.
+#
+# Unreachable from the coxswain binary: verified via
+#   readelf -d /usr/local/bin/coxswain
+# on the published image; the only NEEDED entries are libc.so.6, libgcc_s.so.1,
+# and libm.so.6. Pingora's boring-sys statically links BoringSSL into the
+# binary, so the OpenSSL PKCS#7 code path is not in the process address space —
+# nothing in coxswain's call graph loads or calls into libssl3.so.3.
+#
+# Fixed upstream in Debian's libssl3 3.0.20-1~deb12u2; the suppression becomes
+# inactive when Google ships a distroless/cc-debian12 image carrying that
+# package (the mutable :nonroot tag means subsequent builds pull the fix).
+#
+# Tracking the durable fix (remove libssl3 from the runtime image entirely):
+# coxswain-labs/coxswain#228.
+# Tracking this suppression entry: coxswain-labs/coxswain#227.
+CVE-2026-45447

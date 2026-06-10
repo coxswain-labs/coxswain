@@ -10,11 +10,27 @@
 //!
 //! - Resource name: `<gateway-name>-<gateway-class-name>` (e.g. for Gateway
 //!   `my-gw` in class `coxswain`: `my-gw-coxswain`).
-//! - Labels on every rendered resource:
+//! - Mandatory labels on every rendered resource (the "reserved set"):
 //!   - `gateway.networking.k8s.io/gateway-name: <gateway-name>`
 //!   - `app.kubernetes.io/name: coxswain`
 //!   - `app.kubernetes.io/instance: <gateway-name>`
 //!   - `app.kubernetes.io/managed-by: coxswain`
+//!
+//! ## GEP-1867 infrastructure overlay (#92)
+//!
+//! `Gateway.spec.infrastructure.labels` and `.annotations` are merged onto
+//! every rendered resource's metadata. The four reserved-set label keys above
+//! cannot be overridden by user input — a collision is dropped with a WARN
+//! log naming the key — because the Service/Deployment selectors depend on
+//! them and a user override would silently detach the Service from its pods.
+//! Annotations have no reserved set.
+//!
+//! ## Owner references
+//!
+//! Every rendered resource carries a single owner reference back to the
+//! parent Gateway with `controller: true` and `blockOwnerDeletion: true`,
+//! enabling K8s garbage collection to cascade Gateway deletion to the
+//! provisioned resources (Step 9 acceptance criterion).
 //!
 //! ## Container args
 //!
@@ -22,8 +38,8 @@
 //! --log-format=json`. The two RBAC opt-in flags
 //! (`--allow-cluster-wide-route-read`, `--allow-cluster-wide-namespace-read`)
 //! are *not* emitted yet: the CRD doesn't carry the matching fields in
-//! v1alpha1. They land alongside the actual provisioning in Step 9 (#208),
-//! together with the per-Gateway-proxy RBAC narrowing in Step 10 (#209).
+//! v1alpha1. They land alongside the per-Gateway-proxy RBAC narrowing in
+//! Step 10 (#209).
 //!
 //! ## Service ports
 //!
@@ -43,10 +59,25 @@ use k8s_openapi::api::core::v1::{
     Container, ContainerPort, PodSpec, PodTemplateSpec, Service, ServiceAccount, ServicePort,
     ServiceSpec,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Label keys that the controller owns unconditionally. User-supplied
+/// `Gateway.spec.infrastructure.labels` collisions on any of these keys are
+/// dropped with a WARN log (see [`final_labels`]).
+///
+/// The Service/Deployment selectors join on `app.kubernetes.io/name` +
+/// `app.kubernetes.io/instance`; a user override on either silently detaches
+/// the Service from its pods, which is the exact class of bug this list
+/// prevents.
+const RESERVED_LABEL_KEYS: &[&str] = &[
+    "gateway.networking.k8s.io/gateway-name",
+    "app.kubernetes.io/name",
+    "app.kubernetes.io/instance",
+    "app.kubernetes.io/managed-by",
+];
 
 /// Inputs to the renderer.
 #[non_exhaustive]
@@ -79,6 +110,17 @@ pub(super) struct RenderedSpecs {
 /// Built-in default for [`EffectiveParams::replicas`].
 const DEFAULT_REPLICAS: i32 = 1;
 
+/// Shared metadata threaded through every per-resource render function.
+/// Grouping struct so each `render_*` function stays under the
+/// `clippy::too_many_arguments` threshold per the workspace lint policy.
+struct Common<'a> {
+    name: &'a str,
+    namespace: &'a str,
+    labels: &'a BTreeMap<String, String>,
+    annotations: &'a BTreeMap<String, String>,
+    owner_ref: &'a OwnerReference,
+}
+
 /// Render all three resources for a Gateway.
 #[must_use]
 pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
@@ -91,12 +133,21 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
         .unwrap_or_else(|| {
             panic!("invariant: Gateway has no namespace; the API server requires it")
         });
-    let labels = standard_labels(inputs.gateway);
+    let labels = final_labels(inputs.gateway);
+    let annotations = final_annotations(inputs.gateway);
+    let owner_ref = gateway_owner_reference(inputs.gateway);
+    let common = Common {
+        name: &name,
+        namespace: &namespace,
+        labels: &labels,
+        annotations: &annotations,
+        owner_ref: &owner_ref,
+    };
 
     RenderedSpecs {
-        service_account: render_service_account(&name, &namespace, &labels),
-        service: render_service(&name, &namespace, &labels, inputs.gateway, inputs.params),
-        deployment: render_deployment(&name, &namespace, &labels, inputs),
+        service_account: render_service_account(&common),
+        service: render_service(&common, inputs.gateway, inputs.params),
+        deployment: render_deployment(&common, inputs),
     }
 }
 
@@ -109,6 +160,10 @@ fn resource_name(gateway: &Gateway, class_name: &str) -> String {
     format!("{gw_name}-{class_name}")
 }
 
+/// Reserved-set GEP-1762 labels for one Gateway. Used internally by
+/// [`final_labels`]; not exposed because callers should always go through
+/// `final_labels`, which also overlays the user-supplied
+/// `Gateway.spec.infrastructure.labels`.
 fn standard_labels(gateway: &Gateway) -> BTreeMap<String, String> {
     let gw_name = gateway.metadata.name.clone().unwrap_or_default();
     let mut labels = BTreeMap::new();
@@ -125,38 +180,113 @@ fn standard_labels(gateway: &Gateway) -> BTreeMap<String, String> {
     labels
 }
 
-fn render_service_account(
-    name: &str,
-    namespace: &str,
-    labels: &BTreeMap<String, String>,
-) -> ServiceAccount {
-    ServiceAccount {
-        metadata: ObjectMeta {
-            name: Some(name.to_string()),
-            namespace: Some(namespace.to_string()),
-            labels: Some(labels.clone()),
-            ..Default::default()
+/// Merge user-supplied `Gateway.spec.infrastructure.labels` onto the
+/// reserved GEP-1762 label set. User collisions on a reserved key are
+/// dropped with a WARN log — the reserved set is non-negotiable because the
+/// Service/Deployment selectors depend on it.
+fn final_labels(gateway: &Gateway) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    if let Some(user_labels) = gateway
+        .spec
+        .infrastructure
+        .as_ref()
+        .and_then(|i| i.labels.as_ref())
+    {
+        for (k, v) in user_labels {
+            if RESERVED_LABEL_KEYS.contains(&k.as_str()) {
+                tracing::warn!(
+                    namespace = gateway.metadata.namespace.as_deref().unwrap_or(""),
+                    gateway = gateway.metadata.name.as_deref().unwrap_or(""),
+                    key = k.as_str(),
+                    "operator: ignoring infrastructure.labels override on reserved key (GEP-1762)"
+                );
+                continue;
+            }
+            labels.insert(k.clone(), v.clone());
+        }
+    }
+    labels.extend(standard_labels(gateway));
+    labels
+}
+
+/// Forward user-supplied `Gateway.spec.infrastructure.annotations` verbatim.
+/// No reserved set — annotations don't drive selectors or any controller
+/// invariant.
+fn final_annotations(gateway: &Gateway) -> BTreeMap<String, String> {
+    gateway
+        .spec
+        .infrastructure
+        .as_ref()
+        .and_then(|i| i.annotations.as_ref())
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
+}
+
+/// Build the `controller=true, blockOwnerDeletion=true` owner reference back
+/// to the parent Gateway. Both fields are required for K8s garbage collection
+/// to cascade Gateway deletion to the provisioned resources without leaving
+/// orphans.
+fn gateway_owner_reference(gateway: &Gateway) -> OwnerReference {
+    let group = <Gateway as kube::Resource>::group(&()).into_owned();
+    let version = <Gateway as kube::Resource>::version(&()).into_owned();
+    let api_version = format!("{group}/{version}");
+    let kind = <Gateway as kube::Resource>::kind(&()).into_owned();
+    let name = gateway
+        .metadata
+        .name
+        .clone()
+        .unwrap_or_else(|| panic!("invariant: Gateway has no name"));
+    let uid = gateway.metadata.uid.clone().unwrap_or_else(|| {
+        panic!(
+            "invariant: Gateway has no UID; owner references require one and \
+             the API server populates it on creation"
+        )
+    });
+    OwnerReference {
+        api_version,
+        kind,
+        name,
+        uid,
+        controller: Some(true),
+        block_owner_deletion: Some(true),
+    }
+}
+
+/// Wrap a (labels, annotations, owner_ref) triple in a complete `ObjectMeta`
+/// with the right name/namespace. Used uniformly across the three renderers
+/// so any future metadata field (finalizers, etc.) gets one source of truth.
+fn metadata_for(common: &Common<'_>) -> ObjectMeta {
+    ObjectMeta {
+        name: Some(common.name.to_string()),
+        namespace: Some(common.namespace.to_string()),
+        labels: Some(common.labels.clone()),
+        annotations: if common.annotations.is_empty() {
+            None
+        } else {
+            Some(common.annotations.clone())
         },
+        owner_references: Some(vec![common.owner_ref.clone()]),
         ..Default::default()
     }
 }
 
-fn render_service(
-    name: &str,
-    namespace: &str,
-    labels: &BTreeMap<String, String>,
-    gateway: &Gateway,
-    params: &EffectiveParams,
-) -> Service {
+fn render_service_account(common: &Common<'_>) -> ServiceAccount {
+    ServiceAccount {
+        metadata: metadata_for(common),
+        ..Default::default()
+    }
+}
+
+fn render_service(common: &Common<'_>, gateway: &Gateway, params: &EffectiveParams) -> Service {
     let service_type = service_type_to_k8s_string(params.service_type.unwrap_or_default());
     let ports = service_ports(gateway);
-    // The Service selects pods by the same labels the Deployment's pod
-    // template carries. We use `app.kubernetes.io/instance` + `name` as the
-    // selector — narrower than all four labels (which is a non-issue but
-    // mirrors typical operator output).
+    // The Service selects pods by the reserved-set `app.kubernetes.io/name` +
+    // `instance` labels — narrower than all four, but the canonical operator
+    // pattern. Reserved-set means a user infrastructure label cannot break
+    // this selector.
     let mut selector = BTreeMap::new();
     selector.insert("app.kubernetes.io/name".to_string(), "coxswain".to_string());
-    if let Some(instance) = labels.get("app.kubernetes.io/instance") {
+    if let Some(instance) = common.labels.get("app.kubernetes.io/instance") {
         selector.insert(
             "app.kubernetes.io/instance".to_string(),
             instance.to_string(),
@@ -164,12 +294,7 @@ fn render_service(
     }
 
     Service {
-        metadata: ObjectMeta {
-            name: Some(name.to_string()),
-            namespace: Some(namespace.to_string()),
-            labels: Some(labels.clone()),
-            ..Default::default()
-        },
+        metadata: metadata_for(common),
         spec: Some(ServiceSpec {
             type_: Some(service_type),
             selector: Some(selector),
@@ -219,12 +344,7 @@ fn service_ports(gateway: &Gateway) -> Vec<ServicePort> {
     out
 }
 
-fn render_deployment(
-    name: &str,
-    namespace: &str,
-    labels: &BTreeMap<String, String>,
-    inputs: &RenderInputs<'_>,
-) -> Deployment {
+fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployment {
     let gw_name = inputs.gateway.metadata.name.as_deref().unwrap_or("");
     let image = inputs
         .params
@@ -246,7 +366,7 @@ fn render_deployment(
             "proxy".to_string(),
             "--dedicated".to_string(),
             format!("--gateway-name={gw_name}"),
-            format!("--gateway-namespace={namespace}"),
+            format!("--gateway-namespace={}", common.namespace),
             "--log-format=json".to_string(),
         ]),
         ports: Some(container_ports(inputs.gateway)),
@@ -256,11 +376,16 @@ fn render_deployment(
 
     let base_pod_template = PodTemplateSpec {
         metadata: Some(ObjectMeta {
-            labels: Some(labels.clone()),
+            labels: Some(common.labels.clone()),
+            annotations: if common.annotations.is_empty() {
+                None
+            } else {
+                Some(common.annotations.clone())
+            },
             ..Default::default()
         }),
         spec: Some(PodSpec {
-            service_account_name: Some(name.to_string()),
+            service_account_name: Some(common.name.to_string()),
             containers: vec![coxswain_container],
             ..Default::default()
         }),
@@ -273,7 +398,7 @@ fn render_deployment(
 
     let mut selector_labels = BTreeMap::new();
     selector_labels.insert("app.kubernetes.io/name".to_string(), "coxswain".to_string());
-    if let Some(instance) = labels.get("app.kubernetes.io/instance") {
+    if let Some(instance) = common.labels.get("app.kubernetes.io/instance") {
         selector_labels.insert(
             "app.kubernetes.io/instance".to_string(),
             instance.to_string(),
@@ -281,12 +406,7 @@ fn render_deployment(
     }
 
     Deployment {
-        metadata: ObjectMeta {
-            name: Some(name.to_string()),
-            namespace: Some(namespace.to_string()),
-            labels: Some(labels.clone()),
-            ..Default::default()
-        },
+        metadata: metadata_for(common),
         spec: Some(DeploymentSpec {
             replicas: Some(replicas),
             selector: LabelSelector {
@@ -340,7 +460,9 @@ fn merge_pod_template(base: &PodTemplateSpec, overlay: &serde_json::Value) -> Po
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coxswain_reflector::gw_types::v::gateways::{GatewayListeners, GatewaySpec};
+    use coxswain_reflector::gw_types::v::gateways::{
+        GatewayInfrastructure, GatewayListeners, GatewaySpec,
+    };
     use serde_json::json;
 
     fn make_gateway(namespace: &str, name: &str, listeners: Vec<(&str, u16, &str)>) -> Gateway {
@@ -348,6 +470,7 @@ mod tests {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
                 namespace: Some(namespace.to_string()),
+                uid: Some(format!("uid-{name}")),
                 ..Default::default()
             },
             spec: GatewaySpec {
@@ -623,5 +746,144 @@ mod tests {
             result.service_account.metadata.name.as_deref(),
             Some("my-gw-coxswain")
         );
+    }
+
+    /// Owner reference is set on every rendered resource and points back to
+    /// the parent Gateway with `controller=true, blockOwnerDeletion=true`.
+    /// Required by the Step 9 GC acceptance criterion.
+    #[test]
+    fn owner_reference_set_on_every_resource() {
+        let gw = make_gateway("default", "my-gw", vec![("http", 80, "HTTP")]);
+        let params = EffectiveParams::default();
+        let result = render(&RenderInputs {
+            gateway: &gw,
+            params: &params,
+            controller_image: "coxswain:v0.2",
+            gateway_class_name: "coxswain",
+        });
+        for meta in [
+            &result.deployment.metadata,
+            &result.service.metadata,
+            &result.service_account.metadata,
+        ] {
+            let refs = meta.owner_references.as_ref().expect("owner refs");
+            assert_eq!(refs.len(), 1);
+            let r = &refs[0];
+            assert_eq!(r.kind, "Gateway");
+            assert_eq!(r.name, "my-gw");
+            assert_eq!(r.uid, "uid-my-gw");
+            assert_eq!(r.controller, Some(true));
+            assert_eq!(r.block_owner_deletion, Some(true));
+            assert!(
+                r.api_version.starts_with("gateway.networking.k8s.io/"),
+                "api_version: {}",
+                r.api_version
+            );
+        }
+    }
+
+    /// `Gateway.spec.infrastructure.labels` non-reserved keys are merged onto
+    /// every rendered resource's metadata.
+    #[test]
+    fn infrastructure_labels_merged_onto_resources() {
+        let mut gw = make_gateway("default", "my-gw", vec![("http", 80, "HTTP")]);
+        let mut user_labels = BTreeMap::new();
+        user_labels.insert("team".to_string(), "platform".to_string());
+        user_labels.insert("environment".to_string(), "prod".to_string());
+        gw.spec.infrastructure = Some(GatewayInfrastructure {
+            labels: Some(user_labels),
+            ..Default::default()
+        });
+        let result = render(&RenderInputs {
+            gateway: &gw,
+            params: &EffectiveParams::default(),
+            controller_image: "coxswain:v0.2",
+            gateway_class_name: "coxswain",
+        });
+        for meta in [
+            &result.deployment.metadata,
+            &result.service.metadata,
+            &result.service_account.metadata,
+        ] {
+            let labels = meta.labels.as_ref().expect("labels");
+            assert_eq!(labels.get("team"), Some(&"platform".to_string()));
+            assert_eq!(labels.get("environment"), Some(&"prod".to_string()));
+            // Reserved set still intact.
+            assert_eq!(
+                labels.get("app.kubernetes.io/managed-by"),
+                Some(&"coxswain".to_string())
+            );
+        }
+    }
+
+    /// User cannot override the GEP-1762 reserved-set label keys; collisions
+    /// are dropped and the standard value wins.
+    #[test]
+    fn reserved_label_keys_cannot_be_overridden() {
+        let mut gw = make_gateway("default", "my-gw", vec![("http", 80, "HTTP")]);
+        let mut user_labels = BTreeMap::new();
+        user_labels.insert("app.kubernetes.io/name".to_string(), "evil".to_string());
+        user_labels.insert(
+            "gateway.networking.k8s.io/gateway-name".to_string(),
+            "other-gw".to_string(),
+        );
+        user_labels.insert("kept".to_string(), "yes".to_string());
+        gw.spec.infrastructure = Some(GatewayInfrastructure {
+            labels: Some(user_labels),
+            ..Default::default()
+        });
+        let result = render(&RenderInputs {
+            gateway: &gw,
+            params: &EffectiveParams::default(),
+            controller_image: "coxswain:v0.2",
+            gateway_class_name: "coxswain",
+        });
+        let labels = result.deployment.metadata.labels.as_ref().expect("labels");
+        assert_eq!(
+            labels.get("app.kubernetes.io/name"),
+            Some(&"coxswain".to_string()),
+            "reserved key must not be overridden"
+        );
+        assert_eq!(
+            labels.get("gateway.networking.k8s.io/gateway-name"),
+            Some(&"my-gw".to_string()),
+            "reserved key must not be overridden"
+        );
+        assert_eq!(labels.get("kept"), Some(&"yes".to_string()));
+    }
+
+    /// Infrastructure annotations are merged onto every rendered resource
+    /// verbatim. No reserved set applies.
+    #[test]
+    fn infrastructure_annotations_merged_onto_resources() {
+        let mut gw = make_gateway("default", "my-gw", vec![("http", 80, "HTTP")]);
+        let mut anno = BTreeMap::new();
+        anno.insert(
+            "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
+            "nlb".to_string(),
+        );
+        gw.spec.infrastructure = Some(GatewayInfrastructure {
+            annotations: Some(anno),
+            ..Default::default()
+        });
+        let result = render(&RenderInputs {
+            gateway: &gw,
+            params: &EffectiveParams::default(),
+            controller_image: "coxswain:v0.2",
+            gateway_class_name: "coxswain",
+        });
+        for meta in [
+            &result.deployment.metadata,
+            &result.service.metadata,
+            &result.service_account.metadata,
+        ] {
+            let annotations = meta.annotations.as_ref().expect("annotations");
+            assert_eq!(
+                annotations
+                    .get("service.beta.kubernetes.io/aws-load-balancer-type")
+                    .map(String::as_str),
+                Some("nlb")
+            );
+        }
     }
 }
