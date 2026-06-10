@@ -5,6 +5,7 @@ members = [
     "crates/coxswain-core",
     "crates/coxswain-controller",
     "crates/coxswain-proxy",
+    "crates/coxswain-reflector",
     "crates/coxswain-health",
     "crates/coxswain-admin",
     "crates/coxswain-e2e"
@@ -14,6 +15,7 @@ default-members = [
     "crates/coxswain-core",
     "crates/coxswain-controller",
     "crates/coxswain-proxy",
+    "crates/coxswain-reflector",
     "crates/coxswain-health",
     "crates/coxswain-admin"
 ]
@@ -36,6 +38,7 @@ coxswain-core       = { path = "./crates/coxswain-core" }
 coxswain-controller = { path = "./crates/coxswain-controller" }
 coxswain-health     = { path = "./crates/coxswain-health" }
 coxswain-proxy      = { path = "./crates/coxswain-proxy" }
+coxswain-reflector  = { path = "./crates/coxswain-reflector" }
 
 anyhow             = { version = "1.0" }
 arc-swap           = { version = "1.9" }

@@ -1,9 +1,9 @@
 //! Condition helpers: build and inspect `metav1.Condition` objects for Gateway API resources.
 
-use crate::gw_types::v::gatewayclasses::GatewayClass;
-use crate::gw_types::v::gateways::Gateway;
-use crate::gw_types::v::httproutes::{HTTPRoute, HttpRouteParentRefs};
 use coxswain_core::ownership::{self, ObjectKey};
+use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
+use coxswain_reflector::gw_types::v::gateways::Gateway;
+use coxswain_reflector::gw_types::v::httproutes::{HTTPRoute, HttpRouteParentRefs};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use std::collections::HashSet;
 

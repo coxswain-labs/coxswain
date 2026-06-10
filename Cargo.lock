@@ -636,6 +636,7 @@ dependencies = [
  "coxswain-core",
  "coxswain-health",
  "coxswain-proxy",
+ "coxswain-reflector",
  "gateway-api",
  "humantime",
  "ipnet",
@@ -655,6 +656,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "coxswain-core",
+ "coxswain-reflector",
  "futures",
  "gateway-api",
  "http",
@@ -738,6 +740,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "coxswain-core",
+ "coxswain-reflector",
  "criterion",
  "http",
  "ipnet",
@@ -748,6 +751,28 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "coxswain-reflector"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "coxswain-core",
+ "futures",
+ "gateway-api",
+ "http",
+ "k8s-openapi",
+ "kube",
+ "pingora-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-test",
 ]
 
 [[package]]

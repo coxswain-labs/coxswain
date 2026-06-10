@@ -54,7 +54,7 @@ Coxswain exposes the Prometheus endpoint at `http://<admin-address>:<admin-port>
 1. All Kubernetes reflectors emit their first `InitDone` event (CRDs must be installed)
 2. The routing table is built for the first time
 
-Inspect the per-subsystem detail via the admin port (open `kubectl -n coxswain-system port-forward svc/coxswain-internal 8082:8082` in a separate terminal first; Helm installs use the Service name `<release>-internal`):
+Inspect the per-subsystem detail via the admin port (open `kubectl -n coxswain-system port-forward svc/coxswain-shared-proxy-internal 8082:8082` in a separate terminal first; Helm installs use the Service name `<release>-internal`):
 
 ```bash
 curl -s http://localhost:8082/status | jq .
@@ -147,7 +147,7 @@ Use `RUST_LOG` directive syntax for per-crate control:
 
 === "Prometheus scrape_configs"
 
-    Replace `<release>` with the Helm release name (or use `coxswain-internal` for raw-manifest installs):
+    Replace `<release>` with the Helm release name (or use `coxswain-shared-proxy-internal` for raw-manifest installs):
 
     ```yaml
     scrape_configs:

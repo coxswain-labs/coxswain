@@ -52,13 +52,54 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-ServiceAccount name used by the Deployment.
+Controller pod fullname: "<release>-coxswain-controller".
 */}}
-{{- define "coxswain.serviceAccountName" -}}
-{{- if .Values.serviceAccount.create }}
-{{- default (include "coxswain.fullname" .) .Values.serviceAccount.name }}
+{{- define "coxswain.controller.fullname" -}}
+{{- printf "%s-controller" (include "coxswain.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Shared-proxy pod fullname: "<release>-coxswain-shared-proxy".
+*/}}
+{{- define "coxswain.sharedProxy.fullname" -}}
+{{- printf "%s-shared-proxy" (include "coxswain.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Controller selector labels — selectorLabels + component=controller.
+*/}}
+{{- define "coxswain.controller.selectorLabels" -}}
+{{ include "coxswain.selectorLabels" . }}
+app.kubernetes.io/component: controller
+{{- end }}
+
+{{/*
+Shared-proxy selector labels — selectorLabels + component=shared-proxy.
+*/}}
+{{- define "coxswain.sharedProxy.selectorLabels" -}}
+{{ include "coxswain.selectorLabels" . }}
+app.kubernetes.io/component: shared-proxy
+{{- end }}
+
+{{/*
+Controller ServiceAccount name.
+*/}}
+{{- define "coxswain.controller.serviceAccountName" -}}
+{{- if .Values.controller.serviceAccount.create }}
+{{- default (include "coxswain.controller.fullname" .) .Values.controller.serviceAccount.name }}
 {{- else }}
-{{- default "default" .Values.serviceAccount.name }}
+{{- default "default" .Values.controller.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
+Shared-proxy ServiceAccount name.
+*/}}
+{{- define "coxswain.sharedProxy.serviceAccountName" -}}
+{{- if .Values.proxy.shared.serviceAccount.create }}
+{{- default (include "coxswain.sharedProxy.fullname" .) .Values.proxy.shared.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.proxy.shared.serviceAccount.name }}
 {{- end }}
 {{- end }}
 

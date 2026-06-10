@@ -151,7 +151,7 @@ The proxy port depends on your cluster and install method. For a local cluster w
 
 ```bash
 # Find the proxy service address
-kubectl -n coxswain-system get svc coxswain-proxy
+kubectl -n coxswain-system get svc coxswain-shared-proxy
 
 # Test via Host header
 curl -H "Host: echo.example.com" http://<proxy-address>/

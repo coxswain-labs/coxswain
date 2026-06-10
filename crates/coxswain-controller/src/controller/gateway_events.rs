@@ -2,9 +2,9 @@
 
 use super::config::StatusAddress;
 use super::gateway_status::build_gateway_status_patch;
-use crate::gw_types::v::gateways::Gateway;
-use crate::ingress::IngressPorts;
-use crate::tls::GatewayListenerHealth;
+use coxswain_reflector::gw_types::v::gateways::Gateway;
+use coxswain_reflector::ingress::IngressPorts;
+use coxswain_reflector::tls::GatewayListenerHealth;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
     Client,

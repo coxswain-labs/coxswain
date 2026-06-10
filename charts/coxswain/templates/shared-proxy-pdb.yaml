@@ -1,0 +1,14 @@
+{{- if and .Values.proxy.shared.enabled .Values.proxy.shared.podDisruptionBudget.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "coxswain.sharedProxy.fullname" . }}
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "coxswain.sharedProxy.selectorLabels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.proxy.shared.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "coxswain.sharedProxy.selectorLabels" . | nindent 6 }}
+{{- end }}

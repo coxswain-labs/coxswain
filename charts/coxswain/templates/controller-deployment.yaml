@@ -1,31 +1,30 @@
+{{- if .Values.controller.enabled -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "coxswain.fullname" . }}
+  name: {{ include "coxswain.controller.fullname" . }}
   namespace: {{ .Values.namespace.name }}
   labels:
     {{- include "coxswain.labels" . | nindent 4 }}
-    app.kubernetes.io/component: proxy
+    app.kubernetes.io/component: controller
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ .Values.controller.replicas }}
   selector:
     matchLabels:
-      {{- include "coxswain.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: proxy
+      {{- include "coxswain.controller.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "coxswain.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: proxy
-        {{- with .Values.podLabels }}
+        {{- include "coxswain.controller.selectorLabels" . | nindent 8 }}
+        {{- with .Values.controller.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.podAnnotations }}
+      {{- with .Values.controller.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "coxswain.serviceAccountName" . }}
+      serviceAccountName: {{ include "coxswain.controller.serviceAccountName" . }}
       automountServiceAccountToken: true
       {{- with .Values.podSecurityContext }}
       securityContext:
@@ -35,22 +34,22 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.priorityClassName }}
+      {{- with .Values.controller.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
-      {{- with .Values.nodeSelector }}
+      {{- with .Values.controller.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
+      {{- with .Values.controller.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with .Values.controller.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.topologySpreadConstraints }}
+      {{- with .Values.controller.topologySpreadConstraints }}
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -58,17 +57,8 @@ spec:
         - name: coxswain
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "controller"]
           ports:
-            {{- if .Values.proxy.http.enabled }}
-            - name: http
-              containerPort: {{ include "coxswain.httpContainerPort" . }}
-              protocol: TCP
-            {{- end }}
-            {{- if .Values.proxy.https.enabled }}
-            - name: https
-              containerPort: {{ include "coxswain.httpsContainerPort" . }}
-              protocol: TCP
-            {{- end }}
             - name: health
               containerPort: {{ .Values.health.port }}
               protocol: TCP
@@ -88,29 +78,25 @@ spec:
               value: {{ .Values.logFilter | quote }}
             - name: COXSWAIN_LOG_FORMAT
               value: {{ .Values.logFormat | quote }}
-            - name: COXSWAIN_PROXY_THREADS
-              value: {{ .Values.proxy.threads | quote }}
             - name: COXSWAIN_HEALTH_PORT
               value: {{ .Values.health.port | quote }}
             - name: COXSWAIN_ADMIN_PORT
               value: {{ .Values.admin.port | quote }}
-            - name: COXSWAIN_PROXY_BIND_ADDRESS
-              value: {{ .Values.proxy.bindAddress | quote }}
             - name: COXSWAIN_MANAGEMENT_BIND_ADDRESS
               value: {{ .Values.management.bindAddress | quote }}
+            - name: COXSWAIN_CONTROLLER_NAME
+              value: {{ .Values.controllerName | quote }}
+            {{- if .Values.watchNamespace }}
+            - name: COXSWAIN_WATCH_NAMESPACE
+              value: {{ .Values.watchNamespace | quote }}
+            {{- end }}
             {{- if .Values.proxy.http.enabled }}
-            - name: COXSWAIN_PROXY_HTTP_PORT
+            - name: COXSWAIN_INGRESS_HTTP_PORT
               value: {{ include "coxswain.httpContainerPort" . | quote }}
             {{- end }}
             {{- if .Values.proxy.https.enabled }}
-            - name: COXSWAIN_PROXY_HTTPS_PORT
+            - name: COXSWAIN_INGRESS_HTTPS_PORT
               value: {{ include "coxswain.httpsContainerPort" . | quote }}
-            {{- end }}
-            - name: COXSWAIN_CONTROLLER_NAME
-              value: {{ .Values.controller.name | quote }}
-            {{- if .Values.controller.watchNamespace }}
-            - name: COXSWAIN_CONTROLLER_WATCH_NAMESPACE
-              value: {{ .Values.controller.watchNamespace | quote }}
             {{- end }}
             - name: COXSWAIN_CONTROLLER_LEASE_TTL
               value: {{ .Values.controller.leaseTtl | quote }}
@@ -119,30 +105,6 @@ spec:
             {{- if .Values.controller.statusAddress }}
             - name: COXSWAIN_STATUS_ADDRESS
               value: {{ .Values.controller.statusAddress | quote }}
-            {{- end }}
-            {{- if .Values.controller.ingressDefaultBackend }}
-            - name: COXSWAIN_INGRESS_DEFAULT_BACKEND
-              value: {{ .Values.controller.ingressDefaultBackend | quote }}
-            {{- end }}
-            - name: COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD
-              value: {{ .Values.proxy.shutdownGracePeriod | quote }}
-            - name: COXSWAIN_PROXY_SHUTDOWN_TIMEOUT
-              value: {{ .Values.proxy.shutdownTimeout | quote }}
-            {{- if .Values.proxy.acceptProxyProtocol }}
-            - name: COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL
-              value: "true"
-            {{- end }}
-            {{- if .Values.proxy.trustedSources }}
-            - name: COXSWAIN_PROXY_TRUSTED_SOURCES
-              value: {{ .Values.proxy.trustedSources | join "," | quote }}
-            {{- end }}
-            {{- if .Values.proxy.defaultRequestTimeout }}
-            - name: COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT
-              value: {{ .Values.proxy.defaultRequestTimeout | quote }}
-            {{- end }}
-            {{- if .Values.proxy.defaultBackendRequestTimeout }}
-            - name: COXSWAIN_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT
-              value: {{ .Values.proxy.defaultBackendRequestTimeout | quote }}
             {{- end }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
@@ -153,6 +115,8 @@ spec:
             readOnlyRootFilesystem: {{ .Values.containerSecurityContext.readOnlyRootFilesystem }}
             capabilities:
               drop: {{ .Values.containerSecurityContext.capabilities.drop | toJson }}
-              add: {{ if .Values.security.rootless }}[]{{ else }}{{ .Values.containerSecurityContext.capabilities.add | toJson }}{{ end }}
+              # Controller does not bind low ports; drop NET_BIND_SERVICE regardless.
+              add: []
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+{{- end }}

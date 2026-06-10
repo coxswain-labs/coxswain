@@ -1,6 +1,6 @@
 //! Validated configuration for the leader-election controller.
 
-use crate::ingress::IngressPorts;
+use coxswain_reflector::ingress::IngressPorts;
 use std::net::IpAddr;
 use std::time::Duration;
 use thiserror::Error;

@@ -2,10 +2,10 @@
 
 use super::conditions::{has_condition, make_condition};
 use super::config::StatusAddress;
-use crate::gw_types::v::gateways::{
+use coxswain_reflector::gw_types::v::gateways::{
     Gateway, GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
-use crate::tls::GatewayListenerHealth;
+use coxswain_reflector::tls::GatewayListenerHealth;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Returns true when the Gateway's current status does not yet reflect the desired
@@ -123,7 +123,7 @@ pub(super) fn build_gateway_status_patch(
     generation: i64,
     now: &Time,
     addr: Option<&StatusAddress>,
-    ingress_ports: crate::ingress::IngressPorts,
+    ingress_ports: coxswain_reflector::ingress::IngressPorts,
 ) -> serde_json::Value {
     // Gateway-level Programmed is always True once the controller has processed the
     // Gateway. Per-listener conditions (ListenerConditionProgrammed, ResolvedRefs)

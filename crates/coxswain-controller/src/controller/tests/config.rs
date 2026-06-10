@@ -1,5 +1,5 @@
 use super::super::config::{ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress};
-use crate::ingress::IngressPorts;
+use coxswain_reflector::ingress::IngressPorts;
 use std::time::Duration;
 
 fn cfg(ttl_secs: u64, renew_secs: u64) -> Result<ControllerConfig, ControllerConfigError> {

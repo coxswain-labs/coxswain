@@ -1,19 +1,22 @@
 # Helm chart for Coxswain — Kubernetes Ingress & Gateway API controller.
 #
-# Every COXSWAIN_* environment variable documented in the binary maps to a
-# value here; see crates/coxswain-bin/src/main.rs for the full reference.
-# Empty strings are treated as "omit the env var; use the binary's default."
+# Coxswain ships as two cooperating pods in the default topology:
+#  - `controller` — leader-elected writer; status patches; future
+#    per-Gateway provisioning. Cluster-wide reads + write verbs on the
+#    `*/status` subresources.
+#  - `proxy.shared` — read-only data plane serving Ingress + non-dedicated
+#    Gateway traffic. Cluster-wide reads, zero writes — the ServiceAccount
+#    has no write verbs at all.
+#
+# Set `controller.enabled: false` to omit the writer (rarely useful — the
+# proxy depends on it for accurate status); set `proxy.shared.enabled: false`
+# or `proxy.shared.replicas: 0` for a strict-multi-tenant install where every
+# Gateway uses a dedicated per-Gateway proxy.
 
 nameOverride: ""
 fullnameOverride: ""
 
-# -- Namespace to deploy into.
-namespace:
-  # Create the namespace as part of this release.
-  create: true
-  name: coxswain-system
-
-# -- Container image.
+# -- Container image, shared by both pods.
 image:
   repository: ghcr.io/coxswain-labs/coxswain
   # Defaults to .Chart.AppVersion when empty.
@@ -22,52 +25,41 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets: []
 
-replicaCount: 1
-
-# -- CPU / memory resource requests and limits.
-resources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    cpu: 500m
-    memory: 256Mi
-
-# -- ServiceAccount settings.
-serviceAccount:
-  # Create a dedicated ServiceAccount for coxswain.
+# -- Namespace to deploy into.
+namespace:
+  # Create the namespace as part of this release.
   create: true
-  # Defaults to the chart fullname when empty.
-  name: ""
-  annotations: {}
+  name: coxswain-system
 
-# -- Whether to create the ClusterRole, ClusterRoleBinding, and leader-election
-# Role + RoleBinding. Disable only if you manage RBAC externally.
-rbac:
-  create: true
+# -- GatewayClass controllerName this install claims.
+controllerName: coxswain-labs.dev/gateway-controller
 
-# -- PodDisruptionBudget to protect rolling upgrades.
-podDisruptionBudget:
-  enabled: true
-  maxUnavailable: 1
+# -- Kubernetes namespace to watch. Empty = cluster-wide. Both pods receive
+# the same value via env var.
+watchNamespace: ""
 
-# -- Pod-level security context.
+# -- COXSWAIN_LOG_FORMAT — "json" for production; "console" for development.
+logFormat: json
+
+# -- COXSWAIN_LOG — log verbosity / per-crate filter (RUST_LOG syntax).
+logFilter: info
+
+# -- Pod-level security context, applied to both pods.
 podSecurityContext:
   runAsNonRoot: true
   seccompProfile:
     type: RuntimeDefault
 
-# -- Security mode.
+# -- Security mode, applied to both pods.
 # rootless: false (default) — container binds ports ≤1024 directly via
 #   CAP_NET_BIND_SERVICE. Works on PSS "baseline" and "privileged".
-# rootless: true — container binds 8080/8443 instead of 80/443, and
-#   NET_BIND_SERVICE is dropped from capabilities. The gateway Service still
-#   exposes 80/443, mapping to the higher container ports. Required for PSS
-#   "restricted" namespaces.
+# rootless: true — proxy container binds 8080/8443 instead of 80/443, and
+#   NET_BIND_SERVICE is dropped. The gateway Service still exposes 80/443,
+#   mapping to the higher container ports. Required for PSS "restricted".
 security:
   rootless: false
 
-# -- Container-level security context.
+# -- Container-level security context, applied to both pods.
 # When security.rootless is true, capabilities.add is overridden to [] regardless
 # of what is set here.
 containerSecurityContext:
@@ -78,17 +70,6 @@ containerSecurityContext:
       - ALL
     add:
       - NET_BIND_SERVICE
-
-# -- Extra labels and annotations added to each pod.
-podAnnotations: {}
-podLabels: {}
-
-# -- Scheduling constraints.
-nodeSelector: {}
-tolerations: []
-affinity: {}
-topologySpreadConstraints: []
-priorityClassName: ""
 
 # -- Liveness probe. Calls /healthz on the health port (always 200).
 livenessProbe:
@@ -107,59 +88,7 @@ readinessProbe:
   periodSeconds: 10
   failureThreshold: 6
 
-# -- Controller settings.
-controller:
-  # COXSWAIN_CONTROLLER_NAME — GatewayClass controllerName this instance claims.
-  name: coxswain-labs.dev/gateway-controller
-  # COXSWAIN_CONTROLLER_WATCH_NAMESPACE — restrict to a single namespace; empty = cluster-wide.
-  watchNamespace: ""
-  # COXSWAIN_CONTROLLER_LEASE_TTL — how long a leader lease stays valid without renewal.
-  leaseTtl: 15s
-  # COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL — how often the leader renews its lease.
-  leaseRenewInterval: 5s
-  # COXSWAIN_STATUS_ADDRESS — external IP/hostname written to Ingress and Gateway status.
-  statusAddress: ""
-  # COXSWAIN_INGRESS_DEFAULT_BACKEND — fallback backend for unmatched Ingress traffic.
-  # Format: <namespace>/<service>:<port>, e.g. default/my-404-page:80
-  ingressDefaultBackend: ""
-
-# -- Proxy settings.
-proxy:
-  # COXSWAIN_PROXY_THREADS — worker threads per proxy service.
-  threads: 2
-  # COXSWAIN_PROXY_BIND_ADDRESS — IP address all proxy listeners bind to.
-  bindAddress: "0.0.0.0"
-
-  # HTTP listener. Clients always connect on `port`; the container binds on
-  # `port` normally, or 8080 when security.rootless is true.
-  http:
-    enabled: true
-    port: 80  # COXSWAIN_PROXY_HTTP_PORT
-
-  # HTTPS / TLS listener. Clients always connect on `port`; the container binds
-  # on `port` normally, or 8443 when security.rootless is true.
-  https:
-    enabled: true
-    port: 443  # COXSWAIN_PROXY_HTTPS_PORT
-
-  # COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD — drain window before final shutdown.
-  shutdownGracePeriod: 30s
-  # COXSWAIN_PROXY_SHUTDOWN_TIMEOUT — hard deadline after grace period expires.
-  shutdownTimeout: 5s
-
-  # COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL — enable HAProxy PROXY protocol v1/v2.
-  acceptProxyProtocol: false
-  # COXSWAIN_PROXY_TRUSTED_SOURCES — CIDRs allowed to send PROXY headers (comma-joined).
-  trustedSources: []
-
-  # COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT — global default total request timeout.
-  # Empty = disabled. Human-readable: "30s", "1m".
-  defaultRequestTimeout: ""
-  # COXSWAIN_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT — global default backend timeout.
-  # Empty = disabled.
-  defaultBackendRequestTimeout: ""
-
-# -- Bind address shared by the health and admin servers.
+# -- Bind address shared by the health and admin servers on both pods.
 # COXSWAIN_MANAGEMENT_BIND_ADDRESS — set to a management-network IP to restrict
 # /healthz, /readyz, /metrics, /routes, /status access; leave as 0.0.0.0 to keep
 # kubelet probes and Prometheus scraping working out of the box.
@@ -176,16 +105,10 @@ health:
 admin:
   port: 8082
 
-# -- COXSWAIN_LOG_FORMAT — "json" for production; "console" for development.
-logFormat: json
-
-# -- COXSWAIN_LOG — log verbosity / per-crate filter (RUST_LOG syntax).
-logFilter: info
-
 # -- GatewayClass resource. Set create: false if you manage it externally.
 gatewayClass:
   create: true
-  # Must match controller.name above.
+  # Must match controllerName above.
   name: coxswain
 
 # -- IngressClass resource. Set create: false if you manage it externally.
@@ -193,9 +116,174 @@ ingressClass:
   create: true
   name: coxswain
 
+# =============================================================================
+# Controller pod — leader-elected writer.
+# =============================================================================
+controller:
+  # Render the controller Deployment + RBAC + Service + PDB. Disabling here
+  # omits every controller-related object from the install. Without a running
+  # controller no status patches will be written, but the shared-proxy data
+  # plane keeps serving traffic from the routing tables it builds itself.
+  enabled: true
+
+  # Number of controller replicas. The controller is leader-elected via Lease;
+  # extra replicas are HA failover, not throughput. Set to 0 to keep the
+  # Deployment around (faster to bring back) but run no pods.
+  replicas: 1
+
+  # CPU / memory resource requests and limits.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+
+  # ServiceAccount settings.
+  serviceAccount:
+    create: true
+    # Defaults to "<release>-coxswain-controller" when empty.
+    name: ""
+    annotations: {}
+
+  # Whether to render the ClusterRole, ClusterRoleBinding, leader-election
+  # Role + RoleBinding. Disable only if RBAC is managed externally.
+  rbac:
+    create: true
+
+  # PodDisruptionBudget to protect rolling upgrades.
+  podDisruptionBudget:
+    enabled: true
+    # maxUnavailable: 0 keeps at least one leader-eligible replica during a
+    # node drain; harmless when replicas == 1 because there is nothing else to
+    # disrupt.
+    maxUnavailable: 0
+
+  # Extra pod metadata.
+  podAnnotations: {}
+  podLabels: {}
+
+  # Scheduling constraints.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  priorityClassName: ""
+
+  # COXSWAIN_CONTROLLER_LEASE_TTL — how long a leader lease stays valid
+  # without renewal.
+  leaseTtl: 15s
+  # COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL — how often the leader renews
+  # its lease.
+  leaseRenewInterval: 5s
+
+  # COXSWAIN_STATUS_ADDRESS — external IP/hostname written to Ingress and
+  # Gateway status. Required for cert-manager HTTP-01 + external-dns.
+  statusAddress: ""
+
+# =============================================================================
+# Proxy pod — read-only data plane.
+# =============================================================================
+proxy:
+  # Shared-pool proxy (serves Ingress + non-dedicated Gateway traffic).
+  shared:
+    # Render the shared-proxy Deployment + RBAC + Services + PDB. Set to false
+    # for a strict-multi-tenant install where every Gateway runs a dedicated
+    # proxy provisioned by the controller. The shared-proxy ServiceAccount has
+    # zero write verbs whether enabled or not.
+    enabled: true
+
+    # Number of shared-proxy replicas. Read-only data plane; scaling is
+    # horizontal and stateless (each replica independently builds its routing
+    # table from the same K8s watch). Set to 0 to keep the Deployment around
+    # but run no pods (cheaper "off" toggle than enabled: false).
+    replicas: 1
+
+    # CPU / memory resource requests and limits.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+
+    # ServiceAccount settings.
+    serviceAccount:
+      create: true
+      # Defaults to "<release>-coxswain-shared-proxy" when empty.
+      name: ""
+      annotations: {}
+
+    # Whether to render the read-only ClusterRole + ClusterRoleBinding. There
+    # is no Lease Role for the proxy — the proxy doesn't leader-elect.
+    rbac:
+      create: true
+
+    # PodDisruptionBudget.
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1
+
+    # Extra pod metadata.
+    podAnnotations: {}
+    podLabels: {}
+
+    # Scheduling constraints.
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    topologySpreadConstraints: []
+    priorityClassName: ""
+
+    # COXSWAIN_PROXY_THREADS — worker threads per proxy service.
+    threads: 2
+
+    # COXSWAIN_PROXY_BIND_ADDRESS — IP address all proxy data-plane listeners
+    # bind to (independent from management.bindAddress).
+    bindAddress: "0.0.0.0"
+
+    # COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD — drain window before final shutdown.
+    shutdownGracePeriod: 30s
+    # COXSWAIN_PROXY_SHUTDOWN_TIMEOUT — hard deadline after grace period expires.
+    shutdownTimeout: 5s
+
+    # COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL — enable HAProxy PROXY protocol v1/v2.
+    acceptProxyProtocol: false
+    # COXSWAIN_PROXY_TRUSTED_SOURCES — CIDRs allowed to send PROXY headers
+    # (comma-joined when rendered).
+    trustedSources: []
+
+    # COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT — global default total request timeout.
+    # Empty = disabled. Human-readable: "30s", "1m".
+    defaultRequestTimeout: ""
+    # COXSWAIN_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT — global default backend timeout.
+    # Empty = disabled.
+    defaultBackendRequestTimeout: ""
+
+    # COXSWAIN_INGRESS_DEFAULT_BACKEND — fallback backend for unmatched
+    # Ingress traffic. Format: <namespace>/<service>:<port>, e.g.
+    # default/my-404-page:80
+    ingressDefaultBackend: ""
+
+  # HTTP listener. Clients always connect on `port`; the container binds on
+  # `port` normally, or 8080 when security.rootless is true. Both pods take
+  # the value as COXSWAIN_INGRESS_HTTP_PORT: the proxy binds it for data
+  # plane traffic; the controller compares Gateway listener ports against it
+  # for the `PortUnavailable` status condition.
+  http:
+    enabled: true
+    port: 80
+
+  # HTTPS / TLS listener. Same dual-pod semantics as `http`.
+  https:
+    enabled: true
+    port: 443
+
 # -- Service settings.
 service:
-  # Gateway service exposes the data-plane ports (80/443) to external traffic.
+  # External data-plane Service backing the shared-proxy pods.
   gateway:
     type: LoadBalancer
     annotations: {}
@@ -206,14 +294,9 @@ service:
     externalTrafficPolicy: ""
     # Pre-declare additional fixed ports for known Gateway API listeners.
     # Each entry follows the ServicePort schema: name, port, targetPort, protocol.
-    #
-    # Note: Coxswain dynamically binds new Gateway listener ports at runtime
-    # (via HotReloader), but the Kubernetes Service is static — a new port bound
-    # by the pod is not reachable externally until it is also added here and
-    # `helm upgrade` is run. Automatic Service port management (patching spec.ports
-    # when Gateway listeners change) is tracked as a follow-up issue.
     additionalPorts: []
 
-  # Internal service exposes health (8081) and admin (8082) as ClusterIP only.
+  # Internal ClusterIP services exposing health (8081) and admin (8082) on
+  # each pod. One Service per pod role; both share the same annotations.
   internal:
     annotations: {}

@@ -1,32 +1,35 @@
-//! Kubernetes controller for Coxswain.
+//! Kubernetes status writer for Coxswain.
 //!
-//! Runs reflector-backed stores for all relevant resources (`HTTPRoute`, `Ingress`,
-//! `Gateway`, `Secret`, `EndpointSlice`, …), debounces updates into routing-table
-//! rebuilds, and writes Gateway API status conditions back through a leader-elected
-//! [`Controller`].
+//! This crate runs in the controller pod role. It does not start any reflectors
+//! of its own — those live in [`coxswain_reflector`] — but it consumes the
+//! shared health channels published by the reflector pipeline and writes
+//! Gateway API / Ingress `status` patches back to the API server through a
+//! leader-elected [`Controller`].
+//!
+//! The proxy pod role does not depend on this crate; the read-only-proxy
+//! invariant is enforced structurally.
 
 mod controller;
-pub(crate) mod endpoints;
-pub(crate) mod gateway_api;
-pub(crate) mod gw_types;
-pub(crate) mod ingress;
-pub(crate) mod k8s_utils;
-pub(crate) mod keys;
-mod reconciler;
-mod tls;
-
-#[cfg(test)]
-mod tests;
+mod status_writer;
 
 pub use controller::{
     Controller, ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress,
 };
-pub use ingress::IngressPorts;
-pub use reconciler::{
-    IngressDefaultBackend, IngressDefaultBackendParseError, Reconciler, ReconcilerHealth,
-    ReconcilerOptions, ReconcilerOutputs,
+pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writer};
+
+// Re-export reflector primitives that bin or downstream crates expect to reach
+// from `coxswain_controller::…`. Direct re-exports keep callers compiling
+// without forcing every site to learn the new crate name.
+pub use coxswain_reflector::{
+    GatewayListenerHealth, IngressPorts, ListenerInfo, ListenerTlsOutcome,
+    SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
+    gateway_api_crds_present,
 };
-pub use tls::{
-    GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, SharedBackendTlsPolicyHealth,
-    SharedGatewayListenerHealth,
+
+// The status writer no longer instantiates a Reconciler directly — bin owns
+// the wiring — but the types it produces still need to be reachable from the
+// controller crate's API surface for the dev role's combined startup.
+pub use coxswain_reflector::reconciler::{
+    Reconciler, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
 };
+pub use coxswain_reflector::{IngressDefaultBackend, IngressDefaultBackendParseError};

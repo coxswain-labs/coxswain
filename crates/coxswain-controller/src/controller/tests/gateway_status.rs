@@ -1,5 +1,5 @@
 use super::super::gateway_status::gateway_needs_status_patch;
-use crate::tls::GatewayListenerHealth;
+use coxswain_reflector::tls::GatewayListenerHealth;
 use gateway_api::apis::standard::gateways::{
     Gateway, GatewaySpec, GatewayStatus, GatewayStatusListeners,
 };

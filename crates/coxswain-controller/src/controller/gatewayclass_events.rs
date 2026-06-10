@@ -1,7 +1,7 @@
 //! Kubernetes API calls that write `GatewayClass` status patches.
 
 use super::gateway_class_status::build_gateway_class_status_patch;
-use crate::gw_types::v::gatewayclasses::GatewayClass;
+use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
     Client,

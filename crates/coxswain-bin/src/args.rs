@@ -155,6 +155,32 @@ pub(crate) struct CommonArgs {
     /// The bind address is controlled by `--management-bind-address`.
     #[arg(long, env = "COXSWAIN_HEALTH_PORT", default_value_t = 8081)]
     pub health_port: u16,
+
+    /// Kubernetes namespace to watch. Omit for cluster-wide scope.
+    ///
+    /// Both the controller and proxy pods watch the same namespace scope so
+    /// they agree on which resources count. Mirror this value across both
+    /// pods when installing manually; Helm renders it identically by default.
+    #[arg(long, env = "COXSWAIN_WATCH_NAMESPACE")]
+    pub watch_namespace: Option<String>,
+
+    /// Port on which Ingress traffic is served cluster-wide.
+    ///
+    /// The proxy pod binds this port; the controller pod compares Gateway
+    /// listener ports against it for the `PortUnavailable` listener
+    /// condition. When omitted, no static Ingress HTTP listener is bound and
+    /// Coxswain serves only the ports declared by `Gateway.spec.listeners`.
+    #[arg(long, env = "COXSWAIN_INGRESS_HTTP_PORT")]
+    pub ingress_http_port: Option<u16>,
+
+    /// Port on which TLS-terminated Ingress traffic is served cluster-wide.
+    ///
+    /// The proxy pod binds this port; the controller pod compares Gateway
+    /// listener ports against it for the `PortUnavailable` listener
+    /// condition. SNI selects the certificate from each `Ingress.spec.tls`
+    /// block. When omitted, no static Ingress HTTPS listener is bound.
+    #[arg(long, env = "COXSWAIN_INGRESS_HTTPS_PORT")]
+    pub ingress_https_port: Option<u16>,
 }
 
 /// Flags specific to roles that bind Pingora proxy listeners (`proxy`, `dev`).
@@ -194,28 +220,12 @@ pub(crate) struct ProxyArgs {
 
     /// IP address to bind all proxy listeners to.
     ///
-    /// Shared by both HTTP and HTTPS listeners; combine with `--proxy-http-port`
-    /// and/or `--proxy-https-port` to form the full bind address for each listener.
-    /// The health and admin servers bind separately via `--management-bind-address`.
+    /// Shared by both HTTP and HTTPS listeners; combine with
+    /// `--ingress-http-port` and/or `--ingress-https-port` (on `CommonArgs`)
+    /// to form the full bind address for each listener. The health and admin
+    /// servers bind separately via `--management-bind-address`.
     #[arg(long, env = "COXSWAIN_PROXY_BIND_ADDRESS", default_value = "0.0.0.0")]
     pub proxy_bind_address: IpAddr,
-
-    /// Port to listen on for inbound HTTP traffic.
-    ///
-    /// When omitted, no default HTTP listener is bound; coxswain relies on
-    /// Gateway `spec.listeners` to discover which ports to serve.
-    #[arg(long, env = "COXSWAIN_PROXY_HTTP_PORT")]
-    pub proxy_http_port: Option<u16>,
-
-    /// Port to listen on for inbound HTTPS traffic.
-    ///
-    /// SNI selects the certificate from each Ingress's `spec.tls` block.
-    /// Handshakes with no matching SNI fail cleanly.
-    ///
-    /// When omitted, no default HTTPS listener is bound; coxswain relies on
-    /// Gateway `spec.listeners` to discover which ports to serve.
-    #[arg(long, env = "COXSWAIN_PROXY_HTTPS_PORT")]
-    pub proxy_https_port: Option<u16>,
 
     /// Enable HAProxy PROXY protocol v1/v2 on the proxy listeners.
     ///
@@ -265,16 +275,25 @@ pub(crate) struct ProxyArgs {
         value_parser = humantime::parse_duration,
     )]
     pub proxy_default_backend_request_timeout: Option<Duration>,
+
+    /// Controller-wide default backend for Ingress traffic that does not match any rule.
+    ///
+    /// Format: `<namespace>/<service>:<port>` — e.g. `default/my-404-page:80`.
+    ///
+    /// When set, requests to hosts with no matching path (and requests to entirely
+    /// unknown hosts) are forwarded to this service. A per-Ingress `spec.defaultBackend`
+    /// always overrides this setting within that Ingress's rule hosts.
+    ///
+    /// The backing service is re-resolved on every routing-table rebuild; the default
+    /// disappears automatically if its endpoints become unavailable and reappears when
+    /// they recover.
+    #[arg(long, env = "COXSWAIN_INGRESS_DEFAULT_BACKEND")]
+    pub ingress_default_backend: Option<IngressDefaultBackend>,
 }
 
-/// Flags specific to roles that run the reconciler / status writer
-/// (`controller`, `dev`).
+/// Flags specific to roles that run the status writer (`controller`, `dev`).
 #[derive(Args, Debug)]
 pub(crate) struct ControllerArgs {
-    /// Kubernetes namespace to watch. Omit for cluster-wide scope.
-    #[arg(long, env = "COXSWAIN_CONTROLLER_WATCH_NAMESPACE")]
-    pub controller_watch_namespace: Option<String>,
-
     /// How long a leader lease stays valid without renewal.
     ///
     /// Determines how quickly a standby replica can take over after the leader dies.
@@ -310,20 +329,6 @@ pub(crate) struct ControllerArgs {
     /// not patched (backward-compatible default).
     #[arg(long, env = "COXSWAIN_STATUS_ADDRESS")]
     pub status_address: Option<String>,
-
-    /// Controller-wide default backend for Ingress traffic that does not match any rule.
-    ///
-    /// Format: `<namespace>/<service>:<port>` — e.g. `default/my-404-page:80`.
-    ///
-    /// When set, requests to hosts with no matching path (and requests to entirely
-    /// unknown hosts) are forwarded to this service. A per-Ingress `spec.defaultBackend`
-    /// always overrides this setting within that Ingress's rule hosts.
-    ///
-    /// The backing service is re-resolved on every routing-table rebuild; the default
-    /// disappears automatically if its endpoints become unavailable and reappears when
-    /// they recover.
-    #[arg(long, env = "COXSWAIN_INGRESS_DEFAULT_BACKEND")]
-    pub ingress_default_backend: Option<IngressDefaultBackend>,
 }
 
 /// Arguments accepted by the hidden `dev` role.

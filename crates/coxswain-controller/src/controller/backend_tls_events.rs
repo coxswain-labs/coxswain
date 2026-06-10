@@ -4,12 +4,12 @@
 //! for each owned Gateway that is an ancestor of the policy's target Service.
 
 use super::conditions::make_condition;
-use crate::gw_types::BackendTlsPolicy;
-use crate::gw_types::backendtlspolicies::{
+use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::gw_types::BackendTlsPolicy;
+use coxswain_reflector::gw_types::backendtlspolicies::{
     BackendTlsPolicyStatusAncestors, BackendTlsPolicyStatusAncestorsAncestorRef,
 };
-use crate::tls::{BackendTlsPolicyHealth, BackendTlsPolicyHealthMap};
-use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::tls::{BackendTlsPolicyHealth, BackendTlsPolicyHealthMap};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
     Client,

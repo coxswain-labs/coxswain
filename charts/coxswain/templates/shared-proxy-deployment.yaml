@@ -1,0 +1,151 @@
+{{- if .Values.proxy.shared.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "coxswain.sharedProxy.fullname" . }}
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "coxswain.labels" . | nindent 4 }}
+    app.kubernetes.io/component: shared-proxy
+spec:
+  replicas: {{ .Values.proxy.shared.replicas }}
+  selector:
+    matchLabels:
+      {{- include "coxswain.sharedProxy.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "coxswain.sharedProxy.selectorLabels" . | nindent 8 }}
+        {{- with .Values.proxy.shared.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.proxy.shared.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "coxswain.sharedProxy.serviceAccountName" . }}
+      automountServiceAccountToken: true
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.proxy.shared.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.proxy.shared.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.proxy.shared.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.proxy.shared.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.proxy.shared.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: coxswain
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "proxy", "--shared"]
+          ports:
+            {{- if .Values.proxy.http.enabled }}
+            - name: http
+              containerPort: {{ include "coxswain.httpContainerPort" . }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.proxy.https.enabled }}
+            - name: https
+              containerPort: {{ include "coxswain.httpsContainerPort" . }}
+              protocol: TCP
+            {{- end }}
+            - name: health
+              containerPort: {{ .Values.health.port }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ .Values.admin.port }}
+              protocol: TCP
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: COXSWAIN_LOG
+              value: {{ .Values.logFilter | quote }}
+            - name: COXSWAIN_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
+            - name: COXSWAIN_PROXY_THREADS
+              value: {{ .Values.proxy.shared.threads | quote }}
+            - name: COXSWAIN_HEALTH_PORT
+              value: {{ .Values.health.port | quote }}
+            - name: COXSWAIN_ADMIN_PORT
+              value: {{ .Values.admin.port | quote }}
+            - name: COXSWAIN_PROXY_BIND_ADDRESS
+              value: {{ .Values.proxy.shared.bindAddress | quote }}
+            - name: COXSWAIN_MANAGEMENT_BIND_ADDRESS
+              value: {{ .Values.management.bindAddress | quote }}
+            {{- if .Values.proxy.http.enabled }}
+            - name: COXSWAIN_INGRESS_HTTP_PORT
+              value: {{ include "coxswain.httpContainerPort" . | quote }}
+            {{- end }}
+            {{- if .Values.proxy.https.enabled }}
+            - name: COXSWAIN_INGRESS_HTTPS_PORT
+              value: {{ include "coxswain.httpsContainerPort" . | quote }}
+            {{- end }}
+            - name: COXSWAIN_CONTROLLER_NAME
+              value: {{ .Values.controllerName | quote }}
+            {{- if .Values.watchNamespace }}
+            - name: COXSWAIN_WATCH_NAMESPACE
+              value: {{ .Values.watchNamespace | quote }}
+            {{- end }}
+            - name: COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD
+              value: {{ .Values.proxy.shared.shutdownGracePeriod | quote }}
+            - name: COXSWAIN_PROXY_SHUTDOWN_TIMEOUT
+              value: {{ .Values.proxy.shared.shutdownTimeout | quote }}
+            {{- if .Values.proxy.shared.acceptProxyProtocol }}
+            - name: COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL
+              value: "true"
+            {{- end }}
+            {{- if .Values.proxy.shared.trustedSources }}
+            - name: COXSWAIN_PROXY_TRUSTED_SOURCES
+              value: {{ .Values.proxy.shared.trustedSources | join "," | quote }}
+            {{- end }}
+            {{- if .Values.proxy.shared.defaultRequestTimeout }}
+            - name: COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT
+              value: {{ .Values.proxy.shared.defaultRequestTimeout | quote }}
+            {{- end }}
+            {{- if .Values.proxy.shared.defaultBackendRequestTimeout }}
+            - name: COXSWAIN_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT
+              value: {{ .Values.proxy.shared.defaultBackendRequestTimeout | quote }}
+            {{- end }}
+            {{- if .Values.proxy.shared.ingressDefaultBackend }}
+            - name: COXSWAIN_INGRESS_DEFAULT_BACKEND
+              value: {{ .Values.proxy.shared.ingressDefaultBackend | quote }}
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: {{ .Values.containerSecurityContext.allowPrivilegeEscalation }}
+            readOnlyRootFilesystem: {{ .Values.containerSecurityContext.readOnlyRootFilesystem }}
+            capabilities:
+              drop: {{ .Values.containerSecurityContext.capabilities.drop | toJson }}
+              add: {{ if .Values.security.rootless }}[]{{ else }}{{ .Values.containerSecurityContext.capabilities.add | toJson }}{{ end }}
+          resources:
+            {{- toYaml .Values.proxy.shared.resources | nindent 12 }}
+{{- end }}

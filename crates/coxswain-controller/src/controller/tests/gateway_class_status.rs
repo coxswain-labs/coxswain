@@ -1,7 +1,7 @@
 use super::super::gateway_class_status::{
     SUPPORTED_FEATURES, build_gateway_class_status_patch, gateway_class_needs_status_patch,
 };
-use crate::gw_types::v::gatewayclasses::{
+use coxswain_reflector::gw_types::v::gatewayclasses::{
     GatewayClass, GatewayClassStatus, GatewayClassStatusSupportedFeatures,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};

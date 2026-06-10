@@ -63,9 +63,14 @@ ENV COXSWAIN_LOG=info \
 
 # No EXPOSE — coxswain's port model is fully env-driven. Only the health
 # (8081) and admin (8082) ports have defaults; proxy 80/443 are off unless
-# COXSWAIN_PROXY_HTTP_PORT / _HTTPS_PORT are set. EXPOSE 80 443 would imply
+# COXSWAIN_INGRESS_HTTP_PORT / _HTTPS_PORT are set. EXPOSE 80 443 would imply
 # a contract the bare image doesn't honor. README's `## Ports (default)`
 # table is the canonical documentation.
 
+# No CMD: every production deployment picks a role explicitly
+# (`serve controller`, `serve proxy --shared`, etc.). The Helm chart and the
+# raw manifests both set `args:` on the Deployment; bare `docker run` errors
+# with clap's help message, matching the binary's "no implicit role" stance.
+# Local development uses `cargo run -- serve dev` from a working copy, not
+# the image, so we don't need a dev-default CMD either.
 ENTRYPOINT ["/usr/local/bin/coxswain"]
-CMD ["serve"]

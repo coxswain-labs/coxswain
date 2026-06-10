@@ -1,12 +1,11 @@
-{{- if or .Values.proxy.http.enabled .Values.proxy.https.enabled .Values.service.gateway.additionalPorts -}}
+{{- if and .Values.proxy.shared.enabled (or .Values.proxy.http.enabled .Values.proxy.https.enabled .Values.service.gateway.additionalPorts) -}}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "coxswain.fullname" . }}-proxy
+  name: {{ include "coxswain.sharedProxy.fullname" . }}
   namespace: {{ .Values.namespace.name }}
   labels:
-    {{- include "coxswain.labels" . | nindent 4 }}
-    app.kubernetes.io/component: proxy
+    {{- include "coxswain.sharedProxy.selectorLabels" . | nindent 4 }}
   {{- with .Values.service.gateway.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -14,8 +13,7 @@ metadata:
 spec:
   type: {{ .Values.service.gateway.type }}
   selector:
-    {{- include "coxswain.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: proxy
+    {{- include "coxswain.sharedProxy.selectorLabels" . | nindent 4 }}
   {{- if .Values.service.gateway.externalTrafficPolicy }}
   externalTrafficPolicy: {{ .Values.service.gateway.externalTrafficPolicy }}
   {{- end }}
