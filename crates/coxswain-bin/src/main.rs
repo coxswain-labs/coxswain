@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use coxswain_admin::AdminServer;
 use coxswain_controller::{
-    ControllerConfig, IngressPorts, LeaseSettings, SharedGatewayListenerHealth, StatusWriterConfig,
-    spawn_status_writer,
+    ControllerConfig, IngressPorts, LeaseSettings, SharedClusterSummary,
+    SharedGatewayListenerHealth, StatusWriterConfig, spawn_status_writer,
 };
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::routing::{RouteTimeouts, SharedGatewayRoutingTable, SharedIngressRoutingTable};
@@ -129,6 +129,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             status_writer.outputs.ingress_routes,
             status_writer.outputs.gateway_routes,
         )
+        .with_cluster_summary(status_writer.outputs.cluster_summary)
         .into_service(admin_addr),
     );
 
@@ -208,6 +209,7 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
         leader,
         source.ingress_routes(),
         source.gateway_routes(),
+        None,
     );
 
     tracing::info!(
@@ -282,6 +284,7 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
         status_writer.leader,
         source.ingress_routes(),
         source.gateway_routes(),
+        Some(status_writer.outputs.cluster_summary),
     );
 
     tracing::info!(
@@ -504,6 +507,10 @@ fn wire_proxy_services(
 }
 
 /// Register the health and admin HTTP servers on the supplied server.
+///
+/// When `cluster` is `Some`, the admin server also serves `GET /cluster` and
+/// includes the three cluster-wide counters in `GET /status`. The shared-proxy
+/// role passes `None` so its admin surface stays read-only-and-routing-only.
 fn wire_management_servers(
     server: &mut Server,
     common: &CommonArgs,
@@ -511,6 +518,7 @@ fn wire_management_servers(
     leader: Arc<AtomicBool>,
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
+    cluster: Option<SharedClusterSummary>,
 ) {
     let health_addr = SocketAddr::new(common.management_bind_address, common.health_port);
     server.add_service({
@@ -525,9 +533,11 @@ fn wire_management_servers(
     });
 
     let admin_addr = SocketAddr::new(common.management_bind_address, common.admin_port);
-    server.add_service(
-        AdminServer::new(health, leader, ingress_routes, gateway_routes).into_service(admin_addr),
-    );
+    let mut admin = AdminServer::new(health, leader, ingress_routes, gateway_routes);
+    if let Some(cs) = cluster {
+        admin = admin.with_cluster_summary(cs);
+    }
+    server.add_service(admin.into_service(admin_addr));
 }
 
 /// List all owned Gateway objects from the cluster and return listener specs for

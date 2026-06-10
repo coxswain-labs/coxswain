@@ -1,6 +1,7 @@
 //! Debounced reconciler: watches all Kubernetes resources and rebuilds the routing
 //! and TLS tables whenever any of them change.
 
+use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
 use crate::gateway_api::hostnames_intersect;
 use crate::gateway_api::{
     BackendTlsIndex, GatewayApiReconciler, ListenerBinding, build_backend_tls_index,
@@ -21,6 +22,7 @@ use crate::{
     ingress::{IngressPorts, IngressReconciler},
 };
 use async_trait::async_trait;
+use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::reference_grants::ReferenceGrantKey;
@@ -43,6 +45,7 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -148,19 +151,21 @@ pub struct Reconciler {
     gateway_routes: SharedGatewayRoutingTable,
     tls: SharedTlsStore,
     tls_health: SharedGatewayListenerHealth,
+    cluster_summary: SharedClusterSummary,
     route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
     owned_gateways: OwnedGateways,
+    leader: Arc<AtomicBool>,
     health: ReconcilerHealth,
     controller_name: String,
     opts: ReconcilerOptions,
 }
 
-/// The four `Shared<T>` outputs the [`Reconciler`] writes into on each rebuild.
+/// The `Shared<T>` outputs the [`Reconciler`] writes into on each rebuild.
 ///
 /// Bundling them lets [`Reconciler::new`] stay under the workspace
 /// `clippy::too_many_arguments` threshold; callers pass one
-/// `ReconcilerOutputs` struct instead of four positional handles.
+/// `ReconcilerOutputs` struct instead of several positional handles.
 #[non_exhaustive]
 pub struct ReconcilerOutputs {
     /// Ingress-flavored routing table snapshot, updated on every successful Ingress build.
@@ -171,31 +176,42 @@ pub struct ReconcilerOutputs {
     pub tls: SharedTlsStore,
     /// Per-listener Gateway health used by status writes and the hot-reloader.
     pub tls_health: SharedGatewayListenerHealth,
+    /// Cluster aggregate (per-Gateway / per-Ingress summary) consumed by the
+    /// controller's `/cluster` admin endpoint. Updated on every rebuild.
+    pub cluster_summary: SharedClusterSummary,
 }
 
 impl ReconcilerOutputs {
-    /// Construct a `ReconcilerOutputs` bundle from its four shared handles.
+    /// Construct a `ReconcilerOutputs` bundle from its shared handles.
     #[must_use]
     pub fn new(
         ingress_routes: SharedIngressRoutingTable,
         gateway_routes: SharedGatewayRoutingTable,
         tls: SharedTlsStore,
         tls_health: SharedGatewayListenerHealth,
+        cluster_summary: SharedClusterSummary,
     ) -> Self {
         Self {
             ingress_routes,
             gateway_routes,
             tls,
             tls_health,
+            cluster_summary,
         }
     }
 }
 
 impl Reconciler {
     /// Construct a new reconciler (does not start the watch loop).
+    ///
+    /// `leader` is the shared leader-election flag the controller pod owns; the
+    /// proxy pod passes a fresh `Arc::new(AtomicBool::new(false))` since it never
+    /// holds a lease. The reconciler reads it once per rebuild to populate
+    /// [`coxswain_core::cluster::ControllerSummary::leader`].
     pub fn new(
         outputs: ReconcilerOutputs,
         owned_gateways: OwnedGateways,
+        leader: Arc<AtomicBool>,
         health: ReconcilerHealth,
         controller_name: String,
         opts: ReconcilerOptions,
@@ -205,15 +221,18 @@ impl Reconciler {
             gateway_routes,
             tls,
             tls_health,
+            cluster_summary,
         } = outputs;
         Self {
             ingress_routes,
             gateway_routes,
             tls,
             tls_health,
+            cluster_summary,
             route_health: SharedHttpRouteHealth::new(),
             policy_health: SharedBackendTlsPolicyHealth::new(),
             owned_gateways,
+            leader,
             health,
             controller_name,
             opts,
@@ -264,6 +283,7 @@ struct SharedOutputs<'a> {
     gateway_routes: &'a SharedGatewayRoutingTable,
     tls: &'a SharedTlsStore,
     tls_health: &'a SharedGatewayListenerHealth,
+    cluster_summary: &'a SharedClusterSummary,
     route_health: &'a SharedHttpRouteHealth,
     policy_health: &'a SharedBackendTlsPolicyHealth,
 }
@@ -361,9 +381,11 @@ impl BackgroundService for Reconciler {
             gateway_routes: self.gateway_routes.clone(),
             tls: self.tls.clone(),
             tls_health: self.tls_health.clone(),
+            cluster_summary: self.cluster_summary.clone(),
             route_health: self.route_health.clone(),
             policy_health: self.policy_health.clone(),
             owned_gateways: self.owned_gateways.clone(),
+            leader: Arc::clone(&self.leader),
             controller_health: self.health.controller.clone(),
             proxy_health: self.health.proxy.clone(),
         };
@@ -390,9 +412,11 @@ struct SharedHandles {
     gateway_routes: SharedGatewayRoutingTable,
     tls: SharedTlsStore,
     tls_health: SharedGatewayListenerHealth,
+    cluster_summary: SharedClusterSummary,
     route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
     owned_gateways: OwnedGateways,
+    leader: Arc<AtomicBool>,
     controller_health: SubsystemHandle,
     proxy_health: SubsystemHandle,
 }
@@ -407,9 +431,11 @@ async fn spawn_tasks(
         gateway_routes,
         tls,
         tls_health,
+        cluster_summary,
         route_health,
         policy_health,
         owned_gateways,
+        leader,
         controller_health,
         proxy_health,
     } = handles;
@@ -562,6 +588,7 @@ async fn spawn_tasks(
                 gateway_routes: &gateway_routes,
                 tls: &tls,
                 tls_health: &tls_health,
+                cluster_summary: &cluster_summary,
                 route_health: &route_health,
                 policy_health: &policy_health,
             };
@@ -571,6 +598,7 @@ async fn spawn_tasks(
                 &owned_gateways,
                 ingress_default_backend.as_ref(),
                 ingress_ports,
+                leader.load(Ordering::Acquire),
                 &outputs,
             );
             // First successful publish: flip the readiness checks that gate
@@ -596,6 +624,7 @@ fn rebuild(
     owned_gateways_handle: &OwnedGateways,
     ingress_default_backend: Option<&IngressDefaultBackend>,
     ingress_ports: IngressPorts,
+    leader: bool,
     outputs: &SharedOutputs<'_>,
 ) -> bool {
     let routes = stores.routes.state();
@@ -647,9 +676,25 @@ fn rebuild(
     let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, outputs.tls);
 
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
-    outputs.tls_health.store_and_notify(gateway_tls_health);
 
     let gateways = stores.gateways.state();
+    // Publish the cluster summary while we still have access to gateway_tls_health
+    // (it's moved into `tls_health.store_and_notify` next). Reads from already-
+    // materialised state: nothing kube-side, no allocations beyond the summary.
+    outputs
+        .cluster_summary
+        .store(Arc::new(build_cluster_summary(&ClusterSummaryInputs {
+            gateways: &gateways,
+            ingresses: &ingresses,
+            owned_gateways: &owned_gateways,
+            owned_ingress_classes: &owned_ingress_classes,
+            default_ingress_class: owned_default_ingress_class.as_deref(),
+            gateway_tls_health: &gateway_tls_health,
+            leader,
+        })));
+
+    outputs.tls_health.store_and_notify(gateway_tls_health);
+
     let route_health_map = GatewayApiReconciler::compute_route_health(
         &routes,
         &gateways,

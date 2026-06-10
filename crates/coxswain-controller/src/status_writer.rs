@@ -15,6 +15,7 @@
 //! invariant.
 
 use crate::{Controller, ControllerConfig};
+use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_reflector::{
@@ -108,6 +109,7 @@ pub fn spawn_status_writer(
     let gateway_routes = coxswain_core::routing::SharedGatewayRoutingTable::new();
     let tls_store = coxswain_core::tls::SharedTlsStore::new();
     let gateway_tls_health = SharedGatewayListenerHealth::new();
+    let cluster_summary = SharedClusterSummary::new();
     let leader = Arc::new(AtomicBool::new(false));
     let owned_gateways = OwnedGateways::new();
 
@@ -135,6 +137,7 @@ pub fn spawn_status_writer(
         gateway_routes,
         tls_store,
         gateway_tls_health.clone(),
+        cluster_summary,
     );
 
     let reconciler = Reconciler::new(
@@ -143,8 +146,10 @@ pub fn spawn_status_writer(
             outputs.gateway_routes.clone(),
             outputs.tls.clone(),
             outputs.tls_health.clone(),
+            outputs.cluster_summary.clone(),
         ),
         owned_gateways.clone(),
+        Arc::clone(&leader),
         ReconcilerHealth::new(controller_handle, proxy_handle),
         controller_name.clone(),
         {

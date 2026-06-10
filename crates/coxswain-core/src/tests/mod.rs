@@ -1,3 +1,4 @@
+mod cluster;
 mod gateway_parameters;
 mod health;
 mod ownership;
