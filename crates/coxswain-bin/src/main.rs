@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use coxswain_admin::AdminServer;
 use coxswain_controller::{
-    ControllerConfig, IngressPorts, LeaseSettings, SharedClusterSummary,
+    ControllerConfig, IngressPorts, LeaseSettings, Operator, OperatorConfig, SharedClusterSummary,
     SharedGatewayListenerHealth, StatusWriterConfig, spawn_status_writer,
 };
 use coxswain_core::health::HealthRegistry;
@@ -108,6 +108,15 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     server.add_service(background_service("controller", status_writer.controller));
     server.add_service(background_service("reconciler", status_writer.reconciler));
 
+    server.add_service(background_service(
+        "operator",
+        Operator::new(OperatorConfig {
+            controller_name: args.common.controller_name.clone(),
+            controller_image: resolve_controller_image(),
+            leader: Arc::clone(&status_writer.leader),
+        }),
+    ));
+
     let health_addr = SocketAddr::new(args.common.management_bind_address, args.common.health_port);
     server.add_service({
         let mut svc = Service::new(
@@ -139,6 +148,22 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         "Listening"
     );
     server.run_forever();
+}
+
+/// Resolve the image string the provisioning operator embeds in rendered
+/// dedicated-proxy Deployments when `CoxswainGatewayParameters.spec.image`
+/// is unset. Priority: `COXSWAIN_IMAGE` env var (set by the Helm chart from
+/// the controller's own image) → built-in `ghcr.io/coxswain-labs/coxswain:<version>`
+/// fallback for local `serve dev` runs. The fallback isn't pulled when
+/// running locally (Step 8 is log-only); it shows up only in the logged
+/// YAML so operators can spot whether the chart's env wiring is healthy.
+fn resolve_controller_image() -> String {
+    std::env::var("COXSWAIN_IMAGE").unwrap_or_else(|_| {
+        format!(
+            "ghcr.io/coxswain-labs/coxswain:{}",
+            env!("CARGO_PKG_VERSION")
+        )
+    })
 }
 
 /// Wire and run the `proxy --shared` pod role: read-only data plane for
@@ -595,6 +620,15 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
 
     server.add_service(background_service("controller", status_writer.controller));
     server.add_service(background_service("reconciler", status_writer.reconciler));
+
+    server.add_service(background_service(
+        "operator",
+        Operator::new(OperatorConfig {
+            controller_name: args.common.controller_name.clone(),
+            controller_image: resolve_controller_image(),
+            leader: Arc::clone(&status_writer.leader),
+        }),
+    ));
 
     wire_proxy_services(&mut server, &args.common, &args.proxy, &source, &tls_health)?;
 

@@ -148,6 +148,36 @@ cargo run --bin coxswain -- serve proxy --dedicated \
 - **Listener refusal is a warning today.** A listener with `from: All` or `from: Selector` and no matching opt-in logs a warning at startup but still serves traffic. Step 10 promotes this to an `Accepted=false` listener condition.
 - **`ControllerReconciler` is a type alias for `SharedProxyReconciler`.** The narrower controller-only output set (skipping routing-table builds, skipping TLS store) is deferred to a follow-up; the controller pod runs the full shared-proxy reconciler today. The type-level distinction exists so the future split is a purely internal refactor.
 
+### Observe the provisioning operator's dry-run output
+
+`serve controller` (and `serve dev`) runs a provisioning operator that watches every `Gateway` and renders the dedicated-proxy `Deployment` / `Service` / `ServiceAccount` for any Gateway whose `parametersRef` (or whose `GatewayClass`'s `parametersRef`) points at a `CoxswainGatewayParameters` object. The renderer logs the YAML at `INFO` whenever the rendered spec changes. **No cluster writes** — that's Step 9 (#208).
+
+Apply the dev fixture and watch the controller log:
+
+```bash
+kubectl apply -f deploy/dev/sample-gateway-parameters.yaml
+# In a separate window, follow the controller log:
+cargo run --bin coxswain -- serve dev --log-format console 2>&1 | grep "operator:"
+```
+
+A Gateway in the `coxswain` class with `spec.infrastructure.parametersRef` pointing at the `sample` `CoxswainGatewayParameters` produces a single log entry per reconcile cycle with three YAML fields: `deployment`, `service`, `service_account`. Re-applying the same params produces no new log line (steady-state is quiet); changing `replicas` or any other field re-fires the log.
+
+Verify no cluster writes happen:
+
+```bash
+kubectl get events --field-selector=involvedObject.kind=Deployment \
+  -A --watch-only
+# No events from the coxswain-controller SA for Step 8.
+```
+
+If `parametersRef` targets a missing `CoxswainGatewayParameters` object, the operator logs a warning naming the missing reference and re-queues. Step 9 will promote this to an `Accepted=false` listener condition on the Gateway (#208).
+
+#### Known limitations (deferred)
+
+- **No cluster apply.** The operator logs rendered YAML only. Step 9 (#208) wires server-side-apply of `Deployment` / `Service` / `ServiceAccount`, owner-referenced to the Gateway, with GC on Gateway delete.
+- **Opt-in RBAC flags are not on the CRD yet.** The two flags exist as CLI args for manual `serve proxy --dedicated` (Step 7) but `spec.proxy.allowClusterWideRouteRead` / `spec.proxy.allowClusterWideNamespaceRead` are not yet on `CoxswainGatewayParameters`. They land alongside the actual apply in #208 so the controller can resolve them into the provisioned pod's CLI args in one place.
+- **`InvalidParameters` Gateway condition deferred.** Today a missing parametersRef target only logs a warning; Step 9 (#208) wires the condition emission into the existing status writer's path.
+
 | Port   | Purpose                                          |
 |--------|--------------------------------------------------|
 | `80`   | HTTP proxy (data plane)                          |

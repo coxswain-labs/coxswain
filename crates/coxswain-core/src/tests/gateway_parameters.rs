@@ -50,23 +50,23 @@ fn chart_crd_is_byte_identical_to_manifest_crd() {
 }
 
 #[test]
-fn empty_spec_uses_serde_defaults() {
+fn empty_spec_leaves_all_fields_unset() {
     let cr = parse_cr("{}");
-    assert_eq!(cr.spec.replicas, 1);
-    assert_eq!(cr.spec.service_type, ServiceType::LoadBalancer);
+    assert!(cr.spec.replicas.is_none());
+    assert!(cr.spec.service_type.is_none());
     assert!(cr.spec.image.is_none());
     assert!(cr.spec.resources.is_none());
     assert!(cr.spec.pod_template.is_none());
 }
 
 #[test]
-fn partial_specs_fill_remaining_with_defaults() {
+fn partial_specs_leave_unmentioned_fields_unset() {
     let cases: &[(&str, &str, CoxswainGatewayParametersSpec)] = &[
         (
             "replicas only",
             "replicas: 7",
             CoxswainGatewayParametersSpec {
-                replicas: 7,
+                replicas: Some(7),
                 ..Default::default()
             },
         ),
@@ -82,7 +82,7 @@ fn partial_specs_fill_remaining_with_defaults() {
             "serviceType NodePort",
             "serviceType: NodePort",
             CoxswainGatewayParametersSpec {
-                service_type: ServiceType::NodePort,
+                service_type: Some(ServiceType::NodePort),
                 ..Default::default()
             },
         ),
@@ -90,7 +90,7 @@ fn partial_specs_fill_remaining_with_defaults() {
             "serviceType ClusterIP",
             "serviceType: ClusterIP",
             CoxswainGatewayParametersSpec {
-                service_type: ServiceType::ClusterIp,
+                service_type: Some(ServiceType::ClusterIp),
                 ..Default::default()
             },
         ),
@@ -143,8 +143,8 @@ fn pod_template_preserves_arbitrary_json() {
 fn sample_dev_fixture_deserializes() {
     let parsed: CoxswainGatewayParameters = serde_yaml::from_str(SAMPLE_FIXTURE_YAML)
         .unwrap_or_else(|e| panic!("dev sample fixture must deserialize: {e}"));
-    assert_eq!(parsed.spec.replicas, 2);
-    assert_eq!(parsed.spec.service_type, ServiceType::LoadBalancer);
+    assert_eq!(parsed.spec.replicas, Some(2));
+    assert_eq!(parsed.spec.service_type, Some(ServiceType::LoadBalancer));
     assert_eq!(
         parsed.spec.image.as_deref(),
         Some("ghcr.io/coxswain-labs/coxswain:latest"),
