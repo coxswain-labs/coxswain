@@ -6,7 +6,7 @@ on:
 name: E2E
 
 concurrency:
-  group: E2E-${{ github.ref }}
+  group: e2e-${{ github.ref }}
   cancel-in-progress: true
 
 # `e2e-*` matrix entries and `e2e-conformance` are required status checks.

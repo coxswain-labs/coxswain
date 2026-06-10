@@ -12,7 +12,7 @@ name: Release
 # cancel in-progress runs because each is publishing artifacts.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 # Publishes coxswain OCI images and the Helm chart to ghcr.io, and attaches
 # a rendered install.yaml to every GitHub Release.

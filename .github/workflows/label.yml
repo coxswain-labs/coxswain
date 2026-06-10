@@ -7,7 +7,7 @@ on:
 name: Label
 
 concurrency:
-  group: Label-${{ github.ref }}
+  group: label-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

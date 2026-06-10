@@ -6,7 +6,7 @@ on:
 name: Distribution
 
 concurrency:
-  group: Distribution-${{ github.ref }}
+  group: distribution-${{ github.ref }}
   cancel-in-progress: true
 
 # PR-time validation for distribution artifacts: Docker image, Helm chart,

@@ -4,8 +4,8 @@ on:
 
 name: Security audit
 concurrency:
-  group: Security audit
-  cancel-in-progress: false
+  group: security-audit
+  cancel-in-progress: true
 
 jobs:
   audit:

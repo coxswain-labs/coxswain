@@ -6,7 +6,7 @@ on:
 name: CI
 
 concurrency:
-  group: CI-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 # The workflow-level `paths:` filter was removed deliberately: the jobs below

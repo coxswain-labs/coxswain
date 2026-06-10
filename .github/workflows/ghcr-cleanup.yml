@@ -6,8 +6,8 @@ on:
 name: GHCR cleanup
 
 concurrency:
-  group: GHCR cleanup
-  cancel-in-progress: false
+  group: ghcr-cleanup
+  cancel-in-progress: true
 
 # Deletes old :main-<sha7> container image versions from GHCR, keeping the
 # 20 most recent snapshots. Versioned releases (:v*, :0.*, :latest) are

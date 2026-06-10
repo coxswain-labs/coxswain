@@ -7,7 +7,7 @@ on:
 name: Experimental
 
 concurrency:
-  group: Experimental-${{ github.ref }}
+  group: experimental-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
