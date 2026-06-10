@@ -2,6 +2,7 @@
 
 use anyhow::Context as _;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use tokio::process::Command;
 
 /// Single source of truth for the Gateway API CRD version installed in tests.
@@ -26,20 +27,31 @@ pub async fn bootstrap() -> anyhow::Result<()> {
 
     let root = workspace_root().context("workspace root")?;
 
-    // Purge any namespaces left over from a previous interrupted run.
-    // --wait=false: don't block; the counter-based names ensure no collision with
-    // Terminating namespaces within the same run.
-    let _ = Command::new("kubectl")
-        .args([
-            "delete",
-            "ns",
-            "-l",
-            "coxswain-e2e=true",
-            "--ignore-not-found",
-            "--wait=false",
-        ])
-        .status()
-        .await;
+    // Purge any namespaces left over from a previous interrupted run. Runs at
+    // most once per process — tests that restart the harness mid-run (e.g.
+    // `restart_controller_does_not_bump_resource_version`) need their
+    // in-flight namespaces preserved across the second `Harness::start()`.
+    // The counter-based naming inside one process guarantees no collision
+    // with Terminating namespaces from a previous run; cross-process cleanup
+    // is what this purge is for.
+    static PURGED: Once = Once::new();
+    let mut should_purge = false;
+    PURGED.call_once(|| {
+        should_purge = true;
+    });
+    if should_purge {
+        let _ = Command::new("kubectl")
+            .args([
+                "delete",
+                "ns",
+                "-l",
+                "coxswain-e2e=true",
+                "--ignore-not-found",
+                "--wait=false",
+            ])
+            .status()
+            .await;
+    }
 
     if !gateway_v1_crds_installed().await {
         tracing::info!("Gateway API CRDs absent or pre-v1, installing {GATEWAY_API_VERSION}");
@@ -59,6 +71,10 @@ pub async fn bootstrap() -> anyhow::Result<()> {
 
     let manifests = root.join("deploy/manifests");
     kubectl_apply(&manifests.join("namespace.yaml")).await?;
+    // Coxswain-specific CRDs (e.g. `CoxswainGatewayParameters` driving the
+    // dedicated-mode provisioning operator). Applied before any RBAC or
+    // Gateway resources so fixtures that reference these kinds resolve.
+    kubectl_apply_dir(&manifests.join("crds")).await?;
     // Both RBAC files install ServiceAccounts + ClusterRoles. The e2e harness
     // runs coxswain as a local subprocess against the cluster, so it doesn't
     // actually exercise either ServiceAccount, but applying them keeps the
@@ -66,6 +82,9 @@ pub async fn bootstrap() -> anyhow::Result<()> {
     // for the `rbac_read_only_proxy.rs` test which audits the proxy SA.
     kubectl_apply(&manifests.join("controller-rbac.yaml")).await?;
     kubectl_apply(&manifests.join("shared-proxy-rbac.yaml")).await?;
+    // ClusterRole the dedicated-proxy ServiceAccount is bound to via the
+    // per-namespace RoleBindings the controller reconciles (#209).
+    kubectl_apply(&manifests.join("dedicated-proxy-clusterrole.yaml")).await?;
     kubectl_apply(&manifests.join("gateway-class.yaml")).await?;
     kubectl_apply(&manifests.join("ingress-class.yaml")).await?;
 
@@ -184,6 +203,24 @@ async fn kubectl_apply(path: &Path) -> anyhow::Result<()> {
         .await
         .context("kubectl")?;
     anyhow::ensure!(status.success(), "kubectl apply failed: {}", path.display());
+    Ok(())
+}
+
+/// Apply every `.yaml` / `.yml` file in `dir` non-recursively. Used for
+/// `deploy/manifests/crds/` so adding a new CRD doesn't require updating the
+/// bootstrap.
+async fn kubectl_apply_dir(dir: &Path) -> anyhow::Result<()> {
+    let status = Command::new("kubectl")
+        .args(["apply", "-f"])
+        .arg(dir)
+        .status()
+        .await
+        .context("kubectl")?;
+    anyhow::ensure!(
+        status.success(),
+        "kubectl apply -f {} failed",
+        dir.display()
+    );
     Ok(())
 }
 

@@ -271,17 +271,20 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
         gateway_namespace,
         allow_cluster_wide_route_read,
         allow_cluster_wide_namespace_read,
+        watch_namespaces,
     ) = match args.scope() {
         ProxyScope::Gateway {
             name,
             namespace,
             allow_cluster_wide_route_read,
             allow_cluster_wide_namespace_read,
+            watch_namespaces,
         } => (
             name,
             namespace,
             allow_cluster_wide_route_read,
             allow_cluster_wide_namespace_read,
+            watch_namespaces,
         ),
         ProxyScope::Shared => {
             // Invariant: this arm is only entered when the caller already
@@ -332,6 +335,7 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
         gateway_namespace: gateway_namespace.clone(),
         allow_cluster_wide_route_read,
         allow_cluster_wide_namespace_read,
+        watch_namespaces,
         health: ReconcilerHealth::new(controller_handle, proxy_handle),
     });
 

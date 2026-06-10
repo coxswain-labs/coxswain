@@ -44,12 +44,31 @@ rules:
     verbs: ["patch", "update"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
-      ["gatewayclasses", "gateways", "httproutes", "referencegrants", "backendtlspolicies"]
+      ["gatewayclasses", "httproutes", "referencegrants", "backendtlspolicies"]
     verbs: ["get", "list", "watch"]
+  # `gateways` has `patch` / `update` on the main resource (in addition to the
+  # /status subresource) so the controller can manage a finalizer for
+  # dedicated-mode cleanup (#209). The controller code only mutates
+  # `metadata.finalizers` — the wider RBAC scope is unavoidable because K8s
+  # doesn't expose a `/finalizers` subresource for `gateways`. Every Gateway
+  # API controller using finalizers operates the same way.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways"]
+    verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       ["gatewayclasses/status", "gateways/status", "httproutes/status", "backendtlspolicies/status"]
     verbs: ["patch", "update"]
+  # Server-side-apply / delete of per-namespace `RoleBinding`s that scope
+  # each dedicated-proxy ServiceAccount to the namespaces its Gateway routes
+  # backends into (#209). Cluster-wide because backendRefs can target any
+  # namespace. RoleBindings the controller manages carry the
+  # `app.kubernetes.io/managed-by=coxswain` label; reconcile-driven cleanup
+  # (no owner-refs — cross-namespace ownership is unsupported by K8s GC) lists
+  # by that label.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Read CoxswainGatewayParameters so the provisioning operator (#207) can
   # resolve `parametersRef`s from Gateway and GatewayClass. No write verbs:
   # operators author these objects; the controller only renders from them.

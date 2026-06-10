@@ -267,6 +267,19 @@ proxy:
     # default/my-404-page:80
     ingressDefaultBackend: ""
 
+  # Dedicated-mode proxy provisioning. The pods themselves are not rendered
+  # by Helm — the controller provisions one Deployment / Service /
+  # ServiceAccount per Gateway with `parametersRef`, in the Gateway's own
+  # namespace. This block only governs the cluster-wide objects the
+  # provisioning relies on.
+  dedicated:
+    # Render the ClusterRole `coxswain-gateway-proxy-reader` (the permission
+    # template the controller binds via per-namespace RoleBindings — issue
+    # #209). Disable only if you manage this object externally; the
+    # controller's binding logic still expects a ClusterRole by that name.
+    rbac:
+      create: true
+
   # HTTP listener. Clients always connect on `port`; the container binds on
   # `port` normally, or 8080 when security.rootless is true. Both pods take
   # the value as COXSWAIN_INGRESS_HTTP_PORT: the proxy binds it for data

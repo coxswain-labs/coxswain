@@ -1,0 +1,39 @@
+{{- if .Values.proxy.dedicated.rbac.create -}}
+# Permission template for dedicated-mode Gateway proxy ServiceAccounts.
+#
+# The controller (issue #209, Step 10) binds this ClusterRole via per-namespace
+# `RoleBinding`s — one binding per (dedicated Gateway, namespace it routes a
+# backend into), so each proxy ServiceAccount holds reads only in the
+# namespaces its Gateway actually touches.
+#
+# Load-bearing invariants:
+#   - Zero write verbs. A compromised dedicated proxy must not be able to
+#     write to Kubernetes. The e2e test in
+#     `crates/coxswain-e2e/tests/rbac_read_only_proxy.rs` enforces this.
+#   - No rules on cluster-scoped resources. Rules on `gatewayclasses` would be
+#     silently ineffective when bound via a `RoleBinding`, so listing them
+#     would be a lie. The dedicated proxy drops the `GatewayClass` watch
+#     entirely on the dedicated path; the controller is the authority on
+#     "this Gateway is dedicated and mine".
+#
+# The role is named with a fixed cluster-wide identifier — coxswain is an
+# ingress controller and only one install per cluster is supported.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: coxswain-gateway-proxy-reader
+  labels:
+    {{- include "coxswain.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dedicated-proxy
+rules:
+  - apiGroups: [""]
+    resources: ["services", "secrets", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      ["gateways", "httproutes", "referencegrants", "backendtlspolicies"]
+    verbs: ["get", "list", "watch"]
+{{- end }}

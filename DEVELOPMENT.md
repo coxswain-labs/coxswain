@@ -144,8 +144,7 @@ cargo run --bin coxswain -- serve proxy --dedicated \
 
 #### Known limitations (deferred)
 
-- **Watch scope is cluster-wide today.** True per-namespace narrowed watches land with Step 10 (per-Gateway-proxy `RoleBinding` reconciliation) — the two need to ship together because the runtime narrowing has no value without the matching RBAC narrowing.
-- **Listener refusal is a warning today.** A listener with `from: All` or `from: Selector` and no matching opt-in logs a warning at startup but still serves traffic. Step 10 promotes this to an `Accepted=false` listener condition.
+- **Watch scope is per-namespace only on `from: Same` listeners (#209).** The dedicated proxy now spawns per-namespace reflectors driven by the controller-rendered `--proxy-watch-namespaces` arg list, which mirrors the per-namespace `RoleBinding`s the controller has provisioned for the proxy ServiceAccount. `from: All` and `from: Selector` route attachment, plus the CRD-level opt-in flags `spec.proxy.allowClusterWideRouteRead` / `allowClusterWideNamespaceRead` and the `Accepted=false` listener-refusal status, are punted to a follow-up issue tracked in the v0.2 milestone.
 - **`ControllerReconciler` is a type alias for `SharedProxyReconciler`.** The narrower controller-only output set (skipping routing-table builds, skipping TLS store) is deferred to a follow-up; the controller pod runs the full shared-proxy reconciler today. The type-level distinction exists so the future split is a purely internal refactor.
 
 ### Observe dedicated-mode provisioning
@@ -178,14 +177,12 @@ kubectl delete gateway tenant-a-gw -n tenant-a
 
 If `parametersRef` targets a missing `CoxswainGatewayParameters` object, the operator publishes an `Accepted=False, reason=InvalidParameters` condition on the Gateway via the shared override channel; the status writer picks it up on the next Gateway reconcile.
 
-#### Half-functional state (intentional, until #209 lands)
-
-The dedicated proxy pod **boots but stays in `CrashLoopBackOff`** in this PR. The provisioned `ServiceAccount` has no per-namespace `RoleBinding`s yet — Step 10 (#209) provisions those. The proxy pod fails every K8s list/watch with `forbidden` until then. This is deliberate: #208 covers resource provisioning, GC, and SSA idempotency, but not traffic flow. `kubectl get pod -n tenant-a` shows the proxy retrying; `kubectl get gateway -n tenant-a -o yaml` shows `Programmed=True` (no listener-level health divergence yet — Step 12 refines dedicated-mode status coordination).
+As of #209 the controller also reconciles a `RoleBinding` in every namespace the Gateway's HTTPRoutes route a backend into (gated by `ReferenceGrant` for cross-namespace refs). Each binding ties the provisioned `ServiceAccount` to the static `coxswain-gateway-proxy-reader` `ClusterRole` (shipped by the Helm chart and `deploy/manifests/dedicated-proxy-clusterrole.yaml`). The dedicated proxy pod uses the controller-rendered `--proxy-watch-namespaces` arg to spawn per-namespace reflectors that match the binding set — so a multi-tenant install gets least-privilege RBAC by construction. The Gateway carries a `gateway.coxswain-labs.dev/dedicated-cleanup` finalizer so cross-namespace bindings are removed before K8s finalizes the Gateway deletion.
 
 #### Known limitations (deferred)
 
-- **Opt-in RBAC flags are not on the CRD yet.** The two flags exist as CLI args for manual `serve proxy --dedicated` (Step 7) but `spec.proxy.allowClusterWideRouteRead` / `spec.proxy.allowClusterWideNamespaceRead` are not yet on `CoxswainGatewayParameters`. They land in Step 10 (#209) alongside the per-Gateway-proxy RBAC narrowing.
-- **Shared pool still serves dedicated-mode Gateways.** Step 11 (#210) excludes dedicated Gateways from the shared-proxy's routing table; until then, traffic served by the shared pool *and* the (not-yet-functional) dedicated pod overlap.
+- **Opt-in RBAC flags are not on the CRD yet (#229).** The two flags exist as CLI args for manual `serve proxy --dedicated` (Step 7) but `spec.proxy.allowClusterWideRouteRead` / `spec.proxy.allowClusterWideNamespaceRead` are not yet on `CoxswainGatewayParameters`. They land in #229 alongside the cluster-wide-mode ClusterRoles and the `Accepted=false` listener-refusal status promotion.
+- **Shared pool still serves dedicated-mode Gateways.** Step 11 (#210) excludes dedicated Gateways from the shared-proxy's routing table; until then, traffic served by the shared pool *and* the dedicated pod overlap.
 
 | Port   | Purpose                                          |
 |--------|--------------------------------------------------|

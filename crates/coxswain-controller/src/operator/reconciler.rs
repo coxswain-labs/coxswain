@@ -33,17 +33,21 @@
 //! successful resolve we clear the override so the writer returns to
 //! emitting `Accepted=True`.
 
-use super::{apply, params, render};
+use super::{apply, params, rbac, render};
 use crate::AcceptedOverrides;
 use crate::AcceptedReason;
 use async_trait::async_trait;
 use coxswain_core::crd::CoxswainGatewayParameters;
 use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::gw_types::HttpRoute;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
+use coxswain_reflector::gw_types::v::referencegrants::ReferenceGrant;
 use futures::StreamExt;
+use k8s_openapi::api::rbac::v1::RoleBinding;
 use kube::{
     Api, Client, Resource as _,
+    api::{Patch, PatchParams},
     runtime::{
         WatchStreamExt,
         controller::{Action, Controller},
@@ -86,6 +90,9 @@ pub(super) enum ReconcileError {
     /// SSA of one of the three rendered resources failed.
     #[error("apply: {0}")]
     Apply(#[from] apply::ApplyError),
+    /// Per-namespace `RoleBinding` reconcile or cleanup failed (#209).
+    #[error("rbac: {0}")]
+    Rbac(#[from] rbac::RbacError),
 }
 
 /// Bundle of inputs the operator's [`BackgroundService::start`] needs from
@@ -143,8 +150,22 @@ struct ReconcileContext {
     client: Client,
     class_store: Store<GatewayClass>,
     params_store: Store<CoxswainGatewayParameters>,
+    routes_store: Store<HttpRoute>,
+    grants_store: Store<ReferenceGrant>,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
+
+/// Finalizer key the operator places on every dedicated-mode Gateway. The
+/// reconcile clears cross-namespace `RoleBinding`s (and provisioned same-ns
+/// resources will GC via owner-ref) before removing this finalizer; without
+/// it K8s would delete the Gateway before we can clean up the bindings,
+/// leaving stale RBAC across the cluster.
+const CLEANUP_FINALIZER: &str = "gateway.coxswain-labs.dev/dedicated-cleanup";
+
+/// Short re-queue used after adding the finalizer on a fresh dedicated
+/// Gateway. The follow-up reconcile sees the patched object (with the
+/// finalizer in place) and proceeds to apply + bind in one body.
+const POST_FINALIZER_REQUEUE: Duration = Duration::from_millis(50);
 
 fn gateway_key(gw: &Gateway) -> ObjectKey {
     ObjectKey::new(
@@ -164,7 +185,7 @@ impl BackgroundService for Operator {
             }
         };
 
-        // Spawn the two cross-watched reflector stores in parallel with the
+        // Spawn the cross-watched reflector stores in parallel with the
         // Controller. Their `Store`s are shared into the reconcile Context.
         let mut tasks = JoinSet::new();
         let (class_reader, class_writer) = reflector::store::<GatewayClass>();
@@ -191,6 +212,30 @@ impl BackgroundService for Operator {
                 while stream.next().await.is_some() {}
             }
         });
+        let (routes_reader, routes_writer) = reflector::store::<HttpRoute>();
+        tasks.spawn({
+            let api = Api::<HttpRoute>::all(client.clone());
+            async move {
+                let stream = reflector::reflector(
+                    routes_writer,
+                    watcher(api, watcher::Config::default()).default_backoff(),
+                );
+                tokio::pin!(stream);
+                while stream.next().await.is_some() {}
+            }
+        });
+        let (grants_reader, grants_writer) = reflector::store::<ReferenceGrant>();
+        tasks.spawn({
+            let api = Api::<ReferenceGrant>::all(client.clone());
+            async move {
+                let stream = reflector::reflector(
+                    grants_writer,
+                    watcher(api, watcher::Config::default()).default_backoff(),
+                );
+                tokio::pin!(stream);
+                while stream.next().await.is_some() {}
+            }
+        });
 
         let ctx = Arc::new(ReconcileContext {
             controller_name: self.config.controller_name.clone(),
@@ -200,6 +245,8 @@ impl BackgroundService for Operator {
             client: client.clone(),
             class_store: class_reader,
             params_store: params_reader,
+            routes_store: routes_reader,
+            grants_store: grants_reader,
             last_hashes: Mutex::new(HashMap::new()),
         });
 
@@ -208,8 +255,12 @@ impl BackgroundService for Operator {
         // observe. Step 9 (#208) adds `.owns(api_deployments, ...)`.
         let api_gateways: Api<Gateway> = Api::all(client.clone());
         let api_classes: Api<GatewayClass> = Api::all(client.clone());
-        let api_params: Api<CoxswainGatewayParameters> = Api::all(client);
+        let api_params: Api<CoxswainGatewayParameters> = Api::all(client.clone());
+        let api_routes: Api<HttpRoute> = Api::all(client.clone());
+        let api_grants: Api<ReferenceGrant> = Api::all(client.clone());
+        let api_bindings: Api<RoleBinding> = Api::all(client);
         let class_store_for_watches = ctx.class_store.clone();
+        let routes_store_for_watches = ctx.routes_store.clone();
 
         let controller = Controller::new(api_gateways, watcher::Config::default());
         let gateway_store = controller.store();
@@ -251,7 +302,82 @@ impl BackgroundService for Operator {
                         .map(|gw| ObjectRef::from_obj(gw.as_ref()))
                         .collect()
                 }
-            });
+            })
+            // HTTPRoute → Gateway: every parentRef pointing at a Gateway
+            // we manage triggers a reconcile for that Gateway. Precise
+            // mapping — no fan-out.
+            .watches(api_routes, watcher::Config::default(), {
+                move |route: HttpRoute| -> Vec<ObjectRef<Gateway>> {
+                    let route_ns = route
+                        .metadata
+                        .namespace
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_string();
+                    let Some(parents) = route.spec.parent_refs.as_deref() else {
+                        return vec![];
+                    };
+                    parents
+                        .iter()
+                        .filter(|p| {
+                            let group = p.group.as_deref().unwrap_or("gateway.networking.k8s.io");
+                            let kind = p.kind.as_deref().unwrap_or("Gateway");
+                            group == "gateway.networking.k8s.io" && kind == "Gateway"
+                        })
+                        .map(|p| {
+                            let ns = p.namespace.clone().unwrap_or_else(|| route_ns.clone());
+                            ObjectRef::new(&p.name).within(&ns)
+                        })
+                        .collect()
+                }
+            })
+            // ReferenceGrant → Gateway: filter to those whose routes have a
+            // backendRef into the grant's namespace. Engineering-correct
+            // precise mapping; we deliberately do not broad fan-out — the
+            // cost of maintaining the index closure is bounded
+            // (dedicated_gateways × routes × backend_refs) and the precise
+            // mapping scales naturally past today's "tens of Gateways" cap.
+            .watches(api_grants, watcher::Config::default(), {
+                let gateway_store = gateway_store.clone();
+                let routes_store = routes_store_for_watches.clone();
+                move |grant: ReferenceGrant| -> Vec<ObjectRef<Gateway>> {
+                    let Some(target_ns) = grant.metadata.namespace.clone() else {
+                        return vec![];
+                    };
+                    let routes: Vec<Arc<HttpRoute>> = routes_store.state();
+                    gateway_store
+                        .state()
+                        .into_iter()
+                        .filter(|gw| {
+                            let gw_ns = gw.metadata.namespace.as_deref().unwrap_or("");
+                            let gw_name = gw.metadata.name.as_deref().unwrap_or("");
+                            gateway_routes_into(&routes, gw_ns, gw_name, &target_ns)
+                        })
+                        .map(|gw| ObjectRef::from_obj(gw.as_ref()))
+                        .collect()
+                }
+            })
+            // RoleBinding → Gateway: managed-by label filter; mapper reads
+            // the gateway-namespace/gateway-name labels to identify the
+            // owning Gateway. Drives drift detection — an out-of-band delete
+            // re-creates within watch latency rather than waiting for the
+            // next natural reconcile trigger.
+            .watches(
+                api_bindings,
+                watcher::Config::default().labels("app.kubernetes.io/managed-by=coxswain"),
+                |rb: RoleBinding| -> Vec<ObjectRef<Gateway>> {
+                    let Some(labels) = rb.metadata.labels.as_ref() else {
+                        return vec![];
+                    };
+                    let Some(name) = labels.get("gateway.networking.k8s.io/gateway-name") else {
+                        return vec![];
+                    };
+                    let Some(ns) = labels.get("gateway.coxswain-labs.dev/gateway-namespace") else {
+                        return vec![];
+                    };
+                    vec![ObjectRef::new(name).within(ns)]
+                },
+            );
 
         let stream = controller.run(reconcile, error_policy, ctx);
         // The controller stream contains `!Unpin` futures internally
@@ -284,6 +410,34 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
     }
 
     let key = gateway_key(&gw);
+    let gw_namespace = gw.metadata.namespace.as_deref().unwrap_or("");
+    let gw_name = gw.metadata.name.as_deref().unwrap_or("");
+
+    // ----- Finalizer / deletion path ------------------------------------
+    //
+    // A Gateway with `deletionTimestamp` set is being deleted; if it carries
+    // our finalizer, we own the synchronous cleanup of cross-namespace
+    // `RoleBinding`s before K8s can finalize the delete. Provisioned
+    // resources (Deployment/Service/SA) in the Gateway's own namespace
+    // GC via owner-refs — independent of this finalizer.
+    if gw.metadata.deletion_timestamp.is_some() {
+        if has_our_finalizer(&gw) {
+            tracing::info!(
+                gateway = %gateway_id(&gw),
+                "operator: cleaning up dedicated-mode bindings for terminating Gateway"
+            );
+            rbac::delete_all_for_gateway(&ctx.client, gw_namespace, gw_name).await?;
+            remove_finalizer(&ctx.client, &gw).await?;
+            // GC of in-namespace resources is owner-ref driven; nothing else
+            // to do here.
+            ctx.last_hashes
+                .lock()
+                .unwrap_or_else(|e| panic!("invariant: hash-tracking mutex poisoned: {e}"))
+                .remove(&key);
+        }
+        return Ok(Action::await_change());
+    }
+
     let class_name = &gw.spec.gateway_class_name;
     let Some(class) = ctx
         .class_store
@@ -316,9 +470,18 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
     }) {
         Ok(Some(e)) => e,
         Ok(None) => {
-            // Not dedicated mode; clear any stale override left over from a
-            // previous dedicated-mode reconcile (e.g. user removed
-            // `parametersRef` to roll back to the shared pool).
+            // Not dedicated mode. If we previously placed our finalizer on
+            // this Gateway (it was dedicated, now isn't), clean up bindings
+            // and the finalizer too so the Gateway can transition cleanly
+            // back to the shared pool.
+            if has_our_finalizer(&gw) {
+                tracing::info!(
+                    gateway = %gateway_id(&gw),
+                    "operator: Gateway transitioned out of dedicated mode; cleaning bindings"
+                );
+                rbac::delete_all_for_gateway(&ctx.client, gw_namespace, gw_name).await?;
+                remove_finalizer(&ctx.client, &gw).await?;
+            }
             ctx.accepted_overrides.clear(&key);
             return Ok(Action::await_change());
         }
@@ -335,17 +498,43 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
         }
     };
 
+    // Dedicated-mode Gateway. Ensure the finalizer is in place before doing
+    // any provisioning — if anything goes wrong before the finalizer is
+    // patched, a delete can race past us. Add → requeue → continue.
+    if !has_our_finalizer(&gw) {
+        add_finalizer(&ctx.client, &gw).await?;
+        return Ok(Action::requeue(POST_FINALIZER_REQUEUE));
+    }
+
+    // Compute the desired namespace set once and share between rbac.rs and
+    // (future) the rendered `--proxy-watch-namespaces` arg.
+    let desired = rbac::desired_namespaces_for_gateway(&gw, &ctx.routes_store, &ctx.grants_store);
+
     let rendered = render::render(&render::RenderInputs {
         gateway: &gw,
         params: &effective,
         controller_image: &ctx.controller_image,
         gateway_class_name: class_name,
+        watch_namespaces: &desired,
     });
 
-    // Always SSA — `force=true` re-asserts ownership on every reconcile so a
-    // human `kubectl edit` is reverted on the next cycle. See
-    // [`apply`] module docs for the source-of-truth contract.
+    // Stage 1 — provisioning (Deployment/Service/SA). SSA with force=true
+    // re-asserts ownership on every reconcile; the apply order is SA →
+    // Service → Deployment so the ServiceAccount exists before any
+    // RoleBinding references it.
     apply::apply_rendered(&ctx.client, &gw, &rendered).await?;
+
+    // Stage 2 — per-namespace RoleBindings. The proxy SA name matches the
+    // rendered SA's name (GEP-1762 `<NAME>-<GATEWAY CLASS>`); we pass it in
+    // explicitly so reconciler.rs stays the single source of truth for
+    // resource naming.
+    let proxy_sa_name = rendered
+        .service_account
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or_else(|| panic!("invariant: rendered ServiceAccount has no name"));
+    rbac::reconcile_rbac(&ctx.client, &gw, proxy_sa_name, &desired).await?;
 
     // Successful resolve + apply → clear any prior `InvalidParameters`
     // override (e.g. user just created the missing
@@ -378,6 +567,117 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
     }
 
     Ok(Action::await_change())
+}
+
+/// Returns true iff the Gateway carries our cleanup finalizer.
+fn has_our_finalizer(gw: &Gateway) -> bool {
+    gw.metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|s| s == CLEANUP_FINALIZER))
+}
+
+/// Patch the Gateway to add our finalizer to `metadata.finalizers`.
+/// Idempotent server-side: if the finalizer is already present, the patched
+/// state matches and the apiserver accepts the no-op.
+async fn add_finalizer(client: &Client, gw: &Gateway) -> Result<(), kube::Error> {
+    let namespace = gw.metadata.namespace.as_deref().unwrap_or_else(|| {
+        panic!("invariant: Gateway has no namespace; the API server requires it")
+    });
+    let name =
+        gw.metadata.name.as_deref().unwrap_or_else(|| {
+            panic!("invariant: Gateway has no name; the API server requires it")
+        });
+    // Construct the desired finalizer set: existing + ours. SSA's strategic
+    // merge handles deduplication when we list our finalizer alongside
+    // pre-existing ones.
+    let mut finalizers: Vec<String> = gw.metadata.finalizers.clone().unwrap_or_default();
+    if !finalizers.iter().any(|s| s == CLEANUP_FINALIZER) {
+        finalizers.push(CLEANUP_FINALIZER.to_string());
+    }
+    let patch = serde_json::json!({
+        "metadata": {
+            "finalizers": finalizers,
+        }
+    });
+    let api: Api<Gateway> = Api::namespaced(client.clone(), namespace);
+    let params = PatchParams::default();
+    api.patch(name, &params, &Patch::Merge(&patch)).await?;
+    Ok(())
+}
+
+/// Patch the Gateway to remove our finalizer. Idempotent — if the finalizer
+/// isn't present, we still write the resulting list back; the apiserver
+/// accepts the no-op.
+async fn remove_finalizer(client: &Client, gw: &Gateway) -> Result<(), kube::Error> {
+    let namespace = gw.metadata.namespace.as_deref().unwrap_or_else(|| {
+        panic!("invariant: Gateway has no namespace; the API server requires it")
+    });
+    let name =
+        gw.metadata.name.as_deref().unwrap_or_else(|| {
+            panic!("invariant: Gateway has no name; the API server requires it")
+        });
+    let finalizers: Vec<String> = gw
+        .metadata
+        .finalizers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s != CLEANUP_FINALIZER)
+        .collect();
+    let patch = serde_json::json!({
+        "metadata": {
+            "finalizers": finalizers,
+        }
+    });
+    let api: Api<Gateway> = Api::namespaced(client.clone(), namespace);
+    let params = PatchParams::default();
+    api.patch(name, &params, &Patch::Merge(&patch)).await?;
+    Ok(())
+}
+
+/// Returns true iff any HTTPRoute attached to the given Gateway has a
+/// `backendRef` whose target namespace equals `target_ns`. Used by the
+/// ReferenceGrant cross-watch mapper to filter affected Gateways precisely.
+fn gateway_routes_into(
+    routes: &[Arc<HttpRoute>],
+    gw_namespace: &str,
+    gw_name: &str,
+    target_ns: &str,
+) -> bool {
+    for route in routes {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("");
+        let Some(parents) = route.spec.parent_refs.as_deref() else {
+            continue;
+        };
+        let attaches = parents.iter().any(|p| {
+            let group = p.group.as_deref().unwrap_or("gateway.networking.k8s.io");
+            let kind = p.kind.as_deref().unwrap_or("Gateway");
+            let ns = p.namespace.as_deref().unwrap_or(route_ns);
+            group == "gateway.networking.k8s.io"
+                && kind == "Gateway"
+                && p.name == gw_name
+                && ns == gw_namespace
+        });
+        if !attaches {
+            continue;
+        }
+        let Some(rules) = route.spec.rules.as_deref() else {
+            continue;
+        };
+        for rule in rules {
+            let Some(brefs) = rule.backend_refs.as_deref() else {
+                continue;
+            };
+            for b in brefs {
+                let ns = b.namespace.as_deref().unwrap_or(route_ns);
+                if ns == target_ns {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn error_policy(obj: Arc<Gateway>, err: &ReconcileError, _ctx: Arc<ReconcileContext>) -> Action {
@@ -487,12 +787,14 @@ mod tests {
             params: &params_a,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: &std::collections::BTreeSet::new(),
         });
         let r_b = render::render(&render::RenderInputs {
             gateway: &gw,
             params: &params_b,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: &std::collections::BTreeSet::new(),
         });
         assert_ne!(
             hash_rendered(&r_a),
@@ -522,11 +824,13 @@ mod tests {
             status: None,
         };
         let params = EffectiveParams::default();
+        let empty_ns = std::collections::BTreeSet::new();
         let inputs = render::RenderInputs {
             gateway: &gw,
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: &empty_ns,
         };
         let r1 = render::render(&inputs);
         let r2 = render::render(&inputs);
