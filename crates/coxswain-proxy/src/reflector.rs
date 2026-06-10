@@ -147,6 +147,11 @@ pub struct DedicatedProxyReflectorConfig {
     /// Permit cluster-wide Namespace reads (gates listeners with
     /// `allowedRoutes.namespaces.from: Selector`).
     pub allow_cluster_wide_namespace_read: bool,
+    /// Namespaces the proxy is permitted to watch backend resources in.
+    /// Rendered by the controller from the Gateway's desired-namespace set
+    /// (issue #209). Empty list falls back to cluster-wide watches; production
+    /// invocations always set this.
+    pub watch_namespaces: Vec<String>,
     /// Health-registry handles produced by the bin's `HealthRegistry::register`
     /// calls.
     pub health: ReconcilerHealth,
@@ -183,6 +188,7 @@ pub fn spawn_dedicated_routing_table_builder(
         gateway_namespace,
         allow_cluster_wide_route_read,
         allow_cluster_wide_namespace_read,
+        watch_namespaces,
         health,
     } = config;
 
@@ -204,6 +210,7 @@ pub fn spawn_dedicated_routing_table_builder(
     );
     dedicated_config.allow_cluster_wide_route_read = allow_cluster_wide_route_read;
     dedicated_config.allow_cluster_wide_namespace_read = allow_cluster_wide_namespace_read;
+    dedicated_config.watch_namespaces = watch_namespaces;
 
     let reconciler = DedicatedProxyReconciler::new(
         dedicated_config,

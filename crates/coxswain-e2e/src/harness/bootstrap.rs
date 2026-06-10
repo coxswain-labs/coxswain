@@ -26,9 +26,19 @@ pub async fn bootstrap() -> anyhow::Result<()> {
 
     let root = workspace_root().context("workspace root")?;
 
-    // Purge any namespaces left over from a previous interrupted run.
-    // --wait=false: don't block; the counter-based names ensure no collision with
-    // Terminating namespaces within the same run.
+    // Purge any namespaces left over from a previous run AND from
+    // already-completed tests inside the current run. This runs on EVERY
+    // `Harness::start()` call. Without it, a terminating namespace from a
+    // previous test can keep its `Ingress` resources in the proxy's routing
+    // table briefly — long enough that the next test's HTTP requests hit
+    // (and assert against) the wrong backend, especially when the lingering
+    // Ingress is the `*`-host catchall used by `default_backend_only`.
+    //
+    // Tests that need a namespace to survive across multiple
+    // `Harness::start()` calls within the same test function (i.e. the
+    // controller-restart idempotency test) MUST use
+    // [`crate::NamespaceGuard::create_persistent`] to opt out of the
+    // `coxswain-e2e=true` label that this purge keys on.
     let _ = Command::new("kubectl")
         .args([
             "delete",
@@ -59,6 +69,10 @@ pub async fn bootstrap() -> anyhow::Result<()> {
 
     let manifests = root.join("deploy/manifests");
     kubectl_apply(&manifests.join("namespace.yaml")).await?;
+    // Coxswain-specific CRDs (e.g. `CoxswainGatewayParameters` driving the
+    // dedicated-mode provisioning operator). Applied before any RBAC or
+    // Gateway resources so fixtures that reference these kinds resolve.
+    kubectl_apply_dir(&manifests.join("crds")).await?;
     // Both RBAC files install ServiceAccounts + ClusterRoles. The e2e harness
     // runs coxswain as a local subprocess against the cluster, so it doesn't
     // actually exercise either ServiceAccount, but applying them keeps the
@@ -66,6 +80,9 @@ pub async fn bootstrap() -> anyhow::Result<()> {
     // for the `rbac_read_only_proxy.rs` test which audits the proxy SA.
     kubectl_apply(&manifests.join("controller-rbac.yaml")).await?;
     kubectl_apply(&manifests.join("shared-proxy-rbac.yaml")).await?;
+    // ClusterRole the dedicated-proxy ServiceAccount is bound to via the
+    // per-namespace RoleBindings the controller reconciles (#209).
+    kubectl_apply(&manifests.join("dedicated-proxy-clusterrole.yaml")).await?;
     kubectl_apply(&manifests.join("gateway-class.yaml")).await?;
     kubectl_apply(&manifests.join("ingress-class.yaml")).await?;
 
@@ -184,6 +201,24 @@ async fn kubectl_apply(path: &Path) -> anyhow::Result<()> {
         .await
         .context("kubectl")?;
     anyhow::ensure!(status.success(), "kubectl apply failed: {}", path.display());
+    Ok(())
+}
+
+/// Apply every `.yaml` / `.yml` file in `dir` non-recursively. Used for
+/// `deploy/manifests/crds/` so adding a new CRD doesn't require updating the
+/// bootstrap.
+async fn kubectl_apply_dir(dir: &Path) -> anyhow::Result<()> {
+    let status = Command::new("kubectl")
+        .args(["apply", "-f"])
+        .arg(dir)
+        .status()
+        .await
+        .context("kubectl")?;
+    anyhow::ensure!(
+        status.success(),
+        "kubectl apply -f {} failed",
+        dir.display()
+    );
     Ok(())
 }
 

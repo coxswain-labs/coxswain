@@ -442,6 +442,34 @@ pub(crate) struct ProxyRoleArgs {
         conflicts_with = "shared"
     )]
     pub allow_cluster_wide_namespace_read: bool,
+
+    /// Comma-separated list of namespaces the dedicated proxy is permitted to
+    /// watch backend resources in (Services, EndpointSlices, Secrets,
+    /// ConfigMaps, HTTPRoutes, ReferenceGrants, BackendTLSPolicies, Gateways).
+    ///
+    /// The controller renders this list from the desired-namespace set
+    /// computed for the Gateway: the Gateway's own namespace plus every
+    /// namespace its HTTPRoutes route backends into (gated by `ReferenceGrant`
+    /// for cross-namespace refs). The list mirrors the `RoleBinding`s the
+    /// controller has provisioned for this proxy's `ServiceAccount` — every
+    /// listed namespace must have a matching binding, or the proxy's watches
+    /// hard-fail with a permission denied.
+    ///
+    /// When the list changes, the controller updates the rendered Deployment
+    /// spec and K8s rolls the proxy pod; the proxy itself never re-discovers
+    /// the namespace set at runtime.
+    ///
+    /// Required with `--dedicated`; rejected with `--shared`. Empty list is
+    /// rejected (every dedicated proxy must at least watch its Gateway's own
+    /// namespace).
+    #[arg(
+        long,
+        env = "COXSWAIN_PROXY_WATCH_NAMESPACES",
+        value_delimiter = ',',
+        required_if_eq("dedicated", "true"),
+        conflicts_with = "shared"
+    )]
+    pub proxy_watch_namespaces: Vec<String>,
 }
 
 /// Resolved scope for a `proxy` role invocation.
@@ -459,6 +487,10 @@ pub(crate) enum ProxyScope {
         allow_cluster_wide_route_read: bool,
         /// Whether the operator opted into cluster-wide Namespace reads.
         allow_cluster_wide_namespace_read: bool,
+        /// Namespaces the proxy is permitted to watch backend resources in.
+        /// Set by the controller from the Gateway's resolved
+        /// desired-namespace set.
+        watch_namespaces: Vec<String>,
     },
 }
 
@@ -485,6 +517,7 @@ impl ProxyRoleArgs {
                 namespace,
                 allow_cluster_wide_route_read: self.allow_cluster_wide_route_read,
                 allow_cluster_wide_namespace_read: self.allow_cluster_wide_namespace_read,
+                watch_namespaces: self.proxy_watch_namespaces.clone(),
             }
         }
     }
@@ -548,6 +581,7 @@ mod tests {
             "--dedicated",
             "--gateway-name=my-gw",
             "--gateway-namespace=tenant-a",
+            "--proxy-watch-namespaces=tenant-a",
         ])
         .expect("parses");
         let Commands::Serve(serve) = cli.command;
@@ -561,6 +595,7 @@ mod tests {
                 namespace: "tenant-a".to_string(),
                 allow_cluster_wide_route_read: false,
                 allow_cluster_wide_namespace_read: false,
+                watch_namespaces: vec!["tenant-a".to_string()],
             }
         );
     }
@@ -575,6 +610,7 @@ mod tests {
             "--dedicated",
             "--gateway-name=my-gw",
             "--gateway-namespace=tenant-a",
+            "--proxy-watch-namespaces=tenant-a,shared",
             "--allow-cluster-wide-route-read",
             "--allow-cluster-wide-namespace-read",
         ])
@@ -590,8 +626,40 @@ mod tests {
                 namespace: "tenant-a".to_string(),
                 allow_cluster_wide_route_read: true,
                 allow_cluster_wide_namespace_read: true,
+                watch_namespaces: vec!["tenant-a".to_string(), "shared".to_string()],
             }
         );
+    }
+
+    /// `--dedicated` without `--proxy-watch-namespaces` fails the
+    /// `required_if_eq` rule — the proxy needs to know which namespaces it can
+    /// watch, derived by the controller from the desired-namespace set.
+    #[test]
+    fn serve_proxy_dedicated_requires_watch_namespaces() {
+        let err = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "proxy",
+            "--dedicated",
+            "--gateway-name=my-gw",
+            "--gateway-namespace=tenant-a",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    /// `--proxy-watch-namespaces` conflicts with `--shared`.
+    #[test]
+    fn shared_rejects_proxy_watch_namespaces() {
+        let err = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "proxy",
+            "--shared",
+            "--proxy-watch-namespaces=tenant-a",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     /// The opt-in flags conflict with `--shared`.

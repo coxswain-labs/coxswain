@@ -35,11 +35,15 @@
 //! ## Container args
 //!
 //! `serve proxy --dedicated --gateway-name=<name> --gateway-namespace=<ns>
-//! --log-format=json`. The two RBAC opt-in flags
-//! (`--allow-cluster-wide-route-read`, `--allow-cluster-wide-namespace-read`)
-//! are *not* emitted yet: the CRD doesn't carry the matching fields in
-//! v1alpha1. They land alongside the per-Gateway-proxy RBAC narrowing in
-//! Step 10 (#209).
+//! --proxy-watch-namespaces=<ns1>,<ns2>,... --log-format=json`. The
+//! `--proxy-watch-namespaces` list mirrors the per-namespace `RoleBinding`s
+//! the controller manages for this proxy's `ServiceAccount` (#209); both are
+//! derived from
+//! [`super::rbac::desired_namespaces_for_gateway`] so they cannot drift.
+//! The two RBAC opt-in flags (`--allow-cluster-wide-route-read`,
+//! `--allow-cluster-wide-namespace-read`) are *not* emitted yet: the CRD
+//! doesn't carry the matching fields in v1alpha1; their plumbing lands in a
+//! follow-up issue once the default per-namespace mode is stable.
 //!
 //! ## Service ports
 //!
@@ -63,6 +67,12 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReferen
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Empty placeholder used by render tests that don't exercise the
+/// per-namespace narrowing arg list. Declared here so tests don't have to
+/// re-spell the empty literal at every call site.
+#[cfg(test)]
+const EMPTY_WATCH_NS: &BTreeSet<String> = &BTreeSet::new();
 
 /// Label keys that the controller owns unconditionally. User-supplied
 /// `Gateway.spec.infrastructure.labels` collisions on any of these keys are
@@ -93,6 +103,12 @@ pub(super) struct RenderInputs<'a> {
     /// Name of the Gateway's GatewayClass (i.e. `gateway.spec.gatewayClassName`).
     /// Used in the GEP-1762 `<NAME>-<GATEWAY CLASS>` resource naming.
     pub(super) gateway_class_name: &'a str,
+    /// Sorted set of namespaces the proxy is permitted to watch backend
+    /// resources in. Rendered into the container args as
+    /// `--proxy-watch-namespaces=ns1,ns2,...` so it mirrors the per-namespace
+    /// `RoleBinding`s the controller has provisioned (#209). Sorted so
+    /// reorderings don't produce hash churn or unnecessary Deployment rolls.
+    pub(super) watch_namespaces: &'a BTreeSet<String>,
 }
 
 /// The three rendered resources for one dedicated-mode Gateway.
@@ -358,17 +374,33 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         .and_then(|r| i32::try_from(r).ok())
         .unwrap_or(DEFAULT_REPLICAS);
 
+    let mut args = vec![
+        "serve".to_string(),
+        "proxy".to_string(),
+        "--dedicated".to_string(),
+        format!("--gateway-name={gw_name}"),
+        format!("--gateway-namespace={}", common.namespace),
+    ];
+    // BTreeSet iterates in sorted order — the resulting `--proxy-watch-namespaces`
+    // value is deterministic, so the rendered Deployment hash only changes
+    // when the namespace SET changes (not when its iteration order would).
+    // Omit the arg entirely when the set is empty so the proxy falls back to
+    // cluster-wide watches for tests and the legacy half-functional state.
+    if !inputs.watch_namespaces.is_empty() {
+        let joined = inputs
+            .watch_namespaces
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        args.push(format!("--proxy-watch-namespaces={joined}"));
+    }
+    args.push("--log-format=json".to_string());
+
     let coxswain_container = Container {
         name: "coxswain".to_string(),
         image: Some(image),
-        args: Some(vec![
-            "serve".to_string(),
-            "proxy".to_string(),
-            "--dedicated".to_string(),
-            format!("--gateway-name={gw_name}"),
-            format!("--gateway-namespace={}", common.namespace),
-            "--log-format=json".to_string(),
-        ]),
+        args: Some(args),
         ports: Some(container_ports(inputs.gateway)),
         resources: inputs.params.resources.clone(),
         ..Default::default()
@@ -503,6 +535,7 @@ mod tests {
             params: &params,
             controller_image: "ghcr.io/coxswain-labs/coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
 
         // Names per GEP-1762.
@@ -550,6 +583,7 @@ mod tests {
             params: &params,
             controller_image: "irrelevant",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
         assert_eq!(result.deployment.spec.unwrap().replicas, Some(5));
         assert_eq!(
@@ -559,7 +593,8 @@ mod tests {
     }
 
     /// Container args carry the dedicated-mode invocation, gateway name +
-    /// namespace, and JSON log format.
+    /// namespace, and JSON log format. Empty `watch_namespaces` omits the
+    /// `--proxy-watch-namespaces` arg entirely (legacy/test fallback).
     #[test]
     fn container_args_carry_dedicated_invocation() {
         let gw = make_gateway("tenant-a", "team-gw", vec![("http", 80, "HTTP")]);
@@ -569,6 +604,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
         let container = &result
             .deployment
@@ -592,6 +628,55 @@ mod tests {
         );
     }
 
+    /// `--proxy-watch-namespaces` is rendered when the set is non-empty, in
+    /// sorted order (BTreeSet iteration). The arg appears before
+    /// `--log-format` so a human reading the spec sees scope before output
+    /// format.
+    #[test]
+    fn container_args_carry_sorted_watch_namespaces() {
+        let gw = make_gateway("tenant-a", "team-gw", vec![("http", 80, "HTTP")]);
+        let params = EffectiveParams::default();
+        let mut watch_ns = BTreeSet::new();
+        watch_ns.insert("shared-services".to_string());
+        watch_ns.insert("tenant-a".to_string());
+        watch_ns.insert("certs".to_string());
+        let result = render(&RenderInputs {
+            gateway: &gw,
+            params: &params,
+            controller_image: "coxswain:v0.2",
+            gateway_class_name: "coxswain",
+            watch_namespaces: &watch_ns,
+        });
+        let container = &result
+            .deployment
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers[0];
+        let args = container.args.as_ref().expect("args set");
+        // BTreeSet iterates lexicographically — certs, shared-services,
+        // tenant-a.
+        let expected_ns_arg = "--proxy-watch-namespaces=certs,shared-services,tenant-a";
+        assert!(
+            args.iter().any(|a| a == expected_ns_arg),
+            "expected sorted --proxy-watch-namespaces arg; got: {args:?}"
+        );
+        let pos_ns = args
+            .iter()
+            .position(|a| a == expected_ns_arg)
+            .expect("found");
+        let pos_log = args
+            .iter()
+            .position(|a| a == "--log-format=json")
+            .expect("found");
+        assert!(
+            pos_ns < pos_log,
+            "namespace scoping arg should precede --log-format"
+        );
+    }
+
     /// One Service port per listener.
     #[test]
     fn service_ports_one_per_listener() {
@@ -606,6 +691,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2);
@@ -634,6 +720,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2, "the two HTTP:80 listeners dedupe");
@@ -660,6 +747,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod_spec.containers.len(), 2, "coxswain + sidecar");
@@ -700,6 +788,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
         for labels in [
             result.deployment.metadata.labels.as_ref(),
@@ -736,6 +825,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(
@@ -760,6 +850,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
         for meta in [
             &result.deployment.metadata,
@@ -799,6 +890,7 @@ mod tests {
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
         for meta in [
             &result.deployment.metadata,
@@ -837,6 +929,7 @@ mod tests {
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
         let labels = result.deployment.metadata.labels.as_ref().expect("labels");
         assert_eq!(
@@ -871,6 +964,7 @@ mod tests {
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
+            watch_namespaces: EMPTY_WATCH_NS,
         });
         for meta in [
             &result.deployment.metadata,

@@ -30,7 +30,7 @@ Watches Ingress, GatewayClass, Gateway, HTTPRoute, and related resources cluster
 
 The provisioning operator runs as a kube-rs `Controller` alongside the status writer in the same pod. Its reconcile loop resolves each Gateway's effective `CoxswainGatewayParameters` (per-field overlay: Gateway's `parametersRef` wins per-field, GatewayClass's fills the rest; `podTemplate` strategic-merges across both layers) and renders the desired `Deployment` / `Service` / `ServiceAccount`. The `podTemplate` escape hatch is merged onto the rendered Deployment with `kubectl apply` strategic-merge semantics — `containers` merges by `name`, `tolerations` by `(key, operator)`, container-level `env` by `name`, and so on — so sidecar injection and env overlays behave the way operators expect from native K8s tooling.
 
-As of issue #207 the operator runs in *log-only* mode: it hashes the rendered specs and logs the YAML at `INFO` whenever they change. No cluster writes happen — the controller's RBAC at this stage carries `get/list/watch` on `CoxswainGatewayParameters` but no create/update on `Deployment` / `Service` / `ServiceAccount`. Step 9 (#208) promotes the operator to server-side-apply and adds the matching RBAC.
+The same reconcile loop also manages per-namespace `RoleBinding`s for the proxy's `ServiceAccount` (#209): one binding per namespace the Gateway's HTTPRoutes route a backend into (gated by `ReferenceGrant` for cross-namespace refs), each binding the SA to the static `coxswain-gateway-proxy-reader` `ClusterRole`. A finalizer `gateway.coxswain-labs.dev/dedicated-cleanup` on every dedicated Gateway guarantees cross-namespace bindings are removed before K8s finalizes the Gateway deletion (cross-namespace owner references aren't supported by K8s GC for namespaced resources, so cleanup is reconcile-driven via a `managed-by` label selector).
 
 ### `serve proxy --shared`
 
@@ -38,9 +38,11 @@ Stateless read-only Pingora data plane. Serves every `Ingress` and every `Gatewa
 
 ### `serve proxy --dedicated`
 
-Read-only proxy scoped to a single Gateway (identified by `--gateway-name` and `--gateway-namespace`). Provisioned by the controller in the Gateway's namespace (or a namespace specified via `parametersRef`) — see Step 9 of the architecture plan. Has its own rollout, failure domain, and `/metrics`. As of issue #206 (v0.2), the dedicated proxy runs with the same cluster-wide-reads RBAC profile as the shared proxy; per-namespace read narrowing is paired with Step 10's per-Gateway-proxy `RoleBinding` reconciliation.
+Read-only proxy scoped to a single Gateway (identified by `--gateway-name` and `--gateway-namespace`). Provisioned by the controller in the Gateway's namespace (or a namespace specified via `parametersRef`) — see Step 9 of the architecture plan. Has its own rollout, failure domain, and `/metrics`.
 
-When the target Gateway has any listener with `allowedRoutes.namespaces.from: All` or `Selector`, the operator must explicitly opt in to broader RBAC via `--allow-cluster-wide-route-read` (for `from: All`) or `--allow-cluster-wide-namespace-read` (for `from: Selector`). Today these flags govern a startup warning only; once Step 10 lands, listeners using a non-`Same` `from` without the matching opt-in will be marked `Accepted=false`.
+As of #209 the dedicated proxy runs with **per-namespace narrowed RBAC**: the controller renders `--proxy-watch-namespaces=<ns1>,<ns2>,...` into the container args, and the proxy spawns one reflector per (resource, namespace) pair scoped to exactly the namespaces the controller has provisioned `RoleBinding`s for. The binding set and the watch set are derived from the same desired-namespace computation in the controller, so they can't drift. The `GatewayClass` watch is dropped on this path — the controller is the authority on "this Gateway is dedicated and mine".
+
+When the target Gateway has any listener with `allowedRoutes.namespaces.from: All` or `Selector`, the operator must explicitly opt in to broader RBAC via `--allow-cluster-wide-route-read` (for `from: All`) or `--allow-cluster-wide-namespace-read` (for `from: Selector`). These flags exist as CLI args today and govern a startup warning; the matching CRD fields (`spec.proxy.allowClusterWideRouteRead` / `allowClusterWideNamespaceRead`) and the `Accepted=false` listener-refusal status condition land in #229.
 
 ### `serve dev`
 
@@ -154,7 +156,7 @@ flowchart LR
 Each proxy pod self-watches Kubernetes directly:
 
 - A **shared-proxy** uses a broad cluster-wide filter covering all routing CRs (HTTPRoute, Ingress, Gateway, Service, EndpointSlice).
-- A **dedicated proxy** (`--dedicated`) narrows its routing-table build to a single named Gateway; cross-namespace backends and TLS Secrets resolve via `ReferenceGrant` as usual. Per-namespace watch narrowing (and the matching RBAC narrowing) is paired with Step 10 of the architecture plan; until then the dedicated proxy uses cluster-wide reads with zero write verbs, identical to the shared-proxy RBAC profile.
+- A **dedicated proxy** (`--dedicated`) narrows its routing-table build to a single named Gateway; cross-namespace backends and TLS Secrets resolve via `ReferenceGrant` as usual. As of #209 it also narrows its **watches** to the namespaces the controller has rendered into `--proxy-watch-namespaces`, matching the per-namespace `RoleBinding`s the same reconcile cycle provisioned for the proxy SA.
 
 There is no xDS server and no IPC between the controller and any proxy — the controller never pushes data, and a controller crash never disrupts proxy traffic. A future `--source=xds` mode could be added behind the same `RoutingSource` trait boundary without touching proxy code.
 
@@ -162,12 +164,16 @@ There is no xDS server and no IPC between the controller and any proxy — the c
 
 | Resource | Verb | `controller` | `shared-proxy` | `dedicated-proxy` |
 |---|---|:-:|:-:|:-:|
-| HTTPRoute, Gateway, GatewayClass, Ingress, IngressClass | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (cluster today; namespace after Step 10) |
-| Service, EndpointSlice | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (cluster today; namespace after Step 10) |
-| Secret (`kubernetes.io/tls`) | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (cluster today; namespace after Step 10) |
+| HTTPRoute, Gateway, ReferenceGrant, BackendTLSPolicy | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (per-namespace, via `RoleBinding`) |
+| GatewayClass, Ingress, IngressClass | list, watch, get | ✓ (cluster) | ✓ (cluster) | — (dropped — Gateway carries its class name) |
+| Service, EndpointSlice | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (per-namespace) |
+| Secret (`kubernetes.io/tls`), ConfigMap | list, watch, get | ✓ (cluster) | ✓ (cluster) | ✓ (per-namespace) |
 | HTTPRoute, Gateway, Ingress `/status` | update, patch | ✓ (cluster) | — | — |
-| Deployment, Service | create, update, delete | ✓ (scoped) | — | — |
+| Gateway | patch | ✓ (cluster — finalizers only) | — | — |
+| Deployment, Service, ServiceAccount, RoleBinding | create, update, delete | ✓ (cluster) | — | — |
 | Lease | create, update, get | ✓ (`coxswain-system`) | — | — |
+
+The dedicated-proxy permissions come from a single static `ClusterRole` `coxswain-gateway-proxy-reader` (shipped by the Helm chart and `deploy/manifests/dedicated-proxy-clusterrole.yaml`) bound via per-namespace `RoleBinding`s reconciled by the controller (#209). A compromised dedicated-proxy `ServiceAccount` holds reads only in the namespaces its Gateway has routes into — not in any other namespace, and zero write verbs anywhere.
 
 ## Admin endpoints by mode
 
