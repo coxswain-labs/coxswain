@@ -5,8 +5,9 @@ on:
 
 name: E2E
 
-# Three jobs below (`e2e-ingress`, `e2e-gateway-api`, `e2e-gateway-api-conformance`)
-# are required status checks. A workflow-level path filter that excludes the
+# Five jobs below (`e2e-ingress`, `e2e-gateway-api`, `e2e-dedicated-gateway`,
+# `e2e-proxy-listener-drain`, `e2e-gateway-api-conformance`) are required
+# status checks. A workflow-level path filter that excludes the
 # whole workflow leaves those checks pending forever on docs-only PRs. Instead
 # we always start on PRs and gate the heavy jobs on the `changes` job. A job
 # whose `if:` evaluates to false reports `skipped`, which counts as success for
@@ -91,6 +92,76 @@ jobs:
 
       - name: Run e2e tests (gateway_api)
         run: bin/gateway_api --test-threads=1
+        env:
+          COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
+          RUST_LOG: coxswain_e2e=debug,warn
+
+      - uses: ./.github/actions/dump-cluster-state
+        if: failure()
+
+  e2e-dedicated-gateway:
+    name: e2e-dedicated-gateway
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-kind-cluster
+        with:
+          cluster-name: coxswain-e2e-dedicated-gateway
+
+      - uses: ./.github/actions/preload-gateway-api-images
+        with:
+          cluster-name: coxswain-e2e-dedicated-gateway
+          include-busybox: 'true'
+
+      - name: Download e2e binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-bins
+          path: bin/
+
+      - name: Make binaries executable
+        run: chmod +x bin/coxswain bin/dedicated_gateway
+
+      - name: Run e2e tests (dedicated_gateway)
+        run: bin/dedicated_gateway --test-threads=1
+        env:
+          COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
+          RUST_LOG: coxswain_e2e=debug,warn
+
+      - uses: ./.github/actions/dump-cluster-state
+        if: failure()
+
+  e2e-proxy-listener-drain:
+    name: e2e-proxy-listener-drain
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-kind-cluster
+        with:
+          cluster-name: coxswain-e2e-proxy-listener-drain
+
+      - uses: ./.github/actions/preload-gateway-api-images
+        with:
+          cluster-name: coxswain-e2e-proxy-listener-drain
+          include-busybox: 'true'
+
+      - name: Download e2e binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-bins
+          path: bin/
+
+      - name: Make binaries executable
+        run: chmod +x bin/coxswain bin/proxy_listener_drain
+
+      - name: Run e2e tests (proxy_listener_drain)
+        run: bin/proxy_listener_drain --test-threads=1
         env:
           COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
           RUST_LOG: coxswain_e2e=debug,warn

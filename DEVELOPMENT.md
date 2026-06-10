@@ -326,6 +326,15 @@ cargo build --bin coxswain
 cargo test -p coxswain-e2e --test dedicated_gateway -- --test-threads=1
 ```
 
+### proxy_listener_drain
+
+Covers zero-drop Gateway listener add/remove (#231): runs 2 000 requests through a live listener while a port is added or removed mid-flight and asserts zero non-2xx responses and zero connection errors.
+
+```bash
+cargo build --bin coxswain
+cargo test -p coxswain-e2e --test proxy_listener_drain -- --test-threads=1
+```
+
 ### conformance
 
 The Gateway API conformance suite (`conformance/`) connects to a coxswain instance you start manually on fixed ports. Start coxswain in a separate terminal first.

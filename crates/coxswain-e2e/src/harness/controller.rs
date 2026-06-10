@@ -20,8 +20,8 @@ const BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Ingress entry points and are passed to coxswain via `--proxy-http-port` /
 /// `--proxy-https-port`. `gateway_http_addr` / `gateway_https_addr` are
 /// pre-allocated for Gateway listeners — tests apply Gateway resources whose
-/// listeners declare these ports, and the controller's HotReloader detects
-/// them and binds them on restart.
+/// listeners declare these ports, and the in-process `ProxyAcceptor` binds
+/// them dynamically when the reflector picks up the Gateway resource.
 pub struct ControllerProcess {
     child: Child,
     /// Bound address of the Ingress HTTP proxy listener (`--proxy-http-port`).

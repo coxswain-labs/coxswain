@@ -31,6 +31,7 @@ use pingora_core::apps::{HttpServerApp, ServerApp};
 use pingora_core::protocols::http::ServerSession;
 use pingora_core::protocols::l4::stream::Stream as L4Stream;
 use pingora_core::protocols::tls::server::handshake_with_callback;
+use pingora_core::protocols::{GetSocketDigest, SocketDigest};
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::Service;
 use pingora_core::tls::ssl::{SslAcceptor, SslMethod};
@@ -604,6 +605,14 @@ async fn handle_standard<P>(
     P: ProxyHttp + Send + Sync + 'static,
     <P as ProxyHttp>::CTX: Send + Sync,
 {
+    // Mirror what Pingora's own `l4::Listener::accept` does: build a
+    // `SocketDigest` from the raw fd so that `session.server_addr()` returns
+    // the correct local port for routing-table lookups.
+    let raw_fd = {
+        use std::os::unix::io::AsRawFd as _;
+        tcp.as_raw_fd()
+    };
+
     let stream: pingora_core::protocols::Stream = match protocol {
         ListenerProtocol::Https => {
             let tls_ctx = match build_tls_context(&tls_selector) {
@@ -613,7 +622,8 @@ async fn handle_standard<P>(
                     return;
                 }
             };
-            let l4: L4Stream = tcp.into();
+            let mut l4: L4Stream = tcp.into();
+            l4.set_socket_digest(SocketDigest::from_raw_fd(raw_fd));
             match handshake_with_callback(&tls_ctx.acceptor, l4, tls_ctx.callbacks.as_ref()).await {
                 Ok(tls_stream) => Box::new(tls_stream),
                 Err(e) => {
@@ -622,7 +632,11 @@ async fn handle_standard<P>(
                 }
             }
         }
-        ListenerProtocol::Http => Box::new(L4Stream::from(tcp)),
+        ListenerProtocol::Http => {
+            let mut l4 = L4Stream::from(tcp);
+            l4.set_socket_digest(SocketDigest::from_raw_fd(raw_fd));
+            Box::new(l4)
+        }
     };
 
     // `process_new` handles ALPN detection (h1/h2), keepalive, and shutdown
