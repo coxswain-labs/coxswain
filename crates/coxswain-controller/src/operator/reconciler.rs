@@ -7,34 +7,38 @@
 //! every Gateway — the population is small enough by design that re-checking
 //! all is cheaper than tracking which Gateways resolve to which params).
 //!
-//! ## Step 8 scope: log-only
+//! ## Step 9 scope: server-side-apply
 //!
-//! The reconcile function renders the desired Deployment/Service/ServiceAccount,
-//! hashes them, and logs the rendered YAML at `INFO` whenever the hash changes
-//! (or on first observation). On no-change reconciles it logs at `DEBUG` only,
-//! so the steady-state log stream is quiet. **No cluster writes.** Step 9
-//! (#208) promotes this to server-side-apply.
+//! Every reconcile renders the desired Deployment/Service/ServiceAccount and
+//! server-side-applies all three under field manager `"coxswain-controller"`
+//! with `force=true` — the controller is the authoritative owner of the
+//! generated resources (see [`super::apply`] for the source-of-truth
+//! contract). The hash check from Step 8 is preserved but only suppresses
+//! the INFO log on no-change reconciles; SSA still fires every time so any
+//! out-of-band `kubectl edit` is reverted on the next reconcile.
 //!
 //! ## Leader gating
 //!
 //! Every reconcile checks the shared leader [`AtomicBool`] (owned by the
 //! existing [`crate::Controller`]'s leader-election machinery). Non-leader
-//! pods short-circuit and re-queue; only the elected leader logs the
-//! rendered specs. This matches Step 9's behaviour (apply must be
-//! leader-only), so promoting from log-only to apply touches the reconcile
-//! body, not the gating.
+//! pods short-circuit and re-queue; only the elected leader applies.
 //!
 //! ## Missing parametersRef target
 //!
-//! [`params::resolve`] surfaces this as `Err(ParamsError::NotFound)`; the
-//! reconciler logs a warning and re-queues. The follow-up
-//! `Accepted=False, reason=InvalidParameters` Gateway condition is deferred
-//! to Step 9 — that work touches the existing status writer's condition
-//! channel and is naturally bundled with the actual provisioning logic.
+//! [`params::resolve`] surfaces this as `Err(ParamsError::NotFound)`. The
+//! reconciler publishes an `AcceptedReason::InvalidParameters` override into
+//! the shared [`AcceptedOverrides`] map; the status writer in
+//! [`crate::controller`] consults the map on every Gateway reconcile and
+//! emits `Accepted=False, reason=InvalidParameters` (Gateway API spec). On a
+//! successful resolve we clear the override so the writer returns to
+//! emitting `Accepted=True`.
 
-use super::{params, render};
+use super::{apply, params, render};
+use crate::AcceptedOverrides;
+use crate::AcceptedReason;
 use async_trait::async_trait;
 use coxswain_core::crd::CoxswainGatewayParameters;
+use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use futures::StreamExt;
@@ -74,11 +78,14 @@ const ERROR_REQUEUE: Duration = Duration::from_secs(15);
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub(super) enum ReconcileError {
-    /// Kubernetes API error. Currently unreachable in Step 8 (the reconcile
-    /// reads from in-memory stores and never calls the API directly), but
-    /// reserved so Step 9's apply path slots in without a signature change.
+    /// Kubernetes API error encountered outside the SSA path (e.g. by future
+    /// pre-flight reads of provisioned resources). The SSA path's failures
+    /// land in [`ReconcileError::Apply`] instead.
     #[error("kube error: {0}")]
     Kube(#[from] kube::Error),
+    /// SSA of one of the three rendered resources failed.
+    #[error("apply: {0}")]
+    Apply(#[from] apply::ApplyError),
 }
 
 /// Bundle of inputs the operator's [`BackgroundService::start`] needs from
@@ -100,6 +107,12 @@ pub struct OperatorConfig {
     /// Shared leader-election flag the status writer flips on `Acquire`.
     /// Reconcile is a no-op (re-queue) when this is `false`.
     pub leader: Arc<AtomicBool>,
+    /// Shared override channel that the operator publishes into when a
+    /// Gateway's `parametersRef` resolves to a missing target. The bin layer
+    /// must wire this to the *same* [`AcceptedOverrides`] instance held by
+    /// the [`crate::ControllerConfig`] so the status writer can read what
+    /// the operator publishes.
+    pub accepted_overrides: AcceptedOverrides,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -126,25 +139,18 @@ struct ReconcileContext {
     controller_name: String,
     controller_image: String,
     leader: Arc<AtomicBool>,
+    accepted_overrides: AcceptedOverrides,
+    client: Client,
     class_store: Store<GatewayClass>,
     params_store: Store<CoxswainGatewayParameters>,
-    last_hashes: Mutex<HashMap<GatewayKey, u64>>,
+    last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
 
-/// Stable identity for a Gateway, used as the per-Gateway hash map key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct GatewayKey {
-    namespace: String,
-    name: String,
-}
-
-impl GatewayKey {
-    fn from_gateway(gw: &Gateway) -> Self {
-        Self {
-            namespace: gw.metadata.namespace.clone().unwrap_or_default(),
-            name: gw.metadata.name.clone().unwrap_or_default(),
-        }
-    }
+fn gateway_key(gw: &Gateway) -> ObjectKey {
+    ObjectKey::new(
+        gw.metadata.namespace.clone().unwrap_or_default(),
+        gw.metadata.name.clone().unwrap_or_default(),
+    )
 }
 
 #[async_trait]
@@ -190,6 +196,8 @@ impl BackgroundService for Operator {
             controller_name: self.config.controller_name.clone(),
             controller_image: self.config.controller_image.clone(),
             leader: Arc::clone(&self.config.leader),
+            accepted_overrides: self.config.accepted_overrides.clone(),
+            client: client.clone(),
             class_store: class_reader,
             params_store: params_reader,
             last_hashes: Mutex::new(HashMap::new()),
@@ -270,11 +278,12 @@ impl BackgroundService for Operator {
 
 async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Action, ReconcileError> {
     if !ctx.leader.load(Ordering::Acquire) {
-        // Non-leader pods don't render. Re-queue rather than `await_change()`
+        // Non-leader pods don't apply. Re-queue rather than `await_change()`
         // so the operator catches up promptly on leader promotion.
         return Ok(Action::requeue(NON_LEADER_REQUEUE));
     }
 
+    let key = gateway_key(&gw);
     let class_name = &gw.spec.gateway_class_name;
     let Some(class) = ctx
         .class_store
@@ -307,16 +316,21 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
     }) {
         Ok(Some(e)) => e,
         Ok(None) => {
-            // Not dedicated mode; nothing to render.
+            // Not dedicated mode; clear any stale override left over from a
+            // previous dedicated-mode reconcile (e.g. user removed
+            // `parametersRef` to roll back to the shared pool).
+            ctx.accepted_overrides.clear(&key);
             return Ok(Action::await_change());
         }
         Err(params::ParamsError::NotFound(ns, name)) => {
             tracing::warn!(
                 gateway = %gateway_id(&gw),
                 missing = %format!("{ns}/{name}"),
-                "operator: parametersRef target not found; skipping render \
-                 (Step 9 will surface this as Accepted=False / InvalidParameters)"
+                "operator: parametersRef target not found; publishing \
+                 Accepted=False, reason=InvalidParameters and re-queuing"
             );
+            ctx.accepted_overrides
+                .set(key, AcceptedReason::InvalidParameters);
             return Ok(Action::requeue(ERROR_REQUEUE));
         }
     };
@@ -328,8 +342,18 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
         gateway_class_name: class_name,
     });
 
+    // Always SSA — `force=true` re-asserts ownership on every reconcile so a
+    // human `kubectl edit` is reverted on the next cycle. See
+    // [`apply`] module docs for the source-of-truth contract.
+    apply::apply_rendered(&ctx.client, &gw, &rendered).await?;
+
+    // Successful resolve + apply → clear any prior `InvalidParameters`
+    // override (e.g. user just created the missing
+    // `CoxswainGatewayParameters` object) so the status writer can return
+    // the Gateway to `Accepted=True` on its next reconcile.
+    ctx.accepted_overrides.clear(&key);
+
     let new_hash = hash_rendered(&rendered);
-    let key = GatewayKey::from_gateway(&gw);
     let changed = {
         let mut hashes = ctx
             .last_hashes
@@ -349,7 +373,7 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
     } else {
         tracing::debug!(
             gateway = %gateway_id(&gw),
-            "operator: re-render produced identical specs; no-op (Step 8 log-only)"
+            "operator: re-render produced identical specs; SSA was a no-op server-side"
         );
     }
 
@@ -400,7 +424,7 @@ fn log_rendered_change(gw: &Gateway, rendered: &render::RenderedSpecs) {
         deployment = %deployment_yaml,
         service = %service_yaml,
         service_account = %service_account_yaml,
-        "operator: rendered dedicated-proxy specs (Step 8 log-only; no cluster writes)"
+        "operator: dedicated-proxy specs changed; SSA succeeded"
     );
 }
 
@@ -418,8 +442,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let k = GatewayKey::from_gateway(&gw);
-        assert_eq!(k.namespace, "tenant-a");
+        let k = gateway_key(&gw);
+        assert_eq!(k.ns, "tenant-a");
         assert_eq!(k.name, "my-gw");
     }
 
@@ -433,6 +457,7 @@ mod tests {
             metadata: kube::api::ObjectMeta {
                 namespace: Some("default".into()),
                 name: Some("my-gw".into()),
+                uid: Some("uid-my-gw".into()),
                 ..Default::default()
             },
             spec: GatewaySpec {
@@ -486,6 +511,7 @@ mod tests {
             metadata: kube::api::ObjectMeta {
                 namespace: Some("default".into()),
                 name: Some("my-gw".into()),
+                uid: Some("uid-my-gw".into()),
                 ..Default::default()
             },
             spec: GatewaySpec {

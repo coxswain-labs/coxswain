@@ -1,0 +1,13 @@
+# Tenant namespace for the dedicated-mode Gateway fixture.
+#
+# Step 9 (#208) provisions a Deployment/Service/ServiceAccount in the same
+# namespace as the Gateway; the fixture keeps the tenant isolated under
+# `tenant-a` so the provisioned resources do not collide with shared-pool
+# fixtures in `default`.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-a
+  labels:
+    coxswain-e2e/tenant: a

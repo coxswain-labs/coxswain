@@ -1,11 +1,11 @@
 //! Provisioning operator for dedicated-mode Gateways.
 //!
-//! Step 8 of the architecture plan: for each `Gateway` whose
+//! Step 9 of the architecture plan (#208): for each `Gateway` whose
 //! `spec.infrastructure.parametersRef` (or whose `GatewayClass`'s
 //! `spec.parametersRef`) resolves to a `CoxswainGatewayParameters` object,
-//! render the desired `Deployment`, `Service`, and `ServiceAccount` specs
-//! from the merged parameters and log them as YAML. **No cluster writes** —
-//! Step 9 (#208) promotes this to server-side-apply.
+//! render the desired `Deployment`, `Service`, and `ServiceAccount` and
+//! server-side-apply them into the Gateway's namespace, owner-referenced to
+//! the Gateway so deletion cascades.
 //!
 //! ## Architecture
 //!
@@ -17,23 +17,26 @@
 //! services coexist in the controller pod, each subscribed to their own
 //! event streams.
 //!
-//! ## Output (Step 8)
+//! ## Output (Step 9)
 //!
-//! - On first observation of a Gateway with a resolved `CoxswainGatewayParameters`,
-//!   the rendered YAML is logged at `INFO`.
-//! - On every subsequent reconcile, the rendered spec is hashed and compared
-//!   against the previous hash; the YAML is re-logged at `INFO` only if it
-//!   changed, otherwise at `DEBUG`. Per-Gateway hashes live in the kube-rs
-//!   `Controller`'s reconcile `Context` and are GC'd when the Gateway is
-//!   deleted.
-//! - If `parametersRef` resolves to a missing object, the reconciler emits a
-//!   `ResolvedRefs=False, reason=InvalidParameters` condition on the Gateway
-//!   via the existing status writer's condition channel.
+//! - Every reconcile renders the desired specs and server-side-applies all
+//!   three resources under field manager `"coxswain-controller"` with
+//!   `force=true`. SSA is idempotent server-side; the same content costs one
+//!   roundtrip with no write amplification.
+//! - The rendered spec is hashed and compared against the previous hash. The
+//!   YAML is re-logged at `INFO` only when it changes, at `DEBUG` otherwise.
+//!   Per-Gateway hashes live in the kube-rs `Controller`'s reconcile
+//!   `Context` and are GC'd when the Gateway is deleted.
+//! - If `parametersRef` resolves to a missing object, the reconciler
+//!   publishes an `AcceptedReason::InvalidParameters` override into the
+//!   shared [`crate::AcceptedOverrides`] map; the status writer in
+//!   [`crate::controller`] consults the map and emits `Accepted=False,
+//!   reason=InvalidParameters` (Gateway API spec) on the next Gateway
+//!   reconcile.
 //! - The reconcile is leader-gated: only the controller pod holding the
-//!   leadership lease renders + logs. This matches Step 9's behavior (apply
-//!   must be leader-only) so promoting from log-only to apply requires zero
-//!   gating churn.
+//!   leadership lease applies — non-leaders re-queue.
 
+pub(crate) mod apply;
 pub(crate) mod merge;
 pub(crate) mod params;
 pub(crate) mod reconciler;

@@ -2,19 +2,34 @@
 
 use super::conditions::{has_condition, make_condition};
 use super::config::StatusAddress;
+use super::overrides::AcceptedReason;
 use coxswain_reflector::gw_types::v::gateways::{
     Gateway, GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
 use coxswain_reflector::tls::GatewayListenerHealth;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
-/// Returns true when the Gateway's current status does not yet reflect the desired
-/// state computed from `health`. Prevents redundant patches and watch-feedback loops.
-pub(super) fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerHealth) -> bool {
-    if !super::conditions::gateway_accepted(gw) {
+/// Returns true when the Gateway's current status does not yet reflect the
+/// desired state computed from `health` and `accepted_override`. Prevents
+/// redundant patches and watch-feedback loops.
+///
+/// `accepted_override` is consulted to detect the case where the operator
+/// has just published an override (e.g. `InvalidParameters`) but the current
+/// Gateway status still carries `Accepted=True` from a prior reconcile cycle,
+/// or vice versa when an override has just cleared.
+pub(super) fn gateway_needs_status_patch(
+    gw: &Gateway,
+    health: &GatewayListenerHealth,
+    accepted_override: Option<AcceptedReason>,
+) -> bool {
+    if !accepted_matches_override(gw, accepted_override) {
         return true;
     }
-    if !super::conditions::gateway_programmed(gw) {
+    // When the override is active we expect Programmed=False; otherwise True.
+    // `gateway_programmed` returns true iff a Programmed=True condition exists,
+    // so flip the test based on the override state.
+    let want_programmed_true = accepted_override.is_none();
+    if super::conditions::gateway_programmed(gw) != want_programmed_true {
         return true;
     }
     let current_listener_count = gw
@@ -73,6 +88,23 @@ fn any_condition_stale(conditions: &[Condition], expected_gen: i64) -> bool {
         .any(|c| c.observed_generation.unwrap_or(0) < expected_gen)
 }
 
+/// Returns true if the Gateway's current `Accepted` condition matches what
+/// `accepted_override` says it should be.
+///
+/// - `None` override → expect `Accepted=True, reason=Accepted`.
+/// - `Some(r)` override → expect `Accepted=False` with `reason=r.reason()`.
+fn accepted_matches_override(gw: &Gateway, accepted_override: Option<AcceptedReason>) -> bool {
+    let (want_status, want_reason) = match accepted_override {
+        Some(r) => ("False", r.reason()),
+        None => ("True", "Accepted"),
+    };
+    gw.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|cs| cs.iter().find(|c| c.type_ == "Accepted"))
+        .is_some_and(|c| c.status == want_status && c.reason == want_reason)
+}
+
 /// Returns `(has_any_invalid, supported_kinds)` for a listener's `allowedRoutes.kinds`.
 ///
 /// - `has_any_invalid`: true if any listed kind is not supported by this controller.
@@ -124,16 +156,37 @@ pub(super) fn build_gateway_status_patch(
     now: &Time,
     addr: Option<&StatusAddress>,
     ingress_ports: coxswain_reflector::ingress::IngressPorts,
+    accepted_override: Option<AcceptedReason>,
 ) -> serde_json::Value {
-    // Gateway-level Programmed is always True once the controller has processed the
-    // Gateway. Per-listener conditions (ListenerConditionProgrammed, ResolvedRefs)
-    // express individual listener health. This matches what the conformance suite
-    // expects: the setup waits for Programmed=True on all Gateways, including ones
-    // with invalid TLS refs, and the per-listener tests check listener conditions.
-    let (prog_status, prog_reason, prog_message) = ("True", "Programmed", "");
+    // Gateway-level `Accepted` is `True` by default. When the operator has
+    // published an override (e.g. `InvalidParameters` from an unresolvable
+    // `parametersRef`), surface that instead — and force `Programmed=False`
+    // because a Gateway whose spec is invalid cannot be programmed. The
+    // listener conditions below stay computed from `health` either way; the
+    // per-listener Programmed reason still expresses listener-level health.
+    let (accepted_status, accepted_reason, accepted_message): (&str, &str, &str) =
+        match accepted_override {
+            Some(r) => ("False", r.reason(), r.message()),
+            None => ("True", "Accepted", ""),
+        };
+    let (prog_status, prog_reason, prog_message): (&str, &str, &str) = match accepted_override {
+        Some(_) => (
+            "False",
+            "Invalid",
+            "Gateway spec is invalid; see the Accepted condition for details",
+        ),
+        None => ("True", "Programmed", ""),
+    };
 
     let conditions = vec![
-        make_condition("Accepted", "True", "Accepted", "", generation, now.clone()),
+        make_condition(
+            "Accepted",
+            accepted_status,
+            accepted_reason,
+            accepted_message,
+            generation,
+            now.clone(),
+        ),
         make_condition(
             "Programmed",
             prog_status,

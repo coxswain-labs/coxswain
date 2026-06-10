@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use coxswain_admin::AdminServer;
 use coxswain_controller::{
-    ControllerConfig, IngressPorts, LeaseSettings, Operator, OperatorConfig, SharedClusterSummary,
-    SharedGatewayListenerHealth, StatusWriterConfig, spawn_status_writer,
+    AcceptedOverrides, ControllerConfig, IngressPorts, LeaseSettings, Operator, OperatorConfig,
+    SharedClusterSummary, SharedGatewayListenerHealth, StatusWriterConfig, spawn_status_writer,
 };
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::routing::{RouteTimeouts, SharedGatewayRoutingTable, SharedIngressRoutingTable};
@@ -86,7 +86,14 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         "Starting"
     );
 
-    let controller_config = build_controller_config(&args.common, &args.controller)?;
+    // Single AcceptedOverrides instance shared between the status writer and
+    // the provisioning operator: the operator publishes overrides (e.g.
+    // `InvalidParameters` for an unresolvable `parametersRef`), the writer
+    // consults them when patching `Gateway.status`. Cloning shares the
+    // underlying `Arc<Mutex<…>>`.
+    let accepted_overrides = AcceptedOverrides::new();
+    let controller_config = build_controller_config(&args.common, &args.controller)?
+        .with_accepted_overrides(accepted_overrides.clone());
 
     let mut server = build_minimal_server();
     let health = HealthRegistry::new();
@@ -114,6 +121,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             controller_name: args.common.controller_name.clone(),
             controller_image: resolve_controller_image(),
             leader: Arc::clone(&status_writer.leader),
+            accepted_overrides,
         }),
     ));
 
@@ -154,9 +162,10 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
 /// dedicated-proxy Deployments when `CoxswainGatewayParameters.spec.image`
 /// is unset. Priority: `COXSWAIN_IMAGE` env var (set by the Helm chart from
 /// the controller's own image) → built-in `ghcr.io/coxswain-labs/coxswain:<version>`
-/// fallback for local `serve dev` runs. The fallback isn't pulled when
-/// running locally (Step 8 is log-only); it shows up only in the logged
-/// YAML so operators can spot whether the chart's env wiring is healthy.
+/// fallback. Implicit-bump semantics: when the controller is upgraded
+/// (`COXSWAIN_IMAGE` changes), the next reconcile re-renders with the new
+/// image and SSA rolls every dedicated proxy. Pinning a specific image per
+/// Gateway requires setting `CoxswainGatewayParameters.spec.image`.
 fn resolve_controller_image() -> String {
     std::env::var("COXSWAIN_IMAGE").unwrap_or_else(|_| {
         format!(
@@ -588,7 +597,11 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
         "Starting"
     );
 
-    let controller_config = build_controller_config(&args.common, &args.controller)?;
+    // See `run_controller` for why the operator and the status writer share
+    // a single `AcceptedOverrides` instance.
+    let accepted_overrides = AcceptedOverrides::new();
+    let controller_config = build_controller_config(&args.common, &args.controller)?
+        .with_accepted_overrides(accepted_overrides.clone());
     let mut server = build_server(&args.proxy);
 
     let health = HealthRegistry::new();
@@ -627,6 +640,7 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
             controller_name: args.common.controller_name.clone(),
             controller_image: resolve_controller_image(),
             leader: Arc::clone(&status_writer.leader),
+            accepted_overrides,
         }),
     ));
 

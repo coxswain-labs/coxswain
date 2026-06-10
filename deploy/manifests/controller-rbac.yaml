@@ -19,8 +19,19 @@ rules:
   # Reads needed for accurate status computation: backend-existence checks
   # (Services), endpoint resolution (EndpointSlices), TLS termination
   # (Secrets), BackendTLSPolicy CA resolution (ConfigMaps).
+  #
+  # `services` and `serviceaccounts` ALSO carry write verbs because the
+  # provisioning operator (#208) server-side-applies them in the Gateway's
+  # namespace; the writes are bundled into the same rule to keep the
+  # ClusterRole concise.
   - apiGroups: [""]
-    resources: ["services", "secrets", "configmaps"]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
@@ -45,6 +56,12 @@ rules:
   - apiGroups: ["gateway.coxswain-labs.dev"]
     resources: ["coxswaingatewayparameters"]
     verbs: ["get", "list", "watch"]
+  # Server-side-apply provisioning of dedicated-mode proxy Deployments
+  # (#208). The Deployments are owner-referenced to the Gateway so K8s
+  # cascades their deletion automatically.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

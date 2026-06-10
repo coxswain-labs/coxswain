@@ -1,0 +1,17 @@
+# Per-Gateway parameters consumed by the provisioning operator (#208).
+#
+# The Gateway in gateway.yaml references this object via
+# `spec.infrastructure.parametersRef`. The operator merges these fields
+# (per-field overlay with optional GatewayClass-level defaults) into the
+# rendered Deployment / Service / ServiceAccount.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: tenant-a-defaults
+  namespace: tenant-a
+spec:
+  replicas: 2
+  serviceType: ClusterIP
+  # image: pinned by default to the controller's own image — see the
+  # operator's resolve_controller_image() resolution strategy.

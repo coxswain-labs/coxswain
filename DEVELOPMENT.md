@@ -148,35 +148,44 @@ cargo run --bin coxswain -- serve proxy --dedicated \
 - **Listener refusal is a warning today.** A listener with `from: All` or `from: Selector` and no matching opt-in logs a warning at startup but still serves traffic. Step 10 promotes this to an `Accepted=false` listener condition.
 - **`ControllerReconciler` is a type alias for `SharedProxyReconciler`.** The narrower controller-only output set (skipping routing-table builds, skipping TLS store) is deferred to a follow-up; the controller pod runs the full shared-proxy reconciler today. The type-level distinction exists so the future split is a purely internal refactor.
 
-### Observe the provisioning operator's dry-run output
+### Observe dedicated-mode provisioning
 
-`serve controller` (and `serve dev`) runs a provisioning operator that watches every `Gateway` and renders the dedicated-proxy `Deployment` / `Service` / `ServiceAccount` for any Gateway whose `parametersRef` (or whose `GatewayClass`'s `parametersRef`) points at a `CoxswainGatewayParameters` object. The renderer logs the YAML at `INFO` whenever the rendered spec changes. **No cluster writes** — that's Step 9 (#208).
+`serve controller` (and `serve dev`) runs a provisioning operator that watches every `Gateway` and provisions a dedicated-proxy `Deployment` / `Service` / `ServiceAccount` for any Gateway whose `parametersRef` (or whose `GatewayClass`'s `parametersRef`) points at a `CoxswainGatewayParameters` object. As of #208 the operator applies these resources to the cluster via server-side-apply under field manager `"coxswain-controller"`, owner-referenced to the parent Gateway so deletion cascades.
 
-Apply the dev fixture and watch the controller log:
-
-```bash
-kubectl apply -f deploy/dev/sample-gateway-parameters.yaml
-# In a separate window, follow the controller log:
-cargo run --bin coxswain -- serve dev --log-format console 2>&1 | grep "operator:"
-```
-
-A Gateway in the `coxswain` class with `spec.infrastructure.parametersRef` pointing at the `sample` `CoxswainGatewayParameters` produces a single log entry per reconcile cycle with three YAML fields: `deployment`, `service`, `service_account`. Re-applying the same params produces no new log line (steady-state is quiet); changing `replicas` or any other field re-fires the log.
-
-Verify no cluster writes happen:
+Apply the dev fixture set and verify the resources land:
 
 ```bash
-kubectl get events --field-selector=involvedObject.kind=Deployment \
-  -A --watch-only
-# No events from the coxswain-controller SA for Step 8.
+kubectl apply -f deploy/dev/dedicated-gateway/
+# Three resources land in tenant-a, named <gateway-name>-coxswain:
+kubectl get deploy,svc,sa -n tenant-a \
+  -l gateway.networking.k8s.io/gateway-name=tenant-a-gw
 ```
 
-If `parametersRef` targets a missing `CoxswainGatewayParameters` object, the operator logs a warning naming the missing reference and re-queues. Step 9 will promote this to an `Accepted=false` listener condition on the Gateway (#208).
+Field-manager assertion (Step 9 acceptance criterion):
+
+```bash
+kubectl get deployment tenant-a-gw-coxswain -n tenant-a -o json | \
+  jq '.metadata.managedFields[].manager'
+# "coxswain-controller"
+```
+
+Garbage collection on Gateway deletion (owner-ref cascade):
+
+```bash
+kubectl delete gateway tenant-a-gw -n tenant-a
+# All three resources disappear within ~30s.
+```
+
+If `parametersRef` targets a missing `CoxswainGatewayParameters` object, the operator publishes an `Accepted=False, reason=InvalidParameters` condition on the Gateway via the shared override channel; the status writer picks it up on the next Gateway reconcile.
+
+#### Half-functional state (intentional, until #209 lands)
+
+The dedicated proxy pod **boots but stays in `CrashLoopBackOff`** in this PR. The provisioned `ServiceAccount` has no per-namespace `RoleBinding`s yet — Step 10 (#209) provisions those. The proxy pod fails every K8s list/watch with `forbidden` until then. This is deliberate: #208 covers resource provisioning, GC, and SSA idempotency, but not traffic flow. `kubectl get pod -n tenant-a` shows the proxy retrying; `kubectl get gateway -n tenant-a -o yaml` shows `Programmed=True` (no listener-level health divergence yet — Step 12 refines dedicated-mode status coordination).
 
 #### Known limitations (deferred)
 
-- **No cluster apply.** The operator logs rendered YAML only. Step 9 (#208) wires server-side-apply of `Deployment` / `Service` / `ServiceAccount`, owner-referenced to the Gateway, with GC on Gateway delete.
-- **Opt-in RBAC flags are not on the CRD yet.** The two flags exist as CLI args for manual `serve proxy --dedicated` (Step 7) but `spec.proxy.allowClusterWideRouteRead` / `spec.proxy.allowClusterWideNamespaceRead` are not yet on `CoxswainGatewayParameters`. They land alongside the actual apply in #208 so the controller can resolve them into the provisioned pod's CLI args in one place.
-- **`InvalidParameters` Gateway condition deferred.** Today a missing parametersRef target only logs a warning; Step 9 (#208) wires the condition emission into the existing status writer's path.
+- **Opt-in RBAC flags are not on the CRD yet.** The two flags exist as CLI args for manual `serve proxy --dedicated` (Step 7) but `spec.proxy.allowClusterWideRouteRead` / `spec.proxy.allowClusterWideNamespaceRead` are not yet on `CoxswainGatewayParameters`. They land in Step 10 (#209) alongside the per-Gateway-proxy RBAC narrowing.
+- **Shared pool still serves dedicated-mode Gateways.** Step 11 (#210) excludes dedicated Gateways from the shared-proxy's routing table; until then, traffic served by the shared pool *and* the (not-yet-functional) dedicated pod overlap.
 
 | Port   | Purpose                                          |
 |--------|--------------------------------------------------|
@@ -293,7 +302,7 @@ curl -s http://localhost:8082/routes | jq .    # lists all active hostnames
 
 ## E2E tests
 
-All three suites require a live cluster. Reset your cluster (delete and recreate it) per your distro's documentation, then prepare it as described in the **Running coxswain locally** section above.
+All four suites require a live cluster. Reset your cluster (delete and recreate it) per your distro's documentation, then prepare it as described in the **Running coxswain locally** section above.
 
 ### ingress
 
@@ -309,6 +318,15 @@ cargo test -p coxswain-e2e --test ingress -- --test-threads=1
 ```bash
 cargo build --bin coxswain
 cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
+```
+
+### dedicated_gateway
+
+Covers the dedicated-mode provisioning operator (#208): a Gateway with `spec.infrastructure.parametersRef` produces a `Deployment` / `Service` / `ServiceAccount` in its namespace; Gateway deletion garbage-collects them; controller restart is idempotent.
+
+```bash
+cargo build --bin coxswain
+cargo test -p coxswain-e2e --test dedicated_gateway -- --test-threads=1
 ```
 
 ### conformance
