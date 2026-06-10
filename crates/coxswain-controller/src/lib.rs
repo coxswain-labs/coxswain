@@ -20,6 +20,7 @@ pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writ
 // Re-export reflector primitives that bin or downstream crates expect to reach
 // from `coxswain_controller::…`. Direct re-exports keep callers compiling
 // without forcing every site to learn the new crate name.
+pub use coxswain_core::cluster::SharedClusterSummary;
 pub use coxswain_reflector::{
     GatewayListenerHealth, IngressPorts, ListenerInfo, ListenerTlsOutcome,
     SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,

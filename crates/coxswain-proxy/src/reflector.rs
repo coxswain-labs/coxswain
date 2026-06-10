@@ -12,6 +12,7 @@
 //! live exclusively in [`coxswain_controller`], which the proxy crate does
 //! not import.
 
+use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_core::tls::SharedTlsStore;
@@ -19,6 +20,8 @@ use coxswain_reflector::{
     IngressDefaultBackend, IngressPorts, Reconciler, ReconcilerHealth, ReconcilerOptions,
     ReconcilerOutputs, SharedGatewayListenerHealth,
 };
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::source::KubernetesSource;
 
@@ -87,7 +90,12 @@ pub fn spawn_routing_table_builder(config: ProxyReflectorConfig) -> ProxyReflect
     let gateway_routes = SharedGatewayRoutingTable::new();
     let tls_store = SharedTlsStore::new();
     let tls_health = SharedGatewayListenerHealth::new();
+    let cluster_summary = SharedClusterSummary::new();
     let owned_gateways = OwnedGateways::new();
+    // Proxy pods never hold a leader-election lease; pass a always-false handle
+    // so the reflector pipeline's shared shape stays uniform across pod roles.
+    // The summary the proxy writes here is unused (proxy doesn't serve `/cluster`).
+    let leader = Arc::new(AtomicBool::new(false));
 
     let reconciler = Reconciler::new(
         ReconcilerOutputs::new(
@@ -95,8 +103,10 @@ pub fn spawn_routing_table_builder(config: ProxyReflectorConfig) -> ProxyReflect
             gateway_routes.clone(),
             tls_store.clone(),
             tls_health.clone(),
+            cluster_summary,
         ),
         owned_gateways,
+        leader,
         health,
         controller_name,
         {

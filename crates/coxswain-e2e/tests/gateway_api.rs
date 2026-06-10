@@ -1669,3 +1669,102 @@ async fn backend_tls_policy_hostname_mismatch() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// `/cluster` aggregate endpoint: after applying a Gateway + HTTPRoute, the
+/// controller's `/cluster` JSON must include the Gateway with `proxy.pool ==
+/// "shared"`, a positive `route_count`, and at least one condition, all within
+/// one reconcile cycle. Also asserts the matching counters appear on `/status`.
+#[tokio::test]
+async fn cluster_endpoint() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-cluster-endpoint").await?;
+
+    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(gwa::PATH_MATCHING, FixtureVars::new(&ns.name))
+        .await?;
+
+    // First wait for the route to be live so we know the reconciler has built
+    // the routing table at least once after our Gateway was applied.
+    let host = format!("echo.{}.local", ns.name);
+    wait::wait_for_route(&h.gateway_http, &host, "/a", Duration::from_secs(60)).await?;
+
+    let cluster_url = h.admin_url("/cluster");
+    let status_url = h.admin_url("/status");
+    let client = reqwest::Client::new();
+
+    // Poll /cluster until the Gateway we just applied is visible. The reconciler
+    // rebuilds with a 500 ms trailing-edge debounce so allow a generous window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let cluster = loop {
+        let resp = client.get(&cluster_url).send().await?;
+        assert_eq!(
+            resp.status(),
+            200,
+            "/cluster should be 200 on the controller"
+        );
+        let json: serde_json::Value = resp.json().await?;
+        let gateways = json["gateways"].as_array().cloned().unwrap_or_default();
+        let visible = gateways
+            .iter()
+            .any(|g| g["namespace"] == ns.name && g["name"] == "coxswain-test");
+        if visible {
+            break json;
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "Gateway coxswain-test/{} did not appear in /cluster within timeout: {}",
+                ns.name,
+                json
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    let gw = cluster["gateways"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["namespace"] == ns.name && g["name"] == "coxswain-test")
+        .expect("Gateway entry");
+    assert_eq!(
+        gw["proxy"]["pool"], "shared",
+        "Gateway without parametersRef must be classified as shared"
+    );
+    let route_count = gw["route_count"].as_u64().unwrap_or(0);
+    assert!(
+        route_count >= 1,
+        "expected at least one attached route, got {route_count} (gw={gw})"
+    );
+    let conditions = gw["conditions"].as_array().expect("conditions array");
+    assert!(
+        !conditions.is_empty(),
+        "expected at least one condition, got none (gw={gw})"
+    );
+    let cond_types: Vec<&str> = conditions
+        .iter()
+        .filter_map(|c| c["type"].as_str())
+        .collect();
+    assert!(
+        cond_types.contains(&"Programmed") || cond_types.contains(&"Accepted"),
+        "expected Programmed or Accepted condition, got {cond_types:?}"
+    );
+
+    // /status must mirror the same counters now that the cluster summary is wired.
+    let status: serde_json::Value = client.get(&status_url).send().await?.json().await?;
+    let gateway_count = status["gateway_count"]
+        .as_u64()
+        .expect("gateway_count present on controller /status");
+    assert!(gateway_count >= 1, "gateway_count={gateway_count}");
+    assert_eq!(
+        status["dedicated_count"], 0,
+        "no parametersRef in this fixture; dedicated_count must be 0"
+    );
+    assert!(
+        status["ingress_count"].is_u64(),
+        "ingress_count must be present when /cluster summary is enabled"
+    );
+
+    Ok(())
+}

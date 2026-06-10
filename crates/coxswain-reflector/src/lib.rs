@@ -27,6 +27,7 @@
 //!   reflector store snapshots.
 //! - [`crds`] — startup probe for Gateway API CRD presence.
 
+pub mod cluster;
 pub mod crds;
 pub mod endpoints;
 pub mod gateway_api;
@@ -40,6 +41,7 @@ pub mod tls;
 #[cfg(test)]
 mod tests;
 
+pub use cluster::{ClusterSummaryInputs, build_cluster_summary};
 pub use crds::gateway_api_crds_present;
 pub use ingress::IngressPorts;
 pub use reconciler::{
