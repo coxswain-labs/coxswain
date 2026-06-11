@@ -120,7 +120,10 @@ impl IngressReconciler {
                     continue;
                 }
 
-                let e = Arc::new(RouteEntry::path_only(group, route_id.clone(), created_at));
+                let e = Arc::new(
+                    RouteEntry::path_only(group, route_id.clone(), created_at)
+                        .with_path_pattern(Arc::from(path)),
+                );
                 // "Prefix" and "ImplementationSpecific" both map to prefix matching.
                 for &listener_port in &ports {
                     let host_builder = builder
@@ -165,11 +168,14 @@ impl IngressReconciler {
                                 .with_protocol(protocol),
                         );
                         let make_entry = || {
-                            Arc::new(RouteEntry::path_only(
-                                Arc::clone(&group),
-                                route_id.clone(),
-                                created_at,
-                            ))
+                            Arc::new(
+                                RouteEntry::path_only(
+                                    Arc::clone(&group),
+                                    route_id.clone(),
+                                    created_at,
+                                )
+                                .with_path_pattern(Arc::from("/")),
+                            )
                         };
                         for &listener_port in &ports {
                             for rule in rules {

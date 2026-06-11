@@ -8,6 +8,7 @@ use super::engine::RoutingEngine;
 use super::filter::TrafficFilter;
 use super::outcome::{merge_timeouts, resolve_outcome, try_redirect};
 use super::redirect::extract_host;
+use crate::config::AccessLogPathMode;
 use crate::upstream_ca::UpstreamCaCache;
 use bytes::Bytes;
 use coxswain_core::routing::{RequestContext, RouteTimeouts, UpstreamCa};
@@ -35,6 +36,8 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             request_timeout_is_controlling: false,
             backend_request_timeout_active: false,
             selected_backend_filters: None,
+            start: None,
+            upstream_addr: None,
         })
         .unwrap_or_default()
 }
@@ -55,6 +58,9 @@ pub(crate) async fn request_filter<K>(
     session: &mut Session,
     ctx: &mut ProxyCtx,
 ) -> Result<bool> {
+    // Capture start time as early as possible for accurate duration_ms in the access log.
+    ctx.start.get_or_insert_with(Instant::now);
+
     let req = session.req_header();
     let mut host_buf = String::new();
     let host: Arc<str> = Arc::from(extract_host(req, &mut host_buf));
@@ -91,7 +97,7 @@ pub(crate) async fn request_filter<K>(
         engine.find(port, &host, &path, &route_ctx)
     }; // route_ctx (and req borrow) drops here
 
-    let Some((backend_group, filters, route_timeouts)) =
+    let Some((backend_group, filters, route_timeouts, path_pattern)) =
         resolve_outcome(session, &host, &path, outcome).await?
     else {
         return Ok(true);
@@ -120,6 +126,7 @@ pub(crate) async fn request_filter<K>(
         timeouts,
         original_host: host,
         original_path: path,
+        path_pattern,
     });
     Ok(false)
 }
@@ -157,6 +164,7 @@ pub(crate) async fn upstream_peer(
             pingora_core::Error::explain(HTTPStatus(503), "no active endpoints for backend group")
         })?;
     ctx.selected_backend_filters = per_backend_filters;
+    ctx.upstream_addr = Some(addr);
 
     let protocol = resolved.backend_group.protocol();
 
@@ -332,4 +340,75 @@ pub(crate) async fn fail_to_proxy(
         error_code: code,
         can_reuse_downstream: false,
     }
+}
+
+/// Pingora `logging` body: emit one structured access-log event per request.
+///
+/// Emits at `INFO` level on the `coxswain_proxy::access` target so operators
+/// can filter it independently with `--log=info,coxswain_proxy::access=off`.
+/// When `access_log_enabled` is `false` this is a no-op (zero cost).
+pub(crate) async fn logging(
+    access_log_enabled: bool,
+    access_log_path_mode: AccessLogPathMode,
+    session: &mut Session,
+    e: Option<&pingora_core::Error>,
+    ctx: &ProxyCtx,
+) {
+    if !access_log_enabled {
+        return;
+    }
+
+    let req = session.req_header();
+    let method = req.method.as_str();
+    let status = session.response_written().map(|h| h.status.as_u16());
+    let bytes_sent = session.body_bytes_sent() as u64;
+    let duration_ms = ctx
+        .start
+        .map(|s| s.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+
+    // Prefer the pre-resolved host from context; fall back to parsing the header.
+    let mut host_buf = String::new();
+    let host: &str = ctx
+        .resolved
+        .as_ref()
+        .map(|r| r.original_host.as_ref())
+        .unwrap_or_else(|| extract_host(req, &mut host_buf));
+
+    let upstream = ctx.resolved.as_ref().map(|r| r.backend_group.name());
+    let upstream_addr_str = ctx.upstream_addr.map(|a| a.to_string());
+
+    // path_str is Option<&str>: tracing's Value impl for Option silently omits
+    // the field when None, giving us free conditional emission for `None` mode.
+    let path_str: Option<&str> = match access_log_path_mode {
+        AccessLogPathMode::Full => Some(
+            ctx.resolved
+                .as_ref()
+                .map(|r| r.original_path.as_ref())
+                .unwrap_or_else(|| req.uri.path()),
+        ),
+        AccessLogPathMode::Pattern => Some(
+            ctx.resolved
+                .as_ref()
+                .map(|r| r.path_pattern.as_ref())
+                .unwrap_or("/"),
+        ),
+        AccessLogPathMode::None => None,
+    };
+
+    let err_msg = e.map(|err| err.to_string());
+
+    tracing::info!(
+        target: "coxswain_proxy::access",
+        host = %host,
+        method = method,
+        path = path_str,
+        status = status,
+        upstream = upstream,
+        upstream_addr = upstream_addr_str.as_deref(),
+        duration_ms = duration_ms,
+        bytes_sent = bytes_sent,
+        error = err_msg.as_deref(),
+        "access",
+    );
 }

@@ -35,9 +35,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::args::{
-    Cli, Commands, CommonArgs, ControllerArgs, ControllerRoleArgs, DevRoleArgs, LogFormat,
-    ProxyArgs, ProxyRoleArgs, ProxyScope, Role,
+    AccessLogPathMode as BinAccessLogPathMode, Cli, Commands, CommonArgs, ControllerArgs,
+    ControllerRoleArgs, DevRoleArgs, LogFormat, ProxyArgs, ProxyRoleArgs, ProxyScope, Role,
 };
+use coxswain_proxy::AccessLogPathMode;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -379,6 +380,8 @@ fn wire_gateway_only_proxy_services(
             Arc::new(RoutingEngine::new(source.gateway_routes())),
             default_timeouts,
             ca_cache,
+            proxy.access_log,
+            access_log_path_mode(proxy),
         ),
     ));
 
@@ -442,6 +445,15 @@ fn wire_gateway_only_proxy_services(
     Ok(())
 }
 
+/// Convert the CLI `AccessLogPathMode` to the proxy-crate equivalent.
+fn access_log_path_mode(proxy: &ProxyArgs) -> AccessLogPathMode {
+    match proxy.access_log_path_mode {
+        BinAccessLogPathMode::Full => AccessLogPathMode::Full,
+        BinAccessLogPathMode::Pattern => AccessLogPathMode::Pattern,
+        BinAccessLogPathMode::None => AccessLogPathMode::None,
+    }
+}
+
 /// Register both the Ingress and Gateway dynamic proxy acceptors on the
 /// supplied server.  Shared between `run_proxy_shared` and `run_dev`.
 ///
@@ -487,6 +499,8 @@ fn wire_proxy_services(
                     Arc::new(RoutingEngine::new(source.ingress_routes())),
                     default_timeouts.clone(),
                     Arc::clone(&ca_cache),
+                    proxy.access_log,
+                    access_log_path_mode(proxy),
                 ),
             ));
             let selector = SniCertSelector::new(source.tls_store());
@@ -509,6 +523,8 @@ fn wire_proxy_services(
                 Arc::new(RoutingEngine::new(source.gateway_routes())),
                 default_timeouts,
                 ca_cache,
+                proxy.access_log,
+                access_log_path_mode(proxy),
             ),
         ));
         let selector = SniCertSelector::new(source.tls_store());
@@ -531,6 +547,8 @@ fn wire_proxy_services(
                     Arc::new(RoutingEngine::new(source.ingress_routes())),
                     default_timeouts.clone(),
                     Arc::clone(&ca_cache),
+                    proxy.access_log,
+                    access_log_path_mode(proxy),
                 ),
             ));
             let selector = SniCertSelector::new(source.tls_store());
@@ -553,6 +571,8 @@ fn wire_proxy_services(
                 Arc::new(RoutingEngine::new(source.gateway_routes())),
                 default_timeouts,
                 ca_cache,
+                proxy.access_log,
+                access_log_path_mode(proxy),
             ),
         ));
         let selector = SniCertSelector::new(source.tls_store());

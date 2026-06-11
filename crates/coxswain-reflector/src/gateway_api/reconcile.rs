@@ -351,7 +351,10 @@ fn apply_rule(
             let filter_list = super::filters::build_filters(ctx.filters, "/", false);
             pb.add_prefix_route(
                 "/",
-                Arc::new(make_entry(MatchPredicates::default(), filter_list)),
+                Arc::new(
+                    make_entry(MatchPredicates::default(), filter_list)
+                        .with_path_pattern(Arc::from("/")),
+                ),
             );
         }
         Some(ms) => {
@@ -378,7 +381,8 @@ fn apply_rule(
                     None | Some(HttpRouteRulesMatchesPathType::PathPrefix)
                 );
                 let filter_list = super::filters::build_filters(ctx.filters, val, is_prefix);
-                let e = Arc::new(make_entry(predicates, filter_list));
+                let e =
+                    Arc::new(make_entry(predicates, filter_list).with_path_pattern(Arc::from(val)));
 
                 match m.path.as_ref().and_then(|p| p.r#type.as_ref()) {
                     Some(HttpRouteRulesMatchesPathType::Exact) => {

@@ -138,6 +138,14 @@ spec:
             - name: COXSWAIN_INGRESS_DEFAULT_BACKEND
               value: {{ .Values.proxy.shared.ingressDefaultBackend | quote }}
             {{- end }}
+            {{- if not .Values.proxy.shared.accessLog }}
+            - name: COXSWAIN_ACCESS_LOG
+              value: "false"
+            {{- end }}
+            {{- if ne .Values.proxy.shared.accessLogPathMode "full" }}
+            - name: COXSWAIN_ACCESS_LOG_PATH_MODE
+              value: {{ .Values.proxy.shared.accessLogPathMode | quote }}
+            {{- end }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:

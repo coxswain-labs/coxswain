@@ -148,7 +148,8 @@ fn backend_group_without_tls_returns_none() {
 fn upstream_tls_size_unchanged() {
     // BackendGroup now has one extra Option<Arc<UpstreamTls>> = 8 bytes;
     // but RouteEntry holds Arc<BackendGroup>, so RouteEntry size is unaffected.
-    static_assertions::assert_eq_size!(RouteEntry, [u8; 176]);
+    // Bumped 176→192: path_pattern: Arc<str> added for access-log pattern mode.
+    static_assertions::assert_eq_size!(RouteEntry, [u8; 192]);
 }
 
 #[test]

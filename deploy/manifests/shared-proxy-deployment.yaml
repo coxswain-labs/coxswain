@@ -77,6 +77,10 @@ spec:
               value: "5s"
             - name: COXSWAIN_PROXY_LISTENER_DRAIN_TIMEOUT
               value: "30s"
+            - name: COXSWAIN_ACCESS_LOG
+              value: "true"
+            - name: COXSWAIN_ACCESS_LOG_PATH_MODE
+              value: "full"
           livenessProbe:
             httpGet:
               path: /healthz

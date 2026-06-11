@@ -247,7 +247,7 @@ fn find_returns_filters_alongside_upstream() {
     let engine = engine_with_table(shared);
     let ctx = RequestContext::default();
     match engine.find(PORT, "example.com", "/test", &ctx) {
-        RouteOutcome::Found(_, filters, _) => {
+        RouteOutcome::Found(_, filters, _, _) => {
             assert_eq!(filters.len(), 1);
             assert!(matches!(
                 &filters[0],

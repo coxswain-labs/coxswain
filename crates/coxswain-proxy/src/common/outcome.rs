@@ -2,7 +2,7 @@
 //! sit between the lock-free table lookup and the upstream connection.
 
 use super::redirect::{RedirectOrigin, build_redirect_location};
-use coxswain_core::routing::{FilterAction, RouteOutcome, RouteTimeouts};
+use coxswain_core::routing::{BackendGroup, FilterAction, RouteOutcome, RouteTimeouts};
 use http::header;
 use pingora_core::{HTTPStatus, Result};
 use pingora_http::ResponseHeader;
@@ -34,13 +34,14 @@ pub(crate) async fn resolve_outcome(
     outcome: RouteOutcome,
 ) -> Result<
     Option<(
-        Arc<coxswain_core::routing::BackendGroup>,
+        Arc<BackendGroup>,
         Arc<[FilterAction]>,
         RouteTimeouts,
+        Arc<str>,
     )>,
 > {
     match outcome {
-        RouteOutcome::Found(u, f, t) => Ok(Some((u, f, t))),
+        RouteOutcome::Found(u, f, t, p) => Ok(Some((u, f, t, p))),
         RouteOutcome::Error(status) => {
             let resp = ResponseHeader::build(status, Some(0))?;
             session

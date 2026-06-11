@@ -1001,11 +1001,10 @@ fn build_ingress_routes(
                 .into_iter()
                 .flatten()
             {
-                let e = Arc::new(RouteEntry::path_only(
-                    Arc::clone(&group),
-                    svc_id.clone(),
-                    None,
-                ));
+                let e = Arc::new(
+                    RouteEntry::path_only(Arc::clone(&group), svc_id.clone(), None)
+                        .with_path_pattern(Arc::from("/")),
+                );
                 builder.for_port(port).catchall().add_prefix_route("/", e);
             }
         }

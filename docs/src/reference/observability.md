@@ -98,6 +98,51 @@ curl -s http://localhost:8082/routes | jq .
 
 Returns the active routing table as JSON — all hostname entries, their rules, and resolved upstream addresses. Useful for debugging routing decisions without reading raw Kubernetes objects.
 
+## Access logs
+
+Coxswain emits one structured log event per proxied request at `INFO` level on the `coxswain_proxy::access` target. Access logs are active by default; set `--access-log=false` (or `COXSWAIN_ACCESS_LOG=false`) to disable them entirely.
+
+### Log fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `host` | string | `Host` header value |
+| `method` | string | HTTP method |
+| `path` | string | Request path — see `--access-log-path-mode` below |
+| `status` | integer | Response HTTP status code |
+| `upstream` | string | Name of the matched upstream service |
+| `upstream_addr` | string | Selected endpoint `ip:port` |
+| `duration_ms` | integer | Total request duration in milliseconds |
+| `bytes_sent` | integer | Response body bytes sent to the client |
+| `error` | string | Error message if the request failed (omitted on success) |
+
+The `timestamp` field is written automatically by the logging subscriber in RFC 3339 format.
+
+### Path redaction
+
+The `--access-log-path-mode` flag (or `COXSWAIN_ACCESS_LOG_PATH_MODE`) controls what the `path` field contains:
+
+| Value | `path` field content | Use case |
+|-------|----------------------|----------|
+| `full` (default) | The concrete request path, e.g. `/users/42/orders/7` | Standard traffic analysis |
+| `pattern` | The matched rule's registered path pattern, e.g. `/users/` | Cardinality reduction; the proxy holds this without config duplication |
+| `none` | Field omitted entirely | Strict path redaction |
+
+!!! tip "Prefer pipeline-side redaction"
+    Redacting at the log-collection pipeline is the architecturally correct default — it keeps the proxy emitting ground truth while centralising PII policy. Use `pattern` or `none` only when the pipeline genuinely cannot filter.
+
+### Filtering access logs
+
+Access logs are emitted on the `coxswain_proxy::access` target, so they can be silenced independently of other logs:
+
+```bash
+# Silence access logs, keep controller logs at INFO
+--log=info,coxswain_proxy::access=off
+
+# Or via environment variable
+COXSWAIN_LOG=info,coxswain_proxy::access=off
+```
+
 ## Logging
 
 Coxswain uses structured logging via `tracing`. Configure the level with `--log` (or `COXSWAIN_LOG`):
