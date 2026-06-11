@@ -3,14 +3,13 @@
 # runner into the same distroless base as the production image.
 #
 # This avoids the full cargo-chef multi-stage build (5-10 min cold) during
-# e2e test runs. The binary is a debug build — sufficient for correctness
-# testing, not for release or performance benchmarks.
+# e2e test runs while still using a release binary.
 #
 # Usage:
-#   cargo build --bin coxswain
+#   cargo build --release --bin coxswain
 #   docker build -f Dockerfile.e2e -t coxswain:e2e .
 FROM gcr.io/distroless/cc-debian12:nonroot
-COPY target/debug/coxswain /usr/local/bin/coxswain
+COPY target/release/coxswain /usr/local/bin/coxswain
 ENV COXSWAIN_LOG=info \
     COXSWAIN_LOG_FORMAT=json
 ENTRYPOINT ["/usr/local/bin/coxswain"]

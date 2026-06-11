@@ -48,9 +48,9 @@ For each reset: briefly tell the user one line ("Resetting <type> cluster with `
 
 **Before running any Cargo suite, build the binary once:**
 ```bash
-cargo build --bin coxswain
+cargo build --release --bin coxswain
 ```
-The bootstrap fails fast with a clear error if `target/debug/coxswain` is absent. Re-run `cargo build` only when source changes — the Docker image rebuild (~5 s) and cluster state are separate.
+The bootstrap fails fast with a clear error if `target/release/coxswain` is absent. Re-run only when source changes — the Docker image rebuild (~5 s) and cluster state are separate.
 
 **Conformance**: also handled automatically by the Cargo bootstrap infrastructure when you run the Go test. No manual Helm install or coxswain startup needed.
 

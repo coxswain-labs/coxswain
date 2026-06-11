@@ -306,7 +306,7 @@ The harness wraps the locally compiled binary in a minimal `Dockerfile.e2e` imag
 ### ingress / gateway_api / dedicated_proxy / proxy_hot_reconfig
 
 ```bash
-cargo build --bin coxswain   # compile once; re-run only when source changes
+cargo build --release --bin coxswain   # compile once; re-run only when source changes
 cargo test -p coxswain-e2e --test ingress           -- --test-threads=1
 cargo test -p coxswain-e2e --test gateway_api        -- --test-threads=1
 cargo test -p coxswain-e2e --test dedicated_proxy    -- --test-threads=1

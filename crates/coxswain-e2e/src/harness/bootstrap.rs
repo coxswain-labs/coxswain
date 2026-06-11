@@ -285,9 +285,9 @@ fn image_tag() -> &'static str {
 /// Build the coxswain Docker image tagged `coxswain:e2e`.
 ///
 /// Uses `Dockerfile.e2e` — a 2-line COPY-only image that wraps the binary
-/// already compiled by `cargo build --bin coxswain`. The full multi-stage
-/// `Dockerfile` is for production releases; `Dockerfile.e2e` gives ~5 s
-/// builds at the cost of a debug binary (fine for correctness testing).
+/// already compiled by `cargo build --release --bin coxswain`. The full
+/// multi-stage `Dockerfile` is for production releases only; `Dockerfile.e2e`
+/// gives ~5 s builds with a release binary.
 ///
 /// Set `COXSWAIN_E2E_SKIP_BUILD=1` to skip the build entirely when the image
 /// has already been loaded into the Docker daemon (e.g. from a CI artifact).
@@ -295,7 +295,7 @@ fn image_tag() -> &'static str {
 /// # Errors
 ///
 /// Returns an error if `docker build` exits non-zero, or if the coxswain
-/// binary has not been compiled yet (`target/debug/coxswain` is absent).
+/// binary has not been compiled yet (`target/release/coxswain` is absent).
 async fn build_image(root: &Path) -> anyhow::Result<()> {
     if std::env::var("COXSWAIN_E2E_SKIP_BUILD").is_ok() {
         tracing::info!("COXSWAIN_E2E_SKIP_BUILD set; skipping docker build");
@@ -303,10 +303,10 @@ async fn build_image(root: &Path) -> anyhow::Result<()> {
     }
 
     // Fail fast with a clear message if the binary hasn't been compiled yet.
-    let binary = root.join("target/debug/coxswain");
+    let binary = root.join("target/release/coxswain");
     anyhow::ensure!(
         binary.exists(),
-        "target/debug/coxswain not found — run `cargo build --bin coxswain` first"
+        "target/release/coxswain not found — run `cargo build --release --bin coxswain` first"
     );
 
     tracing::info!("building Docker image {E2E_IMAGE} via Dockerfile.e2e");
