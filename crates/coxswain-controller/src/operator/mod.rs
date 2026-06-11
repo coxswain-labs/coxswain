@@ -17,7 +17,20 @@
 //! services coexist in the controller pod, each subscribed to their own
 //! event streams.
 //!
-//! ## Output (Step 9)
+//! ## Status writing (Step 12, #211)
+//!
+//! For every dedicated-mode Gateway, the operator is the **sole writer** of
+//! `Gateway.status`. One merge patch per reconcile carries
+//! `Accepted`/`Programmed`/`status.addresses`, the per-listener stanza shared
+//! with the shared-pool writer via [`crate::status_common`], and the
+//! `gateway.coxswain-labs.dev/DedicatedProxyReady` cut-over signal consumed by
+//! the shared-proxy reflector. The status writer in [`crate::controller`]
+//! skips Gateways whose `parametersRef` (on the Gateway or its GatewayClass)
+//! points at `gateway.coxswain-labs.dev/CoxswainGatewayParameters`, so the
+//! two writers never patch the same Gateway. See [`status`] for the patch
+//! builder.
+//!
+//! ## SSA contract
 //!
 //! - Every reconcile renders the desired specs and server-side-applies all
 //!   three resources under field manager `"coxswain-controller"` with
@@ -27,21 +40,21 @@
 //!   YAML is re-logged at `INFO` only when it changes, at `DEBUG` otherwise.
 //!   Per-Gateway hashes live in the kube-rs `Controller`'s reconcile
 //!   `Context` and are GC'd when the Gateway is deleted.
-//! - If `parametersRef` resolves to a missing object, the reconciler
-//!   publishes an `AcceptedReason::InvalidParameters` override into the
-//!   shared [`crate::AcceptedOverrides`] map; the status writer in
-//!   [`crate::controller`] consults the map and emits `Accepted=False,
-//!   reason=InvalidParameters` (Gateway API spec) on the next Gateway
-//!   reconcile.
+//! - If `parametersRef` resolves to a missing object, the reconciler emits
+//!   `Accepted=False, reason=InvalidParameters` (Gateway API spec) directly
+//!   via [`status::patch_dedicated_gateway_status`] and re-queues.
 //! - The reconcile is leader-gated: only the controller pod holding the
 //!   leadership lease applies — non-leaders re-queue.
 
 pub(crate) mod apply;
-pub(crate) mod condition;
 pub(crate) mod merge;
 pub(crate) mod params;
 pub(crate) mod rbac;
 pub(crate) mod reconciler;
 pub(crate) mod render;
+pub(crate) mod status;
+
+#[cfg(test)]
+mod tests;
 
 pub use reconciler::{Operator, OperatorConfig};

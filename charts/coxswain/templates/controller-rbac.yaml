@@ -76,14 +76,25 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Read-only Pod watch (#210) so the operator can observe dedicated-proxy
-  # Pod readiness and publish the `gateway.coxswain-labs.dev/DedicatedProxyReady`
-  # condition. Cluster-wide because dedicated-proxy Pods live in each
-  # Gateway's own namespace; the actual watch is label-selector scoped to
+  # Read-only Pod watch (#210, #211) so the operator can observe
+  # dedicated-proxy Pod readiness — publishes the
+  # `gateway.coxswain-labs.dev/DedicatedProxyReady` cut-over condition and
+  # gates `Programmed=True` in the dedicated Gateway status writer. Cluster-
+  # wide because dedicated-proxy Pods live in each Gateway's own namespace;
+  # the watch is label-selector scoped to
   # `app.kubernetes.io/managed-by=coxswain,app.kubernetes.io/name=coxswain`
   # so only our own Pods stream through it.
   - apiGroups: [""]
     resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Read cluster Nodes (#211): the dedicated Gateway status writer
+  # enumerates Node ExternalIP / InternalIP to populate
+  # `Gateway.status.addresses` when the dedicated Service is `NodePort`-typed.
+  # Unscoped watch (Nodes have no selector affordance) but cluster Nodes are
+  # low-cardinality at the sizes Coxswain targets, and no write verbs are
+  # included.
+  - apiGroups: [""]
+    resources: ["nodes"]
     verbs: ["get", "list", "watch"]
   # Server-side-apply / delete of per-namespace `RoleBinding`s that scope
   # each dedicated-proxy ServiceAccount to the namespaces its Gateway routes

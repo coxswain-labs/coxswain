@@ -1,0 +1,25 @@
+# Dedicated-mode Gateway whose `parametersRef` targets a missing
+# `CoxswainGatewayParameters` object (#211 Scenario C). The operator must
+# write `Accepted=False, reason=InvalidParameters` and
+# `Programmed=False, reason=Invalid` directly into Gateway.status — no
+# rendered Deployment/Service should appear.
+# TESTNS is substituted at runtime.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: dedicated-gw
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    parametersRef:
+      group: gateway.coxswain-labs.dev
+      kind: CoxswainGatewayParameters
+      name: does-not-exist
+  listeners:
+    - name: http
+      port: 8100
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

@@ -1,29 +1,18 @@
-//! Condition helpers: build and inspect `metav1.Condition` objects for Gateway API resources.
+//! Condition helpers: inspect `metav1.Condition` objects on Gateway API resources.
+//!
+//! The constructor lives in [`crate::status_common::make_condition`] so both
+//! the shared-pool status writer and the dedicated-mode status writer use one
+//! source of truth for condition layout; this module just re-exports it for
+//! call sites that already spell the bare name.
 
 use coxswain_core::ownership::{self, ObjectKey};
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::gw_types::v::httproutes::{HTTPRoute, HttpRouteParentRefs};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use std::collections::HashSet;
 
-pub(super) fn make_condition(
-    type_: &str,
-    status: &str,
-    reason: &str,
-    message: &str,
-    generation: i64,
-    now: Time,
-) -> Condition {
-    Condition {
-        type_: type_.to_string(),
-        status: status.to_string(),
-        reason: reason.to_string(),
-        message: message.to_string(),
-        observed_generation: Some(generation),
-        last_transition_time: now,
-    }
-}
+pub(super) use crate::status_common::make_condition;
 
 pub(super) fn has_condition(conditions: Option<&[Condition]>, type_: &str) -> bool {
     has_condition_at_gen(conditions, type_, 0)

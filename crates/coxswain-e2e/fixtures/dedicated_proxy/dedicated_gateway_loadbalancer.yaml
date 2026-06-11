@@ -1,0 +1,33 @@
+# Dedicated-mode Gateway with `serviceType: LoadBalancer` (#211 Scenario B).
+# Local clusters (kind/Orb) don't run an LB controller, so the rendered
+# Service stays `<pending>` for an LB IP — the e2e harness patches
+# `Service.status.loadBalancer.ingress` manually to simulate the LB
+# controller and verify Gateway.status.addresses + Programmed transitions.
+# TESTNS is substituted at runtime.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: dedicated-params
+spec:
+  replicas: 1
+  serviceType: LoadBalancer
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: dedicated-gw
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    parametersRef:
+      group: gateway.coxswain-labs.dev
+      kind: CoxswainGatewayParameters
+      name: dedicated-params
+  listeners:
+    - name: http
+      port: 8100
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

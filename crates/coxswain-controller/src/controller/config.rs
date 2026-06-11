@@ -1,6 +1,5 @@
 //! Validated configuration for the leader-election controller.
 
-use super::overrides::AcceptedOverrides;
 use coxswain_reflector::ingress::IngressPorts;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -92,17 +91,6 @@ pub struct ControllerConfig {
     /// are surfaced as `Programmed=False, reason=PortUnavailable` since the
     /// `GatewayProxy` cannot bind a port already claimed by the `IngressProxy`.
     pub ingress_ports: IngressPorts,
-    /// Shared override channel published into by the provisioning operator
-    /// (#208). When the operator detects an unresolvable `parametersRef`, it
-    /// records [`crate::AcceptedReason::InvalidParameters`] here; the
-    /// `gateway_status` writer consults the map on every Gateway reconcile and
-    /// emits `Accepted=False, reason=InvalidParameters` instead of the
-    /// default `Accepted=True`.
-    ///
-    /// Initialised empty by [`Self::new`]; the bin layer wires both this
-    /// `ControllerConfig` and the operator's `OperatorConfig` to the *same*
-    /// instance via [`Self::with_accepted_overrides`].
-    pub accepted_overrides: AcceptedOverrides,
 }
 
 impl ControllerConfig {
@@ -152,21 +140,6 @@ impl ControllerConfig {
             watch_namespace,
             status_address,
             ingress_ports,
-            accepted_overrides: AcceptedOverrides::new(),
         })
-    }
-
-    /// Attach a shared [`AcceptedOverrides`] map to this config.
-    ///
-    /// The bin layer constructs a single `AcceptedOverrides` instance and
-    /// shares it between the controller and the provisioning operator so the
-    /// operator can publish `Accepted=False, reason=InvalidParameters` for
-    /// dedicated-mode Gateways with an unresolvable `parametersRef` (#208).
-    /// Use this builder method rather than direct field assignment to keep
-    /// the construction-site documented.
-    #[must_use]
-    pub fn with_accepted_overrides(mut self, overrides: AcceptedOverrides) -> Self {
-        self.accepted_overrides = overrides;
-        self
     }
 }

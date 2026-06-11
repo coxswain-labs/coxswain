@@ -2,48 +2,28 @@
 
 use super::conditions::{has_condition, make_condition};
 use super::config::StatusAddress;
-use super::overrides::AcceptedReason;
-use coxswain_reflector::gw_types::v::gateways::{
-    Gateway, GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
+use crate::status_common::{
+    OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
 };
+use coxswain_reflector::gw_types::v::gateways::{Gateway, GatewayStatusListeners};
 use coxswain_reflector::tls::GatewayListenerHealth;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
-/// Conditions whose type starts with this prefix are written by
-/// `crate::operator::condition` (cut-over signalling and any future
-/// operator-side condition). The status writer preserves them when
-/// rebuilding `status.conditions` so its merge patch doesn't clobber the
-/// operator's writes. See `crate::operator::condition` for the counterparty.
-const OPERATOR_OWNED_CONDITION_TYPE_PREFIX: &str = "gateway.coxswain-labs.dev/";
-
 /// Returns true when the Gateway's current status does not yet reflect the
-/// desired state computed from `health` and `accepted_override`. Prevents
-/// redundant patches and watch-feedback loops.
-///
-/// `accepted_override` is consulted to detect the case where the operator
-/// has just published an override (e.g. `InvalidParameters`) but the current
-/// Gateway status still carries `Accepted=True` from a prior reconcile cycle,
-/// or vice versa when an override has just cleared.
-pub(super) fn gateway_needs_status_patch(
-    gw: &Gateway,
-    health: &GatewayListenerHealth,
-    accepted_override: Option<AcceptedReason>,
-) -> bool {
-    if !accepted_matches_override(gw, accepted_override) {
+/// desired state computed from `health`. Prevents redundant patches and
+/// watch-feedback loops.
+pub(super) fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerHealth) -> bool {
+    if !accepted_is_true(gw) {
         return true;
     }
-    // When the override is active we expect Programmed=False; otherwise True.
-    // `gateway_programmed` returns true iff a Programmed=True condition exists,
-    // so flip the test based on the override state.
-    let want_programmed_true = accepted_override.is_none();
-    if super::conditions::gateway_programmed(gw) != want_programmed_true {
+    if !super::conditions::gateway_programmed(gw) {
         return true;
     }
     let current_listener_count = gw
         .status
         .as_ref()
         .and_then(|s| s.listeners.as_deref())
-        .map(|l| l.len())
+        .map(<[GatewayStatusListeners]>::len)
         .unwrap_or(0);
     if current_listener_count != gw.spec.listeners.len() {
         return true;
@@ -52,7 +32,7 @@ pub(super) fn gateway_needs_status_patch(
         .status
         .as_ref()
         .and_then(|s| s.listeners.as_ref())
-        .map(|v| v.as_slice())
+        .map(Vec::as_slice)
         .unwrap_or(&[]);
     for listener in &gw.spec.listeners {
         let (has_invalid_kinds, _) = listener_route_kind_info(listener);
@@ -108,65 +88,15 @@ fn any_status_writer_owned_condition_stale(conditions: &[Condition], expected_ge
         .any(|c| c.observed_generation.unwrap_or(0) < expected_gen)
 }
 
-/// Returns true if the Gateway's current `Accepted` condition matches what
-/// `accepted_override` says it should be.
-///
-/// - `None` override → expect `Accepted=True, reason=Accepted`.
-/// - `Some(r)` override → expect `Accepted=False` with `reason=r.reason()`.
-fn accepted_matches_override(gw: &Gateway, accepted_override: Option<AcceptedReason>) -> bool {
-    let (want_status, want_reason) = match accepted_override {
-        Some(r) => ("False", r.reason()),
-        None => ("True", "Accepted"),
-    };
+/// Returns true iff the Gateway's current `Accepted` condition is the canonical
+/// `(True, reason=Accepted)` pair. The shared-pool writer is the sole writer
+/// of `Accepted` for non-dedicated Gateways; any other state requires a patch.
+fn accepted_is_true(gw: &Gateway) -> bool {
     gw.status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
         .and_then(|cs| cs.iter().find(|c| c.type_ == "Accepted"))
-        .is_some_and(|c| c.status == want_status && c.reason == want_reason)
-}
-
-/// Returns `(has_any_invalid, supported_kinds)` for a listener's `allowedRoutes.kinds`.
-///
-/// - `has_any_invalid`: true if any listed kind is not supported by this controller.
-///   When true, `ResolvedRefs: False, reason: InvalidRouteKinds` must be set.
-/// - `supported_kinds`: intersection of the listed kinds with what we support (currently
-///   only `HTTPRoute`). Empty list when all listed kinds are unsupported. When
-///   `allowedRoutes.kinds` is absent or empty, returns `[HTTPRoute]` with `has_any_invalid=false`.
-pub(super) fn listener_route_kind_info(
-    listener: &GatewayListeners,
-) -> (bool, Vec<GatewayStatusListenersSupportedKinds>) {
-    const HTTP_ROUTE_GROUP: &str = "gateway.networking.k8s.io";
-    let http_route_kind = || GatewayStatusListenersSupportedKinds {
-        group: Some(HTTP_ROUTE_GROUP.to_string()),
-        kind: "HTTPRoute".to_string(),
-    };
-    let allowed = match listener
-        .allowed_routes
-        .as_ref()
-        .and_then(|ar| ar.kinds.as_deref())
-    {
-        Some(k) if !k.is_empty() => k,
-        _ => return (false, vec![http_route_kind()]),
-    };
-    let mut has_invalid = false;
-    let mut includes_http_route = false;
-    for k in allowed {
-        let is_http_route = k.kind == "HTTPRoute"
-            && k.group
-                .as_deref()
-                .is_none_or(|g| g.is_empty() || g == HTTP_ROUTE_GROUP);
-        if is_http_route {
-            includes_http_route = true;
-        } else {
-            has_invalid = true;
-        }
-    }
-    let supported = if includes_http_route {
-        vec![http_route_kind()]
-    } else {
-        vec![]
-    };
-    (has_invalid, supported)
+        .is_some_and(|c| c.status == "True" && c.reason == "Accepted")
 }
 
 pub(super) fn build_gateway_status_patch(
@@ -176,47 +106,19 @@ pub(super) fn build_gateway_status_patch(
     now: &Time,
     addr: Option<&StatusAddress>,
     ingress_ports: coxswain_reflector::ingress::IngressPorts,
-    accepted_override: Option<AcceptedReason>,
 ) -> serde_json::Value {
-    // Gateway-level `Accepted` is `True` by default. When the operator has
-    // published an override (e.g. `InvalidParameters` from an unresolvable
-    // `parametersRef`), surface that instead — and force `Programmed=False`
-    // because a Gateway whose spec is invalid cannot be programmed. The
-    // listener conditions below stay computed from `health` either way; the
-    // per-listener Programmed reason still expresses listener-level health.
-    let (accepted_status, accepted_reason, accepted_message): (&str, &str, &str) =
-        match accepted_override {
-            Some(r) => ("False", r.reason(), r.message()),
-            None => ("True", "Accepted", ""),
-        };
-    let (prog_status, prog_reason, prog_message): (&str, &str, &str) = match accepted_override {
-        Some(_) => (
-            "False",
-            "Invalid",
-            "Gateway spec is invalid; see the Accepted condition for details",
-        ),
-        None => ("True", "Programmed", ""),
-    };
-
     // Preserve any operator-owned conditions (those whose type starts with
     // `gateway.coxswain-labs.dev/`) so the merge patch below doesn't clobber
     // them. The operator side mirrors the convention by preserving everything
-    // NOT prefixed with that domain. See `crate::operator::condition` for the
+    // NOT prefixed with that domain. See `crate::operator::status` for the
     // counterparty.
     let mut conditions = vec![
-        make_condition(
-            "Accepted",
-            accepted_status,
-            accepted_reason,
-            accepted_message,
-            generation,
-            now.clone(),
-        ),
+        make_condition("Accepted", "True", "Accepted", "", generation, now.clone()),
         make_condition(
             "Programmed",
-            prog_status,
-            prog_reason,
-            prog_message,
+            "True",
+            "Programmed",
+            "",
             generation,
             now.clone(),
         ),
@@ -235,75 +137,8 @@ pub(super) fn build_gateway_status_patch(
         .listeners
         .iter()
         .map(|l| {
-            let outcome = health
-                .listeners
-                .get(&l.name)
-                .map(|i| i.tls_outcome.clone())
-                .unwrap_or_default();
-            let (has_invalid_kinds, supported_kinds_list) = listener_route_kind_info(l);
-            let (resolved_refs_status, resolved_refs_reason, resolved_refs_msg) =
-                if has_invalid_kinds {
-                    (
-                        "False",
-                        "InvalidRouteKinds",
-                        "One or more specified route kinds are not supported by this implementation",
-                    )
-                } else if outcome.is_healthy() {
-                    ("True", "ResolvedRefs", "")
-                } else {
-                    ("False", outcome.reason(), outcome.message())
-                };
-            // Port-conflict detection (issue #201): a Gateway listener whose port is
-            // reserved by the Ingress data plane (--proxy-http-port / --proxy-https-port)
-            // cannot be bound by GatewayProxy. Surface a Programmed=False condition with
-            // reason=PortUnavailable so operators see the conflict without trawling logs.
-            let listener_port = u16::try_from(l.port).unwrap_or(0);
-            let port_conflict = ingress_ports.http == Some(listener_port)
-                || ingress_ports.https == Some(listener_port);
-            let port_conflict_msg = format!(
-                "port {listener_port} is reserved by the Ingress proxy (set via --proxy-http-port or --proxy-https-port)"
-            );
-            let (listener_prog_status, listener_prog_reason, listener_prog_msg) = if port_conflict {
-                ("False", "PortUnavailable", port_conflict_msg.as_str())
-            } else if outcome.is_healthy() {
-                ("True", "Programmed", "")
-            } else {
-                ("False", outcome.reason(), outcome.message())
-            };
-            let attached = health.listeners.get(&l.name).map(|i| i.attached_routes).unwrap_or(0);
-            tracing::debug!(
-                listener = %l.name,
-                resolved_refs = resolved_refs_status,
-                programmed = listener_prog_status,
-                attached_routes = attached,
-                supported_kinds = supported_kinds_list.len(),
-                "Listener status"
-            );
-            let listener_conditions = vec![
-                make_condition("Accepted", "True", "Accepted", "", generation, now.clone()),
-                make_condition(
-                    "ResolvedRefs",
-                    resolved_refs_status,
-                    resolved_refs_reason,
-                    resolved_refs_msg,
-                    generation,
-                    now.clone(),
-                ),
-                make_condition(
-                    "Programmed",
-                    listener_prog_status,
-                    listener_prog_reason,
-                    listener_prog_msg,
-                    generation,
-                    now.clone(),
-                ),
-            ];
-            GatewayStatusListeners {
-                name: l.name.clone(),
-                attached_routes: attached,
-                supported_kinds: Some(supported_kinds_list),
-                conditions: listener_conditions,
-            }
+            let info = health.listeners.get(&l.name);
+            build_listener_status(l, info, ingress_ports, generation, now)
         })
         .collect();
 

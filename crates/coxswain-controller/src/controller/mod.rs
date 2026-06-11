@@ -34,14 +34,12 @@ mod gateway_status;
 mod gatewayclass_events;
 mod ingress_events;
 mod ingress_status;
-mod overrides;
 mod route_events;
 
 #[cfg(test)]
 mod tests;
 
 pub use config::{ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress};
-pub use overrides::{AcceptedOverrides, AcceptedReason};
 
 use conditions::{gateway_accepted, http_route_programmed};
 use gateway_class_status::gateway_class_needs_status_patch;
@@ -151,6 +149,14 @@ impl Controller {
         // Names of GatewayClass resources whose controllerName matches ours.
         let mut owned_gateway_classes: HashSet<String> = HashSet::new();
 
+        // Subset of `owned_gateway_classes` whose `spec.parametersRef`
+        // targets the `CoxswainGatewayParameters` CRD — i.e. every Gateway
+        // in such a class is dedicated-mode and its status is written by the
+        // operator in `crate::operator::status`, not by this writer. Tracked
+        // here (not derived on demand) so the Gateway-watcher dispatch
+        // doesn't have to re-snapshot the class each event.
+        let mut owned_dedicated_gateway_classes: HashSet<String> = HashSet::new();
+
         // Names of IngressClass resources whose spec.controller matches ours.
         let mut owned_ingress_classes: HashSet<String> = HashSet::new();
 
@@ -242,6 +248,11 @@ impl Controller {
                             let name = gc.metadata.name.clone().unwrap_or_default();
                             if gc.spec.controller_name == self.config.controller_name {
                                 owned_gateway_classes.insert(name.clone());
+                                if class_has_coxswain_params_ref(&gc) {
+                                    owned_dedicated_gateway_classes.insert(name.clone());
+                                } else {
+                                    owned_dedicated_gateway_classes.remove(&name);
+                                }
                                 if is_leader && gateway_class_needs_status_patch(&gc) {
                                     let Some(generation) = gc.metadata.generation else {
                                         tracing::warn!(name, "Skipping GatewayClass status patch: metadata.generation is unset");
@@ -261,6 +272,7 @@ impl Controller {
                             let name = gc.metadata.name.clone().unwrap_or_default();
                             if gc.spec.controller_name == self.config.controller_name {
                                 owned_gateway_classes.remove(&name);
+                                owned_dedicated_gateway_classes.remove(&name);
                             }
                         }
                         Ok(_) => {}
@@ -284,6 +296,21 @@ impl Controller {
                             let name = gw.metadata.name.clone().unwrap_or_default();
                             known_gateways.insert(ObjectKey::new(ns, name), gw.clone());
 
+                            // Skip dedicated-mode Gateways — the operator in
+                            // `crate::operator::status` is their sole status
+                            // writer (#211). The two writers would otherwise
+                            // race on `Gateway.status.conditions` and produce
+                            // a flapping `Programmed` reason during the
+                            // initial reconcile window.
+                            if is_dedicated_mode(&gw, &owned_dedicated_gateway_classes) {
+                                tracing::debug!(
+                                    name = gw.metadata.name.as_deref().unwrap_or(""),
+                                    class_name,
+                                    "Skipping Gateway status — dedicated mode (operator owns status)"
+                                );
+                                continue;
+                            }
+
                             let controller_ready = self.health.is_subsystem_ready("controller");
                             if is_leader && controller_ready {
                                 let health_map = self.tls_health.load();
@@ -295,20 +322,14 @@ impl Controller {
                                     .get(&key)
                                     .cloned()
                                     .unwrap_or_default();
-                                let accepted_override = self.config.accepted_overrides.get(&key);
-                                if gateway_needs_status_patch(&gw, &health, accepted_override) {
-                                    gateway_events::patch_gateway_status(&client, &gw, &health, self.config.status_address.as_ref(), self.config.ingress_ports, accepted_override).await;
+                                if gateway_needs_status_patch(&gw, &health) {
+                                    gateway_events::patch_gateway_status(&client, &gw, &health, self.config.status_address.as_ref(), self.config.ingress_ports).await;
                                 }
                             } else if is_leader && !gateway_accepted(&gw) {
                                 // Before synced: only ensure Accepted is set; defer Programmed.
                                 let empty_health = GatewayListenerHealth::default();
-                                let key = ObjectKey::new(
-                                    gw.metadata.namespace.clone().unwrap_or_default(),
-                                    gw.metadata.name.clone().unwrap_or_default(),
-                                );
-                                let accepted_override = self.config.accepted_overrides.get(&key);
-                                if gateway_needs_status_patch(&gw, &empty_health, accepted_override) {
-                                    gateway_events::patch_gateway_status(&client, &gw, &empty_health, self.config.status_address.as_ref(), self.config.ingress_ports, accepted_override).await;
+                                if gateway_needs_status_patch(&gw, &empty_health) {
+                                    gateway_events::patch_gateway_status(&client, &gw, &empty_health, self.config.status_address.as_ref(), self.config.ingress_ports).await;
                                 }
                             }
                         }
@@ -331,13 +352,17 @@ impl Controller {
                         if !owned_gateway_classes.contains(&gw.spec.gateway_class_name) {
                             continue;
                         }
+                        // Same dispatch rule as the gateway_watcher arm —
+                        // dedicated-mode Gateways are owned by the operator.
+                        if is_dedicated_mode(gw, &owned_dedicated_gateway_classes) {
+                            continue;
+                        }
                         let health = health_map
                             .get(key)
                             .cloned()
                             .unwrap_or_default();
-                        let accepted_override = self.config.accepted_overrides.get(key);
-                        if gateway_needs_status_patch(gw, &health, accepted_override) {
-                            gateway_events::patch_gateway_status(&client, gw, &health, self.config.status_address.as_ref(), self.config.ingress_ports, accepted_override).await;
+                        if gateway_needs_status_patch(gw, &health) {
+                            gateway_events::patch_gateway_status(&client, gw, &health, self.config.status_address.as_ref(), self.config.ingress_ports).await;
                         }
                     }
                 }
@@ -480,4 +505,44 @@ impl BackgroundService for Controller {
     async fn start(&self, shutdown: ShutdownWatch) {
         self.start_watcher_loop(shutdown).await;
     }
+}
+
+/// CRD group hosting [`coxswain_core::crd::CoxswainGatewayParameters`]. A
+/// `parametersRef` with this group + matching kind marks a Gateway (or its
+/// GatewayClass) as dedicated-mode, which the shared-pool status writer
+/// must skip (#211).
+const COXSWAIN_PARAMS_GROUP: &str = "gateway.coxswain-labs.dev";
+/// CRD kind for the dedicated-mode parameters CRD.
+const COXSWAIN_PARAMS_KIND: &str = "CoxswainGatewayParameters";
+
+/// Returns true iff the GatewayClass's `parametersRef` targets
+/// `CoxswainGatewayParameters`. The presence of the reference is the
+/// dedicated-mode opt-in signal — we do not resolve the target here, because
+/// even an unresolvable reference is the operator's case (the
+/// `InvalidParameters` Gateway condition).
+fn class_has_coxswain_params_ref(gc: &GatewayClass) -> bool {
+    gc.spec
+        .parameters_ref
+        .as_ref()
+        .is_some_and(|r| r.group == COXSWAIN_PARAMS_GROUP && r.kind == COXSWAIN_PARAMS_KIND)
+}
+
+/// Same predicate, applied to the Gateway's own
+/// `spec.infrastructure.parametersRef`. Either reference triggers
+/// dedicated mode.
+fn gateway_has_coxswain_params_ref(gw: &Gateway) -> bool {
+    gw.spec
+        .infrastructure
+        .as_ref()
+        .and_then(|i| i.parameters_ref.as_ref())
+        .is_some_and(|r| r.group == COXSWAIN_PARAMS_GROUP && r.kind == COXSWAIN_PARAMS_KIND)
+}
+
+/// Returns true iff the Gateway is in dedicated mode and therefore must NOT
+/// have its `status` patched by the shared-pool writer. The check is purely
+/// derived from already-watched specs (no resolve, no shared state) so the
+/// dispatch is race-free with respect to the operator.
+fn is_dedicated_mode(gw: &Gateway, owned_dedicated_classes: &HashSet<String>) -> bool {
+    gateway_has_coxswain_params_ref(gw)
+        || owned_dedicated_classes.contains(gw.spec.gateway_class_name.as_str())
 }
