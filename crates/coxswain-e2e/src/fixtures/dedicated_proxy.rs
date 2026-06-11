@@ -36,3 +36,39 @@ pub const DEDICATED_GATEWAY_LOADBALANCER: &str = fixture!("dedicated_gateway_loa
 /// operator writes `Accepted=False, reason=InvalidParameters` directly.
 pub const DEDICATED_GATEWAY_INVALID_PARAMS: &str =
     fixture!("dedicated_gateway_invalid_params.yaml");
+
+// -----------------------------------------------------------------------------
+// Step 13 (#212) — full-lifecycle suite fixtures. Listener ports use the
+// harness-substituted `GATEWAY_HTTP_PORT`, and the dedicated pod's image is
+// pinned to `registry.k8s.io/pause:3.10` so the Pod becomes Ready without a
+// coxswain image build.
+// -----------------------------------------------------------------------------
+
+/// Dedicated-mode Gateway + `CoxswainGatewayParameters` (no HTTPRoute). Used
+/// by the provisioning, status, GC, and restart-idempotency lifecycle tests.
+pub const PROVISIONING: &str = fixture!("provisioning.yaml");
+
+/// Dedicated-mode Gateway + `CoxswainGatewayParameters` + same-namespace
+/// HTTPRoute targeting `echo-a` from `backends/echo.yaml`. Used by the traffic
+/// and dedicated→shared migration lifecycle tests.
+pub const TRAFFIC: &str = fixture!("traffic.yaml");
+
+/// Dedicated-mode Gateway + HTTPRoute targeting a backend Service in TENANTNS.
+/// Pair with [`CROSS_NAMESPACE_TENANT`]; the route only resolves while the
+/// matching `ReferenceGrant` is present.
+pub const CROSS_NAMESPACE_ROUTE: &str = fixture!("cross_namespace_route.yaml");
+
+/// Tenant-namespace counterpart of [`CROSS_NAMESPACE_ROUTE`]: backend `echo-d`
+/// plus the `ReferenceGrant` permitting an HTTPRoute in TESTNS to target
+/// Services here.
+pub const CROSS_NAMESPACE_TENANT: &str = fixture!("cross_namespace_tenant.yaml");
+
+/// Shared-mode starting point for the shared→dedicated migration test: Gateway
+/// without `infrastructure.parametersRef`, HTTPRoute attached. The
+/// `dedicated-params` object is bundled so the test can patch the parametersRef
+/// in without a second apply.
+pub const MODE_MIGRATION_SHARED: &str = fixture!("mode_migration_shared.yaml");
+
+/// Dedicated-mode starting point for the dedicated→shared migration test:
+/// Gateway with `infrastructure.parametersRef` set, HTTPRoute attached.
+pub const MODE_MIGRATION_DEDICATED: &str = fixture!("mode_migration_dedicated.yaml");

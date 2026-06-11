@@ -517,10 +517,13 @@ fn rebuild_dedicated(
         policy_index: &policy_index,
     };
 
-    let routes_published = build_gateway_routes(stores, &routes, &ownership, gateway_routes);
+    // `skip_cut_over = false`: the dedicated proxy serves the cut-over Gateway.
+    let routes_published = build_gateway_routes(stores, &routes, &ownership, gateway_routes, false);
 
     let ingresses: Vec<Arc<k8s_openapi::api::networking::v1::Ingress>> = Vec::new();
-    let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, tls);
+    // `skip_cut_over = false`: the dedicated proxy's whole job is serving the
+    // cut-over Gateway. The shared-pool filter would drop our listener.
+    let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, tls, false);
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
     tls_health.store_and_notify(gateway_tls_health);
 
@@ -937,10 +940,13 @@ fn rebuild_dedicated_narrow(
         policy_index: &policy_index,
     };
 
-    let routes_published = build_gateway_routes(stores, &routes, &ownership, gateway_routes);
+    // `skip_cut_over = false`: the dedicated proxy serves the cut-over Gateway.
+    let routes_published = build_gateway_routes(stores, &routes, &ownership, gateway_routes, false);
 
     let ingresses: Vec<Arc<k8s_openapi::api::networking::v1::Ingress>> = Vec::new();
-    let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, tls);
+    // `skip_cut_over = false`: the dedicated proxy's whole job is serving the
+    // cut-over Gateway. The shared-pool filter would drop our listener.
+    let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, tls, false);
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
     tls_health.store_and_notify(gateway_tls_health);
 
