@@ -602,6 +602,11 @@ pub struct RouteEntry {
     /// When `Some`, the proxy returns this status code immediately without contacting upstream.
     /// Used for routes with invalid/missing/forbidden backend refs (Gateway API §4.3.4).
     pub error_status: Option<u16>,
+    /// Registered path pattern (exact value, prefix, or regex) for this rule.
+    ///
+    /// Shared as an `Arc<str>` so the access-log `pattern` mode can emit the rule
+    /// pattern instead of the concrete request path without a per-request allocation.
+    pub path_pattern: Arc<str>,
 }
 
 impl RouteEntry {
@@ -619,6 +624,7 @@ impl RouteEntry {
             route_id,
             created_at,
             error_status: None,
+            path_pattern: Arc::from(""),
         }
     }
 
@@ -637,6 +643,7 @@ impl RouteEntry {
             route_id,
             created_at,
             error_status: None,
+            path_pattern: Arc::from(""),
         }
     }
 
@@ -660,6 +667,7 @@ impl RouteEntry {
             route_id,
             created_at,
             error_status: None,
+            path_pattern: Arc::from(""),
         }
     }
 
@@ -685,12 +693,25 @@ impl RouteEntry {
             route_id,
             created_at,
             error_status: None,
+            path_pattern: Arc::from(""),
         }
+    }
+
+    /// Set the path pattern this entry was registered under (builder-style).
+    ///
+    /// Call this immediately after construction, before wrapping in `Arc`, so
+    /// the access-log `pattern` mode can emit the rule pattern instead of the
+    /// concrete request path.
+    #[must_use]
+    pub fn with_path_pattern(mut self, pattern: Arc<str>) -> Self {
+        self.path_pattern = pattern;
+        self
     }
 }
 
 // Lock the hot-path RouteEntry and BackendPool sizes to catch accidental growth.
 // Update the constant when a deliberate layout change is made.
-static_assertions::assert_eq_size!(RouteEntry, [u8; 176]);
+// Bumped 176→192 by adding path_pattern: Arc<str> (16 bytes) for access-log pattern mode.
+static_assertions::assert_eq_size!(RouteEntry, [u8; 192]);
 // Hot type — review with the team before bumping this number.
 static_assertions::assert_eq_size!(BackendPool, [u8; 24]);

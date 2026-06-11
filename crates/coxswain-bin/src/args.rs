@@ -37,6 +37,20 @@ pub(crate) enum LogFormat {
     Json,
 }
 
+/// Controls what the access log records in the `path` field.
+#[derive(ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
+pub(crate) enum AccessLogPathMode {
+    /// Emit the concrete request path as received (default).
+    Full,
+    /// Emit the matched rule's path pattern instead of the concrete path.
+    ///
+    /// E.g. `/users/` instead of `/users/42/orders/7`. When no route
+    /// matched, emits `/` as a stable placeholder.
+    Pattern,
+    /// Omit the `path` field from the access log entirely.
+    None,
+}
+
 /// Coxswain: a Kubernetes Ingress & Gateway API Controller built on Pingora.
 #[derive(Parser, Debug)]
 #[command(
@@ -313,6 +327,32 @@ pub(crate) struct ProxyArgs {
     /// they recover.
     #[arg(long, env = "COXSWAIN_INGRESS_DEFAULT_BACKEND")]
     pub ingress_default_backend: Option<IngressDefaultBackend>,
+
+    /// Enable per-request access logging.
+    ///
+    /// When `true` (default), one structured log event is emitted per request at
+    /// `INFO` level on the `coxswain_proxy::access` target. Set to `false` to
+    /// silence access logs entirely (useful for high-traffic benchmarking).
+    ///
+    /// Individual fields can be suppressed or transformed with `--access-log-path-mode`.
+    #[arg(
+        long,
+        env = "COXSWAIN_ACCESS_LOG",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub access_log: bool,
+
+    /// Controls what the access log records in the `path` field.
+    ///
+    /// `full` (default): the concrete request path. `pattern`: the matched
+    /// rule's registered path pattern — e.g. `/users/` instead of
+    /// `/users/42/orders/7`. `none`: the field is omitted entirely.
+    ///
+    /// Prefer pipeline-side redaction when your log collector supports it.
+    /// Use `pattern` or `none` only when the pipeline cannot filter.
+    #[arg(long, env = "COXSWAIN_ACCESS_LOG_PATH_MODE", default_value = "full")]
+    pub access_log_path_mode: AccessLogPathMode,
 }
 
 /// Flags specific to roles that run the status writer (`controller`, `dev`).
@@ -851,6 +891,72 @@ mod tests {
         assert_eq!(
             controller.common.management_bind_address,
             "0.0.0.0".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// `--access-log` defaults to `true` and `--access-log-path-mode` to `full`.
+    #[test]
+    fn access_log_defaults() {
+        let cli = Cli::try_parse_from(["coxswain", "serve", "dev"]).expect("dev parses");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Dev(args)) = serve.role else {
+            panic!("expected dev role");
+        };
+        assert!(args.proxy.access_log, "access_log defaults to true");
+        assert_eq!(
+            args.proxy.access_log_path_mode,
+            AccessLogPathMode::Full,
+            "access_log_path_mode defaults to Full"
+        );
+    }
+
+    /// `--access-log false` and all three path mode values parse correctly.
+    #[test]
+    fn access_log_flags_parse() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["coxswain", "serve", "dev"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args).expect("parses")
+        };
+
+        // Disabled access log
+        let cli = parse(&["--access-log=false"]);
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Dev(args)) = serve.role else {
+            panic!("expected dev role");
+        };
+        assert!(!args.proxy.access_log);
+
+        // Pattern mode
+        let cli = parse(&["--access-log-path-mode=pattern"]);
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Dev(args)) = serve.role else {
+            panic!("expected dev role");
+        };
+        assert_eq!(args.proxy.access_log_path_mode, AccessLogPathMode::Pattern);
+
+        // None mode
+        let cli = parse(&["--access-log-path-mode=none"]);
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Dev(args)) = serve.role else {
+            panic!("expected dev role");
+        };
+        assert_eq!(args.proxy.access_log_path_mode, AccessLogPathMode::None);
+    }
+
+    /// `--access-log` and `--access-log-path-mode` appear in `dev --help`.
+    #[test]
+    fn access_log_flags_in_dev_help() {
+        let mut cmd = Cli::command();
+        let dev = cmd
+            .find_subcommand_mut("serve")
+            .and_then(|s| s.find_subcommand_mut("dev"))
+            .expect("dev subcommand exists");
+        let help = dev.render_help().to_string();
+        assert!(help.contains("--access-log"), "dev help lists --access-log");
+        assert!(
+            help.contains("--access-log-path-mode"),
+            "dev help lists --access-log-path-mode"
         );
     }
 }

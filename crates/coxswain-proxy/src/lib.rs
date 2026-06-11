@@ -10,6 +10,7 @@
 
 pub(crate) mod accept;
 pub(crate) mod common;
+pub mod config;
 mod gateway;
 mod ingress;
 pub(crate) mod metrics;
@@ -26,6 +27,7 @@ pub use accept::{
 };
 pub use common::ctx::{ProxyCtx, ResolvedRoute};
 pub use common::engine::RoutingEngine;
+pub use config::AccessLogPathMode;
 pub use gateway::{GatewayEngine, GatewayProxy};
 pub use ingress::{IngressEngine, IngressProxy};
 pub use reflector::{

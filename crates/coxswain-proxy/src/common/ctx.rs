@@ -23,9 +23,9 @@ tokio::task_local! {
 
 /// Routing result cached from `request_filter` for use in later hooks.
 ///
-/// `original_host` and `original_path` are `Arc<str>` so that cloning them
-/// in subsequent hooks (e.g. for SNI or redirect) is a refcount bump, not
-/// a heap allocation.
+/// `original_host`, `original_path`, and `path_pattern` are `Arc<str>` so that
+/// cloning them in subsequent hooks (e.g. for SNI, redirect, or access logging)
+/// is a refcount bump, not a heap allocation.
 pub struct ResolvedRoute {
     /// Chosen backend group for this request.
     pub backend_group: Arc<BackendGroup>,
@@ -37,6 +37,12 @@ pub struct ResolvedRoute {
     pub original_host: Arc<str>,
     /// Original request path (before any rewrite).
     pub original_path: Arc<str>,
+    /// Registered path pattern of the matched rule (exact value, prefix, or regex).
+    ///
+    /// Shared from `RouteEntry::path_pattern` — one `Arc<str>` per rule, zero
+    /// per-request allocation. Used by the access-log `pattern` mode to emit the
+    /// rule pattern instead of the concrete request path.
+    pub path_pattern: Arc<str>,
 }
 
 /// Per-request context carrying the real client address extracted from the PROXY header.
@@ -68,8 +74,16 @@ pub struct ProxyCtx {
     /// filters in `upstream_request_filter`. `None` for the common case where no
     /// per-backend filters apply to this request.
     pub selected_backend_filters: Option<Arc<[FilterAction]>>,
+    /// Timestamp captured at `request_filter` entry — used by the access log to compute
+    /// `duration_ms`. `None` when `request_filter` was not reached (unusual error path).
+    pub start: Option<Instant>,
+    /// Upstream endpoint address chosen in `upstream_peer` — written to the access log.
+    pub upstream_addr: Option<SocketAddr>,
 }
 
 // Hot types — review with the team before bumping these numbers.
-const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 88);
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 176);
+// ResolvedRoute: +16 bytes for path_pattern: Arc<str> (88→104).
+const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 104);
+// ProxyCtx: +16 for start: Option<Instant>, +48 for upstream_addr: Option<SocketAddr>
+// with alignment padding (176→240).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 240);

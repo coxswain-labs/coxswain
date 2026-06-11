@@ -277,6 +277,14 @@ proxy:
     # default/my-404-page:80
     ingressDefaultBackend: ""
 
+    # COXSWAIN_ACCESS_LOG — enable per-request access logging.
+    # Set to false to disable entirely (useful for high-traffic benchmarking).
+    accessLog: true
+    # COXSWAIN_ACCESS_LOG_PATH_MODE — what the access log emits for the path field.
+    # full: concrete request path (default); pattern: matched rule's path pattern;
+    # none: field omitted entirely. Prefer pipeline-side redaction when possible.
+    accessLogPathMode: full
+
   # Dedicated-mode proxy provisioning. The pods themselves are not rendered
   # by Helm — the controller provisions one Deployment / Service /
   # ServiceAccount per Gateway with `parametersRef`, in the Gateway's own

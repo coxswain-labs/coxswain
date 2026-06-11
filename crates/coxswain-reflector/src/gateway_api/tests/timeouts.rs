@@ -14,7 +14,7 @@ fn find_timeouts(
     let empty_hdrs = http::HeaderMap::new();
     let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
     match table.find(80, host, path, &ctx) {
-        RouteOutcome::Found(_, _, t) => t,
+        RouteOutcome::Found(_, _, t, _) => t,
         _ => panic!("expected Found"),
     }
 }

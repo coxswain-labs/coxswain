@@ -30,8 +30,13 @@ pub enum RouterError {
 /// Result of a two-level host+path routing lookup.
 #[non_exhaustive]
 pub enum RouteOutcome {
-    /// Route matched; tuple is `(backend_group, filters, timeouts)`.
-    Found(Arc<BackendGroup>, Arc<[FilterAction]>, RouteTimeouts),
+    /// Route matched; tuple is `(backend_group, filters, timeouts, path_pattern)`.
+    Found(
+        Arc<BackendGroup>,
+        Arc<[FilterAction]>,
+        RouteTimeouts,
+        Arc<str>,
+    ),
     /// Route matched but backend is invalid/missing/forbidden — return this status immediately.
     Error(u16),
     /// No entry for this hostname (host is not registered at this proxy).

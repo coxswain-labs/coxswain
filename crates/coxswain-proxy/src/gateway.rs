@@ -11,6 +11,7 @@
 use crate::common::ctx::ProxyCtx;
 use crate::common::engine::RoutingEngine;
 use crate::common::hooks;
+use crate::config::AccessLogPathMode;
 use crate::upstream_ca::UpstreamCaCache;
 use async_trait::async_trait;
 use coxswain_core::routing::{Gateway, RouteTimeouts};
@@ -32,20 +33,28 @@ pub struct GatewayProxy {
     pub default_timeouts: RouteTimeouts,
     /// Parse cache for upstream CA bundles from `BackendTLSPolicy` attachments.
     pub ca_cache: Arc<UpstreamCaCache>,
+    /// Whether to emit one access-log event per request.
+    pub access_log_enabled: bool,
+    /// Controls what the access log emits for the `path` field.
+    pub access_log_path_mode: AccessLogPathMode,
 }
 
 impl GatewayProxy {
-    /// Construct a `GatewayProxy` from its three runtime collaborators.
+    /// Construct a `GatewayProxy` from its runtime collaborators.
     #[must_use]
     pub fn new(
         engine: Arc<GatewayEngine>,
         default_timeouts: RouteTimeouts,
         ca_cache: Arc<UpstreamCaCache>,
+        access_log_enabled: bool,
+        access_log_path_mode: AccessLogPathMode,
     ) -> Self {
         Self {
             engine,
             default_timeouts,
             ca_cache,
+            access_log_enabled,
+            access_log_path_mode,
         }
     }
 }
@@ -104,5 +113,23 @@ impl ProxyHttp for GatewayProxy {
         Self::CTX: Send + Sync,
     {
         hooks::fail_to_proxy(session, e, ctx).await
+    }
+
+    async fn logging(
+        &self,
+        session: &mut Session,
+        e: Option<&pingora_core::Error>,
+        ctx: &mut ProxyCtx,
+    ) where
+        Self::CTX: Send + Sync,
+    {
+        hooks::logging(
+            self.access_log_enabled,
+            self.access_log_path_mode,
+            session,
+            e,
+            ctx,
+        )
+        .await;
     }
 }
