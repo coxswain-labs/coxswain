@@ -1,204 +1,268 @@
-//! Spawns a coxswain subprocess on ephemeral ports and tears it down on drop.
+//! Handle to the in-cluster coxswain installation, with port-forwards to the
+//! management (health + admin) endpoints.
 
 use anyhow::Context as _;
-use ipnet::IpNet;
-use nix::sys::signal::{Signal, killpg};
-use nix::unistd::Pid;
-use std::os::unix::process::CommandExt as _;
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
-};
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 use tokio::process::{Child, Command};
 
-const BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+use crate::harness::bootstrap::{
+    COXSWAIN_NAMESPACE, E2E_IMAGE, GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, HelmOverrides,
+    helm_install, workspace_root,
+};
 
-/// Handle to a running coxswain subprocess spawned for e2e tests.
+/// Fixed port the Helm chart sets for HTTP ingress (`proxy.http.port`).
+pub const INGRESS_HTTP_PORT: u16 = 80;
+/// Fixed port the Helm chart sets for HTTPS ingress (`proxy.https.port`).
+pub const INGRESS_HTTPS_PORT: u16 = 443;
+
+/// Name of the shared-proxy external LoadBalancer Service as rendered by the
+/// chart when the release name is `coxswain` (i.e. `coxswain-shared-proxy`).
+const SHARED_PROXY_SVC: &str = "coxswain-shared-proxy";
+/// Name of the shared-proxy internal ClusterIP Service (health + admin).
+const SHARED_PROXY_INTERNAL_SVC: &str = "coxswain-shared-proxy-internal";
+
+/// Optional parameters for tests that need non-default proxy configuration.
 ///
-/// Since the IngressProxy / GatewayProxy split (issue #201), Ingress and
-/// Gateway traffic bind disjoint port sets. `proxy_addr` / `tls_addr` are the
-/// Ingress entry points and are passed to coxswain via `--proxy-http-port` /
-/// `--proxy-https-port`. `gateway_http_addr` / `gateway_https_addr` are
-/// pre-allocated for Gateway listeners — tests apply Gateway resources whose
-/// listeners declare these ports, and the in-process `ProxyAcceptor` binds
-/// them dynamically when the reflector picks up the Gateway resource.
-pub struct ControllerProcess {
-    child: Child,
-    /// Bound address of the Ingress HTTP proxy listener (`--proxy-http-port`).
-    pub proxy_addr: SocketAddr,
-    /// Bound address of the Ingress HTTPS/TLS proxy listener (`--proxy-https-port`).
-    pub tls_addr: SocketAddr,
-    /// Pre-allocated address for tests that declare a Gateway HTTP listener.
-    /// The port is passed via `GATEWAY_HTTP_PORT` in fixture templates.
-    pub gateway_http_addr: SocketAddr,
-    /// Pre-allocated address for tests that declare a Gateway HTTPS listener.
-    /// The port is passed via `GATEWAY_HTTPS_PORT` in fixture templates.
-    pub gateway_https_addr: SocketAddr,
-    /// Bound address of the `/healthz`/`/readyz` endpoint.
-    pub health_addr: SocketAddr,
-    /// Bound address of the `/metrics`/`/routes`/`/status` endpoint.
-    pub admin_addr: SocketAddr,
-}
-
-/// Optional parameters for `ControllerProcess::start_with_options`.
+/// Each non-default field triggers a `helm upgrade --install` to reconfigure
+/// the release before the test runs.
 #[derive(Default)]
 pub struct ControllerOptions {
-    /// When set, passed as `--status-address` to the controller.
-    pub status_address: Option<IpAddr>,
-    /// When set, passed as `--ingress-default-backend` to the controller.
+    /// Sets `controller.statusAddress`. Needed by the conformance suite so
+    /// `Gateway.status.addresses` carries a reachable IP.
+    pub status_address: Option<String>,
+    /// Sets `proxy.shared.ingressDefaultBackend`.
     /// Format: `<namespace>/<service>:<port>`.
     pub ingress_default_backend: Option<String>,
-    /// When true, passes `--proxy-accept-proxy-protocol` to the controller.
-    pub proxy_accept_proxy_protocol: bool,
-    /// CIDR ranges passed to `--proxy-trusted-sources`.
-    pub proxy_trusted_sources: Vec<IpNet>,
+    /// Sets `proxy.shared.acceptProxyProtocol`.
+    pub accept_proxy_protocol: bool,
+    /// Sets `proxy.shared.trustedSources` (CIDR list).
+    /// Only meaningful when `accept_proxy_protocol` is true.
+    pub trusted_sources: Vec<String>,
+}
+
+/// Handle to the in-cluster coxswain installation for one test.
+///
+/// The shared-proxy data-plane is reachable at `proxy_addr` (HTTP),
+/// `tls_addr` (HTTPS), `gateway_http_addr`, and `gateway_https_addr` — all
+/// are addresses on the Service's LoadBalancer IP. Health and admin are
+/// port-forwarded to `127.0.0.1:<ephemeral>` for the duration of the test.
+pub struct ControllerProcess {
+    /// LoadBalancer IP assigned to the shared-proxy external Service.
+    pub lb_ip: IpAddr,
+    /// Bound address for Ingress HTTP traffic (`<lb_ip>:80`).
+    pub proxy_addr: SocketAddr,
+    /// Bound address for Ingress HTTPS/TLS traffic (`<lb_ip>:443`).
+    pub tls_addr: SocketAddr,
+    /// Bound address for Gateway HTTP traffic (`<lb_ip>:GATEWAY_HTTP_PORT`).
+    pub gateway_http_addr: SocketAddr,
+    /// Bound address for Gateway HTTPS traffic (`<lb_ip>:GATEWAY_HTTPS_PORT`).
+    pub gateway_https_addr: SocketAddr,
+    /// Local port-forwarded address for `/healthz` / `/readyz`.
+    pub health_addr: SocketAddr,
+    /// Local port-forwarded address for `/metrics` / `/routes` / `/status` on
+    /// the shared-proxy pod.
+    pub admin_addr: SocketAddr,
+    /// Local port-forwarded address for the controller pod's admin endpoint.
+    /// Serves `/cluster`, `/status`, `/routes` (controller reconciler view).
+    pub controller_admin_addr: SocketAddr,
+    health_pf: Child,
+    admin_pf: Child,
+    controller_admin_pf: Child,
 }
 
 impl ControllerProcess {
-    /// Spawn a controller with default options.
+    /// Connect to the existing in-cluster installation with default options.
     pub async fn start() -> anyhow::Result<Self> {
         Self::start_with_options(ControllerOptions::default()).await
     }
 
-    /// Spawn a controller with the given options, binding ephemeral ports for all listeners.
+    /// Connect to the existing in-cluster installation, applying any non-default
+    /// Helm overrides first (triggers a `helm upgrade --wait`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Helm upgrade, LB-IP lookup, or port-forward
+    /// setup fails.
     pub async fn start_with_options(opts: ControllerOptions) -> anyhow::Result<Self> {
-        let http_port = free_port()?;
-        let https_port = free_port()?;
-        let gateway_http_port = free_port()?;
-        let gateway_https_port = free_port()?;
+        // Apply Helm overrides when the caller needs non-default config.
+        let overrides = HelmOverrides {
+            status_address: opts.status_address,
+            ingress_default_backend: opts.ingress_default_backend,
+            accept_proxy_protocol: opts.accept_proxy_protocol,
+            trusted_sources: opts.trusted_sources,
+        };
+        let has_overrides = overrides.status_address.is_some()
+            || overrides.ingress_default_backend.is_some()
+            || overrides.accept_proxy_protocol;
+        if has_overrides {
+            let root = workspace_root().context("workspace root")?;
+            helm_install(&root, &overrides)
+                .await
+                .context("helm upgrade with overrides")?;
+        }
+
+        let lb_ip = wait_for_lb_ip().await.context("shared-proxy LB IP")?;
+
         let health_port = free_port()?;
         let admin_port = free_port()?;
 
-        let proxy_addr = SocketAddr::new(BIND_ADDR, http_port);
-        let tls_addr = SocketAddr::new(BIND_ADDR, https_port);
-        let gateway_http_addr = SocketAddr::new(BIND_ADDR, gateway_http_port);
-        let gateway_https_addr = SocketAddr::new(BIND_ADDR, gateway_https_port);
-        let health_addr = SocketAddr::new(BIND_ADDR, health_port);
-        let admin_addr = SocketAddr::new(BIND_ADDR, admin_port);
+        let controller_admin_port = free_port()?;
 
-        // Use the test process's PID as pod-name: if the lease is still held by
-        // a prior test's controller (same pod-name), renewal succeeds immediately
-        // instead of waiting out the TTL.
-        let pod_name = format!("coxswain-e2e-{}", std::process::id());
+        let health_pf = start_port_forward(SHARED_PROXY_INTERNAL_SVC, health_port, 8081).await?;
+        let admin_pf = start_port_forward(SHARED_PROXY_INTERNAL_SVC, admin_port, 8082).await?;
+        let controller_admin_pf =
+            start_port_forward(CONTROLLER_SVC, controller_admin_port, 8082).await?;
 
-        let binary = coxswain_bin()?;
-        let mut args = vec![
-            // E2E uses the hidden `dev` role for single-process all-in-one,
-            // matching today's combined-process behaviour. Production split
-            // (`controller` + `proxy --shared`) is covered by chart-based
-            // installs in the cluster-side suite.
-            "serve".to_string(),
-            "dev".to_string(),
-            "--proxy-bind-address".to_string(),
-            BIND_ADDR.to_string(),
-            "--ingress-http-port".to_string(),
-            http_port.to_string(),
-            "--ingress-https-port".to_string(),
-            https_port.to_string(),
-            "--health-port".to_string(),
-            health_port.to_string(),
-            "--admin-port".to_string(),
-            admin_port.to_string(),
-            "--log-format".to_string(),
-            "console".to_string(),
-            "--pod-name".to_string(),
-            pod_name,
-            "--pod-namespace".to_string(),
-            "coxswain-system".to_string(),
-            "--controller-lease-ttl".to_string(),
-            "3s".to_string(),
-            "--controller-lease-renew-interval".to_string(),
-            "1s".to_string(),
-        ];
-        if let Some(addr) = opts.status_address {
-            args.push("--status-address".to_string());
-            args.push(addr.to_string());
-        }
-        if let Some(db) = opts.ingress_default_backend {
-            args.push("--ingress-default-backend".to_string());
-            args.push(db);
-        }
-        if opts.proxy_accept_proxy_protocol {
-            args.push("--proxy-accept-proxy-protocol".to_string());
-        }
-        if !opts.proxy_trusted_sources.is_empty() {
-            args.push("--proxy-trusted-sources".to_string());
-            args.push(
-                opts.proxy_trusted_sources
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-        }
+        let health_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), health_port);
+        let admin_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), admin_port);
+        let controller_admin_addr = SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            controller_admin_port,
+        );
 
-        // Make the spawned coxswain its own process-group leader so SIGKILL on
-        // Drop always terminates the correct process, even when the test runner
-        // is itself inside a process group.
-        let mut cmd = Command::new(&binary);
-        cmd.args(&args);
-        cmd.as_std_mut().process_group(0);
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("spawn {}", binary.display()))?;
+        // When a helm upgrade restarted the controller pod, poll its own
+        // readyz (via a temporary port-forward) until it's synced. The proxy's
+        // readyz (polled by Harness::start_with_options) returns immediately
+        // since the proxy wasn't restarted — but the controller may still be
+        // running its initial informer sync and hasn't written any status yet.
+        if has_overrides {
+            wait_for_controller_ready()
+                .await
+                .context("controller readyz")?;
+        }
 
         Ok(Self {
-            child,
-            proxy_addr,
-            tls_addr,
-            gateway_http_addr,
-            gateway_https_addr,
+            lb_ip,
+            proxy_addr: SocketAddr::new(lb_ip, INGRESS_HTTP_PORT),
+            tls_addr: SocketAddr::new(lb_ip, INGRESS_HTTPS_PORT),
+            gateway_http_addr: SocketAddr::new(lb_ip, GATEWAY_HTTP_PORT),
+            gateway_https_addr: SocketAddr::new(lb_ip, GATEWAY_HTTPS_PORT),
             health_addr,
             admin_addr,
+            controller_admin_addr,
+            health_pf,
+            admin_pf,
+            controller_admin_pf,
         })
     }
 }
 
 impl Drop for ControllerProcess {
     fn drop(&mut self) {
-        // Kill the process group so the whole coxswain process tree is cleaned up.
-        // `start_kill` on the directly-tracked child is a belt-and-braces fallback
-        // in case the process-group setup failed.
-        if let Some(pid) = self.child.id() {
-            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        let _ = self.health_pf.start_kill();
+        let _ = self.admin_pf.start_kill();
+        let _ = self.controller_admin_pf.start_kill();
+    }
+}
+
+/// Poll `Service.status.loadBalancer.ingress[0].ip` for the shared-proxy external
+/// Service until an IP is assigned or the timeout expires.
+///
+/// OrbStack assigns IPs within ~150 ms; cloud-provider-kind on kind takes ~5-10 s.
+///
+/// # Errors
+///
+/// Returns an error if no IP is assigned within 60 s.
+async fn wait_for_lb_ip() -> anyhow::Result<IpAddr> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let out = Command::new("kubectl")
+            .args([
+                "get",
+                "svc",
+                SHARED_PROXY_SVC,
+                "-n",
+                COXSWAIN_NAMESPACE,
+                "-o",
+                "jsonpath={.status.loadBalancer.ingress[0].ip}",
+            ])
+            .output()
+            .await
+            .context("kubectl get svc")?;
+        let ip_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !ip_str.is_empty() {
+            return ip_str
+                .parse::<IpAddr>()
+                .with_context(|| format!("parse LB IP: {ip_str}"));
         }
-        let _ = self.child.start_kill();
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("shared-proxy Service has no LoadBalancer IP after 60s");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
-#[must_use = "port allocation result must be used"]
-fn free_addr() -> anyhow::Result<SocketAddr> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
-    let addr = listener.local_addr().context("local_addr")?;
-    Ok(addr)
-    // listener drops here, releasing the port; small race window is acceptable
+/// Spawn a `kubectl port-forward` tunnel from `127.0.0.1:<local_port>` to
+/// `<svc_name>:<remote_port>` in the coxswain namespace.
+///
+/// The returned [`Child`] must be kept alive for the lifetime of the tunnel;
+/// dropping it kills the forward.
+///
+/// # Errors
+///
+/// Returns an error if `kubectl port-forward` fails to spawn.
+async fn start_port_forward(
+    svc_name: &str,
+    local_port: u16,
+    remote_port: u16,
+) -> anyhow::Result<Child> {
+    let child = Command::new("kubectl")
+        .args([
+            "port-forward",
+            "-n",
+            COXSWAIN_NAMESPACE,
+            &format!("svc/{svc_name}"),
+            &format!("{local_port}:{remote_port}"),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("kubectl port-forward {svc_name} {local_port}:{remote_port}"))?;
+    // Brief settle to let kubectl establish the tunnel before the caller
+    // starts polling the forwarded port.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Ok(child)
 }
 
-#[must_use = "port allocation result must be used"]
+/// Allocate a free loopback TCP port by binding and immediately releasing it.
+///
+/// There is a small race window between release and reuse; acceptable for tests.
 fn free_port() -> anyhow::Result<u16> {
-    free_addr().map(|a| a.port())
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
+    Ok(listener.local_addr().context("local_addr")?.port())
 }
 
-/// Locate the `coxswain` binary the e2e harness spawns. Honours `COXSWAIN_BIN`,
-/// otherwise looks under the test runner's `target/{profile}/` directory.
-pub(crate) fn coxswain_bin() -> anyhow::Result<PathBuf> {
-    if let Ok(p) = std::env::var("COXSWAIN_BIN") {
-        let path = PathBuf::from(p);
-        anyhow::ensure!(path.exists(), "COXSWAIN_BIN not found: {}", path.display());
-        return Ok(path);
-    }
-    // Test binary lives at target/{profile}/deps/<name>-<hash>.
-    // The coxswain binary is at target/{profile}/coxswain.
-    let exe = std::env::current_exe().context("current_exe")?;
-    let target_dir = exe
-        .parent()
-        .and_then(|p| p.parent())
-        .context("unexpected test binary path")?;
-    let bin = target_dir.join("coxswain");
-    anyhow::ensure!(
-        bin.exists(),
-        "coxswain binary not found at {}. Run: cargo build --bin coxswain",
-        bin.display()
-    );
-    Ok(bin)
+/// Name of the controller ClusterIP Service (health + admin).
+const CONTROLLER_SVC: &str = "coxswain-controller";
+
+/// Poll the controller pod's `/readyz` via a temporary port-forward until it
+/// returns 200 or 60 s elapses.
+///
+/// Used after a `helm upgrade` that restarts only the controller pod; the
+/// proxy's `/readyz` returns immediately (proxy is unchanged) so the caller
+/// can't rely on the existing health forward to detect controller readiness.
+///
+/// # Errors
+///
+/// Returns an error if the port-forward cannot be started or readyz doesn't
+/// return 200 within 60 s.
+async fn wait_for_controller_ready() -> anyhow::Result<()> {
+    let port = free_port()?;
+    let mut pf = start_port_forward(CONTROLLER_SVC, port, 8081).await?;
+    let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
+    let result = crate::harness::wait::wait_for_ready(addr, Duration::from_secs(60))
+        .await
+        .context("controller readyz timeout");
+    let _ = pf.start_kill();
+    result
+}
+
+/// Returns the coxswain image name used for dedicated-mode proxy Deployments.
+///
+/// Tests that assert the provisioned Deployment's image should compare against
+/// this value.
+pub fn dedicated_proxy_image() -> &'static str {
+    E2E_IMAGE
 }

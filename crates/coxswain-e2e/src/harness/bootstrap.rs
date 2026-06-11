@@ -1,30 +1,91 @@
-//! Cluster bootstrapping: installs Gateway API CRDs, cert-manager, and Coxswain manifests.
+//! Cluster bootstrapping: builds the coxswain image, loads it into the cluster,
+//! and installs the Helm release with the settings needed for e2e tests.
 
 use anyhow::Context as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command;
+
+/// Guards the heavy one-time cluster setup (image build, Helm install, CRDs,
+/// cert-manager) so it only runs once per test-binary process, not per test.
+static CLUSTER_SETUP_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Single source of truth for the Gateway API CRD version installed in tests.
 /// To bump: change `.gateway-api-version` at the repo root and update
 /// `gateway-api` in workspace `Cargo.toml`. See `docs/gateway-api-support.md`.
 const GATEWAY_API_VERSION: &str = include_str!("../../../../.gateway-api-version").trim_ascii();
 
-/// Ensure the cluster is ready for e2e tests: installs Gateway API CRDs (once),
-/// cert-manager (once), and applies the Coxswain service manifests.
+/// Local Docker image tag used for all e2e runs.
+pub(crate) const E2E_IMAGE: &str = "coxswain:e2e";
+/// Helm release name.
+pub(crate) const HELM_RELEASE: &str = "coxswain";
+/// Kubernetes namespace coxswain is installed into.
+pub(crate) const COXSWAIN_NAMESPACE: &str = "coxswain-system";
+
+/// Fixed port the shared-proxy Service exposes for Gateway HTTP listeners.
+pub const GATEWAY_HTTP_PORT: u16 = 8000;
+/// Fixed port the shared-proxy Service exposes for Gateway HTTPS listeners.
+pub const GATEWAY_HTTPS_PORT: u16 = 8443;
+
+/// The local Kubernetes cluster distribution detected from the current context.
+#[derive(Debug, Clone)]
+pub(crate) enum ClusterKind {
+    /// OrbStack-managed Kubernetes — ships its own LB controller; Docker images
+    /// visible to containerd automatically via the shared OrbStack daemon.
+    Orbstack,
+    /// kind cluster — needs `kind load docker-image` and cloud-provider-kind for
+    /// LoadBalancer IP assignment.
+    Kind {
+        /// The kind cluster name (context is `kind-<name>`).
+        name: String,
+    },
+}
+
+impl ClusterKind {
+    /// Detect the cluster distribution from the current kubeconfig context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `kubectl config current-context` fails.
+    pub(crate) async fn detect() -> anyhow::Result<Self> {
+        let out = Command::new("kubectl")
+            .args(["config", "current-context"])
+            .output()
+            .await
+            .context("kubectl config current-context")?;
+        let ctx = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if ctx == "orbstack" || ctx.starts_with("orb/") {
+            Ok(Self::Orbstack)
+        } else if let Some(name) = ctx.strip_prefix("kind-") {
+            Ok(Self::Kind {
+                name: name.to_string(),
+            })
+        } else {
+            // Unknown context — treat like kind (explicit image load required).
+            tracing::warn!(context = %ctx, "unrecognised cluster context, treating as kind");
+            Ok(Self::Kind { name: ctx })
+        }
+    }
+}
+
+/// Ensure the cluster is ready for e2e tests.
 ///
-/// Idempotent — safe to call multiple times; subsequent calls skip already-installed
-/// components in under 200 ms.
+/// The heavyweight steps (image build, Helm install, CRDs, cert-manager) run
+/// only **once per test-binary process** — subsequent calls skip them via
+/// [`CLUSTER_SETUP_DONE`]. The namespace purge always runs so each test starts
+/// with a clean slate.
+///
+/// Cold path (fresh cluster, no Docker cache): ~10 min for the BoringSSL build.
+/// Warm path (image cached, Helm release deployed): < 1 s.
 ///
 /// # Errors
 ///
-/// Returns an error if any `kubectl apply` step fails or a required component
-/// does not become available within its timeout.
+/// Returns an error if any setup step fails or a required component does not
+/// become available within its timeout.
 pub async fn bootstrap() -> anyhow::Result<()> {
     // reqwest 0.13 uses `rustls-no-provider`; install ring explicitly so the
     // process has exactly one crypto provider regardless of transitive deps.
     let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let root = workspace_root().context("workspace root")?;
 
     // Purge any namespaces left over from a previous run AND from
     // already-completed tests inside the current run. This runs on EVERY
@@ -33,12 +94,6 @@ pub async fn bootstrap() -> anyhow::Result<()> {
     // table briefly — long enough that the next test's HTTP requests hit
     // (and assert against) the wrong backend, especially when the lingering
     // Ingress is the `*`-host catchall used by `default_backend_only`.
-    //
-    // Tests that need a namespace to survive across multiple
-    // `Harness::start()` calls within the same test function (i.e. the
-    // controller-restart idempotency test) MUST use
-    // [`crate::NamespaceGuard::create_persistent`] to opt out of the
-    // `coxswain-e2e=true` label that this purge keys on.
     let _ = Command::new("kubectl")
         .args([
             "delete",
@@ -50,6 +105,33 @@ pub async fn bootstrap() -> anyhow::Result<()> {
         ])
         .status()
         .await;
+
+    // Everything below is expensive and idempotent — skip on the second+
+    // call within the same process (i.e. between tests in the same suite).
+    if CLUSTER_SETUP_DONE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let root = workspace_root().context("workspace root")?;
+    let cluster = ClusterKind::detect().await.context("detect cluster kind")?;
+
+    build_image(&root).await.context("docker build")?;
+
+    match &cluster {
+        ClusterKind::Kind { name } => {
+            kind_load_image(name).await.context("kind load")?;
+            install_cloud_provider_kind_if_missing()
+                .await
+                .context("cloud-provider-kind")?;
+        }
+        ClusterKind::Orbstack => {
+            // OrbStack's containerd shares the local Docker daemon; no explicit
+            // image load needed.
+        }
+    }
 
     if !gateway_v1_crds_installed().await {
         tracing::info!("Gateway API CRDs absent or pre-v1, installing {GATEWAY_API_VERSION}");
@@ -67,30 +149,232 @@ pub async fn bootstrap() -> anyhow::Result<()> {
         .await
         .context("install cert-manager")?;
 
-    let manifests = root.join("deploy/manifests");
-    kubectl_apply(&manifests.join("namespace.yaml")).await?;
-    // Coxswain-specific CRDs (e.g. `CoxswainGatewayParameters` driving the
-    // dedicated-mode provisioning operator). Applied before any RBAC or
-    // Gateway resources so fixtures that reference these kinds resolve.
-    kubectl_apply_dir(&manifests.join("crds")).await?;
-    // Both RBAC files install ServiceAccounts + ClusterRoles. The e2e harness
-    // runs coxswain as a local subprocess against the cluster, so it doesn't
-    // actually exercise either ServiceAccount, but applying them keeps the
-    // installed cluster in the same shape production would see — and matters
-    // for the `rbac_read_only_proxy.rs` test which audits the proxy SA.
-    kubectl_apply(&manifests.join("controller-rbac.yaml")).await?;
-    kubectl_apply(&manifests.join("shared-proxy-rbac.yaml")).await?;
-    // ClusterRole the dedicated-proxy ServiceAccount is bound to via the
-    // per-namespace RoleBindings the controller reconciles (#209).
-    kubectl_apply(&manifests.join("dedicated-proxy-clusterrole.yaml")).await?;
-    kubectl_apply(&manifests.join("gateway-class.yaml")).await?;
-    kubectl_apply(&manifests.join("ingress-class.yaml")).await?;
+    // Pre-apply coxswain CRDs with server-side apply before helm install so
+    // the CRD field manager is consistent across fresh and pre-existing clusters.
+    // Helm's `crds/` directory uses client-side apply which conflicts with a
+    // prior CSA-managed install; `--server-side --force-conflicts` avoids that.
+    let crd_dir = root.join("charts/coxswain/crds");
+    let status = Command::new("kubectl")
+        .args([
+            "apply",
+            "--server-side",
+            "--force-conflicts",
+            "-f",
+            crd_dir.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .await
+        .context("kubectl apply crds")?;
+    anyhow::ensure!(status.success(), "kubectl apply --server-side crds failed");
+
+    helm_install(&root, &HelmOverrides::default())
+        .await
+        .context("helm install")?;
 
     Ok(())
 }
 
+/// Additional Helm `--set` overrides for tests that need non-default proxy config.
+///
+/// All fields default to the chart's own defaults (empty / false).
+#[derive(Debug, Default)]
+pub(crate) struct HelmOverrides {
+    /// Passed as `controller.statusAddress`. Used by the conformance suite so
+    /// `Gateway.status.addresses` is populated with a reachable LB IP.
+    pub status_address: Option<String>,
+    /// Passed as `proxy.shared.ingressDefaultBackend`.
+    /// Format: `<namespace>/<service>:<port>`.
+    pub ingress_default_backend: Option<String>,
+    /// Passed as `proxy.shared.acceptProxyProtocol`.
+    pub accept_proxy_protocol: bool,
+    /// Passed as `proxy.shared.trustedSources` (comma-joined CIDR list).
+    /// Only meaningful when `accept_proxy_protocol` is true.
+    pub trusted_sources: Vec<String>,
+}
+
+/// Install or upgrade the coxswain Helm release with e2e-specific overrides.
+///
+/// Uses `helm upgrade --install --wait` so the call blocks until both pods are
+/// `Ready`. Idempotent: if the release is already deployed and the rendered
+/// manifests are unchanged, Helm returns immediately.
+///
+/// # Errors
+///
+/// Returns an error if `helm upgrade` exits non-zero or times out.
+pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyhow::Result<()> {
+    let chart = root.join("charts/coxswain");
+    let mut args: Vec<String> = vec![
+        "upgrade".into(),
+        "--install".into(),
+        HELM_RELEASE.into(),
+        chart.to_string_lossy().into_owned(),
+        "--namespace".into(),
+        COXSWAIN_NAMESPACE.into(),
+        "--create-namespace".into(),
+        "--set".into(),
+        format!("image.repository={}", image_repository()),
+        "--set".into(),
+        format!("image.tag={}", image_tag()),
+        "--set".into(),
+        "image.pullPolicy=Never".into(),
+        "--set".into(),
+        "service.gateway.type=LoadBalancer".into(),
+        "--set".into(),
+        format!("controller.coxswainImage={E2E_IMAGE}"),
+        // Pre-declare the fixed gateway ports on the Service so they're reachable
+        // via the LoadBalancer in addition to the standard 80/443.
+        "--set".into(),
+        format!(
+            "service.gateway.additionalPorts[0].name=gw-http,service.gateway.additionalPorts[0].port={GATEWAY_HTTP_PORT},service.gateway.additionalPorts[0].targetPort={GATEWAY_HTTP_PORT},service.gateway.additionalPorts[0].protocol=TCP"
+        ),
+        "--set".into(),
+        format!(
+            "service.gateway.additionalPorts[1].name=gw-https,service.gateway.additionalPorts[1].port={GATEWAY_HTTPS_PORT},service.gateway.additionalPorts[1].targetPort={GATEWAY_HTTPS_PORT},service.gateway.additionalPorts[1].protocol=TCP"
+        ),
+        "--skip-crds".into(), // CRDs are pre-applied with SSA above
+        "--wait".into(),
+        "--timeout".into(),
+        "120s".into(),
+    ];
+
+    if let Some(addr) = &overrides.status_address {
+        args.push("--set".into());
+        args.push(format!("controller.statusAddress={addr}"));
+    }
+    if let Some(db) = &overrides.ingress_default_backend {
+        args.push("--set".into());
+        args.push(format!("proxy.shared.ingressDefaultBackend={db}"));
+    }
+    if overrides.accept_proxy_protocol {
+        args.push("--set".into());
+        args.push("proxy.shared.acceptProxyProtocol=true".into());
+    }
+    if !overrides.trusted_sources.is_empty() {
+        args.push("--set".into());
+        args.push(format!(
+            "proxy.shared.trustedSources={{{}}}",
+            overrides.trusted_sources.join("\\,")
+        ));
+    }
+
+    let status = Command::new("helm")
+        .args(&args)
+        .status()
+        .await
+        .context("helm upgrade")?;
+    anyhow::ensure!(status.success(), "helm upgrade --install failed");
+    Ok(())
+}
+
+/// Split `E2E_IMAGE` (`repo:tag`) into the repository part.
+fn image_repository() -> &'static str {
+    E2E_IMAGE
+        .rsplit_once(':')
+        .map(|(repo, _)| repo)
+        .unwrap_or(E2E_IMAGE)
+}
+
+/// Split `E2E_IMAGE` (`repo:tag`) into the tag part.
+fn image_tag() -> &'static str {
+    E2E_IMAGE
+        .rsplit_once(':')
+        .map(|(_, tag)| tag)
+        .unwrap_or("latest")
+}
+
+/// Build the coxswain Docker image tagged `coxswain:e2e`.
+///
+/// Uses the production `Dockerfile` at the workspace root. Docker layer cache
+/// makes subsequent builds fast (~30 s after the first BoringSSL build).
+///
+/// # Errors
+///
+/// Returns an error if `docker build` exits non-zero.
+async fn build_image(root: &Path) -> anyhow::Result<()> {
+    tracing::info!("building Docker image {E2E_IMAGE}");
+    let status = Command::new("docker")
+        .args(["build", "-t", E2E_IMAGE, "."])
+        .current_dir(root)
+        .status()
+        .await
+        .context("docker build")?;
+    anyhow::ensure!(status.success(), "docker build failed");
+    Ok(())
+}
+
+/// Load the e2e image into the named kind cluster.
+///
+/// # Errors
+///
+/// Returns an error if `kind load docker-image` exits non-zero.
+async fn kind_load_image(cluster_name: &str) -> anyhow::Result<()> {
+    tracing::info!(cluster = %cluster_name, "loading image into kind cluster");
+    let status = Command::new("kind")
+        .args(["load", "docker-image", E2E_IMAGE, "--name", cluster_name])
+        .status()
+        .await
+        .context("kind load docker-image")?;
+    anyhow::ensure!(status.success(), "kind load docker-image failed");
+    Ok(())
+}
+
+/// Install [cloud-provider-kind](https://github.com/kubernetes-sigs/cloud-provider-kind)
+/// if not already running, so LoadBalancer Services get real IPs on kind.
+///
+/// cloud-provider-kind is the officially-supported LoadBalancer controller for kind.
+/// It watches the Docker socket and assigns IPs from the kind Docker network.
+///
+/// # Errors
+///
+/// Returns an error if the install or readiness wait fails.
+async fn install_cloud_provider_kind_if_missing() -> anyhow::Result<()> {
+    // Check if it's already deployed (Deployment exists in kube-system).
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "deployment",
+            "cloud-provider-kind",
+            "-n",
+            "kube-system",
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ])
+        .output()
+        .await
+        .context("kubectl get cloud-provider-kind")?;
+    if !out.stdout.is_empty() {
+        return Ok(()); // already installed
+    }
+
+    tracing::info!("installing cloud-provider-kind for LoadBalancer support on kind");
+    kubectl_apply_url(
+        "https://raw.githubusercontent.com/kubernetes-sigs/cloud-provider-kind/main/deploy/cloud-provider-kind.yaml",
+    )
+    .await
+    .context("install cloud-provider-kind")?;
+
+    let status = Command::new("kubectl")
+        .args([
+            "wait",
+            "--for=condition=Available",
+            "--timeout=60s",
+            "deployment/cloud-provider-kind",
+            "-n",
+            "kube-system",
+        ])
+        .status()
+        .await
+        .context("kubectl wait cloud-provider-kind")?;
+    anyhow::ensure!(
+        status.success(),
+        "cloud-provider-kind deployment not ready within 60s"
+    );
+    Ok(())
+}
+
 /// Install cert-manager v1.18.0 if not already present, then ensure the
-/// `coxswain-e2e-selfsigned` ClusterIssuer exists.  Both steps are idempotent
+/// `coxswain-e2e-selfsigned` ClusterIssuer exists. Both steps are idempotent
 /// via `kubectl apply`.
 async fn install_cert_manager_if_missing() -> anyhow::Result<()> {
     if !cert_manager_installed().await {
@@ -101,7 +385,6 @@ async fn install_cert_manager_if_missing() -> anyhow::Result<()> {
         .await
         .context("install cert-manager")?;
 
-        // Wait for all three cert-manager Deployments to be Available.
         let status = Command::new("kubectl")
             .args([
                 "wait",
@@ -122,8 +405,7 @@ async fn install_cert_manager_if_missing() -> anyhow::Result<()> {
         );
     }
 
-    // Always apply the ClusterIssuer — `kubectl apply` is idempotent so this is
-    // safe on subsequent bootstrap calls when cert-manager was already installed.
+    // Always apply the ClusterIssuer — idempotent.
     let issuer_yaml = r#"
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -152,7 +434,7 @@ spec:
     Ok(())
 }
 
-/// Returns true if cert-manager CRDs are present at v1.
+/// Returns `true` if cert-manager CRDs are present at v1.
 async fn cert_manager_installed() -> bool {
     Command::new("kubectl")
         .args([
@@ -172,8 +454,7 @@ async fn cert_manager_installed() -> bool {
         .unwrap_or(false)
 }
 
-/// Returns true only if ReferenceGrant is served at v1 (requires Gateway API >= v1.0.0 CRDs).
-/// We need v1 because the `gateway-api` Rust crate targets the v1 API group.
+/// Returns `true` only if `ReferenceGrant` is served at v1 (Gateway API >= v1.0.0).
 async fn gateway_v1_crds_installed() -> bool {
     Command::new("kubectl")
         .args([
@@ -193,32 +474,13 @@ async fn gateway_v1_crds_installed() -> bool {
         .unwrap_or(false)
 }
 
-async fn kubectl_apply(path: &Path) -> anyhow::Result<()> {
+async fn kubectl_apply_url(url: &str) -> anyhow::Result<()> {
     let status = Command::new("kubectl")
-        .args(["apply", "-f"])
-        .arg(path)
+        .args(["apply", "-f", url])
         .status()
         .await
         .context("kubectl")?;
-    anyhow::ensure!(status.success(), "kubectl apply failed: {}", path.display());
-    Ok(())
-}
-
-/// Apply every `.yaml` / `.yml` file in `dir` non-recursively. Used for
-/// `deploy/manifests/crds/` so adding a new CRD doesn't require updating the
-/// bootstrap.
-async fn kubectl_apply_dir(dir: &Path) -> anyhow::Result<()> {
-    let status = Command::new("kubectl")
-        .args(["apply", "-f"])
-        .arg(dir)
-        .status()
-        .await
-        .context("kubectl")?;
-    anyhow::ensure!(
-        status.success(),
-        "kubectl apply -f {} failed",
-        dir.display()
-    );
+    anyhow::ensure!(status.success(), "kubectl apply -f {url} failed");
     Ok(())
 }
 
@@ -239,16 +501,6 @@ async fn wait_for_crds_established() -> anyhow::Result<()> {
         status.success(),
         "Gateway API CRDs not established within 60s"
     );
-    Ok(())
-}
-
-async fn kubectl_apply_url(url: &str) -> anyhow::Result<()> {
-    let status = Command::new("kubectl")
-        .args(["apply", "-f", url])
-        .status()
-        .await
-        .context("kubectl")?;
-    anyhow::ensure!(status.success(), "kubectl apply -f {url} failed");
     Ok(())
 }
 

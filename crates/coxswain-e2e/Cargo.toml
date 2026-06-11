@@ -16,8 +16,6 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-ipnet.workspace = true
-nix.workspace = true
 futures.workspace = true
 base64.workspace = true
 gateway-api.workspace = true

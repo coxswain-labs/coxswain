@@ -106,6 +106,10 @@ spec:
             - name: COXSWAIN_STATUS_ADDRESS
               value: {{ .Values.controller.statusAddress | quote }}
             {{- end }}
+            {{- if .Values.controller.coxswainImage }}
+            - name: COXSWAIN_IMAGE
+              value: {{ .Values.controller.coxswainImage | quote }}
+            {{- end }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:

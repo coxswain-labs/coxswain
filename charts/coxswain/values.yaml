@@ -171,6 +171,11 @@ controller:
   topologySpreadConstraints: []
   priorityClassName: ""
 
+  # COXSWAIN_IMAGE — image used for dedicated-mode proxy Deployments
+  # provisioned by the controller operator. Defaults to the main image
+  # (`image.repository:image.tag`) when empty.
+  coxswainImage: ""
+
   # COXSWAIN_CONTROLLER_LEASE_TTL — how long a leader lease stays valid
   # without renewal.
   leaseTtl: 15s
