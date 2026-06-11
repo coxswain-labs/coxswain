@@ -210,7 +210,6 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         chart.to_string_lossy().into_owned(),
         "--namespace".into(),
         COXSWAIN_NAMESPACE.into(),
-        "--create-namespace".into(),
         "--set".into(),
         format!("image.repository={}", image_repository()),
         "--set".into(),
