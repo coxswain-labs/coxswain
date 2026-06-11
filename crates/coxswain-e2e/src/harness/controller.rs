@@ -39,6 +39,11 @@ pub struct ControllerOptions {
     /// Sets `proxy.shared.trustedSources` (CIDR list).
     /// Only meaningful when `accept_proxy_protocol` is true.
     pub trusted_sources: Vec<String>,
+    /// Sets `proxy.shared.accessLog`. `None` leaves the chart default.
+    pub access_log: Option<bool>,
+    /// Sets `proxy.shared.accessLogPathMode` (`"full"` / `"pattern"` / `"none"`).
+    /// `None` leaves the chart default.
+    pub access_log_path_mode: Option<String>,
 }
 
 /// Handle to the in-cluster coxswain installation for one test.
@@ -91,10 +96,14 @@ impl ControllerProcess {
             ingress_default_backend: opts.ingress_default_backend,
             accept_proxy_protocol: opts.accept_proxy_protocol,
             trusted_sources: opts.trusted_sources,
+            access_log: opts.access_log,
+            access_log_path_mode: opts.access_log_path_mode,
         };
         let has_overrides = overrides.status_address.is_some()
             || overrides.ingress_default_backend.is_some()
-            || overrides.accept_proxy_protocol;
+            || overrides.accept_proxy_protocol
+            || overrides.access_log.is_some()
+            || overrides.access_log_path_mode.is_some();
         if has_overrides {
             let root = workspace_root().context("workspace root")?;
             helm_install(&root, &overrides)
@@ -145,6 +154,53 @@ impl ControllerProcess {
             admin_pf,
             controller_admin_pf,
         })
+    }
+}
+
+impl ControllerProcess {
+    /// Read every shared-proxy pod's stdout in the coxswain namespace and
+    /// return only the JSON-formatted access-log lines (i.e. tracing events
+    /// emitted on the `coxswain_proxy::access` target).
+    ///
+    /// Helm-installed pods run with `--log-format=json`. Lines that fail to
+    /// parse as JSON or don't carry `"target":"coxswain_proxy::access"` are
+    /// skipped. The shared-proxy Deployment may have multiple replicas — the
+    /// returned vector is the concatenation across them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if listing the pods or reading their logs fails.
+    pub async fn shared_proxy_access_logs(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        let out = Command::new("kubectl")
+            .args([
+                "logs",
+                "-n",
+                COXSWAIN_NAMESPACE,
+                "-l",
+                "app.kubernetes.io/name=coxswain,app.kubernetes.io/component=shared-proxy",
+                "--tail=-1",
+            ])
+            .output()
+            .await
+            .context("kubectl logs shared-proxy")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "kubectl logs shared-proxy exit {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let stdout = String::from_utf8(out.stdout).context("decode kubectl logs stdout")?;
+        let mut access = Vec::new();
+        for line in stdout.lines() {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if json.get("target").and_then(|v| v.as_str()) == Some("coxswain_proxy::access") {
+                access.push(json);
+            }
+        }
+        Ok(access)
     }
 }
 

@@ -16,10 +16,12 @@ pub(super) async fn patch_ingress_status(client: &Client, ingress: &Ingress, add
     let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
     let api: Api<Ingress> = Api::namespaced(client.clone(), ns);
     let patch = build_ingress_status_patch(addr);
-    match api
+    let started = std::time::Instant::now();
+    let result = api
         .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-        .await
-    {
+        .await;
+    crate::metrics::observe_status_patch("ingress", started, &result);
+    match result {
         Ok(_) => tracing::info!(name, ns, "Ingress loadBalancer status patched"),
         Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Ingress status"),
     }

@@ -66,13 +66,13 @@ impl IngressReconciler {
 
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
-        for rule in rules {
+        for (rule_index, rule) in rules.iter().enumerate() {
             let http = match rule.http.as_ref() {
                 Some(h) => h,
                 None => continue,
             };
 
-            for path_rule in &http.paths {
+            for (path_index, path_rule) in http.paths.iter().enumerate() {
                 let svc = match path_rule.backend.service.as_ref() {
                     Some(s) => s,
                     None => {
@@ -120,9 +120,13 @@ impl IngressReconciler {
                     continue;
                 }
 
+                let metric_route_id: Arc<str> = Arc::from(format!(
+                    "ingress/{ns}/{ingress_name}:{rule_index}.{path_index}"
+                ));
                 let e = Arc::new(
                     RouteEntry::path_only(group, route_id.clone(), created_at)
-                        .with_path_pattern(Arc::from(path)),
+                        .with_path_pattern(Arc::from(path))
+                        .with_metric_route_id(metric_route_id),
                 );
                 // "Prefix" and "ImplementationSpecific" both map to prefix matching.
                 for &listener_port in &ports {
@@ -167,6 +171,8 @@ impl IngressReconciler {
                             BackendGroup::new(format!("{ns}/{}", default_svc.name), resolved.addrs)
                                 .with_protocol(protocol),
                         );
+                        let default_metric_route_id: Arc<str> =
+                            Arc::from(format!("ingress/{ns}/{ingress_name}:default"));
                         let make_entry = || {
                             Arc::new(
                                 RouteEntry::path_only(
@@ -174,7 +180,8 @@ impl IngressReconciler {
                                     route_id.clone(),
                                     created_at,
                                 )
-                                .with_path_pattern(Arc::from("/")),
+                                .with_path_pattern(Arc::from("/"))
+                                .with_metric_route_id(Arc::clone(&default_metric_route_id)),
                             )
                         };
                         for &listener_port in &ports {

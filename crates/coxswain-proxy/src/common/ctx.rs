@@ -23,9 +23,10 @@ tokio::task_local! {
 
 /// Routing result cached from `request_filter` for use in later hooks.
 ///
-/// `original_host`, `original_path`, and `path_pattern` are `Arc<str>` so that
-/// cloning them in subsequent hooks (e.g. for SNI, redirect, or access logging)
-/// is a refcount bump, not a heap allocation.
+/// `original_host`, `original_path`, `path_pattern`, and `metric_route_id`
+/// are `Arc<str>` so that cloning them in subsequent hooks (e.g. for SNI,
+/// redirect, access logging, or metric label emission) is a refcount bump,
+/// not a heap allocation.
 pub struct ResolvedRoute {
     /// Chosen backend group for this request.
     pub backend_group: Arc<BackendGroup>,
@@ -43,6 +44,12 @@ pub struct ResolvedRoute {
     /// per-request allocation. Used by the access-log `pattern` mode to emit the
     /// rule pattern instead of the concrete request path.
     pub path_pattern: Arc<str>,
+    /// Canonical metric/log identifier for the matched rule.
+    ///
+    /// Shared from `RouteEntry::metric_route_id` — emitted as the `route`
+    /// Prometheus label and the `route_id` access-log field so a Grafana →
+    /// log pivot has an exact join key.
+    pub metric_route_id: Arc<str>,
 }
 
 /// Per-request context carrying the real client address extracted from the PROXY header.
@@ -83,7 +90,9 @@ pub struct ProxyCtx {
 
 // Hot types — review with the team before bumping these numbers.
 // ResolvedRoute: +16 bytes for path_pattern: Arc<str> (88→104).
-const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 104);
+// ResolvedRoute: +16 bytes for metric_route_id: Arc<str> (104→120).
+const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 120);
 // ProxyCtx: +16 for start: Option<Instant>, +48 for upstream_addr: Option<SocketAddr>
 // with alignment padding (176→240).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 240);
+// ProxyCtx: +16 because Option<ResolvedRoute> inlines the struct (240→256).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 256);

@@ -4,6 +4,7 @@ use crate::shared::Shared;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 /// Raw PEM bytes for a single TLS cert/key pair sourced from a `kubernetes.io/tls` Secret.
 ///
@@ -17,21 +18,38 @@ pub struct TlsCert {
     pub key_pem: Vec<u8>,
     /// `"namespace/secret-name"` — for log messages only.
     pub source: String,
+    /// Leaf certificate `notAfter`, parsed once at load time.
+    ///
+    /// `None` when the PEM couldn't be parsed (logged as a warn at load
+    /// time — never fatal because a metrics gap must not break route
+    /// serving). Consumed by `coxswain_proxy_tls_cert_expiry_seconds`.
+    pub not_after: Option<SystemTime>,
 }
 
 impl TlsCert {
     /// Construct a [`TlsCert`] from raw PEM bytes and a diagnostic source label.
+    ///
+    /// Use [`TlsCert::with_not_after`] to record a parsed expiry on the
+    /// returned cert.
     pub fn new(cert_pem: Vec<u8>, key_pem: Vec<u8>, source: String) -> Self {
         Self {
             cert_pem,
             key_pem,
             source,
+            not_after: None,
         }
+    }
+
+    /// Builder-style setter for the leaf certificate's `notAfter` expiry.
+    #[must_use]
+    pub fn with_not_after(mut self, not_after: Option<SystemTime>) -> Self {
+        self.not_after = not_after;
+        self
     }
 }
 
-/// PEM bytes only; `source` is diagnostic and excluded so a cert moving between owners
-/// does not trigger an unnecessary `ArcSwap` store.
+/// PEM bytes only; `source` and `not_after` are diagnostic and excluded so a
+/// cert moving between owners does not trigger an unnecessary `ArcSwap` store.
 impl PartialEq for TlsCert {
     fn eq(&self, other: &Self) -> bool {
         self.cert_pem == other.cert_pem && self.key_pem == other.key_pem
@@ -69,6 +87,42 @@ impl TlsStore {
     /// Total number of certificates across all buckets (exact + wildcard + default).
     pub fn cert_count(&self) -> usize {
         self.exact.len() + self.wildcard.len() + self.default.is_some() as usize
+    }
+
+    /// `(exact, wildcard, default)` cert counts — feeds the
+    /// `*_tls_certs_loaded{bucket}` gauge.
+    pub fn cert_counts(&self) -> (usize, usize, usize) {
+        (
+            self.exact.len(),
+            self.wildcard.len(),
+            usize::from(self.default.is_some()),
+        )
+    }
+
+    /// `(sni, not_after)` pairs for every cert with a parsed expiry. Used by
+    /// the proxy-pod `*_tls_cert_expiry_seconds{sni}` gauge. Certs whose
+    /// `not_after` is `None` (PEM parse failure) are omitted.
+    ///
+    /// SNI labels: exact patterns are themselves; wildcard patterns are
+    /// emitted as `"*.suffix"`; the default cert is labelled `"*"`.
+    pub fn expiries(&self) -> Vec<(String, SystemTime)> {
+        let mut out = Vec::with_capacity(self.cert_count());
+        for (sni, cert) in &self.exact {
+            if let Some(t) = cert.not_after {
+                out.push((sni.clone(), t));
+            }
+        }
+        for (suffix, cert) in &self.wildcard {
+            if let Some(t) = cert.not_after {
+                out.push((format!("*.{suffix}"), t));
+            }
+        }
+        if let Some(cert) = &self.default
+            && let Some(t) = cert.not_after
+        {
+            out.push(("*".to_string(), t));
+        }
+        out
     }
 }
 

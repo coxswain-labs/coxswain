@@ -1,6 +1,6 @@
 ---
 name: test-e2e
-description: Reset the local Kubernetes cluster and run one or more of the coxswain e2e suites (ingress, gateway_api, dedicated_proxy, proxy_hot_reconfig, conformance). Use when the user wants to validate a change against a live cluster — for example "test e2e", "run e2e", "run conformance", or "run the full e2e suite". Asks which suites to run; auto-detects the local cluster type (caches the reset command in memory after first use); reports a clean summary; offers to debug on failure.
+description: Reset the local Kubernetes cluster and run one or more of the coxswain e2e suites (ingress, gateway_api, dedicated_proxy, proxy_hot_reconfig, observability, conformance). Use when the user wants to validate a change against a live cluster — for example "test e2e", "run e2e", "run conformance", or "run the full e2e suite". Asks which suites to run; auto-detects the local cluster type (caches the reset command in memory after first use); reports a clean summary; offers to debug on failure.
 ---
 
 Run one or more of the project's e2e suites against a freshly-reset local Kubernetes cluster. Follow these steps in order.
@@ -13,6 +13,7 @@ Use `AskUserQuestion` with `multiSelect: true` and these options (omit "Other"; 
 - **gateway_api** — Cargo e2e suite. Same shape as ingress; also covers health endpoint checks. `cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1`
 - **dedicated_proxy** — Cargo e2e suite covering dedicated-mode provisioning + per-namespace RBAC. Dedicated-proxy Services use NodePort; tests connect via node IP. `cargo test -p coxswain-e2e --test dedicated_proxy -- --test-threads=1`
 - **proxy_hot_reconfig** — Cargo load-test suite: zero-drop listener add/remove; crash-loop shared-pool fallback. `cargo test -p coxswain-e2e --test proxy_hot_reconfig -- --test-threads=1`
+- **observability** — Cargo e2e suite covering readiness/status (formerly `health.rs`), the `coxswain_proxy_*` / `coxswain_controller_*` Prometheus surface, and the access-log contract (field set, path-mode behaviour, disabled mode). `cargo test -p coxswain-e2e --test observability -- --test-threads=1`
 - **conformance** — Gateway API Go conformance suite. The Cargo harness bootstrap handles image build + Helm install + LB-IP discovery; `go test` runs against the deployed cluster. Takes ~2 minutes.
 
 Cap the question at one phrase: "Which e2e suites to run?". Header: "E2E suites".
@@ -40,7 +41,7 @@ For each reset: briefly tell the user one line ("Resetting <type> cluster with `
 
 ## 3 — Bootstrap
 
-**All Cargo suites** (ingress, gateway_api, dedicated_proxy, proxy_hot_reconfig) bootstrap the cluster themselves via `coxswain-e2e`'s harness — no manual cluster setup. The bootstrap:
+**All Cargo suites** (ingress, gateway_api, dedicated_proxy, proxy_hot_reconfig, observability) bootstrap the cluster themselves via `coxswain-e2e`'s harness — no manual cluster setup. The bootstrap:
 1. Detects cluster type (OrbStack vs kind).
 2. Builds `coxswain:e2e` via `Dockerfile.e2e` — a 2-line COPY-only image wrapping the already-compiled binary (~5 s). The full production Dockerfile is NOT used locally.
 3. For kind: `kind load docker-image` + starts cloud-provider-kind if not running.

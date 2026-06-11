@@ -107,6 +107,7 @@ impl Controller {
         // during the initial list are processed with the correct leader state.
         let mut is_leader = Self::try_renew(&lease_lock, &self.config.pod_name).await;
         self.leader.store(is_leader, Ordering::Release);
+        crate::metrics::leader().set(i64::from(is_leader));
 
         let route_watcher = watcher(
             scoped_api::<HttpRoute>(client.clone(), self.config.watch_namespace.as_deref()),
@@ -201,6 +202,8 @@ impl Controller {
                         }
                         is_leader = leading;
                         self.leader.store(is_leader, Ordering::Release);
+                        crate::metrics::leader().set(i64::from(is_leader));
+                        crate::metrics::leader_transitions_total().inc();
                     }
                 }
 

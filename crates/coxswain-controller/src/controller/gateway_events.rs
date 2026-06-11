@@ -37,10 +37,12 @@ pub(super) async fn patch_gateway_status(
     let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
     let now = Time(k8s_openapi::jiff::Timestamp::now());
     let patch = build_gateway_status_patch(gw, health, generation, &now, addr, ingress_ports);
-    match api
+    let started = std::time::Instant::now();
+    let result = api
         .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-        .await
-    {
+        .await;
+    crate::metrics::observe_status_patch("gateway", started, &result);
+    match result {
         Ok(_) => tracing::info!(name, ns, "Gateway status patched"),
         Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Gateway status"),
     }

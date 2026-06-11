@@ -655,6 +655,7 @@ dependencies = [
  "kube",
  "kube-leader-election",
  "pingora-core",
+ "prometheus 0.14.0",
  "regex",
  "serde",
  "serde_json",
@@ -758,6 +759,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "pingora-core",
+ "prometheus 0.14.0",
  "regex",
  "serde",
  "serde_json",
@@ -765,6 +767,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-test",
+ "x509-parser",
 ]
 
 [[package]]

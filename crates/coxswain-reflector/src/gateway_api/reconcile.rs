@@ -130,7 +130,9 @@ impl GatewayApiReconciler {
             "Reconciling HTTPRoute"
         );
 
-        for rule in rules {
+        for (rule_index, rule) in rules.iter().enumerate() {
+            let metric_route_id: Arc<str> =
+                Arc::from(format!("httproute/{route_ns}/{route_name}:{rule_index}"));
             let rule_filters = rule.filters.as_deref().unwrap_or(&[]);
             let rule_timeouts = rule
                 .timeouts
@@ -221,6 +223,7 @@ impl GatewayApiReconciler {
                 timeouts: &rule_timeouts,
                 error_status,
                 route_id: &route_id,
+                metric_route_id: &metric_route_id,
                 created_at,
             };
             for (hostname_opt, port) in &bindings {
@@ -309,6 +312,7 @@ struct RuleContext<'a> {
     timeouts: &'a RouteTimeouts,
     error_status: Option<u16>,
     route_id: &'a str,
+    metric_route_id: &'a Arc<str>,
     created_at: Option<SystemTime>,
 }
 
@@ -323,7 +327,7 @@ fn apply_rule(
     ctx: &RuleContext<'_>,
 ) {
     let make_entry = |predicates: MatchPredicates, filter_list: Vec<FilterAction>| -> RouteEntry {
-        match group {
+        let entry = match group {
             Some(g) => {
                 let mut e = RouteEntry::with_filters(
                     Arc::clone(g),
@@ -343,7 +347,8 @@ fn apply_rule(
                 ctx.route_id.to_string(),
                 ctx.created_at,
             ),
-        }
+        };
+        entry.with_metric_route_id(Arc::clone(ctx.metric_route_id))
     };
 
     match rule.matches.as_deref() {

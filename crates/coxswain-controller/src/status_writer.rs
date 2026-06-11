@@ -157,6 +157,7 @@ pub fn spawn_status_writer(
             opts.watch_namespace = watch_namespace;
             opts.ingress_default_backend = ingress_default_backend;
             opts.ingress_ports = ingress_ports;
+            opts.metrics_prefix = coxswain_reflector::MetricsPrefix::Controller;
             opts
         },
     );

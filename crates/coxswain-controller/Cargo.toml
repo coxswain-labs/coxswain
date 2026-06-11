@@ -27,6 +27,7 @@ k8s-openapi = { workspace = true }
 kube = { workspace = true }
 kube-leader-election = { workspace = true }
 pingora-core = { workspace = true }
+prometheus = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

@@ -144,6 +144,8 @@ jobs:
             test: proxy_hot_reconfig
           - suite: rbac-read-only-proxy
             test: rbac_read_only_proxy
+          - suite: observability
+            test: observability
     steps:
       # Checkout is required because the test binaries embed
       # CARGO_MANIFEST_DIR at compile time and read fixture YAML / Helm chart
