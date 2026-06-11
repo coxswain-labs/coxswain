@@ -16,7 +16,7 @@
 //!   error-path emission, and disabled-mode silence.
 
 use coxswain_e2e::{
-    ControllerOptions, ControllerProcess, FixtureVars, Harness, NamespaceGuard, bootstrap,
+    ControllerOptions, FixtureVars, Harness, NamespaceGuard,
     fixtures::{self, backends, ingress},
     harness::wait,
 };
@@ -43,43 +43,16 @@ const CONTROLLER_CHECKS: &[&str] = &[
     "routing_table_built",
 ];
 
-#[tokio::test]
-async fn readyz_starts_not_ready_then_transitions_to_ready() -> anyhow::Result<()> {
-    common::init_tracing();
-    bootstrap().await?;
-
-    let controller = ControllerProcess::start().await?;
-    let url = format!("http://{}/readyz", controller.health_addr);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()?;
-
-    let mut saw_not_ready = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if tokio::time::Instant::now() > deadline {
-            anyhow::bail!("readyz never returned 200 within 30s");
-        }
-        match client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => break,
-            Ok(r) => {
-                tracing::debug!(status = %r.status(), "readyz not yet ready");
-                saw_not_ready = true;
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "readyz probe error (likely pre-bind)");
-                saw_not_ready = true;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    assert!(
-        saw_not_ready,
-        "readyz returned 200 on the first probe; either the gate is broken or the test lost the race"
-    );
-    Ok(())
-}
+// Note: the original `readyz_starts_not_ready_then_transitions_to_ready` test
+// from `health.rs` was deleted alongside the move to the Helm-deployed harness
+// (#236). It depended on observing the proxy *during* its initial cold-start
+// transition, but the harness now connects to a long-running, already-Ready
+// pod via a port-forward — there is no cold-start window to observe. The
+// initial readiness gate is still exercised end-to-end:
+//   - `helm install --wait` blocks until `/readyz` returns 200, so all tests
+//     transitively assert it;
+//   - `status_exposes_per_subsystem_checks` (below) verifies the per-subsystem
+//     check detail behind that gate.
 
 #[tokio::test]
 async fn status_exposes_per_subsystem_checks() -> anyhow::Result<()> {
@@ -226,20 +199,19 @@ async fn access_log_emits_required_fields_on_success() -> anyhow::Result<()> {
         .iter()
         .rev()
         .find(|line| {
-            line.pointer("/fields/host").and_then(|h| h.as_str()) == Some(host.as_str())
-                && line.pointer("/fields/method").and_then(|m| m.as_str()) == Some("GET")
-                && line.pointer("/fields/status").and_then(|s| s.as_u64()) == Some(200)
+            line.get("host").and_then(|h| h.as_str()) == Some(host.as_str())
+                && line.get("method").and_then(|m| m.as_str()) == Some("GET")
+                && line.get("status").and_then(|s| s.as_u64()) == Some(200)
         })
         .expect("at least one access-log row matching the driven request");
 
-    let fields = &row["fields"];
     for required in ["host", "method", "path", "status", "route_id", "upstream"] {
         assert!(
-            !fields.get(required).map(|v| v.is_null()).unwrap_or(true),
+            !row.get(required).map(|v| v.is_null()).unwrap_or(true),
             "access-log row must carry `{required}` — got: {row}"
         );
     }
-    let route_id = fields["route_id"].as_str().expect("route_id is a string");
+    let route_id = row["route_id"].as_str().expect("route_id is a string");
     assert!(
         route_id.starts_with(&format!("ingress/{}/", ns.name)),
         "route_id must be `ingress/<ns>/<name>:<r>.<p>` for an Ingress hit, got `{route_id}`"
@@ -273,11 +245,11 @@ async fn access_log_path_mode_pattern_uses_rule_pattern() -> anyhow::Result<()> 
         .iter()
         .rev()
         .find(|line| {
-            line.pointer("/fields/host").and_then(|h| h.as_str()) == Some(host.as_str())
-                && line.pointer("/fields/status").and_then(|s| s.as_u64()) == Some(200)
+            line.get("host").and_then(|h| h.as_str()) == Some(host.as_str())
+                && line.get("status").and_then(|s| s.as_u64()) == Some(200)
         })
         .expect("at least one matching access-log row");
-    let path = row.pointer("/fields/path").and_then(|p| p.as_str());
+    let path = row.get("path").and_then(|p| p.as_str());
     assert!(
         path.unwrap_or("").starts_with("/a"),
         "pattern mode must emit the matched rule pattern, got {path:?}"
@@ -315,18 +287,17 @@ async fn access_log_path_mode_none_omits_path() -> anyhow::Result<()> {
         .iter()
         .rev()
         .find(|line| {
-            line.pointer("/fields/host").and_then(|h| h.as_str()) == Some(host.as_str())
-                && line.pointer("/fields/status").and_then(|s| s.as_u64()) == Some(200)
+            line.get("host").and_then(|h| h.as_str()) == Some(host.as_str())
+                && line.get("status").and_then(|s| s.as_u64()) == Some(200)
         })
         .expect("at least one matching access-log row");
-    let fields = &row["fields"];
     assert!(
-        fields.get("path").map(|v| v.is_null()).unwrap_or(true),
-        "none mode must omit `path`, got {fields}"
+        row.get("path").map(|v| v.is_null()).unwrap_or(true),
+        "none mode must omit `path`, got {row}"
     );
     for required in ["host", "method", "status", "route_id", "upstream"] {
         assert!(
-            !fields.get(required).map(|v| v.is_null()).unwrap_or(true),
+            !row.get(required).map(|v| v.is_null()).unwrap_or(true),
             "none mode must still emit `{required}`"
         );
     }
@@ -341,22 +312,27 @@ async fn access_log_error_path_carries_error_field() -> anyhow::Result<()> {
     let h = Harness::start().await?;
 
     // No route is ever installed for this host: the proxy responds 404 from
-    // `resolve_outcome::NoHost`.
-    let _ = h.http.get("nonexistent.coxswain-e2e.invalid", "/").await?;
+    // `resolve_outcome::NoHost`. We use `get_status` (not `get`) because the
+    // latter propagates non-2xx as Err.
+    let status = h
+        .http
+        .get_status("nonexistent.coxswain-e2e.invalid", "/")
+        .await?;
+    assert_eq!(status, 404, "unmatched host must yield 404 from the proxy");
 
     let logs = h.controller.shared_proxy_access_logs().await?;
     let row = logs
         .iter()
         .rev()
         .find(|line| {
-            line.pointer("/fields/host")
+            line.get("host")
                 .and_then(|h| h.as_str())
                 .map(|h| h.starts_with("nonexistent."))
                 .unwrap_or(false)
         })
         .expect("at least one access-log row for the unmatched-host request");
     assert!(
-        row.pointer("/fields/error")
+        row.get("error")
             .and_then(|v| v.as_str())
             .map(|s| !s.is_empty())
             .unwrap_or(false),
@@ -391,7 +367,7 @@ async fn access_log_disabled_emits_nothing() -> anyhow::Result<()> {
     let logs = h.controller.shared_proxy_access_logs().await?;
     let recent: Vec<_> = logs
         .iter()
-        .filter(|line| line.pointer("/fields/host").and_then(|h| h.as_str()) == Some(host.as_str()))
+        .filter(|line| line.get("host").and_then(|h| h.as_str()) == Some(host.as_str()))
         .collect();
     assert!(
         recent.is_empty(),
