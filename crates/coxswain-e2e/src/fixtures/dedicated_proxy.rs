@@ -18,11 +18,17 @@ pub const DEDICATED_GATEWAY: &str = fixture!("dedicated_gateway.yaml");
 /// `RoleBinding` reconciliation.
 pub const DEDICATED_GATEWAY_WITH_ROUTE: &str = fixture!("dedicated_gateway_with_route.yaml");
 
+/// Dedicated-mode `Gateway` with `serviceType: ClusterIP` (#211 Scenario A).
+/// Pins the proxy `image` to `registry.k8s.io/pause:3.10` so the Pod becomes
+/// Ready instantly — this test gates `Programmed=True` on Pod readiness but
+/// only exercises the operator's status writer, not the proxy data plane.
+pub const DEDICATED_GATEWAY_CLUSTERIP: &str = fixture!("dedicated_gateway_clusterip.yaml");
+
 /// Dedicated-mode `Gateway` with `serviceType: LoadBalancer` (#211 Scenario
 /// B). Used to verify the operator's address resolution from
 /// `Service.status.loadBalancer.ingress` and the `Programmed` transition
 /// from `AddressNotAssigned` → `True` once the harness injects a synthetic
-/// LB ingress.
+/// LB ingress. Same pause-image stub as `DEDICATED_GATEWAY_CLUSTERIP`.
 pub const DEDICATED_GATEWAY_LOADBALANCER: &str = fixture!("dedicated_gateway_loadbalancer.yaml");
 
 /// Dedicated-mode `Gateway` whose `parametersRef` targets a missing

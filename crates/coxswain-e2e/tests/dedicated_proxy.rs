@@ -545,21 +545,33 @@ fn gateway_addresses(gw: &Gateway) -> Vec<(String, String)> {
 }
 
 /// 8 — Scenario A (#211, ClusterIP happy path): apply a dedicated Gateway with
-/// `serviceType: ClusterIP` (the existing fixture), wait for pod Ready, then
-/// assert the operator writes `Accepted=True`, `Programmed=True`,
+/// `serviceType: ClusterIP`, wait for pod Ready, then assert the operator
+/// writes `Accepted=True`, `Programmed=True`,
 /// `gateway.coxswain-labs.dev/DedicatedProxyReady=True/Ready`, and
 /// `status.addresses[0]` matching the provisioned Service's `spec.clusterIP`.
+///
+/// Uses [`dedicated::DEDICATED_GATEWAY_CLUSTERIP`] rather than the shared
+/// `DEDICATED_GATEWAY` fixture because Pod-Ready gating requires a
+/// stub-image container — the default `coxswain:<version>` image cached
+/// on the cluster predates the controller/proxy CLI split and CrashLoops
+/// against the operator-rendered args, so it never reports Ready.
 #[tokio::test]
 async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow::Result<()> {
     common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-status-clusterip").await?;
 
-    let (_, services, _, _, _, _) = apply_and_wait(&h, &ns).await?;
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_CLUSTERIP,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
 
-    // Read the rendered Service to learn its clusterIP — apiserver assigns
-    // it synchronously on Service creation.
-    let svc = services.get(RESOURCE_NAME).await?;
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let svc = poll_until(Duration::from_secs(15), || async {
+        services.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
     let cluster_ip = svc
         .spec
         .as_ref()
@@ -603,12 +615,19 @@ async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow
     Ok(())
 }
 
-/// 9 — Scenario B (#211, LoadBalancer with synthetic status patch): local
-/// clusters don't run an LB controller, so we apply a `serviceType:
-/// LoadBalancer` Gateway, assert `Programmed=False, reason=AddressNotAssigned`,
-/// then manually patch the Service's `/status` subresource with a synthetic
-/// LB ingress and confirm the operator flips `Programmed=True` with the
-/// injected IP showing in `status.addresses`.
+/// 9 — Scenario B (#211, LoadBalancer address propagation): apply a
+/// `serviceType: LoadBalancer` Gateway and verify the operator surfaces the
+/// assigned LB IP in `Gateway.status.addresses` and flips `Programmed=True`
+/// once an IP is present.
+///
+/// Address-source resilience: some local clusters (e.g. OrbStack) ship a
+/// built-in LB controller that assigns an IP within seconds; on bare clusters
+/// the harness writes a synthetic `Service.status.loadBalancer.ingress` if
+/// none appears within a short window. Either path produces the same observable
+/// downstream signal — the operator's address resolution doesn't care which
+/// source populated the field, and pinning to one specific IP is fragile
+/// because an active LB controller will overwrite a synthetic patch within
+/// a single reconcile loop.
 #[tokio::test]
 async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> anyhow::Result<()> {
     common::init_tracing();
@@ -629,13 +648,10 @@ async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> any
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
 
-    // Before the synthetic status patch: the Service has no LB ingress (no
-    // LB controller in the local cluster), so the operator must surface
-    // Programmed=False, reason=AddressNotAssigned. Pod readiness is not
-    // required for this assertion — the precedence ladder yields
-    // AddressNotAssigned when a Ready pod is present and addresses are
-    // still empty (and Pending otherwise — both are False so we only assert
-    // status=False here to avoid coupling to pod startup timing).
+    // Before any LB ingress is assigned the operator must surface
+    // Programmed=False with one of two reasons:
+    //   * Pending — pod not yet Ready (precedence: pod-ready > address)
+    //   * AddressNotAssigned — pod is Ready but no LB IP yet
     poll_until(Duration::from_secs(45), || async {
         let gw = gateways.get(GATEWAY_NAME).await.ok()?;
         let programmed = gateway_condition(&gw, "Programmed")?;
@@ -649,27 +665,49 @@ async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> any
     })
     .await?;
 
-    // Patch the Service's /status subresource with a synthetic LB ingress.
-    // Plain `.patch()` would target the spec subresource — we MUST go
-    // through `.patch_status()` to write `status.loadBalancer.ingress`.
-    let synthetic_lb_ip = "203.0.113.7";
-    let status_patch = serde_json::json!({
-        "status": {
-            "loadBalancer": {
-                "ingress": [{"ip": synthetic_lb_ip}]
+    // Give an in-cluster LB controller a short window to assign an IP. If
+    // nothing shows up in 10 s we synthetically patch the status subresource
+    // so the test still exercises address propagation on bare clusters.
+    // Plain `.patch()` would target the spec subresource — `/status` writes
+    // MUST go through `.patch_status()`.
+    let in_cluster_assigned = poll_until(Duration::from_secs(10), || async {
+        let svc = services.get_status(RESOURCE_NAME).await.ok()?;
+        let ip = svc
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+            .and_then(|lb| lb.ingress.as_ref())
+            .and_then(|i| i.first())
+            .and_then(|e| e.ip.clone())
+            .filter(|s| !s.is_empty());
+        ip.map(|ip| ip.to_string())
+    })
+    .await
+    .ok();
+    let expected_ip: String = if let Some(ip) = in_cluster_assigned {
+        ip
+    } else {
+        let synthetic_lb_ip = "203.0.113.7";
+        let status_patch = serde_json::json!({
+            "status": {
+                "loadBalancer": {
+                    "ingress": [{"ip": synthetic_lb_ip}]
+                }
             }
-        }
-    });
-    services
-        .patch_status(
-            RESOURCE_NAME,
-            &kube::api::PatchParams::default(),
-            &kube::api::Patch::Merge(&status_patch),
-        )
-        .await?;
+        });
+        services
+            .patch_status(
+                RESOURCE_NAME,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(&status_patch),
+            )
+            .await?;
+        synthetic_lb_ip.to_string()
+    };
 
-    // The operator's Service cross-watch should pick this up and re-reconcile
-    // the owning Gateway. Wait for Programmed=True with the injected IP.
+    // The operator's Service cross-watch picks up the LB-ingress change and
+    // re-reconciles the owning Gateway. Wait for Programmed=True and the
+    // assigned IP in status.addresses.
     let gw = poll_until(Duration::from_secs(60), || async {
         let gw = gateways.get(GATEWAY_NAME).await.ok()?;
         let programmed = gateway_condition(&gw, "Programmed")?;
@@ -677,7 +715,7 @@ async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> any
         if programmed == ("True".to_string(), "Programmed".to_string())
             && addresses
                 .iter()
-                .any(|(t, v)| t == "IPAddress" && v == synthetic_lb_ip)
+                .any(|(t, v)| t == "IPAddress" && v == &expected_ip)
         {
             Some(gw)
         } else {

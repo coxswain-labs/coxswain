@@ -177,12 +177,6 @@ struct ReconcileContext {
     /// and gate `Programmed=True` on having ≥1 Ready Pod (#211).
     /// Cluster-wide watch narrowed by `PROXY_POD_LABEL_SELECTOR`.
     pods_store: Store<Pod>,
-    /// Provisioned dedicated-proxy `Service` objects. The status writer
-    /// resolves `Gateway.status.addresses` from these (#211): LB ingress for
-    /// `LoadBalancer`, `spec.clusterIP` for `ClusterIP`, Node IPs for
-    /// `NodePort`. Cluster-wide watch narrowed by
-    /// `PROXY_POD_LABEL_SELECTOR` (same selector our SSA stamps).
-    services_store: Store<Service>,
     /// Cluster `Node` snapshot. Only consulted when a dedicated Gateway's
     /// Service is `NodePort`-typed; otherwise unused. Unscoped watch
     /// (Nodes are cluster-wide and low-cardinality).
@@ -307,20 +301,6 @@ impl BackgroundService for Operator {
                 while stream.next().await.is_some() {}
             }
         });
-        // Service reflector for dedicated-proxy address resolution (#211).
-        // Same label-selector scoping as Pods — the only Services that flow
-        // through the watch are the ones we provisioned ourselves.
-        let (services_reader, services_writer) = reflector::store::<Service>();
-        tasks.spawn({
-            let api = Api::<Service>::all(client.clone());
-            let config = watcher::Config::default().labels(PROXY_POD_LABEL_SELECTOR);
-            async move {
-                let stream =
-                    reflector::reflector(services_writer, watcher(api, config).default_backoff());
-                tokio::pin!(stream);
-                while stream.next().await.is_some() {}
-            }
-        });
         // Node reflector — cluster-wide, no label scoping. Only consulted for
         // `NodePort`-typed dedicated Services; one snapshot per reconcile.
         // Low cardinality at the cluster sizes Coxswain targets (tens of
@@ -363,7 +343,6 @@ impl BackgroundService for Operator {
             let _ = routes_reader.wait_until_ready().await;
             let _ = grants_reader.wait_until_ready().await;
             let _ = pods_reader.wait_until_ready().await;
-            let _ = services_reader.wait_until_ready().await;
             let _ = nodes_reader.wait_until_ready().await;
         })
         .await;
@@ -386,7 +365,6 @@ impl BackgroundService for Operator {
             routes_store: routes_reader,
             grants_store: grants_reader,
             pods_store: pods_reader,
-            services_store: services_reader,
             nodes_store: nodes_reader,
             tls_health: self.config.tls_health.clone(),
             ingress_ports: self.config.ingress_ports,
@@ -706,8 +684,14 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
         Ok(None) => {
             // Not dedicated mode. If we previously placed our finalizer on
             // this Gateway (it was dedicated, now isn't), clean up bindings
-            // and the finalizer too so the Gateway can transition cleanly
-            // back to the shared pool.
+            // and the finalizer AND clear every condition this writer owned
+            // so the shared-pool status writer can re-establish
+            // `Accepted`/`Programmed` on its next Gateway reconcile.
+            //
+            // The finalizer is what tells us we ever owned this Gateway's
+            // status — without it the clear path would delete conditions
+            // written by the shared-pool writer on every reconcile of every
+            // non-dedicated Gateway, producing an unbounded patch loop.
             if has_our_finalizer(&gw) {
                 tracing::info!(
                     gateway = %gateway_id(&gw),
@@ -715,17 +699,12 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
                 );
                 rbac::delete_all_for_gateway(&ctx.client, gw_namespace, gw_name).await?;
                 remove_finalizer(&ctx.client, &gw).await?;
+                status::clear_dedicated_gateway_status(&ctx.client, &gw).await?;
+                ctx.last_hashes
+                    .lock()
+                    .unwrap_or_else(|e| panic!("invariant: hash-tracking mutex poisoned: {e}"))
+                    .remove(&key);
             }
-            // Clear every condition (and addresses) this writer owned so the
-            // shared-pool status writer can re-establish `Accepted`/
-            // `Programmed` on its next Gateway reconcile. The shared pool
-            // also reads `DedicatedProxyReady` for cut-over; removing it
-            // signals "fall back to shared".
-            status::clear_dedicated_gateway_status(&ctx.client, &gw).await?;
-            ctx.last_hashes
-                .lock()
-                .unwrap_or_else(|e| panic!("invariant: hash-tracking mutex poisoned: {e}"))
-                .remove(&key);
             return Ok(Action::await_change());
         }
         Err(params::ParamsError::NotFound(ns, name)) => {
@@ -795,18 +774,30 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
     // `gateway.coxswain-labs.dev/DedicatedProxyReady` cut-over signal the
     // shared-proxy reflector consumes (#210). All gated on observed Pod
     // readiness + resolved Service-address presence + TLS-health.
+    //
+    // The Service is fetched directly from the apiserver — NOT read from a
+    // reflector store — because the Service cross-watch that triggers this
+    // reconcile is an independent subscription from any reflector: the
+    // cross-watch can deliver a MODIFIED event before a reflector finishes
+    // applying it, leaving the store one resourceVersion behind for the
+    // duration of this reconcile. A status-only LoadBalancer patch has no
+    // other trigger to re-reconcile against, so reading stale state here
+    // would silently strand `Programmed=False, reason=AddressNotAssigned`
+    // indefinitely.
     let ready_pod_count = count_ready_proxy_pods(&ctx.pods_store, gw_namespace, gw_name);
-    let service = ctx.services_store.state().into_iter().find(|s| {
-        s.metadata.namespace.as_deref() == Some(gw_namespace)
-            && s.metadata.name.as_deref()
-                == Some(status::resource_name(gw_name, class_name).as_str())
-    });
+    let services_api: Api<Service> = Api::namespaced(ctx.client.clone(), gw_namespace);
+    let resource_name = status::resource_name(gw_name, class_name);
+    let service = match services_api.get(&resource_name).await {
+        Ok(svc) => Some(svc),
+        Err(kube::Error::Api(api_err)) if api_err.code == 404 => None,
+        Err(e) => return Err(ReconcileError::Kube(e)),
+    };
     let nodes: Vec<Arc<Node>> = ctx.nodes_store.state();
     let tls_health_map = ctx.tls_health.load();
     let gateway_health = tls_health_map.get(&key).cloned().unwrap_or_default();
     let inputs = status::DedicatedGatewayStatusInputs {
         gw: &gw,
-        service: service.as_deref(),
+        service: service.as_ref(),
         nodes: &nodes,
         tls_health: &gateway_health,
         ingress_ports: ctx.ingress_ports,
