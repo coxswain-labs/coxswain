@@ -24,18 +24,12 @@ async fn status_load_balancer_ip() -> anyhow::Result<()> {
     wait::wait_for_backends(&ns.name).await?;
     fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
-    // 60 s: in the in-cluster harness this test triggers a helm upgrade that
-    // rolls out a new controller pod. `helm --wait` returns once the new pod
-    // is Ready, but for a brief window the old pod can still hold the
-    // leader-election lease (rolling-update keeps both pods alive). The new
-    // pod's first Ingress reconciliation only happens after lease handover,
-    // which can add up to ~10 s on top of the test's own setup time.
     wait::wait_for_ingress_lb_ip(
         &h.client,
         "echo-ingress",
         &ns.name,
         "203.0.113.1",
-        Duration::from_secs(60),
+        Duration::from_secs(30),
     )
     .await?;
 

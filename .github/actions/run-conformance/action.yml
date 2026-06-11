@@ -131,6 +131,35 @@ runs:
           --wait \
           --timeout 60s
 
+    - name: Wait for controller leader handover
+      shell: bash
+      run: |
+        # `helm --wait` returns once the new controller pod is Ready, but the
+        # OLD pod can still hold the leader-election lease for up to its TTL
+        # (~15 s). During that window the new pod sees objects via InitApply
+        # events with is_leader=false and skips status patches; once it later
+        # becomes leader nothing re-fires for already-known objects. The
+        # conformance suite hits this immediately by creating Gateways during
+        # setup. Block until exactly one controller pod exists and it holds
+        # the lease.
+        for i in $(seq 1 60); do
+          PODS=$(kubectl get pods -n coxswain-system \
+            -l app.kubernetes.io/component=controller \
+            -o jsonpath='{.items[*].metadata.name}')
+          HOLDER=$(kubectl get lease coxswain-leader-lock -n coxswain-system \
+            -o jsonpath='{.spec.holderIdentity}' --ignore-not-found)
+          COUNT=$(echo "$PODS" | wc -w | tr -d ' ')
+          if [ "$COUNT" = "1" ] && [ -n "$HOLDER" ] && echo " $PODS " | grep -q " $HOLDER "; then
+            echo "Leader: $HOLDER"
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "Leader handover timed out — pods=[$PODS] holder=$HOLDER"
+        kubectl get pods -n coxswain-system
+        kubectl get lease coxswain-leader-lock -n coxswain-system -o yaml
+        exit 1
+
     - name: Run Gateway API conformance suite
       id: conformance
       shell: bash

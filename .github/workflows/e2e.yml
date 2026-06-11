@@ -100,7 +100,19 @@ jobs:
       # Build cloud-provider-kind once here so the e2e and conformance jobs
       # download a binary instead of each running `go install` (which pulls
       # the module + transitive Go deps every time, ~30-60 s per job).
+      #
+      # The binary itself is cached across runs — cloud-provider-kind
+      # updates roughly monthly and we don't need bleeding-edge. Bump the
+      # cache-key suffix (`v1` → `v2` …) to force a refresh.
+      - name: Cache cloud-provider-kind binary
+        id: cpk-cache
+        uses: actions/cache@v5
+        with:
+          path: cloud-provider-kind
+          key: cloud-provider-kind-${{ runner.os }}-v1
+
       - name: Install cloud-provider-kind
+        if: steps.cpk-cache.outputs.cache-hit != 'true'
         run: |
           go install sigs.k8s.io/cloud-provider-kind@latest
           cp "$(go env GOPATH)/bin/cloud-provider-kind" ./cloud-provider-kind

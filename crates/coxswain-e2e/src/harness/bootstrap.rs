@@ -268,7 +268,79 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         .await
         .context("helm upgrade")?;
     anyhow::ensure!(status.success(), "helm upgrade --install failed");
+
+    // `helm --wait` returns when the new controller pod is Ready, but for a
+    // ~15 s window (the lease TTL) the OLD controller pod can still hold the
+    // leader-election lease. During that window the new pod sees ingresses /
+    // gateways via `InitApply` events with `is_leader=false`, so it never
+    // patches their status. Once it later becomes leader, no event re-fires
+    // for already-known objects — they stay un-reconciled until something
+    // else mutates them. Block until the new (sole) controller pod has the
+    // lease so callers can assume status writes will happen.
+    wait_for_leader_ready()
+        .await
+        .context("controller leader handover")?;
     Ok(())
+}
+
+/// Poll the `coxswain-leader-lock` Lease until its `holderIdentity` is one of
+/// the currently-running controller pods AND no extra (terminating) controller
+/// pods remain. This guarantees the new leader from a rolling update has fully
+/// taken over before tests proceed.
+///
+/// # Errors
+///
+/// Returns an error if handover does not complete within 60 s.
+async fn wait_for_leader_ready() -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let pods_out = Command::new("kubectl")
+            .args([
+                "get",
+                "pods",
+                "-n",
+                COXSWAIN_NAMESPACE,
+                "-l",
+                "app.kubernetes.io/component=controller",
+                "-o",
+                "jsonpath={.items[*].metadata.name}",
+            ])
+            .output()
+            .await
+            .context("kubectl get pods")?;
+        let pods: Vec<String> = String::from_utf8_lossy(&pods_out.stdout)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+
+        let lease_out = Command::new("kubectl")
+            .args([
+                "get",
+                "lease",
+                "coxswain-leader-lock",
+                "-n",
+                COXSWAIN_NAMESPACE,
+                "-o",
+                "jsonpath={.spec.holderIdentity}",
+                "--ignore-not-found",
+            ])
+            .output()
+            .await
+            .context("kubectl get lease")?;
+        let holder = String::from_utf8_lossy(&lease_out.stdout)
+            .trim()
+            .to_string();
+
+        if pods.len() == 1 && pods.contains(&holder) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "leader handover timeout: pods={pods:?}, holder={holder:?} (expected exactly one controller pod holding the lease)"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 /// Split `E2E_IMAGE` (`repo:tag`) into the repository part.
