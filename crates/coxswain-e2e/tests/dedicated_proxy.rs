@@ -823,6 +823,36 @@ async fn wait_for_cut_over(
     .await
 }
 
+/// Poll until `addr` is bindable by another process.
+///
+/// The cutover signal on the Gateway flips before the shared subprocess's
+/// listener acceptor releases the socket — there's an ~1s watch-propagation
+/// window between `DedicatedProxyReady=True` and the listener actually
+/// unbinding, plus the proxy's own listener-drain phase (#231) which keeps the
+/// kernel socket open while accepting in-flight traffic.
+///
+/// `TcpStream::connect` is NOT a sufficient test: a draining listener still
+/// answers new SYNs until the socket is fully closed, so connect would return
+/// `Ok` for the entire drain window and we'd see a false negative. Instead we
+/// try to `bind()` the port ourselves — succeeds only when the previous owner
+/// has fully released it. The ephemeral listener is dropped immediately so the
+/// dedicated subprocess can claim the port on its next reconcile.
+async fn wait_for_port_release(
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    poll_until(timeout, || async move {
+        match std::net::TcpListener::bind(addr) {
+            Ok(listener) => {
+                drop(listener);
+                Some(())
+            }
+            Err(_) => None,
+        }
+    })
+    .await
+}
+
 /// 11 — Apply a dedicated-mode Gateway → assert Deployment/Service/ServiceAccount
 /// land with the GEP-1762 labels, owner references back to the Gateway, and the
 /// SSA field manager set to `coxswain-controller`.
@@ -924,6 +954,10 @@ async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
     // it does, the shared subprocess still holds GATEWAY_HTTP_PORT.
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+    // 35s budget covers the proxy_listener_drain_timeout (30s default) — the
+    // shared subprocess can't fully release the socket until in-flight keep-
+    // alive connections from earlier `wait_for_route` polls close.
+    wait_for_port_release(h.controller.gateway_http_addr, Duration::from_secs(35)).await?;
 
     let dedicated_proxy = h
         .start_dedicated_proxy(GATEWAY_NAME, &ns.name, &[&ns.name])
@@ -964,6 +998,10 @@ async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+    // 35s budget covers the proxy_listener_drain_timeout (30s default) — the
+    // shared subprocess can't fully release the socket until in-flight keep-
+    // alive connections from earlier `wait_for_route` polls close.
+    wait_for_port_release(h.controller.gateway_http_addr, Duration::from_secs(35)).await?;
 
     let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &tenant.name);
     let want_binding = binding_name(&ns.name);
@@ -1010,6 +1048,10 @@ async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+    // 35s budget covers the proxy_listener_drain_timeout (30s default) — the
+    // shared subprocess can't fully release the socket until in-flight keep-
+    // alive connections from earlier `wait_for_route` polls close.
+    wait_for_port_release(h.controller.gateway_http_addr, Duration::from_secs(35)).await?;
 
     let dedicated_proxy = h
         .start_dedicated_proxy(GATEWAY_NAME, &ns.name, &[&ns.name, &tenant.name])
@@ -1026,8 +1068,10 @@ async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<
     let grant_name = format!("allow-httproute-from-{}", ns.name);
     grants.delete(&grant_name, &DeleteParams::default()).await?;
 
-    // Cross-namespace backend dropped from the routing table → 503.
-    wait::wait_for_route_status(&http, &host, "/", 503, Duration::from_secs(30)).await?;
+    // Cross-namespace backend dropped from the routing table → reflector
+    // installs an "error route" returning 500 ("No ready endpoints for rule —
+    // installing error route (500)"; see `gateway_api::reconcile`).
+    wait::wait_for_route_status(&http, &host, "/", 500, Duration::from_secs(30)).await?;
 
     // Tenant ns is no longer in the desired-namespace set → the per-tenant
     // RoleBinding is reconciled away.
@@ -1172,10 +1216,14 @@ async fn lifecycle_mode_migration_shared_to_dedicated() -> anyhow::Result<()> {
         .await?;
 
     wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
-
-    // Shared subprocess must drop the Gateway → port released, 404 on the
-    // shared listener. The wait absorbs the listener-drain handoff window.
-    wait::wait_for_route_status(&h.gateway_http, &host, "/", 404, Duration::from_secs(15)).await?;
+    // Shared subprocess releases the listener after the cutover signal
+    // propagates through its reflector. Once that happens, requests to the
+    // shared port get connection-refused (the only Gateway on that port has
+    // been dropped, so the listener unbinds entirely — not a 404).
+    // 35s budget covers the proxy_listener_drain_timeout (30s default) — the
+    // shared subprocess can't fully release the socket until in-flight keep-
+    // alive connections from earlier `wait_for_route` polls close.
+    wait_for_port_release(h.controller.gateway_http_addr, Duration::from_secs(35)).await?;
 
     let dedicated_proxy = h
         .start_dedicated_proxy(GATEWAY_NAME, &ns.name, &[&ns.name])
@@ -1210,6 +1258,10 @@ async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+    // 35s budget covers the proxy_listener_drain_timeout (30s default) — the
+    // shared subprocess can't fully release the socket until in-flight keep-
+    // alive connections from earlier `wait_for_route` polls close.
+    wait_for_port_release(h.controller.gateway_http_addr, Duration::from_secs(35)).await?;
 
     let dedicated_proxy = h
         .start_dedicated_proxy(GATEWAY_NAME, &ns.name, &[&ns.name])
@@ -1220,6 +1272,14 @@ async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
     let http = dedicated_proxy.http_client()?;
     let pre = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
     pre.assert_backend("echo-a");
+
+    // Shutdown the dedicated subprocess BEFORE patching out parametersRef. In
+    // production the K8s GC of the dedicated Pod (driven by the parametersRef
+    // removal) is what frees the listener port on the pod's own IP; here on
+    // the host loopback we must release the port up front so the shared
+    // subprocess, which sees the parametersRef removal moments later and tries
+    // to rebind, doesn't race the dedicated subprocess and silently fail.
+    dedicated_proxy.shutdown().await;
 
     // Patch out the parametersRef. Merge-patch null deletes the field.
     let patch = serde_json::json!({
@@ -1233,28 +1293,9 @@ async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
         .patch(GATEWAY_NAME, &PatchParams::default(), &Patch::Merge(&patch))
         .await?;
 
-    // Wait for the controller to clear the cutover signal. Once cleared, the
-    // shared subprocess will try to re-adopt the Gateway and bind the listener.
-    poll_until(Duration::from_secs(30), || async {
-        let gw = gateways.get(GATEWAY_NAME).await.ok()?;
-        let conds = gw.status.as_ref()?.conditions.as_ref();
-        let still_cut_over = conds
-            .map(|cs| {
-                cs.iter()
-                    .any(|c| c.type_ == CUT_OVER_CONDITION && c.status == "True")
-            })
-            .unwrap_or(false);
-        if still_cut_over { None } else { Some(()) }
-    })
-    .await?;
-
-    // Release the listener port so the shared subprocess can bind it. In
-    // production the GC'd pod releases the port on its own pod IP; on the host
-    // loopback we have to do this explicitly.
-    dedicated_proxy.shutdown().await;
-
-    // Shared subprocess re-adopts the Gateway. The ~1s race window between
-    // status-clear and shared re-bind is covered by this poll budget.
+    // Shared subprocess re-adopts the Gateway once the controller clears the
+    // status. The ~1s race window between status-clear and shared re-bind
+    // (where neither subprocess serves) is absorbed by this poll.
     let post = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(30)).await?;
     post.assert_backend("echo-a");
 
@@ -1279,6 +1320,10 @@ async fn lifecycle_controller_restart_is_idempotent() -> anyhow::Result<()> {
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+    // 35s budget covers the proxy_listener_drain_timeout (30s default) — the
+    // shared subprocess can't fully release the socket until in-flight keep-
+    // alive connections from earlier `wait_for_route` polls close.
+    wait_for_port_release(h.controller.gateway_http_addr, Duration::from_secs(35)).await?;
 
     // Spawn the dedicated subprocess and verify baseline traffic. This
     // subprocess is held across the controller restart — proof of "no traffic

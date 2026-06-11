@@ -686,7 +686,7 @@ fn rebuild(
         outputs,
     );
 
-    let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, outputs.tls);
+    let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, outputs.tls, true);
 
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
 
@@ -872,7 +872,8 @@ fn build_routes(
     ingress_ports: IngressPorts,
     outputs: &SharedOutputs<'_>,
 ) -> bool {
-    let gateway_published = build_gateway_routes(stores, routes, ownership, outputs.gateway_routes);
+    let gateway_published =
+        build_gateway_routes(stores, routes, ownership, outputs.gateway_routes, true);
     let ingress_published = build_ingress_routes(
         stores,
         ingresses,
@@ -886,15 +887,20 @@ fn build_routes(
 
 /// Build the Gateway-API routing table from `HTTPRoute` resources and publish
 /// it to `shared`. Returns `true` if the publish succeeded.
+/// `skip_cut_over` drops cut-over Gateways from the listener-info map —
+/// correct for the *shared* reconciler (those listeners bind on the dedicated
+/// proxy instead). The dedicated reconciler must pass `false`: its target
+/// Gateway IS the cut-over Gateway, and filtering it leaves the dedicated
+/// subprocess with no listener_info and no resolvable routes.
 pub(super) fn build_gateway_routes(
     stores: &ReflectorStores<'_>,
     routes: &[Arc<HttpRoute>],
     ownership: &Ownership<'_>,
     shared: &SharedGatewayRoutingTable,
+    skip_cut_over: bool,
 ) -> bool {
     // Precompute ListenerKey → (hostname, port) from all owned gateway
-    // listeners. Cut-over Gateways (#210) are excluded so their listeners
-    // never bind ports on the shared data plane.
+    // listeners.
     let listener_info: HashMap<ListenerKey, ListenerBinding> = stores
         .gateways
         .state()
@@ -904,7 +910,7 @@ pub(super) fn build_gateway_routes(
                 .gateway_classes
                 .contains(&g.spec.gateway_class_name)
         })
-        .filter(|g| !gateway_is_cut_over(g))
+        .filter(|g| !(skip_cut_over && gateway_is_cut_over(g)))
         .flat_map(|g| {
             let ns = g.metadata.namespace.clone().unwrap_or_default();
             let name = g.metadata.name.clone().unwrap_or_default();
@@ -1059,11 +1065,21 @@ fn publish_routes<K>(
 }
 
 /// Build and publish the TLS cert store; returns per-gateway listener health for further use.
+/// Build the per-Gateway TLS listener health map plus update the shared TLS
+/// cert store.
+///
+/// `skip_cut_over` drops Gateways whose `DedicatedProxyReady=True` condition
+/// matches their current generation — appropriate for the *shared* reconciler
+/// (the shared pool yields these listeners to the dedicated proxy that owns
+/// them). The dedicated reconciler must pass `false`: the Gateway it serves
+/// IS the cut-over Gateway, and skipping it leaves the dedicated subprocess
+/// with no listener specs and no bound listener.
 pub(super) fn build_tls(
     stores: &ReflectorStores<'_>,
     ingresses: &[Arc<Ingress>],
     ownership: &Ownership<'_>,
     tls_shared: &SharedTlsStore,
+    skip_cut_over: bool,
 ) -> HashMap<ObjectKey, GatewayListenerHealth> {
     let mut tls_builder = TlsStoreBuilder::new();
     for ingress in ingresses {
@@ -1085,8 +1101,10 @@ pub(super) fn build_tls(
             continue;
         }
         // Cut-over Gateways (#210) don't contribute TLS certs to the shared
-        // store — the dedicated proxy terminates their TLS instead.
-        if gateway_is_cut_over(&gw) {
+        // store — the dedicated proxy terminates their TLS instead. The
+        // dedicated reconciler passes `skip_cut_over = false` because its
+        // target Gateway IS cut over and it must still bind its listener.
+        if skip_cut_over && gateway_is_cut_over(&gw) {
             continue;
         }
         let ns = gw.metadata.namespace.clone().unwrap_or_default();
