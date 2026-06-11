@@ -110,8 +110,17 @@ runs:
       run: |
         # Re-upgrade with the confirmed LB IP so the controller populates
         # Gateway.status.addresses — required by the conformance suite.
+        #
+        # namespace.create=false must be kept on the upgrade. The initial
+        # install used `--create-namespace`, which creates the namespace
+        # outside Helm (no `app.kubernetes.io/managed-by=Helm` label, no
+        # `meta.helm.sh/release-*` annotations). If this upgrade lets the
+        # chart's Namespace template render, Helm tries to take ownership
+        # of the existing namespace and fails with "missing key
+        # app.kubernetes.io/managed-by".
         helm upgrade coxswain charts/coxswain \
           --namespace coxswain-system \
+          --set namespace.create=false \
           --set image.repository=coxswain \
           --set image.tag=e2e \
           --set image.pullPolicy=Never \

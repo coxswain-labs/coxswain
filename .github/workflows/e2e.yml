@@ -97,6 +97,21 @@ jobs:
           path: test-bins/
           retention-days: 1
 
+      # Build cloud-provider-kind once here so the e2e and conformance jobs
+      # download a binary instead of each running `go install` (which pulls
+      # the module + transitive Go deps every time, ~30-60 s per job).
+      - name: Install cloud-provider-kind
+        run: |
+          go install sigs.k8s.io/cloud-provider-kind@latest
+          cp "$(go env GOPATH)/bin/cloud-provider-kind" ./cloud-provider-kind
+
+      - name: Upload cloud-provider-kind
+        uses: actions/upload-artifact@v7
+        with:
+          name: cloud-provider-kind
+          path: cloud-provider-kind
+          retention-days: 1
+
   e2e:
     name: e2e-${{ matrix.suite }}
     needs: build
@@ -124,6 +139,19 @@ jobs:
       # /home/runner/work/<repo>/<repo> path on every runner image, so the
       # paths baked in by the build job resolve here too.
       - uses: actions/checkout@v6
+
+      # Pre-built by the `build` job; place on PATH so setup-kind-cluster
+      # skips its `go install` fallback.
+      - name: Download cloud-provider-kind
+        uses: actions/download-artifact@v8
+        with:
+          name: cloud-provider-kind
+          path: /tmp/cpk
+
+      - name: Install cloud-provider-kind on PATH
+        run: |
+          chmod +x /tmp/cpk/cloud-provider-kind
+          sudo mv /tmp/cpk/cloud-provider-kind /usr/local/bin/cloud-provider-kind
 
       - uses: ./.github/actions/setup-kind-cluster
         with:
@@ -182,6 +210,19 @@ jobs:
 
       - name: Load Docker image into daemon
         run: docker load < e2e-image.tar.gz
+
+      # Pre-built by the `build` job; place on PATH so setup-kind-cluster
+      # (invoked by run-conformance) skips its `go install` fallback.
+      - name: Download cloud-provider-kind
+        uses: actions/download-artifact@v8
+        with:
+          name: cloud-provider-kind
+          path: /tmp/cpk
+
+      - name: Install cloud-provider-kind on PATH
+        run: |
+          chmod +x /tmp/cpk/cloud-provider-kind
+          sudo mv /tmp/cpk/cloud-provider-kind /usr/local/bin/cloud-provider-kind
 
       - uses: ./.github/actions/run-conformance
         id: conformance

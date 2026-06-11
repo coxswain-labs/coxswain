@@ -36,12 +36,18 @@ runs:
         # LoadBalancer Services. An in-cluster DaemonSet does not work because
         # kind nodes are Docker containers that lack their own Docker socket.
         #
-        # ubuntu-latest runners have Go pre-installed; we use it to install
-        # the binary rather than guessing release-asset URL conventions.
-        go install sigs.k8s.io/cloud-provider-kind@latest
+        # CI pre-installs the binary in the `build` job and ships it as an
+        # artifact, so matrix/conformance jobs find it on PATH and skip the Go
+        # install entirely. Local runs (with no prefab binary on PATH) fall
+        # back to `go install`, using the pre-installed Go on ubuntu-latest.
+        if command -v cloud-provider-kind >/dev/null 2>&1; then
+          CPK_BIN="$(command -v cloud-provider-kind)"
+        else
+          go install sigs.k8s.io/cloud-provider-kind@latest
+          CPK_BIN="$(go env GOPATH)/bin/cloud-provider-kind"
+        fi
         # Run in background under sudo so it can manipulate Docker networks.
-        sudo "$(go env GOPATH)/bin/cloud-provider-kind" \
-          > /tmp/cloud-provider-kind.log 2>&1 &
-        echo "cloud-provider-kind started (PID $!)"
+        sudo "$CPK_BIN" > /tmp/cloud-provider-kind.log 2>&1 &
+        echo "cloud-provider-kind started (PID $!) using $CPK_BIN"
         # Brief pause to let it register its watch against the cluster.
         sleep 3
