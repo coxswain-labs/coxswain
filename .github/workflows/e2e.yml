@@ -50,23 +50,11 @@ jobs:
         with:
           cache-key-prefix: e2e-build
 
-      # Compile the coxswain binary (release) and the e2e test harness binaries.
-      # The release binary goes into Dockerfile.e2e; the test binaries run on
-      # the CI runner and drive the cluster via kubectl/helm.
-      - name: Build coxswain binary and e2e test binaries
-        run: |
-          mkdir -p bin
-          cargo build --release --bin coxswain
-          cargo test --no-run -p coxswain-e2e --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .executable != null) | "\(.executable) \(.target.name)"' \
-            | while read -r src name; do cp "$src" "bin/$name"; done
-
-      - name: Upload e2e test binaries
-        uses: actions/upload-artifact@v7
-        with:
-          name: e2e-bins
-          path: bin/
-          retention-days: 1
+      # Compile the coxswain binary (release) only — the e2e test harness is
+      # compiled per-job in the `e2e` matrix so its test-profile artifacts share
+      # the same Rust cache without needing a separate artifact upload/download.
+      - name: Build coxswain binary
+        run: cargo build --release --bin coxswain
 
       # Wrap the compiled binary in a minimal distroless image using
       # Dockerfile.e2e — a 2-line COPY-only Dockerfile that takes ~5 s.
@@ -95,17 +83,23 @@ jobs:
       matrix:
         include:
           - suite: ingress
-            binary: ingress
+            test: ingress
           - suite: gateway-api
-            binary: gateway_api
+            test: gateway_api
           - suite: dedicated-proxy
-            binary: dedicated_proxy
+            test: dedicated_proxy
           - suite: proxy-hot-reconfig
-            binary: proxy_hot_reconfig
+            test: proxy_hot_reconfig
           - suite: rbac-read-only-proxy
-            binary: rbac_read_only_proxy
+            test: rbac_read_only_proxy
     steps:
       - uses: actions/checkout@v6
+
+      # Restore the Rust build cache so `cargo test --no-run` below only
+      # recompiles what changed since the last run of this suite.
+      - uses: ./.github/actions/setup-rust-with-cache
+        with:
+          cache-key-prefix: e2e-test
 
       - uses: ./.github/actions/setup-kind-cluster
         with:
@@ -124,17 +118,8 @@ jobs:
       - name: Load Docker image into daemon
         run: docker load < e2e-image.tar.gz
 
-      - name: Download e2e test binaries
-        uses: actions/download-artifact@v8
-        with:
-          name: e2e-bins
-          path: bin/
-
-      - name: Make binaries executable
-        run: chmod +x bin/${{ matrix.binary }}
-
       - name: Run e2e tests (${{ matrix.suite }})
-        run: bin/${{ matrix.binary }} --test-threads=1
+        run: cargo test -p coxswain-e2e --test ${{ matrix.test }} -- --test-threads=1
         env:
           # Image already loaded into the Docker daemon; bootstrap skips docker build.
           COXSWAIN_E2E_SKIP_BUILD: "1"
