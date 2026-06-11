@@ -90,6 +90,8 @@ runs:
           --set proxy.https.enabled=false \
           --set 'service.gateway.additionalPorts[0].name=http,service.gateway.additionalPorts[0].port=80,service.gateway.additionalPorts[0].targetPort=80,service.gateway.additionalPorts[0].protocol=TCP' \
           --set 'service.gateway.additionalPorts[1].name=https,service.gateway.additionalPorts[1].port=443,service.gateway.additionalPorts[1].targetPort=443,service.gateway.additionalPorts[1].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[2].name=alt-http,service.gateway.additionalPorts[2].port=8080,service.gateway.additionalPorts[2].targetPort=8080,service.gateway.additionalPorts[2].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[3].name=alt-http-2,service.gateway.additionalPorts[3].port=8090,service.gateway.additionalPorts[3].targetPort=8090,service.gateway.additionalPorts[3].protocol=TCP' \
           --skip-crds \
           --wait \
           --timeout 120s
@@ -146,6 +148,8 @@ runs:
           --set proxy.https.enabled=false \
           --set 'service.gateway.additionalPorts[0].name=http,service.gateway.additionalPorts[0].port=80,service.gateway.additionalPorts[0].targetPort=80,service.gateway.additionalPorts[0].protocol=TCP' \
           --set 'service.gateway.additionalPorts[1].name=https,service.gateway.additionalPorts[1].port=443,service.gateway.additionalPorts[1].targetPort=443,service.gateway.additionalPorts[1].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[2].name=alt-http,service.gateway.additionalPorts[2].port=8080,service.gateway.additionalPorts[2].targetPort=8080,service.gateway.additionalPorts[2].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[3].name=alt-http-2,service.gateway.additionalPorts[3].port=8090,service.gateway.additionalPorts[3].targetPort=8090,service.gateway.additionalPorts[3].protocol=TCP' \
           --skip-crds \
           --wait \
           --timeout 60s
