@@ -3,6 +3,7 @@
 
 pub mod bootstrap;
 pub mod controller;
+pub mod dedicated_proxy_process;
 pub mod http;
 pub mod namespace;
 pub mod tls;
@@ -11,6 +12,7 @@ pub mod wait;
 use anyhow::Context as _;
 pub use bootstrap::bootstrap;
 pub use controller::{ControllerOptions, ControllerProcess};
+pub use dedicated_proxy_process::DedicatedProxyProcess;
 pub use http::HttpClient;
 pub use namespace::{IngressClassGuard, NamespaceGuard};
 pub use tls::GeneratedCert;
@@ -71,6 +73,25 @@ impl Harness {
     /// Build an admin endpoint URL (e.g. `admin_url("/routes")`).
     pub fn admin_url(&self, path: &str) -> String {
         format!("http://{}{path}", self.controller.admin_addr)
+    }
+
+    /// Spawn a `serve proxy --dedicated` subprocess scoped to one Gateway,
+    /// binding the same `GATEWAY_HTTP_PORT` / `GATEWAY_HTTPS_PORT` the fixture
+    /// declared. The shared subprocess must have already released the listener
+    /// (i.e. the Gateway is in dedicated mode and `DedicatedProxyReady=True`),
+    /// otherwise the bind races and one of the two will fail.
+    pub async fn start_dedicated_proxy(
+        &self,
+        gateway_name: &str,
+        gateway_namespace: &str,
+    ) -> anyhow::Result<DedicatedProxyProcess> {
+        DedicatedProxyProcess::start(
+            gateway_name,
+            gateway_namespace,
+            self.controller.gateway_http_addr,
+            self.controller.gateway_https_addr,
+        )
+        .await
     }
 
     /// Apply a fixture YAML. Automatically substitutes the four port placeholders

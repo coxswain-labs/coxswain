@@ -1,18 +1,35 @@
 #![allow(missing_docs)]
-//! E2E coverage for the Step 9 (#208) provisioning operator.
+//! E2E coverage for the dedicated-mode Gateway lifecycle (Steps 9–13).
 //!
-//! Three scenarios — apply→assert, delete→assert GC, restart→assert
-//! resourceVersion stability. The dedicated proxy pod is intentionally
-//! non-functional in this PR (its SA has no per-namespace RBAC bindings yet;
-//! those land in #209), so these tests assert **resource provisioning only**,
-//! never traffic flow.
+//! Tests are layered by phase:
+//! - **Step 9 (#208)** — provisioning operator: resource creation, GC on
+//!   Gateway deletion, SSA idempotency across controller restart.
+//! - **Step 10 (#209)** — per-namespace RBAC narrowing: RoleBinding lifecycle,
+//!   drift detection, container-args rendering.
+//! - **Step 11 (#211)** — Gateway status writer: `Accepted`/`Programmed`
+//!   conditions, address derivation per `serviceType`,
+//!   `InvalidParameters` path.
+//! - **Step 13 (#212)** — user-visible lifecycle: traffic through a dedicated
+//!   proxy host subprocess, cross-namespace + `ReferenceGrant` revocation,
+//!   mode migration in both directions, and traffic continuity across a
+//!   controller restart.
+//!
+//! The Step-13 lifecycle tests spawn a second `serve proxy --dedicated`
+//! subprocess on the host alongside the existing `serve dev` subprocess.
+//! In-cluster Deployments are pinned to `registry.k8s.io/pause:3.10` so a
+//! coxswain image build is not required — bind/release of the listener port
+//! is sequenced by the controller's cutover signal.
 
-use coxswain_e2e::{FixtureVars, Harness, NamespaceGuard, fixtures::dedicated_proxy as dedicated};
+use coxswain_e2e::{
+    DedicatedProxyProcess, FixtureVars, Harness, NamespaceGuard,
+    fixtures::{backends, dedicated_proxy as dedicated},
+    harness::{HttpClient, wait},
+};
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
 use k8s_openapi::api::rbac::v1::RoleBinding;
-use kube::api::{Api, DeleteParams, ListParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use std::time::Duration;
 use tokio::time;
 
@@ -25,6 +42,9 @@ mod common;
 const GATEWAY_NAME: &str = "dedicated-gw";
 /// Rendered resource name per GEP-1762 — `<gateway-name>-<gateway-class>`.
 const RESOURCE_NAME: &str = "dedicated-gw-coxswain";
+/// Condition type the operator writes when the dedicated pod is Ready and the
+/// shared pool must stop serving the Gateway (#210).
+const CUT_OVER_CONDITION: &str = "gateway.coxswain-labs.dev/DedicatedProxyReady";
 
 /// `RoleBinding` name pattern: `coxswain-<gateway-namespace>-<gateway-name>`
 /// (see `coxswain_controller::operator::rbac`). Constructed at runtime from
@@ -776,5 +796,520 @@ async fn invalid_parameters_yields_accepted_false_invalid_parameters() -> anyhow
         sas.get(RESOURCE_NAME).await.is_err(),
         "no ServiceAccount should be provisioned on the InvalidParameters path"
     );
+    Ok(())
+}
+
+// =============================================================================
+// #212 — Step 13: user-visible dedicated-mode Gateway lifecycle.
+// =============================================================================
+
+/// Wait until the controller flips the cutover condition to `True` — i.e. the
+/// dedicated pod is Ready and the shared pool has dropped the Gateway from its
+/// routing table.
+async fn wait_for_cut_over(
+    gateways: &Api<Gateway>,
+    name: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    poll_until(timeout, || async {
+        let gw = gateways.get(name).await.ok()?;
+        let conds = gw.status.as_ref()?.conditions.as_ref()?;
+        conds
+            .iter()
+            .find(|c| c.type_ == CUT_OVER_CONDITION)
+            .filter(|c| c.status == "True")
+            .map(|_| ())
+    })
+    .await
+}
+
+/// 11 — Apply a dedicated-mode Gateway → assert Deployment/Service/ServiceAccount
+/// land with the GEP-1762 labels, owner references back to the Gateway, and the
+/// SSA field manager set to `coxswain-controller`.
+#[tokio::test]
+async fn lifecycle_provisioning_creates_resources() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-prov").await?;
+
+    h.apply(dedicated::PROVISIONING, FixtureVars::new(&ns.name))
+        .await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
+
+    let deploy = poll_until(Duration::from_secs(30), || async {
+        deployments.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
+    let svc = poll_until(Duration::from_secs(30), || async {
+        services.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
+    let sa = poll_until(Duration::from_secs(30), || async {
+        sas.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
+
+    for (kind, meta) in [
+        ("Deployment", &deploy.metadata),
+        ("Service", &svc.metadata),
+        ("ServiceAccount", &sa.metadata),
+    ] {
+        let labels = meta
+            .labels
+            .as_ref()
+            .unwrap_or_else(|| panic!("{kind}: labels missing"));
+        assert_eq!(
+            labels
+                .get("gateway.networking.k8s.io/gateway-name")
+                .map(String::as_str),
+            Some(GATEWAY_NAME),
+            "{kind}: GEP-1762 gateway-name label"
+        );
+        assert_eq!(
+            labels
+                .get("app.kubernetes.io/managed-by")
+                .map(String::as_str),
+            Some("coxswain"),
+            "{kind}: managed-by label"
+        );
+
+        let refs = meta
+            .owner_references
+            .as_ref()
+            .unwrap_or_else(|| panic!("{kind}: owner references missing"));
+        assert_eq!(refs.len(), 1, "{kind}: expected one owner ref");
+        assert_eq!(refs[0].kind, "Gateway", "{kind}: owner ref kind");
+        assert_eq!(refs[0].name, GATEWAY_NAME, "{kind}: owner ref name");
+        assert_eq!(refs[0].controller, Some(true), "{kind}: controller=true");
+        assert_eq!(
+            refs[0].block_owner_deletion,
+            Some(true),
+            "{kind}: blockOwnerDeletion=true"
+        );
+    }
+
+    let managers = deploy
+        .metadata
+        .managed_fields
+        .as_ref()
+        .expect("Deployment managedFields");
+    assert!(
+        managers
+            .iter()
+            .any(|f| f.manager.as_deref() == Some("coxswain-controller")),
+        "expected managedFields entry for 'coxswain-controller'"
+    );
+
+    Ok(())
+}
+
+/// 12 — Spawn a dedicated-proxy host subprocess once the controller has flipped
+/// `DedicatedProxyReady=True`, send a GET via the Gateway listener, assert the
+/// expected backend.
+#[tokio::test]
+async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-traffic").await?;
+
+    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(dedicated::TRAFFIC, FixtureVars::new(&ns.name))
+        .await?;
+
+    // Cutover must complete before we spawn the dedicated subprocess — until
+    // it does, the shared subprocess still holds GATEWAY_HTTP_PORT.
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    let dedicated_proxy = h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("dedicated.{}.local", ns.name);
+    let http = dedicated_proxy.http_client()?;
+    let resp = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// 13 — An HTTPRoute with a backend Service in a different namespace resolves
+/// via `ReferenceGrant`. The per-tenant `RoleBinding` is provisioned for the
+/// dedicated proxy ServiceAccount, and traffic flows through the dedicated
+/// subprocess.
+#[tokio::test]
+async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "ded-life-xns-tenant").await?;
+
+    h.apply(
+        dedicated::CROSS_NAMESPACE_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
+
+    h.apply(
+        dedicated::CROSS_NAMESPACE_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &tenant.name);
+    let want_binding = binding_name(&ns.name);
+    poll_until(Duration::from_secs(30), || async {
+        bindings.get(&want_binding).await.ok()
+    })
+    .await?;
+
+    let dedicated_proxy = h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("cross-ns.{}.local", ns.name);
+    let http = dedicated_proxy.http_client()?;
+    let resp = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-d");
+
+    Ok(())
+}
+
+/// 14 — Delete the `ReferenceGrant` → the cross-namespace backend is dropped
+/// from the dedicated proxy's routing table (requests 503) and the per-tenant
+/// `RoleBinding` is reconciled away.
+#[tokio::test]
+async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-revoke").await?;
+    let tenant = NamespaceGuard::create(&h.client, "ded-life-revoke-tenant").await?;
+
+    h.apply(
+        dedicated::CROSS_NAMESPACE_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
+
+    h.apply(
+        dedicated::CROSS_NAMESPACE_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    let dedicated_proxy = h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("cross-ns.{}.local", ns.name);
+    let http = dedicated_proxy.http_client()?;
+    // Baseline — the route resolves while the grant is in place.
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+
+    use gateway_api::apis::standard::referencegrants::ReferenceGrant;
+    let grants: Api<ReferenceGrant> = Api::namespaced(h.client.clone(), &tenant.name);
+    let grant_name = format!("allow-httproute-from-{}", ns.name);
+    grants.delete(&grant_name, &DeleteParams::default()).await?;
+
+    // Cross-namespace backend dropped from the routing table → 503.
+    wait::wait_for_route_status(&http, &host, "/", 503, Duration::from_secs(30)).await?;
+
+    // Tenant ns is no longer in the desired-namespace set → the per-tenant
+    // RoleBinding is reconciled away.
+    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &tenant.name);
+    let want_binding = binding_name(&ns.name);
+    poll_until(Duration::from_secs(30), || async {
+        bindings.get(&want_binding).await.err().map(|_| ())
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// 15 — `Programmed=True` plus `status.addresses` populated for a ClusterIP
+/// dedicated-mode Gateway. (Sibling of test 8 which also pins ClusterIP, but
+/// gates only on conditions/addresses without the cutover-and-traffic plumbing.)
+#[tokio::test]
+async fn lifecycle_gateway_status_conditions_and_addresses() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-status").await?;
+
+    h.apply(dedicated::PROVISIONING, FixtureVars::new(&ns.name))
+        .await?;
+
+    wait::wait_for_gateway_programmed(&h.client, GATEWAY_NAME, &ns.name, Duration::from_secs(60))
+        .await?;
+
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let svc = services.get(RESOURCE_NAME).await?;
+    let cluster_ip = svc
+        .spec
+        .as_ref()
+        .and_then(|s| s.cluster_ip.clone())
+        .expect("Service should have a clusterIP");
+    assert!(
+        !cluster_ip.is_empty() && cluster_ip != "None",
+        "ClusterIP fixture expects a non-headless IP, got {cluster_ip}"
+    );
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let gw = gateways.get(GATEWAY_NAME).await?;
+    let addresses: Vec<(String, String)> = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.addresses.as_ref())
+        .map(|addrs| {
+            addrs
+                .iter()
+                .map(|a| (a.r#type.clone().unwrap_or_default(), a.value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        addresses
+            .iter()
+            .any(|(t, v)| t == "IPAddress" && v == &cluster_ip),
+        "Gateway.status.addresses should include ({cluster_ip}); got {addresses:?}"
+    );
+
+    Ok(())
+}
+
+/// 16 — Gateway deletion cascades to Deployment/Service/ServiceAccount via
+/// owner-ref GC, and the Gateway itself is removed after the dedicated-cleanup
+/// finalizer runs. (Sibling of test 2 which asserts the same against
+/// `DEDICATED_GATEWAY` without the pause stub; this variant exercises the same
+/// path with a pause-image fixture for consistency with the rest of the
+/// lifecycle suite.)
+#[tokio::test]
+async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-gc").await?;
+
+    h.apply(dedicated::PROVISIONING, FixtureVars::new(&ns.name))
+        .await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
+
+    poll_until(Duration::from_secs(30), || async {
+        deployments.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    gateways
+        .delete(GATEWAY_NAME, &DeleteParams::default())
+        .await?;
+
+    poll_until(Duration::from_secs(30), || async {
+        let gone = deployments.get(RESOURCE_NAME).await.is_err()
+            && services.get(RESOURCE_NAME).await.is_err()
+            && sas.get(RESOURCE_NAME).await.is_err()
+            && gateways.get(GATEWAY_NAME).await.is_err();
+        if gone { Some(()) } else { None }
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// 17 — Mode migration shared → dedicated. Final-state assertion: pre-migration
+/// the shared subprocess serves the Gateway; after patching in `parametersRef`
+/// and waiting for cutover, the shared subprocess returns 404 and the dedicated
+/// subprocess returns the backend response.
+#[tokio::test]
+async fn lifecycle_mode_migration_shared_to_dedicated() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-m-s2d").await?;
+
+    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(dedicated::MODE_MIGRATION_SHARED, FixtureVars::new(&ns.name))
+        .await?;
+
+    let host = format!("migrate.{}.local", ns.name);
+
+    // Baseline: shared subprocess serves the Gateway in shared mode.
+    let pre = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
+    pre.assert_backend("echo-a");
+
+    // Patch in the parametersRef → controller provisions a dedicated pod and
+    // flips DedicatedProxyReady=True once it's Ready.
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let patch = serde_json::json!({
+        "spec": {
+            "infrastructure": {
+                "parametersRef": {
+                    "group": "gateway.coxswain-labs.dev",
+                    "kind": "CoxswainGatewayParameters",
+                    "name": "dedicated-params",
+                },
+            },
+        },
+    });
+    gateways
+        .patch(GATEWAY_NAME, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    // Shared subprocess must drop the Gateway → port released, 404 on the
+    // shared listener. The wait absorbs the listener-drain handoff window.
+    wait::wait_for_route_status(&h.gateway_http, &host, "/", 404, Duration::from_secs(15)).await?;
+
+    let dedicated_proxy = h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
+
+    let http = dedicated_proxy.http_client()?;
+    let post = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    post.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// 18 — Mode migration dedicated → shared. Final-state assertion: pre-migration
+/// the dedicated subprocess serves; after patching `parametersRef` out, waiting
+/// for the cutover signal to clear, and shutting down the dedicated subprocess
+/// (releasing the listener port — in production the pod GC does this), the
+/// shared subprocess re-adopts the Gateway and serves backend traffic again.
+#[tokio::test]
+async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-m-d2s").await?;
+
+    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(
+        dedicated::MODE_MIGRATION_DEDICATED,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    let dedicated_proxy = h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("migrate.{}.local", ns.name);
+    let http = dedicated_proxy.http_client()?;
+    let pre = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    pre.assert_backend("echo-a");
+
+    // Patch out the parametersRef. Merge-patch null deletes the field.
+    let patch = serde_json::json!({
+        "spec": {
+            "infrastructure": {
+                "parametersRef": null,
+            },
+        },
+    });
+    gateways
+        .patch(GATEWAY_NAME, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+
+    // Wait for the controller to clear the cutover signal. Once cleared, the
+    // shared subprocess will try to re-adopt the Gateway and bind the listener.
+    poll_until(Duration::from_secs(30), || async {
+        let gw = gateways.get(GATEWAY_NAME).await.ok()?;
+        let conds = gw.status.as_ref()?.conditions.as_ref();
+        let still_cut_over = conds
+            .map(|cs| {
+                cs.iter()
+                    .any(|c| c.type_ == CUT_OVER_CONDITION && c.status == "True")
+            })
+            .unwrap_or(false);
+        if still_cut_over { None } else { Some(()) }
+    })
+    .await?;
+
+    // Release the listener port so the shared subprocess can bind it. In
+    // production the GC'd pod releases the port on its own pod IP; on the host
+    // loopback we have to do this explicitly.
+    dedicated_proxy.shutdown().await;
+
+    // Shared subprocess re-adopts the Gateway. The ~1s race window between
+    // status-clear and shared re-bind is covered by this poll budget.
+    let post = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(30)).await?;
+    post.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// 19 — Controller restart idempotency: the dedicated subprocess keeps serving
+/// across a `serve dev` restart (no traffic disruption), and the controller's
+/// SSA on identical content does not bump the Deployment's `.metadata.generation`.
+#[tokio::test]
+async fn lifecycle_controller_restart_is_idempotent() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    // Persistent namespace so the bootstrap purge on the second `Harness::start()`
+    // doesn't delete it.
+    let ns = NamespaceGuard::create_persistent(&h.client, "ded-life-restart").await?;
+
+    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(dedicated::TRAFFIC, FixtureVars::new(&ns.name))
+        .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    // Spawn the dedicated subprocess and verify baseline traffic. This
+    // subprocess is held across the controller restart — proof of "no traffic
+    // disruption" is that it keeps serving while `h` is dropped+respawned.
+    let dedicated_proxy: DedicatedProxyProcess =
+        h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("dedicated.{}.local", ns.name);
+    let http: HttpClient = dedicated_proxy.http_client()?;
+    let pre = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    pre.assert_backend("echo-a");
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let deploy_before = deployments.get(RESOURCE_NAME).await?;
+    let gen_before = deploy_before
+        .metadata
+        .generation
+        .expect("Deployment generation");
+
+    // Restart: drop the controller (kills `serve dev`) and spawn a fresh one.
+    // The dedicated subprocess survives — it keeps serving on its listener
+    // port through the restart.
+    drop(h);
+    let h2 = Harness::start().await?;
+
+    // Let the new leader's operator emit its first few idempotent SSAs.
+    time::sleep(Duration::from_secs(15)).await;
+
+    let deployments_after: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
+    let deploy_after = deployments_after.get(RESOURCE_NAME).await?;
+    assert_eq!(
+        deploy_after.metadata.generation,
+        Some(gen_before),
+        "Deployment .metadata.generation should not bump across controller restart (SSA must be idempotent on identical content)"
+    );
+
+    // Traffic continuity — the dedicated subprocess kept serving the whole
+    // time, so the same backend assertion still holds.
+    let post = http.get(&host, "/").await?;
+    post.assert_backend("echo-a");
+
     Ok(())
 }

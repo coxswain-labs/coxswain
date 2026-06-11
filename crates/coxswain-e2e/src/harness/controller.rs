@@ -179,7 +179,9 @@ fn free_port() -> anyhow::Result<u16> {
     free_addr().map(|a| a.port())
 }
 
-fn coxswain_bin() -> anyhow::Result<PathBuf> {
+/// Locate the `coxswain` binary the e2e harness spawns. Honours `COXSWAIN_BIN`,
+/// otherwise looks under the test runner's `target/{profile}/` directory.
+pub(crate) fn coxswain_bin() -> anyhow::Result<PathBuf> {
     if let Ok(p) = std::env::var("COXSWAIN_BIN") {
         let path = PathBuf::from(p);
         anyhow::ensure!(path.exists(), "COXSWAIN_BIN not found: {}", path.display());
