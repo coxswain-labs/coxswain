@@ -52,12 +52,22 @@ impl DedicatedProxyProcess {
     /// and `gateway_https_addr` must match the listener ports the fixture
     /// rendered into the Gateway spec — the subprocess will bind them dynamically
     /// once its first reconcile cycle picks up the Gateway.
+    ///
+    /// `watch_namespaces` is the per-namespace reflector set passed via
+    /// `--proxy-watch-namespaces` (required by clap when `--dedicated` is set;
+    /// must at least include `gateway_namespace`). For cross-namespace
+    /// HTTPRoute backends, also include the tenant namespaces.
     pub async fn start(
         gateway_name: &str,
         gateway_namespace: &str,
         gateway_http_addr: SocketAddr,
         gateway_https_addr: SocketAddr,
+        watch_namespaces: &[&str],
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !watch_namespaces.is_empty(),
+            "watch_namespaces must include at least the Gateway's namespace"
+        );
         let health_port = free_port()?;
         let admin_port = free_port()?;
         let health_addr = SocketAddr::new(BIND_ADDR, health_port);
@@ -79,6 +89,8 @@ impl DedicatedProxyProcess {
             gateway_name.to_string(),
             "--gateway-namespace".to_string(),
             gateway_namespace.to_string(),
+            "--proxy-watch-namespaces".to_string(),
+            watch_namespaces.join(","),
             "--proxy-bind-address".to_string(),
             BIND_ADDR.to_string(),
             "--health-port".to_string(),

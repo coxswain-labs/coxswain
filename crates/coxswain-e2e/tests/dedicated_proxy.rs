@@ -925,7 +925,9 @@ async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
 
-    let dedicated_proxy = h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    let dedicated_proxy = h
+        .start_dedicated_proxy(GATEWAY_NAME, &ns.name, &[&ns.name])
+        .await?;
     wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
 
     let host = format!("dedicated.{}.local", ns.name);
@@ -970,7 +972,9 @@ async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
     })
     .await?;
 
-    let dedicated_proxy = h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    let dedicated_proxy = h
+        .start_dedicated_proxy(GATEWAY_NAME, &ns.name, &[&ns.name, &tenant.name])
+        .await?;
     wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
 
     let host = format!("cross-ns.{}.local", ns.name);
@@ -1007,7 +1011,9 @@ async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
 
-    let dedicated_proxy = h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    let dedicated_proxy = h
+        .start_dedicated_proxy(GATEWAY_NAME, &ns.name, &[&ns.name, &tenant.name])
+        .await?;
     wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
 
     let host = format!("cross-ns.{}.local", ns.name);
@@ -1171,7 +1177,9 @@ async fn lifecycle_mode_migration_shared_to_dedicated() -> anyhow::Result<()> {
     // shared listener. The wait absorbs the listener-drain handoff window.
     wait::wait_for_route_status(&h.gateway_http, &host, "/", 404, Duration::from_secs(15)).await?;
 
-    let dedicated_proxy = h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    let dedicated_proxy = h
+        .start_dedicated_proxy(GATEWAY_NAME, &ns.name, &[&ns.name])
+        .await?;
     wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
 
     let http = dedicated_proxy.http_client()?;
@@ -1203,7 +1211,9 @@ async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
 
-    let dedicated_proxy = h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    let dedicated_proxy = h
+        .start_dedicated_proxy(GATEWAY_NAME, &ns.name, &[&ns.name])
+        .await?;
     wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
 
     let host = format!("migrate.{}.local", ns.name);
@@ -1273,8 +1283,9 @@ async fn lifecycle_controller_restart_is_idempotent() -> anyhow::Result<()> {
     // Spawn the dedicated subprocess and verify baseline traffic. This
     // subprocess is held across the controller restart — proof of "no traffic
     // disruption" is that it keeps serving while `h` is dropped+respawned.
-    let dedicated_proxy: DedicatedProxyProcess =
-        h.start_dedicated_proxy(GATEWAY_NAME, &ns.name).await?;
+    let dedicated_proxy: DedicatedProxyProcess = h
+        .start_dedicated_proxy(GATEWAY_NAME, &ns.name, &[&ns.name])
+        .await?;
     wait::wait_for_ready(dedicated_proxy.health_addr, Duration::from_secs(30)).await?;
 
     let host = format!("dedicated.{}.local", ns.name);

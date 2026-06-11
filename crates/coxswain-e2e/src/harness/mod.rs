@@ -80,16 +80,22 @@ impl Harness {
     /// declared. The shared subprocess must have already released the listener
     /// (i.e. the Gateway is in dedicated mode and `DedicatedProxyReady=True`),
     /// otherwise the bind races and one of the two will fail.
+    ///
+    /// `watch_namespaces` is the per-namespace reflector set; must include the
+    /// Gateway's own namespace, plus any tenant namespaces an HTTPRoute attached
+    /// to the Gateway routes a backend into.
     pub async fn start_dedicated_proxy(
         &self,
         gateway_name: &str,
         gateway_namespace: &str,
+        watch_namespaces: &[&str],
     ) -> anyhow::Result<DedicatedProxyProcess> {
         DedicatedProxyProcess::start(
             gateway_name,
             gateway_namespace,
             self.controller.gateway_http_addr,
             self.controller.gateway_https_addr,
+            watch_namespaces,
         )
         .await
     }
