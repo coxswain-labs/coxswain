@@ -70,6 +70,13 @@ runs:
     - name: Install coxswain via Helm (initial — no status-address yet)
       shell: bash
       run: |
+        # The conformance suite declares Gateway listeners on ports 80/443
+        # itself. Coxswain's controller surfaces Programmed=False with
+        # reason=PortUnavailable when a Gateway listener port collides with
+        # the Ingress data-plane reservation, so we must NOT reserve those
+        # ports for Ingress here — disable proxy.http / proxy.https and
+        # surface 80/443 only on the Service so the LB still routes them to
+        # the proxy pod, where Gateway listeners bind them dynamically.
         helm upgrade --install coxswain charts/coxswain \
           --namespace coxswain-system \
           --create-namespace \
@@ -79,6 +86,10 @@ runs:
           --set image.pullPolicy=Never \
           --set service.gateway.type=LoadBalancer \
           --set controller.coxswainImage=coxswain:e2e \
+          --set proxy.http.enabled=false \
+          --set proxy.https.enabled=false \
+          --set 'service.gateway.additionalPorts[0].name=http,service.gateway.additionalPorts[0].port=80,service.gateway.additionalPorts[0].targetPort=80,service.gateway.additionalPorts[0].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[1].name=https,service.gateway.additionalPorts[1].port=443,service.gateway.additionalPorts[1].targetPort=443,service.gateway.additionalPorts[1].protocol=TCP' \
           --skip-crds \
           --wait \
           --timeout 120s
@@ -118,6 +129,10 @@ runs:
         # chart's Namespace template render, Helm tries to take ownership
         # of the existing namespace and fails with "missing key
         # app.kubernetes.io/managed-by".
+        # Keep the same proxy.http / proxy.https and Service port overrides
+        # as the initial install (see comment there) so the controller does
+        # not reserve 80/443 for Ingress while the conformance Gateways are
+        # using them.
         helm upgrade coxswain charts/coxswain \
           --namespace coxswain-system \
           --set namespace.create=false \
@@ -127,6 +142,10 @@ runs:
           --set service.gateway.type=LoadBalancer \
           --set controller.coxswainImage=coxswain:e2e \
           --set controller.statusAddress=${{ steps.lb-ip.outputs.lb-ip }} \
+          --set proxy.http.enabled=false \
+          --set proxy.https.enabled=false \
+          --set 'service.gateway.additionalPorts[0].name=http,service.gateway.additionalPorts[0].port=80,service.gateway.additionalPorts[0].targetPort=80,service.gateway.additionalPorts[0].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[1].name=https,service.gateway.additionalPorts[1].port=443,service.gateway.additionalPorts[1].targetPort=443,service.gateway.additionalPorts[1].protocol=TCP' \
           --skip-crds \
           --wait \
           --timeout 60s
