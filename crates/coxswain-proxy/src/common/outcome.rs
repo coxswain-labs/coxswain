@@ -38,10 +38,11 @@ pub(crate) async fn resolve_outcome(
         Arc<[FilterAction]>,
         RouteTimeouts,
         Arc<str>,
+        Arc<str>,
     )>,
 > {
     match outcome {
-        RouteOutcome::Found(u, f, t, p) => Ok(Some((u, f, t, p))),
+        RouteOutcome::Found(u, f, t, p, m) => Ok(Some((u, f, t, p, m))),
         RouteOutcome::Error(status) => {
             let resp = ResponseHeader::build(status, Some(0))?;
             session

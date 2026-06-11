@@ -364,5 +364,40 @@ pub(crate) fn load_tls_cert(
         return Err(TlsLoadError::InvalidPem);
     }
 
-    Ok(TlsCert::new(cert_pem, key_pem, format!("{ns}/{name}")))
+    let not_after = parse_leaf_not_after(&cert_pem).unwrap_or_else(|e| {
+        tracing::warn!(
+            ns,
+            name,
+            error = %e,
+            "TLS cert notAfter parse failed — expiry metric will omit this cert"
+        );
+        None
+    });
+
+    Ok(TlsCert::new(cert_pem, key_pem, format!("{ns}/{name}")).with_not_after(not_after))
+}
+
+/// Parse the leaf certificate's `notAfter` field from a PEM chain.
+///
+/// Returns `Ok(None)` if the chain parsed but contained no certificate (a
+/// degenerate case — `Ok(Some(_))` is the expected shape for any well-formed
+/// `kubernetes.io/tls` Secret). Returns `Err` on PEM/ASN.1 parse failure.
+fn parse_leaf_not_after(cert_pem: &[u8]) -> Result<Option<std::time::SystemTime>, String> {
+    use x509_parser::pem::Pem;
+    use x509_parser::prelude::*;
+    let mut reader = std::io::Cursor::new(cert_pem);
+    let pem = Pem::read(&mut reader)
+        .map_err(|e| format!("PEM parse: {e}"))?
+        .0;
+    let (_, cert) =
+        parse_x509_certificate(&pem.contents).map_err(|e| format!("X509 parse: {e}"))?;
+    let not_after_unix = cert.validity().not_after.timestamp();
+    if not_after_unix < 0 {
+        return Ok(None);
+    }
+    // `timestamp()` is a Unix epoch i64; convert to SystemTime via Duration.
+    let secs = u64::try_from(not_after_unix).map_err(|e| format!("notAfter overflow: {e}"))?;
+    Ok(Some(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+    ))
 }

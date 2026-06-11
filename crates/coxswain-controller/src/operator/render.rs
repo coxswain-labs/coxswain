@@ -467,6 +467,21 @@ fn container_ports(gateway: &Gateway) -> Vec<ContainerPort> {
             ..Default::default()
         });
     }
+    // Expose health (8081) and admin (8082) as named container ports so the
+    // PodMonitor template's `port: admin` resolves uniformly across the
+    // shared-proxy and operator-rendered dedicated proxies. The ports aren't
+    // mapped onto the Service (which would put admin on the LoadBalancer IP);
+    // the chart's PodMonitor scrapes the pod IP directly.
+    for (name, port) in [("health", 8081), ("admin", 8082)] {
+        if seen.insert(port) {
+            out.push(ContainerPort {
+                name: Some(name.to_string()),
+                container_port: port,
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            });
+        }
+    }
     out
 }
 

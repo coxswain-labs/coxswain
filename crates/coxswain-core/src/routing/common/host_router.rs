@@ -10,11 +10,13 @@ use std::cmp::Reverse;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// Return type of `HostRouter::route`: backend group + filters + timeouts + path pattern + optional error status.
+/// Return type of `HostRouter::route`: backend group + filters + timeouts +
+/// path pattern + metric route id + optional error status.
 pub(super) type RouteMatch = (
     Arc<BackendGroup>,
     Arc<[FilterAction]>,
     RouteTimeouts,
+    Arc<str>,
     Arc<str>,
     Option<u16>,
 );
@@ -47,6 +49,7 @@ impl HostRouter {
                         Arc::clone(&entry.filters),
                         entry.timeouts.clone(),
                         Arc::clone(&entry.path_pattern),
+                        Arc::clone(&entry.metric_route_id),
                         entry.error_status,
                     ));
                 }
@@ -63,6 +66,7 @@ impl HostRouter {
                             Arc::clone(&entry.filters),
                             entry.timeouts.clone(),
                             Arc::clone(&entry.path_pattern),
+                            Arc::clone(&entry.metric_route_id),
                             entry.error_status,
                         ));
                     }

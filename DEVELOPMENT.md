@@ -303,7 +303,7 @@ All four suites require a live cluster. Reset your cluster (delete and recreate 
 
 The harness wraps the locally compiled binary in a minimal `Dockerfile.e2e` image (~5 s build), loads it into the cluster, installs the Helm chart, and runs tests against the deployed pods. First-time setup is fast because there is no BoringSSL compilation — the full `Dockerfile` is only used for production releases.
 
-### ingress / gateway_api / dedicated_proxy / proxy_hot_reconfig
+### ingress / gateway_api / dedicated_proxy / proxy_hot_reconfig / observability
 
 ```bash
 cargo build --release --bin coxswain   # compile once; re-run only when source changes
@@ -311,7 +311,10 @@ cargo test -p coxswain-e2e --test ingress           -- --test-threads=1
 cargo test -p coxswain-e2e --test gateway_api        -- --test-threads=1
 cargo test -p coxswain-e2e --test dedicated_proxy    -- --test-threads=1
 cargo test -p coxswain-e2e --test proxy_hot_reconfig -- --test-threads=1
+cargo test -p coxswain-e2e --test observability      -- --test-threads=1
 ```
+
+The `observability` suite covers readiness/status (formerly `health.rs`), the Prometheus surface from #20, and the access-log contract from #21.
 
 The bootstrap detects a missing `target/debug/coxswain` and fails fast with a clear message if you forget the build step.
 

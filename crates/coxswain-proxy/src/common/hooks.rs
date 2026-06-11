@@ -97,7 +97,7 @@ pub(crate) async fn request_filter<K>(
         engine.find(port, &host, &path, &route_ctx)
     }; // route_ctx (and req borrow) drops here
 
-    let Some((backend_group, filters, route_timeouts, path_pattern)) =
+    let Some((backend_group, filters, route_timeouts, path_pattern, metric_route_id)) =
         resolve_outcome(session, &host, &path, outcome).await?
     else {
         return Ok(true);
@@ -127,6 +127,7 @@ pub(crate) async fn request_filter<K>(
         original_host: host,
         original_path: path,
         path_pattern,
+        metric_route_id,
     });
     Ok(false)
 }
@@ -292,6 +293,9 @@ pub(crate) async fn upstream_response_filter(
     if let Some(resolved) = &ctx.resolved {
         TrafficFilter::apply_response_filters(upstream_response, &resolved.filters);
     }
+    if upstream_response.status.as_u16() >= 500 {
+        inc_upstream_error(ctx, "5xx");
+    }
     Ok(())
 }
 
@@ -326,6 +330,8 @@ pub(crate) async fn fail_to_proxy(
             _ => 500,
         },
     };
+    let error_type = classify_upstream_error(e);
+    inc_upstream_error(ctx, error_type);
     if code > 0 {
         let reason = http::StatusCode::from_u16(code)
             .ok()
@@ -342,11 +348,42 @@ pub(crate) async fn fail_to_proxy(
     }
 }
 
-/// Pingora `logging` body: emit one structured access-log event per request.
+/// Bucket a Pingora `Error` into the `error_type` taxonomy carried on
+/// `coxswain_proxy_upstream_errors_total`.
+fn classify_upstream_error(e: &pingora_core::Error) -> &'static str {
+    match e.etype() {
+        ConnectTimedout | ReadTimedout | WriteTimedout => "timeout",
+        _ => match e.esource() {
+            ErrorSource::Upstream => "connect",
+            _ => "other",
+        },
+    }
+}
+
+/// Increment `coxswain_proxy_upstream_errors_total{listener, route, upstream,
+/// error_type}` from a per-request `ProxyCtx`. Best-effort: when the request
+/// reached `fail_to_proxy` before routing resolved, `route`/`upstream` carry
+/// the literal `"none"` fallback so the increment isn't dropped.
+fn inc_upstream_error(ctx: &ProxyCtx, error_type: &'static str) {
+    let listener = ctx
+        .local_port
+        .map_or_else(|| "0".to_string(), |p| p.to_string());
+    let (route, upstream) = ctx.resolved.as_ref().map_or(("none", "none"), |r| {
+        (r.metric_route_id.as_ref(), r.backend_group.name())
+    });
+    crate::metrics::upstream_errors_total()
+        .with_label_values(&[&listener, route, upstream, error_type])
+        .inc();
+}
+
+/// Pingora `logging` body: emit one structured access-log event per request
+/// *and* increment the per-request Prometheus counters.
 ///
-/// Emits at `INFO` level on the `coxswain_proxy::access` target so operators
-/// can filter it independently with `--log=info,coxswain_proxy::access=off`.
-/// When `access_log_enabled` is `false` this is a no-op (zero cost).
+/// Access-log emission is at `INFO` level on the `coxswain_proxy::access`
+/// target so operators can filter it independently with
+/// `--log=info,coxswain_proxy::access=off`. When `access_log_enabled` is
+/// `false` the access-log emission is skipped but the metric emission still
+/// runs — operators silencing logs must not lose request-rate signal.
 pub(crate) async fn logging(
     access_log_enabled: bool,
     access_log_path_mode: AccessLogPathMode,
@@ -354,18 +391,12 @@ pub(crate) async fn logging(
     e: Option<&pingora_core::Error>,
     ctx: &ProxyCtx,
 ) {
-    if !access_log_enabled {
-        return;
-    }
-
     let req = session.req_header();
     let method = req.method.as_str();
     let status = session.response_written().map(|h| h.status.as_u16());
     let bytes_sent = session.body_bytes_sent() as u64;
-    let duration_ms = ctx
-        .start
-        .map(|s| s.elapsed().as_millis() as u64)
-        .unwrap_or(0);
+    let duration = ctx.start.map(|s| s.elapsed()).unwrap_or_default();
+    let duration_ms = duration.as_millis() as u64;
 
     // Prefer the pre-resolved host from context; fall back to parsing the header.
     let mut host_buf = String::new();
@@ -377,6 +408,24 @@ pub(crate) async fn logging(
 
     let upstream = ctx.resolved.as_ref().map(|r| r.backend_group.name());
     let upstream_addr_str = ctx.upstream_addr.map(|a| a.to_string());
+    let route_id = ctx.resolved.as_ref().map(|r| r.metric_route_id.as_ref());
+
+    // --- Metric emission (always, independent of access-log toggle) ---
+    let listener_label = ctx
+        .local_port
+        .map_or_else(|| "0".to_string(), |p| p.to_string());
+    let route_label = route_id.unwrap_or("none");
+    let status_label = status.map_or_else(|| "0".to_string(), |s| s.to_string());
+    crate::metrics::requests_total()
+        .with_label_values(&[&listener_label, route_label, method, &status_label])
+        .inc();
+    crate::metrics::request_duration_seconds()
+        .with_label_values(&[&listener_label, route_label])
+        .observe(duration.as_secs_f64());
+
+    if !access_log_enabled {
+        return;
+    }
 
     // path_str is Option<&str>: tracing's Value impl for Option silently omits
     // the field when None, giving us free conditional emission for `None` mode.
@@ -404,6 +453,7 @@ pub(crate) async fn logging(
         method = method,
         path = path_str,
         status = status,
+        route_id = route_id,
         upstream = upstream,
         upstream_addr = upstream_addr_str.as_deref(),
         duration_ms = duration_ms,

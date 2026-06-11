@@ -35,6 +35,7 @@ pub mod gw_types;
 pub mod ingress;
 pub mod k8s_utils;
 pub mod keys;
+pub mod metrics;
 pub mod reconciler;
 pub mod tls;
 
@@ -44,6 +45,7 @@ mod tests;
 pub use cluster::{ClusterSummaryInputs, build_cluster_summary};
 pub use crds::gateway_api_crds_present;
 pub use ingress::IngressPorts;
+pub use metrics::{MetricsPrefix, ReflectorMetrics};
 pub use reconciler::{
     ControllerReconciler, DedicatedConfig, DedicatedOutputs, DedicatedProxyReconciler,
     IngressDefaultBackend, IngressDefaultBackendParseError, ReconcilerHealth, ReconcilerOptions,

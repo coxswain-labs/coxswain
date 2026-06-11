@@ -190,6 +190,12 @@ pub(crate) struct HelmOverrides {
     /// Passed as `proxy.shared.trustedSources` (comma-joined CIDR list).
     /// Only meaningful when `accept_proxy_protocol` is true.
     pub trusted_sources: Vec<String>,
+    /// Passed as `proxy.shared.accessLog`. `None` leaves the chart default
+    /// (currently `true`).
+    pub access_log: Option<bool>,
+    /// Passed as `proxy.shared.accessLogPathMode`. `None` leaves the chart
+    /// default (currently `"full"`).
+    pub access_log_path_mode: Option<String>,
 }
 
 /// Install or upgrade the coxswain Helm release with e2e-specific overrides.
@@ -260,6 +266,14 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
             "proxy.shared.trustedSources={{{}}}",
             overrides.trusted_sources.join("\\,")
         ));
+    }
+    if let Some(enabled) = overrides.access_log {
+        args.push("--set".into());
+        args.push(format!("proxy.shared.accessLog={enabled}"));
+    }
+    if let Some(mode) = &overrides.access_log_path_mode {
+        args.push("--set".into());
+        args.push(format!("proxy.shared.accessLogPathMode={mode}"));
     }
 
     let status = Command::new("helm")

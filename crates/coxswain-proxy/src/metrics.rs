@@ -11,6 +11,17 @@ use prometheus::{
 };
 use std::sync::OnceLock;
 
+/// Histogram buckets for HTTP request latency in seconds, sized for typical
+/// proxy paths (sub-millisecond local hops through multi-second slow upstreams).
+const REQUEST_DURATION_BUCKETS: &[f64] = &[
+    0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// Histogram buckets for TCP connection lifetime in seconds. Short-lived HTTP/1
+/// requests sit near 0.05–0.5; long-lived keep-alive or HTTP/2 streams stretch
+/// into the minutes.
+const CONNECTION_DURATION_BUCKETS: &[f64] = &[0.05, 0.5, 5.0, 30.0, 60.0, 300.0];
+
 /// Gauge: number of listeners currently in `"serving"` or `"draining"` state.
 ///
 /// Labels: `state ∈ {"serving", "draining"}`.
@@ -83,6 +94,137 @@ pub(crate) fn requests_force_closed() -> &'static IntCounterVec {
                 "Connections aborted because the per-listener drain timeout was exhausted",
             ),
             &["reason"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: HTTP requests proxied, keyed by listener, matched route, method,
+/// and final response status code.
+///
+/// The `route` label is the canonical rule id
+/// (`httproute/<ns>/<name>:<rule_index>` or `ingress/<ns>/<name>:<r>.<p>`) —
+/// the same string emitted in the access log so an operator pivoting from
+/// Grafana to logs has an exact join key.
+pub(crate) fn requests_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_proxy_requests_total",
+                "HTTP requests proxied, by listener, route, method, and status",
+            ),
+            &["listener", "route", "method", "status_code"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Histogram: request latency in seconds, from `request_filter` entry to
+/// `logging` invocation.
+///
+/// Carries only `listener` and `route` — `status_code` and `method` deliberately
+/// omitted to keep the histogram cardinality bounded. Operators correlate
+/// latency to status via the counter above.
+pub(crate) fn request_duration_seconds() -> &'static HistogramVec {
+    static HIST: OnceLock<HistogramVec> = OnceLock::new();
+    HIST.get_or_init(|| {
+        register_histogram_vec!(
+            HistogramOpts::new(
+                "coxswain_proxy_request_duration_seconds",
+                "End-to-end request latency in seconds, by listener and route",
+            )
+            .buckets(REQUEST_DURATION_BUCKETS.to_vec()),
+            &["listener", "route"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: upstream-side request failures, classified by error type.
+///
+/// Labels: `error_type ∈ {"connect", "timeout", "refused", "tls", "5xx", "other"}`.
+/// Incremented in `fail_to_proxy` (connect/timeout/refused/tls) and
+/// `upstream_response_filter` (5xx). The `"other"` bucket catches Pingora
+/// error types not mapped explicitly so unexpected classes don't silently
+/// misattribute.
+pub(crate) fn upstream_errors_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_proxy_upstream_errors_total",
+                "Upstream errors observed by the proxy, classified by error type",
+            ),
+            &["listener", "route", "upstream", "error_type"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+// `active_upstreams`, `tls_certs_loaded`, and `tls_cert_expiry_seconds` are
+// registered by `coxswain_reflector::metrics` — the proxy crate doesn't
+// duplicate them here because both modules would try to register the same
+// global name and the second registration would panic. The proxy reads its
+// values via the reflector's `ReflectorMetrics` handle.
+
+/// Counter: TLS handshakes completed by the proxy, by negotiated version and
+/// success/failure result.
+pub(crate) fn tls_handshakes_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_proxy_tls_handshakes_total",
+                "TLS handshakes completed by the proxy, by result and version",
+            ),
+            &["result", "version"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Gauge: open downstream connections to the proxy, by listener.
+pub(crate) fn connections_active() -> &'static IntGaugeVec {
+    static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        register_int_gauge_vec!(
+            Opts::new(
+                "coxswain_proxy_connections_active",
+                "Open downstream connections to the proxy, by listener",
+            ),
+            &["listener"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: cumulative downstream connections accepted by the proxy.
+pub(crate) fn connections_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_proxy_connections_total",
+                "Cumulative downstream connections accepted, by listener",
+            ),
+            &["listener"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Histogram: downstream connection lifetime in seconds, observed on close.
+pub(crate) fn connection_duration_seconds() -> &'static HistogramVec {
+    static HIST: OnceLock<HistogramVec> = OnceLock::new();
+    HIST.get_or_init(|| {
+        register_histogram_vec!(
+            HistogramOpts::new(
+                "coxswain_proxy_connection_duration_seconds",
+                "Downstream connection lifetime in seconds, by listener",
+            )
+            .buckets(CONNECTION_DURATION_BUCKETS.to_vec()),
+            &["listener"]
         )
         .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
     })

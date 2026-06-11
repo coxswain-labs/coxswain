@@ -149,7 +149,8 @@ fn upstream_tls_size_unchanged() {
     // BackendGroup now has one extra Option<Arc<UpstreamTls>> = 8 bytes;
     // but RouteEntry holds Arc<BackendGroup>, so RouteEntry size is unaffected.
     // Bumped 176→192: path_pattern: Arc<str> added for access-log pattern mode.
-    static_assertions::assert_eq_size!(RouteEntry, [u8; 192]);
+    // Bumped 192→208: metric_route_id: Arc<str> added for Prometheus `route` label.
+    static_assertions::assert_eq_size!(RouteEntry, [u8; 208]);
 }
 
 #[test]

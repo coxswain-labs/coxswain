@@ -12,10 +12,12 @@ pub(super) async fn patch_gateway_class_status(client: &Client, name: &str, gene
     let api: Api<GatewayClass> = Api::all(client.clone());
     let now = Time(k8s_openapi::jiff::Timestamp::now());
     let patch = build_gateway_class_status_patch(generation, &now);
-    match api
+    let started = std::time::Instant::now();
+    let result = api
         .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-        .await
-    {
+        .await;
+    crate::metrics::observe_status_patch("gateway_class", started, &result);
+    match result {
         Ok(_) => tracing::info!(name, "GatewayClass status patched"),
         Err(e) => tracing::warn!(name, error = %e, "Failed to patch GatewayClass status"),
     }

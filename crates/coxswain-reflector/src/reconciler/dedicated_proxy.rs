@@ -297,6 +297,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
     let controller_health = &rec.health.controller;
+    let metrics = crate::ReflectorMetrics::new(crate::MetricsPrefix::Proxy);
 
     // Cluster-wide watches: identical RBAC profile to the shared-proxy SA.
     // See the module header for the rationale.
@@ -305,7 +306,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
         route_writer,
         Api::<HttpRoute>::all(client.clone()),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, controller_health, "httproute"),
+        ReflectorEffects::new(&notify, controller_health, "httproute", metrics),
         "HttpRoute",
     );
     spawn_reflector(
@@ -313,7 +314,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
         gateway_writer,
         Api::<Gateway>::all(client.clone()),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, controller_health, "gateway"),
+        ReflectorEffects::new(&notify, controller_health, "gateway", metrics),
         "Gateway",
     );
     spawn_reflector(
@@ -321,7 +322,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
         gateway_class_writer,
         Api::<GatewayClass>::all(client.clone()),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, controller_health, "gateway_class"),
+        ReflectorEffects::new(&notify, controller_health, "gateway_class", metrics),
         "GatewayClass",
     );
     spawn_reflector(
@@ -329,7 +330,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
         slice_writer,
         scoped_api::<EndpointSlice>(client.clone(), None),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, controller_health, "endpoint_slice"),
+        ReflectorEffects::new(&notify, controller_health, "endpoint_slice", metrics),
         "EndpointSlice",
     );
     spawn_reflector(
@@ -337,7 +338,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
         grant_writer,
         scoped_api::<ReferenceGrant>(client.clone(), None),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, controller_health, "reference_grant"),
+        ReflectorEffects::new(&notify, controller_health, "reference_grant", metrics),
         "ReferenceGrant",
     );
     spawn_reflector(
@@ -345,7 +346,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
         secret_writer,
         scoped_api::<Secret>(client.clone(), None),
         watcher::Config::default().fields("type=kubernetes.io/tls"),
-        ReflectorEffects::new(&notify, controller_health, "secret"),
+        ReflectorEffects::new(&notify, controller_health, "secret", metrics),
         "Secret",
     );
     spawn_reflector(
@@ -353,7 +354,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
         service_writer,
         scoped_api::<Service>(client.clone(), None),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, controller_health, "service"),
+        ReflectorEffects::new(&notify, controller_health, "service", metrics),
         "Service",
     );
     spawn_reflector(
@@ -361,7 +362,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
         policy_writer,
         scoped_api::<BackendTlsPolicy>(client.clone(), None),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, controller_health, "backend_tls_policy"),
+        ReflectorEffects::new(&notify, controller_health, "backend_tls_policy", metrics),
         "BackendTlsPolicy",
     );
     spawn_reflector(
@@ -369,7 +370,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
         configmap_writer,
         scoped_api::<ConfigMap>(client, None),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, controller_health, "config_map"),
+        ReflectorEffects::new(&notify, controller_health, "config_map", metrics),
         "ConfigMap",
     );
     // The dedicated reconciler skips Ingress / IngressClass — but those
@@ -415,6 +416,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
                 policies: &policy_reader,
                 configmaps: &configmap_reader,
             };
+            let rebuild_start = std::time::Instant::now();
             let published = rebuild_dedicated(
                 &stores,
                 &controller_name,
@@ -429,6 +431,16 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
                 &route_health,
                 &policy_health,
             );
+            metrics.observe_rebuild(
+                rebuild_start.elapsed(),
+                if published { "ok" } else { "error" },
+            );
+            let snapshot = gateway_routes.load();
+            metrics.set_routing_table(snapshot.host_count(), 0, snapshot.host_count());
+            let tls_snapshot = tls.load();
+            let (exact, wildcard, default) = tls_snapshot.cert_counts();
+            let expiries = tls_snapshot.expiries();
+            metrics.set_tls(exact, wildcard, default, &expiries);
             if published && !routing_table_published {
                 controller_health_for_loop.ready("routing_table_built");
                 proxy_health_for_loop.ready("routing_table_loaded");
@@ -641,6 +653,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
     let controller_health = &rec.health.controller;
+    let metrics = crate::ReflectorMetrics::new(crate::MetricsPrefix::Proxy);
 
     for ns in &namespaces {
         // Gateway: only watched in the target Gateway's own namespace. Other
@@ -654,7 +667,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
                 gateway_writer,
                 scoped_api::<Gateway>(client.clone(), Some(ns)),
                 watcher::Config::default(),
-                ReflectorEffects::new(&notify, controller_health, "gateway"),
+                ReflectorEffects::new(&notify, controller_health, "gateway", metrics),
                 "Gateway",
             );
             gateway_readers.push(gateway_reader);
@@ -668,7 +681,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
                 route_writer,
                 scoped_api::<HttpRoute>(client.clone(), Some(ns)),
                 watcher::Config::default(),
-                ReflectorEffects::new(&notify, controller_health, "httproute"),
+                ReflectorEffects::new(&notify, controller_health, "httproute", metrics),
                 "HttpRoute",
             );
             route_readers.push(route_reader);
@@ -684,7 +697,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
             slice_writer,
             scoped_api::<EndpointSlice>(client.clone(), Some(ns)),
             watcher::Config::default(),
-            ReflectorEffects::new(&notify, controller_health, "endpoint_slice"),
+            ReflectorEffects::new(&notify, controller_health, "endpoint_slice", metrics),
             "EndpointSlice",
         );
         slice_readers.push(slice_reader);
@@ -695,7 +708,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
             grant_writer,
             scoped_api::<ReferenceGrant>(client.clone(), Some(ns)),
             watcher::Config::default(),
-            ReflectorEffects::new(&notify, controller_health, "reference_grant"),
+            ReflectorEffects::new(&notify, controller_health, "reference_grant", metrics),
             "ReferenceGrant",
         );
         grant_readers.push(grant_reader);
@@ -706,7 +719,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
             secret_writer,
             scoped_api::<Secret>(client.clone(), Some(ns)),
             watcher::Config::default().fields("type=kubernetes.io/tls"),
-            ReflectorEffects::new(&notify, controller_health, "secret"),
+            ReflectorEffects::new(&notify, controller_health, "secret", metrics),
             "Secret",
         );
         secret_readers.push(secret_reader);
@@ -717,7 +730,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
             service_writer,
             scoped_api::<Service>(client.clone(), Some(ns)),
             watcher::Config::default(),
-            ReflectorEffects::new(&notify, controller_health, "service"),
+            ReflectorEffects::new(&notify, controller_health, "service", metrics),
             "Service",
         );
         service_readers.push(service_reader);
@@ -728,7 +741,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
             policy_writer,
             scoped_api::<BackendTlsPolicy>(client.clone(), Some(ns)),
             watcher::Config::default(),
-            ReflectorEffects::new(&notify, controller_health, "backend_tls_policy"),
+            ReflectorEffects::new(&notify, controller_health, "backend_tls_policy", metrics),
             "BackendTlsPolicy",
         );
         policy_readers.push(policy_reader);
@@ -739,7 +752,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
             configmap_writer,
             scoped_api::<ConfigMap>(client.clone(), Some(ns)),
             watcher::Config::default(),
-            ReflectorEffects::new(&notify, controller_health, "config_map"),
+            ReflectorEffects::new(&notify, controller_health, "config_map", metrics),
             "ConfigMap",
         );
         configmap_readers.push(configmap_reader);
@@ -810,6 +823,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
                 policies: &policies_aggr,
                 configmaps: &configmaps_aggr,
             };
+            let rebuild_start = std::time::Instant::now();
             let published = rebuild_dedicated_narrow(
                 &stores,
                 &controller_name,
@@ -824,6 +838,16 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
                 &route_health,
                 &policy_health,
             );
+            metrics.observe_rebuild(
+                rebuild_start.elapsed(),
+                if published { "ok" } else { "error" },
+            );
+            let snapshot = gateway_routes.load();
+            metrics.set_routing_table(snapshot.host_count(), 0, snapshot.host_count());
+            let tls_snapshot = tls.load();
+            let (exact, wildcard, default) = tls_snapshot.cert_counts();
+            let expiries = tls_snapshot.expiries();
+            metrics.set_tls(exact, wildcard, default, &expiries);
             if published && !routing_table_published {
                 controller_health_for_loop.ready("routing_table_built");
                 proxy_health_for_loop.ready("routing_table_loaded");

@@ -115,10 +115,12 @@ pub(super) async fn mark_http_route_programmed(
         .collect();
 
     let patch = serde_json::json!({ "status": { "parents": parents } });
-    match api
+    let started = std::time::Instant::now();
+    let result = api
         .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-        .await
-    {
+        .await;
+    crate::metrics::observe_status_patch("httproute", started, &result);
+    match result {
         Ok(_) => tracing::info!(name, ns, "HttpRoute programmed"),
         Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch HttpRoute status"),
     }

@@ -565,6 +565,8 @@ async fn handle_connection<P>(
     P: ProxyHttp + Send + Sync + 'static,
     <P as ProxyHttp>::CTX: Send + Sync,
 {
+    let listener_label = handler.local_addr.port().to_string();
+    let _conn_guard = ConnectionGuard::new(listener_label);
     if let Some(trusted) = handler.trusted {
         handle_proxy_protocol(
             tcp,
@@ -589,6 +591,57 @@ async fn handle_connection<P>(
         )
         .await;
     }
+}
+
+/// RAII guard: increments `coxswain_proxy_connections_active{listener}` on
+/// construction, decrements it on drop, and observes
+/// `coxswain_proxy_connection_duration_seconds{listener}`. Used by
+/// [`handle_connection`] so the gauges and histogram stay accurate across
+/// every connection-termination path (clean close, drain abort, TLS failure,
+/// panic).
+struct ConnectionGuard {
+    listener: String,
+    start: Instant,
+}
+
+impl ConnectionGuard {
+    fn new(listener: String) -> Self {
+        metrics::connections_total()
+            .with_label_values(&[&listener])
+            .inc();
+        metrics::connections_active()
+            .with_label_values(&[&listener])
+            .inc();
+        Self {
+            listener,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        metrics::connections_active()
+            .with_label_values(&[&self.listener])
+            .dec();
+        metrics::connection_duration_seconds()
+            .with_label_values(&[&self.listener])
+            .observe(self.start.elapsed().as_secs_f64());
+    }
+}
+
+/// Observe one TLS handshake outcome on
+/// `coxswain_proxy_tls_handshakes_total{result, version}`.
+///
+/// The `version` label is currently emitted as `"unknown"` for both
+/// outcomes — the underlying `tls_stream` exposes the negotiated version
+/// only after the request layer extracts the digest; surfacing it here is a
+/// follow-up. Operators still get the `result` dimension (ok vs fail) which
+/// is the higher-value signal during incidents.
+fn observe_tls_handshake(result: &'static str) {
+    metrics::tls_handshakes_total()
+        .with_label_values(&[result, "unknown"])
+        .inc();
 }
 
 /// Standard (non-PROXY-protocol) connection handler.
@@ -625,8 +678,12 @@ async fn handle_standard<P>(
             let mut l4: L4Stream = tcp.into();
             l4.set_socket_digest(SocketDigest::from_raw_fd(raw_fd));
             match handshake_with_callback(&tls_ctx.acceptor, l4, tls_ctx.callbacks.as_ref()).await {
-                Ok(tls_stream) => Box::new(tls_stream),
+                Ok(tls_stream) => {
+                    observe_tls_handshake("ok");
+                    Box::new(tls_stream)
+                }
                 Err(e) => {
+                    observe_tls_handshake("fail");
                     tracing::debug!(error = %e, "TLS handshake failed");
                     return;
                 }
@@ -717,8 +774,12 @@ async fn handle_proxy_protocol<P>(
                 result = handshake_with_callback(&tls_ctx.acceptor, l4, tls_ctx.callbacks.as_ref()) => result,
             };
             match tls_result {
-                Ok(tls_stream) => Box::new(tls_stream),
+                Ok(tls_stream) => {
+                    observe_tls_handshake("ok");
+                    Box::new(tls_stream)
+                }
                 Err(e) => {
+                    observe_tls_handshake("fail");
                     tracing::debug!(peer = %peer_addr, error = %e, "TLS handshake failed");
                     return;
                 }

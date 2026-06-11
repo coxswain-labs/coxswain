@@ -596,6 +596,15 @@ pub struct RouteEntry {
     pub timeouts: RouteTimeouts,
     /// Parent resource identity `"{namespace}/{name}"` — used for precedence tiebreaking.
     pub route_id: String,
+    /// Canonical rule identifier used as the `route` label on Prometheus metrics
+    /// and as the `route_id` field on access-log lines.
+    ///
+    /// Format: `httproute/<ns>/<name>:<rule_index>` for HTTPRoute rules,
+    /// `ingress/<ns>/<name>:<r>.<p>` for Ingress rule/path pairs, and
+    /// `ingress/<ns>/<name>:default` for `spec.defaultBackend`. Shared as an
+    /// `Arc<str>` so propagating it through `ResolvedRoute` and into hooks is a
+    /// refcount bump, not a heap allocation.
+    pub metric_route_id: Arc<str>,
     /// Creation timestamp — older routes win ties after predicate-count comparison.
     /// `None` sorts last.
     pub created_at: Option<SystemTime>,
@@ -622,6 +631,7 @@ impl RouteEntry {
             filters: Arc::from([]),
             timeouts: RouteTimeouts::default(),
             route_id,
+            metric_route_id: Arc::from(""),
             created_at,
             error_status: None,
             path_pattern: Arc::from(""),
@@ -641,6 +651,7 @@ impl RouteEntry {
             filters: Arc::from([]),
             timeouts: RouteTimeouts::default(),
             route_id,
+            metric_route_id: Arc::from(""),
             created_at,
             error_status: None,
             path_pattern: Arc::from(""),
@@ -665,6 +676,7 @@ impl RouteEntry {
             filters: Arc::from(filters.into_boxed_slice()),
             timeouts,
             route_id,
+            metric_route_id: Arc::from(""),
             created_at,
             error_status: None,
             path_pattern: Arc::from(""),
@@ -691,6 +703,7 @@ impl RouteEntry {
             filters: Arc::from(filters.into_boxed_slice()),
             timeouts,
             route_id,
+            metric_route_id: Arc::from(""),
             created_at,
             error_status: None,
             path_pattern: Arc::from(""),
@@ -707,11 +720,25 @@ impl RouteEntry {
         self.path_pattern = pattern;
         self
     }
+
+    /// Set the canonical metric/log identifier for this rule (builder-style).
+    ///
+    /// Call this immediately after construction in every production reconcile
+    /// path so the proxy can emit `coxswain_proxy_requests_total{route="…"}`
+    /// and the access log carries a matching `route_id` field. Test fixtures
+    /// without metric assertions can omit this call — the default empty string
+    /// is harmless but produces unlabelled metric series.
+    #[must_use]
+    pub fn with_metric_route_id(mut self, id: Arc<str>) -> Self {
+        self.metric_route_id = id;
+        self
+    }
 }
 
 // Lock the hot-path RouteEntry and BackendPool sizes to catch accidental growth.
 // Update the constant when a deliberate layout change is made.
 // Bumped 176→192 by adding path_pattern: Arc<str> (16 bytes) for access-log pattern mode.
-static_assertions::assert_eq_size!(RouteEntry, [u8; 192]);
+// Bumped 192→208 by adding metric_route_id: Arc<str> (16 bytes) for Prometheus `route` label and access-log `route_id` join key.
+static_assertions::assert_eq_size!(RouteEntry, [u8; 208]);
 // Hot type — review with the team before bumping this number.
 static_assertions::assert_eq_size!(BackendPool, [u8; 24]);

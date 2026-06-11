@@ -122,7 +122,6 @@ impl std::str::FromStr for IngressDefaultBackend {
 
 /// Optional configuration for a [`SharedProxyReconciler`].
 #[non_exhaustive]
-#[derive(Default)]
 pub struct ReconcilerOptions {
     /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
     pub watch_namespace: Option<String>,
@@ -130,6 +129,20 @@ pub struct ReconcilerOptions {
     pub ingress_default_backend: Option<IngressDefaultBackend>,
     /// Ports on which Ingress routes are served.
     pub ingress_ports: IngressPorts,
+    /// Pod role driving the metric-prefix selection (`coxswain_proxy_*` vs
+    /// `coxswain_controller_*`). Default [`MetricsPrefix::Proxy`].
+    pub metrics_prefix: crate::MetricsPrefix,
+}
+
+impl Default for ReconcilerOptions {
+    fn default() -> Self {
+        Self {
+            watch_namespace: None,
+            ingress_default_backend: None,
+            ingress_ports: IngressPorts::default(),
+            metrics_prefix: crate::MetricsPrefix::Proxy,
+        }
+    }
 }
 
 /// Health-registry handles consumed by the [`SharedProxyReconciler`].
@@ -270,6 +283,7 @@ struct ReconcilerConfig {
     watch_namespace: Option<String>,
     ingress_default_backend: Option<IngressDefaultBackend>,
     ingress_ports: IngressPorts,
+    metrics: crate::ReflectorMetrics,
 }
 
 pub(super) struct ReflectorStores<'a> {
@@ -315,22 +329,31 @@ pub(super) struct Ownership<'a> {
     pub(super) policy_index: &'a BackendTlsIndex,
 }
 
-/// Per-reflector side-effect channels: rebuild notification and readiness flip.
+/// Per-reflector side-effect channels: rebuild notification, readiness flip,
+/// and metric observation.
 ///
 /// Grouped so [`spawn_reflector`] stays under `clippy::too_many_arguments`.
 pub(super) struct ReflectorEffects {
     notify: Arc<Notify>,
     controller_health: SubsystemHandle,
-    /// Health-check name to flip Ready on first `Event::InitDone`.
+    /// Health-check name to flip Ready on first `Event::InitDone`. Also used
+    /// as the `kind` metric label for `watch_events_total` / `watch_errors_total`.
     check: &'static str,
+    metrics: crate::ReflectorMetrics,
 }
 
 impl ReflectorEffects {
-    pub(super) fn new(notify: &Arc<Notify>, health: &SubsystemHandle, check: &'static str) -> Self {
+    pub(super) fn new(
+        notify: &Arc<Notify>,
+        health: &SubsystemHandle,
+        check: &'static str,
+        metrics: crate::ReflectorMetrics,
+    ) -> Self {
         Self {
             notify: Arc::clone(notify),
             controller_health: health.clone(),
             check,
+            metrics,
         }
     }
 }
@@ -356,6 +379,7 @@ pub(super) fn spawn_reflector<T>(
         notify,
         controller_health,
         check,
+        metrics,
     } = effects;
     set.spawn(async move {
         let stream = reflector::reflector(writer, watcher(api, config).default_backoff());
@@ -365,9 +389,24 @@ pub(super) fn spawn_reflector<T>(
                 Ok(watcher::Event::InitDone) => {
                     notify.notify_one();
                     controller_health.ready(check);
+                    metrics.observe_watch_event(check, "init_done");
                 }
-                Ok(_) => notify.notify_one(),
-                Err(e) => tracing::warn!(error = %e, "{label} reflector error"),
+                Ok(watcher::Event::Apply(_)) => {
+                    notify.notify_one();
+                    metrics.observe_watch_event(check, "apply");
+                }
+                Ok(watcher::Event::Delete(_)) => {
+                    notify.notify_one();
+                    metrics.observe_watch_event(check, "delete");
+                }
+                Ok(_) => {
+                    notify.notify_one();
+                    metrics.observe_watch_event(check, "restart");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "{label} reflector error");
+                    metrics.observe_watch_error(check);
+                }
             }
         }
     });
@@ -388,6 +427,7 @@ impl BackgroundService for SharedProxyReconciler {
             watch_namespace: self.opts.watch_namespace.clone(),
             ingress_default_backend: self.opts.ingress_default_backend.clone(),
             ingress_ports: self.opts.ingress_ports,
+            metrics: crate::ReflectorMetrics::new(self.opts.metrics_prefix),
         };
         let handles = SharedHandles {
             ingress_routes: self.ingress_routes.clone(),
@@ -457,6 +497,7 @@ async fn spawn_tasks(
         watch_namespace,
         ingress_default_backend,
         ingress_ports,
+        metrics,
     } = config;
     let (route_reader, route_writer) = reflector::store::<HttpRoute>();
     let (ingress_reader, ingress_writer) = reflector::store::<Ingress>();
@@ -478,7 +519,7 @@ async fn spawn_tasks(
         route_writer,
         scoped_api::<HttpRoute>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "httproute"),
+        ReflectorEffects::new(&notify, &controller_health, "httproute", metrics),
         "HttpRoute",
     );
     spawn_reflector(
@@ -486,7 +527,7 @@ async fn spawn_tasks(
         ingress_writer,
         scoped_api::<Ingress>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "ingress"),
+        ReflectorEffects::new(&notify, &controller_health, "ingress", metrics),
         "Ingress",
     );
     spawn_reflector(
@@ -494,7 +535,7 @@ async fn spawn_tasks(
         class_writer,
         Api::<IngressClass>::all(client.clone()),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "ingress_class"),
+        ReflectorEffects::new(&notify, &controller_health, "ingress_class", metrics),
         "IngressClass",
     );
     spawn_reflector(
@@ -502,7 +543,7 @@ async fn spawn_tasks(
         gateway_writer,
         scoped_api::<Gateway>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "gateway"),
+        ReflectorEffects::new(&notify, &controller_health, "gateway", metrics),
         "Gateway",
     );
     spawn_reflector(
@@ -510,7 +551,7 @@ async fn spawn_tasks(
         gateway_class_writer,
         Api::<GatewayClass>::all(client.clone()),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "gateway_class"),
+        ReflectorEffects::new(&notify, &controller_health, "gateway_class", metrics),
         "GatewayClass",
     );
     spawn_reflector(
@@ -518,7 +559,7 @@ async fn spawn_tasks(
         slice_writer,
         scoped_api::<EndpointSlice>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "endpoint_slice"),
+        ReflectorEffects::new(&notify, &controller_health, "endpoint_slice", metrics),
         "EndpointSlice",
     );
     spawn_reflector(
@@ -526,7 +567,7 @@ async fn spawn_tasks(
         grant_writer,
         scoped_api::<ReferenceGrant>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "reference_grant"),
+        ReflectorEffects::new(&notify, &controller_health, "reference_grant", metrics),
         "ReferenceGrant",
     );
     // Field-selector scoped to `type=kubernetes.io/tls` to avoid pulling every Secret into memory.
@@ -535,7 +576,7 @@ async fn spawn_tasks(
         secret_writer,
         scoped_api::<Secret>(client.clone(), ns),
         watcher::Config::default().fields("type=kubernetes.io/tls"),
-        ReflectorEffects::new(&notify, &controller_health, "secret"),
+        ReflectorEffects::new(&notify, &controller_health, "secret", metrics),
         "Secret",
     );
     // Used to resolve targetPort for backends where servicePort ≠ targetPort.
@@ -544,7 +585,7 @@ async fn spawn_tasks(
         service_writer,
         scoped_api::<Service>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "service"),
+        ReflectorEffects::new(&notify, &controller_health, "service", metrics),
         "Service",
     );
     spawn_reflector(
@@ -552,7 +593,7 @@ async fn spawn_tasks(
         policy_writer,
         scoped_api::<BackendTlsPolicy>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "backend_tls_policy"),
+        ReflectorEffects::new(&notify, &controller_health, "backend_tls_policy", metrics),
         "BackendTlsPolicy",
     );
     // ConfigMaps have no type= field selector equivalent; all CMs in scope are
@@ -563,7 +604,7 @@ async fn spawn_tasks(
         configmap_writer,
         scoped_api::<ConfigMap>(client, ns),
         watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "config_map"),
+        ReflectorEffects::new(&notify, &controller_health, "config_map", metrics),
         "ConfigMap",
     );
 
@@ -605,6 +646,7 @@ async fn spawn_tasks(
                 route_health: &route_health,
                 policy_health: &policy_health,
             };
+            let rebuild_start = std::time::Instant::now();
             let published = rebuild(
                 &stores,
                 &controller_name,
@@ -614,6 +656,23 @@ async fn spawn_tasks(
                 leader.load(Ordering::Acquire),
                 &outputs,
             );
+            metrics.observe_rebuild(
+                rebuild_start.elapsed(),
+                if published { "ok" } else { "error" },
+            );
+            // Mirror the routing-table size gauges from the published snapshots.
+            // Loads via `Shared::load()` are atomic and cheap.
+            let ing_snapshot = outputs.ingress_routes.load();
+            let gw_snapshot = outputs.gateway_routes.load();
+            metrics.set_routing_table(
+                ing_snapshot.host_count() + gw_snapshot.host_count(),
+                ing_snapshot.host_count(),
+                gw_snapshot.host_count(),
+            );
+            let tls_snapshot = outputs.tls.load();
+            let (exact, wildcard, default) = tls_snapshot.cert_counts();
+            let expiries = tls_snapshot.expiries();
+            metrics.set_tls(exact, wildcard, default, &expiries);
             // First successful publish: flip the readiness checks that gate
             // `/readyz` on having an honest routing table. Subsequent rebuilds
             // do not re-touch the checks — `Ready` is idempotent and there is
@@ -997,13 +1056,21 @@ fn build_ingress_routes(
                     .with_protocol(protocol),
             );
             let svc_id = format!("{}/{}", db.namespace, db.name);
+            // Distinct kind prefix so the controller-wide `--ingress-default-backend`
+            // doesn't collide with any specific Ingress's `spec.defaultBackend`
+            // (which uses `ingress/<ns>/<name>:default`).
+            let metric_route_id: Arc<str> = Arc::from(format!(
+                "ingress-default-backend/{}/{}",
+                db.namespace, db.name
+            ));
             for port in [ingress_ports.http, ingress_ports.https]
                 .into_iter()
                 .flatten()
             {
                 let e = Arc::new(
                     RouteEntry::path_only(Arc::clone(&group), svc_id.clone(), None)
-                        .with_path_pattern(Arc::from("/")),
+                        .with_path_pattern(Arc::from("/"))
+                        .with_metric_route_id(Arc::clone(&metric_route_id)),
                 );
                 builder.for_port(port).catchall().add_prefix_route("/", e);
             }

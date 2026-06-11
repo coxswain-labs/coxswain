@@ -1,46 +1,76 @@
 # Observability reference
 
-!!! warning "Planned catalog — not yet implemented"
-    The metrics tables below describe the **planned v0.2 catalog**. They are not emitted by the current build. The `/metrics` endpoint is reachable today but only exposes the default `prometheus` collector. Per-request and routing-table metrics land in [#20](https://github.com/coxswain-labs/coxswain/issues/20); access logging in [#21](https://github.com/coxswain-labs/coxswain/issues/21). Treat this page as a design preview, not a runtime reference.
-
 ## Metrics
 
-Coxswain exposes the Prometheus endpoint at `http://<admin-address>:<admin-port>/metrics` (default port `8082`). The catalog below is the **planned** shape for v0.2 — none of these series are emitted by the current build.
+Coxswain exposes the Prometheus endpoint at `http://<admin-address>:<admin-port>/metrics` (default port `8082`). Series are emitted under one of two prefixes that identify the pod role:
 
-### HTTP proxy metrics
+- `coxswain_proxy_*` — emitted by `serve proxy --shared`, `serve proxy --dedicated`, and the proxy half of `serve dev`.
+- `coxswain_controller_*` — emitted by `serve controller` and the controller half of `serve dev`.
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `coxswain_requests_total` | Counter | `host`, `method`, `status` | Total HTTP requests processed by the proxy |
-| `coxswain_request_duration_seconds` | Histogram | `host`, `method`, `status` | Request latency from proxy receipt to upstream response |
-| `coxswain_upstream_connections_total` | Counter | `host`, `upstream` | Total connections opened to upstream services |
-| `coxswain_upstream_connection_errors_total` | Counter | `host`, `upstream`, `error` | Upstream connection errors (timeout, refused, etc.) |
-| `coxswain_active_connections` | Gauge | — | Current number of active proxy connections |
+The `route` Prometheus label is a **stable rule identifier**, not a request path. Operators reading `coxswain_proxy_requests_total{route="httproute/checkout/api:0"}` see the same label value on the matching access-log line's `route_id` field, so a Grafana → Loki/Tempo pivot is an exact join (no fuzzy host/path matching). Path patterns stay on the access log for human-readable display.
 
-### Routing table metrics
+Route id formats:
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `coxswain_routing_table_hosts` | Gauge | — | Number of hostnames in the active routing table |
-| `coxswain_routing_table_rebuilds_total` | Counter | `reason` | Number of times the routing table was rebuilt |
-| `coxswain_routing_table_rebuild_duration_seconds` | Histogram | — | Time taken to rebuild the routing table |
+- HTTPRoute: `httproute/<namespace>/<name>:<rule_index>` — `rule_index` is the position in `spec.rules[]`.
+- Ingress per-rule: `ingress/<namespace>/<name>:<r>.<p>` — nested `(rules, paths)` index, mirroring the YAML structure.
+- Ingress `spec.defaultBackend`: `ingress/<namespace>/<name>:default`.
+- The controller-wide `--ingress-default-backend` fallback: `ingress-default-backend/<service-namespace>/<service-name>`.
 
-### Controller metrics
+### Proxy-pod metrics (`coxswain_proxy_*`)
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `coxswain_reconcile_total` | Counter | `resource`, `result` | Reconciliation cycles by resource type and outcome |
-| `coxswain_reconcile_duration_seconds` | Histogram | `resource` | Time taken per reconciliation cycle |
-| `coxswain_watch_events_total` | Counter | `resource`, `event_type` | Kubernetes watch events received |
-| `coxswain_leader_transitions_total` | Counter | — | Number of leader election transitions |
-| `coxswain_is_leader` | Gauge | — | `1` if this replica is the current leader, `0` otherwise |
+| Metric | Type | Labels |
+|--------|------|--------|
+| `coxswain_proxy_requests_total` | Counter | `listener`, `route`, `method`, `status_code` |
+| `coxswain_proxy_request_duration_seconds` | Histogram | `listener`, `route` |
+| `coxswain_proxy_upstream_errors_total` | Counter | `listener`, `route`, `upstream`, `error_type` (`connect`/`timeout`/`refused`/`tls`/`5xx`/`other`) |
+| `coxswain_proxy_active_upstreams` | Gauge | `upstream` |
+| `coxswain_proxy_routing_table_hosts` | Gauge | — |
+| `coxswain_proxy_routing_table_routes` | Gauge | `kind` (`ingress`/`gateway`) |
+| `coxswain_proxy_routing_table_rebuilds_total` | Counter | `result` (`ok`/`error`) |
+| `coxswain_proxy_routing_table_rebuild_duration_seconds` | Histogram | — |
+| `coxswain_proxy_tls_certs_loaded` | Gauge | `bucket` (`exact`/`wildcard`/`default`) |
+| `coxswain_proxy_tls_cert_expiry_seconds` | Gauge | `sni` |
+| `coxswain_proxy_tls_handshakes_total` | Counter | `result` (`ok`/`fail`), `version` |
+| `coxswain_proxy_connections_active` | Gauge | `listener` |
+| `coxswain_proxy_connections_total` | Counter | `listener` |
+| `coxswain_proxy_connection_duration_seconds` | Histogram | `listener` |
 
-### TLS metrics
+The existing listener-lifecycle series from [#231](https://github.com/coxswain-labs/coxswain/issues/231) are also exposed: `coxswain_proxy_listeners_active`, `coxswain_proxy_listener_lifecycle_total`, `coxswain_proxy_listener_drain_duration_seconds`, `coxswain_proxy_requests_force_closed_total`.
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `coxswain_tls_secrets_loaded` | Gauge | — | Number of TLS Secrets currently loaded |
-| `coxswain_tls_secret_reloads_total` | Counter | `reason` | TLS Secret reloads (cert rotation, new Secret, etc.) |
+### Controller-pod metrics (`coxswain_controller_*`)
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `coxswain_controller_leader` | Gauge | — (1 when this replica holds the lease) |
+| `coxswain_controller_leader_transitions_total` | Counter | — |
+| `coxswain_controller_reconcile_total` | Counter | `controller`, `result` (`ok`/`error`) |
+| `coxswain_controller_reconcile_duration_seconds` | Histogram | `controller` |
+| `coxswain_controller_reconcile_errors_total` | Counter | `controller` |
+| `coxswain_controller_status_patch_total` | Counter | `kind`, `result` (`ok`/`error`/`conflict`) |
+| `coxswain_controller_status_patch_duration_seconds` | Histogram | `kind` |
+| `coxswain_controller_watch_events_total` | Counter | `kind`, `event` (`init_done`/`apply`/`delete`/`restart`) |
+| `coxswain_controller_watch_errors_total` | Counter | `kind` |
+| `coxswain_controller_routing_table_hosts` | Gauge | — (mirrors the proxy view; drift indicates a stale snapshot) |
+| `coxswain_controller_routing_table_routes` | Gauge | `kind` |
+| `coxswain_controller_routing_table_rebuilds_total` | Counter | `result` |
+| `coxswain_controller_routing_table_rebuild_duration_seconds` | Histogram | — |
+| `coxswain_controller_tls_certs_loaded` | Gauge | `bucket` |
+
+### Dedicated-mode label injection
+
+The proxy never bakes a `gateway_name` / `gateway_namespace` label into its emitted series — doing so would multiply request-counter cardinality across every dedicated Gateway. Instead, the operator-rendered dedicated-proxy pods carry the Gateway identity as **pod labels** (`gateway.networking.k8s.io/gateway-name`, `gateway.networking.k8s.io/gateway-namespace`), and the chart's PodMonitor copies those onto the scraped samples as target labels:
+
+```yaml
+relabelings:
+  - sourceLabels:
+      - __meta_kubernetes_pod_label_gateway_networking_k8s_io_gateway_name
+    targetLabel: gateway_name
+  - sourceLabels:
+      - __meta_kubernetes_pod_label_gateway_networking_k8s_io_gateway_namespace
+    targetLabel: gateway_namespace
+```
+
+Shared-pool pods don't carry those labels; the relabel leaves the target empty, which is the intended behaviour.
 
 ## Health endpoints
 
@@ -110,11 +140,14 @@ Coxswain emits one structured log event per proxied request at `INFO` level on t
 | `method` | string | HTTP method |
 | `path` | string | Request path — see `--access-log-path-mode` below |
 | `status` | integer | Response HTTP status code |
+| `route_id` | string | Canonical rule identifier; same value as the `route` Prometheus label. Empty for requests that bypass routing (e.g. 404 with no matching host) |
 | `upstream` | string | Name of the matched upstream service |
 | `upstream_addr` | string | Selected endpoint `ip:port` |
 | `duration_ms` | integer | Total request duration in milliseconds |
 | `bytes_sent` | integer | Response body bytes sent to the client |
 | `error` | string | Error message if the request failed (omitted on success) |
+
+The `route_id` field is the **join key** for pivoting from a Grafana alert into a log slice. Copy the metric label value verbatim into a Loki / CloudWatch / Splunk filter to land on the exact rule's traffic.
 
 The `timestamp` field is written automatically by the logging subscriber in RFC 3339 format.
 
@@ -170,35 +203,27 @@ Use `RUST_LOG` directive syntax for per-crate control:
 
 ## Prometheus scrape configuration
 
-=== "Prometheus operator (ServiceMonitor)"
+=== "Prometheus operator (PodMonitor)"
 
-    Coxswain installs two Services that share the `app.kubernetes.io/name: coxswain` label: the proxy Service (`http`, `https` ports) and the internal Service (`health`, `admin` ports). The ServiceMonitor below selects both, but `port: admin` only matches the internal Service, so the proxy Service produces no scrape targets and is silently ignored.
+    The chart ships a `PodMonitor` template gated on `.Values.podMonitor.enabled`. Enable it with `--set podMonitor.enabled=true` (or `podMonitor.enabled: true` in your values file). One selector matches both the shared-proxy pool and the operator-rendered dedicated proxies; the relabel block injects `gateway_name` / `gateway_namespace` on dedicated metrics only (see [Dedicated-mode label injection](#dedicated-mode-label-injection) above).
 
-    ```yaml
-    apiVersion: monitoring.coreos.com/v1
-    kind: ServiceMonitor
-    metadata:
-      name: coxswain
-      namespace: coxswain-system
-    spec:
-      selector:
-        matchLabels:
-          app.kubernetes.io/name: coxswain
-      endpoints:
-        - port: admin
-          path: /metrics
-          interval: 15s
-    ```
+    Why `PodMonitor` and not `ServiceMonitor`? Dedicated-proxy Services don't expose port `8082` — adding it would leak `/metrics` onto the LoadBalancer IP. PodMonitor scrapes the pod directly (port `admin`, `:8082`) and skips that issue entirely. Shared-pool pods are also discovered the same way, so one resource covers every coxswain proxy in the cluster.
+
+    Hardened installs that pin `podMonitorSelector` on the `Prometheus` resource must update it to include the chart's labels (`app.kubernetes.io/name: coxswain`) — by default kube-prometheus-stack matches both `ServiceMonitor` and `PodMonitor` broadly.
 
 === "Prometheus scrape_configs"
 
-    Replace `<release>` with the Helm release name (or use `coxswain-shared-proxy-internal` for raw-manifest installs):
+    Replace `<release>` with the Helm release name (or use the literal `coxswain-shared-proxy-internal` for raw-manifest installs). Dedicated-proxy metrics aren't reachable through this Service surface — use the PodMonitor path for full coverage.
 
     ```yaml
     scrape_configs:
-      - job_name: coxswain
+      - job_name: coxswain-shared
         static_configs:
           - targets: ['<release>-internal.coxswain-system.svc:8082']
+        metrics_path: /metrics
+      - job_name: coxswain-controller
+        static_configs:
+          - targets: ['<release>-controller.coxswain-system.svc:8082']
         metrics_path: /metrics
     ```
 

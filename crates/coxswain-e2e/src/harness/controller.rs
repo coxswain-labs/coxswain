@@ -39,6 +39,11 @@ pub struct ControllerOptions {
     /// Sets `proxy.shared.trustedSources` (CIDR list).
     /// Only meaningful when `accept_proxy_protocol` is true.
     pub trusted_sources: Vec<String>,
+    /// Sets `proxy.shared.accessLog`. `None` leaves the chart default.
+    pub access_log: Option<bool>,
+    /// Sets `proxy.shared.accessLogPathMode` (`"full"` / `"pattern"` / `"none"`).
+    /// `None` leaves the chart default.
+    pub access_log_path_mode: Option<String>,
 }
 
 /// Handle to the in-cluster coxswain installation for one test.
@@ -85,22 +90,24 @@ impl ControllerProcess {
     /// Returns an error if the Helm upgrade, LB-IP lookup, or port-forward
     /// setup fails.
     pub async fn start_with_options(opts: ControllerOptions) -> anyhow::Result<Self> {
-        // Apply Helm overrides when the caller needs non-default config.
+        // Always reconcile the Helm release with the requested overrides so the
+        // chart never carries leftover state from a previous test in the same
+        // binary (e.g. test N flipping `accessLog=false` would leak into test
+        // N+1 if N+1 passed `ControllerOptions::default()` and we skipped the
+        // upgrade). When the values match the live release Helm short-circuits
+        // — the cost is one helm-upgrade decision plus `wait_for_leader_ready`.
         let overrides = HelmOverrides {
             status_address: opts.status_address,
             ingress_default_backend: opts.ingress_default_backend,
             accept_proxy_protocol: opts.accept_proxy_protocol,
             trusted_sources: opts.trusted_sources,
+            access_log: opts.access_log,
+            access_log_path_mode: opts.access_log_path_mode,
         };
-        let has_overrides = overrides.status_address.is_some()
-            || overrides.ingress_default_backend.is_some()
-            || overrides.accept_proxy_protocol;
-        if has_overrides {
-            let root = workspace_root().context("workspace root")?;
-            helm_install(&root, &overrides)
-                .await
-                .context("helm upgrade with overrides")?;
-        }
+        let root = workspace_root().context("workspace root")?;
+        helm_install(&root, &overrides)
+            .await
+            .context("helm upgrade with overrides")?;
 
         let lb_ip = wait_for_lb_ip().await.context("shared-proxy LB IP")?;
 
@@ -121,16 +128,14 @@ impl ControllerProcess {
             controller_admin_port,
         );
 
-        // When a helm upgrade restarted the controller pod, poll its own
-        // readyz (via a temporary port-forward) until it's synced. The proxy's
-        // readyz (polled by Harness::start_with_options) returns immediately
-        // since the proxy wasn't restarted — but the controller may still be
+        // After every helm upgrade, poll the controller's own /readyz via a
+        // temporary port-forward until it's synced. The proxy's /readyz (polled
+        // by Harness::start_with_options) returns immediately since the proxy
+        // wasn't necessarily restarted — but the controller may still be
         // running its initial informer sync and hasn't written any status yet.
-        if has_overrides {
-            wait_for_controller_ready()
-                .await
-                .context("controller readyz")?;
-        }
+        wait_for_controller_ready()
+            .await
+            .context("controller readyz")?;
 
         Ok(Self {
             lb_ip,
@@ -145,6 +150,53 @@ impl ControllerProcess {
             admin_pf,
             controller_admin_pf,
         })
+    }
+}
+
+impl ControllerProcess {
+    /// Read every shared-proxy pod's stdout in the coxswain namespace and
+    /// return only the JSON-formatted access-log lines (i.e. tracing events
+    /// emitted on the `coxswain_proxy::access` target).
+    ///
+    /// Helm-installed pods run with `--log-format=json`. Lines that fail to
+    /// parse as JSON or don't carry `"target":"coxswain_proxy::access"` are
+    /// skipped. The shared-proxy Deployment may have multiple replicas — the
+    /// returned vector is the concatenation across them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if listing the pods or reading their logs fails.
+    pub async fn shared_proxy_access_logs(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        let out = Command::new("kubectl")
+            .args([
+                "logs",
+                "-n",
+                COXSWAIN_NAMESPACE,
+                "-l",
+                "app.kubernetes.io/name=coxswain,app.kubernetes.io/component=shared-proxy",
+                "--tail=-1",
+            ])
+            .output()
+            .await
+            .context("kubectl logs shared-proxy")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "kubectl logs shared-proxy exit {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let stdout = String::from_utf8(out.stdout).context("decode kubectl logs stdout")?;
+        let mut access = Vec::new();
+        for line in stdout.lines() {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if json.get("target").and_then(|v| v.as_str()) == Some("coxswain_proxy::access") {
+                access.push(json);
+            }
+        }
+        Ok(access)
     }
 }
 
@@ -220,10 +272,31 @@ async fn start_port_forward(
         .stderr(std::process::Stdio::null())
         .spawn()
         .with_context(|| format!("kubectl port-forward {svc_name} {local_port}:{remote_port}"))?;
-    // Brief settle to let kubectl establish the tunnel before the caller
-    // starts polling the forwarded port.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    Ok(child)
+    // Actively poll the loopback port until kubectl has actually bound it AND
+    // the underlying pod accepts connections. A fixed sleep races with helm
+    // upgrades that briefly leave no Ready endpoint for the Service. Cap the
+    // wait at 30 s — anything longer is a real bring-up failure.
+    let local_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), local_port);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::net::TcpStream::connect(local_addr),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_some()
+        {
+            return Ok(child);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "port-forward {svc_name} {local_port}:{remote_port} never accepted connections within 30s"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Allocate a free loopback TCP port by binding and immediately releasing it.

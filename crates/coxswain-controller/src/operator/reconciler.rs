@@ -615,6 +615,16 @@ impl BackgroundService for Operator {
 }
 
 async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Action, ReconcileError> {
+    let started = std::time::Instant::now();
+    let res = reconcile_inner(gw, ctx).await;
+    crate::metrics::observe_reconcile("operator", started, &res);
+    res
+}
+
+async fn reconcile_inner(
+    gw: Arc<Gateway>,
+    ctx: Arc<ReconcileContext>,
+) -> Result<Action, ReconcileError> {
     if !ctx.leader.load(Ordering::Acquire) {
         // Non-leader pods don't apply. Re-queue rather than `await_change()`
         // so the operator catches up promptly on leader promotion.

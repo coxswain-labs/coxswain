@@ -10,6 +10,7 @@
 //! invariant is enforced structurally.
 
 mod controller;
+mod metrics;
 mod operator;
 mod status_common;
 mod status_writer;

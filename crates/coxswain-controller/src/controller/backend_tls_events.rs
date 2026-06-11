@@ -52,10 +52,12 @@ pub(super) async fn patch_backend_tls_policy_status(
     let ancestors = build_ancestors(health, controller_name, observed_gen, now);
 
     let patch = serde_json::json!({ "status": { "ancestors": ancestors } });
-    match api
+    let started = std::time::Instant::now();
+    let result = api
         .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-        .await
-    {
+        .await;
+    crate::metrics::observe_status_patch("backend_tls_policy", started, &result);
+    match result {
         Ok(_) => tracing::debug!(name, ns, "BackendTLSPolicy status patched"),
         Err(e) => {
             tracing::warn!(name, ns, error = %e, "Failed to patch BackendTLSPolicy status")

@@ -331,3 +331,15 @@ service:
   # each pod. One Service per pod role; both share the same annotations.
   internal:
     annotations: {}
+
+# -- Prometheus PodMonitor for the Prometheus Operator. Opt-in; requires the
+# `monitoring.coreos.com/v1` CRD to be installed on the cluster when enabled.
+# Covers both the shared-proxy pods and the operator-rendered dedicated
+# proxies — a single PodMonitor selector matches every coxswain proxy pod.
+podMonitor:
+  enabled: false
+  # Scrape interval forwarded to the rendered PodMonitor endpoint.
+  interval: 15s
+  # Extra labels merged onto the PodMonitor metadata (e.g. to attach the
+  # resource to a specific Prometheus instance).
+  labels: {}

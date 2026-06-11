@@ -1,0 +1,37 @@
+{{- if .Values.podMonitor.enabled }}
+# PodMonitor for the Prometheus Operator. Selects every coxswain proxy pod —
+# both the shared-proxy Deployment and the per-Gateway dedicated proxies the
+# operator renders at runtime — and scrapes their admin (:8082) /metrics.
+#
+# Dedicated-mode pods carry the Gateway identity as pod labels; the
+# relabelings stanza copies those onto every metric sample as `gateway_name`
+# and `gateway_namespace` so dashboards can slice per-Gateway without the
+# series themselves growing the label dimensionality. Shared-pool pods don't
+# carry those labels — relabel rules with no source value leave the target
+# label empty, which is the intended behaviour.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "coxswain.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "coxswain.labels" . | nindent 4 }}
+    {{- with .Values.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coxswain
+  podMetricsEndpoints:
+    - port: admin
+      path: /metrics
+      interval: {{ .Values.podMonitor.interval | default "15s" }}
+      relabelings:
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_gateway_networking_k8s_io_gateway_name
+          targetLabel: gateway_name
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_gateway_networking_k8s_io_gateway_namespace
+          targetLabel: gateway_namespace
+{{- end }}
