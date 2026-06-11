@@ -60,10 +60,18 @@ spec:
               value: "8081"
             - name: COXSWAIN_ADMIN_PORT
               value: "8082"
+            - name: COXSWAIN_MANAGEMENT_BIND_ADDRESS
+              value: "0.0.0.0"
+            - name: COXSWAIN_CONTROLLER_NAME
+              value: "coxswain-labs.dev/gateway-controller"
             - name: COXSWAIN_INGRESS_HTTP_PORT
               value: "80"
             - name: COXSWAIN_INGRESS_HTTPS_PORT
               value: "443"
+            - name: COXSWAIN_CONTROLLER_LEASE_TTL
+              value: "15s"
+            - name: COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL
+              value: "5s"
           livenessProbe:
             httpGet:
               path: /healthz
