@@ -1,7 +1,8 @@
 name: Run Gateway API conformance suite
 description: >
-  Spins up a kind cluster, starts coxswain, and runs the full Gateway API
-  conformance suite. Assumes bin/coxswain exists at the workspace root.
+  Spins up a kind cluster, installs coxswain via Helm, and runs the full
+  Gateway API conformance suite. Assumes the `coxswain:e2e` Docker image has
+  already been loaded into the local Docker daemon by the calling job.
   Outputs the workspace-relative path of the generated report YAML.
 
 outputs:
@@ -31,42 +32,94 @@ runs:
       shell: bash
       run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
 
-    - name: Bootstrap cluster (CRDs, RBAC, GatewayClass)
+    - name: Load coxswain image into kind
+      shell: bash
+      run: |
+        # The parent job loaded the image into the Docker daemon; now import it
+        # into the kind cluster's containerd so pods can pull it with
+        # imagePullPolicy: Never.
+        kind load docker-image coxswain:e2e --name coxswain-conformance
+
+    - name: Install cert-manager
+      shell: bash
+      run: |
+        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.18.0/cert-manager.yaml
+        kubectl wait --for=condition=Available --timeout=120s \
+          deployment/cert-manager \
+          deployment/cert-manager-webhook \
+          deployment/cert-manager-cainjector \
+          -n cert-manager
+
+    - name: Install Gateway API CRDs
       shell: bash
       run: |
         kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/${{ steps.gw-version.outputs.version }}/standard-install.yaml
-        kubectl apply -f deploy/manifests/namespace.yaml
-        kubectl apply -f deploy/manifests/controller-rbac.yaml
-        kubectl apply -f deploy/manifests/shared-proxy-rbac.yaml
-        kubectl apply -f deploy/manifests/gateway-class.yaml
-        kubectl wait --for=condition=Established crd/gatewayclasses.gateway.networking.k8s.io --timeout=60s
-        kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io --timeout=60s
+        kubectl wait --for=condition=Established --timeout=60s \
+          crd/gatewayclasses.gateway.networking.k8s.io \
+          crd/httproutes.gateway.networking.k8s.io \
+          crd/referencegrants.gateway.networking.k8s.io
 
-    - name: Start coxswain proxy
+    - name: Pre-apply coxswain CRDs (server-side apply)
       shell: bash
       run: |
-        chmod +x bin/coxswain
-        # Deliberately omit --ingress-http-port / --ingress-https-port: those
-        # flags reserve ports for IngressProxy, but the conformance Gateway
-        # resources declare listeners on 80/443 themselves. Leaving the Ingress
-        # flags off lets GatewayProxy bind 80/443 dynamically from the test
-        # Gateway specs without conflict.
-        sudo KUBECONFIG="$HOME/.kube/config" ./bin/coxswain serve dev \
-          --proxy-bind-address 0.0.0.0 \
-          --health-port 8081 \
-          --admin-port 8082 \
-          --status-address 127.0.0.1 \
-          --log-format console \
-          --pod-name coxswain-conformance \
-          --pod-namespace coxswain-system \
-          --controller-lease-ttl 15s \
-          --controller-lease-renew-interval 5s \
-          &
-        for i in $(seq 1 30); do
-          curl -sf http://localhost:8081/readyz && break || true
-          sleep 2
+        # Pre-apply with SSA before helm install so the CRD field manager is
+        # consistent between fresh and pre-existing clusters (avoids conflicts
+        # with Helm's client-side apply of the crds/ directory).
+        kubectl apply --server-side --force-conflicts -f charts/coxswain/crds/
+
+    - name: Install coxswain via Helm (initial — no status-address yet)
+      shell: bash
+      run: |
+        helm upgrade --install coxswain charts/coxswain \
+          --namespace coxswain-system \
+          --create-namespace \
+          --set image.repository=coxswain \
+          --set image.tag=e2e \
+          --set image.pullPolicy=Never \
+          --set service.gateway.type=LoadBalancer \
+          --set controller.coxswainImage=coxswain:e2e \
+          --skip-crds \
+          --wait \
+          --timeout 120s
+
+    - name: Wait for LoadBalancer IP
+      id: lb-ip
+      shell: bash
+      run: |
+        # cloud-provider-kind assigns IPs from the kind Docker bridge network.
+        # Poll until the Service has a populated ingress IP.
+        for i in $(seq 1 60); do
+          LB_IP=$(kubectl get svc coxswain-shared-proxy -n coxswain-system \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+          if [ -n "$LB_IP" ]; then
+            echo "lb-ip=${LB_IP}" >> "$GITHUB_OUTPUT"
+            echo "LoadBalancer IP: ${LB_IP}"
+            break
+          fi
+          sleep 3
         done
-        curl -sf http://localhost:8081/readyz
+        if [ -z "$LB_IP" ]; then
+          echo "Timed out waiting for LoadBalancer IP"
+          kubectl get svc coxswain-shared-proxy -n coxswain-system
+          exit 1
+        fi
+
+    - name: Configure status-address and upgrade Helm release
+      shell: bash
+      run: |
+        # Re-upgrade with the confirmed LB IP so the controller populates
+        # Gateway.status.addresses — required by the conformance suite.
+        helm upgrade coxswain charts/coxswain \
+          --namespace coxswain-system \
+          --set image.repository=coxswain \
+          --set image.tag=e2e \
+          --set image.pullPolicy=Never \
+          --set service.gateway.type=LoadBalancer \
+          --set controller.coxswainImage=coxswain:e2e \
+          --set controller.statusAddress=${{ steps.lb-ip.outputs.lb-ip }} \
+          --skip-crds \
+          --wait \
+          --timeout 60s
 
     - name: Run Gateway API conformance suite
       id: conformance

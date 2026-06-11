@@ -1,7 +1,8 @@
 name: Set up kind cluster
 description: >
-  Creates a kind cluster with the given name and routes the pod CIDR to the
-  kind node so that test pods are reachable from the runner.
+  Creates a kind cluster with the given name, routes the pod CIDR to the
+  kind node so that test pods are reachable from the runner, and starts
+  cloud-provider-kind so LoadBalancer Services receive real IPs.
 
 inputs:
   cluster-name:
@@ -26,3 +27,21 @@ runs:
         POD_CIDR=${POD_CIDR:-10.244.0.0/16}
         echo "Routing $POD_CIDR via $KIND_NODE_IP"
         sudo ip route add "$POD_CIDR" via "$KIND_NODE_IP"
+
+    - name: Install and start cloud-provider-kind
+      shell: bash
+      run: |
+        # cloud-provider-kind must run as a host process — it watches the Docker
+        # socket and assigns IPs from the kind Docker bridge network to
+        # LoadBalancer Services. An in-cluster DaemonSet does not work because
+        # kind nodes are Docker containers that lack their own Docker socket.
+        #
+        # ubuntu-latest runners have Go pre-installed; we use it to install
+        # the binary rather than guessing release-asset URL conventions.
+        go install sigs.k8s.io/cloud-provider-kind@latest
+        # Run in background under sudo so it can manipulate Docker networks.
+        sudo "$(go env GOPATH)/bin/cloud-provider-kind" \
+          > /tmp/cloud-provider-kind.log 2>&1 &
+        echo "cloud-provider-kind started (PID $!)"
+        # Brief pause to let it register its watch against the cluster.
+        sleep 3

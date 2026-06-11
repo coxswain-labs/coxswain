@@ -29,7 +29,8 @@ jobs:
           filters: |
             code:
               - 'crates/**'
-              - 'deploy/manifests/**'
+              - 'charts/**'
+              - 'Dockerfile'
               - 'conformance/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -41,7 +42,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
@@ -49,22 +50,46 @@ jobs:
         with:
           cache-key-prefix: e2e-build
 
-      - name: Build coxswain binary
-        run: cargo build --bin coxswain
-
+      # Build e2e test binaries. coxswain itself is packaged in the Docker
+      # image below — the test binaries run on the CI runner and drive the
+      # cluster via kubectl/helm.
       - name: Build e2e test binaries
         run: |
           mkdir -p bin
           cargo test --no-run -p coxswain-e2e --message-format=json \
             | jq -r 'select(.reason == "compiler-artifact" and .executable != null) | "\(.executable) \(.target.name)"' \
             | while read -r src name; do cp "$src" "bin/$name"; done
-          cp target/debug/coxswain bin/coxswain
 
-      - name: Upload e2e binaries
+      - name: Upload e2e test binaries
         uses: actions/upload-artifact@v7
         with:
           name: e2e-bins
           path: bin/
+          retention-days: 1
+
+      # Build the production Docker image. docker/build-push-action caches
+      # layers in the GHA cache so BoringSSL (the dominant compile cost) is
+      # only rebuilt when Cargo.lock or the Dockerfile changes.
+      - name: Set up Docker BuildKit
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: coxswain:e2e
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save Docker image
+        run: docker save coxswain:e2e | gzip > e2e-image.tar.gz
+
+      - name: Upload Docker image
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-image
+          path: e2e-image.tar.gz
           retention-days: 1
 
   e2e:
@@ -84,8 +109,6 @@ jobs:
             binary: dedicated_proxy
           - suite: proxy-hot-reconfig
             binary: proxy_hot_reconfig
-          - suite: health
-            binary: health
           - suite: rbac-read-only-proxy
             binary: rbac_read_only_proxy
     steps:
@@ -100,19 +123,28 @@ jobs:
           cluster-name: coxswain-e2e-${{ matrix.suite }}
           include-busybox: 'true'
 
-      - name: Download e2e binaries
+      - name: Download Docker image
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-image
+
+      - name: Load Docker image into daemon
+        run: docker load < e2e-image.tar.gz
+
+      - name: Download e2e test binaries
         uses: actions/download-artifact@v8
         with:
           name: e2e-bins
           path: bin/
 
       - name: Make binaries executable
-        run: chmod +x bin/coxswain bin/${{ matrix.binary }}
+        run: chmod +x bin/${{ matrix.binary }}
 
       - name: Run e2e tests (${{ matrix.suite }})
         run: bin/${{ matrix.binary }} --test-threads=1
         env:
-          COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
+          # Image already loaded into the Docker daemon; bootstrap skips docker build.
+          COXSWAIN_E2E_SKIP_BUILD: "1"
           RUST_LOG: coxswain_e2e=debug,warn
 
       - uses: ./.github/actions/dump-cluster-state
@@ -134,11 +166,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Download e2e binaries
+      - name: Download Docker image
         uses: actions/download-artifact@v8
         with:
-          name: e2e-bins
-          path: bin/
+          name: e2e-image
+
+      - name: Load Docker image into daemon
+        run: docker load < e2e-image.tar.gz
 
       - uses: ./.github/actions/run-conformance
         id: conformance

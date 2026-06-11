@@ -287,10 +287,17 @@ fn image_tag() -> &'static str {
 /// Uses the production `Dockerfile` at the workspace root. Docker layer cache
 /// makes subsequent builds fast (~30 s after the first BoringSSL build).
 ///
+/// Set `COXSWAIN_E2E_SKIP_BUILD=1` to skip the build entirely when the image
+/// has already been loaded into the Docker daemon (e.g. from a CI artifact).
+///
 /// # Errors
 ///
 /// Returns an error if `docker build` exits non-zero.
 async fn build_image(root: &Path) -> anyhow::Result<()> {
+    if std::env::var("COXSWAIN_E2E_SKIP_BUILD").is_ok() {
+        tracing::info!("COXSWAIN_E2E_SKIP_BUILD set; skipping docker build");
+        return Ok(());
+    }
     tracing::info!("building Docker image {E2E_IMAGE}");
     let status = Command::new("docker")
         .args(["build", "-t", E2E_IMAGE, "."])
@@ -318,58 +325,65 @@ async fn kind_load_image(cluster_name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Install [cloud-provider-kind](https://github.com/kubernetes-sigs/cloud-provider-kind)
-/// if not already running, so LoadBalancer Services get real IPs on kind.
+/// Ensure [cloud-provider-kind](https://github.com/kubernetes-sigs/cloud-provider-kind)
+/// is running as a host process so LoadBalancer Services get real IPs on kind.
 ///
-/// cloud-provider-kind is the officially-supported LoadBalancer controller for kind.
-/// It watches the Docker socket and assigns IPs from the kind Docker network.
+/// cloud-provider-kind must run on the Docker host — it watches the Docker socket
+/// and assigns IPs from the kind Docker bridge network. An in-cluster DaemonSet
+/// does NOT work because kind nodes are Docker containers that lack their own
+/// Docker socket.
+///
+/// In CI, the `setup-kind-cluster` composite action pre-starts cloud-provider-kind
+/// before the tests run, so this function only starts it when the binary is on PATH
+/// and no process is already running. If neither condition is met, a warning is
+/// logged and the function returns `Ok(())` — tests that need LoadBalancer IPs
+/// will fail when they poll for the address.
 ///
 /// # Errors
 ///
-/// Returns an error if the install or readiness wait fails.
+/// Returns an error if `spawn` fails after finding the binary.
 async fn install_cloud_provider_kind_if_missing() -> anyhow::Result<()> {
-    // Check if it's already deployed (Deployment exists in kube-system).
-    let out = Command::new("kubectl")
-        .args([
-            "get",
-            "deployment",
-            "cloud-provider-kind",
-            "-n",
-            "kube-system",
-            "--ignore-not-found",
-            "-o",
-            "name",
-        ])
-        .output()
-        .await
-        .context("kubectl get cloud-provider-kind")?;
-    if !out.stdout.is_empty() {
-        return Ok(()); // already installed
-    }
-
-    tracing::info!("installing cloud-provider-kind for LoadBalancer support on kind");
-    kubectl_apply_url(
-        "https://raw.githubusercontent.com/kubernetes-sigs/cloud-provider-kind/main/deploy/cloud-provider-kind.yaml",
-    )
-    .await
-    .context("install cloud-provider-kind")?;
-
-    let status = Command::new("kubectl")
-        .args([
-            "wait",
-            "--for=condition=Available",
-            "--timeout=60s",
-            "deployment/cloud-provider-kind",
-            "-n",
-            "kube-system",
-        ])
+    // Check if already running as a host process.
+    let already_running = Command::new("pgrep")
+        .args(["-x", "cloud-provider-kind"])
         .status()
         .await
-        .context("kubectl wait cloud-provider-kind")?;
-    anyhow::ensure!(
-        status.success(),
-        "cloud-provider-kind deployment not ready within 60s"
-    );
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if already_running {
+        return Ok(());
+    }
+
+    // Try to locate the binary on PATH.
+    let which = Command::new("which")
+        .arg("cloud-provider-kind")
+        .output()
+        .await;
+
+    let binary = match which {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => {
+            tracing::warn!(
+                "cloud-provider-kind not found on PATH; LoadBalancer Services may not \
+                 receive IPs — install with: go install sigs.k8s.io/cloud-provider-kind@latest"
+            );
+            return Ok(());
+        }
+    };
+
+    tracing::info!(%binary, "starting cloud-provider-kind for LoadBalancer support on kind");
+    // Spawn detached — the child outlives the test binary and is reparented to
+    // init when the test process exits. stdout/stderr are suppressed to avoid
+    // polluting the test output.
+    Command::new(&binary)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawn cloud-provider-kind")?;
+
+    // Give it a moment to register with the cluster.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     Ok(())
 }
 
