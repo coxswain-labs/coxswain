@@ -6,6 +6,6 @@ metadata:
   labels:
     {{- include "coxswain.labels" . | nindent 4 }}
 spec:
-  # Must match controller.name (COXSWAIN_CONTROLLER_NAME) in the Deployment.
-  controllerName: {{ .Values.controller.name }}
+  # Must match controllerName (COXSWAIN_CONTROLLER_NAME) in the Deployment.
+  controllerName: {{ .Values.controllerName }}
 {{- end }}

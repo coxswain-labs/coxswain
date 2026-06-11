@@ -375,6 +375,85 @@ pub async fn wait_for_route_status(
     .await
 }
 
+/// Return a `SocketAddr` for the dedicated-proxy Service using its NodePort.
+///
+/// The dedicated-proxy Service is rendered with `type: NodePort` (avoids klipper-lb
+/// host-port conflicts on single-node clusters where the shared-proxy already owns
+/// ports 80/443/8000/8443). Traffic is reachable at `<node-ip>:<node-port>`.
+///
+/// The dedicated-proxy Service name is `<gateway-name>-coxswain` as rendered by
+/// the controller's provisioning operator.
+///
+/// # Errors
+///
+/// Returns an error if the Service has no NodePort within `timeout`, or if the
+/// node address cannot be determined.
+pub async fn wait_for_dedicated_proxy_endpoint(
+    namespace: &str,
+    gateway_name: &str,
+    timeout: Duration,
+) -> anyhow::Result<std::net::SocketAddr> {
+    let svc_name = format!("{gateway_name}-coxswain");
+    let node_ip = get_node_ip().await?;
+    let node_port = poll_until(
+        timeout,
+        POLL,
+        || format!("dedicated-proxy Service {namespace}/{svc_name} to have a NodePort"),
+        || async {
+            let out = tokio::process::Command::new("kubectl")
+                .args([
+                    "get",
+                    "svc",
+                    &svc_name,
+                    "-n",
+                    namespace,
+                    "-o",
+                    "jsonpath={.spec.ports[0].nodePort}",
+                ])
+                .output()
+                .await
+                .ok()?;
+            let port_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if port_str.is_empty() {
+                return None;
+            }
+            port_str.parse::<u16>().ok()
+        },
+    )
+    .await?;
+    Ok(std::net::SocketAddr::new(node_ip, node_port))
+}
+
+/// Return the address of the first Kubernetes node.
+///
+/// On single-node clusters (OrbStack, kind) there is exactly one node and its
+/// `InternalIP` is routable from the test runner host.
+///
+/// # Errors
+///
+/// Returns an error if `kubectl get nodes` fails or the output cannot be parsed
+/// as an IP address.
+async fn get_node_ip() -> anyhow::Result<std::net::IpAddr> {
+    let out = tokio::process::Command::new("kubectl")
+        .args([
+            "get",
+            "nodes",
+            "-o",
+            "jsonpath={.items[0].status.addresses[?(@.type==\"InternalIP\")].address}",
+        ])
+        .output()
+        .await
+        .context("kubectl get nodes")?;
+    let raw = String::from_utf8_lossy(&out.stdout);
+    // Nodes may report multiple InternalIP addresses (IPv4 + IPv6); the
+    // jsonpath returns them space-separated. Prefer the first IPv4 address
+    // so test clients bind to a well-known family.
+    raw.split_whitespace()
+        .find_map(|s| s.parse::<std::net::IpAddr>().ok().filter(|ip| ip.is_ipv4()))
+        .or_else(|| raw.split_whitespace().find_map(|s| s.parse().ok()))
+        .with_context(|| format!("no parseable IP in node address output: {raw}"))
+}
+
 /// Poll until `Ingress.status.loadBalancer.ingress[0].ip` equals `expected_ip`.
 pub async fn wait_for_ingress_lb_ip(
     client: &kube::Client,

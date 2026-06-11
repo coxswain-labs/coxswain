@@ -2,14 +2,14 @@ name: Set up Rust toolchain with cargo cache
 description: >
   Installs the stable Rust toolchain with optional extra components and
   restores the cargo registry/git/target cache. The cache key is scoped to
-  the caller-supplied prefix so that jobs with different build profiles do
-  not evict each other's caches.
+  the caller-supplied prefix and the exact rustc version so that a new Rust
+  stable release does not produce a phantom cache hit with stale artifacts.
 
 inputs:
   cache-key-prefix:
     description: >
       Prefix for the cache key, e.g. "ci-clippy" or "release-conformance".
-      The full key is "<prefix>-<Cargo.lock hash>".
+      The full key is "<prefix>-<rustc-version>-<Cargo.lock hash>".
     required: true
   components:
     description: >
@@ -22,6 +22,7 @@ runs:
   using: composite
   steps:
     - uses: dtolnay/rust-toolchain@stable
+      id: rust
       with:
         components: ${{ inputs.components }}
 
@@ -31,5 +32,7 @@ runs:
           ~/.cargo/registry
           ~/.cargo/git
           target/
-        key: ${{ runner.os }}-cargo-${{ inputs.cache-key-prefix }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-${{ inputs.cache-key-prefix }}-
+        key: ${{ runner.os }}-cargo-${{ inputs.cache-key-prefix }}-${{ steps.rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ inputs.cache-key-prefix }}-${{ steps.rust.outputs.cachekey }}-
+          ${{ runner.os }}-cargo-${{ inputs.cache-key-prefix }}-

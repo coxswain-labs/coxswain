@@ -1690,8 +1690,8 @@ async fn cluster_endpoint() -> anyhow::Result<()> {
     let host = format!("echo.{}.local", ns.name);
     wait::wait_for_route(&h.gateway_http, &host, "/a", Duration::from_secs(60)).await?;
 
-    let cluster_url = h.admin_url("/cluster");
-    let status_url = h.admin_url("/status");
+    let cluster_url = h.controller_admin_url("/cluster");
+    let status_url = h.controller_admin_url("/status");
     let client = reqwest::Client::new();
 
     // Poll /cluster until the Gateway we just applied is visible. The reconciler

@@ -29,7 +29,8 @@ jobs:
           filters: |
             code:
               - 'crates/**'
-              - 'deploy/manifests/**'
+              - 'charts/**'
+              - 'Dockerfile'
               - 'conformance/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -49,27 +50,84 @@ jobs:
         with:
           cache-key-prefix: e2e-build
 
+      # Build coxswain and the e2e test binaries in debug profile so they share
+      # the same dependency graph — one cargo cache, two sets of artifacts.
+      # Debug is fine for tests; we're not measuring proxy throughput here.
       - name: Build coxswain binary
         run: cargo build --bin coxswain
 
+      # cargo test --no-run compiles every #[test] binary in coxswain-e2e/tests/
+      # without running them. --message-format=json emits one JSON per artifact;
+      # we extract (target.name, executable) pairs and copy each into test-bins/
+      # under its short name so matrix jobs can address them by suite.
       - name: Build e2e test binaries
         run: |
-          mkdir -p bin
-          cargo test --no-run -p coxswain-e2e --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .executable != null) | "\(.executable) \(.target.name)"' \
-            | while read -r src name; do cp "$src" "bin/$name"; done
-          cp target/debug/coxswain bin/coxswain
+          set -euo pipefail
+          mkdir -p test-bins
+          cargo test --no-run -p coxswain-e2e --tests --message-format=json \
+            | tee /tmp/cargo-test.json \
+            | jq -r '
+                select(.reason == "compiler-artifact") |
+                select(.target.kind[]? == "test") |
+                select(.executable != null) |
+                "\(.target.name)\t\(.executable)"
+              ' \
+            | while IFS=$'\t' read -r name exe; do
+                cp "$exe" "test-bins/$name"
+              done
+          ls -lh test-bins/
 
-      - name: Upload e2e binaries
+      - name: Build e2e Docker image
+        run: docker build -f Dockerfile.e2e -t coxswain:e2e .
+
+      - name: Save Docker image
+        run: docker save coxswain:e2e | gzip > e2e-image.tar.gz
+
+      - name: Upload Docker image
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-bins
-          path: bin/
+          name: e2e-image
+          path: e2e-image.tar.gz
+          retention-days: 1
+
+      - name: Upload e2e test binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-test-bins
+          path: test-bins/
+          retention-days: 1
+
+      # Build cloud-provider-kind once here so the e2e and conformance jobs
+      # download a binary instead of each running `go install` (which pulls
+      # the module + transitive Go deps every time, ~30-60 s per job).
+      #
+      # The binary itself is cached across runs — cloud-provider-kind
+      # updates roughly monthly and we don't need bleeding-edge. Bump the
+      # cache-key suffix (`v1` → `v2` …) to force a refresh.
+      - name: Cache cloud-provider-kind binary
+        id: cpk-cache
+        uses: actions/cache@v5
+        with:
+          path: cloud-provider-kind
+          key: cloud-provider-kind-${{ runner.os }}-v1
+
+      - name: Install cloud-provider-kind
+        if: steps.cpk-cache.outputs.cache-hit != 'true'
+        run: |
+          go install sigs.k8s.io/cloud-provider-kind@latest
+          cp "$(go env GOPATH)/bin/cloud-provider-kind" ./cloud-provider-kind
+
+      - name: Upload cloud-provider-kind
+        uses: actions/upload-artifact@v7
+        with:
+          name: cloud-provider-kind
+          path: cloud-provider-kind
           retention-days: 1
 
   e2e:
     name: e2e-${{ matrix.suite }}
     needs: build
+    # Matrix jobs only run pre-compiled binaries — no Rust toolchain, no cargo.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -77,19 +135,35 @@ jobs:
       matrix:
         include:
           - suite: ingress
-            binary: ingress
+            test: ingress
           - suite: gateway-api
-            binary: gateway_api
+            test: gateway_api
           - suite: dedicated-proxy
-            binary: dedicated_proxy
+            test: dedicated_proxy
           - suite: proxy-hot-reconfig
-            binary: proxy_hot_reconfig
-          - suite: health
-            binary: health
+            test: proxy_hot_reconfig
           - suite: rbac-read-only-proxy
-            binary: rbac_read_only_proxy
+            test: rbac_read_only_proxy
     steps:
+      # Checkout is required because the test binaries embed
+      # CARGO_MANIFEST_DIR at compile time and read fixture YAML / Helm chart
+      # files from the workspace at runtime. The runner uses the same
+      # /home/runner/work/<repo>/<repo> path on every runner image, so the
+      # paths baked in by the build job resolve here too.
       - uses: actions/checkout@v6
+
+      # Pre-built by the `build` job; place on PATH so setup-kind-cluster
+      # skips its `go install` fallback.
+      - name: Download cloud-provider-kind
+        uses: actions/download-artifact@v8
+        with:
+          name: cloud-provider-kind
+          path: /tmp/cpk
+
+      - name: Install cloud-provider-kind on PATH
+        run: |
+          chmod +x /tmp/cpk/cloud-provider-kind
+          sudo mv /tmp/cpk/cloud-provider-kind /usr/local/bin/cloud-provider-kind
 
       - uses: ./.github/actions/setup-kind-cluster
         with:
@@ -100,19 +174,26 @@ jobs:
           cluster-name: coxswain-e2e-${{ matrix.suite }}
           include-busybox: 'true'
 
-      - name: Download e2e binaries
+      - name: Download Docker image
         uses: actions/download-artifact@v8
         with:
-          name: e2e-bins
-          path: bin/
+          name: e2e-image
 
-      - name: Make binaries executable
-        run: chmod +x bin/coxswain bin/${{ matrix.binary }}
+      - name: Load Docker image into daemon
+        run: docker load < e2e-image.tar.gz
+
+      - name: Download e2e test binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-test-bins
+          path: test-bins/
 
       - name: Run e2e tests (${{ matrix.suite }})
-        run: bin/${{ matrix.binary }} --test-threads=1
+        run: |
+          chmod +x test-bins/${{ matrix.test }}
+          ./test-bins/${{ matrix.test }} --test-threads=1
         env:
-          COXSWAIN_BIN: ${{ github.workspace }}/bin/coxswain
+          COXSWAIN_E2E_SKIP_BUILD: "1"
           RUST_LOG: coxswain_e2e=debug,warn
 
       - uses: ./.github/actions/dump-cluster-state
@@ -134,11 +215,26 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Download e2e binaries
+      - name: Download Docker image
         uses: actions/download-artifact@v8
         with:
-          name: e2e-bins
-          path: bin/
+          name: e2e-image
+
+      - name: Load Docker image into daemon
+        run: docker load < e2e-image.tar.gz
+
+      # Pre-built by the `build` job; place on PATH so setup-kind-cluster
+      # (invoked by run-conformance) skips its `go install` fallback.
+      - name: Download cloud-provider-kind
+        uses: actions/download-artifact@v8
+        with:
+          name: cloud-provider-kind
+          path: /tmp/cpk
+
+      - name: Install cloud-provider-kind on PATH
+        run: |
+          chmod +x /tmp/cpk/cloud-provider-kind
+          sudo mv /tmp/cpk/cloud-provider-kind /usr/local/bin/cloud-provider-kind
 
       - uses: ./.github/actions/run-conformance
         id: conformance

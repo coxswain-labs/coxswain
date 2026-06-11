@@ -1,7 +1,8 @@
 name: Run Gateway API conformance suite
 description: >
-  Spins up a kind cluster, starts coxswain, and runs the full Gateway API
-  conformance suite. Assumes bin/coxswain exists at the workspace root.
+  Spins up a kind cluster, installs coxswain via Helm, and runs the full
+  Gateway API conformance suite. Assumes the `coxswain:e2e` Docker image has
+  already been loaded into the local Docker daemon by the calling job.
   Outputs the workspace-relative path of the generated report YAML.
 
 outputs:
@@ -31,42 +32,156 @@ runs:
       shell: bash
       run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
 
-    - name: Bootstrap cluster (CRDs, RBAC, GatewayClass)
+    - name: Load coxswain image into kind
+      shell: bash
+      run: |
+        # The parent job loaded the image into the Docker daemon; now import it
+        # into the kind cluster's containerd so pods can pull it with
+        # imagePullPolicy: Never.
+        kind load docker-image coxswain:e2e --name coxswain-conformance
+
+    - name: Install cert-manager
+      shell: bash
+      run: |
+        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.18.0/cert-manager.yaml
+        kubectl wait --for=condition=Available --timeout=120s \
+          deployment/cert-manager \
+          deployment/cert-manager-webhook \
+          deployment/cert-manager-cainjector \
+          -n cert-manager
+
+    - name: Install Gateway API CRDs
       shell: bash
       run: |
         kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/${{ steps.gw-version.outputs.version }}/standard-install.yaml
-        kubectl apply -f deploy/manifests/namespace.yaml
-        kubectl apply -f deploy/manifests/controller-rbac.yaml
-        kubectl apply -f deploy/manifests/shared-proxy-rbac.yaml
-        kubectl apply -f deploy/manifests/gateway-class.yaml
-        kubectl wait --for=condition=Established crd/gatewayclasses.gateway.networking.k8s.io --timeout=60s
-        kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io --timeout=60s
+        kubectl wait --for=condition=Established --timeout=60s \
+          crd/gatewayclasses.gateway.networking.k8s.io \
+          crd/httproutes.gateway.networking.k8s.io \
+          crd/referencegrants.gateway.networking.k8s.io
 
-    - name: Start coxswain proxy
+    - name: Pre-apply coxswain CRDs (server-side apply)
       shell: bash
       run: |
-        chmod +x bin/coxswain
-        # Deliberately omit --ingress-http-port / --ingress-https-port: those
-        # flags reserve ports for IngressProxy, but the conformance Gateway
-        # resources declare listeners on 80/443 themselves. Leaving the Ingress
-        # flags off lets GatewayProxy bind 80/443 dynamically from the test
-        # Gateway specs without conflict.
-        sudo KUBECONFIG="$HOME/.kube/config" ./bin/coxswain serve dev \
-          --proxy-bind-address 0.0.0.0 \
-          --health-port 8081 \
-          --admin-port 8082 \
-          --status-address 127.0.0.1 \
-          --log-format console \
-          --pod-name coxswain-conformance \
-          --pod-namespace coxswain-system \
-          --controller-lease-ttl 15s \
-          --controller-lease-renew-interval 5s \
-          &
-        for i in $(seq 1 30); do
-          curl -sf http://localhost:8081/readyz && break || true
-          sleep 2
+        # Pre-apply with SSA before helm install so the CRD field manager is
+        # consistent between fresh and pre-existing clusters (avoids conflicts
+        # with Helm's client-side apply of the crds/ directory).
+        kubectl apply --server-side --force-conflicts -f charts/coxswain/crds/
+
+    - name: Install coxswain via Helm (initial — no status-address yet)
+      shell: bash
+      run: |
+        # The conformance suite declares Gateway listeners on ports 80/443
+        # itself. Coxswain's controller surfaces Programmed=False with
+        # reason=PortUnavailable when a Gateway listener port collides with
+        # the Ingress data-plane reservation, so we must NOT reserve those
+        # ports for Ingress here — disable proxy.http / proxy.https and
+        # surface 80/443 only on the Service so the LB still routes them to
+        # the proxy pod, where Gateway listeners bind them dynamically.
+        helm upgrade --install coxswain charts/coxswain \
+          --namespace coxswain-system \
+          --create-namespace \
+          --set namespace.create=false \
+          --set image.repository=coxswain \
+          --set image.tag=e2e \
+          --set image.pullPolicy=Never \
+          --set service.gateway.type=LoadBalancer \
+          --set controller.coxswainImage=coxswain:e2e \
+          --set proxy.http.enabled=false \
+          --set proxy.https.enabled=false \
+          --set 'service.gateway.additionalPorts[0].name=http,service.gateway.additionalPorts[0].port=80,service.gateway.additionalPorts[0].targetPort=80,service.gateway.additionalPorts[0].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[1].name=https,service.gateway.additionalPorts[1].port=443,service.gateway.additionalPorts[1].targetPort=443,service.gateway.additionalPorts[1].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[2].name=alt-http,service.gateway.additionalPorts[2].port=8080,service.gateway.additionalPorts[2].targetPort=8080,service.gateway.additionalPorts[2].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[3].name=alt-http-2,service.gateway.additionalPorts[3].port=8090,service.gateway.additionalPorts[3].targetPort=8090,service.gateway.additionalPorts[3].protocol=TCP' \
+          --skip-crds \
+          --wait \
+          --timeout 120s
+
+    - name: Wait for LoadBalancer IP
+      id: lb-ip
+      shell: bash
+      run: |
+        # cloud-provider-kind assigns IPs from the kind Docker bridge network.
+        # Poll until the Service has a populated ingress IP.
+        for i in $(seq 1 60); do
+          LB_IP=$(kubectl get svc coxswain-shared-proxy -n coxswain-system \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+          if [ -n "$LB_IP" ]; then
+            echo "lb-ip=${LB_IP}" >> "$GITHUB_OUTPUT"
+            echo "LoadBalancer IP: ${LB_IP}"
+            break
+          fi
+          sleep 3
         done
-        curl -sf http://localhost:8081/readyz
+        if [ -z "$LB_IP" ]; then
+          echo "Timed out waiting for LoadBalancer IP"
+          kubectl get svc coxswain-shared-proxy -n coxswain-system
+          exit 1
+        fi
+
+    - name: Configure status-address and upgrade Helm release
+      shell: bash
+      run: |
+        # Re-upgrade with the confirmed LB IP so the controller populates
+        # Gateway.status.addresses — required by the conformance suite.
+        #
+        # namespace.create=false must be kept on the upgrade. The initial
+        # install used `--create-namespace`, which creates the namespace
+        # outside Helm (no `app.kubernetes.io/managed-by=Helm` label, no
+        # `meta.helm.sh/release-*` annotations). If this upgrade lets the
+        # chart's Namespace template render, Helm tries to take ownership
+        # of the existing namespace and fails with "missing key
+        # app.kubernetes.io/managed-by".
+        # Keep the same proxy.http / proxy.https and Service port overrides
+        # as the initial install (see comment there) so the controller does
+        # not reserve 80/443 for Ingress while the conformance Gateways are
+        # using them.
+        helm upgrade coxswain charts/coxswain \
+          --namespace coxswain-system \
+          --set namespace.create=false \
+          --set image.repository=coxswain \
+          --set image.tag=e2e \
+          --set image.pullPolicy=Never \
+          --set service.gateway.type=LoadBalancer \
+          --set controller.coxswainImage=coxswain:e2e \
+          --set controller.statusAddress=${{ steps.lb-ip.outputs.lb-ip }} \
+          --set proxy.http.enabled=false \
+          --set proxy.https.enabled=false \
+          --set 'service.gateway.additionalPorts[0].name=http,service.gateway.additionalPorts[0].port=80,service.gateway.additionalPorts[0].targetPort=80,service.gateway.additionalPorts[0].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[1].name=https,service.gateway.additionalPorts[1].port=443,service.gateway.additionalPorts[1].targetPort=443,service.gateway.additionalPorts[1].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[2].name=alt-http,service.gateway.additionalPorts[2].port=8080,service.gateway.additionalPorts[2].targetPort=8080,service.gateway.additionalPorts[2].protocol=TCP' \
+          --set 'service.gateway.additionalPorts[3].name=alt-http-2,service.gateway.additionalPorts[3].port=8090,service.gateway.additionalPorts[3].targetPort=8090,service.gateway.additionalPorts[3].protocol=TCP' \
+          --skip-crds \
+          --wait \
+          --timeout 60s
+
+    - name: Wait for controller leader handover
+      shell: bash
+      run: |
+        # `helm --wait` returns once the new controller pod is Ready, but the
+        # OLD pod can still hold the leader-election lease for up to its TTL
+        # (~15 s). During that window the new pod sees objects via InitApply
+        # events with is_leader=false and skips status patches; once it later
+        # becomes leader nothing re-fires for already-known objects. The
+        # conformance suite hits this immediately by creating Gateways during
+        # setup. Block until exactly one controller pod exists and it holds
+        # the lease.
+        for i in $(seq 1 60); do
+          PODS=$(kubectl get pods -n coxswain-system \
+            -l app.kubernetes.io/component=controller \
+            -o jsonpath='{.items[*].metadata.name}')
+          HOLDER=$(kubectl get lease coxswain-leader-lock -n coxswain-system \
+            -o jsonpath='{.spec.holderIdentity}' --ignore-not-found)
+          COUNT=$(echo "$PODS" | wc -w | tr -d ' ')
+          if [ "$COUNT" = "1" ] && [ -n "$HOLDER" ] && echo " $PODS " | grep -q " $HOLDER "; then
+            echo "Leader: $HOLDER"
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "Leader handover timed out — pods=[$PODS] holder=$HOLDER"
+        kubectl get pods -n coxswain-system
+        kubectl get lease coxswain-leader-lock -n coxswain-system -o yaml
+        exit 1
 
     - name: Run Gateway API conformance suite
       id: conformance

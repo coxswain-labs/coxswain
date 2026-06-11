@@ -299,66 +299,35 @@ curl -s http://localhost:8082/routes | jq .    # lists all active hostnames
 
 ## E2E tests
 
-All four suites require a live cluster. Reset your cluster (delete and recreate it) per your distro's documentation, then prepare it as described in the **Running coxswain locally** section above.
+All four suites require a live cluster. Reset your cluster (delete and recreate it) before each run — the harness bootstraps everything from scratch.
 
-### ingress
+The harness wraps the locally compiled binary in a minimal `Dockerfile.e2e` image (~5 s build), loads it into the cluster, installs the Helm chart, and runs tests against the deployed pods. First-time setup is fast because there is no BoringSSL compilation — the full `Dockerfile` is only used for production releases.
 
-The harness spawns coxswain automatically on ephemeral ports. Build the binary first:
-
-```bash
-cargo build --bin coxswain
-cargo test -p coxswain-e2e --test ingress -- --test-threads=1
-```
-
-### gateway_api
+### ingress / gateway_api / dedicated_proxy / proxy_hot_reconfig
 
 ```bash
-cargo build --bin coxswain
-cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1
-```
-
-### dedicated_proxy
-
-Covers the dedicated-mode provisioning operator (#208): a Gateway with `spec.infrastructure.parametersRef` produces a `Deployment` / `Service` / `ServiceAccount` in its namespace; Gateway deletion garbage-collects them; controller restart is idempotent.
-
-```bash
-cargo build --bin coxswain
-cargo test -p coxswain-e2e --test dedicated_proxy -- --test-threads=1
-```
-
-### proxy_hot_reconfig
-
-Covers in-flight requests surviving a data-plane reconfig:
-
-- Zero-drop Gateway listener add/remove (#231): runs 2 000 requests through a live listener while a port is added or removed mid-flight and asserts zero non-2xx responses and zero connection errors.
-- Dedicated-mode crash-loop (#210): a Gateway promoted into dedicated mode with an unreachable image must keep being served by the shared pool indefinitely — sustained load for 15 s asserts zero drops while the dedicated proxy stays NotReady.
-
-```bash
-cargo build --bin coxswain
+cargo build --release --bin coxswain   # compile once; re-run only when source changes
+cargo test -p coxswain-e2e --test ingress           -- --test-threads=1
+cargo test -p coxswain-e2e --test gateway_api        -- --test-threads=1
+cargo test -p coxswain-e2e --test dedicated_proxy    -- --test-threads=1
 cargo test -p coxswain-e2e --test proxy_hot_reconfig -- --test-threads=1
 ```
 
+The bootstrap detects a missing `target/debug/coxswain` and fails fast with a clear message if you forget the build step.
+
+`proxy_hot_reconfig` covers:
+- Zero-drop Gateway listener add/remove (#231): 2 000 requests through a live listener while a port is added or removed mid-flight; asserts zero non-2xx and zero connection errors.
+- Dedicated-mode crash-loop (#210): a Gateway promoted into dedicated mode with an unreachable image keeps being served by the shared pool indefinitely.
+
 ### conformance
 
-The Gateway API conformance suite (`conformance/`) connects to a coxswain instance you start manually on fixed ports. Start coxswain in a separate terminal first.
-
-The launch command deliberately omits `--ingress-http-port` and `--ingress-https-port`: those flags reserve ports for the `IngressProxy` data plane (issue #201), and the conformance Gateway resources declare listeners on 80/443 themselves. Leaving the Ingress flags off lets the `GatewayProxy` bind 80/443 from the test Gateway specs without conflict.
+The Gateway API conformance suite runs against coxswain deployed via Helm. The harness installs the chart, discovers the LoadBalancer IP, and passes it as `--status-address` so `Gateway.status.addresses` is populated correctly.
 
 ```bash
-# Terminal 1 — keep running
-cargo run --bin coxswain -- serve dev \
-  --health-port 8081 \
-  --admin-port 8082 \
-  --status-address 127.0.0.1 \
-  --log-format console \
-  --pod-name coxswain-conformance \
-  --pod-namespace coxswain-system
-```
+# Build the image first (same image the harness would build automatically).
+docker build -t coxswain:e2e .
 
-Then run the suite:
-
-```bash
-# Terminal 2
+# Install coxswain; discover the LB IP; run the suite.
 cd conformance && go test -v -timeout 60m -run TestConformance \
   -args \
   --organization=coxswain-labs \
@@ -378,12 +347,12 @@ cd conformance && go vet ./...
 
 ### Tips
 
-- **Verbose output** (ingress/gateway_api): prepend `RUST_LOG=coxswain_e2e=debug,warn` and pass `--nocapture`.
-- **Manual cleanup** after an interrupted run: `kubectl delete ns -l coxswain-e2e=true`.
-- The harness bootstraps the cluster on first ingress/gateway_api run (installs Gateway API CRDs, applies `deploy/manifests/`); subsequent runs skip bootstrap in ~100 ms.
+- **Verbose output**: prepend `RUST_LOG=coxswain_e2e=debug,warn` and pass `--nocapture`.
+- **Manual cleanup** after an interrupted run: `kubectl delete ns -l coxswain-e2e=true && helm uninstall coxswain -n coxswain-system`.
+- The bootstrap is idempotent: if the Helm release is already installed and the image is unchanged, `bootstrap()` returns in < 1 s.
 - `cargo test` alone does **not** run e2e — the crate is excluded from `default-members` to keep the unit-test loop fast.
-- CI runs all three suites on every PR (see `.github/workflows/e2e.yml`).
-- Set `COXSWAIN_BIN=/path/to/binary` to point the ingress/gateway_api harness at a specific binary instead of `target/debug/coxswain`.
+- Set `COXSWAIN_E2E_SKIP_BUILD=1` to skip the `docker build` step when you know the `coxswain:e2e` image is already up to date in the local Docker daemon.
+- CI builds and caches the Docker image in the `build` job, then each matrix job downloads the image tar, loads it, and runs with `COXSWAIN_E2E_SKIP_BUILD=1`.
 
 ---
 

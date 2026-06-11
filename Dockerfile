@@ -5,7 +5,7 @@
 # Stage 1 (planner): generate a cargo-chef recipe describing the dependency tree.
 # Stage 2 (builder): cook dependencies into a cached layer (BoringSSL builds here,
 #                    ~5-10 min on amd64) then compile the coxswain binary.
-# Stage 3 (runtime): copy the binary onto distroless/cc-debian12:nonroot.
+# Stage 3 (runtime): copy the binary onto distroless/cc-debian13:nonroot.
 #
 # BoringSSL (vendored by pingora's boring-sys) is the dominant build cost.
 # cargo-chef caches it in the deps layer so PR rebuilds that don't touch
@@ -39,7 +39,7 @@ RUN cargo chef cook --release --recipe-path recipe.json --bin coxswain
 COPY . .
 RUN cargo build --release --bin coxswain
 
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 COPY --from=builder /app/target/release/coxswain /usr/local/bin/coxswain
 
 # Static OCI image-spec annotations. Dynamic ones (created, revision, version,
@@ -54,7 +54,7 @@ LABEL org.opencontainers.image.title="coxswain" \
       org.opencontainers.image.vendor="Coxswain Labs" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.authors="Matteo Giaccone" \
-      org.opencontainers.image.base.name="gcr.io/distroless/cc-debian12:nonroot"
+      org.opencontainers.image.base.name="gcr.io/distroless/cc-debian13:nonroot"
 
 # Defaults; the binary already defaults --log to "info" via clap so this is
 # primarily for discoverability via `docker inspect`.
