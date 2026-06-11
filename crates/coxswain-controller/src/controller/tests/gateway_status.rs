@@ -1,4 +1,3 @@
-use super::super::AcceptedReason;
 use super::super::gateway_status::gateway_needs_status_patch;
 use coxswain_reflector::tls::GatewayListenerHealth;
 use gateway_api::apis::standard::gateways::{
@@ -7,10 +6,9 @@ use gateway_api::apis::standard::gateways::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 
 fn condition(type_: &str, observed_gen: i64) -> Condition {
-    // Reason matches what `build_gateway_status_patch` writes in the
-    // override-is-None case: `Accepted` and `Programmed` carry the type name
-    // as the reason. The Accepted-override path uses different reasons (e.g.
-    // `InvalidParameters`); those tests build their conditions explicitly.
+    // Reason matches what `build_gateway_status_patch` writes: `Accepted` and
+    // `Programmed` carry the type name as the reason for the shared-pool
+    // happy path.
     Condition {
         type_: type_.to_string(),
         status: "True".to_string(),
@@ -73,19 +71,19 @@ fn needs_patch_when_no_status() {
         status: None,
         ..Default::default()
     };
-    assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+    assert!(gateway_needs_status_patch(&gw, &default_health()));
 }
 
 #[test]
 fn needs_patch_when_accepted_missing() {
     let gw = gateway(1, Some(vec![condition("Programmed", 1)]), None);
-    assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+    assert!(gateway_needs_status_patch(&gw, &default_health()));
 }
 
 #[test]
 fn needs_patch_when_programmed_missing() {
     let gw = gateway(1, Some(vec![condition("Accepted", 1)]), None);
-    assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+    assert!(gateway_needs_status_patch(&gw, &default_health()));
 }
 
 #[test]
@@ -96,7 +94,7 @@ fn needs_patch_when_top_level_condition_stale() {
         Some(vec![condition("Accepted", 0), condition("Programmed", 0)]),
         Some(vec![listener_status("http", 2)]),
     );
-    assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+    assert!(gateway_needs_status_patch(&gw, &default_health()));
 }
 
 #[test]
@@ -107,7 +105,7 @@ fn needs_patch_when_listener_condition_stale() {
         Some(vec![condition("Accepted", 2), condition("Programmed", 2)]),
         Some(vec![listener_status("http", 0)]),
     );
-    assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+    assert!(gateway_needs_status_patch(&gw, &default_health()));
 }
 
 #[test]
@@ -118,7 +116,7 @@ fn needs_patch_when_listener_count_mismatch() {
         Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
         Some(vec![]),
     );
-    assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+    assert!(gateway_needs_status_patch(&gw, &default_health()));
 }
 
 #[test]
@@ -128,62 +126,5 @@ fn no_patch_needed_when_fully_up_to_date() {
         Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
         Some(vec![listener_status("http", 1)]),
     );
-    assert!(!gateway_needs_status_patch(&gw, &default_health(), None));
-}
-
-/// Override active but current status still has `Accepted=True` from a prior
-/// reconcile cycle → status writer must repatch.
-#[test]
-fn needs_patch_when_override_disagrees_with_current_accepted() {
-    let gw = gateway(
-        1,
-        Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
-        Some(vec![listener_status("http", 1)]),
-    );
-    assert!(gateway_needs_status_patch(
-        &gw,
-        &default_health(),
-        Some(AcceptedReason::InvalidParameters)
-    ));
-}
-
-/// Override matches current status (steady state of an invalid-parameters
-/// Gateway) → no patch needed.
-#[test]
-fn no_patch_needed_when_override_matches_current_accepted_false() {
-    let mut accepted_false = condition("Accepted", 1);
-    accepted_false.status = "False".to_string();
-    accepted_false.reason = "InvalidParameters".to_string();
-    let mut programmed_false = condition("Programmed", 1);
-    programmed_false.status = "False".to_string();
-    programmed_false.reason = "Invalid".to_string();
-    let gw = gateway(
-        1,
-        Some(vec![accepted_false, programmed_false]),
-        Some(vec![listener_status("http", 1)]),
-    );
-    assert!(!gateway_needs_status_patch(
-        &gw,
-        &default_health(),
-        Some(AcceptedReason::InvalidParameters)
-    ));
-}
-
-/// Override has just cleared but current status still carries
-/// `Accepted=False, reason=InvalidParameters` → status writer must repatch
-/// to restore `Accepted=True`.
-#[test]
-fn needs_patch_when_override_cleared_but_status_still_false() {
-    let mut accepted_false = condition("Accepted", 1);
-    accepted_false.status = "False".to_string();
-    accepted_false.reason = "InvalidParameters".to_string();
-    let mut programmed_false = condition("Programmed", 1);
-    programmed_false.status = "False".to_string();
-    programmed_false.reason = "Invalid".to_string();
-    let gw = gateway(
-        1,
-        Some(vec![accepted_false, programmed_false]),
-        Some(vec![listener_status("http", 1)]),
-    );
-    assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+    assert!(!gateway_needs_status_patch(&gw, &default_health()));
 }

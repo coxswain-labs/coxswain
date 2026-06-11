@@ -81,6 +81,20 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read dedicated-proxy Pods (#210, #211): operator watches their Ready
+  # condition to publish the `DedicatedProxyReady` cut-over signal and to
+  # gate `Programmed=True` in the dedicated Gateway status writer. Narrowed
+  # to the operator's label-selector at the watch layer.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Read cluster Nodes (#211): the dedicated Gateway status writer
+  # enumerates Node ExternalIP / InternalIP to populate
+  # `Gateway.status.addresses` when the dedicated Service is `NodePort`-typed.
+  # No write verbs.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

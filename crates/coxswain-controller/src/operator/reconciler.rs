@@ -23,19 +23,22 @@
 //! existing [`crate::Controller`]'s leader-election machinery). Non-leader
 //! pods short-circuit and re-queue; only the elected leader applies.
 //!
-//! ## Missing parametersRef target
+//! ## Status writing (Step 12, #211)
 //!
-//! [`params::resolve`] surfaces this as `Err(ParamsError::NotFound)`. The
-//! reconciler publishes an `AcceptedReason::InvalidParameters` override into
-//! the shared [`AcceptedOverrides`] map; the status writer in
-//! [`crate::controller`] consults the map on every Gateway reconcile and
-//! emits `Accepted=False, reason=InvalidParameters` (Gateway API spec). On a
-//! successful resolve we clear the override so the writer returns to
-//! emitting `Accepted=True`.
+//! Every reconcile that completes its SSA + RBAC stages also calls
+//! [`super::status::patch_dedicated_gateway_status`] with the latest snapshot
+//! of provisioned Service, Node fleet, listener TLS health, and Ready Pod
+//! count. The `NotFound` branch writes `Accepted=False,
+//! reason=InvalidParameters` directly via the same entry point — no shared
+//! `AcceptedOverrides` map is needed because the operator is now the sole
+//! writer of `Gateway.status` on dedicated-mode Gateways (the shared-pool
+//! writer skips them via a `parametersRef` group/kind check). Health-channel
+//! retriggers wire [`SharedGatewayListenerHealth`] and
+//! [`SharedHttpRouteHealth`] into [`Controller::reconcile_all_on`] so a
+//! cert-ref or route-resolution flip kicks every owned Gateway through the
+//! patch path within watch latency.
 
-use super::{apply, condition, params, rbac, render};
-use crate::AcceptedOverrides;
-use crate::AcceptedReason;
+use super::{apply, params, rbac, render, status};
 use async_trait::async_trait;
 use coxswain_core::crd::CoxswainGatewayParameters;
 use coxswain_core::ownership::ObjectKey;
@@ -43,8 +46,12 @@ use coxswain_reflector::gw_types::HttpRoute;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::gw_types::v::referencegrants::ReferenceGrant;
+use coxswain_reflector::ingress::IngressPorts;
+use coxswain_reflector::tls::{
+    GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
+};
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Node, Pod, Service};
 use k8s_openapi::api::rbac::v1::RoleBinding;
 use kube::{
     Api, Client, Resource as _,
@@ -84,8 +91,7 @@ const ERROR_REQUEUE: Duration = Duration::from_secs(15);
 #[derive(Debug, Error)]
 pub(super) enum ReconcileError {
     /// Kubernetes API error encountered outside the SSA path (e.g. by future
-    /// pre-flight reads of provisioned resources). The SSA path's failures
-    /// land in [`ReconcileError::Apply`] instead.
+    /// pre-flight reads of provisioned resources, or by the status patch).
     #[error("kube error: {0}")]
     Kube(#[from] kube::Error),
     /// SSA of one of the three rendered resources failed.
@@ -115,12 +121,26 @@ pub struct OperatorConfig {
     /// Shared leader-election flag the status writer flips on `Acquire`.
     /// Reconcile is a no-op (re-queue) when this is `false`.
     pub leader: Arc<AtomicBool>,
-    /// Shared override channel that the operator publishes into when a
-    /// Gateway's `parametersRef` resolves to a missing target. The bin layer
-    /// must wire this to the *same* [`AcceptedOverrides`] instance held by
-    /// the [`crate::ControllerConfig`] so the status writer can read what
-    /// the operator publishes.
-    pub accepted_overrides: AcceptedOverrides,
+    /// Per-listener TLS-resolution health channel. Read on every reconcile
+    /// (the patch builder maps each listener to its `(tls_outcome,
+    /// attached_routes)` snapshot) and subscribed via
+    /// [`SharedGatewayListenerHealth::subscribe`] so a TLS-cert resolution
+    /// flip kicks every owned Gateway through
+    /// [`Controller::reconcile_all_on`].
+    pub tls_health: SharedGatewayListenerHealth,
+    /// Per-route ResolvedRefs/Accepted health channel. Subscribed for the
+    /// same retrigger reason as [`Self::tls_health`]; the patch builder does
+    /// not consume the snapshot directly (per-listener `ResolvedRefs`
+    /// derives from TLS health alone — see the issue-211 grilling notes),
+    /// but a route-health flip still warrants re-checking listener
+    /// `attached_routes` counts.
+    pub route_health: SharedHttpRouteHealth,
+    /// Ports reserved for the Ingress data plane via `--proxy-http-port` /
+    /// `--proxy-https-port`. Forwarded to the listener-status helper so a
+    /// dedicated-mode listener whose port collides with the Ingress
+    /// reservation surfaces `Programmed=False, reason=PortUnavailable` —
+    /// same semantics as the shared-pool writer (#201).
+    pub ingress_ports: IngressPorts,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -147,16 +167,27 @@ struct ReconcileContext {
     controller_name: String,
     controller_image: String,
     leader: Arc<AtomicBool>,
-    accepted_overrides: AcceptedOverrides,
     client: Client,
     class_store: Store<GatewayClass>,
     params_store: Store<CoxswainGatewayParameters>,
     routes_store: Store<HttpRoute>,
     grants_store: Store<ReferenceGrant>,
     /// Pods carrying the dedicated-proxy labels. Reads off this store drive
-    /// the `gateway.coxswain-labs.dev/DedicatedProxyReady` condition (#210).
+    /// the `gateway.coxswain-labs.dev/DedicatedProxyReady` condition (#210)
+    /// and gate `Programmed=True` on having ≥1 Ready Pod (#211).
     /// Cluster-wide watch narrowed by `PROXY_POD_LABEL_SELECTOR`.
     pods_store: Store<Pod>,
+    /// Cluster `Node` snapshot. Only consulted when a dedicated Gateway's
+    /// Service is `NodePort`-typed; otherwise unused. Unscoped watch
+    /// (Nodes are cluster-wide and low-cardinality).
+    nodes_store: Store<Node>,
+    /// Shared per-listener TLS-health channel — read-only snapshot at each
+    /// reconcile.
+    tls_health: SharedGatewayListenerHealth,
+    /// Ports reserved for the Ingress data plane via the controller's CLI.
+    /// Forwarded to [`super::status::build_dedicated_gateway_status_patch`]
+    /// for the listener `PortUnavailable` precedence check.
+    ingress_ports: IngressPorts,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
 
@@ -270,6 +301,22 @@ impl BackgroundService for Operator {
                 while stream.next().await.is_some() {}
             }
         });
+        // Node reflector — cluster-wide, no label scoping. Only consulted for
+        // `NodePort`-typed dedicated Services; one snapshot per reconcile.
+        // Low cardinality at the cluster sizes Coxswain targets (tens of
+        // Nodes) so an unfiltered watch is fine.
+        let (nodes_reader, nodes_writer) = reflector::store::<Node>();
+        tasks.spawn({
+            let api = Api::<Node>::all(client.clone());
+            async move {
+                let stream = reflector::reflector(
+                    nodes_writer,
+                    watcher(api, watcher::Config::default()).default_backoff(),
+                );
+                tokio::pin!(stream);
+                while stream.next().await.is_some() {}
+            }
+        });
 
         // Wait for every dependency reflector to complete its initial sync
         // before exposing the stores to the reconcile loop. Without this,
@@ -296,6 +343,7 @@ impl BackgroundService for Operator {
             let _ = routes_reader.wait_until_ready().await;
             let _ = grants_reader.wait_until_ready().await;
             let _ = pods_reader.wait_until_ready().await;
+            let _ = nodes_reader.wait_until_ready().await;
         })
         .await;
         if sync.is_err() {
@@ -311,13 +359,15 @@ impl BackgroundService for Operator {
             controller_name: self.config.controller_name.clone(),
             controller_image: self.config.controller_image.clone(),
             leader: Arc::clone(&self.config.leader),
-            accepted_overrides: self.config.accepted_overrides.clone(),
             client: client.clone(),
             class_store: class_reader,
             params_store: params_reader,
             routes_store: routes_reader,
             grants_store: grants_reader,
             pods_store: pods_reader,
+            nodes_store: nodes_reader,
+            tls_health: self.config.tls_health.clone(),
+            ingress_ports: self.config.ingress_ports,
             last_hashes: Mutex::new(HashMap::new()),
         });
 
@@ -330,9 +380,48 @@ impl BackgroundService for Operator {
         let api_routes: Api<HttpRoute> = Api::all(client.clone());
         let api_grants: Api<ReferenceGrant> = Api::all(client.clone());
         let api_bindings: Api<RoleBinding> = Api::all(client.clone());
-        let api_pods: Api<Pod> = Api::all(client);
+        let api_pods: Api<Pod> = Api::all(client.clone());
+        let api_services: Api<Service> = Api::all(client);
         let class_store_for_watches = ctx.class_store.clone();
         let routes_store_for_watches = ctx.routes_store.clone();
+
+        // Build the health-channel retrigger stream (#211). We bridge two
+        // `tokio::sync::watch::Receiver<u64>`s (which are `Send` but not
+        // `Sync`) onto a single `futures::channel::mpsc::UnboundedReceiver`
+        // (which is `Send + Sync`, the bound `Controller::reconcile_all_on`
+        // requires). Each forwarder task drops the initial value via
+        // `borrow_and_update` so operator startup doesn't spuriously fire a
+        // reconcile-all before any health flip has actually occurred.
+        let (trigger_tx, trigger_rx) = futures::channel::mpsc::unbounded::<()>();
+        {
+            let mut tls_rx = self.config.tls_health.subscribe();
+            let tx = trigger_tx.clone();
+            tasks.spawn(async move {
+                let _ = tls_rx.borrow_and_update();
+                while tls_rx.changed().await.is_ok() {
+                    if tx.unbounded_send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        {
+            let mut route_rx = self.config.route_health.subscribe();
+            let tx = trigger_tx.clone();
+            tasks.spawn(async move {
+                let _ = route_rx.borrow_and_update();
+                while route_rx.changed().await.is_ok() {
+                    if tx.unbounded_send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        // Drop the construction-site sender so the receiver closes if both
+        // forwarder tasks exit. Without this, the receiver would stay alive
+        // forever and `Controller::reconcile_all_on` would hold a permanent
+        // task slot.
+        drop(trigger_tx);
 
         let controller = Controller::new(api_gateways, watcher::Config::default());
         let gateway_store = controller.store();
@@ -471,7 +560,36 @@ impl BackgroundService for Operator {
                     };
                     vec![ObjectRef::new(name).within(ns)]
                 },
-            );
+            )
+            // Service → Gateway: dedicated-proxy Services live in the
+            // Gateway's own namespace and carry the GEP-1762 gateway-name
+            // label. Drives `Programmed=False, reason=AddressNotAssigned`
+            // → `True` transitions the instant the apiserver populates
+            // `clusterIP` (ClusterIP type) or an LB controller writes
+            // `status.loadBalancer.ingress` — without this watch the status
+            // would only refresh on the next natural Gateway reconcile (#211).
+            .watches(
+                api_services,
+                watcher::Config::default().labels(PROXY_POD_LABEL_SELECTOR),
+                |svc: Service| -> Vec<ObjectRef<Gateway>> {
+                    let Some(ns) = svc.metadata.namespace.as_deref() else {
+                        return vec![];
+                    };
+                    let Some(labels) = svc.metadata.labels.as_ref() else {
+                        return vec![];
+                    };
+                    let Some(name) = labels.get(POD_GATEWAY_NAME_LABEL) else {
+                        return vec![];
+                    };
+                    vec![ObjectRef::new(name).within(ns)]
+                },
+            )
+            // Bulk retrigger on listener-TLS / route-health flips. Each tick
+            // reconciles every Gateway in the controller's store; the
+            // `dedicated_gateway_needs_status_patch` idempotence check
+            // absorbs duplicates so this is cheap even under chatty health
+            // channels.
+            .reconcile_all_on(trigger_rx);
 
         let stream = controller.run(reconcile, error_policy, ctx);
         // The controller stream contains `!Unpin` futures internally
@@ -566,8 +684,14 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
         Ok(None) => {
             // Not dedicated mode. If we previously placed our finalizer on
             // this Gateway (it was dedicated, now isn't), clean up bindings
-            // and the finalizer too so the Gateway can transition cleanly
-            // back to the shared pool.
+            // and the finalizer AND clear every condition this writer owned
+            // so the shared-pool status writer can re-establish
+            // `Accepted`/`Programmed` on its next Gateway reconcile.
+            //
+            // The finalizer is what tells us we ever owned this Gateway's
+            // status — without it the clear path would delete conditions
+            // written by the shared-pool writer on every reconcile of every
+            // non-dedicated Gateway, producing an unbounded patch loop.
             if has_our_finalizer(&gw) {
                 tracing::info!(
                     gateway = %gateway_id(&gw),
@@ -575,22 +699,34 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
                 );
                 rbac::delete_all_for_gateway(&ctx.client, gw_namespace, gw_name).await?;
                 remove_finalizer(&ctx.client, &gw).await?;
+                status::clear_dedicated_gateway_status(&ctx.client, &gw).await?;
+                ctx.last_hashes
+                    .lock()
+                    .unwrap_or_else(|e| panic!("invariant: hash-tracking mutex poisoned: {e}"))
+                    .remove(&key);
             }
-            // The shared pool resumes serving this Gateway as soon as the
-            // `DedicatedProxyReady` condition is gone from its status.
-            condition::clear_dedicated_proxy_ready(&ctx.client, &gw).await?;
-            ctx.accepted_overrides.clear(&key);
             return Ok(Action::await_change());
         }
         Err(params::ParamsError::NotFound(ns, name)) => {
             tracing::warn!(
                 gateway = %gateway_id(&gw),
                 missing = %format!("{ns}/{name}"),
-                "operator: parametersRef target not found; publishing \
+                "operator: parametersRef target not found; writing \
                  Accepted=False, reason=InvalidParameters and re-queuing"
             );
-            ctx.accepted_overrides
-                .set(key, AcceptedReason::InvalidParameters);
+            // The operator is the sole writer of Gateway.status for
+            // dedicated-mode Gateways — InvalidParameters is emitted
+            // directly here, no shared cross-task signal involved.
+            let inputs = status::DedicatedGatewayStatusInputs {
+                gw: &gw,
+                service: None,
+                nodes: &[],
+                tls_health: &GatewayListenerHealth::default(),
+                ingress_ports: ctx.ingress_ports,
+                accepted: status::AcceptedOutcome::InvalidParameters,
+                ready_pod_count: 0,
+            };
+            status::patch_dedicated_gateway_status(&ctx.client, &inputs).await?;
             return Ok(Action::requeue(ERROR_REQUEUE));
         }
     };
@@ -633,22 +769,42 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
         .unwrap_or_else(|| panic!("invariant: rendered ServiceAccount has no name"));
     rbac::reconcile_rbac(&ctx.client, &gw, proxy_sa_name, &desired).await?;
 
-    // Stage 3 — publish the `DedicatedProxyReady` cut-over condition (#210)
-    // based on observed Pod readiness. The shared-proxy reflector reads
-    // this condition to decide whether to keep serving the Gateway; a True
-    // value means the dedicated pool has at least one Ready Pod and the
-    // shared pool must drop the Gateway from its routing table. Tracks
-    // current state — flips back to False whenever the dedicated pool has
-    // zero Ready Pods (rolling restart, crash, drain) so the shared pool
-    // resumes serving rather than dropping traffic entirely.
+    // Stage 3 — write Gateway.status (#211). One JSON merge patch carries
+    // Accepted/Programmed/per-listener/addresses + the
+    // `gateway.coxswain-labs.dev/DedicatedProxyReady` cut-over signal the
+    // shared-proxy reflector consumes (#210). All gated on observed Pod
+    // readiness + resolved Service-address presence + TLS-health.
+    //
+    // The Service is fetched directly from the apiserver — NOT read from a
+    // reflector store — because the Service cross-watch that triggers this
+    // reconcile is an independent subscription from any reflector: the
+    // cross-watch can deliver a MODIFIED event before a reflector finishes
+    // applying it, leaving the store one resourceVersion behind for the
+    // duration of this reconcile. A status-only LoadBalancer patch has no
+    // other trigger to re-reconcile against, so reading stale state here
+    // would silently strand `Programmed=False, reason=AddressNotAssigned`
+    // indefinitely.
     let ready_pod_count = count_ready_proxy_pods(&ctx.pods_store, gw_namespace, gw_name);
-    condition::patch_dedicated_proxy_ready(&ctx.client, &gw, ready_pod_count >= 1).await?;
-
-    // Successful resolve + apply → clear any prior `InvalidParameters`
-    // override (e.g. user just created the missing
-    // `CoxswainGatewayParameters` object) so the status writer can return
-    // the Gateway to `Accepted=True` on its next reconcile.
-    ctx.accepted_overrides.clear(&key);
+    let services_api: Api<Service> = Api::namespaced(ctx.client.clone(), gw_namespace);
+    let resource_name = status::resource_name(gw_name, class_name);
+    let service = match services_api.get(&resource_name).await {
+        Ok(svc) => Some(svc),
+        Err(kube::Error::Api(api_err)) if api_err.code == 404 => None,
+        Err(e) => return Err(ReconcileError::Kube(e)),
+    };
+    let nodes: Vec<Arc<Node>> = ctx.nodes_store.state();
+    let tls_health_map = ctx.tls_health.load();
+    let gateway_health = tls_health_map.get(&key).cloned().unwrap_or_default();
+    let inputs = status::DedicatedGatewayStatusInputs {
+        gw: &gw,
+        service: service.as_ref(),
+        nodes: &nodes,
+        tls_health: &gateway_health,
+        ingress_ports: ctx.ingress_ports,
+        accepted: status::AcceptedOutcome::Accepted,
+        ready_pod_count,
+    };
+    status::patch_dedicated_gateway_status(&ctx.client, &inputs).await?;
 
     let new_hash = hash_rendered(&rendered);
     let changed = {

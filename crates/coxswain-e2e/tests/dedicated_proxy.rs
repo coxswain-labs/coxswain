@@ -509,3 +509,272 @@ async fn deployment_container_carries_watch_namespaces_arg() -> anyhow::Result<(
     );
     Ok(())
 }
+
+// =============================================================================
+// #211 — dedicated-mode Gateway status writer.
+// =============================================================================
+
+/// Helper: returns the Gateway's `status.conditions[type=...]` `(status, reason)`
+/// pair, or `None` if the condition isn't present yet.
+fn gateway_condition(gw: &Gateway, type_: &str) -> Option<(String, String)> {
+    gw.status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.type_ == type_)
+        .map(|c| (c.status.clone(), c.reason.clone()))
+}
+
+/// Helper: returns the Gateway's `status.addresses` as a sorted vec of
+/// `(type, value)` tuples for deterministic comparison.
+fn gateway_addresses(gw: &Gateway) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.addresses.as_ref())
+        .map(|addrs| {
+            addrs
+                .iter()
+                .map(|a| (a.r#type.clone().unwrap_or_default(), a.value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// 8 — Scenario A (#211, ClusterIP happy path): apply a dedicated Gateway with
+/// `serviceType: ClusterIP`, wait for pod Ready, then assert the operator
+/// writes `Accepted=True`, `Programmed=True`,
+/// `gateway.coxswain-labs.dev/DedicatedProxyReady=True/Ready`, and
+/// `status.addresses[0]` matching the provisioned Service's `spec.clusterIP`.
+///
+/// Uses [`dedicated::DEDICATED_GATEWAY_CLUSTERIP`] rather than the shared
+/// `DEDICATED_GATEWAY` fixture because Pod-Ready gating requires a
+/// stub-image container — the default `coxswain:<version>` image cached
+/// on the cluster predates the controller/proxy CLI split and CrashLoops
+/// against the operator-rendered args, so it never reports Ready.
+#[tokio::test]
+async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-status-clusterip").await?;
+
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_CLUSTERIP,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let svc = poll_until(Duration::from_secs(15), || async {
+        services.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
+    let cluster_ip = svc
+        .spec
+        .as_ref()
+        .and_then(|s| s.cluster_ip.clone())
+        .expect("provisioned Service should have a clusterIP");
+    assert!(
+        !cluster_ip.is_empty() && cluster_ip != "None",
+        "ClusterIP fixture expects a non-headless clusterIP, got {cluster_ip}"
+    );
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    // Programmed=True takes a moment: we wait for both pod readiness and
+    // the operator's reconcile to propagate. 60s window accommodates image
+    // pull and pod startup on a cold local cluster.
+    let gw = poll_until(Duration::from_secs(60), || async {
+        let gw = gateways.get(GATEWAY_NAME).await.ok()?;
+        let accepted = gateway_condition(&gw, "Accepted")?;
+        let programmed = gateway_condition(&gw, "Programmed")?;
+        let cut_over = gateway_condition(&gw, "gateway.coxswain-labs.dev/DedicatedProxyReady")?;
+        let addresses = gateway_addresses(&gw);
+        if accepted == ("True".to_string(), "Accepted".to_string())
+            && programmed == ("True".to_string(), "Programmed".to_string())
+            && cut_over == ("True".to_string(), "Ready".to_string())
+            && !addresses.is_empty()
+        {
+            Some(gw)
+        } else {
+            None
+        }
+    })
+    .await?;
+
+    // Address came from the Service's clusterIP, type=IPAddress.
+    let addresses = gateway_addresses(&gw);
+    assert_eq!(addresses.len(), 1, "ClusterIP yields exactly one address");
+    assert_eq!(
+        addresses[0],
+        ("IPAddress".to_string(), cluster_ip.clone()),
+        "Gateway.status.addresses must mirror Service.spec.clusterIP"
+    );
+    Ok(())
+}
+
+/// 9 — Scenario B (#211, LoadBalancer address propagation): apply a
+/// `serviceType: LoadBalancer` Gateway and verify the operator surfaces the
+/// assigned LB IP in `Gateway.status.addresses` and flips `Programmed=True`
+/// once an IP is present.
+///
+/// Address-source resilience: some local clusters (e.g. OrbStack) ship a
+/// built-in LB controller that assigns an IP within seconds; on bare clusters
+/// the harness writes a synthetic `Service.status.loadBalancer.ingress` if
+/// none appears within a short window. Either path produces the same observable
+/// downstream signal — the operator's address resolution doesn't care which
+/// source populated the field, and pinning to one specific IP is fragile
+/// because an active LB controller will overwrite a synthetic patch within
+/// a single reconcile loop.
+#[tokio::test]
+async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-status-lb").await?;
+
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_LOADBALANCER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    poll_until(Duration::from_secs(15), || async {
+        services.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // Before any LB ingress is assigned the operator must surface
+    // Programmed=False with one of two reasons:
+    //   * Pending — pod not yet Ready (precedence: pod-ready > address)
+    //   * AddressNotAssigned — pod is Ready but no LB IP yet
+    poll_until(Duration::from_secs(45), || async {
+        let gw = gateways.get(GATEWAY_NAME).await.ok()?;
+        let programmed = gateway_condition(&gw, "Programmed")?;
+        if programmed.0 == "False"
+            && (programmed.1 == "AddressNotAssigned" || programmed.1 == "Pending")
+        {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await?;
+
+    // Give an in-cluster LB controller a short window to assign an IP. If
+    // nothing shows up in 10 s we synthetically patch the status subresource
+    // so the test still exercises address propagation on bare clusters.
+    // Plain `.patch()` would target the spec subresource — `/status` writes
+    // MUST go through `.patch_status()`.
+    let in_cluster_assigned = poll_until(Duration::from_secs(10), || async {
+        let svc = services.get_status(RESOURCE_NAME).await.ok()?;
+        let ip = svc
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+            .and_then(|lb| lb.ingress.as_ref())
+            .and_then(|i| i.first())
+            .and_then(|e| e.ip.clone())
+            .filter(|s| !s.is_empty());
+        ip.map(|ip| ip.to_string())
+    })
+    .await
+    .ok();
+    let expected_ip: String = if let Some(ip) = in_cluster_assigned {
+        ip
+    } else {
+        let synthetic_lb_ip = "203.0.113.7";
+        let status_patch = serde_json::json!({
+            "status": {
+                "loadBalancer": {
+                    "ingress": [{"ip": synthetic_lb_ip}]
+                }
+            }
+        });
+        services
+            .patch_status(
+                RESOURCE_NAME,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(&status_patch),
+            )
+            .await?;
+        synthetic_lb_ip.to_string()
+    };
+
+    // The operator's Service cross-watch picks up the LB-ingress change and
+    // re-reconciles the owning Gateway. Wait for Programmed=True and the
+    // assigned IP in status.addresses.
+    let gw = poll_until(Duration::from_secs(60), || async {
+        let gw = gateways.get(GATEWAY_NAME).await.ok()?;
+        let programmed = gateway_condition(&gw, "Programmed")?;
+        let addresses = gateway_addresses(&gw);
+        if programmed == ("True".to_string(), "Programmed".to_string())
+            && addresses
+                .iter()
+                .any(|(t, v)| t == "IPAddress" && v == &expected_ip)
+        {
+            Some(gw)
+        } else {
+            None
+        }
+    })
+    .await?;
+    let _ = gw;
+    Ok(())
+}
+
+/// 10 — Scenario C (#211, InvalidParameters): apply a dedicated Gateway whose
+/// `parametersRef.name` targets a missing `CoxswainGatewayParameters` object,
+/// and assert the operator writes `Accepted=False, reason=InvalidParameters`
+/// + `Programmed=False, reason=Invalid` directly — no shared
+/// `AcceptedOverrides` channel.
+#[tokio::test]
+async fn invalid_parameters_yields_accepted_false_invalid_parameters() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-status-invalid").await?;
+
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_INVALID_PARAMS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    poll_until(Duration::from_secs(30), || async {
+        let gw = gateways.get(GATEWAY_NAME).await.ok()?;
+        let accepted = gateway_condition(&gw, "Accepted")?;
+        let programmed = gateway_condition(&gw, "Programmed")?;
+        if accepted == ("False".to_string(), "InvalidParameters".to_string())
+            && programmed == ("False".to_string(), "Invalid".to_string())
+        {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await?;
+
+    // No Deployment/Service/SA should have been provisioned — the
+    // InvalidParameters branch returns before render+apply.
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
+    assert!(
+        deployments.get(RESOURCE_NAME).await.is_err(),
+        "no Deployment should be provisioned on the InvalidParameters path"
+    );
+    assert!(
+        services.get(RESOURCE_NAME).await.is_err(),
+        "no Service should be provisioned on the InvalidParameters path"
+    );
+    assert!(
+        sas.get(RESOURCE_NAME).await.is_err(),
+        "no ServiceAccount should be provisioned on the InvalidParameters path"
+    );
+    Ok(())
+}

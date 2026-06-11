@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use clap::Parser;
 use coxswain_admin::AdminServer;
 use coxswain_controller::{
-    AcceptedOverrides, ControllerConfig, IngressPorts, LeaseSettings, Operator, OperatorConfig,
-    SharedClusterSummary, SharedGatewayListenerHealth, StatusWriterConfig, spawn_status_writer,
+    ControllerConfig, IngressPorts, LeaseSettings, Operator, OperatorConfig, SharedClusterSummary,
+    SharedGatewayListenerHealth, StatusWriterConfig, spawn_status_writer,
 };
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::ObjectKey;
@@ -73,9 +73,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         "Starting"
     );
 
-    let accepted_overrides = AcceptedOverrides::new();
-    let controller_config = build_controller_config(&args.common, &args.controller)?
-        .with_accepted_overrides(accepted_overrides.clone());
+    let controller_config = build_controller_config(&args.common, &args.controller)?;
 
     let mut server = build_minimal_server();
     let health = HealthRegistry::new();
@@ -94,6 +92,15 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         health.clone(),
     )?;
 
+    // The operator publishes Gateway.status conditions for dedicated-mode
+    // Gateways using the same per-listener TLS / route health channels the
+    // shared-pool status writer subscribes to (#211). The bin layer is the
+    // sole construction site for both — share the same instances so the
+    // operator's reconcile-all retrigger fires off the exact channel the
+    // reflector publishes into.
+    let tls_health = status_writer.outputs.tls_health.clone();
+    let route_health = status_writer.reconciler.route_health();
+
     server.add_service(background_service("controller", status_writer.controller));
     server.add_service(background_service("reconciler", status_writer.reconciler));
 
@@ -103,7 +110,12 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             controller_name: args.common.controller_name.clone(),
             controller_image: resolve_controller_image(),
             leader: Arc::clone(&status_writer.leader),
-            accepted_overrides,
+            tls_health,
+            route_health,
+            ingress_ports: IngressPorts::new(
+                args.common.ingress_http_port,
+                args.common.ingress_https_port,
+            ),
         }),
     ));
 
@@ -657,9 +669,7 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
         "Starting"
     );
 
-    let accepted_overrides = AcceptedOverrides::new();
-    let controller_config = build_controller_config(&args.common, &args.controller)?
-        .with_accepted_overrides(accepted_overrides.clone());
+    let controller_config = build_controller_config(&args.common, &args.controller)?;
     let mut server = build_server(&args.proxy);
 
     let health = HealthRegistry::new();
@@ -683,6 +693,9 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
         status_writer.outputs.tls.clone(),
     );
     let tls_health = status_writer.outputs.tls_health.clone();
+    // Operator's reconcile-all retrigger consumes both health channels — see
+    // the `run_controller` arm for the shared rationale (#211).
+    let route_health = status_writer.reconciler.route_health();
 
     server.add_service(background_service("controller", status_writer.controller));
     server.add_service(background_service("reconciler", status_writer.reconciler));
@@ -693,7 +706,12 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
             controller_name: args.common.controller_name.clone(),
             controller_image: resolve_controller_image(),
             leader: Arc::clone(&status_writer.leader),
-            accepted_overrides,
+            tls_health: tls_health.clone(),
+            route_health,
+            ingress_ports: IngressPorts::new(
+                args.common.ingress_http_port,
+                args.common.ingress_https_port,
+            ),
         }),
     ));
 
