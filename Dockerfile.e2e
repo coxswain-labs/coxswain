@@ -1,15 +1,22 @@
 # syntax=docker/dockerfile:1.7
-# Lightweight e2e image: copies the binary already compiled on the host/CI
-# runner into the same distroless base as the production image.
+# Lightweight e2e image: copies the debug binary already compiled on the host/CI
+# runner into a distroless runtime with a glibc that covers current Ubuntu
+# runners.
 #
-# This avoids the full cargo-chef multi-stage build (5-10 min cold) during
-# e2e test runs while still using a release binary.
+# Debug profile is used so the host compile shares its dependency graph with
+# the `cargo test --no-run` invocation that produces the e2e test binaries —
+# no double compilation across profiles.
+#
+# Runtime base: distroless/cc-debian13 (trixie, glibc 2.41) — exceeds Ubuntu
+# 24.04's glibc 2.39 on `ubuntu-latest` runners, so host-compiled binaries
+# load cleanly. cc-debian12 (glibc 2.36) crash-loops because the binary
+# requires symbol versions newer than the runtime can provide.
 #
 # Usage:
-#   cargo build --release --bin coxswain
+#   cargo build --bin coxswain
 #   docker build -f Dockerfile.e2e -t coxswain:e2e .
-FROM gcr.io/distroless/cc-debian12:nonroot
-COPY target/release/coxswain /usr/local/bin/coxswain
+FROM gcr.io/distroless/cc-debian13:nonroot
+COPY target/debug/coxswain /usr/local/bin/coxswain
 ENV COXSWAIN_LOG=info \
     COXSWAIN_LOG_FORMAT=json
 ENTRYPOINT ["/usr/local/bin/coxswain"]

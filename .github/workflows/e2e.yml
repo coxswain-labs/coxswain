@@ -50,16 +50,33 @@ jobs:
         with:
           cache-key-prefix: e2e-build
 
-      # Compile the coxswain binary (release) only — the e2e test harness is
-      # compiled per-job in the `e2e` matrix so its test-profile artifacts share
-      # the same Rust cache without needing a separate artifact upload/download.
+      # Build coxswain and the e2e test binaries in debug profile so they share
+      # the same dependency graph — one cargo cache, two sets of artifacts.
+      # Debug is fine for tests; we're not measuring proxy throughput here.
       - name: Build coxswain binary
-        run: cargo build --release --bin coxswain
+        run: cargo build --bin coxswain
 
-      # Wrap the compiled binary in a minimal distroless image using
-      # Dockerfile.e2e — a 2-line COPY-only Dockerfile that takes ~5 s.
-      # No BuildKit cache needed; the compile cost is already paid above via
-      # the Rust GHA cache.
+      # cargo test --no-run compiles every #[test] binary in coxswain-e2e/tests/
+      # without running them. --message-format=json emits one JSON per artifact;
+      # we extract (target.name, executable) pairs and copy each into test-bins/
+      # under its short name so matrix jobs can address them by suite.
+      - name: Build e2e test binaries
+        run: |
+          set -euo pipefail
+          mkdir -p test-bins
+          cargo test --no-run -p coxswain-e2e --tests --message-format=json \
+            | tee /tmp/cargo-test.json \
+            | jq -r '
+                select(.reason == "compiler-artifact") |
+                select(.target.kind[]? == "test") |
+                select(.executable != null) |
+                "\(.target.name)\t\(.executable)"
+              ' \
+            | while IFS=$'\t' read -r name exe; do
+                cp "$exe" "test-bins/$name"
+              done
+          ls -lh test-bins/
+
       - name: Build e2e Docker image
         run: docker build -f Dockerfile.e2e -t coxswain:e2e .
 
@@ -73,9 +90,17 @@ jobs:
           path: e2e-image.tar.gz
           retention-days: 1
 
+      - name: Upload e2e test binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-test-bins
+          path: test-bins/
+          retention-days: 1
+
   e2e:
     name: e2e-${{ matrix.suite }}
     needs: build
+    # Matrix jobs only run pre-compiled binaries — no Rust toolchain, no cargo.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -93,13 +118,12 @@ jobs:
           - suite: rbac-read-only-proxy
             test: rbac_read_only_proxy
     steps:
+      # Checkout is required because the test binaries embed
+      # CARGO_MANIFEST_DIR at compile time and read fixture YAML / Helm chart
+      # files from the workspace at runtime. The runner uses the same
+      # /home/runner/work/<repo>/<repo> path on every runner image, so the
+      # paths baked in by the build job resolve here too.
       - uses: actions/checkout@v6
-
-      # Restore the Rust build cache so `cargo test --no-run` below only
-      # recompiles what changed since the last run of this suite.
-      - uses: ./.github/actions/setup-rust-with-cache
-        with:
-          cache-key-prefix: e2e-test
 
       - uses: ./.github/actions/setup-kind-cluster
         with:
@@ -118,10 +142,17 @@ jobs:
       - name: Load Docker image into daemon
         run: docker load < e2e-image.tar.gz
 
+      - name: Download e2e test binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-test-bins
+          path: test-bins/
+
       - name: Run e2e tests (${{ matrix.suite }})
-        run: cargo test -p coxswain-e2e --test ${{ matrix.test }} -- --test-threads=1
+        run: |
+          chmod +x test-bins/${{ matrix.test }}
+          ./test-bins/${{ matrix.test }} --test-threads=1
         env:
-          # Image already loaded into the Docker daemon; bootstrap skips docker build.
           COXSWAIN_E2E_SKIP_BUILD: "1"
           RUST_LOG: coxswain_e2e=debug,warn
 

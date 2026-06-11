@@ -1,8 +1,8 @@
-# Cargo build artefacts — exclude everything except the release binary
+# Cargo build artefacts — exclude everything except the debug binary
 # needed by Dockerfile.e2e (last rule wins in .dockerignore).
 target/
 **/target/
-!target/release/coxswain
+!target/debug/coxswain
 
 # VCS / editor / harness scratch.
 .git/

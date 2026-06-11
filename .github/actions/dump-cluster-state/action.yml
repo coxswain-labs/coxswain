@@ -20,3 +20,15 @@ runs:
         kubectl get httproutes -A
         echo "=== Ingresses ==="
         kubectl get ingresses -A
+        echo "=== Pods in coxswain-system ==="
+        kubectl get pods -n coxswain-system -o wide || true
+        echo "=== Describe coxswain pods ==="
+        kubectl describe pods -n coxswain-system -l app.kubernetes.io/name=coxswain || true
+        echo "=== Current container logs (controller) ==="
+        kubectl logs -n coxswain-system deploy/coxswain-controller --tail=200 --all-containers --ignore-errors || true
+        echo "=== Previous container logs (controller, if crashed) ==="
+        kubectl logs -n coxswain-system deploy/coxswain-controller --tail=200 --all-containers --previous --ignore-errors || true
+        echo "=== Current container logs (shared-proxy) ==="
+        kubectl logs -n coxswain-system deploy/coxswain-shared-proxy --tail=200 --all-containers --ignore-errors || true
+        echo "=== Previous container logs (shared-proxy, if crashed) ==="
+        kubectl logs -n coxswain-system deploy/coxswain-shared-proxy --tail=200 --all-containers --previous --ignore-errors || true
