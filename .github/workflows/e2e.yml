@@ -42,7 +42,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
@@ -50,12 +50,13 @@ jobs:
         with:
           cache-key-prefix: e2e-build
 
-      # Build e2e test binaries. coxswain itself is packaged in the Docker
-      # image below — the test binaries run on the CI runner and drive the
-      # cluster via kubectl/helm.
-      - name: Build e2e test binaries
+      # Compile the coxswain binary and the e2e test harness binaries in a
+      # single cargo invocation. The binary goes into Dockerfile.e2e; the
+      # test binaries run on the CI runner and drive the cluster via kubectl/helm.
+      - name: Build coxswain binary and e2e test binaries
         run: |
           mkdir -p bin
+          cargo build --bin coxswain
           cargo test --no-run -p coxswain-e2e --message-format=json \
             | jq -r 'select(.reason == "compiler-artifact" and .executable != null) | "\(.executable) \(.target.name)"' \
             | while read -r src name; do cp "$src" "bin/$name"; done
@@ -67,20 +68,12 @@ jobs:
           path: bin/
           retention-days: 1
 
-      # Build the production Docker image. docker/build-push-action caches
-      # layers in the GHA cache so BoringSSL (the dominant compile cost) is
-      # only rebuilt when Cargo.lock or the Dockerfile changes.
-      - name: Set up Docker BuildKit
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          load: true
-          tags: coxswain:e2e
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      # Wrap the compiled binary in a minimal distroless image using
+      # Dockerfile.e2e — a 2-line COPY-only Dockerfile that takes ~5 s.
+      # No BuildKit cache needed; the compile cost is already paid above via
+      # the Rust GHA cache.
+      - name: Build e2e Docker image
+        run: docker build -f Dockerfile.e2e -t coxswain:e2e .
 
       - name: Save Docker image
         run: docker save coxswain:e2e | gzip > e2e-image.tar.gz

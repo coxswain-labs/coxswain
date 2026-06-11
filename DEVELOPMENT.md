@@ -301,18 +301,19 @@ curl -s http://localhost:8082/routes | jq .    # lists all active hostnames
 
 All four suites require a live cluster. Reset your cluster (delete and recreate it) before each run — the harness bootstraps everything from scratch.
 
-The harness builds the production Docker image, loads it into the cluster, installs the Helm chart, and runs tests against the deployed pods. On OrbStack, the first run takes ~10 min (BoringSSL build); subsequent runs with Docker layer cache take ~30 s.
+The harness wraps the locally compiled binary in a minimal `Dockerfile.e2e` image (~5 s build), loads it into the cluster, installs the Helm chart, and runs tests against the deployed pods. First-time setup is fast because there is no BoringSSL compilation — the full `Dockerfile` is only used for production releases.
 
 ### ingress / gateway_api / dedicated_proxy / proxy_hot_reconfig
 
 ```bash
+cargo build --bin coxswain   # compile once; re-run only when source changes
 cargo test -p coxswain-e2e --test ingress           -- --test-threads=1
 cargo test -p coxswain-e2e --test gateway_api        -- --test-threads=1
 cargo test -p coxswain-e2e --test dedicated_proxy    -- --test-threads=1
 cargo test -p coxswain-e2e --test proxy_hot_reconfig -- --test-threads=1
 ```
 
-No `cargo build` step needed — `docker build` runs inside the harness bootstrap.
+The bootstrap detects a missing `target/debug/coxswain` and fails fast with a clear message if you forget the build step.
 
 `proxy_hot_reconfig` covers:
 - Zero-drop Gateway listener add/remove (#231): 2 000 requests through a live listener while a port is added or removed mid-flight; asserts zero non-2xx and zero connection errors.

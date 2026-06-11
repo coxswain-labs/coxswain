@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1.7
+# Lightweight e2e image: copies the binary already compiled on the host/CI
+# runner into the same distroless base as the production image.
+#
+# This avoids the full cargo-chef multi-stage build (5-10 min cold) during
+# e2e test runs. The binary is a debug build — sufficient for correctness
+# testing, not for release or performance benchmarks.
+#
+# Usage:
+#   cargo build --bin coxswain
+#   docker build -f Dockerfile.e2e -t coxswain:e2e .
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY target/debug/coxswain /usr/local/bin/coxswain
+ENV COXSWAIN_LOG=info \
+    COXSWAIN_LOG_FORMAT=json
+ENTRYPOINT ["/usr/local/bin/coxswain"]
