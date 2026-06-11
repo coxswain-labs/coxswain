@@ -69,3 +69,10 @@ pub const BACKEND_TLS_POLICY_CONFLICT: &str = fixture!("backend_tls_policy_confl
 /// Minimal single-listener Gateway used by the listener-drain traffic tests (#231).
 /// Declares one HTTP listener on `GATEWAY_HTTP_PORT`.
 pub const LISTENER_DRAIN: &str = fixture!("listener_drain.yaml");
+
+/// Dedicated-mode Gateway whose `CoxswainGatewayParameters` references an
+/// image that cannot be pulled (#210). The dedicated proxy Pod never becomes
+/// Ready, so the operator never publishes `DedicatedProxyReady=True` and the
+/// shared pool must keep serving. Declares one HTTP listener on
+/// `GATEWAY_HTTP_PORT`.
+pub const CUTOVER_CRASH_LOOP: &str = fixture!("cutover_crash_loop.yaml");

@@ -1,0 +1,53 @@
+# Dedicated-mode Gateway whose dedicated proxy can never become Ready (#210).
+#
+# The `CoxswainGatewayParameters` overrides the image with one that does not
+# exist in any reachable registry. The operator's provisioning still succeeds
+# (the Deployment is server-side-applied), but the resulting Pod stays in
+# `ImagePullBackOff` indefinitely, so the operator publishes
+# `DedicatedProxyReady=False` and the shared pool must keep serving the
+# Gateway's routes.
+#
+# TESTNS is substituted at runtime; GATEWAY_HTTP_PORT is substituted from the
+# controller's pre-allocated Gateway HTTP port.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: crash-loop-params
+spec:
+  replicas: 1
+  serviceType: ClusterIP
+  image: registry.invalid/coxswain-labs/coxswain:does-not-exist
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: crash-gw
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    parametersRef:
+      group: gateway.coxswain-labs.dev
+      kind: CoxswainGatewayParameters
+      name: crash-loop-params
+  listeners:
+    - name: http
+      port: GATEWAY_HTTP_PORT
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: crash-route
+spec:
+  parentRefs:
+    - name: crash-gw
+  hostnames:
+    - "crash.TESTNS.local"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000

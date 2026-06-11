@@ -82,8 +82,8 @@ jobs:
             binary: gateway_api
           - suite: dedicated-proxy
             binary: dedicated_proxy
-          - suite: proxy-listener-drain
-            binary: proxy_listener_drain
+          - suite: proxy-hot-reconfig
+            binary: proxy_hot_reconfig
           - suite: health
             binary: health
           - suite: rbac-read-only-proxy

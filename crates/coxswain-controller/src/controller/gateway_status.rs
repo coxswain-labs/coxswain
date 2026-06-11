@@ -9,6 +9,13 @@ use coxswain_reflector::gw_types::v::gateways::{
 use coxswain_reflector::tls::GatewayListenerHealth;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
+/// Conditions whose type starts with this prefix are written by
+/// `crate::operator::condition` (cut-over signalling and any future
+/// operator-side condition). The status writer preserves them when
+/// rebuilding `status.conditions` so its merge patch doesn't clobber the
+/// operator's writes. See `crate::operator::condition` for the counterparty.
+const OPERATOR_OWNED_CONDITION_TYPE_PREFIX: &str = "gateway.coxswain-labs.dev/";
+
 /// Returns true when the Gateway's current status does not yet reflect the
 /// desired state computed from `health` and `accepted_override`. Prevents
 /// redundant patches and watch-feedback loops.
@@ -68,9 +75,13 @@ pub(super) fn gateway_needs_status_patch(
     // GEP-1364: every condition's observedGeneration must reflect the generation
     // the controller last processed. A spec-only change bumps .metadata.generation
     // without changing programmed-ness, leaving existing conditions stale.
+    //
+    // Operator-owned conditions (`gateway.coxswain-labs.dev/` prefix) have
+    // their own observed-generation lifecycle driven by the operator's
+    // reconcile, so the status writer ignores their staleness here.
     let expected_gen = gw.metadata.generation.unwrap_or(0);
     if let Some(conds) = gw.status.as_ref().and_then(|s| s.conditions.as_deref())
-        && any_condition_stale(conds, expected_gen)
+        && any_status_writer_owned_condition_stale(conds, expected_gen)
     {
         return true;
     }
@@ -85,6 +96,15 @@ pub(super) fn gateway_needs_status_patch(
 fn any_condition_stale(conditions: &[Condition], expected_gen: i64) -> bool {
     conditions
         .iter()
+        .any(|c| c.observed_generation.unwrap_or(0) < expected_gen)
+}
+
+/// Skip operator-owned conditions whose observed-generation lifecycle is
+/// driven separately by the operator's reconcile loop.
+fn any_status_writer_owned_condition_stale(conditions: &[Condition], expected_gen: i64) -> bool {
+    conditions
+        .iter()
+        .filter(|c| !c.type_.starts_with(OPERATOR_OWNED_CONDITION_TYPE_PREFIX))
         .any(|c| c.observed_generation.unwrap_or(0) < expected_gen)
 }
 
@@ -178,7 +198,12 @@ pub(super) fn build_gateway_status_patch(
         None => ("True", "Programmed", ""),
     };
 
-    let conditions = vec![
+    // Preserve any operator-owned conditions (those whose type starts with
+    // `gateway.coxswain-labs.dev/`) so the merge patch below doesn't clobber
+    // them. The operator side mirrors the convention by preserving everything
+    // NOT prefixed with that domain. See `crate::operator::condition` for the
+    // counterparty.
+    let mut conditions = vec![
         make_condition(
             "Accepted",
             accepted_status,
@@ -196,6 +221,14 @@ pub(super) fn build_gateway_status_patch(
             now.clone(),
         ),
     ];
+    if let Some(existing) = gw.status.as_ref().and_then(|s| s.conditions.as_deref()) {
+        conditions.extend(
+            existing
+                .iter()
+                .filter(|c| c.type_.starts_with(OPERATOR_OWNED_CONDITION_TYPE_PREFIX))
+                .cloned(),
+        );
+    }
 
     let listener_statuses: Vec<GatewayStatusListeners> = gw
         .spec

@@ -786,6 +786,10 @@ pub(super) fn compute_ownership(
         .state()
         .into_iter()
         .filter(|g| owned_gateway_classes.contains(&g.spec.gateway_class_name))
+        // Exclude Gateways that have been cut over to a dedicated proxy
+        // (#210). The dedicated pool's data plane serves them now; the
+        // shared pool must drop them from its routing table.
+        .filter(|g| !gateway_is_cut_over(g))
         .filter_map(|g| {
             let ns = g.metadata.namespace.clone()?;
             let name = g.metadata.name.clone()?;
@@ -888,7 +892,9 @@ pub(super) fn build_gateway_routes(
     ownership: &Ownership<'_>,
     shared: &SharedGatewayRoutingTable,
 ) -> bool {
-    // Precompute ListenerKey → (hostname, port) from all owned gateway listeners.
+    // Precompute ListenerKey → (hostname, port) from all owned gateway
+    // listeners. Cut-over Gateways (#210) are excluded so their listeners
+    // never bind ports on the shared data plane.
     let listener_info: HashMap<ListenerKey, ListenerBinding> = stores
         .gateways
         .state()
@@ -898,6 +904,7 @@ pub(super) fn build_gateway_routes(
                 .gateway_classes
                 .contains(&g.spec.gateway_class_name)
         })
+        .filter(|g| !gateway_is_cut_over(g))
         .flat_map(|g| {
             let ns = g.metadata.namespace.clone().unwrap_or_default();
             let name = g.metadata.name.clone().unwrap_or_default();
@@ -1077,6 +1084,11 @@ pub(super) fn build_tls(
         {
             continue;
         }
+        // Cut-over Gateways (#210) don't contribute TLS certs to the shared
+        // store — the dedicated proxy terminates their TLS instead.
+        if gateway_is_cut_over(&gw) {
+            continue;
+        }
         let ns = gw.metadata.namespace.clone().unwrap_or_default();
         let name = gw.metadata.name.clone().unwrap_or_default();
         let health = GatewayApiReconciler::reconcile_tls(
@@ -1099,6 +1111,27 @@ pub(super) fn build_tls(
     }
 
     gateway_tls_health
+}
+
+/// Returns true iff the Gateway has been cut over to a dedicated proxy and
+/// the shared pool should not serve its routes (#210).
+///
+/// "Cut over" means the controller's provisioning operator (#208 + #210) has
+/// published `gateway.coxswain-labs.dev/DedicatedProxyReady=True` with an
+/// `observed_generation` that reflects the Gateway's current spec
+/// generation. The generation guard prevents a stale True condition (from
+/// before a spec change that may have demoted the Gateway out of dedicated
+/// mode) from incorrectly filtering the Gateway out — the operator must
+/// observe the new generation and re-publish the condition before the
+/// shared pool drops it again.
+pub(super) fn gateway_is_cut_over(gw: &Gateway) -> bool {
+    const CONDITION_TYPE: &str = "gateway.coxswain-labs.dev/DedicatedProxyReady";
+    let expected_gen = gw.metadata.generation.unwrap_or(0);
+    gw.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|cs| cs.iter().find(|c| c.type_ == CONDITION_TYPE))
+        .is_some_and(|c| c.status == "True" && c.observed_generation.unwrap_or(0) >= expected_gen)
 }
 
 /// Increment `attached_routes` counters for each gateway listener whose hostname
@@ -1164,5 +1197,103 @@ pub(super) fn count_attached_routes(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gateway_is_cut_over;
+    use crate::gw_types::v::gateways::{Gateway, GatewayStatus};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+    use kube::api::ObjectMeta;
+
+    fn cond(type_: &str, status: &str, observed_gen: i64) -> Condition {
+        Condition {
+            type_: type_.into(),
+            status: status.into(),
+            reason: "x".into(),
+            message: String::new(),
+            observed_generation: Some(observed_gen),
+            last_transition_time: Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH),
+        }
+    }
+
+    fn gw(generation: i64, conditions: Vec<Condition>) -> Gateway {
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".into()),
+                namespace: Some("ns".into()),
+                generation: Some(generation),
+                ..Default::default()
+            },
+            spec: Default::default(),
+            status: Some(GatewayStatus {
+                conditions: Some(conditions),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn no_status_means_not_cut_over() {
+        let gw = Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".into()),
+                namespace: Some("ns".into()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: Default::default(),
+            status: None,
+        };
+        assert!(!gateway_is_cut_over(&gw));
+    }
+
+    #[test]
+    fn no_dedicated_proxy_ready_condition_means_not_cut_over() {
+        let gw = gw(1, vec![cond("Accepted", "True", 1)]);
+        assert!(!gateway_is_cut_over(&gw));
+    }
+
+    #[test]
+    fn dedicated_proxy_ready_false_means_not_cut_over() {
+        let gw = gw(
+            1,
+            vec![cond(
+                "gateway.coxswain-labs.dev/DedicatedProxyReady",
+                "False",
+                1,
+            )],
+        );
+        assert!(!gateway_is_cut_over(&gw));
+    }
+
+    #[test]
+    fn dedicated_proxy_ready_true_with_current_gen_means_cut_over() {
+        let gw = gw(
+            2,
+            vec![cond(
+                "gateway.coxswain-labs.dev/DedicatedProxyReady",
+                "True",
+                2,
+            )],
+        );
+        assert!(gateway_is_cut_over(&gw));
+    }
+
+    #[test]
+    fn stale_true_condition_does_not_cut_over() {
+        // metadata.generation=2 but condition observed gen=1 → the condition
+        // reflects an older spec; do not filter the Gateway out until the
+        // operator has re-published the condition against the new spec.
+        let gw = gw(
+            2,
+            vec![cond(
+                "gateway.coxswain-labs.dev/DedicatedProxyReady",
+                "True",
+                1,
+            )],
+        );
+        assert!(!gateway_is_cut_over(&gw));
     }
 }

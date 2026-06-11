@@ -33,7 +33,7 @@
 //! successful resolve we clear the override so the writer returns to
 //! emitting `Accepted=True`.
 
-use super::{apply, params, rbac, render};
+use super::{apply, condition, params, rbac, render};
 use crate::AcceptedOverrides;
 use crate::AcceptedReason;
 use async_trait::async_trait;
@@ -44,6 +44,7 @@ use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::gw_types::v::referencegrants::ReferenceGrant;
 use futures::StreamExt;
+use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::rbac::v1::RoleBinding;
 use kube::{
     Api, Client, Resource as _,
@@ -152,6 +153,10 @@ struct ReconcileContext {
     params_store: Store<CoxswainGatewayParameters>,
     routes_store: Store<HttpRoute>,
     grants_store: Store<ReferenceGrant>,
+    /// Pods carrying the dedicated-proxy labels. Reads off this store drive
+    /// the `gateway.coxswain-labs.dev/DedicatedProxyReady` condition (#210).
+    /// Cluster-wide watch narrowed by `PROXY_POD_LABEL_SELECTOR`.
+    pods_store: Store<Pod>,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
 
@@ -161,6 +166,20 @@ struct ReconcileContext {
 /// it K8s would delete the Gateway before we can clean up the bindings,
 /// leaving stale RBAC across the cluster.
 const CLEANUP_FINALIZER: &str = "gateway.coxswain-labs.dev/dedicated-cleanup";
+
+/// Label selector matching every Pod the operator provisions for a
+/// dedicated-mode Gateway. The selector is the intersection of the reserved
+/// labels rendered onto each Pod (see `RESERVED_LABEL_KEYS` in
+/// [`super::render`]) — `managed-by=coxswain` alone is too narrow (some
+/// charts use it for unrelated objects), the `app.kubernetes.io/name=coxswain`
+/// pin closes that gap.
+const PROXY_POD_LABEL_SELECTOR: &str =
+    "app.kubernetes.io/managed-by=coxswain,app.kubernetes.io/name=coxswain";
+
+/// Label key identifying the owning Gateway's name on every rendered Pod.
+/// Set by `super::render::standard_labels` to match the Gateway-API
+/// GEP-1762 convention.
+const POD_GATEWAY_NAME_LABEL: &str = "gateway.networking.k8s.io/gateway-name";
 
 /// Short re-queue used after adding the finalizer on a fresh dedicated
 /// Gateway. The follow-up reconcile sees the patched object (with the
@@ -236,6 +255,21 @@ impl BackgroundService for Operator {
                 while stream.next().await.is_some() {}
             }
         });
+        // Pod reflector for dedicated-proxy readiness (#210). Cluster-wide
+        // scope (dedicated-proxy Pods live in each Gateway's own namespace)
+        // narrowed to our own Pods via label selector — the watch streams
+        // only the small fleet we provision, not every Pod in the cluster.
+        let (pods_reader, pods_writer) = reflector::store::<Pod>();
+        tasks.spawn({
+            let api = Api::<Pod>::all(client.clone());
+            let config = watcher::Config::default().labels(PROXY_POD_LABEL_SELECTOR);
+            async move {
+                let stream =
+                    reflector::reflector(pods_writer, watcher(api, config).default_backoff());
+                tokio::pin!(stream);
+                while stream.next().await.is_some() {}
+            }
+        });
 
         // Wait for every dependency reflector to complete its initial sync
         // before exposing the stores to the reconcile loop. Without this,
@@ -261,6 +295,7 @@ impl BackgroundService for Operator {
             let _ = params_reader.wait_until_ready().await;
             let _ = routes_reader.wait_until_ready().await;
             let _ = grants_reader.wait_until_ready().await;
+            let _ = pods_reader.wait_until_ready().await;
         })
         .await;
         if sync.is_err() {
@@ -282,6 +317,7 @@ impl BackgroundService for Operator {
             params_store: params_reader,
             routes_store: routes_reader,
             grants_store: grants_reader,
+            pods_store: pods_reader,
             last_hashes: Mutex::new(HashMap::new()),
         });
 
@@ -293,7 +329,8 @@ impl BackgroundService for Operator {
         let api_params: Api<CoxswainGatewayParameters> = Api::all(client.clone());
         let api_routes: Api<HttpRoute> = Api::all(client.clone());
         let api_grants: Api<ReferenceGrant> = Api::all(client.clone());
-        let api_bindings: Api<RoleBinding> = Api::all(client);
+        let api_bindings: Api<RoleBinding> = Api::all(client.clone());
+        let api_pods: Api<Pod> = Api::all(client);
         let class_store_for_watches = ctx.class_store.clone();
         let routes_store_for_watches = ctx.routes_store.clone();
 
@@ -412,6 +449,28 @@ impl BackgroundService for Operator {
                     };
                     vec![ObjectRef::new(name).within(ns)]
                 },
+            )
+            // Pod → Gateway: dedicated-proxy Pods live in the Gateway's own
+            // namespace, so the mapping is `pod.metadata.namespace` +
+            // `pod.metadata.labels[gateway.networking.k8s.io/gateway-name]`.
+            // Drives the `DedicatedProxyReady` condition: every Ready ↔
+            // NotReady flip reconciles the owning Gateway within watch
+            // latency, no polling required.
+            .watches(
+                api_pods,
+                watcher::Config::default().labels(PROXY_POD_LABEL_SELECTOR),
+                |pod: Pod| -> Vec<ObjectRef<Gateway>> {
+                    let Some(ns) = pod.metadata.namespace.as_deref() else {
+                        return vec![];
+                    };
+                    let Some(labels) = pod.metadata.labels.as_ref() else {
+                        return vec![];
+                    };
+                    let Some(name) = labels.get(POD_GATEWAY_NAME_LABEL) else {
+                        return vec![];
+                    };
+                    vec![ObjectRef::new(name).within(ns)]
+                },
             );
 
         let stream = controller.run(reconcile, error_policy, ctx);
@@ -517,6 +576,9 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
                 rbac::delete_all_for_gateway(&ctx.client, gw_namespace, gw_name).await?;
                 remove_finalizer(&ctx.client, &gw).await?;
             }
+            // The shared pool resumes serving this Gateway as soon as the
+            // `DedicatedProxyReady` condition is gone from its status.
+            condition::clear_dedicated_proxy_ready(&ctx.client, &gw).await?;
             ctx.accepted_overrides.clear(&key);
             return Ok(Action::await_change());
         }
@@ -570,6 +632,17 @@ async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Actio
         .as_deref()
         .unwrap_or_else(|| panic!("invariant: rendered ServiceAccount has no name"));
     rbac::reconcile_rbac(&ctx.client, &gw, proxy_sa_name, &desired).await?;
+
+    // Stage 3 — publish the `DedicatedProxyReady` cut-over condition (#210)
+    // based on observed Pod readiness. The shared-proxy reflector reads
+    // this condition to decide whether to keep serving the Gateway; a True
+    // value means the dedicated pool has at least one Ready Pod and the
+    // shared pool must drop the Gateway from its routing table. Tracks
+    // current state — flips back to False whenever the dedicated pool has
+    // zero Ready Pods (rolling restart, crash, drain) so the shared pool
+    // resumes serving rather than dropping traffic entirely.
+    let ready_pod_count = count_ready_proxy_pods(&ctx.pods_store, gw_namespace, gw_name);
+    condition::patch_dedicated_proxy_ready(&ctx.client, &gw, ready_pod_count >= 1).await?;
 
     // Successful resolve + apply → clear any prior `InvalidParameters`
     // override (e.g. user just created the missing
@@ -713,6 +786,40 @@ fn gateway_routes_into(
         }
     }
     false
+}
+
+/// Count the dedicated-proxy Pods that are Ready for the given Gateway.
+///
+/// "Ready" means the Pod is in `gw_namespace`, carries the
+/// `gateway.networking.k8s.io/gateway-name` label matching `gw_name`, has
+/// no `deletionTimestamp` (a terminating Pod is not serving traffic), and
+/// carries a `Ready=True` condition in its `status.conditions`.
+fn count_ready_proxy_pods(pods_store: &Store<Pod>, gw_namespace: &str, gw_name: &str) -> usize {
+    pods_store
+        .state()
+        .iter()
+        .filter(|pod| {
+            pod.metadata.namespace.as_deref() == Some(gw_namespace)
+                && pod.metadata.deletion_timestamp.is_none()
+                && pod
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get(POD_GATEWAY_NAME_LABEL))
+                    .is_some_and(|n| n == gw_name)
+                && pod_is_ready(pod)
+        })
+        .count()
+}
+
+/// Returns true iff the Pod's `status.conditions` carries a `Ready=True`
+/// entry. Kubelet flips this based on the Pod's readiness probe — for
+/// dedicated-proxy Pods that means `/readyz` is passing.
+fn pod_is_ready(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
 }
 
 fn error_policy(obj: Arc<Gateway>, err: &ReconcileError, _ctx: Arc<ReconcileContext>) -> Action {
