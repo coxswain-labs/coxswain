@@ -326,13 +326,16 @@ cargo build --bin coxswain
 cargo test -p coxswain-e2e --test dedicated_proxy -- --test-threads=1
 ```
 
-### proxy_listener_drain
+### proxy_hot_reconfig
 
-Covers zero-drop Gateway listener add/remove (#231): runs 2 000 requests through a live listener while a port is added or removed mid-flight and asserts zero non-2xx responses and zero connection errors.
+Covers in-flight requests surviving a data-plane reconfig:
+
+- Zero-drop Gateway listener add/remove (#231): runs 2 000 requests through a live listener while a port is added or removed mid-flight and asserts zero non-2xx responses and zero connection errors.
+- Dedicated-mode crash-loop (#210): a Gateway promoted into dedicated mode with an unreachable image must keep being served by the shared pool indefinitely — sustained load for 15 s asserts zero drops while the dedicated proxy stays NotReady.
 
 ```bash
 cargo build --bin coxswain
-cargo test -p coxswain-e2e --test proxy_listener_drain -- --test-threads=1
+cargo test -p coxswain-e2e --test proxy_hot_reconfig -- --test-threads=1
 ```
 
 ### conformance
