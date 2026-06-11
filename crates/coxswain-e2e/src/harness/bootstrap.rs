@@ -210,6 +210,12 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         chart.to_string_lossy().into_owned(),
         "--namespace".into(),
         COXSWAIN_NAMESPACE.into(),
+        // --create-namespace tells Helm to create the target namespace if absent.
+        // namespace.create=false disables the chart's own Namespace template so
+        // the two don't conflict when the namespace doesn't exist yet.
+        "--create-namespace".into(),
+        "--set".into(),
+        "namespace.create=false".into(),
         "--set".into(),
         format!("image.repository={}", image_repository()),
         "--set".into(),

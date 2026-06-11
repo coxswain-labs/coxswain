@@ -72,6 +72,8 @@ runs:
       run: |
         helm upgrade --install coxswain charts/coxswain \
           --namespace coxswain-system \
+          --create-namespace \
+          --set namespace.create=false \
           --set image.repository=coxswain \
           --set image.tag=e2e \
           --set image.pullPolicy=Never \
