@@ -1,6 +1,6 @@
 ---
-name: refactor
-description: In-depth code-quality review leveraging /rust-skills.
+name: audit-code-quality
+description: In-depth code-quality audit of the entire workspace leveraging /rust-skills. Produces a remediation plan (does not refactor directly); the user reviews findings and approves which workstreams to execute. Use when the user wants a thorough review after a wave of feature work — for example "audit the workspace", "check for drift", "review code quality", "have we drifted on conventions". Dispatches up to 3 Explore agents in parallel, verifies each BLOCKER claim against source, cross-checks findings against existing GitHub issues, and writes a remediation plan with commit sequencing.
 ---
 
 I need an in-depth code-quality review of the entire workspace. Recent feature work has introduced architectural and feature changes, and I'm concerned quality has drifted.
