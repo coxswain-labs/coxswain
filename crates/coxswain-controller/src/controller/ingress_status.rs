@@ -93,4 +93,68 @@ mod tests {
         assert_eq!(entry["hostname"], "lb.example.com");
         assert!(entry.get("ip").is_none() || entry["ip"].is_null());
     }
+
+    // ── Migrated from controller/tests/controller.rs ─────────────────────────
+
+    #[test]
+    fn patch_uses_ip_field_for_ip_address() {
+        let addr = StatusAddress::Ip("203.0.113.1".parse().unwrap());
+        let patch = build_ingress_status_patch(&addr);
+        assert_eq!(
+            patch,
+            serde_json::json!({
+                "status": { "loadBalancer": { "ingress": [{ "ip": "203.0.113.1" }] } }
+            })
+        );
+    }
+
+    #[test]
+    fn patch_uses_hostname_field_for_hostname() {
+        let addr = StatusAddress::Hostname("coxswain.example.com".into());
+        let patch = build_ingress_status_patch(&addr);
+        assert_eq!(
+            patch,
+            serde_json::json!({
+                "status": { "loadBalancer": { "ingress": [{ "hostname": "coxswain.example.com" }] } }
+            })
+        );
+    }
+
+    #[test]
+    fn lb_already_matches_returns_true_when_ip_equal() {
+        let ing = ingress_with_lb(Some("203.0.113.1"), None);
+        let addr = StatusAddress::Ip("203.0.113.1".parse().unwrap());
+        assert!(ingress_lb_already_matches(&ing, &addr));
+    }
+
+    #[test]
+    fn lb_already_matches_returns_false_when_ip_differs() {
+        let ing = ingress_with_lb(Some("10.0.0.1"), None);
+        let addr = StatusAddress::Ip("203.0.113.1".parse().unwrap());
+        assert!(!ingress_lb_already_matches(&ing, &addr));
+    }
+
+    #[test]
+    fn lb_already_matches_returns_true_when_hostname_equal() {
+        let ing = ingress_with_lb(None, Some("coxswain.example.com"));
+        let addr = StatusAddress::Hostname("coxswain.example.com".into());
+        assert!(ingress_lb_already_matches(&ing, &addr));
+    }
+
+    #[test]
+    fn lb_already_matches_returns_false_when_hostname_differs() {
+        let ing = ingress_with_lb(None, Some("other.example.com"));
+        let addr = StatusAddress::Hostname("coxswain.example.com".into());
+        assert!(!ingress_lb_already_matches(&ing, &addr));
+    }
+
+    #[test]
+    fn lb_already_matches_returns_false_when_status_empty() {
+        let ing = Ingress {
+            status: None,
+            ..Default::default()
+        };
+        let addr = StatusAddress::Ip("203.0.113.1".parse().unwrap());
+        assert!(!ingress_lb_already_matches(&ing, &addr));
+    }
 }

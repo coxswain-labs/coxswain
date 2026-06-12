@@ -34,7 +34,7 @@ use thiserror::Error;
 /// The Step 9 acceptance criterion (#208) verifies this is exactly
 /// `"coxswain-controller"` via `kubectl get deployment ... -o json | jq
 /// '.metadata.managedFields[].manager'`. Do not rename without coordinating
-/// the e2e assertion in `crates/coxswain-e2e/tests/dedicated_gateway.rs`.
+/// the e2e assertion in `crates/coxswain-e2e/tests/dedicated_proxy.rs`.
 pub(super) const FIELD_MANAGER: &str = "coxswain-controller";
 
 /// Errors returned by [`apply_rendered`]. Each variant carries the underlying

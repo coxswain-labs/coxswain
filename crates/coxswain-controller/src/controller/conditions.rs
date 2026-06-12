@@ -111,11 +111,13 @@ pub(super) fn filter_owned_parent_refs(
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_owned_parent_refs, gateway_class_accepted, has_condition, http_route_programmed,
-        make_condition,
+        filter_owned_parent_refs, gateway_accepted, gateway_class_accepted, gateway_programmed,
+        has_condition, http_route_programmed, make_condition,
     };
     use coxswain_core::ownership::ObjectKey;
+    use coxswain_reflector::gw_types::HttpRoute;
     use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassStatus};
+    use gateway_api::apis::standard::gateways::{Gateway, GatewayStatus};
     use gateway_api::apis::standard::httproutes::{
         HttpRouteParentRefs, HttpRouteStatus, HttpRouteStatusParents,
         HttpRouteStatusParentsParentRef,
@@ -126,6 +128,27 @@ mod tests {
 
     fn owned(ns: &str, name: &str) -> HashSet<ObjectKey> {
         [ObjectKey::new(ns, name)].into()
+    }
+
+    fn owned_pairs(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {
+        pairs
+            .iter()
+            .map(|(ns, name)| ObjectKey::new(*ns, *name))
+            .collect()
+    }
+
+    fn stub_condition(
+        type_: &str,
+        status: &str,
+    ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
+            type_: type_.to_string(),
+            status: status.to_string(),
+            reason: String::new(),
+            message: String::new(),
+            observed_generation: None,
+            last_transition_time: Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH),
+        }
     }
 
     fn now() -> Time {
@@ -260,5 +283,231 @@ mod tests {
         ];
         let result = filter_owned_parent_refs(&refs, "ns", &set);
         assert_eq!(result.len(), 2);
+    }
+
+    // ── Stub-condition-driven tests (migrated from controller/tests/controller.rs) ─
+
+    #[test]
+    fn has_condition_returns_true_when_present_and_true() {
+        let conds = vec![stub_condition("Programmed", "True")];
+        assert!(has_condition(Some(&conds), "Programmed"));
+    }
+
+    #[test]
+    fn has_condition_returns_false_when_absent() {
+        let conds = vec![stub_condition("Accepted", "True")];
+        assert!(!has_condition(Some(&conds), "Programmed"));
+    }
+
+    #[test]
+    fn has_condition_returns_false_when_not_true() {
+        let conds = vec![stub_condition("Programmed", "False")];
+        assert!(!has_condition(Some(&conds), "Programmed"));
+    }
+
+    #[test]
+    fn gateway_class_accepted_when_condition_present() {
+        let gc = GatewayClass {
+            status: Some(GatewayClassStatus {
+                conditions: Some(vec![stub_condition("Accepted", "True")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(gateway_class_accepted(&gc));
+    }
+
+    #[test]
+    fn gateway_class_not_accepted_when_no_status() {
+        let gc = GatewayClass {
+            status: None,
+            ..Default::default()
+        };
+        assert!(!gateway_class_accepted(&gc));
+    }
+
+    #[test]
+    fn http_route_programmed_for_matching_controller_and_owned_parent() {
+        let set = owned_pairs(&[("default", "gw")]);
+        let route = HttpRoute {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            status: Some(HttpRouteStatus {
+                parents: vec![HttpRouteStatusParents {
+                    controller_name: "my-controller".to_string(),
+                    conditions: vec![
+                        stub_condition("Programmed", "True"),
+                        stub_condition("ResolvedRefs", "True"),
+                    ],
+                    parent_ref: HttpRouteStatusParentsParentRef {
+                        name: "gw".to_string(),
+                        namespace: Some("default".to_string()),
+                        ..Default::default()
+                    },
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(http_route_programmed(&route, "my-controller", &set));
+    }
+
+    #[test]
+    fn http_route_not_programmed_for_different_controller() {
+        let set = owned_pairs(&[("default", "gw")]);
+        let route = HttpRoute {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            status: Some(HttpRouteStatus {
+                parents: vec![HttpRouteStatusParents {
+                    controller_name: "other-controller".to_string(),
+                    conditions: vec![stub_condition("Programmed", "True")],
+                    parent_ref: HttpRouteStatusParentsParentRef {
+                        name: "gw".to_string(),
+                        namespace: Some("default".to_string()),
+                        ..Default::default()
+                    },
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(!http_route_programmed(&route, "my-controller", &set));
+    }
+
+    #[test]
+    fn http_route_not_programmed_when_parent_not_owned() {
+        let set = owned_pairs(&[("default", "gw")]);
+        let route = HttpRoute {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            status: Some(HttpRouteStatus {
+                parents: vec![HttpRouteStatusParents {
+                    controller_name: "my-controller".to_string(),
+                    conditions: vec![stub_condition("Programmed", "True")],
+                    parent_ref: HttpRouteStatusParentsParentRef {
+                        name: "envoy-gateway".to_string(),
+                        namespace: Some("default".to_string()),
+                        ..Default::default()
+                    },
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(!http_route_programmed(&route, "my-controller", &set));
+    }
+
+    #[test]
+    fn filter_owned_parent_refs_keeps_owned_only() {
+        let set = owned_pairs(&[("default", "gw")]);
+        let refs = vec![
+            HttpRouteParentRefs {
+                name: "gw".to_string(),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            HttpRouteParentRefs {
+                name: "envoy-gw".to_string(),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+        ];
+        let filtered = filter_owned_parent_refs(&refs, "default", &set);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "gw");
+    }
+
+    #[test]
+    fn filter_owned_parent_refs_returns_empty_when_none_owned() {
+        let set = owned_pairs(&[("default", "gw")]);
+        let refs = vec![HttpRouteParentRefs {
+            name: "foreign-gw".to_string(),
+            namespace: Some("default".to_string()),
+            ..Default::default()
+        }];
+        let filtered = filter_owned_parent_refs(&refs, "default", &set);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn filter_owned_parent_refs_applies_default_namespace() {
+        let set = owned_pairs(&[("apps", "gw")]);
+        let refs = vec![HttpRouteParentRefs {
+            name: "gw".to_string(),
+            namespace: None,
+            ..Default::default()
+        }];
+        let filtered = filter_owned_parent_refs(&refs, "apps", &set);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn gateway_accepted_true_when_condition_present() {
+        let gw = Gateway {
+            status: Some(GatewayStatus {
+                conditions: Some(vec![stub_condition("Accepted", "True")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(gateway_accepted(&gw));
+    }
+
+    #[test]
+    fn gateway_accepted_false_when_no_status() {
+        let gw = Gateway {
+            status: None,
+            ..Default::default()
+        };
+        assert!(!gateway_accepted(&gw));
+    }
+
+    #[test]
+    fn gateway_accepted_false_when_status_is_false() {
+        let gw = Gateway {
+            status: Some(GatewayStatus {
+                conditions: Some(vec![stub_condition("Accepted", "False")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!gateway_accepted(&gw));
+    }
+
+    #[test]
+    fn gateway_programmed_true_when_condition_present() {
+        let gw = Gateway {
+            status: Some(GatewayStatus {
+                conditions: Some(vec![stub_condition("Programmed", "True")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(gateway_programmed(&gw));
+    }
+
+    #[test]
+    fn gateway_programmed_false_when_absent() {
+        let gw = Gateway {
+            status: Some(GatewayStatus {
+                conditions: Some(vec![stub_condition("Accepted", "True")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!gateway_programmed(&gw));
+    }
+
+    #[test]
+    fn gateway_programmed_false_when_no_status() {
+        let gw = Gateway {
+            status: None,
+            ..Default::default()
+        };
+        assert!(!gateway_programmed(&gw));
     }
 }

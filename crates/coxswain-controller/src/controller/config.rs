@@ -230,4 +230,19 @@ mod tests {
             Some(StatusAddress::Hostname(_))
         ));
     }
+
+    #[test]
+    fn none_status_address_is_ok() {
+        let cfg = ControllerConfig::new(
+            "ctrl".to_string(),
+            "pod".to_string(),
+            "ns".to_string(),
+            LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
+            None,
+            None,
+            IngressPorts::new(Some(80), Some(443)),
+        )
+        .unwrap();
+        assert!(cfg.status_address.is_none());
+    }
 }
