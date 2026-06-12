@@ -324,13 +324,45 @@ The bootstrap detects a missing `target/debug/coxswain` and fails fast with a cl
 
 ### conformance
 
-The Gateway API conformance suite runs against coxswain deployed via Helm. The harness installs the chart, discovers the LoadBalancer IP, and passes it as `--status-address` so `Gateway.status.addresses` is populated correctly.
+The Gateway API conformance suite runs against coxswain deployed via Helm. Unlike the Rust e2e suites, the conformance run is **not** wrapped by `coxswain-e2e`; install and port plumbing are spelled out below.
+
+The default chart values reserve ports 80/443 for the Ingress data plane, which causes every conformance Gateway listener on those ports to be rejected with `Programmed=False, reason=PortUnavailable` (#201). Conformance therefore installs with the Ingress entry points disabled and the Gateway listener ports pre-declared on the `LoadBalancer` Service. The conformance fixtures declare Gateway listeners on ports 80, 443, 8080, 8090, 8443 — all five must be reachable through the LB.
 
 ```bash
-# Build the image first (same image the harness would build automatically).
+# 1. Reset the cluster (OrbStack example) so the install starts from clean state.
+orb delete -f k8s && orb start k8s
+
+# 2. Build the production image (same Dockerfile we ship, not Dockerfile.e2e —
+#    the conformance claim must validate the artifact published to GHCR).
 docker build -t coxswain:e2e .
 
-# Install coxswain; discover the LB IP; run the suite.
+# 3. Install the Gateway API CRDs at the pinned version.
+kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$(cat .gateway-api-version)/standard-install.yaml"
+
+# 4. Helm install — disable Ingress port reservation, pre-declare every Gateway
+#    listener port the conformance suite uses on the LB Service.
+helm install coxswain charts/coxswain --namespace coxswain-system --create-namespace \
+  --set image.repository=coxswain \
+  --set image.tag=e2e \
+  --set image.pullPolicy=IfNotPresent \
+  --set proxy.http.enabled=false \
+  --set proxy.https.enabled=false \
+  --set 'service.gateway.additionalPorts[0].name=gw-http,service.gateway.additionalPorts[0].port=80,service.gateway.additionalPorts[0].targetPort=80,service.gateway.additionalPorts[0].protocol=TCP' \
+  --set 'service.gateway.additionalPorts[1].name=gw-https,service.gateway.additionalPorts[1].port=443,service.gateway.additionalPorts[1].targetPort=443,service.gateway.additionalPorts[1].protocol=TCP' \
+  --set 'service.gateway.additionalPorts[2].name=gw-8080,service.gateway.additionalPorts[2].port=8080,service.gateway.additionalPorts[2].targetPort=8080,service.gateway.additionalPorts[2].protocol=TCP' \
+  --set 'service.gateway.additionalPorts[3].name=gw-8090,service.gateway.additionalPorts[3].port=8090,service.gateway.additionalPorts[3].targetPort=8090,service.gateway.additionalPorts[3].protocol=TCP' \
+  --set 'service.gateway.additionalPorts[4].name=gw-8443,service.gateway.additionalPorts[4].port=8443,service.gateway.additionalPorts[4].targetPort=8443,service.gateway.additionalPorts[4].protocol=TCP'
+
+# 5. Wait for the LB IP, then upgrade the release with --status-address so
+#    Gateway.status.addresses is populated correctly (memory: OrbStack's LB
+#    controller overwrites any IP you might try to fake here).
+until [ -n "$(kubectl -n coxswain-system get svc coxswain-shared-proxy -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ]; do sleep 2; done
+LB_IP=$(kubectl -n coxswain-system get svc coxswain-shared-proxy -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+helm upgrade coxswain charts/coxswain --namespace coxswain-system \
+  --reuse-values --set controller.statusAddress="$LB_IP"
+
+# 6. Wait for both Deployments Ready, then run the conformance suite.
+kubectl -n coxswain-system rollout status deployment/coxswain-controller deployment/coxswain-shared-proxy --timeout=120s
 cd conformance && go test -v -timeout 60m -run TestConformance \
   -args \
   --organization=coxswain-labs \
