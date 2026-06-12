@@ -2,8 +2,9 @@
 .cargo/config.toml
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
-.claude/plans/
 .claude/memory/
+.claude/plans/
+.claude/worktrees/
 .idea/
 .wip/
 conformance/reports/*.yaml

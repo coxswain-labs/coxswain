@@ -148,7 +148,13 @@ Every public struct and enum is `#[non_exhaustive]` unless it is intentionally o
 
 ### Test layout
 
-Per-source-file unit tests live in a `#[cfg(test)] mod tests;` submodule in the same file (small bodies) or in a sibling `<module>_tests.rs` file (large bodies). Cross-cutting tests for a crate live under `crates/<crate>/src/tests/`. Integration tests against the binary live in `crates/coxswain-e2e/tests/`. Established by issues #143 and #144 — do not collapse back into one test block per file.
+Per-source-file unit tests live **inline** as `#[cfg(test)] mod tests { use super::*; ... }` at the bottom of the source file. This is the rust-skills canonical pattern (rule `test-cfg-test-module`) and what the Rust ecosystem overwhelmingly uses — `use super::*;` reaches `pub(self)` items without forcing visibility bumps for testing, and the parent module's `use` statements flow through transparently.
+
+Cross-cutting unit tests (those that span multiple source files, plus shared test fixtures consumed by many inline test blocks) live under `crates/<crate>/src/[<submodule>/]tests/`. Each inline test block that needs a shared helper imports it via `use crate::<path>::tests::*;`. Shared helpers are declared `pub(super)` so wildcard imports reach them.
+
+Integration tests against the binary live in `crates/coxswain-e2e/tests/`.
+
+The sibling `<module>_tests.rs` pattern (and the `tests/<name>.rs` per-source-file pattern from #143/#144) was retired during the #242 quality remediation: the visibility-bump cost outweighed the file-size benefit, and the partial migration in operator/* and coxswain-admin made the codebase inconsistent. The earlier issues #143 and #144 are superseded by this section — do not reintroduce the sibling-file pattern.
 
 ### Per-crate Cargo manifest
 

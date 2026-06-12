@@ -1,20 +1,17 @@
 mod builder;
-mod entry;
-mod host_router;
-mod predicate;
 mod routing;
 
 use super::*;
-use http::{HeaderMap, HeaderName};
-use std::net::SocketAddr;
-use std::sync::Arc;
+pub(super) use http::{HeaderMap, HeaderName};
+pub(super) use std::net::SocketAddr;
+pub(super) use std::sync::Arc;
 
 // Routing-logic tests are spec-agnostic — the per-rule machinery is identical
 // for Ingress and Gateway. Pin the tests to the Gateway-flavored builder so
 // the existing assertions on multi-label wildcards continue to make sense.
-type RoutingTableBuilder = GatewayRoutingTableBuilder;
+pub(super) type RoutingTableBuilder = GatewayRoutingTableBuilder;
 
-const PORT: u16 = 80;
+pub(super) const PORT: u16 = 80;
 
 pub(super) fn make_group(name: &str, addr: &str) -> Arc<BackendGroup> {
     Arc::new(BackendGroup::new(

@@ -15,6 +15,3 @@ pub mod tls;
 
 pub use health::{CheckState, HealthRegistry, HealthSnapshot, SubsystemHandle, SubsystemSnapshot};
 pub use shared::Shared;
-
-#[cfg(test)]
-mod tests;
