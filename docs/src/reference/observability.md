@@ -87,7 +87,7 @@ Shared-pool pods don't carry those labels; the relabel leaves the target empty, 
 Inspect the per-subsystem detail via the admin port (open `kubectl -n coxswain-system port-forward svc/coxswain-shared-proxy-internal 8082:8082` in a separate terminal first; Helm installs use the Service name `<release>-internal`):
 
 ```bash
-curl -s http://localhost:8082/status | jq .
+curl -s http://localhost:8082/api/v1/health | jq .
 ```
 
 Example output:
@@ -95,9 +95,6 @@ Example output:
 ```json
 {
   "version": "0.1.0",
-  "synced": true,
-  "leader": false,
-  "host_count": 3,
   "subsystems": {
     "controller": {
       "status": "Ready",
@@ -117,8 +114,6 @@ Example output:
   }
 }
 ```
-
-The `synced` field is `true` when all subsystems are ready and is provided for dashboard compatibility.
 
 ## Routes endpoint
 

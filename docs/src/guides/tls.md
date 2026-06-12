@@ -199,7 +199,7 @@ Check the routing table and logs:
 
 ```bash
 curl http://localhost:8082/routes
-curl http://localhost:8082/status
+curl http://localhost:8082/api/v1/health
 ```
 
 A missing or malformed Secret produces a warning log but does not affect HTTP routes.

@@ -82,7 +82,7 @@ kubectl -n coxswain-system get deploy coxswain \
   -o jsonpath='{.spec.template.spec.containers[0].readinessProbe}'
 ```
 
-If `/readyz` returns 503 on a running pod, inspect `/status` to see which subsystem is blocked — see [Troubleshooting](troubleshooting.md#readyz-returns-503-on-startup).
+If `/readyz` returns 503 on a running pod, inspect `/api/v1/health` to see which subsystem is blocked — see [Troubleshooting](troubleshooting.md#readyz-returns-503-on-startup).
 
 ## Graceful shutdown
 
