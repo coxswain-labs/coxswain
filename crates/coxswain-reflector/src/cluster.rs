@@ -36,6 +36,11 @@ pub struct ClusterSummaryInputs<'a> {
     pub ingresses: &'a [Arc<Ingress>],
     /// Set of Gateways owned by this controller — filter for the gateway list.
     pub owned_gateways: &'a HashSet<ObjectKey>,
+    /// Set of GatewayClass names that have a `CoxswainGatewayParameters`
+    /// `parametersRef` (i.e. are dedicated-mode classes). Used to classify
+    /// Gateways whose dedicated-mode opt-in comes via the class, not the
+    /// per-Gateway `infrastructure.parametersRef` (#229).
+    pub dedicated_gateway_class_names: &'a HashSet<String>,
     /// Set of IngressClass names owned by this controller.
     pub owned_ingress_classes: &'a HashSet<String>,
     /// Name of the default IngressClass owned by this controller (if any) — claims
@@ -70,7 +75,11 @@ fn build_gateways(inputs: &ClusterSummaryInputs<'_>) -> Vec<GatewaySummary> {
             if !inputs.owned_gateways.contains(&key) {
                 return None;
             }
-            let proxy = if has_dedicated_parameters_ref(gw) {
+            let proxy = if has_dedicated_parameters_ref(gw)
+                || inputs
+                    .dedicated_gateway_class_names
+                    .contains(&gw.spec.gateway_class_name)
+            {
                 ProxyAssignment::dedicated()
             } else {
                 ProxyAssignment::shared()
@@ -357,7 +366,9 @@ mod tests {
 
         let gateways = vec![gw];
         let ingresses: Vec<Arc<Ingress>> = vec![];
+        let empty_dedicated_classes = HashSet::new();
         let summary = build_cluster_summary(&ClusterSummaryInputs {
+            dedicated_gateway_class_names: &empty_dedicated_classes,
             gateways: &gateways,
             ingresses: &ingresses,
             owned_gateways: &owned,
@@ -395,7 +406,9 @@ mod tests {
 
         let gateways = vec![gw];
         let ingresses: Vec<Arc<Ingress>> = vec![];
+        let empty_dedicated_classes = HashSet::new();
         let summary = build_cluster_summary(&ClusterSummaryInputs {
+            dedicated_gateway_class_names: &empty_dedicated_classes,
             gateways: &gateways,
             ingresses: &ingresses,
             owned_gateways: &owned,
@@ -418,7 +431,9 @@ mod tests {
 
         let gateways: Vec<Arc<Gateway>> = vec![];
         let ingresses = vec![ing];
+        let empty_dedicated_classes = HashSet::new();
         let summary = build_cluster_summary(&ClusterSummaryInputs {
+            dedicated_gateway_class_names: &empty_dedicated_classes,
             gateways: &gateways,
             ingresses: &ingresses,
             owned_gateways: &HashSet::new(),
@@ -463,7 +478,9 @@ mod tests {
 
         let gateways = vec![gw_a, gw_b, gw_c];
         let ingresses = vec![ing_a, ing_b];
+        let empty_dedicated_classes = HashSet::new();
         let summary = build_cluster_summary(&ClusterSummaryInputs {
+            dedicated_gateway_class_names: &empty_dedicated_classes,
             gateways: &gateways,
             ingresses: &ingresses,
             owned_gateways: &owned,
@@ -505,7 +522,9 @@ mod tests {
         let owned = owned_set(&[]); // empty — not ours
         let gateways = vec![gw];
         let ingresses: Vec<Arc<Ingress>> = vec![];
+        let empty_dedicated_classes = HashSet::new();
         let summary = build_cluster_summary(&ClusterSummaryInputs {
+            dedicated_gateway_class_names: &empty_dedicated_classes,
             gateways: &gateways,
             ingresses: &ingresses,
             owned_gateways: &owned,
@@ -522,7 +541,9 @@ mod tests {
         let ing = ingress("default", "unclassed", None, &[1], None);
         let gateways: Vec<Arc<Gateway>> = vec![];
         let ingresses = vec![ing];
+        let empty_dedicated_classes = HashSet::new();
         let summary = build_cluster_summary(&ClusterSummaryInputs {
+            dedicated_gateway_class_names: &empty_dedicated_classes,
             gateways: &gateways,
             ingresses: &ingresses,
             owned_gateways: &HashSet::new(),
@@ -539,7 +560,9 @@ mod tests {
         let ing = ingress("default", "unclassed", None, &[3], None);
         let gateways: Vec<Arc<Gateway>> = vec![];
         let ingresses = vec![ing];
+        let empty_dedicated_classes = HashSet::new();
         let summary = build_cluster_summary(&ClusterSummaryInputs {
+            dedicated_gateway_class_names: &empty_dedicated_classes,
             gateways: &gateways,
             ingresses: &ingresses,
             owned_gateways: &HashSet::new(),
@@ -579,7 +602,9 @@ mod tests {
 
         let gateways: Vec<Arc<Gateway>> = vec![];
         let ingresses = vec![ing];
+        let empty_dedicated_classes = HashSet::new();
         let summary = build_cluster_summary(&ClusterSummaryInputs {
+            dedicated_gateway_class_names: &empty_dedicated_classes,
             gateways: &gateways,
             ingresses: &ingresses,
             owned_gateways: &HashSet::new(),
@@ -618,7 +643,9 @@ mod tests {
         let owned = owned_set(&[("default", "gw")]);
         let gateways = vec![gw];
         let ingresses: Vec<Arc<Ingress>> = vec![];
+        let empty_dedicated_classes = HashSet::new();
         let summary = build_cluster_summary(&ClusterSummaryInputs {
+            dedicated_gateway_class_names: &empty_dedicated_classes,
             gateways: &gateways,
             ingresses: &ingresses,
             owned_gateways: &owned,

@@ -13,6 +13,9 @@
 //!   dedicated proxy pod, cross-namespace + `ReferenceGrant` revocation,
 //!   mode migration in both directions, and traffic continuity across a
 //!   controller pod restart.
+//! - **#229** — cluster-wide RBAC auto-derivation: `ClusterRoleBinding`
+//!   lifecycle for `allowedRoutes.namespaces.from: All` listeners, cleanup
+//!   on listener mode revert and on Gateway deletion.
 //!
 //! The Step-13 lifecycle tests reach the dedicated proxy via its LoadBalancer
 //! Service IP (provisioned by the controller operator with `serviceType:
@@ -28,7 +31,7 @@ use coxswain_e2e::{
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
-use k8s_openapi::api::rbac::v1::RoleBinding;
+use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use std::time::Duration;
 use tokio::process::Command;
@@ -1327,6 +1330,165 @@ async fn lifecycle_controller_restart_is_idempotent() -> anyhow::Result<()> {
     // time, so the same backend assertion still holds.
     let post = http.get(&host, "/").await?;
     post.assert_backend("echo-a");
+
+    Ok(())
+}
+
+// =============================================================================
+// #229 — cluster-wide RBAC auto-derivation from Gateway listener spec.
+// =============================================================================
+
+/// Returns the ClusterRoleBinding name the controller creates for a
+/// `from: All` listener — mirrors `cluster_binding_name` in
+/// `coxswain_controller::operator::rbac`.
+fn cluster_route_binding_name(gw_ns: &str, gw_name: &str) -> String {
+    format!("coxswain-{gw_ns}-{gw_name}-cluster-wide-routes")
+}
+
+/// 21. `from: All` listener → controller auto-provisions a `ClusterRoleBinding`
+///     for cluster-wide `HTTPRoute` reads and renders
+///     `--allow-cluster-wide-route-read` into the Deployment args. Flipping the
+///     listener back to `from: Same` removes the binding on the next reconcile.
+#[tokio::test]
+async fn cluster_wide_binding_created_and_removed_with_listener_mode() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-clusterwide-toggle").await?;
+
+    // Gateway fixture with from: All.
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_FROM_ALL,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let gw_name = "dedicated-gw-from-all";
+    let resource_name = "dedicated-gw-from-all-coxswain";
+    let crb_name = cluster_route_binding_name(&ns.name, gw_name);
+
+    let crbs: Api<ClusterRoleBinding> = Api::all(h.client.clone());
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // 1. ClusterRoleBinding appears within 15 s.
+    poll_until(Duration::from_secs(15), || async {
+        crbs.get(&crb_name).await.ok()
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("ClusterRoleBinding {crb_name} not created within 15s"))?;
+
+    // 2. Deployment carries --allow-cluster-wide-route-read.
+    let deploy = poll_until(Duration::from_secs(15), || async {
+        deployments.get(resource_name).await.ok()
+    })
+    .await?;
+    let containers = deploy
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .map(|s| s.containers.as_slice())
+        .unwrap_or_default();
+    let coxswain_c = containers
+        .iter()
+        .find(|c| c.name == "coxswain")
+        .expect("coxswain container");
+    let args = coxswain_c.args.as_ref().expect("args set");
+    assert!(
+        args.iter().any(|a| a == "--allow-cluster-wide-route-read"),
+        "--allow-cluster-wide-route-read not found in Deployment args: {args:?}"
+    );
+
+    // 3. Patch the listener to from: Same — the binding must disappear.
+    // SSA requires apiVersion + kind in the payload.
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let patch = serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "Gateway",
+        "metadata": { "name": gw_name, "namespace": &ns.name },
+        "spec": {
+            "gatewayClassName": "coxswain",
+            "infrastructure": {
+                "parametersRef": {
+                    "group": "gateway.coxswain-labs.dev",
+                    "kind": "CoxswainGatewayParameters",
+                    "name": "dedicated-params-from-all"
+                }
+            },
+            "listeners": [{
+                "name": "http",
+                "port": 8200,
+                "protocol": "HTTP",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            }]
+        }
+    });
+    gateways
+        .patch(
+            gw_name,
+            &PatchParams::apply("e2e-test").force(),
+            &Patch::Apply(patch),
+        )
+        .await?;
+
+    poll_until(Duration::from_secs(30), || async {
+        if crbs.get(&crb_name).await.is_err() {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "ClusterRoleBinding {crb_name} still present 30s after reverting to from: Same"
+        )
+    })?;
+
+    Ok(())
+}
+
+/// 22. Gateway deletion drives `ClusterRoleBinding` cleanup: the finalizer
+///     keeps the Gateway alive until the controller removes both per-namespace
+///     `RoleBinding`s and any cluster-wide `ClusterRoleBinding`s, then removes
+///     the finalizer.
+#[tokio::test]
+async fn cluster_wide_binding_deleted_on_gateway_deletion() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-clusterwide-gc").await?;
+
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_FROM_ALL,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let gw_name = "dedicated-gw-from-all";
+    let crb_name = cluster_route_binding_name(&ns.name, gw_name);
+
+    let crbs: Api<ClusterRoleBinding> = Api::all(h.client.clone());
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // Wait for the binding to exist before deleting — makes the "binding gone"
+    // assertion below meaningful.
+    poll_until(Duration::from_secs(15), || async {
+        crbs.get(&crb_name).await.ok()
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("ClusterRoleBinding {crb_name} not created within 15s"))?;
+
+    gateways.delete(gw_name, &DeleteParams::default()).await?;
+
+    poll_until(Duration::from_secs(30), || async {
+        let crb_gone = crbs.get(&crb_name).await.is_err();
+        let gw_gone = gateways.get(gw_name).await.is_err();
+        if crb_gone && gw_gone { Some(()) } else { None }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "ClusterRoleBinding {crb_name} or Gateway {gw_name} not cleaned up within 30s"
+        )
+    })?;
 
     Ok(())
 }
