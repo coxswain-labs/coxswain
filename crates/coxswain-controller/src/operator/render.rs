@@ -145,6 +145,12 @@ struct Common<'a> {
 }
 
 /// Render all three resources for a Gateway.
+///
+/// # Panics
+///
+/// Panics if the Gateway has no `metadata.namespace`. This is an apiserver
+/// invariant on any object delivered through a watch; its absence indicates
+/// a controller bug.
 #[must_use]
 pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
     let name = resource_name(inputs.gateway, inputs.gateway_class_name);

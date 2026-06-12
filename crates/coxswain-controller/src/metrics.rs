@@ -25,6 +25,12 @@ const CONTROLLER_LATENCY_BUCKETS: &[f64] =
 /// Gauge: `1` when this controller replica holds the leader lease, `0`
 /// otherwise. Always at most one replica reports `1` cluster-wide; operators
 /// can `sum()` this metric to assert exactly one leader at all times.
+///
+/// # Panics
+///
+/// Panics if the prometheus registry already contains a series with this name
+/// via a different registration path. The [`OnceLock`] makes this unreachable
+/// in practice; a failure indicates a duplicate registration bug.
 pub(crate) fn leader() -> &'static IntGauge {
     static GAUGE: OnceLock<IntGauge> = OnceLock::new();
     GAUGE.get_or_init(|| {
@@ -40,6 +46,10 @@ pub(crate) fn leader() -> &'static IntGauge {
 /// Spikes here usually mean an unstable lease (network partition, slow node)
 /// — under steady-state operation this stays at 0 or 1 for the replica's
 /// lifetime.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`leader`].
 pub(crate) fn leader_transitions_total() -> &'static IntCounter {
     static COUNTER: OnceLock<IntCounter> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -54,6 +64,10 @@ pub(crate) fn leader_transitions_total() -> &'static IntCounter {
 /// Counter: cumulative reconcile-loop iterations, by controller key and outcome.
 ///
 /// Labels: `controller` (e.g. `operator`), `result` (`ok` / `error` / `requeue`).
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`leader`].
 pub(crate) fn reconcile_total() -> &'static IntCounterVec {
     static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -69,6 +83,10 @@ pub(crate) fn reconcile_total() -> &'static IntCounterVec {
 }
 
 /// Histogram: reconcile-loop wall-clock duration, by controller key.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`leader`].
 pub(crate) fn reconcile_duration_seconds() -> &'static HistogramVec {
     static HIST: OnceLock<HistogramVec> = OnceLock::new();
     HIST.get_or_init(|| {
@@ -87,6 +105,10 @@ pub(crate) fn reconcile_duration_seconds() -> &'static HistogramVec {
 /// Counter: reconcile errors, by controller key. Exposed separately from
 /// `reconcile_total{result="error"}` so alerting rules can target it
 /// without ambiguity.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`leader`].
 pub(crate) fn reconcile_errors_total() -> &'static IntCounterVec {
     static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -105,6 +127,10 @@ pub(crate) fn reconcile_errors_total() -> &'static IntCounterVec {
 ///
 /// Labels: `kind` (`httproute`, `gateway`, `gateway_class`, `ingress`,
 /// `backend_tls_policy`), `result` (`ok` / `error` / `conflict`).
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`leader`].
 pub(crate) fn status_patch_total() -> &'static IntCounterVec {
     static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -120,6 +146,10 @@ pub(crate) fn status_patch_total() -> &'static IntCounterVec {
 }
 
 /// Histogram: `*/status` patch wall-clock duration, by resource kind.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`leader`].
 pub(crate) fn status_patch_duration_seconds() -> &'static HistogramVec {
     static HIST: OnceLock<HistogramVec> = OnceLock::new();
     HIST.get_or_init(|| {

@@ -339,6 +339,12 @@ pub(super) fn desired_namespaces_for_gateway(
 /// [`RbacError::Delete`] on delete failure for any binding being removed.
 /// Failures abort the reconcile after the first error — the kube-rs Controller
 /// re-queues, and the next reconcile retries.
+///
+/// # Panics
+///
+/// Panics if the Gateway has no `metadata.namespace` or `metadata.name`.
+/// Both are apiserver invariants on any object delivered through a watch;
+/// their absence indicates a controller bug.
 pub(super) async fn reconcile_rbac(
     client: &Client,
     gateway: &Gateway,
@@ -409,6 +415,11 @@ pub(super) async fn delete_all_for_gateway(
 ///
 /// Returns [`RbacError::ApplyClusterBinding`] or
 /// [`RbacError::DeleteClusterBinding`] on apiserver failure.
+///
+/// # Panics
+///
+/// Panics if the Gateway has no `metadata.namespace` or `metadata.name` —
+/// see [`reconcile_rbac`].
 pub(super) async fn reconcile_cluster_rbac(
     client: &Client,
     gateway: &Gateway,

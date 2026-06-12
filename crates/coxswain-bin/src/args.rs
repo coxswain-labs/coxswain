@@ -561,6 +561,13 @@ pub(crate) enum ProxyScope {
 impl ProxyRoleArgs {
     /// Returns the resolved [`ProxyScope`] without leaking the underlying
     /// flag pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `--dedicated` is set but `--gateway-name` or
+    /// `--gateway-namespace` is absent. The clap `required_if_eq` constraint
+    /// makes this statically unreachable through the CLI; a violation indicates
+    /// a bug in the argument definition.
     pub(crate) fn scope(&self) -> ProxyScope {
         if self.shared {
             ProxyScope::Shared
