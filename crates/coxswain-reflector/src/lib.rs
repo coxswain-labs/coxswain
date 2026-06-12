@@ -47,6 +47,7 @@ pub mod tls;
 mod tests;
 
 pub use cluster::{ClusterSummaryInputs, build_cluster_summary};
+pub use coxswain_core::fleet::SharedFleet;
 pub use crds::gateway_api_crds_present;
 pub use ingress::IngressPorts;
 pub use metrics::{MetricsPrefix, ReflectorMetrics};

@@ -142,6 +142,10 @@ pub struct OperatorConfig {
     /// reservation surfaces `Programmed=False, reason=PortUnavailable` —
     /// same semantics as the shared-pool writer (#201).
     pub ingress_ports: IngressPorts,
+    /// Admin server port rendered into the `gateway.coxswain-labs.dev/admin-port`
+    /// annotation on every dedicated-proxy pod. Propagated from the
+    /// `--admin-port` / `COXSWAIN_ADMIN_PORT` CLI argument.
+    pub admin_port: u16,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -190,6 +194,9 @@ struct ReconcileContext {
     /// Forwarded to [`super::status::build_dedicated_gateway_status_patch`]
     /// for the listener `PortUnavailable` precedence check.
     ingress_ports: IngressPorts,
+    /// Admin server port injected as `gateway.coxswain-labs.dev/admin-port` on
+    /// every rendered dedicated-proxy pod.
+    admin_port: u16,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
 
@@ -388,6 +395,7 @@ impl BackgroundService for Operator {
             nodes_store: nodes_reader,
             tls_health: self.config.tls_health.clone(),
             ingress_ports: self.config.ingress_ports,
+            admin_port: self.config.admin_port,
             last_hashes: Mutex::new(HashMap::new()),
         });
 
@@ -796,6 +804,7 @@ async fn reconcile_inner(
         watch_namespaces: &desired,
         allow_cluster_wide_route_read: derived.allow_cluster_wide_route_read,
         allow_cluster_wide_namespace_read: derived.allow_cluster_wide_namespace_read,
+        admin_port: ctx.admin_port,
     });
 
     // Stage 1 — provisioning (Deployment/Service/SA). SSA with force=true
@@ -1139,6 +1148,7 @@ mod tests {
             watch_namespaces: &std::collections::BTreeSet::new(),
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         let r_b = render::render(&render::RenderInputs {
             gateway: &gw,
@@ -1148,6 +1158,7 @@ mod tests {
             watch_namespaces: &std::collections::BTreeSet::new(),
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         assert_ne!(
             hash_rendered(&r_a),
@@ -1186,6 +1197,7 @@ mod tests {
             watch_namespaces: &empty_ns,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         };
         let r1 = render::render(&inputs);
         let r2 = render::render(&inputs);

@@ -37,6 +37,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
+use coxswain_core::fleet::{self, SharedFleet};
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::routing::{
@@ -46,7 +47,7 @@ use coxswain_core::routing::{
 use coxswain_core::shared::Shared;
 use coxswain_core::tls::{SharedTlsStore, TlsStoreBuilder};
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::{
@@ -134,6 +135,11 @@ pub struct ReconcilerOptions {
     /// Pod role driving the metric-prefix selection (`coxswain_proxy_*` vs
     /// `coxswain_controller_*`). Default [`MetricsPrefix::Proxy`].
     pub metrics_prefix: crate::MetricsPrefix,
+    /// When `true`, spawn a 12th reflector that watches `Pod` objects labelled
+    /// `app.kubernetes.io/name=coxswain` and publishes a [`SharedFleet`] snapshot
+    /// on every change. Must only be set to `true` for the controller role — the
+    /// shared-proxy ServiceAccount does not hold pod-read RBAC.
+    pub watch_fleet: bool,
 }
 
 impl Default for ReconcilerOptions {
@@ -143,6 +149,7 @@ impl Default for ReconcilerOptions {
             ingress_default_backend: None,
             ingress_ports: IngressPorts::default(),
             metrics_prefix: crate::MetricsPrefix::Proxy,
+            watch_fleet: false,
         }
     }
 }
@@ -174,6 +181,10 @@ impl ReconcilerHealth {
 /// `BackendTLSPolicy`, `ConfigMap`, and `EndpointSlice`, and rebuilds the routing
 /// table whenever any of them change — with a 500 ms trailing-edge debounce to
 /// coalesce burst updates (e.g. rolling deploys).
+///
+/// When [`ReconcilerOptions::watch_fleet`] is `true` (controller role only), a
+/// 12th reflector watches `Pod` objects and publishes a [`SharedFleet`] snapshot
+/// immediately on every change.
 #[non_exhaustive]
 pub struct SharedProxyReconciler {
     ingress_routes: SharedIngressRoutingTable,
@@ -183,6 +194,7 @@ pub struct SharedProxyReconciler {
     cluster_summary: SharedClusterSummary,
     route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
+    fleet: SharedFleet,
     owned_gateways: OwnedGateways,
     leader: Arc<AtomicBool>,
     health: ReconcilerHealth,
@@ -260,6 +272,7 @@ impl SharedProxyReconciler {
             cluster_summary,
             route_health: SharedHttpRouteHealth::new(),
             policy_health: SharedBackendTlsPolicyHealth::new(),
+            fleet: SharedFleet::new(),
             owned_gateways,
             leader,
             health,
@@ -279,6 +292,13 @@ impl SharedProxyReconciler {
     pub fn policy_health(&self) -> SharedBackendTlsPolicyHealth {
         self.policy_health.clone()
     }
+
+    /// Returns the fleet snapshot handle so the admin API can read the current
+    /// set of coxswain pods. Only populated when [`ReconcilerOptions::watch_fleet`]
+    /// is `true` (controller role); returns an empty snapshot otherwise.
+    pub fn fleet(&self) -> SharedFleet {
+        self.fleet.clone()
+    }
 }
 
 struct ReconcilerConfig {
@@ -287,6 +307,8 @@ struct ReconcilerConfig {
     ingress_default_backend: Option<IngressDefaultBackend>,
     ingress_ports: IngressPorts,
     metrics: crate::ReflectorMetrics,
+    /// See [`ReconcilerOptions::watch_fleet`].
+    watch_fleet: bool,
 }
 
 pub(super) struct ReflectorStores<'a> {
@@ -431,6 +453,7 @@ impl BackgroundService for SharedProxyReconciler {
             ingress_default_backend: self.opts.ingress_default_backend.clone(),
             ingress_ports: self.opts.ingress_ports,
             metrics: crate::ReflectorMetrics::new(self.opts.metrics_prefix),
+            watch_fleet: self.opts.watch_fleet,
         };
         let handles = SharedHandles {
             ingress_routes: self.ingress_routes.clone(),
@@ -440,6 +463,7 @@ impl BackgroundService for SharedProxyReconciler {
             cluster_summary: self.cluster_summary.clone(),
             route_health: self.route_health.clone(),
             policy_health: self.policy_health.clone(),
+            fleet: self.fleet.clone(),
             owned_gateways: self.owned_gateways.clone(),
             leader: Arc::clone(&self.leader),
             controller_health: self.health.controller.clone(),
@@ -471,6 +495,10 @@ struct SharedHandles {
     cluster_summary: SharedClusterSummary,
     route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
+    /// Populated by the fleet task when `watch_fleet` is enabled; carried here
+    /// so the fleet-rebuild task can publish into the same cell that callers
+    /// obtain via [`SharedProxyReconciler::fleet`].
+    fleet: SharedFleet,
     owned_gateways: OwnedGateways,
     leader: Arc<AtomicBool>,
     controller_health: SubsystemHandle,
@@ -490,6 +518,7 @@ async fn spawn_tasks(
         cluster_summary,
         route_health,
         policy_health,
+        fleet,
         owned_gateways,
         leader,
         controller_health,
@@ -501,6 +530,7 @@ async fn spawn_tasks(
         ingress_default_backend,
         ingress_ports,
         metrics,
+        watch_fleet,
     } = config;
     let (route_reader, route_writer) = reflector::store::<HttpRoute>();
     let (ingress_reader, ingress_writer) = reflector::store::<Ingress>();
@@ -605,11 +635,39 @@ async fn spawn_tasks(
     spawn_reflector(
         &mut set,
         configmap_writer,
-        scoped_api::<ConfigMap>(client, ns),
+        scoped_api::<ConfigMap>(client.clone(), ns),
         watcher::Config::default(),
         ReflectorEffects::new(&notify, &controller_health, "config_map", metrics),
         "ConfigMap",
     );
+
+    // --- Fleet pod watch (controller role only) ---
+    //
+    // Publishes a `SharedFleet` snapshot immediately on every pod watch event —
+    // no debounce, because pod IP / annotation changes are infrequent and
+    // low-latency matters for operator tooling. Gated by `watch_fleet` so the
+    // shared-proxy pod (which lacks pod-read RBAC) never spawns this reflector.
+    if watch_fleet {
+        let (pod_reader, pod_writer) = reflector::store::<Pod>();
+        let fleet_notify = Arc::new(Notify::new());
+        spawn_reflector(
+            &mut set,
+            pod_writer,
+            Api::<Pod>::all(client),
+            watcher::Config::default().labels("app.kubernetes.io/name=coxswain"),
+            ReflectorEffects::new(&fleet_notify, &controller_health, "pod", metrics),
+            "Pod",
+        );
+        set.spawn(async move {
+            loop {
+                fleet_notify.notified().await;
+                let pods = pod_reader.state();
+                fleet.store(Arc::new(fleet::build_snapshot(
+                    pods.iter().map(Arc::as_ref),
+                )));
+            }
+        });
+    }
 
     // --- Trailing-edge debounce + rebuild ---
     //

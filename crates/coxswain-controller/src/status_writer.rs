@@ -129,6 +129,7 @@ pub fn spawn_status_writer(
             "service",
             "backend_tls_policy",
             "config_map",
+            "pod",
             "routing_table_built",
         ],
     );
@@ -160,6 +161,7 @@ pub fn spawn_status_writer(
             opts.ingress_default_backend = ingress_default_backend;
             opts.ingress_ports = ingress_ports;
             opts.metrics_prefix = coxswain_reflector::MetricsPrefix::Controller;
+            opts.watch_fleet = true;
             opts
         },
     );

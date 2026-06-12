@@ -86,6 +86,7 @@ const RESERVED_LABEL_KEYS: &[&str] = &[
     "app.kubernetes.io/name",
     "app.kubernetes.io/instance",
     "app.kubernetes.io/managed-by",
+    "app.kubernetes.io/component",
 ];
 
 /// Inputs to the renderer.
@@ -116,6 +117,9 @@ pub(super) struct RenderInputs<'a> {
     /// Render `--allow-cluster-wide-namespace-read` when true. Same
     /// derivation — set when any listener has `from: Selector`.
     pub(super) allow_cluster_wide_namespace_read: bool,
+    /// Admin server port rendered as the `gateway.coxswain-labs.dev/admin-port`
+    /// annotation on the pod template so fleet discovery can reach this pod.
+    pub(super) admin_port: u16,
 }
 
 /// The three rendered resources for one dedicated-mode Gateway.
@@ -163,7 +167,7 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
             panic!("invariant: Gateway has no namespace; the API server requires it")
         });
     let labels = final_labels(inputs.gateway);
-    let annotations = final_annotations(inputs.gateway);
+    let annotations = final_annotations(inputs.gateway, inputs.admin_port);
     let owner_ref = gateway_owner_reference(inputs.gateway);
     let common = Common {
         name: &name,
@@ -206,7 +210,24 @@ fn standard_labels(gateway: &Gateway) -> BTreeMap<String, String> {
         "app.kubernetes.io/managed-by".to_string(),
         "coxswain".to_string(),
     );
+    labels.insert(
+        "app.kubernetes.io/component".to_string(),
+        "dedicated-proxy".to_string(),
+    );
     labels
+}
+
+/// Reserved annotations placed on every rendered resource. Unlike labels, there
+/// is no reserved-annotation enforcement — user-supplied
+/// `Gateway.spec.infrastructure.annotations` are overlaid on top so operators
+/// can override values when needed.
+fn standard_annotations(admin_port: u16) -> BTreeMap<String, String> {
+    let mut annotations = BTreeMap::new();
+    annotations.insert(
+        "gateway.coxswain-labs.dev/admin-port".to_string(),
+        admin_port.to_string(),
+    );
+    annotations
 }
 
 /// Merge user-supplied `Gateway.spec.infrastructure.labels` onto the
@@ -238,17 +259,23 @@ fn final_labels(gateway: &Gateway) -> BTreeMap<String, String> {
     labels
 }
 
-/// Forward user-supplied `Gateway.spec.infrastructure.annotations` verbatim.
-/// No reserved set — annotations don't drive selectors or any controller
-/// invariant.
-fn final_annotations(gateway: &Gateway) -> BTreeMap<String, String> {
-    gateway
+/// Build the final annotation map: start with [`standard_annotations`] (which
+/// sets the admin-port annotation) then overlay user-supplied
+/// `Gateway.spec.infrastructure.annotations`. User values win on collision —
+/// annotations don't drive selectors so overrides are safe.
+fn final_annotations(gateway: &Gateway, admin_port: u16) -> BTreeMap<String, String> {
+    let mut annotations = standard_annotations(admin_port);
+    if let Some(user_annotations) = gateway
         .spec
         .infrastructure
         .as_ref()
         .and_then(|i| i.annotations.as_ref())
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default()
+    {
+        for (k, v) in user_annotations {
+            annotations.insert(k.clone(), v.clone());
+        }
+    }
+    annotations
 }
 
 /// Build the `controller=true, blockOwnerDeletion=true` owner reference back
@@ -572,6 +599,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
 
         // Names per GEP-1762.
@@ -622,6 +650,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         assert_eq!(result.deployment.spec.unwrap().replicas, Some(5));
         assert_eq!(
@@ -645,6 +674,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         let container = &result
             .deployment
@@ -688,6 +718,7 @@ mod tests {
             watch_namespaces: &watch_ns,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         let container = &result
             .deployment
@@ -736,6 +767,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2);
@@ -767,6 +799,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2, "the two HTTP:80 listeners dedupe");
@@ -796,6 +829,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod_spec.containers.len(), 2, "coxswain + sidecar");
@@ -839,6 +873,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         for labels in [
             result.deployment.metadata.labels.as_ref(),
@@ -878,6 +913,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(
@@ -905,6 +941,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         for meta in [
             &result.deployment.metadata,
@@ -947,6 +984,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         for meta in [
             &result.deployment.metadata,
@@ -988,6 +1026,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         let labels = result.deployment.metadata.labels.as_ref().expect("labels");
         assert_eq!(
@@ -1025,6 +1064,7 @@ mod tests {
             watch_namespaces: EMPTY_WATCH_NS,
             allow_cluster_wide_route_read: false,
             allow_cluster_wide_namespace_read: false,
+            admin_port: 8082,
         });
         for meta in [
             &result.deployment.metadata,

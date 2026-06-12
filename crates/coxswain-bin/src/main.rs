@@ -117,6 +117,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
                 args.common.ingress_http_port,
                 args.common.ingress_https_port,
             ),
+            admin_port: args.common.admin_port,
         }),
     ));
 
@@ -732,6 +733,7 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
                 args.common.ingress_http_port,
                 args.common.ingress_https_port,
             ),
+            admin_port: args.common.admin_port,
         }),
     ));
 
