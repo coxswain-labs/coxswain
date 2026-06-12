@@ -736,6 +736,7 @@ dependencies = [
  "criterion",
  "http",
  "ipnet",
+ "itoa",
  "pingora",
  "pingora-core",
  "pingora-http",

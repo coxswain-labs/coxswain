@@ -3,7 +3,7 @@ name: refactor
 description: In-depth code-quality review leveraging /rust-skills.
 ---
 
-I need an in-depth code-quality review of the entire workspace. Recent feature work landed without the necessary guardrails, and I'm worried quality has drifted from the last refactor baseline.
+I need an in-depth code-quality review of the entire workspace. Recent feature work has introduced architectural and feature changes, and I'm concerned quality has drifted.
 
 1. Enter plan mode
 2. Invoke /rust-skills so the audit criteria are loaded into context.

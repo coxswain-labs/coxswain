@@ -192,15 +192,13 @@ fn merge_pod_templates(
 }
 
 fn group() -> &'static str {
-    <CoxswainGatewayParameters as Resource>::group(&())
-        .into_owned()
-        .leak()
+    static GROUP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    GROUP.get_or_init(|| <CoxswainGatewayParameters as Resource>::group(&()).into_owned())
 }
 
 fn kind() -> &'static str {
-    <CoxswainGatewayParameters as Resource>::kind(&())
-        .into_owned()
-        .leak()
+    static KIND: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KIND.get_or_init(|| <CoxswainGatewayParameters as Resource>::kind(&()).into_owned())
 }
 
 #[cfg(test)]

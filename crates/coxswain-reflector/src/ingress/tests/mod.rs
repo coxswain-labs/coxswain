@@ -1,22 +1,17 @@
-mod backend;
-mod class;
-mod reconcile;
-mod tls;
-
 use super::*;
-use coxswain_core::routing::IngressRoutingTableBuilder;
-use coxswain_core::tls::TlsStoreBuilder;
-use k8s_openapi::api::core::v1::{Secret, Service};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
-use k8s_openapi::api::networking::v1::{
+pub(super) use coxswain_core::routing::IngressRoutingTableBuilder;
+pub(super) use coxswain_core::tls::TlsStoreBuilder;
+pub(super) use k8s_openapi::api::core::v1::{Secret, Service};
+pub(super) use k8s_openapi::api::discovery::v1::EndpointSlice;
+pub(super) use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
     IngressServiceBackend, IngressSpec, ServiceBackendPort,
 };
-use kube::api::ObjectMeta;
-use kube::runtime::reflector;
-use std::collections::{BTreeMap, HashSet};
+pub(super) use kube::api::ObjectMeta;
+pub(super) use kube::runtime::reflector;
+pub(super) use std::collections::{BTreeMap, HashSet};
 
-use crate::tests::fixtures::{empty_svc_store, make_slice, make_svc_store, slice_store};
+pub(super) use crate::tests::fixtures::{empty_svc_store, make_slice, make_svc_store, slice_store};
 
 pub(super) fn owned(names: &[&str]) -> HashSet<String> {
     names.iter().map(|s| s.to_string()).collect()
@@ -55,7 +50,7 @@ pub(super) fn make_service_with_named_port(
     port_name: &str,
     port_number: i32,
 ) -> Service {
-    use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
+    pub(super) use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
     Service {
         metadata: ObjectMeta {
             name: Some(name.to_string()),

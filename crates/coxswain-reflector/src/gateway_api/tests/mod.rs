@@ -1,29 +1,22 @@
-mod backend_tls;
-mod bindings;
-mod filters;
-mod hostnames;
-mod reconcile;
-mod status;
-mod timeouts;
-
 use super::*;
-use crate::gw_types::HttpRoute;
-use crate::gw_types::v::httproutes::{
+pub(super) use crate::gateway_api::GatewayApiReconciler;
+pub(super) use crate::gw_types::HttpRoute;
+pub(super) use crate::gw_types::v::httproutes::{
     HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesMatches,
     HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
     HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
     HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
 };
-use crate::keys::ListenerKey;
-use coxswain_core::ownership::ObjectKey;
-use coxswain_core::routing::RoutingTableBuilder;
-use http::{HeaderMap, HeaderName, Method};
-use kube::api::ObjectMeta;
-use std::collections::{HashMap, HashSet};
+pub(super) use crate::keys::ListenerKey;
+pub(super) use coxswain_core::ownership::ObjectKey;
+pub(super) use coxswain_core::routing::RoutingTableBuilder;
+pub(super) use http::{HeaderMap, HeaderName, Method};
+pub(super) use kube::api::ObjectMeta;
+pub(super) use std::collections::{HashMap, HashSet};
 
-use crate::tests::fixtures::{empty_svc_store, make_slice, slice_store};
+pub(super) use crate::tests::fixtures::{empty_svc_store, make_slice, slice_store};
 
-fn owned(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {
+pub(super) fn owned(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {
     pairs
         .iter()
         .map(|(ns, name)| ObjectKey::new(*ns, *name))
@@ -31,17 +24,17 @@ fn owned(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {
 }
 
 /// Default owned set used by tests that exercise routing logic (not filtering).
-fn default_owned() -> HashSet<ObjectKey> {
+pub(super) fn default_owned() -> HashSet<ObjectKey> {
     owned(&[("default", "gw")])
 }
 
 /// Empty listener info map for tests that don't exercise hostname or port scoping.
-fn no_listener_info() -> HashMap<ListenerKey, ListenerBinding> {
+pub(super) fn no_listener_info() -> HashMap<ListenerKey, ListenerBinding> {
     HashMap::new()
 }
 
 /// Build a listener info map from `(listener_name, hostname, port)` triples.
-fn make_listener_info(
+pub(super) fn make_listener_info(
     gw_ns: &str,
     gw_name: &str,
     listeners: &[(&str, &str, u16)],
@@ -61,7 +54,7 @@ fn make_listener_info(
 }
 
 /// Default parent refs pointing to the Gateway in `default_owned`.
-fn default_parents() -> Option<Vec<HttpRouteParentRefs>> {
+pub(super) fn default_parents() -> Option<Vec<HttpRouteParentRefs>> {
     Some(vec![HttpRouteParentRefs {
         name: "gw".to_string(),
         namespace: Some("default".to_string()),
@@ -69,7 +62,7 @@ fn default_parents() -> Option<Vec<HttpRouteParentRefs>> {
     }])
 }
 
-fn make_route(
+pub(super) fn make_route(
     ns: &str,
     hostnames: &[&str],
     matches: Option<Vec<HttpRouteRulesMatches>>,
@@ -102,7 +95,7 @@ fn make_route(
     }
 }
 
-fn path_match(path: &str, kind: HttpRouteRulesMatchesPathType) -> HttpRouteRulesMatches {
+pub(super) fn path_match(path: &str, kind: HttpRouteRulesMatchesPathType) -> HttpRouteRulesMatches {
     HttpRouteRulesMatches {
         path: Some(HttpRouteRulesMatchesPath {
             r#type: Some(kind),
@@ -112,7 +105,11 @@ fn path_match(path: &str, kind: HttpRouteRulesMatchesPathType) -> HttpRouteRules
     }
 }
 
-fn header_exact_match(path: &str, header_name: &str, header_value: &str) -> HttpRouteRulesMatches {
+pub(super) fn header_exact_match(
+    path: &str,
+    header_name: &str,
+    header_value: &str,
+) -> HttpRouteRulesMatches {
     HttpRouteRulesMatches {
         path: Some(HttpRouteRulesMatchesPath {
             r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
@@ -127,7 +124,11 @@ fn header_exact_match(path: &str, header_name: &str, header_value: &str) -> Http
     }
 }
 
-fn header_regex_match(path: &str, header_name: &str, pattern: &str) -> HttpRouteRulesMatches {
+pub(super) fn header_regex_match(
+    path: &str,
+    header_name: &str,
+    pattern: &str,
+) -> HttpRouteRulesMatches {
     HttpRouteRulesMatches {
         path: Some(HttpRouteRulesMatchesPath {
             r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
@@ -142,7 +143,10 @@ fn header_regex_match(path: &str, header_name: &str, pattern: &str) -> HttpRoute
     }
 }
 
-fn method_match(path: &str, method: HttpRouteRulesMatchesMethod) -> HttpRouteRulesMatches {
+pub(super) fn method_match(
+    path: &str,
+    method: HttpRouteRulesMatchesMethod,
+) -> HttpRouteRulesMatches {
     HttpRouteRulesMatches {
         path: Some(HttpRouteRulesMatchesPath {
             r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
@@ -153,7 +157,7 @@ fn method_match(path: &str, method: HttpRouteRulesMatchesMethod) -> HttpRouteRul
     }
 }
 
-fn query_exact_match(path: &str, param: &str, value: &str) -> HttpRouteRulesMatches {
+pub(super) fn query_exact_match(path: &str, param: &str, value: &str) -> HttpRouteRulesMatches {
     HttpRouteRulesMatches {
         path: Some(HttpRouteRulesMatchesPath {
             r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
@@ -168,7 +172,7 @@ fn query_exact_match(path: &str, param: &str, value: &str) -> HttpRouteRulesMatc
     }
 }
 
-fn ctx_with<'a>(
+pub(super) fn ctx_with<'a>(
     method: &'a Method,
     headers: &'a HeaderMap,
     query: Option<&'a str>,
@@ -180,7 +184,7 @@ fn ctx_with<'a>(
     }
 }
 
-fn headers_from(pairs: &[(&str, &str)]) -> HeaderMap {
+pub(super) fn headers_from(pairs: &[(&str, &str)]) -> HeaderMap {
     let mut m = HeaderMap::new();
     for (k, v) in pairs {
         m.insert(
@@ -191,13 +195,13 @@ fn headers_from(pairs: &[(&str, &str)]) -> HeaderMap {
     m
 }
 
-fn make_route_with_hostnames_and_parent(
+pub(super) fn make_route_with_hostnames_and_parent(
     ns: &str,
     hostnames: &[&str],
     gw_name: &str,
     section_name: Option<&str>,
 ) -> HttpRoute {
-    use gateway_api::apis::standard::httproutes::HttpRouteSpec;
+    pub(super) use gateway_api::apis::standard::httproutes::HttpRouteSpec;
     HttpRoute {
         metadata: kube::api::ObjectMeta {
             name: Some("test-route".to_string()),
@@ -218,13 +222,13 @@ fn make_route_with_hostnames_and_parent(
     }
 }
 
-fn make_route_with_parent_port(
+pub(super) fn make_route_with_parent_port(
     ns: &str,
     hostnames: &[&str],
     gw_name: &str,
     port: Option<i32>,
 ) -> HttpRoute {
-    use gateway_api::apis::standard::httproutes::HttpRouteSpec;
+    pub(super) use gateway_api::apis::standard::httproutes::HttpRouteSpec;
     HttpRoute {
         metadata: kube::api::ObjectMeta {
             name: Some("test-route".to_string()),
@@ -245,8 +249,12 @@ fn make_route_with_parent_port(
     }
 }
 
-fn make_simple_rule(svc: &str) -> gateway_api::apis::standard::httproutes::HttpRouteRules {
-    use gateway_api::apis::standard::httproutes::{HttpRouteRules, HttpRouteRulesBackendRefs};
+pub(super) fn make_simple_rule(
+    svc: &str,
+) -> gateway_api::apis::standard::httproutes::HttpRouteRules {
+    pub(super) use gateway_api::apis::standard::httproutes::{
+        HttpRouteRules, HttpRouteRulesBackendRefs,
+    };
     HttpRouteRules {
         backend_refs: Some(vec![HttpRouteRulesBackendRefs {
             name: svc.to_string(),
@@ -257,7 +265,7 @@ fn make_simple_rule(svc: &str) -> gateway_api::apis::standard::httproutes::HttpR
     }
 }
 
-fn ctx_get() -> coxswain_core::routing::RequestContext<'static> {
+pub(super) fn ctx_get() -> coxswain_core::routing::RequestContext<'static> {
     static METHOD: std::sync::LazyLock<Method> = std::sync::LazyLock::new(|| Method::GET);
     static HDRS: std::sync::LazyLock<http::HeaderMap> =
         std::sync::LazyLock::new(http::HeaderMap::new);

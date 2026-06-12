@@ -9,6 +9,7 @@ use std::sync::Arc;
 /// with no locks. The controller stores a new snapshot on every reconcile; readers
 /// (proxy hot path, status writer) load atomically on every use.
 // No dedicated tests/shared.rs: trivial ArcSwap wrapper exercised transitively.
+#[non_exhaustive]
 pub struct Shared<T>(Arc<ArcSwap<T>>);
 
 impl<T> Clone for Shared<T> {

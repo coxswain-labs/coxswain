@@ -35,6 +35,7 @@ use thiserror::Error;
 /// it's an internal wiring struct that only `coxswain-bin` instantiates, and
 /// the construction-site convenience outweighs the (nonexistent) downstream
 /// compatibility win.
+// intentionally open: field-literal constructed in crates/coxswain-bin/src/main.rs from CLI args.
 pub struct StatusWriterConfig {
     /// Identity, leader-election parameters, and status-write address.
     pub controller: ControllerConfig,
@@ -73,6 +74,7 @@ pub enum StatusWriterError {
 /// which the controller pod does not serve traffic from but does aggregate
 /// for the future `/cluster` endpoint). Same rationale as
 /// [`StatusWriterConfig`] for the lack of `#[non_exhaustive]`.
+#[non_exhaustive]
 pub struct SpawnedStatusWriter {
     /// Reflector + rebuild background service.
     pub reconciler: ControllerReconciler,

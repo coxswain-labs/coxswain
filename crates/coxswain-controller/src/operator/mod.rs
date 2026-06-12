@@ -54,7 +54,4 @@ pub(crate) mod reconciler;
 pub(crate) mod render;
 pub(crate) mod status;
 
-#[cfg(test)]
-mod tests;
-
 pub use reconciler::{Operator, OperatorConfig};

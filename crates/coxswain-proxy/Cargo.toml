@@ -16,6 +16,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 ipnet = { workspace = true }
+itoa = { workspace = true }
 coxswain-core = { workspace = true }
 coxswain-reflector = { workspace = true }
 pingora = { workspace = true, features = ["boringssl"] }

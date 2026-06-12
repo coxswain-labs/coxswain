@@ -83,6 +83,7 @@ pub(crate) enum ProxyHeaderError {
 }
 
 /// CIDR allow-list for peers permitted to send PROXY protocol headers.
+#[non_exhaustive]
 pub struct TrustedSources {
     nets: Vec<IpNet>,
 }
@@ -100,6 +101,7 @@ impl TrustedSources {
 }
 
 /// Whether a listener speaks plain HTTP or HTTPS.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ListenerProtocol {
     /// Plain HTTP/1.1 (no TLS).
@@ -109,6 +111,7 @@ pub enum ListenerProtocol {
 }
 
 /// One listen address with its associated protocol.
+// intentionally open: field-literal constructed in crates/coxswain-bin/src/main.rs while assembling the desired listener set.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ListenerSpec {
     /// The socket address to bind.
@@ -146,6 +149,7 @@ impl ListenerSpec {
 /// valid HAProxy PROXY-protocol header from the allow-listed CIDR set.  When
 /// it is `None` (the common case), standard Pingora connection handling is
 /// used, supporting both HTTP/1.1 and HTTP/2 via ALPN.
+#[non_exhaustive]
 pub struct ProxyAcceptor<P>
 where
     P: ProxyHttp + Send + Sync + 'static,
@@ -1007,5 +1011,29 @@ mod tests {
         assert_eq!(to_remove, vec![addr_a]);
         assert_eq!(to_add.len(), 1);
         assert_eq!(to_add[0].addr, addr_b);
+    }
+
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn trusted_sources_contains_ip_in_range() {
+        let net: ipnet::IpNet = "192.168.1.0/24".parse().unwrap();
+        let ts = TrustedSources::new(vec![net]);
+        assert!(ts.contains(&"192.168.1.100".parse::<IpAddr>().unwrap()));
+        assert!(!ts.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn trusted_sources_loopback() {
+        let net: ipnet::IpNet = "127.0.0.1/32".parse().unwrap();
+        let ts = TrustedSources::new(vec![net]);
+        assert!(ts.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!ts.contains(&"192.168.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn trusted_sources_empty_rejects_all() {
+        let ts = TrustedSources::new(vec![]);
+        assert!(!ts.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 }

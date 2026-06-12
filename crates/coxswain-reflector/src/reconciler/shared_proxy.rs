@@ -26,6 +26,7 @@ use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
 use crate::k8s_utils::scoped_api;
 use crate::keys::ListenerKey;
+use crate::reference_grants::{GrantSet, flatten_grants};
 use crate::tls::{
     GatewayListenerHealth, SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth,
     SharedHttpRouteHealth,
@@ -38,7 +39,6 @@ use async_trait::async_trait;
 use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
-use coxswain_core::reference_grants::ReferenceGrantKey;
 use coxswain_core::routing::{
     BackendGroup, GatewayRoutingTableBuilder, IngressRoutingTableBuilder, RouteEntry, RoutingTable,
     RoutingTableBuilder, SharedGatewayRoutingTable, SharedIngressRoutingTable,
@@ -65,6 +65,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 /// Error returned when parsing `--ingress-default-backend`.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum IngressDefaultBackendParseError {
     /// No `:` separator found; expected `<namespace>/<service>:<port>`.
@@ -86,6 +87,7 @@ pub enum IngressDefaultBackendParseError {
 /// Set via `--ingress-default-backend=<namespace>/<service>:<port>`.
 /// Implements [`std::str::FromStr`]; parsing errors are reported as
 /// [`IngressDefaultBackendParseError`].
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct IngressDefaultBackend {
     /// Kubernetes namespace of the backend service.
@@ -172,6 +174,7 @@ impl ReconcilerHealth {
 /// `BackendTLSPolicy`, `ConfigMap`, and `EndpointSlice`, and rebuilds the routing
 /// table whenever any of them change — with a 500 ms trailing-edge debounce to
 /// coalesce burst updates (e.g. rolling deploys).
+#[non_exhaustive]
 pub struct SharedProxyReconciler {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
@@ -865,55 +868,6 @@ pub(super) fn compute_ownership(
     )
 }
 
-pub(super) type GrantSet = HashSet<ReferenceGrantKey>;
-
-/// Flatten `ReferenceGrant` objects into two O(1) sets for cross-namespace ref checks:
-/// - `backend_grants`: HTTPRoute → Service (used by `GatewayApiReconciler::reconcile`)
-/// - `cert_grants`: Gateway → Secret (used by `GatewayApiReconciler::reconcile_tls`)
-pub(super) fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
-    fn flatten(grants: &[Arc<ReferenceGrant>], from_kind: &str, to_kind: &str) -> GrantSet {
-        grants
-            .iter()
-            .filter_map(|grant| {
-                let to_ns = grant.metadata.namespace.clone()?;
-                Some((grant, to_ns))
-            })
-            .flat_map(|(grant, to_ns)| {
-                let from_entries: Vec<_> = grant
-                    .spec
-                    .from
-                    .iter()
-                    .filter(|f| f.group == "gateway.networking.k8s.io" && f.kind == from_kind)
-                    .map(|f| f.namespace.clone())
-                    .collect();
-                let to_entries: Vec<_> = grant
-                    .spec
-                    .to
-                    .iter()
-                    .filter(|t| (t.group.is_empty() || t.group == "core") && t.kind == to_kind)
-                    .map(|t| t.name.clone())
-                    .collect();
-                from_entries.into_iter().flat_map(move |from_ns| {
-                    let to_ns = to_ns.clone();
-                    to_entries
-                        .clone()
-                        .into_iter()
-                        .map(move |to_name| match to_name {
-                            Some(name) => {
-                                ReferenceGrantKey::specific(from_ns.clone(), to_ns.clone(), name)
-                            }
-                            None => ReferenceGrantKey::wildcard(from_ns.clone(), to_ns.clone()),
-                        })
-                })
-            })
-            .collect()
-    }
-
-    let backend_grants = flatten(grants, "HTTPRoute", "Service");
-    let cert_grants = flatten(grants, "Gateway", "Secret");
-    (backend_grants, cert_grants)
-}
-
 /// Build and publish the Ingress and Gateway routing tables from their
 /// respective source resources.
 ///
@@ -1379,5 +1333,81 @@ mod tests {
             )],
         );
         assert!(!gateway_is_cut_over(&gw));
+    }
+
+    use crate::reconciler::{IngressDefaultBackend, IngressDefaultBackendParseError};
+
+    #[test]
+    fn happy_path() {
+        let b: IngressDefaultBackend = "default/echo:80".parse().unwrap();
+        assert_eq!(b.namespace, "default");
+        assert_eq!(b.name, "echo");
+        assert_eq!(b.port, 80);
+    }
+
+    #[test]
+    fn missing_colon_returns_missing_port() {
+        let err = "default/echo".parse::<IngressDefaultBackend>().unwrap_err();
+        assert!(matches!(err, IngressDefaultBackendParseError::MissingPort));
+    }
+
+    #[test]
+    fn missing_slash_returns_missing_namespace() {
+        let err = "defaultecho:80"
+            .parse::<IngressDefaultBackend>()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IngressDefaultBackendParseError::MissingNamespace
+        ));
+    }
+
+    #[test]
+    fn empty_namespace_returns_empty_component() {
+        let err = "/echo:80".parse::<IngressDefaultBackend>().unwrap_err();
+        assert!(matches!(
+            err,
+            IngressDefaultBackendParseError::EmptyComponent
+        ));
+    }
+
+    #[test]
+    fn empty_name_returns_empty_component() {
+        let err = "default/:80".parse::<IngressDefaultBackend>().unwrap_err();
+        assert!(matches!(
+            err,
+            IngressDefaultBackendParseError::EmptyComponent
+        ));
+    }
+
+    #[test]
+    fn non_numeric_port_returns_invalid_port() {
+        let err = "default/echo:abc"
+            .parse::<IngressDefaultBackend>()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IngressDefaultBackendParseError::InvalidPort(s) if s == "abc"
+        ));
+    }
+
+    #[test]
+    fn port_overflow_returns_invalid_port() {
+        let err = "default/echo:2147483648"
+            .parse::<IngressDefaultBackend>()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IngressDefaultBackendParseError::InvalidPort(_)
+        ));
+    }
+
+    #[test]
+    fn colon_in_service_name_uses_last_colon_as_port_separator() {
+        // rsplit_once(':') splits on the last colon; "ns/svc:extra:80" → ns_name="ns/svc:extra", port=80
+        let b: IngressDefaultBackend = "ns/svc:extra:80".parse().unwrap();
+        assert_eq!(b.namespace, "ns");
+        assert_eq!(b.name, "svc:extra");
+        assert_eq!(b.port, 80);
     }
 }

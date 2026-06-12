@@ -1,6 +1,7 @@
 //! Internal key types used as `HashMap` keys across the reflector pipeline.
 
 /// Key for a specific listener on a Gateway: `(gw_ns, gw_name, listener_name)`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ListenerKey {
     /// Namespace of the parent Gateway.
@@ -30,6 +31,7 @@ impl ListenerKey {
 ///
 /// `section` is the `sectionName` from `parentRef`, or an empty string when
 /// no `sectionName` was specified.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteParentKey {
     /// Namespace of the HTTPRoute.

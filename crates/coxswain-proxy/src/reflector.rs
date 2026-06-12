@@ -34,6 +34,7 @@ use crate::source::KubernetesSource;
 /// is that they now flow through a proxy-crate-owned entry point instead of
 /// being constructed in `main.rs`. Not `#[non_exhaustive]` — it's an internal
 /// wiring struct only `coxswain-bin` builds.
+// intentionally open: field-literal constructed in crates/coxswain-bin/src/main.rs from CLI args.
 pub struct ProxyReflectorConfig {
     /// `GatewayClass`/`IngressClass`/`HTTPRoute` `controllerName` claim.
     pub controller_name: String,
@@ -57,6 +58,7 @@ pub struct ProxyReflectorConfig {
 /// Holds the [`KubernetesSource`] the Pingora proxy services consume from,
 /// the shared TLS handles, and the [`SharedProxyReconciler`] background
 /// service the caller must register with the Pingora server.
+// intentionally open: field-literal destructured in crates/coxswain-bin/src/main.rs to wire Pingora services.
 pub struct ProxyReflector {
     /// Source the proxy services read routing tables from.
     pub source: KubernetesSource,
@@ -133,6 +135,7 @@ pub fn spawn_routing_table_builder(config: ProxyReflectorConfig) -> ProxyReflect
 /// identifiers + RBAC opt-in flags instead of the shared pool's
 /// `IngressDefaultBackend` / `watch_namespace`. Constructed by the bin layer
 /// from `serve proxy --gateway` args.
+// intentionally open: field-literal constructed in crates/coxswain-bin/src/main.rs from CLI args.
 pub struct DedicatedProxyReflectorConfig {
     /// `GatewayClass`/`HTTPRoute` `controllerName` claim.
     pub controller_name: String,
@@ -162,6 +165,7 @@ pub struct DedicatedProxyReflectorConfig {
 /// service (the dedicated pod registers no `IngressProxy`), the shared TLS
 /// handles, and the [`DedicatedProxyReconciler`] the caller registers with
 /// the Pingora server.
+// intentionally open: field-literal destructured in crates/coxswain-bin/src/main.rs to wire Pingora services.
 pub struct DedicatedProxyReflector {
     /// Source the `GatewayProxy` service reads its routing table from.
     pub source: KubernetesSource,

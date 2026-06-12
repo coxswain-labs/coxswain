@@ -19,9 +19,6 @@ mod source;
 mod tls;
 pub mod upstream_ca;
 
-#[cfg(test)]
-mod tests;
-
 pub use accept::{
     AcceptorBuildError, ListenerProtocol, ListenerSpec, ProxyAcceptor, TrustedSources,
 };

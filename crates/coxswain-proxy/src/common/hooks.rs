@@ -2,6 +2,25 @@
 //! kind. Both [`IngressProxy`][crate::ingress::IngressProxy] and
 //! [`GatewayProxy`][crate::gateway::GatewayProxy] forward to these helpers so
 //! their hook implementations remain a thin shim.
+//!
+//! ## Per-request allocation budget
+//!
+//! The hot path captures host/path/query once at [`request_filter`] entry
+//! (3 small allocations: `Arc<str>` for host, `Arc<str>` for path, optional
+//! `String` for query); everything downstream — routing lookup, upstream
+//! selection, metric emission, and error counters — runs allocation-free.
+//!
+//! Metric label rendering used to allocate a `String` per `u16` port and
+//! status code (regression introduced by #237/#239 access logging + metrics);
+//! both labels now write into stack-only [`itoa::Buffer`]s. The optional
+//! upstream `SocketAddr → String` render lives inside the access-log branch
+//! so operators silencing the log via `--access-log=off` skip it entirely.
+//!
+//! Two unavoidable allocations remain inside [`upstream_peer`]: the SNI
+//! hostname is cloned into a fresh `String` per outbound TLS connection
+//! because Pingora's `HttpPeer` constructor takes ownership of it. These are
+//! TLS-path allocations (once per upstream connection, not per request), and
+//! cleartext upstream connections skip them entirely.
 
 use super::ctx::{CONN_INFO, ProxyCtx, ResolvedRoute};
 use super::engine::RoutingEngine;
@@ -365,14 +384,16 @@ fn classify_upstream_error(e: &pingora_core::Error) -> &'static str {
 /// reached `fail_to_proxy` before routing resolved, `route`/`upstream` carry
 /// the literal `"none"` fallback so the increment isn't dropped.
 fn inc_upstream_error(ctx: &ProxyCtx, error_type: &'static str) {
-    let listener = ctx
-        .local_port
-        .map_or_else(|| "0".to_string(), |p| p.to_string());
+    // `itoa::Buffer` writes into a stack-only buffer; no heap allocation for
+    // the u16 → &str render. Re-issuing `p.to_string()` here would allocate
+    // per request and is what #239's metric emission accidentally regressed.
+    let mut port_buf = itoa::Buffer::new();
+    let listener = port_buf.format(ctx.local_port.unwrap_or(0));
     let (route, upstream) = ctx.resolved.as_ref().map_or(("none", "none"), |r| {
         (r.metric_route_id.as_ref(), r.backend_group.name())
     });
     crate::metrics::upstream_errors_total()
-        .with_label_values(&[&listener, route, upstream, error_type])
+        .with_label_values(&[listener, route, upstream, error_type])
         .inc();
 }
 
@@ -407,25 +428,30 @@ pub(crate) async fn logging(
         .unwrap_or_else(|| extract_host(req, &mut host_buf));
 
     let upstream = ctx.resolved.as_ref().map(|r| r.backend_group.name());
-    let upstream_addr_str = ctx.upstream_addr.map(|a| a.to_string());
     let route_id = ctx.resolved.as_ref().map(|r| r.metric_route_id.as_ref());
 
     // --- Metric emission (always, independent of access-log toggle) ---
-    let listener_label = ctx
-        .local_port
-        .map_or_else(|| "0".to_string(), |p| p.to_string());
+    // `itoa::Buffer` keeps the u16 → &str render stack-only; both buffers
+    // sit on the request frame for the lifetime of this call.
+    let mut listener_buf = itoa::Buffer::new();
+    let listener_label = listener_buf.format(ctx.local_port.unwrap_or(0));
+    let mut status_buf = itoa::Buffer::new();
+    let status_label = status_buf.format(status.unwrap_or(0));
     let route_label = route_id.unwrap_or("none");
-    let status_label = status.map_or_else(|| "0".to_string(), |s| s.to_string());
     crate::metrics::requests_total()
-        .with_label_values(&[&listener_label, route_label, method, &status_label])
+        .with_label_values(&[listener_label, route_label, method, status_label])
         .inc();
     crate::metrics::request_duration_seconds()
-        .with_label_values(&[&listener_label, route_label])
+        .with_label_values(&[listener_label, route_label])
         .observe(duration.as_secs_f64());
 
     if !access_log_enabled {
         return;
     }
+
+    // `SocketAddr::to_string` allocates — keep it inside the access-log branch
+    // so operators silencing the log don't pay the alloc on every request.
+    let upstream_addr_str = ctx.upstream_addr.map(|a| a.to_string());
 
     // path_str is Option<&str>: tracing's Value impl for Option silently omits
     // the field when None, giving us free conditional emission for `None` mode.

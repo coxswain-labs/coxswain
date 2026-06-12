@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// Entries accumulate until process restart; the number of distinct CA bundles is
 /// bounded by the number of `BackendTLSPolicy` resources, which is small in practice.
+#[non_exhaustive]
 #[derive(Default)]
 pub struct UpstreamCaCache {
     inner: Mutex<HashMap<u64, Arc<CaType>>>,

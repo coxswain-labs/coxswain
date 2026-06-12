@@ -123,7 +123,10 @@ Default to `pub(crate)` for items reachable within the workspace, `pub(super)` f
 The proxy request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet::apply_request_filters`, `filter::FilterSet::apply_response_filters`) is performance-critical:
 
 - At `request_filter` entry, capture immutable request data (host, path, query) once as `Arc<str>` / `Option<String>` — at most 3 allocations per request. Later Pingora hooks clone these arcs cheaply without re-borrowing `session.req_header()`.
-- Beyond that fixed capture set, the routing lookup and upstream-selection paths must not allocate. (Exception: TLS connections allocate one `String` for the SNI hostname in `upstream_peer` — documented and deliberate.)
+- Beyond that fixed capture set, the routing lookup, upstream-selection, metric emission, and access-log paths must not allocate. The documented exceptions are:
+  - TLS connections: `upstream_peer` clones the SNI hostname into a `String` because Pingora's `HttpPeer` constructor takes ownership of it. Per outbound TLS connection, not per request; cleartext upstreams skip this entirely.
+  - Metric label rendering: `u16` port and status code render via stack-only `itoa::Buffer`s — **no heap allocation**. Reintroducing `port.to_string()` / `status.to_string()` in `common/hooks.rs` is a hot-path regression; the WS3 commit on #242 fixed exactly that and the CI gate (`scripts/check-public-types-stability.sh`) does not catch it — guard with code review.
+  - Access log: `SocketAddr::to_string()` for the upstream address allocates exactly once per request **and only when `--access-log=on`**. Operators that silence the access log via `--access-log=off` skip it.
 - Use `Shared<T>` (the `ArcSwap`-backed wrapper in `coxswain-core`) for lock-free routing/TLS snapshot reads.
 - Never hold a `Mutex` or `RwLock` guard across an `.await` point.
 
@@ -133,11 +136,25 @@ Every crate-defined error type uses `#[derive(thiserror::Error)]` with a `#[erro
 
 ### API stability annotations
 
-Every public struct and enum is `#[non_exhaustive]` unless it is intentionally open for downstream construction. Every `pub fn` that returns a value the caller is expected to consume carries `#[must_use]`. This sweep was issue #140 — do not omit these attributes on new public items.
+Every public struct and enum is `#[non_exhaustive]` unless it is intentionally open for downstream construction. Every `pub fn` that returns a value the caller is expected to consume carries `#[must_use]`. The original sweep was issue #140; the comprehensive workspace coverage (107/107 types) landed in issue #242.
+
+**Opt-out for intentionally-open types.** A small number of `pub` structs are field-literally constructed in another crate (e.g. CLI-derived config structs `coxswain-bin/src/main.rs` assembles, or routing predicate structs `coxswain-reflector::gateway_api` assembles per HTTPRoute match). These do not carry `#[non_exhaustive]`; instead they carry a `// intentionally open: <reason>` comment on the line immediately preceding the declaration (or earlier in the contiguous attribute block) explaining where the cross-crate field literal lives. Without that comment, the type is treated as a policy violation.
+
+**CI enforcement.** `scripts/check-public-types-stability.sh` walks every non-test `pub enum`/`pub struct` in the seven production crates and asserts each carries `#[non_exhaustive]` or an `intentionally open` rationale. The CI job `public-types-stability` runs it on every PR touching `crates/**/src/**`. The clippy lints `unwrap_used = "deny"` and `expect_used = "deny"` in `[workspace.lints.clippy]` cover the related shift-left for unwrap/expect usage in non-test code (test allowance via `clippy.toml`'s `allow-{unwrap,expect}-in-tests = true` is unchanged).
+
+**Related backfill issues** (intentionally out of scope of #242, tracked in v0.2):
+- #243 — `# Errors` section backfill on the ~94 currently-uncovered fallible `pub fn`s.
+- #244 — workspace-wide `# Panics` section audit.
 
 ### Test layout
 
-Per-source-file unit tests live in a `#[cfg(test)] mod tests;` submodule in the same file (small bodies) or in a sibling `<module>_tests.rs` file (large bodies). Cross-cutting tests for a crate live under `crates/<crate>/src/tests/`. Integration tests against the binary live in `crates/coxswain-e2e/tests/`. Established by issues #143 and #144 — do not collapse back into one test block per file.
+Per-source-file unit tests live **inline** as `#[cfg(test)] mod tests { use super::*; ... }` at the bottom of the source file. This is the rust-skills canonical pattern (rule `test-cfg-test-module`) and what the Rust ecosystem overwhelmingly uses — `use super::*;` reaches `pub(self)` items without forcing visibility bumps for testing, and the parent module's `use` statements flow through transparently.
+
+Cross-cutting unit tests (those that span multiple source files, plus shared test fixtures consumed by many inline test blocks) live under `crates/<crate>/src/[<submodule>/]tests/`. Each inline test block that needs a shared helper imports it via `use crate::<path>::tests::*;`. Shared helpers are declared `pub(super)` so wildcard imports reach them.
+
+Integration tests against the binary live in `crates/coxswain-e2e/tests/`.
+
+The sibling `<module>_tests.rs` pattern (and the `tests/<name>.rs` per-source-file pattern from #143/#144) was retired during the #242 quality remediation: the visibility-bump cost outweighed the file-size benefit, and the partial migration in operator/* and coxswain-admin made the codebase inconsistent. The earlier issues #143 and #144 are superseded by this section — do not reintroduce the sibling-file pattern.
 
 ### Per-crate Cargo manifest
 

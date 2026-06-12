@@ -28,16 +28,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod backend_tls_events;
 mod conditions;
 mod config;
+mod gateway_class_events;
 mod gateway_class_status;
 mod gateway_events;
 mod gateway_status;
-mod gatewayclass_events;
 mod ingress_events;
 mod ingress_status;
 mod route_events;
-
-#[cfg(test)]
-mod tests;
 
 pub use config::{ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress};
 
@@ -52,6 +49,7 @@ const LEASE_NAME: &str = "coxswain-leader-lock";
 
 /// Kubernetes watch loop for leader election and writing status conditions
 /// back to `HTTPRoute`, `Gateway`, `GatewayClass`, and `BackendTLSPolicy` resources.
+#[non_exhaustive]
 pub struct Controller {
     health: HealthRegistry,
     leader: Arc<AtomicBool>,
@@ -261,7 +259,7 @@ impl Controller {
                                         tracing::warn!(name, "Skipping GatewayClass status patch: metadata.generation is unset");
                                         continue;
                                     };
-                                    gatewayclass_events::patch_gateway_class_status(&client, &name, generation).await;
+                                    gateway_class_events::patch_gateway_class_status(&client, &name, generation).await;
                                 }
                             } else {
                                 tracing::debug!(
