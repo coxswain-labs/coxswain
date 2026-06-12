@@ -11,6 +11,7 @@ pub use ports::IngressPorts;
 
 /// Zero-sized handle namespacing the Ingress reconciliation entry points.
 /// The actual translation logic lives in the `reconcile` and `tls` submodules.
+#[non_exhaustive]
 pub struct IngressReconciler;
 
 #[cfg(test)]

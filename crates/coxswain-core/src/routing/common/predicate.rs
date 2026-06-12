@@ -27,6 +27,7 @@ impl ValueMatch {
 ///
 /// `name` is the canonical (lowercased) `HeaderName`, enabling O(1) lookup in
 /// `HeaderMap`. The comparison is against the header value string.
+// intentionally open: field-literal constructed in crates/coxswain-reflector/src/gateway_api/filters.rs while translating HTTPRoute matches.
 #[derive(Clone)]
 pub struct HeaderPredicate {
     /// Canonical (lowercased) header name for O(1) `HeaderMap` lookup.
@@ -38,6 +39,7 @@ pub struct HeaderPredicate {
 /// Matches a single query parameter by name and value.
 ///
 /// Query parameter names are case-sensitive per RFC 3986.
+// intentionally open: field-literal constructed in crates/coxswain-reflector/src/gateway_api/filters.rs while translating HTTPRoute matches.
 #[derive(Clone)]
 pub struct QueryPredicate {
     /// Query parameter name (case-sensitive).
@@ -50,6 +52,7 @@ pub struct QueryPredicate {
 ///
 /// Every predicate in this struct must pass for the match to succeed
 /// (AND semantics). Empty fields pass unconditionally.
+// intentionally open: field-literal constructed in crates/coxswain-reflector/src/gateway_api/filters.rs while translating HTTPRoute matches.
 #[derive(Clone, Default)]
 pub struct MatchPredicates {
     /// Required HTTP method, or `None` to match any method.
@@ -104,6 +107,7 @@ impl MatchPredicates {
 /// Per-request context passed into the hot-path route lookup.
 ///
 /// All fields are borrows from the live request — no allocations.
+// intentionally open: field-literal constructed per-request in crates/coxswain-proxy/src/common/hooks.rs (proxy hot path).
 pub struct RequestContext<'a> {
     /// HTTP method of the incoming request.
     pub method: &'a Method,

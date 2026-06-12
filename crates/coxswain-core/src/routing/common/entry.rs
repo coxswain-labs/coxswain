@@ -166,6 +166,7 @@ impl PathModifier {
 }
 
 /// Error produced when a header name or value is invalid at routing-table build time.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum HeaderModError {
     /// A header name string is not a valid HTTP token.
@@ -192,6 +193,7 @@ pub enum HeaderModError {
 ///
 /// Headers are pre-parsed at routing-table build time — no per-request
 /// `HeaderName::from_bytes` / `HeaderValue::from_str` parsing on the hot path.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct HeaderMod {
     /// Headers appended to any existing values.
@@ -283,6 +285,7 @@ pub enum FilterAction {
 }
 
 /// Per-rule timeout configuration parsed from `HTTPRouteRule.timeouts`.
+// intentionally open: field-literal constructed in crates/coxswain-reflector/src/gateway_api/timeouts.rs while translating HTTPRoute timeouts.
 #[derive(Clone, Debug, Default)]
 pub struct RouteTimeouts {
     /// Total request timeout (client → proxy → upstream → proxy → client). 504 on expiry.
@@ -305,6 +308,7 @@ type PerBackendFilterSlot = Option<Arc<[FilterAction]>>;
 ///
 /// This gives exact per-backend traffic ratios regardless of pod count, and fair
 /// pod distribution within each backend.
+#[non_exhaustive]
 pub struct BackendGroup {
     /// Service identity — used for logging only.
     name: String,
@@ -560,6 +564,7 @@ impl RouteKind {
 }
 
 /// Snapshot of a single path rule insertion, kept for inspection.
+#[non_exhaustive]
 pub struct RouteInfo {
     /// Registered path string (exact, prefix, or regex).
     pub path: String,
@@ -570,6 +575,7 @@ pub struct RouteInfo {
 }
 
 /// A path rule that was silently dropped because an earlier rule already claimed the same slot.
+#[non_exhaustive]
 pub struct RouteConflict {
     /// Listener port on which the conflict occurred.
     pub port: u16,
@@ -585,6 +591,7 @@ pub struct RouteConflict {
 
 /// A single routing candidate: a backend group plus the predicates that must hold
 /// for this candidate to be selected, along with metadata for precedence ordering.
+#[non_exhaustive]
 pub struct RouteEntry {
     /// Backend group to forward matching requests to.
     pub backend_group: Arc<BackendGroup>,

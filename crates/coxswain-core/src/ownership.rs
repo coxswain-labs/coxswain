@@ -7,6 +7,7 @@ use std::collections::HashSet;
 ///
 /// "Object" is the K8s term for an instance (a Pod, a Gateway); "resource" refers to
 /// the API endpoint type. Matches the terminology used by `kube`'s `ObjectRef`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectKey {
     /// Kubernetes namespace.

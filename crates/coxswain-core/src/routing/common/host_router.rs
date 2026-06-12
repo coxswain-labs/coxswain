@@ -22,6 +22,7 @@ pub(super) type RouteMatch = (
 );
 
 /// Compiled path router for a single hostname, supporting exact, prefix, and regex patterns.
+#[non_exhaustive]
 pub struct HostRouter {
     router: Router<Box<[Arc<RouteEntry>]>>,
     regex_routes: Vec<(RegexSet, Box<[Arc<RouteEntry>]>)>,
@@ -144,6 +145,7 @@ fn sort_and_freeze(entries: Vec<(usize, Arc<RouteEntry>)>) -> Box<[Arc<RouteEntr
 }
 
 /// Builder for a [`HostRouter`]; accumulates routes then compiles them in one pass.
+#[non_exhaustive]
 #[derive(Default)]
 pub struct HostRouterBuilder {
     exact_routes: Vec<(String, Arc<RouteEntry>)>,

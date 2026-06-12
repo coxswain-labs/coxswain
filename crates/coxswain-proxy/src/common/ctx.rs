@@ -27,6 +27,7 @@ tokio::task_local! {
 /// are `Arc<str>` so that cloning them in subsequent hooks (e.g. for SNI,
 /// redirect, access logging, or metric label emission) is a refcount bump,
 /// not a heap allocation.
+#[non_exhaustive]
 pub struct ResolvedRoute {
     /// Chosen backend group for this request.
     pub backend_group: Arc<BackendGroup>,
@@ -53,6 +54,7 @@ pub struct ResolvedRoute {
 }
 
 /// Per-request context carrying the real client address extracted from the PROXY header.
+#[non_exhaustive]
 #[derive(Default)]
 pub struct ProxyCtx {
     /// Real client IP from the PROXY protocol header (set only on the PROXY-protocol path).

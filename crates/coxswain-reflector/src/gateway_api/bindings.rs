@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 ///
 /// Used to scope `HTTPRoute` entries to the correct per-port routing table slot and to
 /// apply listener hostname filtering when the route has no `spec.hostnames` of its own.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ListenerBinding {
     /// Listener `hostname` (empty string = match all).

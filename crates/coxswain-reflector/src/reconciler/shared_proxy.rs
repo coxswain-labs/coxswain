@@ -65,6 +65,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 /// Error returned when parsing `--ingress-default-backend`.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum IngressDefaultBackendParseError {
     /// No `:` separator found; expected `<namespace>/<service>:<port>`.
@@ -86,6 +87,7 @@ pub enum IngressDefaultBackendParseError {
 /// Set via `--ingress-default-backend=<namespace>/<service>:<port>`.
 /// Implements [`std::str::FromStr`]; parsing errors are reported as
 /// [`IngressDefaultBackendParseError`].
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct IngressDefaultBackend {
     /// Kubernetes namespace of the backend service.
@@ -172,6 +174,7 @@ impl ReconcilerHealth {
 /// `BackendTLSPolicy`, `ConfigMap`, and `EndpointSlice`, and rebuilds the routing
 /// table whenever any of them change — with a 500 ms trailing-edge debounce to
 /// coalesce burst updates (e.g. rolling deploys).
+#[non_exhaustive]
 pub struct SharedProxyReconciler {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,

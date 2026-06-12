@@ -83,6 +83,7 @@ impl ListenerTlsOutcome {
 }
 
 /// Consolidated per-listener metadata for one Gateway listener.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct ListenerInfo {
     /// TLS resolution outcome for this listener.
@@ -101,6 +102,7 @@ pub struct ListenerInfo {
 }
 
 /// Per-listener health for one Gateway, keyed by listener name.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct GatewayListenerHealth {
     /// All listeners for this Gateway. Keyed by listener name.
@@ -122,6 +124,7 @@ struct GatewayListenerHealthInner {
 /// which compares the receiver's last-seen generation to the sender's current one)
 /// and supports any number of consumers without starving — both requirements that
 /// `tokio::sync::Notify` cannot meet simultaneously.
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct SharedGatewayListenerHealth(Arc<GatewayListenerHealthInner>);
 
@@ -165,6 +168,7 @@ impl SharedGatewayListenerHealth {
 }
 
 /// Health status for one (HTTPRoute, parent Gateway) pair.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct RouteParentHealth {
     /// True when all backend refs are valid and resolvable.
@@ -202,6 +206,7 @@ struct SharedHttpRouteHealthInner {
 ///
 /// See [`SharedGatewayListenerHealth`] for the rationale behind the `watch`-based
 /// notification scheme.
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct SharedHttpRouteHealth(Arc<SharedHttpRouteHealthInner>);
 
@@ -243,6 +248,7 @@ impl SharedHttpRouteHealth {
 ///
 /// Produced during each reconciler rebuild and consumed by the controller's
 /// leader-gated status writer.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct BackendTlsPolicyHealth {
     /// Owned Gateways that reference the policy's target Service via an HTTPRoute.
@@ -283,6 +289,7 @@ struct SharedBackendTlsPolicyHealthInner {
 ///
 /// See [`SharedGatewayListenerHealth`] for the rationale behind the `watch`-based
 /// notification scheme.
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct SharedBackendTlsPolicyHealth(Arc<SharedBackendTlsPolicyHealthInner>);
 

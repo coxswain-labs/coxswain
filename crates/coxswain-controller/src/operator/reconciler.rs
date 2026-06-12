@@ -109,6 +109,7 @@ pub(super) enum ReconcileError {
 /// Not `#[non_exhaustive]` — same rationale as
 /// [`crate::StatusWriterConfig`]: it's an internal wiring struct that only
 /// `coxswain-bin` instantiates.
+// intentionally open: field-literal constructed in crates/coxswain-bin/src/main.rs from CLI args.
 pub struct OperatorConfig {
     /// `GatewayClass.spec.controllerName` claim — same string the status
     /// writer uses; we only reconcile Gateways whose class matches.
@@ -147,6 +148,7 @@ pub struct OperatorConfig {
 /// to the [`crate::Controller`] in `serve controller` and `serve dev`;
 /// shares the controller pod's process and leader-election truth-source but
 /// owns its own kube-rs `Controller` and reflector stores.
+#[non_exhaustive]
 pub struct Operator {
     config: OperatorConfig,
 }

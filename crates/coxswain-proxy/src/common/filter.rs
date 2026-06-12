@@ -14,6 +14,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 /// Applies Gateway-API and Ingress filter actions to the in-flight request
 /// and response headers, plus the fixed `X-Proxy-Engine` and RFC-7239
 /// `Forwarded` infrastructure headers.
+#[non_exhaustive]
 pub struct TrafficFilter;
 
 impl TrafficFilter {

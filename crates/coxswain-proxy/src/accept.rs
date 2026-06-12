@@ -83,6 +83,7 @@ pub(crate) enum ProxyHeaderError {
 }
 
 /// CIDR allow-list for peers permitted to send PROXY protocol headers.
+#[non_exhaustive]
 pub struct TrustedSources {
     nets: Vec<IpNet>,
 }
@@ -100,6 +101,7 @@ impl TrustedSources {
 }
 
 /// Whether a listener speaks plain HTTP or HTTPS.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ListenerProtocol {
     /// Plain HTTP/1.1 (no TLS).
@@ -109,6 +111,7 @@ pub enum ListenerProtocol {
 }
 
 /// One listen address with its associated protocol.
+// intentionally open: field-literal constructed in crates/coxswain-bin/src/main.rs while assembling the desired listener set.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ListenerSpec {
     /// The socket address to bind.
@@ -146,6 +149,7 @@ impl ListenerSpec {
 /// valid HAProxy PROXY-protocol header from the allow-listed CIDR set.  When
 /// it is `None` (the common case), standard Pingora connection handling is
 /// used, supporting both HTTP/1.1 and HTTP/2 via ALPN.
+#[non_exhaustive]
 pub struct ProxyAcceptor<P>
 where
     P: ProxyHttp + Send + Sync + 'static,

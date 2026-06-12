@@ -95,6 +95,7 @@ impl PortRoutingTable {
 /// [`host_for`](Self::host_for)) to obtain a [`HostRouterBuilder`] for the
 /// hostname class you want, then call its `add_*_route` methods to register
 /// path rules.
+#[non_exhaustive]
 #[derive(Default)]
 pub struct PortTableBuilder {
     exact_hosts: HashMap<String, HostRouterBuilder>,

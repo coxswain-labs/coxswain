@@ -33,6 +33,7 @@ use std::sync::Arc;
 /// [`reconcile`], [`status`]); this struct exposes the surfaces that consumers
 /// (the [`crate::reconciler::SharedProxyReconciler`] rebuild loop, the controller crate's
 /// status writer) call into.
+#[non_exhaustive]
 pub struct GatewayApiReconciler;
 
 impl GatewayApiReconciler {

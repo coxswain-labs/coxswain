@@ -13,6 +13,7 @@ use pingora_core::protocols::http::ServerSession;
 /// `Degraded`; otherwise 503. A `Degraded` subsystem keeps the pod in
 /// kubelet's endpoints because the data plane is still functional — only
 /// `Pending` and `Failed` subsystems flip the probe to 503.
+// intentionally open: field-literal constructed in crates/coxswain-bin/src/main.rs.
 pub struct HealthServer {
     /// Shared health registry inspected on every `/readyz` request.
     pub registry: HealthRegistry,

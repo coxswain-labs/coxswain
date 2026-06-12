@@ -52,6 +52,7 @@ const LEASE_NAME: &str = "coxswain-leader-lock";
 
 /// Kubernetes watch loop for leader election and writing status conditions
 /// back to `HTTPRoute`, `Gateway`, `GatewayClass`, and `BackendTLSPolicy` resources.
+#[non_exhaustive]
 pub struct Controller {
     health: HealthRegistry,
     leader: Arc<AtomicBool>,

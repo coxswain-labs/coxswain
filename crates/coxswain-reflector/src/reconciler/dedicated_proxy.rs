@@ -186,6 +186,7 @@ impl DedicatedOutputs {
 /// Mirrors [`super::SharedProxyReconciler`]'s debounce + rebuild pipeline but
 /// filters at the routing-table-build step to the target Gateway only and
 /// skips the Ingress code paths entirely.
+#[non_exhaustive]
 pub struct DedicatedProxyReconciler {
     config: DedicatedConfig,
     outputs: DedicatedOutputs,

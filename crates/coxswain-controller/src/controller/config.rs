@@ -49,6 +49,7 @@ impl LeaseSettings {
 }
 
 /// Error returned by [`ControllerConfig::new`].
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ControllerConfigError {
     /// The lease renewal interval is too fast relative to the TTL.

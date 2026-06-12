@@ -10,6 +10,7 @@ use std::time::SystemTime;
 ///
 /// Validation happens once in the controller before insertion; the proxy re-parses
 /// on each SNI handshake (cheap relative to the handshake itself).
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct TlsCert {
     /// Raw PEM-encoded certificate chain.
@@ -57,6 +58,7 @@ impl PartialEq for TlsCert {
 }
 
 /// Immutable snapshot of all TLS certs indexed by host pattern.
+#[non_exhaustive]
 #[derive(Debug, Default, PartialEq)]
 pub struct TlsStore {
     exact: HashMap<String, Arc<TlsCert>>,
@@ -139,6 +141,7 @@ fn wildcard_matches(sni: &str, suffix: &str) -> bool {
 }
 
 /// Builder for [`TlsStore`]. Not thread-safe; used only inside the debounced rebuild.
+#[non_exhaustive]
 #[derive(Default)]
 pub struct TlsStoreBuilder {
     exact: HashMap<String, Arc<TlsCert>>,

@@ -13,6 +13,7 @@ use std::sync::Arc;
 /// Reads its snapshot with a single atomic load via the wrapped
 /// [`Shared`][coxswain_core::shared::Shared] handle. The `Kind` marker
 /// preserves the Ingress-vs-Gateway distinction at the type level.
+#[non_exhaustive]
 pub struct RoutingEngine<Kind> {
     table: Shared<RoutingTable<Kind>>,
 }

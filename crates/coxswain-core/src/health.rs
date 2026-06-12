@@ -126,6 +126,7 @@ struct SubsystemInner {
 /// methods to register new checks — the set of check names is fixed at
 /// [`HealthRegistry::register`] time so that misspelled names panic instead
 /// of silently creating a check that never flips.
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct SubsystemHandle {
     inner: Arc<SubsystemInner>,
@@ -204,6 +205,7 @@ impl SubsystemHandle {
 /// the binary, register each subsystem at startup, hand the resulting
 /// [`SubsystemHandle`]s to the subsystem owners, and share clones of the
 /// registry itself with the `/readyz` and `/status` HTTP handlers.
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct HealthRegistry {
     subsystems: Arc<Mutex<BTreeMap<Arc<str>, Arc<SubsystemInner>>>>,

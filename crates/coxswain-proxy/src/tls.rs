@@ -13,6 +13,7 @@ use pingora_core::tls::{ext, pkey::PKey, ssl::NameType, x509::X509};
 /// to fail naturally (OpenSSL/BoringSSL sends `unrecognized_name`).
 ///
 /// Cheaply clonable: the underlying [`SharedTlsStore`] is `Arc`-backed.
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct SniCertSelector {
     tls: SharedTlsStore,

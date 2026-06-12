@@ -37,6 +37,7 @@ use std::time::SystemTime;
 /// listener-binding table and the `BackendTLSPolicy` index — so the function
 /// stays under the workspace `clippy::too_many_arguments` threshold without
 /// each call site repeating the two-arg suffix.
+#[non_exhaustive]
 pub struct RouteResolution<'a> {
     /// `(gw_ns, gw_name, listener_name) → (hostname, port)` mapping for every
     /// listener on every Gateway we own.

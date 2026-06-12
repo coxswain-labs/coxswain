@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 /// A flattened entry from a `ReferenceGrant`, ready for O(1) lookup.
 /// `to_name = None` means the grant covers any resource in `to_ns` (wildcard).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReferenceGrantKey {
     /// Namespace of the referencing resource (e.g. the HTTPRoute's namespace).
