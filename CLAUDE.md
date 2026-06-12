@@ -136,7 +136,15 @@ Every crate-defined error type uses `#[derive(thiserror::Error)]` with a `#[erro
 
 ### API stability annotations
 
-Every public struct and enum is `#[non_exhaustive]` unless it is intentionally open for downstream construction. Every `pub fn` that returns a value the caller is expected to consume carries `#[must_use]`. This sweep was issue #140 — do not omit these attributes on new public items.
+Every public struct and enum is `#[non_exhaustive]` unless it is intentionally open for downstream construction. Every `pub fn` that returns a value the caller is expected to consume carries `#[must_use]`. The original sweep was issue #140; the comprehensive workspace coverage (107/107 types) landed in issue #242.
+
+**Opt-out for intentionally-open types.** A small number of `pub` structs are field-literally constructed in another crate (e.g. CLI-derived config structs `coxswain-bin/src/main.rs` assembles, or routing predicate structs `coxswain-reflector::gateway_api` assembles per HTTPRoute match). These do not carry `#[non_exhaustive]`; instead they carry a `// intentionally open: <reason>` comment on the line immediately preceding the declaration (or earlier in the contiguous attribute block) explaining where the cross-crate field literal lives. Without that comment, the type is treated as a policy violation.
+
+**CI enforcement.** `scripts/check-public-types-stability.sh` walks every non-test `pub enum`/`pub struct` in the seven production crates and asserts each carries `#[non_exhaustive]` or an `intentionally open` rationale. The CI job `public-types-stability` runs it on every PR touching `crates/**/src/**`. The clippy lints `unwrap_used = "deny"` and `expect_used = "deny"` in `[workspace.lints.clippy]` cover the related shift-left for unwrap/expect usage in non-test code (test allowance via `clippy.toml`'s `allow-{unwrap,expect}-in-tests = true` is unchanged).
+
+**Related backfill issues** (intentionally out of scope of #242, tracked in v0.2):
+- #243 — `# Errors` section backfill on the ~94 currently-uncovered fallible `pub fn`s.
+- #244 — workspace-wide `# Panics` section audit.
 
 ### Test layout
 
