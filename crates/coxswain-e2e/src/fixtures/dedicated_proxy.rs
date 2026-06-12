@@ -37,6 +37,12 @@ pub const DEDICATED_GATEWAY_LOADBALANCER: &str = fixture!("dedicated_gateway_loa
 pub const DEDICATED_GATEWAY_INVALID_PARAMS: &str =
     fixture!("dedicated_gateway_invalid_params.yaml");
 
+/// Dedicated-mode `Gateway` with `allowedRoutes.namespaces.from: All` on its
+/// listener (#229). Used to verify that the controller auto-provisions a
+/// `ClusterRoleBinding` for the proxy SA and renders
+/// `--allow-cluster-wide-route-read` into the Deployment args.
+pub const DEDICATED_GATEWAY_FROM_ALL: &str = fixture!("dedicated_gateway_from_all.yaml");
+
 // -----------------------------------------------------------------------------
 // Step 13 (#212) — full-lifecycle suite fixtures. Listener ports use the
 // harness-substituted `GATEWAY_HTTP_PORT`, and the dedicated pod's image is

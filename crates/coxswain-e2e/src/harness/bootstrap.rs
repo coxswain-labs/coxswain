@@ -544,7 +544,12 @@ async fn install_cert_manager_if_missing() -> anyhow::Result<()> {
         );
     }
 
-    // Always apply the ClusterIssuer — idempotent.
+    // Always apply the ClusterIssuer — idempotent. Retried with backoff because
+    // cert-manager's validating admission webhook can return transient errors
+    // for ~10–30 s after the Deployment goes Ready (the apiserver needs to
+    // observe the CA bundle injected by cainjector before webhook calls
+    // succeed). A single apply will fail intermittently on freshly-installed
+    // cert-manager; retrying makes the bootstrap deterministic.
     let issuer_yaml = r#"
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -553,24 +558,40 @@ metadata:
 spec:
   selfSigned: {}
 "#;
-    let mut child = tokio::process::Command::new("kubectl")
-        .args(["apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .context("kubectl apply ClusterIssuer")?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        tokio::io::AsyncWriteExt::write_all(stdin, issuer_yaml.as_bytes())
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut backoff = std::time::Duration::from_secs(1);
+    loop {
+        let mut child = tokio::process::Command::new("kubectl")
+            .args(["apply", "-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("kubectl apply ClusterIssuer")?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            tokio::io::AsyncWriteExt::write_all(stdin, issuer_yaml.as_bytes())
+                .await
+                .context("write ClusterIssuer yaml")?;
+        }
+        drop(child.stdin.take());
+        let output = child
+            .wait_with_output()
             .await
-            .context("write ClusterIssuer yaml")?;
+            .context("kubectl apply ClusterIssuer wait")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("kubectl apply ClusterIssuer failed after 60s: {stderr}");
+        }
+        tracing::debug!(
+            retry_in_s = backoff.as_secs(),
+            "ClusterIssuer apply transient failure, retrying: {stderr}"
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
     }
-    drop(child.stdin.take());
-    let status = child
-        .wait()
-        .await
-        .context("kubectl apply ClusterIssuer wait")?;
-    anyhow::ensure!(status.success(), "kubectl apply ClusterIssuer failed");
-
-    Ok(())
 }
 
 /// Returns `true` if cert-manager CRDs are present at v1.

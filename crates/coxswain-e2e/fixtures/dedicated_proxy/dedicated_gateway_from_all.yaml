@@ -1,0 +1,32 @@
+# Dedicated-mode Gateway with `allowedRoutes.namespaces.from: All` on its
+# listener. Used by the cluster-wide RBAC e2e tests (#229) to assert that the
+# controller auto-provisions a ClusterRoleBinding for the proxy SA and renders
+# `--allow-cluster-wide-route-read` into the Deployment args.
+# TESTNS is substituted with the test namespace at runtime.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: dedicated-params-from-all
+spec:
+  replicas: 1
+  serviceType: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: dedicated-gw-from-all
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    parametersRef:
+      group: gateway.coxswain-labs.dev
+      kind: CoxswainGatewayParameters
+      name: dedicated-params-from-all
+  listeners:
+    - name: http
+      port: 8200
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: All
