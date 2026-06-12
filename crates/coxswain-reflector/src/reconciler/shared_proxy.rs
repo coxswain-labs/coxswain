@@ -36,7 +36,7 @@ use crate::{
     ingress::{IngressPorts, IngressReconciler},
 };
 use async_trait::async_trait;
-use coxswain_core::cluster::SharedClusterSummary;
+use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::routing::{
@@ -753,6 +753,22 @@ fn rebuild(
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
 
     let gateways = stores.gateways.state();
+
+    // GatewayClass names that have a CoxswainGatewayParameters parametersRef —
+    // used to classify Gateways whose dedicated-mode opt-in comes via the class
+    // rather than a per-Gateway infrastructure.parametersRef (#229).
+    let dedicated_gateway_class_names: HashSet<String> = stores
+        .gateway_classes
+        .state()
+        .into_iter()
+        .filter(|gc| {
+            gc.spec.parameters_ref.as_ref().is_some_and(|pr| {
+                pr.group == PARAMETERS_REF_GROUP && pr.kind == PARAMETERS_REF_KIND
+            })
+        })
+        .filter_map(|gc| gc.metadata.name.clone())
+        .collect();
+
     // Publish the cluster summary while we still have access to gateway_tls_health
     // (it's moved into `tls_health.store_and_notify` next). Reads from already-
     // materialised state: nothing kube-side, no allocations beyond the summary.
@@ -762,6 +778,7 @@ fn rebuild(
             gateways: &gateways,
             ingresses: &ingresses,
             owned_gateways: &owned_gateways,
+            dedicated_gateway_class_names: &dedicated_gateway_class_names,
             owned_ingress_classes: &owned_ingress_classes,
             default_ingress_class: owned_default_ingress_class.as_deref(),
             gateway_tls_health: &gateway_tls_health,

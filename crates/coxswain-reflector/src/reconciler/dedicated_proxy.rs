@@ -38,11 +38,10 @@
 //!   transitional half-functional state from #208; production rollouts
 //!   always pass a list.
 //!
-//! The `allow_cluster_wide_route_read` / `allow_cluster_wide_namespace_read`
-//! flags continue to surface listener warnings on both paths. Their CRD
-//! plumbing and full enforcement (`Accepted=false` listener condition) is
-//! deferred to a follow-up issue; the per-namespace path here treats every
-//! listener as `from: Same`.
+//! The `allow_cluster_wide_route_read` flag switches the `HTTPRoute` reflector
+//! from per-namespace to cluster-wide on the per-namespace path so that
+//! listeners with `allowedRoutes.namespaces.from: All` or `from: Selector`
+//! see routes from all namespaces (#229).
 
 use super::shared_proxy::{
     Ownership, ReconcilerHealth, ReflectorEffects, ReflectorStores, build_gateway_routes,
@@ -81,9 +80,9 @@ use tokio::task::JoinSet;
 /// Configuration for a [`DedicatedProxyReconciler`].
 ///
 /// Constructed by the bin layer from `--gateway-name` / `--gateway-namespace`
-/// plus the two RBAC opt-in flags. The opt-in flags are forwarded into the
-/// reconciler so that the eventual Step 10 narrowing of per-NS reflectors can
-/// read them from the same place the listener-refusal logic will.
+/// plus the two cluster-wide read flags. The flags are derived by the
+/// controller from the Gateway's `allowedRoutes.namespaces.from` field and
+/// rendered into the Deployment's container args (#229).
 #[non_exhaustive]
 pub struct DedicatedConfig {
     /// `GatewayClass`/`HTTPRoute` `controllerName` claim — same as the shared
@@ -93,15 +92,13 @@ pub struct DedicatedConfig {
     pub gateway_name: String,
     /// Namespace of the Gateway this proxy is dedicated to.
     pub gateway_namespace: String,
-    /// Permit cluster-wide HTTPRoute reads for listeners with
-    /// `allowedRoutes.namespaces.from: All`. Defaults to `false`; when the
-    /// target Gateway has such a listener and the flag is `false`, the
-    /// reconciler logs a warning at startup (full listener-level refusal lands
-    /// in Step 10 alongside the per-NS RBAC narrowing).
+    /// Spawn a cluster-wide `HTTPRoute` reflector so routes from all
+    /// namespaces are visible. Set when any listener has
+    /// `allowedRoutes.namespaces.from: All` or `from: Selector`.
     pub allow_cluster_wide_route_read: bool,
-    /// Permit cluster-wide Namespace reads for listeners with
-    /// `allowedRoutes.namespaces.from: Selector`. Same shape as
-    /// `allow_cluster_wide_route_read`: warned-on now, enforced in Step 10.
+    /// Permit cluster-wide `Namespace` reads. Set when any listener has
+    /// `allowedRoutes.namespaces.from: Selector` (needed for future
+    /// namespace-selector evaluation).
     pub allow_cluster_wide_namespace_read: bool,
     /// Namespaces the proxy is permitted to watch backend resources in.
     ///
@@ -383,8 +380,6 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
 
     let controller_name = rec.config.controller_name.clone();
     let target = rec.config.target();
-    let allow_cluster_wide_route_read = rec.config.allow_cluster_wide_route_read;
-    let allow_cluster_wide_namespace_read = rec.config.allow_cluster_wide_namespace_read;
     let gateway_routes = rec.outputs.gateway_routes.clone();
     let tls = rec.outputs.tls.clone();
     let tls_health = rec.outputs.tls_health.clone();
@@ -396,7 +391,6 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
 
     set.spawn(async move {
         let mut routing_table_published = false;
-        let mut listener_warning_logged = false;
         loop {
             notify.notified().await;
             loop {
@@ -422,8 +416,6 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
             let target_spec = DedicatedRebuildTarget {
                 controller_name: &controller_name,
                 target: &target,
-                allow_cluster_wide_route_read,
-                allow_cluster_wide_namespace_read,
             };
             let outputs = DedicatedRebuildOutputs {
                 owned_gateways_handle: &owned_gateways_handle,
@@ -433,12 +425,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
                 route_health: &route_health,
                 policy_health: &policy_health,
             };
-            let published = rebuild_dedicated(
-                &stores,
-                &target_spec,
-                &outputs,
-                &mut listener_warning_logged,
-            );
+            let published = rebuild_dedicated(&stores, &target_spec, &outputs);
             metrics.observe_rebuild(
                 rebuild_start.elapsed(),
                 if published { "ok" } else { "error" },
@@ -460,18 +447,12 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
     set
 }
 
-/// Identity + RBAC opt-ins for a dedicated-mode rebuild — the inputs that
-/// determine which Gateway is in scope and which cross-namespace listener
-/// modes the operator has consented to.
+/// Identity of the target Gateway for a dedicated-mode rebuild.
 pub(super) struct DedicatedRebuildTarget<'a> {
     /// `GatewayClass.spec.controllerName` claim — filters owned resources.
     pub(super) controller_name: &'a str,
     /// Single Gateway this dedicated proxy serves.
     pub(super) target: &'a ObjectKey,
-    /// Permit cross-namespace route attachment via `from: All`.
-    pub(super) allow_cluster_wide_route_read: bool,
-    /// Permit cross-namespace route attachment via `from: Selector`.
-    pub(super) allow_cluster_wide_namespace_read: bool,
 }
 
 /// Shared output handles a dedicated-mode rebuild publishes into. Grouped to
@@ -500,13 +481,10 @@ fn rebuild_dedicated(
     stores: &ReflectorStores<'_>,
     target_spec: &DedicatedRebuildTarget<'_>,
     outputs: &DedicatedRebuildOutputs<'_>,
-    listener_warning_logged: &mut bool,
 ) -> bool {
     let DedicatedRebuildTarget {
         controller_name,
         target,
-        allow_cluster_wide_route_read,
-        allow_cluster_wide_namespace_read,
     } = *target_spec;
     let DedicatedRebuildOutputs {
         owned_gateways_handle,
@@ -547,16 +525,6 @@ fn rebuild_dedicated(
         HashSet::new()
     };
     owned_gateways_handle.store(Arc::new(owned_gateways.clone()));
-
-    if !*listener_warning_logged {
-        warn_on_unsupported_listener_modes(
-            stores,
-            target,
-            allow_cluster_wide_route_read,
-            allow_cluster_wide_namespace_read,
-        );
-        *listener_warning_logged = true;
-    }
 
     let (backend_grants, cert_grants) = flatten_grants(&stores.grants.state());
 
@@ -608,72 +576,18 @@ fn rebuild_dedicated(
     routes_published
 }
 
-/// Log a warning the first time we observe the target Gateway with a listener
-/// declaring `allowedRoutes.namespaces.from: All` or `Selector` while the
-/// corresponding opt-in flag is false.
-///
-/// Full listener-level refusal (an `Accepted=false` listener condition) lands
-/// in Step 10 alongside the per-namespace RBAC narrowing — at that point the
-/// refusal has runtime teeth. Today the watches are cluster-wide regardless,
-/// so an unconsented mode would not actually leak more than the shared-proxy
-/// SA already does; the warning is a forward-compatibility breadcrumb.
-fn warn_on_unsupported_listener_modes(
-    stores: &ReflectorStores<'_>,
-    target: &ObjectKey,
-    allow_cluster_wide_route_read: bool,
-    allow_cluster_wide_namespace_read: bool,
-) {
-    use crate::gw_types::v::gateways::GatewayListenersAllowedRoutesNamespacesFrom as From;
-
-    for gw in stores.gateways.state() {
-        let ns = gw.metadata.namespace.clone().unwrap_or_default();
-        let name = gw.metadata.name.clone().unwrap_or_default();
-        if !(ns == target.ns && name == target.name) {
-            continue;
-        }
-        for listener in &gw.spec.listeners {
-            let Some(allowed) = listener.allowed_routes.as_ref() else {
-                continue;
-            };
-            let Some(ns_spec) = allowed.namespaces.as_ref() else {
-                continue;
-            };
-            match ns_spec.from {
-                Some(From::All) if !allow_cluster_wide_route_read => {
-                    tracing::warn!(
-                        gateway = %format!("{ns}/{name}"),
-                        listener = %listener.name,
-                        "Listener uses allowedRoutes.namespaces.from=All but \
-                         --allow-cluster-wide-route-read is false; cluster-wide \
-                         HTTPRoute reads are still in effect today (Step 7), \
-                         but Step 10 will refuse this listener via an \
-                         Accepted=false condition unless the opt-in is set"
-                    );
-                }
-                Some(From::Selector) if !allow_cluster_wide_namespace_read => {
-                    tracing::warn!(
-                        gateway = %format!("{ns}/{name}"),
-                        listener = %listener.name,
-                        "Listener uses allowedRoutes.namespaces.from=Selector but \
-                         --allow-cluster-wide-namespace-read is false; cluster-wide \
-                         Namespace reads are still in effect today (Step 7), \
-                         but Step 10 will refuse this listener via an \
-                         Accepted=false condition unless the opt-in is set"
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-/// Per-namespace reflector spawn + debounced rebuild loop (#209).
+/// Per-namespace reflector spawn + debounced rebuild loop (#209, #229).
 ///
 /// One reflector per (resource, namespace) for the namespaced resources the
 /// dedicated proxy reads. The list comes from
 /// [`DedicatedConfig::watch_namespaces`], which the controller renders from
 /// the Gateway's desired-namespace set so the proxy's watches and the
 /// per-namespace `RoleBinding`s the controller has provisioned stay in sync.
+///
+/// When `allow_cluster_wide_route_read` is true (any listener has
+/// `allowedRoutes.namespaces.from: All` or `from: Selector`), a single
+/// cluster-wide `HTTPRoute` reflector replaces the per-namespace one so
+/// routes from all namespaces are visible.
 ///
 /// The `GatewayClass` watch is deliberately omitted on this path: the
 /// controller is the source of truth for "this Gateway is dedicated and
@@ -682,6 +596,7 @@ fn warn_on_unsupported_listener_modes(
 async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconciler) -> JoinSet<()> {
     let namespaces = rec.config.watch_namespaces.clone();
     let gateway_namespace = rec.config.gateway_namespace.clone();
+    let allow_cluster_wide_route_read = rec.config.allow_cluster_wide_route_read;
 
     // Per-resource Vec<Store<T>>; index parallel to the namespace iteration
     // order. Aggregated on each rebuild tick by `aggregate_into_store`.
@@ -716,17 +631,35 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
             );
             gateway_readers.push(gateway_reader);
 
-            // HTTPRoute: only the Gateway's own namespace until cross-ns
-            // route attachment opt-in lands. With `from: Same` (today's
-            // default) all routes attached to this Gateway live here.
+            // HTTPRoute: cluster-wide when any listener has from: All or
+            // from: Selector; otherwise per-namespace (Gateway's own namespace
+            // covers all from: Same routes, which is the default).
+            if !allow_cluster_wide_route_read {
+                let (route_reader, route_writer) = reflector::store::<HttpRoute>();
+                spawn_reflector(
+                    &mut set,
+                    route_writer,
+                    scoped_api::<HttpRoute>(client.clone(), Some(ns)),
+                    watcher::Config::default(),
+                    ReflectorEffects::new(&notify, controller_health, "httproute", metrics),
+                    "HttpRoute",
+                );
+                route_readers.push(route_reader);
+            }
+        }
+
+        // Cluster-wide HTTPRoute reflector: spawned once when any listener
+        // declares from: All or from: Selector so routes from all namespaces
+        // are visible to the routing table builder.
+        if allow_cluster_wide_route_read {
             let (route_reader, route_writer) = reflector::store::<HttpRoute>();
             spawn_reflector(
                 &mut set,
                 route_writer,
-                scoped_api::<HttpRoute>(client.clone(), Some(ns)),
+                Api::<HttpRoute>::all(client.clone()),
                 watcher::Config::default(),
                 ReflectorEffects::new(&notify, controller_health, "httproute", metrics),
-                "HttpRoute",
+                "HttpRoute (cluster-wide)",
             );
             route_readers.push(route_reader);
         }
@@ -819,8 +752,6 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
 
     let controller_name = rec.config.controller_name.clone();
     let target = rec.config.target();
-    let allow_cluster_wide_route_read = rec.config.allow_cluster_wide_route_read;
-    let allow_cluster_wide_namespace_read = rec.config.allow_cluster_wide_namespace_read;
     let gateway_routes = rec.outputs.gateway_routes.clone();
     let tls = rec.outputs.tls.clone();
     let tls_health = rec.outputs.tls_health.clone();
@@ -832,7 +763,6 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
 
     set.spawn(async move {
         let mut routing_table_published = false;
-        let mut listener_warning_logged = false;
         loop {
             notify.notified().await;
             loop {
@@ -871,8 +801,6 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
             let target_spec = DedicatedRebuildTarget {
                 controller_name: &controller_name,
                 target: &target,
-                allow_cluster_wide_route_read,
-                allow_cluster_wide_namespace_read,
             };
             let outputs = DedicatedRebuildOutputs {
                 owned_gateways_handle: &owned_gateways_handle,
@@ -882,12 +810,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
                 route_health: &route_health,
                 policy_health: &policy_health,
             };
-            let published = rebuild_dedicated_narrow(
-                &stores,
-                &target_spec,
-                &outputs,
-                &mut listener_warning_logged,
-            );
+            let published = rebuild_dedicated_narrow(&stores, &target_spec, &outputs);
             metrics.observe_rebuild(
                 rebuild_start.elapsed(),
                 if published { "ok" } else { "error" },
@@ -946,13 +869,10 @@ fn rebuild_dedicated_narrow(
     stores: &ReflectorStores<'_>,
     target_spec: &DedicatedRebuildTarget<'_>,
     outputs: &DedicatedRebuildOutputs<'_>,
-    listener_warning_logged: &mut bool,
 ) -> bool {
     let DedicatedRebuildTarget {
         controller_name,
         target,
-        allow_cluster_wide_route_read,
-        allow_cluster_wide_namespace_read,
     } = *target_spec;
     let DedicatedRebuildOutputs {
         owned_gateways_handle,
@@ -992,16 +912,6 @@ fn rebuild_dedicated_narrow(
         }
     };
     owned_gateways_handle.store(Arc::new(owned_gateways.clone()));
-
-    if !*listener_warning_logged {
-        warn_on_unsupported_listener_modes(
-            stores,
-            target,
-            allow_cluster_wide_route_read,
-            allow_cluster_wide_namespace_read,
-        );
-        *listener_warning_logged = true;
-    }
 
     let (backend_grants, cert_grants) = flatten_grants(&stores.grants.state());
 

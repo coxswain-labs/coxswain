@@ -1,0 +1,19 @@
+# Cluster-wide Namespace read permission for dedicated-mode proxies whose
+# Gateway has a listener with allowedRoutes.namespaces.from: Selector (#229).
+# Needed so the proxy can evaluate the namespaceSelector against all Namespace
+# objects. The controller binds this via a per-Gateway ClusterRoleBinding.
+#
+# Load-bearing invariants:
+#   - Zero write verbs.
+#   - Limited to namespaces only — the narrowest grant for selector evaluation.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: coxswain-gateway-proxy-cluster-wide-namespace-reader
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: dedicated-proxy
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]

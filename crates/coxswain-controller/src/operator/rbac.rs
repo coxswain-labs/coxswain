@@ -1,5 +1,5 @@
-//! Per-namespace `RoleBinding` reconciliation for dedicated-mode Gateway
-//! proxies (#209, Step 10 of the architecture plan).
+//! Per-namespace `RoleBinding` and cluster-wide `ClusterRoleBinding`
+//! reconciliation for dedicated-mode Gateway proxies (#209, #229).
 //!
 //! ## Why this module exists
 //!
@@ -11,38 +11,41 @@
 //! cluster-wide reads regresses the v0.2 least-privilege story for
 //! multi-tenant Gateways.
 //!
-//! This reconciler maintains a `RoleBinding` per
-//! (Gateway, target-namespace) pair, binding the proxy's `ServiceAccount` to
-//! the cluster-scoped `coxswain-gateway-proxy-reader` `ClusterRole` (defined
-//! in `deploy/manifests/dedicated-proxy-clusterrole.yaml` and shipped by the
-//! Helm chart). As the Gateway's HTTPRoutes change, namespaces enter or leave
-//! the desired set; bindings track that set.
+//! For listeners with `allowedRoutes.namespaces.from: All` or `from: Selector`
+//! the proxy additionally needs cluster-wide `HTTPRoute` reads (so it can see
+//! routes from any namespace) and optionally cluster-wide `Namespace` reads
+//! (for future `namespaceSelector` evaluation). These broader grants are
+//! derived automatically from the Gateway spec — no separate operator opt-in
+//! field is required — via [`derive_proxy_rbac`] and managed as
+//! `ClusterRoleBinding`s alongside the per-namespace `RoleBinding`s.
 //!
 //! ## Naming and labels (no owner references)
 //!
-//! Bindings are named `coxswain-<gw-namespace>-<gw-name>` and carry three
-//! labels for reconcile-driven discovery:
+//! Per-namespace `RoleBinding`s are named `coxswain-<gw-namespace>-<gw-name>`
+//! and carry three labels for reconcile-driven discovery:
 //!
 //! - `app.kubernetes.io/managed-by: coxswain`
 //! - `gateway.networking.k8s.io/gateway-name: <gw-name>` (GEP-1762)
 //! - `gateway.coxswain-labs.dev/gateway-namespace: <gw-ns>`
 //!
-//! **No owner references.** A `RoleBinding` in tenant-b cannot be
-//! owner-referenced to a `Gateway` in tenant-a — Kubernetes treats
-//! cross-namespace owner references as orphaned and the GC silently deletes
-//! the dependent. All cleanup is reconcile-driven via the label selector
-//! above. The same uniform path applies to the Gateway's own namespace for
-//! symmetry; the finalizer on the parent Gateway guarantees cleanup runs
-//! synchronously before the Gateway is removed.
+//! Cluster-wide `ClusterRoleBinding`s use the same label set but are named
+//! `coxswain-<gw-namespace>-<gw-name>-cluster-wide-routes` and
+//! `coxswain-<gw-namespace>-<gw-name>-cluster-wide-namespaces`.
+//!
+//! **No owner references.** A binding in tenant-b cannot be owner-referenced
+//! to a `Gateway` in tenant-a — Kubernetes treats cross-namespace owner refs
+//! as orphaned and the GC silently deletes the dependent. All cleanup is
+//! reconcile-driven via the label selector above. The finalizer on the parent
+//! Gateway guarantees cleanup runs synchronously before the Gateway is removed.
 //!
 //! ## Desired namespace set
 //!
 //! [`desired_namespaces_for_gateway`] computes the union of:
 //!
 //! 1. The Gateway's own namespace (always — Gateway + listener TLS Secrets).
-//! 2. Each attached HTTPRoute's own namespace (default `from: Same` covered
-//!    in case 1; broader attachment modes are gated by opt-in flags punted to
-//!    a follow-up).
+//! 2. Each attached HTTPRoute's own namespace. When `allow_cross_namespace_routes`
+//!    is true (any listener has `from: All` or `from: Selector`), routes from
+//!    all namespaces are included; otherwise only same-namespace routes qualify.
 //! 3. Each cross-namespace `backendRef` target, gated by
 //!    [`coxswain_core::reference_grants::backend_ref_allowed`].
 //! 4. Each Gateway listener TLS `certificateRef` target, gated by the same
@@ -59,10 +62,12 @@
 
 use coxswain_core::reference_grants::backend_ref_allowed;
 use coxswain_reflector::gw_types::HttpRoute;
-use coxswain_reflector::gw_types::v::gateways::Gateway;
+use coxswain_reflector::gw_types::v::gateways::{
+    Gateway, GatewayListenersAllowedRoutesNamespacesFrom as From,
+};
 use coxswain_reflector::gw_types::v::referencegrants::ReferenceGrant;
 use coxswain_reflector::reference_grants::flatten_grants;
-use k8s_openapi::api::rbac::v1::{RoleBinding, RoleRef, Subject};
+use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{ListParams, Patch, PatchParams};
 use kube::runtime::reflector::Store;
@@ -76,6 +81,63 @@ use thiserror::Error;
 /// and `charts/coxswain/templates/dedicated-proxy-clusterrole.yaml`. Renaming
 /// this constant requires coordinated changes to both YAMLs.
 pub(super) const PROXY_CLUSTER_ROLE_NAME: &str = "coxswain-gateway-proxy-reader";
+
+/// `ClusterRole` granting cluster-wide `get/list/watch` on `httproutes`,
+/// bound when any listener has `allowedRoutes.namespaces.from: All` or
+/// `from: Selector`.
+pub(super) const PROXY_CLUSTER_WIDE_ROUTE_ROLE_NAME: &str =
+    "coxswain-gateway-proxy-cluster-wide-route-reader";
+
+/// `ClusterRole` granting cluster-wide `get/list/watch` on `namespaces`,
+/// bound when any listener has `allowedRoutes.namespaces.from: Selector`.
+pub(super) const PROXY_CLUSTER_WIDE_NAMESPACE_ROLE_NAME: &str =
+    "coxswain-gateway-proxy-cluster-wide-namespace-reader";
+
+/// RBAC scope derived from the Gateway's listener specs.
+///
+/// Pure function of the Gateway object — no I/O. `true` means at least one
+/// listener declares the corresponding cross-namespace attachment mode, so the
+/// controller must provision the matching cluster-wide `ClusterRoleBinding`
+/// and pass the corresponding CLI flag to the proxy Deployment.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct DerivedProxyRbac {
+    /// Any listener has `allowedRoutes.namespaces.from: All` or `from: Selector`.
+    /// Triggers cluster-wide `HTTPRoute` reads and the
+    /// `--allow-cluster-wide-route-read` proxy flag.
+    pub(super) allow_cluster_wide_route_read: bool,
+    /// Any listener has `allowedRoutes.namespaces.from: Selector`.
+    /// Triggers cluster-wide `Namespace` reads and the
+    /// `--allow-cluster-wide-namespace-read` proxy flag.
+    pub(super) allow_cluster_wide_namespace_read: bool,
+}
+
+/// Derive the RBAC scope required by the Gateway's listeners.
+///
+/// OR-folds across all listeners: a single `from: All` listener is enough to
+/// set `allow_cluster_wide_route_read`; a single `from: Selector` listener
+/// sets both flags (cluster-wide routes AND namespaces are needed to evaluate
+/// the selector against route namespaces).
+#[must_use]
+pub(super) fn derive_proxy_rbac(gateway: &Gateway) -> DerivedProxyRbac {
+    let mut result = DerivedProxyRbac::default();
+    for listener in &gateway.spec.listeners {
+        let Some(allowed) = listener.allowed_routes.as_ref() else {
+            continue;
+        };
+        let Some(ns_spec) = allowed.namespaces.as_ref() else {
+            continue;
+        };
+        match ns_spec.from {
+            Some(From::All) => result.allow_cluster_wide_route_read = true,
+            Some(From::Selector) => {
+                result.allow_cluster_wide_route_read = true;
+                result.allow_cluster_wide_namespace_read = true;
+            }
+            _ => {}
+        }
+    }
+    result
+}
 
 /// Field manager string used for server-side-apply of every managed
 /// `RoleBinding`. Same identifier the rest of the operator uses
@@ -134,6 +196,24 @@ pub(super) enum RbacError {
     /// `LIST` of managed bindings (used to compute the actual set) failed.
     #[error("list managed RoleBindings: {0}")]
     List(#[source] kube::Error),
+    /// SSA of a `ClusterRoleBinding` failed.
+    #[error("apply ClusterRoleBinding {name}: {source}")]
+    ApplyClusterBinding {
+        /// Name of the cluster-wide binding.
+        name: String,
+        /// Underlying apiserver error.
+        #[source]
+        source: kube::Error,
+    },
+    /// Delete of a `ClusterRoleBinding` failed (not 404 — those are filtered).
+    #[error("delete ClusterRoleBinding {name}: {source}")]
+    DeleteClusterBinding {
+        /// Name of the cluster-wide binding.
+        name: String,
+        /// Underlying apiserver error.
+        #[source]
+        source: kube::Error,
+    },
 }
 
 /// Compute the desired set of namespaces a dedicated Gateway's proxy needs
@@ -144,6 +224,12 @@ pub(super) enum RbacError {
 /// the desired binding set) and the proxy-Deployment renderer (to compute
 /// the `--proxy-watch-namespaces` arg list).
 ///
+/// `allow_cross_namespace_routes` should be true when any listener has
+/// `allowedRoutes.namespaces.from: All` or `from: Selector` — i.e.
+/// [`derive_proxy_rbac`]'s `allow_cluster_wide_route_read` flag. When true,
+/// routes from all namespaces contribute their backend namespaces to the
+/// desired set; when false only same-namespace routes are considered.
+///
 /// See the module docs for the union sources and the known incomplete edge
 /// case around `BackendTLSPolicy` CA ref expansion.
 #[must_use]
@@ -151,6 +237,7 @@ pub(super) fn desired_namespaces_for_gateway(
     gateway: &Gateway,
     routes_store: &Store<HttpRoute>,
     grants_store: &Store<ReferenceGrant>,
+    allow_cross_namespace_routes: bool,
 ) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
 
@@ -197,11 +284,11 @@ pub(super) fn desired_namespaces_for_gateway(
         }
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("");
 
-        // Source #2 — route attachment from a different namespace requires
-        // the listener's `allowedRoutes.from: All`/`Selector` opt-in (punted
-        // to a follow-up). Today only `from: Same` routes are honoured for
-        // RBAC narrowing.
-        if route_ns != gw_namespace {
+        // Source #2 — route attachment from a different namespace. Included
+        // when any listener has `from: All` or `from: Selector`
+        // (`allow_cross_namespace_routes = true`). Otherwise only
+        // same-namespace routes contribute their backend namespaces.
+        if !allow_cross_namespace_routes && route_ns != gw_namespace {
             continue;
         }
         out.insert(route_ns.to_string());
@@ -312,12 +399,95 @@ pub(super) async fn delete_all_for_gateway(
     Ok(())
 }
 
+/// Reconcile the two optional `ClusterRoleBinding`s granting the dedicated
+/// proxy cluster-wide reads. Each binding is created when the corresponding
+/// flag in `derived` is true, and deleted when it is false or when the
+/// Gateway is removed. Idempotent — SSA on the desired bindings, delete on
+/// the undesired ones.
+///
+/// # Errors
+///
+/// Returns [`RbacError::ApplyClusterBinding`] or
+/// [`RbacError::DeleteClusterBinding`] on apiserver failure.
+pub(super) async fn reconcile_cluster_rbac(
+    client: &Client,
+    gateway: &Gateway,
+    proxy_sa_name: &str,
+    derived: DerivedProxyRbac,
+) -> Result<(), RbacError> {
+    let gw_namespace = gateway.metadata.namespace.as_deref().unwrap_or_else(|| {
+        panic!("invariant: Gateway has no namespace; the API server requires it")
+    });
+    let gw_name =
+        gateway.metadata.name.as_deref().unwrap_or_else(|| {
+            panic!("invariant: Gateway has no name; the API server requires it")
+        });
+
+    let route_binding = cluster_binding_name(gw_namespace, gw_name, "cluster-wide-routes");
+    let ns_binding = cluster_binding_name(gw_namespace, gw_name, "cluster-wide-namespaces");
+
+    if derived.allow_cluster_wide_route_read {
+        apply_cluster_binding(
+            client,
+            &route_binding,
+            PROXY_CLUSTER_WIDE_ROUTE_ROLE_NAME,
+            gw_namespace,
+            gw_name,
+            proxy_sa_name,
+        )
+        .await?;
+    } else {
+        delete_cluster_binding(client, &route_binding).await?;
+    }
+
+    if derived.allow_cluster_wide_namespace_read {
+        apply_cluster_binding(
+            client,
+            &ns_binding,
+            PROXY_CLUSTER_WIDE_NAMESPACE_ROLE_NAME,
+            gw_namespace,
+            gw_name,
+            proxy_sa_name,
+        )
+        .await?;
+    } else {
+        delete_cluster_binding(client, &ns_binding).await?;
+    }
+
+    Ok(())
+}
+
+/// Delete both cluster-wide `ClusterRoleBinding`s for the given Gateway.
+/// Called from the finalizer cleanup path and when a Gateway transitions out
+/// of dedicated mode.
+///
+/// # Errors
+///
+/// Returns [`RbacError::DeleteClusterBinding`] on apiserver failure.
+/// Idempotent: a missing binding (404) is treated as `Ok`.
+pub(super) async fn delete_all_cluster_bindings_for_gateway(
+    client: &Client,
+    gw_namespace: &str,
+    gw_name: &str,
+) -> Result<(), RbacError> {
+    let route_binding = cluster_binding_name(gw_namespace, gw_name, "cluster-wide-routes");
+    let ns_binding = cluster_binding_name(gw_namespace, gw_name, "cluster-wide-namespaces");
+    delete_cluster_binding(client, &route_binding).await?;
+    delete_cluster_binding(client, &ns_binding).await?;
+    Ok(())
+}
+
 /// Compute the binding name for a given Gateway. Encoded as
 /// `coxswain-<gw-namespace>-<gw-name>` so two Gateways with the same name in
 /// different namespaces cannot collide when both route into the same backend
 /// namespace.
 fn binding_name(gw_namespace: &str, gw_name: &str) -> String {
     format!("coxswain-{gw_namespace}-{gw_name}")
+}
+
+/// Compute the `ClusterRoleBinding` name for a given Gateway and suffix.
+fn cluster_binding_name(gw_namespace: &str, gw_name: &str, suffix: &str) -> String {
+    format!("coxswain-{gw_namespace}-{gw_name}-{suffix}")
 }
 
 /// Returns true iff the route has any `parentRef` pointing at the given
@@ -441,6 +611,67 @@ async fn delete_binding(
         Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
         Err(source) => Err(RbacError::Delete {
             namespace: namespace.to_string(),
+            name: binding_name.to_string(),
+            source,
+        }),
+    }
+}
+
+async fn apply_cluster_binding(
+    client: &Client,
+    binding_name: &str,
+    cluster_role_name: &str,
+    gw_namespace: &str,
+    gw_name: &str,
+    proxy_sa_name: &str,
+) -> Result<(), RbacError> {
+    let mut labels = BTreeMap::new();
+    labels.insert(labels::MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
+    labels.insert(labels::GATEWAY_NAME.to_string(), gw_name.to_string());
+    labels.insert(
+        labels::GATEWAY_NAMESPACE.to_string(),
+        gw_namespace.to_string(),
+    );
+
+    let binding = ClusterRoleBinding {
+        metadata: ObjectMeta {
+            name: Some(binding_name.to_string()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_string(),
+            kind: "ClusterRole".to_string(),
+            name: cluster_role_name.to_string(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".to_string(),
+            name: proxy_sa_name.to_string(),
+            namespace: Some(gw_namespace.to_string()),
+            api_group: None,
+        }]),
+    };
+
+    let api: Api<ClusterRoleBinding> = Api::all(client.clone());
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+    api.patch(binding_name, &params, &Patch::Apply(&binding))
+        .await
+        .map_err(|source| RbacError::ApplyClusterBinding {
+            name: binding_name.to_string(),
+            source,
+        })?;
+    Ok(())
+}
+
+async fn delete_cluster_binding(client: &Client, binding_name: &str) -> Result<(), RbacError> {
+    let api: Api<ClusterRoleBinding> = Api::all(client.clone());
+    match api
+        .delete(binding_name, &kube::api::DeleteParams::default())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(source) => Err(RbacError::DeleteClusterBinding {
             name: binding_name.to_string(),
             source,
         }),
@@ -598,7 +829,7 @@ mod tests {
         let gw = simple_gateway("tenant-a", "my-gw");
         let routes = build_routes_store(vec![]);
         let grants = build_grants_store(vec![]);
-        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants);
+        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants, false);
         assert_eq!(
             ns,
             ["tenant-a".to_string()]
@@ -621,7 +852,7 @@ mod tests {
         );
         let routes = build_routes_store(vec![route]);
         let grants = build_grants_store(vec![]);
-        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants);
+        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants, false);
         assert_eq!(
             ns,
             ["tenant-a".to_string()]
@@ -644,7 +875,7 @@ mod tests {
         );
         let routes = build_routes_store(vec![route]);
         let grants = build_grants_store(vec![]);
-        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants);
+        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants, false);
         assert_eq!(
             ns,
             ["tenant-a".to_string()]
@@ -667,7 +898,7 @@ mod tests {
         let g = grant("shared-services", "HTTPRoute", "tenant-a", "Service", None);
         let routes = build_routes_store(vec![route]);
         let grants = build_grants_store(vec![g]);
-        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants);
+        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants, false);
         assert_eq!(
             ns,
             ["tenant-a".to_string(), "shared-services".to_string()]
@@ -690,7 +921,7 @@ mod tests {
         let g = grant("shared-services", "HTTPRoute", "tenant-a", "Service", None);
         let routes = build_routes_store(vec![other_route]);
         let grants = build_grants_store(vec![g]);
-        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants);
+        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants, false);
         assert_eq!(
             ns,
             ["tenant-a".to_string()]
@@ -699,12 +930,10 @@ mod tests {
         );
     }
 
-    /// Routes attached from a different namespace are NOT honoured for RBAC
-    /// today — the `from: All`/`Selector` opt-in is punted to a follow-up.
-    /// The route's namespace is excluded; cross-ns backends from such a route
-    /// would also be excluded because the route itself isn't considered.
+    /// Routes attached from a different namespace are excluded when
+    /// `allow_cross_namespace_routes = false` (the default `from: Same` case).
     #[test]
-    fn cross_namespace_route_attachment_is_excluded_until_opt_in() {
+    fn cross_namespace_route_excluded_without_flag() {
         let gw = simple_gateway("tenant-a", "my-gw");
         let route = route_to_gateway(
             "tenant-b",
@@ -715,10 +944,34 @@ mod tests {
         );
         let routes = build_routes_store(vec![route]);
         let grants = build_grants_store(vec![]);
-        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants);
+        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants, false);
         assert_eq!(
             ns,
             ["tenant-a".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// When `allow_cross_namespace_routes = true`, a route from another namespace
+    /// contributes its own namespace (and any cross-namespace backends it has)
+    /// to the desired set.
+    #[test]
+    fn cross_namespace_route_included_with_flag() {
+        let gw = simple_gateway("tenant-a", "my-gw");
+        let route = route_to_gateway(
+            "tenant-b",
+            "r1",
+            "tenant-a",
+            "my-gw",
+            vec![backend_ref("svc-c", None)],
+        );
+        let routes = build_routes_store(vec![route]);
+        let grants = build_grants_store(vec![]);
+        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants, true);
+        assert_eq!(
+            ns,
+            ["tenant-a".to_string(), "tenant-b".to_string()]
                 .into_iter()
                 .collect::<BTreeSet<_>>()
         );
@@ -752,7 +1005,7 @@ mod tests {
         let g = grant("certs-ns", "Gateway", "tenant-a", "Secret", None);
         let routes = build_routes_store(vec![]);
         let grants = build_grants_store(vec![g]);
-        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants);
+        let ns = desired_namespaces_for_gateway(&gw, &routes, &grants, false);
         assert_eq!(
             ns,
             ["tenant-a".to_string(), "certs-ns".to_string()]

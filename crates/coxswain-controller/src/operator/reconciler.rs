@@ -669,6 +669,8 @@ async fn reconcile_inner(
                 "operator: cleaning up dedicated-mode bindings for terminating Gateway"
             );
             rbac::delete_all_for_gateway(&ctx.client, gw_namespace, gw_name).await?;
+            rbac::delete_all_cluster_bindings_for_gateway(&ctx.client, gw_namespace, gw_name)
+                .await?;
             remove_finalizer(&ctx.client, &gw).await?;
             // GC of in-namespace resources is owner-ref driven; nothing else
             // to do here.
@@ -728,6 +730,8 @@ async fn reconcile_inner(
                     "operator: Gateway transitioned out of dedicated mode; cleaning bindings"
                 );
                 rbac::delete_all_for_gateway(&ctx.client, gw_namespace, gw_name).await?;
+                rbac::delete_all_cluster_bindings_for_gateway(&ctx.client, gw_namespace, gw_name)
+                    .await?;
                 remove_finalizer(&ctx.client, &gw).await?;
                 status::clear_dedicated_gateway_status(&ctx.client, &gw).await?;
                 ctx.last_hashes
@@ -769,9 +773,20 @@ async fn reconcile_inner(
         return Ok(Action::requeue(POST_FINALIZER_REQUEUE));
     }
 
+    // Derive RBAC scope from the Gateway's listener specs. Pure, no I/O.
+    let derived = rbac::derive_proxy_rbac(&gw);
+
     // Compute the desired namespace set once and share between rbac.rs and
-    // (future) the rendered `--proxy-watch-namespaces` arg.
-    let desired = rbac::desired_namespaces_for_gateway(&gw, &ctx.routes_store, &ctx.grants_store);
+    // the rendered `--proxy-watch-namespaces` arg. Cross-namespace routes
+    // contribute their backend namespaces when any listener has from: All
+    // or from: Selector.
+    let allow_cross_ns = derived.allow_cluster_wide_route_read;
+    let desired = rbac::desired_namespaces_for_gateway(
+        &gw,
+        &ctx.routes_store,
+        &ctx.grants_store,
+        allow_cross_ns,
+    );
 
     let rendered = render::render(&render::RenderInputs {
         gateway: &gw,
@@ -779,6 +794,8 @@ async fn reconcile_inner(
         controller_image: &ctx.controller_image,
         gateway_class_name: class_name,
         watch_namespaces: &desired,
+        allow_cluster_wide_route_read: derived.allow_cluster_wide_route_read,
+        allow_cluster_wide_namespace_read: derived.allow_cluster_wide_namespace_read,
     });
 
     // Stage 1 — provisioning (Deployment/Service/SA). SSA with force=true
@@ -798,6 +815,10 @@ async fn reconcile_inner(
         .as_deref()
         .unwrap_or_else(|| panic!("invariant: rendered ServiceAccount has no name"));
     rbac::reconcile_rbac(&ctx.client, &gw, proxy_sa_name, &desired).await?;
+
+    // Stage 2b — cluster-wide ClusterRoleBindings for from: All / Selector
+    // listeners (#229). Idempotent: creates/deletes based on derived flags.
+    rbac::reconcile_cluster_rbac(&ctx.client, &gw, proxy_sa_name, derived).await?;
 
     // Stage 3 — write Gateway.status (#211). One JSON merge patch carries
     // Accepted/Programmed/per-listener/addresses + the
@@ -1116,6 +1137,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: &std::collections::BTreeSet::new(),
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         let r_b = render::render(&render::RenderInputs {
             gateway: &gw,
@@ -1123,6 +1146,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: &std::collections::BTreeSet::new(),
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         assert_ne!(
             hash_rendered(&r_a),
@@ -1159,6 +1184,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: &empty_ns,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         };
         let r1 = render::render(&inputs);
         let r2 = render::render(&inputs);

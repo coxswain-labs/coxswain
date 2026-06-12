@@ -35,15 +35,14 @@
 //! ## Container args
 //!
 //! `serve proxy --dedicated --gateway-name=<name> --gateway-namespace=<ns>
-//! --proxy-watch-namespaces=<ns1>,<ns2>,... --log-format=json`. The
+//! --proxy-watch-namespaces=<ns1>,<ns2>,... [--allow-cluster-wide-route-read]
+//! [--allow-cluster-wide-namespace-read] --log-format=json`. The
 //! `--proxy-watch-namespaces` list mirrors the per-namespace `RoleBinding`s
 //! the controller manages for this proxy's `ServiceAccount` (#209); both are
-//! derived from
-//! [`super::rbac::desired_namespaces_for_gateway`] so they cannot drift.
-//! The two RBAC opt-in flags (`--allow-cluster-wide-route-read`,
-//! `--allow-cluster-wide-namespace-read`) are *not* emitted yet: the CRD
-//! doesn't carry the matching fields in v1alpha1; their plumbing lands in a
-//! follow-up issue once the default per-namespace mode is stable.
+//! derived from [`super::rbac::desired_namespaces_for_gateway`] so they
+//! cannot drift. The two cluster-wide flags are derived from the Gateway's
+//! listener `allowedRoutes.namespaces.from` field via
+//! [`super::rbac::derive_proxy_rbac`] (#229).
 //!
 //! ## Service ports
 //!
@@ -109,6 +108,14 @@ pub(super) struct RenderInputs<'a> {
     /// `RoleBinding`s the controller has provisioned (#209). Sorted so
     /// reorderings don't produce hash churn or unnecessary Deployment rolls.
     pub(super) watch_namespaces: &'a BTreeSet<String>,
+    /// Render `--allow-cluster-wide-route-read` when true. Derived from the
+    /// Gateway's listener specs via [`super::rbac::derive_proxy_rbac`] — not
+    /// a user-supplied value. Set when any listener has
+    /// `allowedRoutes.namespaces.from: All` or `from: Selector`.
+    pub(super) allow_cluster_wide_route_read: bool,
+    /// Render `--allow-cluster-wide-namespace-read` when true. Same
+    /// derivation — set when any listener has `from: Selector`.
+    pub(super) allow_cluster_wide_namespace_read: bool,
 }
 
 /// The three rendered resources for one dedicated-mode Gateway.
@@ -395,6 +402,12 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
             .join(",");
         args.push(format!("--proxy-watch-namespaces={joined}"));
     }
+    if inputs.allow_cluster_wide_route_read {
+        args.push("--allow-cluster-wide-route-read".to_string());
+    }
+    if inputs.allow_cluster_wide_namespace_read {
+        args.push("--allow-cluster-wide-namespace-read".to_string());
+    }
     args.push("--log-format=json".to_string());
 
     let coxswain_container = Container {
@@ -551,6 +564,8 @@ mod tests {
             controller_image: "ghcr.io/coxswain-labs/coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
 
         // Names per GEP-1762.
@@ -599,6 +614,8 @@ mod tests {
             controller_image: "irrelevant",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         assert_eq!(result.deployment.spec.unwrap().replicas, Some(5));
         assert_eq!(
@@ -620,6 +637,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         let container = &result
             .deployment
@@ -661,6 +680,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: &watch_ns,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         let container = &result
             .deployment
@@ -707,6 +728,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2);
@@ -736,6 +759,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2, "the two HTTP:80 listeners dedupe");
@@ -763,6 +788,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod_spec.containers.len(), 2, "coxswain + sidecar");
@@ -804,6 +831,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         for labels in [
             result.deployment.metadata.labels.as_ref(),
@@ -841,6 +870,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(
@@ -866,6 +897,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         for meta in [
             &result.deployment.metadata,
@@ -906,6 +939,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         for meta in [
             &result.deployment.metadata,
@@ -945,6 +980,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         let labels = result.deployment.metadata.labels.as_ref().expect("labels");
         assert_eq!(
@@ -980,6 +1017,8 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             watch_namespaces: EMPTY_WATCH_NS,
+            allow_cluster_wide_route_read: false,
+            allow_cluster_wide_namespace_read: false,
         });
         for meta in [
             &result.deployment.metadata,
