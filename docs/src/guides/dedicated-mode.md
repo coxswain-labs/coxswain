@@ -33,16 +33,18 @@ curl -s http://localhost:8082/routes | jq .
 
 The output lists exactly the hosts the target Gateway's HTTPRoutes serve; Ingress routes and routes attached to other Gateways do not appear.
 
-### Opt-in flags for cross-namespace route attachment
+### Cross-namespace route attachment (`from: All` / `from: Selector`)
 
-By default, dedicated mode treats listeners with `allowedRoutes.namespaces.from: All` or `from: Selector` as needing operator consent to broader RBAC scope. The two opt-in flags govern a startup warning today; listener-level refusal (`Accepted=false`) tracking under [#229](https://github.com/coxswain-labs/coxswain/issues/229).
+When a listener declares `allowedRoutes.namespaces.from: All` or `from: Selector`, the controller automatically:
 
-| Flag | Gates listeners with |
-|---|---|
-| `--allow-cluster-wide-route-read` | `allowedRoutes.namespaces.from: All` |
-| `--allow-cluster-wide-namespace-read` | `allowedRoutes.namespaces.from: Selector` |
+1. Creates a `ClusterRoleBinding` granting the proxy SA cluster-wide `HTTPRoute` reads (`coxswain-gateway-proxy-cluster-wide-route-reader`).
+2. For `from: Selector`: also creates a `ClusterRoleBinding` for cluster-wide `Namespace` reads (`coxswain-gateway-proxy-cluster-wide-namespace-reader`).
+3. Renders `--allow-cluster-wide-route-read` (and `--allow-cluster-wide-namespace-read`) into the proxy Deployment args.
+4. The proxy spawns a single cluster-wide `HTTPRoute` reflector instead of the per-namespace one, so routes from all namespaces become visible.
 
-Both default to false. Set them only on Gateways that genuinely accept cross-namespace route attachment:
+No `CoxswainGatewayParameters` fields or manual opt-in are needed — the Gateway spec is the single source of truth. The `ClusterRoleBinding`s are removed automatically when the listener mode changes back to `from: Same` or the Gateway is deleted.
+
+For **manual invocations** (`serve proxy --dedicated`), pass the flags explicitly:
 
 ```bash
 cargo run --bin coxswain -- serve proxy --dedicated \
@@ -83,12 +85,12 @@ kubectl delete gateway tenant-a-gw -n tenant-a
 
 If `parametersRef` targets a missing `CoxswainGatewayParameters` object, the operator publishes an `Accepted=False, reason=InvalidParameters` condition on the Gateway via the shared override channel.
 
-### Per-namespace RBAC
+### RBAC
 
-For every namespace the Gateway's HTTPRoutes route a backend into (gated by `ReferenceGrant` for cross-namespace refs), the controller reconciles a `RoleBinding` tying the provisioned `ServiceAccount` to the static `coxswain-gateway-proxy-reader` `ClusterRole` (shipped by the Helm chart and `deploy/manifests/dedicated-proxy-clusterrole.yaml`). The dedicated proxy pod uses the controller-rendered `--proxy-watch-namespaces` argument to spawn per-namespace reflectors matching the binding set. Multi-tenant installs get least-privilege RBAC by construction.
+The controller maintains two layers of RBAC for each dedicated proxy:
 
-The Gateway carries a `gateway.coxswain-labs.dev/dedicated-cleanup` finalizer so cross-namespace bindings are removed before Kubernetes finalizes the Gateway deletion.
+**Per-namespace `RoleBinding`s** — for every namespace the Gateway's HTTPRoutes route a backend into (gated by `ReferenceGrant` for cross-namespace refs), the controller reconciles a `RoleBinding` tying the provisioned `ServiceAccount` to `coxswain-gateway-proxy-reader`. The proxy pod's `--proxy-watch-namespaces` arg mirrors this binding set so they can't drift.
 
-## Known limitation
+**`ClusterRoleBinding`s (auto-provisioned)** — when any listener declares `from: All` or `from: Selector`, the controller creates the cluster-wide bindings described above. They are deleted when the listener mode reverts to `from: Same` or the Gateway is removed.
 
-Cluster-wide-mode opt-in flags (`spec.proxy.allowClusterWideRouteRead` / `spec.proxy.allowClusterWideNamespaceRead`) are not yet on the `CoxswainGatewayParameters` CRD — tracked in [#229](https://github.com/coxswain-labs/coxswain/issues/229). The CLI flags described above work for manual `serve proxy --dedicated` invocations; the CRD plumbing and the listener-level `Accepted=false` refusal land alongside the cluster-wide-mode ClusterRoles in that issue.
+The Gateway carries a `gateway.coxswain-labs.dev/dedicated-cleanup` finalizer so both per-namespace and cluster-wide bindings are removed before Kubernetes finalizes the Gateway deletion.
