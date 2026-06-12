@@ -28,11 +28,13 @@ The user-facing docs live under `docs/src/` and are built with [mkdocs-material]
 ```bash
 cd docs
 uv venv .venv
-uv pip install -r requirements.txt
+uv pip install -r requirements.txt  # versions pinned exactly — see requirements.txt
 source .venv/bin/activate
 mkdocs serve          # live-reload at http://localhost:8000
 ```
 
 `.venv/` is gitignored. The `--system` flag used in CI does not work on Homebrew-managed Python.
+
+Versions in `requirements.txt` are pinned exactly because mkdocs-material is in maintenance mode (security patches only through ~Nov 2026). When a security advisory lands, bump the pins in a dedicated PR rather than running `uv pip install -U`.
 
 PR-time validation (`mkdocs build --strict`) runs as the `docs-build` job in `.github/workflows/distribution.yml`; the same check runs against your PR before merge. Mike versioning, the `publish-docs` job, and the `PACKAGE_VERSION` substitution behavior are maintainer concerns — see [`RELEASE.md`](RELEASE.md) for those.
