@@ -1,6 +1,6 @@
 ---
 name: update-product-docs
-description: Audit and update the product documentation under `docs/src/` (the mkdocs site that ships to coxswain-labs.github.io/coxswain) against the conventions in the `feedback_proxy_terminology` memory and the broader project guardrails. Audits first, presents the proposed diff, applies on user approval. Covers naming-convention violations in prose and mermaid diagrams (e.g. "Per-Gateway proxy pod" → "Dedicated proxy pool"), broken internal links, pages referenced in `docs/mkdocs.yml` nav but missing on disk (or vice versa), and `mkdocs build --strict` warnings. Sibling to `audit-guardrails` but action-oriented — the verb is `update`, not `audit`. Triggers on phrases like "update the product docs", "fix the docs", "the docs are drifting", "refresh the architecture page", "the diagrams are out of sync".
+description: Audit and update the product documentation under `docs/src/` (the mkdocs site that ships to coxswain-labs.github.io/coxswain) against the canonical conventions embedded in this skill (two macro deployment models — Shared and Dedicated — and the supporting naming and diagram rules). Audits first, presents the proposed diff, applies on user approval. Covers naming-convention violations in prose and mermaid diagrams (e.g. "Per-Gateway proxy pod" → "Dedicated proxy pool"), broken internal links, pages referenced in `docs/mkdocs.yml` nav but missing on disk (or vice versa), and `mkdocs build --strict` warnings. Sibling to `audit-guardrails` but action-oriented — the verb is `update`, not `audit`. Triggers on phrases like "update the product docs", "fix the docs", "the docs are drifting", "refresh the architecture page", "the diagrams are out of sync".
 ---
 
 Maintain `docs/src/` (the mkdocs site published to `coxswain-labs.github.io/coxswain`) against the project's naming conventions, link integrity, and build cleanliness. The skill runs in three phases — audit, apply, verify — and pauses for user approval before any edit lands.
@@ -22,14 +22,37 @@ Maintain `docs/src/` (the mkdocs site published to `coxswain-labs.github.io/coxs
 
 **Out of scope:** the four repo-root guardrail docs (`CLAUDE.md`, `DEVELOPMENT.md`, `CONTRIBUTING.md`, `RELEASE.md`) — those are owned by `/audit-guardrails` (read-only). Per-script header comments are owned by the scripts themselves.
 
-## Source of truth: pinned memories
+## Conventions (canonical)
 
-Run-time the skill reads:
+These rules ARE the source of truth — don't go looking for them elsewhere. If the framework changes, edit this file; it's what every audit run grades against.
 
-- **`feedback_proxy_terminology`** — the deployment-model framework (two macro models: Shared, Dedicated), the "introduce 'dedicated proxy (per Gateway)' once then shorten to 'dedicated' after" rule, the diagram label convention (`Shared proxy pool` / `Dedicated proxy pool`), and the per-namespace-is-NOT-a-deployment-model rule.
-- **`domain-coxswain-labs`** — always `coxswain-labs.dev`, never `coxswain.io`. Applies in CRD groups, condition types, finalizers, label/annotation keys, and any other DNS-form identifier in prose.
+### Deployment-model framework
 
-If the memory framework changes, update the memory first; this skill re-reads the live memory file each invocation rather than embedding the rules. The skill never invents new conventions on its own.
+**Two macro deployment models**:
+
+- **Shared** — one cluster-wide proxy pool serves Ingress and all non-dedicated Gateways. *Ingress-only* is a runtime variant of Shared when Gateway-API CRDs are absent at startup (the controller probes and drops the Gateway pipelines).
+- **Dedicated** — per-Gateway proxy, provisioned on the controller when a `Gateway` carries `spec.infrastructure.parametersRef` → `CoxswainGatewayParameters`. Each dedicated Gateway gets its own Deployment + Service + ServiceAccount + RBAC.
+
+**Per-namespace is intentionally NOT a deployment model.** The Gateway API spec has only per-Gateway data-plane customization (`Gateway.spec.infrastructure.parametersRef`, GEP-1762) and per-class (`GatewayClass.spec.parametersRef`); no namespace-scoped axis exists. Per-Gateway and per-namespace are nested, not orthogonal — per-Gateway is strictly more granular. Don't introduce a per-namespace pool framing in docs.
+
+**CLI subcommands are a separate axis from deployment models.** The binary's `serve dev` / `serve controller` / `serve proxy --shared` / `serve proxy --dedicated` are pod-role choices; the **two** deployment models are data-plane shape. Document them on separate axes; do not conflate counting.
+
+### Prose naming rules
+
+- **Introduce "dedicated proxy (per Gateway)" once per page or section, then shorten to "dedicated" plain.** No "dedicated per-Gateway proxy" mouthful in body text.
+- **"shared proxy" / "dedicated proxy"** (space-separated) in prose. The hyphenated form (`shared-proxy`, `dedicated-proxy`) is only valid inside literal identifiers — `coxswain-shared-proxy`, CLI flags, code symbols, K8s resource names.
+- Never write "all four modes" / "four deployment models" — there are two.
+- Never write `proxy --gateway` — the CLI flag is `proxy --dedicated`.
+- Never write `coxswain.io` — the project domain is always `coxswain-labs.dev`. Applies to CRD groups, condition types, finalizers, label/annotation keys, and any DNS-form identifier in prose.
+
+### Diagram label convention
+
+For mermaid blocks in `docs/src/`:
+
+- `Shared proxy pool` — the multi-replica shared Deployment box
+- `Dedicated proxy pool` — the multi-replica dedicated Deployment box
+- `Controller pod` — single replica (leader-elected)
+- Do NOT use `Per-Gateway proxy pod` (old framing) or `Shared-proxy pods` (hyphenated form in a label).
 
 ## Phase 1 — Audit
 
@@ -106,4 +129,4 @@ Cap the audit report at ~500 lines. If the report threatens to exceed that, focu
 - For the four repo-root guardrail docs (`CLAUDE.md`, `DEVELOPMENT.md`, `CONTRIBUTING.md`, `RELEASE.md`). Use `/audit-guardrails` for those — it's the read-only sibling skill for the process-doc surface.
 - For per-script header comments. Those are technically docs but they live with their script.
 - For writing new feature pages. Authoring new pages is human-authored work; this skill maintains existing pages against the agreed convention.
-- For rewriting the conventions themselves. If the framework changes, update the `feedback_proxy_terminology` memory first; this skill enforces the live memory.
+- For rewriting the conventions themselves. If the framework changes, edit the **Conventions** section at the top of this file — that is the canonical source the audit grades against.
