@@ -406,3 +406,90 @@ Inspect conditions when traffic is not flowing:
 ```bash
 kubectl describe httproute my-route
 ```
+
+## Dedicated Gateway proxies
+
+By default every `Gateway` is served by the shared proxy pool in `coxswain-system`. A `Gateway` opts into its own dedicated proxy pod by pointing `spec.infrastructure.parametersRef` at a `CoxswainGatewayParameters` object. The controller's provisioning operator renders a `Deployment` / `Service` / `ServiceAccount` in the Gateway's own namespace and reconciles them via server-side apply.
+
+Use this when a Gateway needs hard pod-level isolation: dedicated SLOs, compliance boundaries, expensive workloads that should not share a process with neighbours. For a higher-level overview of when to reach for it vs. the shared pool, see [Deployment models](deployment-models.md).
+
+### Canonical example
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-a
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: tenant-a-defaults
+  namespace: tenant-a
+spec:
+  replicas: 2
+  serviceType: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: tenant-a-gw
+  namespace: tenant-a
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    parametersRef:
+      group: gateway.coxswain-labs.dev
+      kind: CoxswainGatewayParameters
+      name: tenant-a-defaults
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      hostname: tenant-a.local
+      allowedRoutes:
+        namespaces:
+          from: Same
+```
+
+Apply, then observe the provisioned resources. They land in the Gateway's namespace, named `<gateway-name>-coxswain`, labelled by the Gateway they serve:
+
+```bash
+kubectl get all -n tenant-a \
+  -l gateway.networking.k8s.io/gateway-name=tenant-a-gw
+
+# Once the proxy pod is Ready, Gateway.status.Programmed flips to True.
+kubectl get gateway tenant-a-gw -n tenant-a \
+  -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}'
+# True
+```
+
+Delete the Gateway and watch the cascade: the provisioned Deployment/Service/ServiceAccount disappear within ~30 seconds via owner-reference garbage collection, and per-namespace `RoleBinding`s the controller created for the proxy SA are cleaned up by the `gateway.coxswain-labs.dev/dedicated-cleanup` finalizer before Kubernetes finalises the Gateway deletion.
+
+### CoxswainGatewayParameters fields
+
+| Field | Type | Effect |
+|---|---|---|
+| `image` | string (optional) | Override the proxy image. Defaults to the controller's own image so a chart upgrade rolls dedicated proxies on the same cadence as the shared pool. |
+| `replicas` | uint32 (optional) | Desired replica count for the provisioned `Deployment`. Defaults to `1`. |
+| `serviceType` | enum (optional) | One of `LoadBalancer`, `NodePort`, `ClusterIP`. Defaults to `LoadBalancer`. |
+| `resources` | `ResourceRequirements` (optional) | Standard Kubernetes `requests` / `limits` / `claims`, applied to the proxy container. |
+| `podTemplate` | partial `PodTemplateSpec` (optional) | Escape hatch for fields not first-classed above — `nodeSelector`, `tolerations`, `env`, sidecar containers, security context. The controller strategic-merges this onto the rendered template (containers match by `name`, container env by `name`, etc.). |
+
+Every field is optional. When `parametersRef` is set on both the `GatewayClass` and the `Gateway`, the operator overlays the two per-field: the Gateway's value wins for each field individually, the GatewayClass's value fills in the rest, and `podTemplate` strategic-merges across both layers.
+
+For the full schema (including the upstream `ResourceRequirements` and `PodTemplateSpec` boilerplate) use:
+
+```bash
+kubectl explain coxswaingatewayparameters.spec --recursive
+```
+
+### Cluster-wide default via GatewayClass
+
+To make every Gateway of a class dedicated by default — without writing YAML on each Gateway — point the `GatewayClass`'s `parametersRef` at a `CoxswainGatewayParameters`. A `parametersRef` on an individual Gateway then acts as a per-field override on top of the class-level defaults.
+
+### Provisioned RBAC
+
+The dedicated proxy's `ServiceAccount` is bound, namespace-scoped, to the static `coxswain-gateway-proxy-reader` `ClusterRole` (shipped by the Helm chart and `deploy/manifests/dedicated-proxy-clusterrole.yaml`). The controller reconciles one `RoleBinding` per namespace the Gateway's HTTPRoutes route a backend into, gated by `ReferenceGrant` for cross-namespace refs. The proxy then receives `--proxy-watch-namespaces=<ns1>,<ns2>,...` matching exactly the binding set, and runs reflectors scoped to those namespaces only. A compromised dedicated proxy's `ServiceAccount` holds reads only in the namespaces its Gateway routes into — nowhere else, and zero write verbs anywhere.
+
+If a Gateway's listener uses `allowedRoutes.namespaces.from: All` or `Selector`, the operator must explicitly opt in to broader RBAC; the matching CRD fields land in [#229](https://github.com/coxswain-labs/coxswain/issues/229).

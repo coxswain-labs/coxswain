@@ -75,6 +75,7 @@ nav:
   - Guides:
     - Ingress: guides/ingress.md
     - Gateway API: guides/gateway-api.md
+    - Deployment models: guides/deployment-models.md
     - TLS: guides/tls.md
     - Running in production: guides/running-in-production.md
     - Verifying releases: guides/verifying-releases.md

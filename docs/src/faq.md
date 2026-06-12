@@ -4,7 +4,7 @@
 
 ### Is Coxswain production-ready?
 
-Not yet. The project is undergoing a significant architectural refactor — splitting the single-binary monolith into a controller pod and a read-only proxy pool (see [Architecture](architecture.md)). Routing, TLS, and leader-election internals are well-tested, but the deployment topology, configuration surface, and several features are still in flux. See the [Roadmap](https://github.com/orgs/coxswain-labs/projects/2).
+Pre-1.0 but architecturally stable. The controller/proxy split is shipped (v0.2), Gateway API conformance passes on the Standard HTTP profile, and routing, TLS, and leader-election internals are well-tested under the e2e suites. The operating model is unlikely to change before 1.0; configuration keys may still ratchet on minor version bumps. Run the e2e suites against your cluster shape before adopting in production, and keep an eye on the [Roadmap](https://github.com/orgs/coxswain-labs/projects/2) for the gap between current scope and 1.0.
 
 ### Why another Ingress controller?
 
@@ -18,15 +18,17 @@ Yes. Both `Ingress` and `HTTPRoute` objects contribute to the same routing table
 
 ## Architecture
 
+For deployment-time guidance see the [Deployment models guide](guides/deployment-models.md). For operational issues see [Troubleshooting](guides/troubleshooting.md).
+
 ### Why the controller/proxy split?
 
 Embedding status writes in the proxy would force leader election into the data plane: only one replica could write at a time, and horizontal scaling would require electing more leaders. Making the controller the sole Kubernetes writer keeps proxy pods stateless, eliminates inter-replica coordination, and shrinks the proxy's RBAC surface to zero write verbs — a compromised proxy pod cannot write to the API server at all. The read-only invariant is enforced by RBAC, not by convention.
 
-See [Architecture](architecture.md#modes) for the four operating modes.
+See [Architecture](architecture.md#deployment-models) for the four operating models.
 
 ### How does Ingress fit?
 
-Classic `Ingress` resources are always served by the shared-proxy pool — `Ingress` has no equivalent of `parametersRef`. Gateway API users can opt a `Gateway` into an isolated per-Gateway proxy pod via `parametersRef` on the `GatewayClass` (cluster-wide default) or on the `Gateway` itself; the controller provisions and manages that pod.
+Classic `Ingress` resources are always served by the shared proxy pool — `Ingress` has no equivalent of `parametersRef`. Gateway API users can opt a `Gateway` into a dedicated proxy pod via `parametersRef` on the `GatewayClass` (cluster-wide default) or on the `Gateway` itself; the controller provisions and manages that pod.
 
 ## Comparison
 
@@ -38,7 +40,7 @@ Architectural differences only — not performance or quality. All projects belo
 |---|---|---|
 | Process model | Go controller + nginx worker processes in the same container | Split controller pod (leader-elected, K8s writes) + horizontally-scalable read-only Pingora proxy pods; Helm renders a controller + shared-proxy by default |
 | Config-application model | Controller renders `nginx.conf`; nginx reloads on change | Controller publishes an immutable routing-table snapshot; proxy reads via atomic pointer |
-| Gateway API surface | Available via separate [NGINX Gateway Fabric](https://github.com/nginx/nginx-gateway-fabric) project | Same controller manages both; default shared-proxy pool serves both |
+| Gateway API surface | Available via separate [NGINX Gateway Fabric](https://github.com/nginx/nginx-gateway-fabric) project | Same controller manages both; default shared proxy pool serves both |
 | Annotation ecosystem | Large catalogue of `nginx.ingress.kubernetes.io/*` annotations | Coxswain reserves `coxswain-labs.dev/*` for future per-resource configuration; currently minimal |
 
 ### Traefik vs. Coxswain

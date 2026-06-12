@@ -8,12 +8,12 @@ flowchart LR
     K8s[Kubernetes\nAPI Server]
 
     subgraph cs[coxswain-system]
-        SP[Shared-proxy pods]
+        SP[Shared proxy pods]
         C[Controller pod]
     end
 
     subgraph ns[gateway-namespace]
-        GP[Per-Gateway proxy pod]
+        GP[Dedicated proxy pod]
     end
 
     Clients --> SP & GP
@@ -26,7 +26,7 @@ flowchart LR
 
 ### `serve controller`
 
-Watches Ingress, GatewayClass, Gateway, HTTPRoute, and related resources cluster-wide; writes status conditions back to them; provisions per-Gateway proxy `Deployment` and `Service` objects when a Gateway opts into dedicated mode. Leader-elected via a Kubernetes `Lease` in `coxswain-system` — status writes pause for up to one Lease TTL during a leader transition; traffic is unaffected. Scales vertically (one active replica + optional warm standby).
+Watches Ingress, GatewayClass, Gateway, HTTPRoute, and related resources cluster-wide; writes status conditions back to them; provisions a dedicated proxy `Deployment` and `Service` per Gateway when a Gateway opts into dedicated mode. Leader-elected via a Kubernetes `Lease` in `coxswain-system` — status writes pause for up to one Lease TTL during a leader transition; traffic is unaffected. Scales vertically (one active replica + optional warm standby).
 
 The provisioning operator runs as a kube-rs `Controller` alongside the status writer in the same pod. Its reconcile loop resolves each Gateway's effective `CoxswainGatewayParameters` (per-field overlay: Gateway's `parametersRef` wins per-field, GatewayClass's fills the rest; `podTemplate` strategic-merges across both layers) and renders the desired `Deployment` / `Service` / `ServiceAccount`. The `podTemplate` escape hatch is merged onto the rendered Deployment with `kubectl apply` strategic-merge semantics — `containers` merges by `name`, `tolerations` by `(key, operator)`, container-level `env` by `name`, and so on — so sidecar injection and env overlays behave the way operators expect from native K8s tooling.
 
@@ -38,7 +38,7 @@ Stateless read-only Pingora data plane. Serves every `Ingress` and every `Gatewa
 
 ### `serve proxy --dedicated`
 
-Read-only proxy scoped to a single Gateway (identified by `--gateway-name` and `--gateway-namespace`). Provisioned by the controller in the Gateway's namespace (or a namespace specified via `parametersRef`) — see Step 9 of the architecture plan. Has its own rollout, failure domain, and `/metrics`.
+Read-only proxy scoped to a single Gateway (identified by `--gateway-name` and `--gateway-namespace`). Provisioned by the controller in the Gateway's namespace via server-side apply, owner-referenced to the parent Gateway so deletion cascades. Has its own rollout, failure domain, and `/metrics`. The walkthrough lives in the [Dedicated Gateway proxies](guides/gateway-api.md#dedicated-gateway-proxies) guide.
 
 As of #209 the dedicated proxy runs with **per-namespace narrowed RBAC**: the controller renders `--proxy-watch-namespaces=<ns1>,<ns2>,...` into the container args, and the proxy spawns one reflector per (resource, namespace) pair scoped to exactly the namespaces the controller has provisioned `RoleBinding`s for. The binding set and the watch set are derived from the same desired-namespace computation in the controller, so they can't drift. The `GatewayClass` watch is dropped on this path — the controller is the authority on "this Gateway is dedicated and mine".
 
@@ -53,9 +53,13 @@ Hidden single-process all-in-one combining controller and proxy in one binary, f
 
 ## Deployment models
 
+Each model is a different way of arranging the shared pool and dedicated proxies. The pages below give an abstract reference picture for each; the [Deployment models guide](guides/deployment-models.md) is the practical counterpart with a decision tree, `helm install` commands, and verification steps.
+
 ### Default (split shared pool)
 
-The Helm chart default. One controller `Deployment` and one shared-proxy `Deployment` in `coxswain-system`.
+The Helm chart default. One controller `Deployment` and one shared proxy `Deployment` in `coxswain-system`.
+
+→ Walkthrough: [Default (shared pool)](guides/deployment-models.md#default-shared-pool).
 
 ```mermaid
 flowchart LR
@@ -63,7 +67,7 @@ flowchart LR
 
     subgraph cs[coxswain-system]
         C[Controller\npod]
-        SP[Shared-proxy\npods]
+        SP[Shared proxy\npods]
     end
 
     K8s -->|watch| C
@@ -75,7 +79,9 @@ flowchart LR
 
 ### Mixed
 
-The default layout plus per-Gateway proxy pods in user namespaces. Workload teams opt a `Gateway` into dedicated mode via `parametersRef`; the controller provisions the per-Gateway pod automatically.
+The default layout plus dedicated proxy pods in user namespaces. Workload teams opt a `Gateway` into dedicated mode via `parametersRef`; the controller provisions the dedicated proxy pod automatically.
+
+→ Walkthrough: [Mixed](guides/deployment-models.md#mixed).
 
 ```mermaid
 flowchart LR
@@ -83,11 +89,11 @@ flowchart LR
 
     subgraph cs[coxswain-system]
         C[Controller\npod]
-        SP[Shared-proxy\npods]
+        SP[Shared proxy\npods]
     end
 
     subgraph ns[team-namespace]
-        GP[Per-Gateway\nproxy pod]
+        GP[Dedicated\nproxy pod]
     end
 
     K8s -->|watch| C
@@ -102,7 +108,9 @@ flowchart LR
 
 ### Strict multi-tenant
 
-Every Gateway gets its own proxy pod; the shared-proxy `Deployment` runs at `replicas: 0`. Classic `Ingress` is unavailable in this model.
+Every Gateway gets its own proxy pod; the shared proxy `Deployment` runs at `replicas: 0`. Classic `Ingress` is unavailable in this model.
+
+→ Walkthrough: [Strict multi-tenant](guides/deployment-models.md#strict-multi-tenant).
 
 ```mermaid
 flowchart LR
@@ -113,11 +121,11 @@ flowchart LR
     end
 
     subgraph ns_a[team-a-namespace]
-        GPA[Per-Gateway\nproxy — team A]
+        GPA[Dedicated\nproxy — team A]
     end
 
     subgraph ns_b[team-b-namespace]
-        GPB[Per-Gateway\nproxy — team B]
+        GPB[Dedicated\nproxy — team B]
     end
 
     K8s -->|watch| C
@@ -133,7 +141,9 @@ flowchart LR
 
 ### Ingress-only
 
-For clusters without Gateway API CRDs. The controller detects their absence at startup and skips Gateway API reconciliation; the shared-proxy pool serves all `Ingress` resources.
+For clusters without Gateway API CRDs. The controller detects their absence at startup and skips Gateway API reconciliation; the shared proxy pool serves all `Ingress` resources.
+
+→ Walkthrough: [Ingress-only](guides/deployment-models.md#ingress-only).
 
 ```mermaid
 flowchart LR
@@ -141,7 +151,7 @@ flowchart LR
 
     subgraph cs[coxswain-system]
         C[Controller\npod]
-        SP[Shared-proxy\npods]
+        SP[Shared proxy\npods]
     end
 
     K8s -->|watch\nIngress only| C
@@ -177,7 +187,7 @@ The dedicated-proxy permissions come from a single static `ClusterRole` `coxswai
 
 ## Admin endpoints by mode
 
-| Endpoint | Controller | Shared-proxy | Dedicated-proxy |
+| Endpoint | Controller | Shared proxy | Dedicated proxy |
 |---|:-:|:-:|:-:|
 | `/healthz`, `/readyz` | ✓ | ✓ | ✓ |
 | `/metrics` | ✓ (reconcile counts, leader status) | ✓ (traffic, errors) | ✓ (scoped to this Gateway) |
