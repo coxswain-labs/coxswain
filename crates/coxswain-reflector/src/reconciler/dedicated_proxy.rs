@@ -419,19 +419,25 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
                 configmaps: &configmap_reader,
             };
             let rebuild_start = std::time::Instant::now();
-            let published = rebuild_dedicated(
-                &stores,
-                &controller_name,
-                &target,
+            let target_spec = DedicatedRebuildTarget {
+                controller_name: &controller_name,
+                target: &target,
                 allow_cluster_wide_route_read,
                 allow_cluster_wide_namespace_read,
+            };
+            let outputs = DedicatedRebuildOutputs {
+                owned_gateways_handle: &owned_gateways_handle,
+                gateway_routes: &gateway_routes,
+                tls: &tls,
+                tls_health: &tls_health,
+                route_health: &route_health,
+                policy_health: &policy_health,
+            };
+            let published = rebuild_dedicated(
+                &stores,
+                &target_spec,
+                &outputs,
                 &mut listener_warning_logged,
-                &owned_gateways_handle,
-                &gateway_routes,
-                &tls,
-                &tls_health,
-                &route_health,
-                &policy_health,
             );
             metrics.observe_rebuild(
                 rebuild_start.elapsed(),
@@ -454,26 +460,62 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
     set
 }
 
+/// Identity + RBAC opt-ins for a dedicated-mode rebuild — the inputs that
+/// determine which Gateway is in scope and which cross-namespace listener
+/// modes the operator has consented to.
+pub(super) struct DedicatedRebuildTarget<'a> {
+    /// `GatewayClass.spec.controllerName` claim — filters owned resources.
+    pub(super) controller_name: &'a str,
+    /// Single Gateway this dedicated proxy serves.
+    pub(super) target: &'a ObjectKey,
+    /// Permit cross-namespace route attachment via `from: All`.
+    pub(super) allow_cluster_wide_route_read: bool,
+    /// Permit cross-namespace route attachment via `from: Selector`.
+    pub(super) allow_cluster_wide_namespace_read: bool,
+}
+
+/// Shared output handles a dedicated-mode rebuild publishes into. Grouped to
+/// keep the rebuild function under the 7-arg threshold per workspace policy.
+pub(super) struct DedicatedRebuildOutputs<'a> {
+    /// Owned-gateways set, narrowed to the singleton target by the rebuild.
+    pub(super) owned_gateways_handle: &'a OwnedGateways,
+    /// Gateway-flavored routing table the rebuild publishes.
+    pub(super) gateway_routes: &'a SharedGatewayRoutingTable,
+    /// TLS cert store the rebuild publishes.
+    pub(super) tls: &'a SharedTlsStore,
+    /// Per-listener TLS-resolution health.
+    pub(super) tls_health: &'a SharedGatewayListenerHealth,
+    /// Per-route health.
+    pub(super) route_health: &'a SharedHttpRouteHealth,
+    /// Per-policy health.
+    pub(super) policy_health: &'a SharedBackendTlsPolicyHealth,
+}
+
 /// One rebuild iteration for the dedicated reconciler.
 ///
 /// Returns `true` if the Gateway routing table was published (i.e. the build
 /// succeeded). The shared-proxy variant also waits for Ingress to publish;
 /// dedicated mode only has one table.
-#[allow(clippy::too_many_arguments)]
 fn rebuild_dedicated(
     stores: &ReflectorStores<'_>,
-    controller_name: &str,
-    target: &ObjectKey,
-    allow_cluster_wide_route_read: bool,
-    allow_cluster_wide_namespace_read: bool,
+    target_spec: &DedicatedRebuildTarget<'_>,
+    outputs: &DedicatedRebuildOutputs<'_>,
     listener_warning_logged: &mut bool,
-    owned_gateways_handle: &OwnedGateways,
-    gateway_routes: &SharedGatewayRoutingTable,
-    tls: &SharedTlsStore,
-    tls_health: &SharedGatewayListenerHealth,
-    route_health: &SharedHttpRouteHealth,
-    policy_health: &SharedBackendTlsPolicyHealth,
 ) -> bool {
+    let DedicatedRebuildTarget {
+        controller_name,
+        target,
+        allow_cluster_wide_route_read,
+        allow_cluster_wide_namespace_read,
+    } = *target_spec;
+    let DedicatedRebuildOutputs {
+        owned_gateways_handle,
+        gateway_routes,
+        tls,
+        tls_health,
+        route_health,
+        policy_health,
+    } = *outputs;
     let routes = stores.routes.state();
     let (
         owned_ingress_classes,
@@ -826,19 +868,25 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
                 configmaps: &configmaps_aggr,
             };
             let rebuild_start = std::time::Instant::now();
-            let published = rebuild_dedicated_narrow(
-                &stores,
-                &controller_name,
-                &target,
+            let target_spec = DedicatedRebuildTarget {
+                controller_name: &controller_name,
+                target: &target,
                 allow_cluster_wide_route_read,
                 allow_cluster_wide_namespace_read,
+            };
+            let outputs = DedicatedRebuildOutputs {
+                owned_gateways_handle: &owned_gateways_handle,
+                gateway_routes: &gateway_routes,
+                tls: &tls,
+                tls_health: &tls_health,
+                route_health: &route_health,
+                policy_health: &policy_health,
+            };
+            let published = rebuild_dedicated_narrow(
+                &stores,
+                &target_spec,
+                &outputs,
                 &mut listener_warning_logged,
-                &owned_gateways_handle,
-                &gateway_routes,
-                &tls,
-                &tls_health,
-                &route_health,
-                &policy_health,
             );
             metrics.observe_rebuild(
                 rebuild_start.elapsed(),
@@ -894,21 +942,26 @@ where
 /// which Gateways are ours) and constructs `owned_gateways` /
 /// `owned_gateway_classes` directly from the target Gateway in the
 /// aggregated store.
-#[allow(clippy::too_many_arguments)]
 fn rebuild_dedicated_narrow(
     stores: &ReflectorStores<'_>,
-    controller_name: &str,
-    target: &ObjectKey,
-    allow_cluster_wide_route_read: bool,
-    allow_cluster_wide_namespace_read: bool,
+    target_spec: &DedicatedRebuildTarget<'_>,
+    outputs: &DedicatedRebuildOutputs<'_>,
     listener_warning_logged: &mut bool,
-    owned_gateways_handle: &OwnedGateways,
-    gateway_routes: &SharedGatewayRoutingTable,
-    tls: &SharedTlsStore,
-    tls_health: &SharedGatewayListenerHealth,
-    route_health: &SharedHttpRouteHealth,
-    policy_health: &SharedBackendTlsPolicyHealth,
 ) -> bool {
+    let DedicatedRebuildTarget {
+        controller_name,
+        target,
+        allow_cluster_wide_route_read,
+        allow_cluster_wide_namespace_read,
+    } = *target_spec;
+    let DedicatedRebuildOutputs {
+        owned_gateways_handle,
+        gateway_routes,
+        tls,
+        tls_health,
+        route_health,
+        policy_health,
+    } = *outputs;
     let routes = stores.routes.state();
     let gateways = stores.gateways.state();
 
