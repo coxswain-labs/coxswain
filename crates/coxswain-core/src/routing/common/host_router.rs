@@ -172,6 +172,12 @@ impl HostRouterBuilder {
         self
     }
 
+    /// Compiles accumulated routes into an immutable [`HostRouter`].
+    ///
+    /// # Errors
+    /// Returns [`RouterError::MatchitInsert`] if an exact-path pattern is rejected
+    /// by the `matchit` router (prefix-path conflicts are logged and silently
+    /// dropped). Returns [`RouterError::Regex`] if a regex pattern fails to compile.
     pub(crate) fn build(
         self,
     ) -> Result<(HostRouter, Vec<RouteConflict>), super::table::RouterError> {
