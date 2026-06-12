@@ -24,6 +24,7 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       parity: ${{ steps.filter.outputs.parity }}
       stability: ${{ steps.filter.outputs.stability }}
+      anti_drift: ${{ steps.filter.outputs.anti_drift }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v4
@@ -44,6 +45,13 @@ jobs:
             stability:
               - 'crates/**/src/**'
               - 'scripts/check-public-types-stability.sh'
+              - '.github/workflows/ci.yml'
+            anti_drift:
+              - 'crates/**'
+              - 'scripts/check-module-headers.sh'
+              - 'scripts/check-no-anyhow-libs.sh'
+              - 'scripts/check-workspace-lints-decl.sh'
+              - 'scripts/check-no-per-site-allow.sh'
               - '.github/workflows/ci.yml'
 
   fmt:
@@ -133,3 +141,19 @@ jobs:
       - uses: actions/checkout@v6
       - name: Check every public type carries #[non_exhaustive] or an open rationale
         run: bash scripts/check-public-types-stability.sh
+
+  anti-drift:
+    name: anti-drift
+    needs: changes
+    if: needs.changes.outputs.anti_drift == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Module headers (every non-test .rs opens with //!)
+        run: bash scripts/check-module-headers.sh
+      - name: No anyhow in library crates
+        run: bash scripts/check-no-anyhow-libs.sh
+      - name: Every crate Cargo.toml declares [lints] workspace = true
+        run: bash scripts/check-workspace-lints-decl.sh
+      - name: No per-site #[allow] / #[expect] in non-test source
+        run: bash scripts/check-no-per-site-allow.sh

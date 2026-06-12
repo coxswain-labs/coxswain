@@ -1,3 +1,5 @@
+//! Ingress data-plane port configuration carried alongside the routing table.
+
 /// Ports on which Ingress routes are served.
 ///
 /// Both fields are optional; when both are `None` no listener is configured

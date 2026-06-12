@@ -1,27 +1,26 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with code in this repository.
+Source-of-truth guidance for Claude Code in this repository.
 
-**Always read the following files at the start of every session:**
-- `DEVELOPMENT.md` — cluster setup, ports, deploy manifests, e2e and conformance test procedures, release process.
-- Any file in `docs/` that is relevant to the task at hand.
+**Always read at the start of every session:**
+- `DEVELOPMENT.md` — local setup, e2e + conformance procedures, troubleshooting.
+- Any `docs/src/` file relevant to the task at hand.
 
-The live roadmap is the [GitHub Project](https://github.com/orgs/coxswain-labs/projects/2). Use `gh project view 2 --owner coxswain-labs` and `gh issue list --milestone v0.1 --state all` to see what's in scope and what's done.
+Roadmap: [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2). `gh project view 2 --owner coxswain-labs` and `gh issue list --milestone v0.X --state all` enumerate scope.
 
 ## Project Overview
 
-**Coxswain** is a pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine.
-It watches Kubernetes `Ingress` and `Gateway API` resources and dynamically routes traffic without a full reload.
+**Coxswain** is a pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora). It watches `Ingress` and `Gateway API` resources and dynamically routes traffic without a full reload.
 
-Coxswain ships as two cooperating pod roles since v0.2 (issue #204):
-- `serve controller` — leader-elected writer pod; all status patches; cluster-wide reads + `*/status` writes.
-- `serve proxy --shared` — read-only data plane for Ingress and non-dedicated Gateway traffic; the ServiceAccount holds zero write verbs.
+Coxswain ships as two cooperating pod roles:
+- `serve controller` — leader-elected status writer; cluster-wide reads + `*/status` writes.
+- `serve proxy --shared` — read-only data plane; the ServiceAccount holds zero write verbs.
 
-The hidden `serve dev` subcommand runs both pipelines in one process for local development. Production deployments always pick a role explicitly; bare `coxswain serve` errors with clap help. The Dockerfile has no `CMD`.
+The hidden `serve dev` runs both pipelines in one process for local development. Production deployments always pick a role explicitly; bare `coxswain serve` errors with clap help. The Dockerfile has no `CMD`.
 
 ## Architecture
 
-The workspace has eight crates under `crates/` with a strict dependency order:
+Eight crates with a strict dependency order:
 
 ```
 coxswain-bin
@@ -39,207 +38,73 @@ coxswain-bin
   └── (coxswain-e2e — black-box tests, not a runtime dep)
 ```
 
-`coxswain-proxy` and `coxswain-controller` do NOT depend on each other. The read-only-proxy invariant is enforced both at RBAC (proxy SA has zero write verbs) and structurally at the crate graph (the proxy binary path never touches `coxswain-controller`).
-
-Per-crate responsibilities (see each crate's `src/lib.rs` for the up-to-date module layout):
-
-- **`coxswain-core`** — shared routing-table types, atomic `Shared<T>` snapshot primitive, TLS store, ownership and reference-grant helpers. No `kube` dep.
-- **`coxswain-reflector`** — K8s watch streams, reflector spawn machinery, `gw_types` aliases, `scoped_api`, `IngressDefaultBackend`, endpoint resolution, the debounced rebuild loop (`Reconciler`), and the `gateway_api_crds_present` CRD probe. Both `coxswain-proxy` and `coxswain-controller` depend on it; neither depends on the other.
-- **`coxswain-controller`** — leader-elected status writer (`Controller`) + `spawn_status_writer` wiring helper consumed by `coxswain-bin`. Holds the `*/status` write rights. Does not own reflectors directly — drives them via `coxswain-reflector::Reconciler`.
-- **`coxswain-proxy`** — Pingora-based reverse proxy: lock-free routing lookup, request/response filter application, in-process SNI TLS termination, optional HAProxy PROXY-protocol acceptor. `reflector` module exposes `spawn_routing_table_builder` — the proxy-pod entry point that constructs a `coxswain-reflector::Reconciler` and publishes its outputs to the Pingora data plane.
-- **`coxswain-health`** — `/healthz` (always 200) and `/readyz` (gated on `HealthRegistry::is_ready`: every registered subsystem must be `Ready` or `Degraded`).
-- **`coxswain-admin`** — `/metrics` (Prometheus), `/routes`, `/status` (full per-subsystem check detail).
-- **`coxswain-bin`** — entry point: CLI parsing per role (`serve controller` / `serve proxy --shared` / hidden `serve dev`), shared-state wiring, Pingora runtime bootstrap.
-- **`coxswain-e2e`** — black-box integration tests against a live cluster (kind/Orb); not a runtime dependency. The `tests/rbac_read_only_proxy.rs` binary asserts the proxy SA has zero write verbs by parsing `kubectl auth can-i --list`.
+`coxswain-proxy` and `coxswain-controller` never depend on each other. The read-only-proxy invariant is enforced at RBAC (proxy SA holds zero write verbs) AND at the crate graph (the proxy never imports the controller). Per-crate responsibilities live in each crate's `src/lib.rs` `//!` header.
 
 ## Code Quality
 
-These rules were established through the v0.1 refactor pass (issues #136–#147). They are deliberate decisions — do not silently undo them.
+**Rule additions go to CI first.** If a new project rule can be expressed as a clippy lint, a `scripts/check-*.sh` grep, or a `deny.toml` policy, encode it there and link from this doc. Don't restate CI-enforced rules in prose. Add prose here only when the rule is a behavioural policy that can't be checked mechanically.
 
-### Lints
+### Enforced rules
 
-`[workspace.lints]` in `Cargo.toml` is the single source of truth for lint configuration. **Never add `#[allow(...)]` or `#[expect(...)]` to silence a lint** — both are per-site escape hatches that this rule prohibits, regardless of attribute spelling. Fix the root cause instead.
+| Rule | Enforced by |
+|---|---|
+| No `.unwrap()` / `.expect()` in non-test code | `unwrap_used = "deny"`, `expect_used = "deny"` (clippy) |
+| Every public type carries `#[non_exhaustive]` or a `// intentionally open:` rationale | `scripts/check-public-types-stability.sh` |
+| `//!` header on every non-test, non-bench `.rs` | `scripts/check-module-headers.sh` |
+| Library crates never use `anyhow` | `scripts/check-no-anyhow-libs.sh` |
+| `[lints] workspace = true` in every `crates/*/Cargo.toml` | `scripts/check-workspace-lints-decl.sh` |
+| No per-site `#[allow]` / `#[expect]` in non-test source | `scripts/check-no-per-site-allow.sh` |
+| Gateway API SupportedFeatures Rust↔Go parity | `scripts/check-supported-features.sh` |
 
-- If a lint fires on *our* code: rename, refactor, or restructure to satisfy it.
-- If a lint fires on an *upstream-imposed* name (e.g. `HTTPRoute` from codegen tripping `upper_case_acronyms`): re-export with a project-canonical alias at the crate boundary (`gw_types.rs`) and use that alias everywhere internally. This is a one-time fix; a per-site annotation locks in an inconsistency forever.
-- Workspace-wide opt-outs in `[workspace.lints]` are acceptable only when an entire lint *group* is too broad for the project. The current example is `clippy::pedantic = "allow"`. Per-site annotations are never acceptable.
+`[workspace.lints]` in `Cargo.toml` is the source of truth for lint configuration. Workspace-wide opt-outs in `[workspace.lints]` are acceptable when an entire lint *group* is too broad for the project (current: `clippy::pedantic = "allow"`). For upstream-imposed names that trip a lint (e.g. `HTTPRoute` from codegen tripping `upper_case_acronyms`): re-export with a project-canonical alias at the crate boundary (`gw_types.rs`) and use the alias everywhere internally — a one-time fix; per-site annotations lock the inconsistency in forever.
 
-The current workspace shape (do not drift without a deliberate decision):
+### Policies the CI gates don't cover
 
-```toml
-[workspace.lints.rust]
-unsafe_code  = "deny"
-missing_docs = "warn"
+- **Panics.** Invariant violations (only reachable via a bug in this module) use `unwrap_or_else(|e| panic!("invariant: {e}"))` — the message states *what must be true*, not what the code is doing. Recoverable errors use `?` or return a typed `Err`. Same rule applies to `unreachable!()`, `todo!()`, and `assert!`-family macros. `debug_assert!` is fine for invariants too expensive in release builds. Bench files and `crates/coxswain-e2e/` may use plain context-style messages (`"{addr}: {e}"`) — setup failures don't fit the "violated only by a bug" framing.
 
-[workspace.lints.clippy]
-correctness     = { level = "deny",  priority = -1 }
-suspicious      = { level = "warn",  priority = -1 }
-style           = { level = "warn",  priority = -1 }
-complexity      = { level = "warn",  priority = -1 }
-perf            = { level = "warn",  priority = -1 }
-pedantic        = { level = "allow", priority = -1 }
-type_complexity = "deny"
-unwrap_used     = "warn"
-expect_used     = "warn"
-```
+- **>7-arg functions.** Refactor into a parameter-grouping struct named after the semantic role (`ReflectorStores<'a>`, `DedicatedRebuildTarget<'a>`), with the narrowest visibility that compiles. Never bump `clippy.toml`'s threshold.
 
-The one legitimate use of `#![allow(missing_docs)]` is at the top of bench files and `coxswain-e2e/tests/*`, where `criterion_group!` and similar macros expand to `pub fn` items that are not user-controllable.
+- **Documentation.** Every `///` on a `pub` item explains *why* and what the invariants are — names already say *what*. Fallible `pub fn`s returning `Result` carry a `# Errors` section; documented-panic `pub fn`s carry `# Panics`; `unsafe` carries `# Safety`. Current `# Errors` / `# Panics` coverage has known gaps tracked in v0.2.
 
-`clippy.toml` sets `allow-unwrap-in-tests = true` / `allow-expect-in-tests = true`. These apply **only** to code inside `#[test]` functions and `#[cfg(test)]` modules — not to non-test code that tests happen to call (e.g. `coxswain-e2e/src/`). Harness and fixture code is non-test code that runs under test, not test code itself.
+- **Visibility.** Default to `pub(crate)` for items reachable within the workspace; `pub(super)` for items only crossing one module boundary; bare `pub` only for items re-exported at the crate root for cross-crate consumption.
 
-### Panics and unwrap
+- **Error types.** Every crate-defined error type uses `#[derive(thiserror::Error)]` with `#[error("…")]` on each variant, and `#[non_exhaustive]`. Library crates emit typed errors via `thiserror`; only `coxswain-bin` may use `anyhow` at the binary boundary.
 
-Never use `.unwrap()` or `.expect("message")` in non-test code.
-
-- **Recoverable errors** → propagate with `?` or return a typed `Err`.
-- **Invariants** (violated only by a bug in this module) → `unwrap_or_else(|e| panic!("invariant: {e}"))`. Prefer this form over `.expect("msg")` because it interpolates the actual error alongside the invariant claim, making any violation self-diagnosing. The message must state *what must be true*, not *what the code is doing*.
-
-The same rule applies to `unreachable!()` and `todo!()` — they are panics; include a message stating the invariant that makes the branch impossible. `debug_assert!` is permitted for invariants too expensive to check in release builds.
-
-Code in `crates/*/benches/` and `crates/coxswain-e2e/` may use plain context-style messages (`"{addr}: {e}"`) because fixture and setup failures don't have the "violated only by a bug" framing.
-
-### Function signatures
-
-Functions with more than 7 parameters trigger `clippy::too_many_arguments`. Do not suppress and do not raise the threshold in `clippy.toml` — refactor into a parameter-grouping struct instead. Name the struct after its semantic role (`ReflectorStores<'a>`, `SharedOutputs<'a>`), not after the function it serves. The struct lives in the same module as the function and takes the narrowest visibility that compiles (typically `pub(crate)` or `pub(super)`).
-
-### Documentation
-
-Every `.rs` file must open with a `//!` module header (a short paragraph: what the module owns, not what every function in it does). Every `pub` item that introduces a new name must carry a `///` doc comment; trivial re-exports (`pub use foo::Bar;`) are exempt.
-
-- Fallible `pub` functions that return `Result` must include a `# Errors` section listing the variants.
-- `pub` functions that can panic under documented conditions must include `# Panics`.
-- `unsafe` functions must include `# Safety` (currently a non-issue because `unsafe_code = "deny"`, but apply this if that ever changes).
-
-Doc comments explain **why** and **what the invariants are** — the names already say *what*. One precise sentence beats a paragraph of padding.
-
-> **Backfill note:** Only ~6 fallible `pub` functions currently carry `# Errors` sections. New code is held to the rule immediately; existing under-coverage is a known gap to backfill incrementally.
-
-### Visibility
-
-Default to `pub(crate)` for items reachable within the workspace, `pub(super)` for items that only need to cross a module boundary. Use bare `pub` only for items re-exported at the crate root (`lib.rs`) that are consumed by another crate in the workspace. See `rust-skills` rules `proj-pub-crate-internal` and `proj-pub-super-parent`.
+- **Test layout.** Per-source-file unit tests live INLINE as `#[cfg(test)] mod tests { use super::*; ... }` at the bottom of the source file (rust-skills `test-cfg-test-module`). Cross-cutting tests (those that span multiple source files + shared helpers) live under `crates/<crate>/src/[<submodule>/]tests/`. Inline test blocks reach shared helpers via `use crate::<path>::tests::*;`; helpers are declared `pub(super)` so wildcard imports work. Integration tests against the binary live in `crates/coxswain-e2e/tests/`.
 
 ### Hot path
 
-The proxy request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet::apply_request_filters`, `filter::FilterSet::apply_response_filters`) is performance-critical:
+Proxy request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet::apply_request_filters`, `filter::FilterSet::apply_response_filters`) is performance-critical:
 
-- At `request_filter` entry, capture immutable request data (host, path, query) once as `Arc<str>` / `Option<String>` — at most 3 allocations per request. Later Pingora hooks clone these arcs cheaply without re-borrowing `session.req_header()`.
-- Beyond that fixed capture set, the routing lookup, upstream-selection, metric emission, and access-log paths must not allocate. The documented exceptions are:
-  - TLS connections: `upstream_peer` clones the SNI hostname into a `String` because Pingora's `HttpPeer` constructor takes ownership of it. Per outbound TLS connection, not per request; cleartext upstreams skip this entirely.
-  - Metric label rendering: `u16` port and status code render via stack-only `itoa::Buffer`s — **no heap allocation**. Reintroducing `port.to_string()` / `status.to_string()` in `common/hooks.rs` is a hot-path regression; the WS3 commit on #242 fixed exactly that and the CI gate (`scripts/check-public-types-stability.sh`) does not catch it — guard with code review.
-  - Access log: `SocketAddr::to_string()` for the upstream address allocates exactly once per request **and only when `--access-log=on`**. Operators that silence the access log via `--access-log=off` skip it.
+- Capture immutable request data at `request_filter` entry: `host` and `path` as `Arc<str>`, `query` as `Option<String>` — 3 allocations per request, max.
+- Routing lookup, upstream selection, metric emission, and access-log path allocate nothing beyond the capture set. Render `u16` labels (port, status) via `itoa::Buffer` — never `.to_string()`.
+- TLS connections allocate one SNI hostname `String` per outbound connection (Pingora's `HttpPeer` requires owned). Per connection, not per request; cleartext upstreams skip it.
+- Access-log `SocketAddr::to_string()` allocates exactly once per request, only when `--access-log=on`. Operators silencing the log skip it.
 - Use `Shared<T>` (the `ArcSwap`-backed wrapper in `coxswain-core`) for lock-free routing/TLS snapshot reads.
-- Never hold a `Mutex` or `RwLock` guard across an `.await` point.
+- Never hold a `Mutex` or `RwLock` guard across `.await`.
 
-### Error types
+## GitHub issue workflow
 
-Every crate-defined error type uses `#[derive(thiserror::Error)]` with a `#[error("...")]` message on each variant. Error enums are `#[non_exhaustive]`. Library crates (`coxswain-core`, `coxswain-controller`, `coxswain-proxy`, `coxswain-health`, `coxswain-admin`) never use `anyhow` — only `coxswain-bin` may use it at the binary boundary.
+1. Invoke `/rust-skills` to load Rust coding guidelines.
+2. `git checkout main && git pull --ff-only origin main`. Stop if it fails.
+3. Enter plan mode. Read `gh issue view N`, cross-check code references, grill the user on anything unclear, design the implementation.
+4. After plan approval: `git checkout -b issue-N`, implement per acceptance criteria. For Gateway API features with a **Feature flags** line in the issue body: add the `features.SupportXxx` constant(s) to `opts.SupportedFeatures` in `conformance/main_test.go` AND the bare feature name(s) to `SUPPORTED_FEATURES` in `crates/coxswain-controller/src/controller/gateway_class_status.rs` (sorted). The `check-supported-features.sh` gate enforces parity. For routing, status-condition, or proxy-behaviour changes: add/update scenarios in `crates/coxswain-e2e/tests/{ingress,gateway_api,dedicated_proxy,observability}.rs`.
+5. After each work cycle: `cargo fmt && cargo test --workspace --exclude coxswain-e2e`. Then ask the user what's next via `AskUserQuestion` (two questions in one call):
+   - **Q1 (header "Next step")**: Refine implementation / Run e2e tests / Commit and push / Merge PR and close issue.
+   - **Q2 (header "E2E suite")**: ingress / gateway_api / conformance / N/A. Consulted only when Q1 = "Run e2e tests".
 
-### API stability annotations
+Always include the issue reference in commit footers: `Refs #N` (intermediate work) or `Fixes #N` (final commit). Closing via `Fixes #N` auto-flips the Project's `Status` to `Done`; never manually close + flip.
 
-Every public struct and enum is `#[non_exhaustive]` unless it is intentionally open for downstream construction. Every `pub fn` that returns a value the caller is expected to consume carries `#[must_use]`. The original sweep was issue #140; the comprehensive workspace coverage (107/107 types) landed in issue #242.
-
-**Opt-out for intentionally-open types.** A small number of `pub` structs are field-literally constructed in another crate (e.g. CLI-derived config structs `coxswain-bin/src/main.rs` assembles, or routing predicate structs `coxswain-reflector::gateway_api` assembles per HTTPRoute match). These do not carry `#[non_exhaustive]`; instead they carry a `// intentionally open: <reason>` comment on the line immediately preceding the declaration (or earlier in the contiguous attribute block) explaining where the cross-crate field literal lives. Without that comment, the type is treated as a policy violation.
-
-**CI enforcement.** `scripts/check-public-types-stability.sh` walks every non-test `pub enum`/`pub struct` in the seven production crates and asserts each carries `#[non_exhaustive]` or an `intentionally open` rationale. The CI job `public-types-stability` runs it on every PR touching `crates/**/src/**`. The clippy lints `unwrap_used = "deny"` and `expect_used = "deny"` in `[workspace.lints.clippy]` cover the related shift-left for unwrap/expect usage in non-test code (test allowance via `clippy.toml`'s `allow-{unwrap,expect}-in-tests = true` is unchanged).
-
-**Related backfill issues** (intentionally out of scope of #242, tracked in v0.2):
-- #243 — `# Errors` section backfill on the ~94 currently-uncovered fallible `pub fn`s.
-- #244 — workspace-wide `# Panics` section audit.
-
-### Test layout
-
-Per-source-file unit tests live **inline** as `#[cfg(test)] mod tests { use super::*; ... }` at the bottom of the source file. This is the rust-skills canonical pattern (rule `test-cfg-test-module`) and what the Rust ecosystem overwhelmingly uses — `use super::*;` reaches `pub(self)` items without forcing visibility bumps for testing, and the parent module's `use` statements flow through transparently.
-
-Cross-cutting unit tests (those that span multiple source files, plus shared test fixtures consumed by many inline test blocks) live under `crates/<crate>/src/[<submodule>/]tests/`. Each inline test block that needs a shared helper imports it via `use crate::<path>::tests::*;`. Shared helpers are declared `pub(super)` so wildcard imports reach them.
-
-Integration tests against the binary live in `crates/coxswain-e2e/tests/`.
-
-The sibling `<module>_tests.rs` pattern (and the `tests/<name>.rs` per-source-file pattern from #143/#144) was retired during the #242 quality remediation: the visibility-bump cost outweighed the file-size benefit, and the partial migration in operator/* and coxswain-admin made the codebase inconsistent. The earlier issues #143 and #144 are superseded by this section — do not reintroduce the sibling-file pattern.
-
-### Per-crate Cargo manifest
-
-Every `crates/*/Cargo.toml` must declare `[lints] workspace = true`. Without it, a new crate silently escapes every workspace lint, defeating the single-source-of-truth rule above.
-
-## GitHub Issue Workflow
-
-### Starting work on issue N
-
-1. Invoke `/rust-skills` to load Rust coding guidelines into context.
-2. Ensure you're on the latest code: `git checkout main && git pull --ff-only origin main`. **Stop and tell the user if this fails — do not continue.**
-3. Enter plan mode.
-4. Run `gh issue view N --repo coxswain-labs/coxswain`. Read the full description, cross-check any code references against the current implementation, and grill the user on anything unclear.
-5. Read all relevant source files and plan the implementation.
-6. Once plan mode exits, create the branch: `git checkout -b issue-N`.
-7. Implement the issue per its acceptance criteria, including:
-   - **E2E tests**: add or update scenarios in `crates/coxswain-e2e/tests/gateway_api.rs` and/or `tests/ingress.rs` for any change to routing, status conditions, or proxy behaviour.
-   - **Conformance** (only if the issue body has a **Feature flags** line): add the corresponding `features.SupportXxx` constant(s) to `opts.SupportedFeatures` in `conformance/main_test.go` (with a comment referencing `#N`), run `go vet ./...` to validate, add the bare feature name(s) to `SUPPORTED_FEATURES` in `crates/coxswain-controller/src/controller/gateway_class_status.rs` (keep sorted), and run `bash scripts/check-supported-features.sh`. See `docs/guides/gateway-api.md` for the full promotion policy.
-   - Closing the issue (via `Fixes #N` in the commit footer, or `gh issue close N` later) automatically flips its `Status` to `Done` in the GitHub Project — no manual roadmap edit.
-8. At the end of each implementation or refinement cycle:
-   - Run `cargo fmt` then `cargo test --workspace --exclude coxswain-e2e` and report results.
-   - **Use `AskUserQuestion` with two simultaneous questions** to ask what to do next. Never commit, push, or close without the user explicitly selecting it here. The `AskUserQuestion` tool allows a maximum of 4 options per question, so split across two questions sent in one call:
-     - Q1 (header "Next step"): **Refine implementation** / **Run e2e tests** / **Commit and push** / **Merge PR and close issue**
-     - Q2 (header "E2E suite", only relevant when Q1 = "Run e2e tests"): **ingress** / **gateway_api** / **conformance** / **N/A**
-   - Act on the combination: if Q1 = "Run e2e tests", use Q2 to pick the suite. If Q1 = "Merge PR and close issue", follow the closing procedure below. If Q1 = "Refine" or "Commit and push", ignore Q2.
-   - Keep presenting these questions after each action until the user selects **Merge PR and close issue** and the PR is merged.
-
-### Closing an issue
-
-1. Run `gh issue close N --repo coxswain-labs/coxswain` (the merge auto-closes if the commit footer is `Fixes #N`; this step is for paranoia).
-2. Merge with `gh pr merge --squash --delete-branch`.
-3. Ask the user to confirm before pulling — then run `git checkout main && git pull --ff-only origin main` (requires user presence).
+When a PR is approved for merge: `gh pr merge --squash --delete-branch`. Then ask the user before `git checkout main && git pull --ff-only origin main`.
 
 ### Commit message convention
 
-Title format: `type(scope): description` — e.g. `feat(controller): add HTTPRoute timeout support`.
+Title format: `type(scope): description`. Common types: `feat`, `fix`, `refactor`, `perf`, `chore`, `docs`, `ci`, `test`. Scope is the affected crate(s) without the `coxswain-` prefix (e.g. `controller`, `proxy,core`).
 
-Common types: `feat`, `fix`, `refactor`, `perf`, `chore`, `docs`, `ci`, `test`. Scope is the affected crate(s) without the `coxswain-` prefix (e.g. `controller`, `proxy,core`).
+## Issue / project management
 
-Every commit on an issue branch must reference the issue in the footer:
-- `Refs #N` — partial work.
-- `Fixes #N` — final commit (GitHub closes the issue automatically on push).
+Source of truth for scope and status: the [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2). New issues land at `Status: Todo`. Triage populates Track (single-select; cross-cutting workstream) and, for milestoned items, Order (numeric; intended execution sequence within the milestone).
 
-## Issue and project management
+Milestones are plain version numbers (`v0.1`, `v0.2`, …); use `gh issue edit N --milestone vX.Y`. Never use special characters (em dashes, colons, `&`) — they break GitHub's filter URL parser.
 
-The single source of truth for scope and status is the [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2). New issues are auto-added at `Status: Todo`. Triage populates the Project's `Track` (single-select; cross-cutting workstream) and, for milestoned items, `Order` (numeric; intended execution sequence within the milestone).
-
-### Milestones
-
-Plain version numbers only (`v0.1`, `v0.2`; create new milestones on demand as scope is committed). Use the GitHub-native milestone field (`gh issue edit N --milestone vX.Y`) — there is no longer a mirror `milestone:` label. Never use special characters like em dashes, colons, or `&` in milestone titles — they break GitHub's issue filter URL parser. Issues not yet committed to a release carry no milestone assignment and the `status: backlog` label instead.
-
-### Labels
-
-Every issue gets one label from each relevant group. At minimum: one `type:` and at least one `area:` or `api:`. Use `status: backlog` for issues that are triaged but deliberately uncommitted to a milestone.
-
-**Status** — applies only when the issue is not committed to any milestone:
-- `status: backlog` — parked; promotion to a v0.N milestone happens when scope solidifies
-
-**Priority** — how urgent within its milestone (or, for backlog items, relative ordering when triage promotes to a milestone):
-- `priority: must-have` — v1.0 blocker; do not ship without it
-- `priority: should-have` — post-v1.0, high priority
-- `priority: nice-to-have` — future / community-driven
-
-**Type** — what kind of work:
-- `type: feature` — new capability
-- `type: bug` — something broken
-- `type: conformance` — Gateway API spec compliance
-- `type: chore` — tooling, CI, maintenance
-- `type: spec-deviation` — known intentional deviation from a spec, documented with rationale
-- `type: experimental` — touches alpha/experimental Gateway API channel
-
-**Area** — which subsystem:
-- `area: controller` — reconciler, leader election, status writes
-- `area: proxy` — Pingora data plane, protocol handling
-- `area: routing` — routing table, path/host matching
-- `area: tls` — TLS termination, cert management, SNI
-- `area: observability` — metrics, logging, tracing
-- `area: security` — auth, rate limiting, policy
-- `area: distribution` — Helm, OCI image, CI/CD
-- `area: docs` — documentation site and guides
-
-**API surface** — use when the issue is specific to one API:
-- `api: gateway` — HTTPRoute, Gateway, GatewayClass, policies
-- `api: ingress` — classic Kubernetes Ingress
-
-**Process** — applied by CI or humans during triage:
-- `process: good first issue` — good for newcomers
-- `process: help wanted` — extra attention needed
+Labels: discover the live taxonomy with `gh label list --repo coxswain-labs/coxswain`. Every issue carries at least one `type:` and one `area:` or `api:`. `status: backlog` only on issues with no milestone; `priority:` is per-milestone; `type:` and `area:`/`api:` are required everywhere.

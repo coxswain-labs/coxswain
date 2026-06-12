@@ -1,6 +1,6 @@
 ---
-name: test-e2e
-description: Reset the local Kubernetes cluster and run one or more of the coxswain e2e suites (ingress, gateway_api, dedicated_proxy, proxy_hot_reconfig, observability, conformance). Use when the user wants to validate a change against a live cluster — for example "test e2e", "run e2e", "run conformance", or "run the full e2e suite". Asks which suites to run; auto-detects the local cluster type (caches the reset command in memory after first use); reports a clean summary; offers to debug on failure.
+name: run-e2e
+description: Reset the local Kubernetes cluster and run one or more of the coxswain e2e suites (ingress, gateway_api, dedicated_proxy, proxy_hot_reconfig, observability, conformance) against it. Use when the user wants to validate a change against a live cluster — for example "run e2e", "test e2e", "run conformance", or "run the full e2e suite". Asks which suites to run; auto-detects the local cluster type (caches the reset command in memory after first use); reports a clean summary; offers to debug on failure.
 ---
 
 Run one or more of the project's e2e suites against a freshly-reset local Kubernetes cluster. Follow these steps in order.
@@ -14,7 +14,7 @@ Use `AskUserQuestion` with `multiSelect: true` and these options (omit "Other"; 
 - **dedicated_proxy** — Cargo e2e suite covering dedicated-mode provisioning + per-namespace RBAC. Dedicated-proxy Services use NodePort; tests connect via node IP. `cargo test -p coxswain-e2e --test dedicated_proxy -- --test-threads=1`
 - **proxy_hot_reconfig** — Cargo load-test suite: zero-drop listener add/remove; crash-loop shared-pool fallback. `cargo test -p coxswain-e2e --test proxy_hot_reconfig -- --test-threads=1`
 - **observability** — Cargo e2e suite covering readiness/status (formerly `health.rs`), the `coxswain_proxy_*` / `coxswain_controller_*` Prometheus surface, and the access-log contract (field set, path-mode behaviour, disabled mode). `cargo test -p coxswain-e2e --test observability -- --test-threads=1`
-- **conformance** — Gateway API Go conformance suite. The Cargo harness bootstrap handles image build + Helm install + LB-IP discovery; `go test` runs against the deployed cluster. Takes ~2 minutes.
+- **conformance** — Gateway API Go conformance suite. Unlike the Cargo suites, conformance is NOT auto-bootstrapped — it needs the production multi-stage `Dockerfile` and conformance-specific Helm overrides. Use `scripts/setup-conformance.sh` to prepare the cluster, then `go test` runs against the deployed cluster. Setup is ~3–5 min on macOS (BoringSSL build); the test itself is ~2 min.
 
 Cap the question at one phrase: "Which e2e suites to run?". Header: "E2E suites".
 
@@ -43,7 +43,7 @@ For each reset: briefly tell the user one line ("Resetting <type> cluster with `
 
 **All Cargo suites** (ingress, gateway_api, dedicated_proxy, proxy_hot_reconfig, observability) bootstrap the cluster themselves via `coxswain-e2e`'s harness — no manual cluster setup. The bootstrap:
 1. Detects cluster type (OrbStack vs kind).
-2. Builds `coxswain:e2e` via `Dockerfile.e2e` — a 2-line COPY-only image wrapping the already-compiled binary (~5 s). The full production Dockerfile is NOT used locally.
+2. Builds the `coxswain:e2e` Docker image. **On Linux CI runners**: `Dockerfile.e2e` — a 2-line COPY-only image wrapping the already-compiled binary (~5 s). **On macOS (or any non-Linux host)**: the production multi-stage `Dockerfile`, because the host produces Mach-O binaries that won't run in Linux containers. First macOS build is ~5–10 min for BoringSSL; cached afterwards. The harness picks the right Dockerfile at compile time via `cfg!(target_os = "linux")`.
 3. For kind: `kind load docker-image` + starts cloud-provider-kind if not running.
 4. Installs Gateway API CRDs, cert-manager, coxswain CRDs, and the Helm chart.
 
@@ -51,9 +51,9 @@ For each reset: briefly tell the user one line ("Resetting <type> cluster with `
 ```bash
 cargo build --release --bin coxswain
 ```
-The bootstrap fails fast with a clear error if `target/release/coxswain` is absent. Re-run only when source changes — the Docker image rebuild (~5 s) and cluster state are separate.
+The bootstrap fails fast with a clear error if `target/release/coxswain` is absent. Re-run only when source changes.
 
-**Conformance**: also handled automatically by the Cargo bootstrap infrastructure when you run the Go test. No manual Helm install or coxswain startup needed.
+**Conformance is NOT auto-bootstrapped.** Its setup differs from the Cargo suites (Ingress entry points off, gateway Service pre-declares ports 80/443/8080/8090/8443, controller status-address set to the LB IP). Use `scripts/setup-conformance.sh` — it wraps the documented procedure and takes a `--reset` flag for cluster-agnostic operation. See step 4.
 
 ## 4 — Run each chosen suite
 
@@ -65,11 +65,13 @@ cargo test -p coxswain-e2e --test <suite> -- --test-threads=1
 
 No `cargo build` prerequisite. Set `COXSWAIN_E2E_SKIP_BUILD=1` only if you know the `coxswain:e2e` image is already up to date in the local Docker daemon and you want to skip the build step.
 
-Capture stdout+stderr to a tmpfile so a failure can be inspected without re-running. Set the Bash timeout to 600000 ms (10 min) — enough for ingress (~4 min), gateway_api (~6 min), dedicated_proxy (~3 min), proxy_hot_reconfig (~2 min) on a fresh cluster.
+Capture stdout+stderr to a tmpfile so a failure can be inspected without re-running. Set the Bash timeout to 600000 ms (10 min) — Cargo suites typically run in 2–7 min each on a fresh cluster, so 10 min is generous headroom.
 
 **conformance**:
 
 ```bash
+bash scripts/setup-conformance.sh --reset '<your cluster reset command>'
+
 cd conformance && go test -v -timeout 60m -run TestConformance -args \
   --organization=coxswain-labs --project=coxswain \
   --url=https://github.com/coxswain-labs/coxswain \
@@ -77,7 +79,9 @@ cd conformance && go test -v -timeout 60m -run TestConformance -args \
   --report-output=reports/local-report.yaml
 ```
 
-Timeout 3600000 ms (1 h) on the Bash call (go's `-timeout` is the inner ceiling). After the run, summarize by reading `conformance/reports/local-report.yaml` — call out `core.{Passed,Failed,Skipped}` and `extended.{Passed,Failed,Skipped}` per-profile.
+`scripts/setup-conformance.sh` does what the Cargo harness does NOT do for conformance: production multi-stage `Dockerfile` build (the conformance claim must validate the artifact GHCR publishes, never `Dockerfile.e2e`), Gateway API CRDs install, Helm install with the conformance overrides, LB IP discovery, and the status-address upgrade. Pass the reset command verbatim — the same one cached in memory from step 2. Pass `SKIP_RESET=1` to skip the reset entirely when iterating against an already-clean cluster.
+
+Timeout 3600000 ms (1 h) on the Bash call for `go test` (go's `-timeout` is the inner ceiling). After the run, summarize by reading `conformance/reports/local-report.yaml` — call out `core.{Passed,Failed,Skipped}` and `extended.{Passed,Failed,Skipped}` per-profile.
 
 There is no coxswain host process to stop after conformance — it runs in-cluster.
 
@@ -101,6 +105,6 @@ If the user picks "Debug and fix", treat it as a normal bug-investigation flow: 
 
 - **Reset the cluster between every suite** (see step 2 — this is non-negotiable; deterministic baselines outweigh the ~30s per-reset cost).
 - There is no host coxswain process to kill between suites — the in-cluster Helm release persists and is reused across tests within a suite. Between suites the cluster is reset anyway.
-- If `kubectl get nodes` shows the cluster missing CRDs after a reset (suggesting `orb start k8s` returned before the apiserver was fully ready), poll for them up to 60 s before failing.
+- If `kubectl get nodes` shows the cluster not Ready after a reset (the apiserver returned before it was fully responsive), poll for it up to 60 s before failing.
 - On kind with local development: if LoadBalancer Services don't get IPs, ensure `cloud-provider-kind` is running: `go install sigs.k8s.io/cloud-provider-kind@latest && sudo cloud-provider-kind &`
 - Hardware-key signing is irrelevant to e2e — don't try to commit anything from this skill.

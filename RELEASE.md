@@ -51,3 +51,45 @@ cargo release minor --dry-run
 ```
 
 Shows exactly what would happen without making any changes.
+
+## Documentation site versioning
+
+The docs site is built with [mike](https://github.com/jimporter/mike) on top of mkdocs-material and published to `coxswain-labs.github.io/coxswain/`. Mike serves a versioned site so old releases stay reachable. Behavior is driven by `.github/workflows/release.yml`'s `publish-docs` job — see the `Determine version and aliases` step for the source of truth.
+
+- **Push to `main`** → publishes under the `unstable` version key with no aliases. `PACKAGE_VERSION` is set to the literal string `main` so the `X.Y.Z` placeholder hook stays inert (substituted commands like `helm --version` and GitHub release-asset URLs are only valid against a tagged release).
+- **Push a tag `vX.Y.Z`** → publishes under the `X.Y` version key (MAJOR.MINOR) and applies the aliases `stable` + `latest`. `PACKAGE_VERSION` is set to the full SemVer so install/verification pages render with the right tag references.
+- Patches overwrite their minor version key (`0.1.1` → `0.1`, same as `0.1.0`).
+- The site root redirects to `stable` (mike's default alias).
+
+Publishing happens automatically as the `publish-docs` job at the tail of `release.yml`, after `publish-image`, `trivy-scan`, `publish-chart`, and `publish-kustomize`. A failed earlier step skips docs promotion and leaves the site unchanged. The job pushes into the `coxswain/` subdirectory of the `coxswain-labs/coxswain-labs.github.io` Pages repo using the `GH_DOCS_PAT` cross-repo PAT.
+
+When previewing a tagged release locally:
+
+```bash
+PACKAGE_VERSION=0.1.2 mkdocs serve
+```
+
+PR-time validation (`mkdocs build --strict`) lives in `.github/workflows/distribution.yml` as the `docs-build` job.
+
+### Pre-release tagging (UNDEFINED — needs design review)
+
+The current `Determine version and aliases` step matches `refs/tags/v*` indiscriminately, so a hypothetical `v0.2.0-rc.1` tag would publish under the same `0.2` version key as the eventual `v0.2.0` release AND apply the `stable` + `latest` aliases — which is almost certainly the wrong behavior for a pre-release. The documented `cargo release patch|minor|major` flow doesn't emit pre-release tags today, so no one has hit this footgun yet, but it remains a latent bug.
+
+Open questions to resolve before publishing the first pre-release:
+
+- Should pre-release tags publish under a separate version key (e.g. `0.2-rc`) or update the same `0.2` key the eventual stable will land on?
+- Should pre-release tags update the `stable` / `latest` aliases (presumably NOT) or only a `next` / `rc` alias?
+- Should `cargo release` learn a `--pre rc` flow that bumps the SemVer pre-release segment without affecting Cargo.toml's main version line?
+- Does the `PACKAGE_VERSION` substitution hook need updating to surface "this is a pre-release, install at your own risk" warnings on the rendered pages?
+
+Until these are answered and the workflow is updated, do not push `v*-rc.*` / `v*-beta.*` / `v*-alpha.*` tags through `cargo release` or by hand.
+
+## CI secrets / PAT rotation
+
+All PAT secrets are managed through one script:
+
+```bash
+./scripts/refresh-pat.sh [labeler|docs]
+```
+
+Run without arguments to select interactively. The script prints the required PAT scopes before opening the GitHub token creation page. The header comments in `scripts/refresh-pat.sh` document the two tokens (`GH_LABELER_PAT` for the PR labeler workflow, `GH_DOCS_PAT` for the cross-repo docs publish), their workflows, and the required permissions. GitHub emails maintainers when a token approaches expiry — run the script to rotate.
