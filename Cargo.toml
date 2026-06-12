@@ -53,6 +53,7 @@ gateway-api        = { version = "0.21" }
 http               = { version = "1" }
 humantime          = { version = "2" }
 ipnet              = { version = "2" }
+itoa               = { version = "1" }
 # Enable the "experimental" feature to expose alpha Gateway API resources
 # (GRPCRoute, TCPRoute, BackendTLSPolicy, etc.) and experimental fields on
 # stable CRDs. This feature is for contributor/CI/preview builds ONLY —

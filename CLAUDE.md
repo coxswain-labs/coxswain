@@ -123,7 +123,10 @@ Default to `pub(crate)` for items reachable within the workspace, `pub(super)` f
 The proxy request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet::apply_request_filters`, `filter::FilterSet::apply_response_filters`) is performance-critical:
 
 - At `request_filter` entry, capture immutable request data (host, path, query) once as `Arc<str>` / `Option<String>` — at most 3 allocations per request. Later Pingora hooks clone these arcs cheaply without re-borrowing `session.req_header()`.
-- Beyond that fixed capture set, the routing lookup and upstream-selection paths must not allocate. (Exception: TLS connections allocate one `String` for the SNI hostname in `upstream_peer` — documented and deliberate.)
+- Beyond that fixed capture set, the routing lookup, upstream-selection, metric emission, and access-log paths must not allocate. The documented exceptions are:
+  - TLS connections: `upstream_peer` clones the SNI hostname into a `String` because Pingora's `HttpPeer` constructor takes ownership of it. Per outbound TLS connection, not per request; cleartext upstreams skip this entirely.
+  - Metric label rendering: `u16` port and status code render via stack-only `itoa::Buffer`s — **no heap allocation**. Reintroducing `port.to_string()` / `status.to_string()` in `common/hooks.rs` is a hot-path regression; the WS3 commit on #242 fixed exactly that and the CI gate (`scripts/check-public-types-stability.sh`) does not catch it — guard with code review.
+  - Access log: `SocketAddr::to_string()` for the upstream address allocates exactly once per request **and only when `--access-log=on`**. Operators that silence the access log via `--access-log=off` skip it.
 - Use `Shared<T>` (the `ArcSwap`-backed wrapper in `coxswain-core`) for lock-free routing/TLS snapshot reads.
 - Never hold a `Mutex` or `RwLock` guard across an `.await` point.
 
