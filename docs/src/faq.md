@@ -39,7 +39,7 @@ Architectural differences only — not performance or quality. All projects belo
 | Process model | Go controller + nginx worker processes in the same container | Split controller pod (leader-elected, K8s writes) + horizontally-scalable read-only Pingora proxy pods; Helm renders a controller + shared-proxy by default |
 | Config-application model | Controller renders `nginx.conf`; nginx reloads on change | Controller publishes an immutable routing-table snapshot; proxy reads via atomic pointer |
 | Gateway API surface | Available via separate [NGINX Gateway Fabric](https://github.com/nginx/nginx-gateway-fabric) project | Same controller manages both; default shared-proxy pool serves both |
-| Annotation ecosystem | Large catalogue of `nginx.ingress.kubernetes.io/*` annotations | Coxswain reserves `coxswain-labs.dev/*` for future per-resource configuration; currently minimal |
+| Annotation ecosystem | Large catalogue of `nginx.ingress.kubernetes.io/*` annotations | Coxswain reserves `gateway.coxswain-labs.dev/*` for future per-resource configuration; currently minimal |
 
 ### Traefik vs. Coxswain
 
