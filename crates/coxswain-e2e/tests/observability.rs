@@ -59,21 +59,18 @@ async fn status_exposes_per_subsystem_checks() -> anyhow::Result<()> {
     common::init_tracing();
     let h = Harness::start().await?;
 
-    let status: serde_json::Value = reqwest::get(h.admin_url("/status")).await?.json().await?;
+    let health: serde_json::Value = reqwest::get(h.admin_url("/api/v1/health"))
+        .await?
+        .json()
+        .await?;
 
-    assert_eq!(
-        status["synced"],
-        serde_json::Value::Bool(true),
-        "/status.synced must be true after harness wait_for_ready",
-    );
-
-    let subsystems = status["subsystems"]
+    let subsystems = health["subsystems"]
         .as_object()
-        .expect("/status.subsystems must be an object");
+        .expect("/api/v1/health.subsystems must be an object");
     assert!(subsystems.contains_key("controller"));
     assert!(subsystems.contains_key("proxy"));
 
-    let controller = &subsystems["controller"];
+    let controller = &health["subsystems"]["controller"];
     assert_eq!(controller["state"]["state"], "ready");
     let controller_checks = controller["checks"]
         .as_object()
@@ -85,7 +82,7 @@ async fn status_exposes_per_subsystem_checks() -> anyhow::Result<()> {
         assert_eq!(entry["state"], "ready");
     }
 
-    let proxy = &subsystems["proxy"];
+    let proxy = &health["subsystems"]["proxy"];
     assert_eq!(proxy["state"]["state"], "ready");
     let proxy_checks = proxy["checks"]
         .as_object()

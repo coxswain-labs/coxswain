@@ -18,7 +18,7 @@ The readiness endpoint gates on every registered subsystem reaching `Ready` or `
 Inspect which subsystem is blocking:
 
 ```bash
-curl -s http://localhost:8082/status | jq .subsystems
+curl -s http://localhost:8082/api/v1/health | jq .subsystems
 ```
 
 A subsystem stuck in `Pending` looks like this — `httproute` hasn't seen its first list complete, typically because the CRD is missing:

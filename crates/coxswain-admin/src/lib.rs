@@ -1,5 +1,5 @@
 //! Admin HTTP endpoints for Coxswain: `/metrics` (Prometheus), `/routes`,
-//! `/status`, and (controller-only) `/cluster`.
+//! `/api/v1/health`, and (controller-only) `/api/v1/cluster`.
 
 use async_trait::async_trait;
 use coxswain_core::cluster::{ClusterSummary, ControllerSummary, SharedClusterSummary};
@@ -17,26 +17,25 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Pingora HTTP app serving `/metrics`, `/routes`, `/status`, and — when
-/// constructed with [`Self::with_cluster_summary`] — `/cluster`.
+/// Pingora HTTP app serving `/metrics`, `/routes`, `/api/v1/health`, and — when
+/// constructed with [`Self::with_cluster_summary`] — `/api/v1/cluster`.
 ///
 /// The `cluster` handle is the opt-in switch: only the controller and `dev`
 /// pod roles wire it through; `proxy --shared` and `proxy --gateway` leave
-/// it `None`, so `GET /cluster` on a proxy pod returns 404. This makes the
-/// proxy / controller surface difference structural rather than convention.
+/// it `None`, so `GET /api/v1/cluster` on a proxy pod returns 404. This makes
+/// the proxy / controller surface difference structural rather than convention.
 #[non_exhaustive]
 pub struct AdminServer {
-    /// Shared health registry surfaced under `/status.subsystems`.
+    /// Shared health registry surfaced under `/api/v1/health`.
     pub health: HealthRegistry,
     /// Flipped to `true` while this replica holds the leader-election lease.
     pub leader: Arc<AtomicBool>,
-    /// Live Ingress routing table snapshot used by `/routes` and `/status`.
+    /// Live Ingress routing table snapshot used by `/routes`.
     pub ingress_routes: SharedIngressRoutingTable,
-    /// Live Gateway-API routing table snapshot used by `/routes` and `/status`.
+    /// Live Gateway-API routing table snapshot used by `/routes`.
     pub gateway_routes: SharedGatewayRoutingTable,
     /// Optional aggregate cluster summary. `None` on proxy roles (returns 404
-    /// from `/cluster` and omits the new `/status` counters); `Some` on the
-    /// controller and `dev` roles.
+    /// from `/api/v1/cluster`); `Some` on the controller and `dev` roles.
     pub cluster: Option<SharedClusterSummary>,
 }
 
@@ -58,8 +57,7 @@ impl AdminServer {
         }
     }
 
-    /// Attach a cluster-summary snapshot, enabling `GET /cluster` and the three
-    /// extra counters in `GET /status`.
+    /// Attach a cluster-summary snapshot, enabling `GET /api/v1/cluster`.
     ///
     /// Called only from the `controller` and `dev` pod roles. Proxy roles
     /// omit this so the read-only-proxy invariant extends to "the proxy admin
@@ -87,14 +85,8 @@ impl ServeHttp for AdminServer {
         match session.req_header().uri.path() {
             "/metrics" => metrics_response(),
             "/routes" => routes_response(&self.ingress_routes, &self.gateway_routes),
-            "/status" => status_response(
-                &self.health,
-                &self.leader,
-                &self.ingress_routes,
-                &self.gateway_routes,
-                self.cluster.as_ref(),
-            ),
-            "/cluster" => cluster_response(self.cluster.as_ref(), &self.leader),
+            "/api/v1/health" => health_response(&self.health),
+            "/api/v1/cluster" => cluster_response(self.cluster.as_ref(), &self.leader),
             _ => {
                 let mut r = Response::new(Vec::new());
                 *r.status_mut() = StatusCode::NOT_FOUND;
@@ -175,67 +167,22 @@ fn routes_response(
     json_response(body)
 }
 
-/// Typed `/status` response. `synced` is retained as a derived top-level alias
-/// of `health.is_ready()` so external consumers that pre-date the per-subsystem
-/// model keep working; new tooling should read `subsystems`.
-///
-/// The `gateway_count` / `dedicated_count` / `ingress_count` fields are present
-/// only on roles that publish a [`SharedClusterSummary`] (controller, dev) and
-/// skipped via `Option::is_none` otherwise. The flat shape matches the existing
-/// `host_count` precedent.
 #[derive(Serialize)]
-struct StatusResponse {
+struct HealthResponse {
     version: &'static str,
-    synced: bool,
-    leader: bool,
-    host_count: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    gateway_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dedicated_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ingress_count: Option<usize>,
     subsystems: BTreeMap<Arc<str>, SubsystemSnapshot>,
 }
 
-fn status_response(
-    health: &HealthRegistry,
-    leader: &Arc<AtomicBool>,
-    ingress: &SharedIngressRoutingTable,
-    gateway: &SharedGatewayRoutingTable,
-    cluster: Option<&SharedClusterSummary>,
-) -> Response<Vec<u8>> {
-    let host_count = ingress.load().host_count() + gateway.load().host_count();
+fn health_response(health: &HealthRegistry) -> Response<Vec<u8>> {
     let snapshot = health.snapshot();
-    let (gateway_count, dedicated_count, ingress_count) = cluster
-        .map(|c| {
-            let s = c.load();
-            let dedicated = s
-                .gateways
-                .iter()
-                .filter(|g| matches!(g.proxy.pool, coxswain_core::cluster::ProxyPool::Dedicated))
-                .count();
-            (
-                Some(s.gateways.len()),
-                Some(dedicated),
-                Some(s.ingresses.len()),
-            )
-        })
-        .unwrap_or((None, None, None));
-    let resp = StatusResponse {
+    let resp = HealthResponse {
         version: env!("CARGO_PKG_VERSION"),
-        synced: health.is_ready(),
-        leader: leader.load(Ordering::Acquire),
-        host_count,
-        gateway_count,
-        dedicated_count,
-        ingress_count,
         subsystems: snapshot.subsystems,
     };
     match serde_json::to_string(&resp) {
         Ok(body) => json_response(body),
         Err(e) => {
-            tracing::error!(error = %e, "Failed to encode /status response");
+            tracing::error!(error = %e, "Failed to encode /api/v1/health response");
             let mut r = Response::new(Vec::new());
             *r.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
             r
@@ -275,7 +222,7 @@ fn cluster_response(
     match serde_json::to_string(&resp) {
         Ok(body) => json_response(body),
         Err(e) => {
-            tracing::error!(error = %e, "Failed to encode /cluster response");
+            tracing::error!(error = %e, "Failed to encode /api/v1/cluster response");
             let mut r = Response::new(Vec::new());
             *r.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
             r
@@ -303,6 +250,29 @@ mod tests {
 
     fn leader_flag(value: bool) -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(value))
+    }
+
+    #[test]
+    fn health_response_returns_version_and_subsystems() {
+        let registry = HealthRegistry::new();
+        let resp = health_response(&registry);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .map(|h| h.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+        let body = std::str::from_utf8(resp.body()).expect("utf8 body");
+        let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+        assert!(v.get("version").is_some(), "response must carry `version`");
+        assert!(
+            v.get("subsystems").is_some(),
+            "response must carry `subsystems`"
+        );
+        assert!(v.get("synced").is_none(), "dropped field `synced`");
+        assert!(v.get("leader").is_none(), "dropped field `leader`");
+        assert!(v.get("host_count").is_none(), "dropped field `host_count`");
     }
 
     #[test]
@@ -375,50 +345,8 @@ mod tests {
     }
 
     #[test]
-    fn status_response_omits_cluster_counters_when_summary_is_absent() {
-        let registry = HealthRegistry::new();
-        let ingress = SharedIngressRoutingTable::new();
-        let gateway = SharedGatewayRoutingTable::new();
-        let leader = leader_flag(false);
-        let resp = status_response(&registry, &leader, &ingress, &gateway, None);
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = std::str::from_utf8(resp.body()).expect("utf8");
-        let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
-        assert!(v.get("gateway_count").is_none());
-        assert!(v.get("dedicated_count").is_none());
-        assert!(v.get("ingress_count").is_none());
-    }
-
-    #[test]
-    fn status_response_includes_cluster_counters_when_summary_is_present() {
-        let registry = HealthRegistry::new();
-        let ingress = SharedIngressRoutingTable::new();
-        let gateway = SharedGatewayRoutingTable::new();
-        let leader = leader_flag(false);
-        let cs: SharedClusterSummary = SharedClusterSummary::default();
-        cs.store(Arc::new(ClusterSummary::new(
-            vec![
-                GatewaySummary::new("a", "default").with_proxy(ProxyAssignment::shared()),
-                GatewaySummary::new("b", "default").with_proxy(ProxyAssignment::dedicated()),
-                GatewaySummary::new("c", "default").with_proxy(ProxyAssignment::dedicated()),
-            ],
-            vec![
-                IngressSummary::new("i1", "default"),
-                IngressSummary::new("i2", "default"),
-            ],
-            ControllerSummary::new(false),
-        )));
-        let resp = status_response(&registry, &leader, &ingress, &gateway, Some(&cs));
-        let body = std::str::from_utf8(resp.body()).expect("utf8");
-        let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
-        assert_eq!(v["gateway_count"], 3);
-        assert_eq!(v["dedicated_count"], 2);
-        assert_eq!(v["ingress_count"], 2);
-    }
-
-    #[test]
     fn admin_server_without_cluster_summary_serves_404_on_cluster_path() {
-        // This is the proxy-role contract: no cluster summary wired → /cluster returns 404.
+        // Proxy-role contract: no cluster summary wired → /api/v1/cluster returns 404.
         let admin = AdminServer::new(
             HealthRegistry::new(),
             leader_flag(false),
