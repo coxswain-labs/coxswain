@@ -25,6 +25,9 @@
 //!   per-Route and per-Policy health computation.
 //! - [`reconciler`] — debounced rebuild loop that drives all of the above off
 //!   reflector store snapshots.
+//! - [`reference_grants`] — `ReferenceGrant` flattening shared by the
+//!   shared-proxy reconciler and the dedicated-mode controller RBAC
+//!   reconciler, so RBAC and data-plane permission sets cannot drift.
 //! - [`crds`] — startup probe for Gateway API CRD presence.
 
 pub mod cluster;
@@ -37,6 +40,7 @@ pub mod k8s_utils;
 pub mod keys;
 pub mod metrics;
 pub mod reconciler;
+pub mod reference_grants;
 pub mod tls;
 
 #[cfg(test)]

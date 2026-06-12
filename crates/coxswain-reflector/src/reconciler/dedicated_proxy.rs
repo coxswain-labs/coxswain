@@ -46,7 +46,7 @@
 
 use super::shared_proxy::{
     Ownership, ReconcilerHealth, ReflectorEffects, ReflectorStores, build_gateway_routes,
-    build_tls, compute_ownership, count_attached_routes, flatten_grants, spawn_reflector,
+    build_tls, compute_ownership, count_attached_routes, spawn_reflector,
 };
 use crate::gateway_api::build_backend_tls_index;
 use crate::gw_types::BackendTlsPolicy;
@@ -55,6 +55,7 @@ use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
 use crate::k8s_utils::scoped_api;
+use crate::reference_grants::flatten_grants;
 use crate::tls::{
     SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
 };

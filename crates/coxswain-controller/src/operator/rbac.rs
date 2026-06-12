@@ -57,10 +57,11 @@
 //! proxy's `--proxy-watch-namespaces` arg list and the controller's binding
 //! set are derived from the same computation — they cannot drift.
 
-use coxswain_core::reference_grants::{ReferenceGrantKey, backend_ref_allowed};
+use coxswain_core::reference_grants::backend_ref_allowed;
 use coxswain_reflector::gw_types::HttpRoute;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::gw_types::v::referencegrants::ReferenceGrant;
+use coxswain_reflector::reference_grants::flatten_grants;
 use k8s_openapi::api::rbac::v1::{RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{ListParams, Patch, PatchParams};
@@ -158,7 +159,7 @@ pub(super) fn desired_namespaces_for_gateway(
     out.insert(gw_namespace.to_string());
 
     let grants_vec: Vec<Arc<ReferenceGrant>> = grants_store.state();
-    let (backend_grants, cert_grants) = flatten_grants_for_rbac(&grants_vec);
+    let (backend_grants, cert_grants) = flatten_grants(&grants_vec);
 
     // Listener TLS certRef target namespaces (source #4).
     for listener in &gateway.spec.listeners {
@@ -340,66 +341,6 @@ fn route_attaches_to(route: &HttpRoute, gw_name: &str, gw_namespace: &str) -> bo
         }
     }
     false
-}
-
-/// Flatten ReferenceGrant objects into the two grant sets we need:
-/// `HTTPRoute → Service` for backendRefs, and `Gateway → Secret` for listener
-/// TLS certificateRefs.
-///
-/// Duplicated structurally from `coxswain_reflector::reconciler::shared_proxy`
-/// because that helper is `pub(super)` and not exported. Logic identical;
-/// both paths must agree on which references are permitted or the data plane
-/// and RBAC will silently drift.
-fn flatten_grants_for_rbac(
-    grants: &[Arc<ReferenceGrant>],
-) -> (
-    std::collections::HashSet<ReferenceGrantKey>,
-    std::collections::HashSet<ReferenceGrantKey>,
-) {
-    fn flatten(
-        grants: &[Arc<ReferenceGrant>],
-        from_kind: &str,
-        to_kind: &str,
-    ) -> std::collections::HashSet<ReferenceGrantKey> {
-        grants
-            .iter()
-            .filter_map(|grant| {
-                let to_ns = grant.metadata.namespace.clone()?;
-                Some((grant, to_ns))
-            })
-            .flat_map(|(grant, to_ns)| {
-                let from_entries: Vec<_> = grant
-                    .spec
-                    .from
-                    .iter()
-                    .filter(|f| f.group == "gateway.networking.k8s.io" && f.kind == from_kind)
-                    .map(|f| f.namespace.clone())
-                    .collect();
-                let to_entries: Vec<_> = grant
-                    .spec
-                    .to
-                    .iter()
-                    .filter(|t| (t.group.is_empty() || t.group == "core") && t.kind == to_kind)
-                    .map(|t| t.name.clone())
-                    .collect();
-                from_entries.into_iter().flat_map(move |from_ns| {
-                    let to_ns = to_ns.clone();
-                    to_entries
-                        .clone()
-                        .into_iter()
-                        .map(move |to_name| match to_name {
-                            Some(name) => {
-                                ReferenceGrantKey::specific(from_ns.clone(), to_ns.clone(), name)
-                            }
-                            None => ReferenceGrantKey::wildcard(from_ns.clone(), to_ns.clone()),
-                        })
-                })
-            })
-            .collect()
-    }
-    let backend_grants = flatten(grants, "HTTPRoute", "Service");
-    let cert_grants = flatten(grants, "Gateway", "Secret");
-    (backend_grants, cert_grants)
 }
 
 async fn list_managed_namespaces(

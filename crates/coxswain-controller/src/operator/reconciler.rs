@@ -334,24 +334,42 @@ impl BackgroundService for Operator {
         // indefinitely; the controller logs and proceeds, so partial
         // observability is preferable to a stuck reconcile loop.
         let sync_timeout = Duration::from_secs(30);
-        let sync = tokio::time::timeout(sync_timeout, async {
-            // Errors here mean the writer was dropped — operator is shutting
-            // down. The match-arms below silently log; if any of them fire
-            // we abandon the wait and let the controller proceed.
-            let _ = class_reader.wait_until_ready().await;
-            let _ = params_reader.wait_until_ready().await;
-            let _ = routes_reader.wait_until_ready().await;
-            let _ = grants_reader.wait_until_ready().await;
-            let _ = pods_reader.wait_until_ready().await;
-            let _ = nodes_reader.wait_until_ready().await;
-        })
-        .await;
-        if sync.is_err() {
+        let deadline = tokio::time::Instant::now() + sync_timeout;
+        async fn wait_or_name<F: std::future::Future>(
+            name: &'static str,
+            fut: F,
+            deadline: tokio::time::Instant,
+        ) -> Option<&'static str> {
+            if tokio::time::timeout_at(deadline, fut).await.is_err() {
+                Some(name)
+            } else {
+                None
+            }
+        }
+        // Errors from `wait_until_ready` mean the writer was dropped — the
+        // operator is shutting down. We treat those as "synced" because there
+        // is nothing left for this reader to deliver; the controller will
+        // exit on the next iteration anyway.
+        let (a, b, c, d, e, f) = tokio::join!(
+            wait_or_name("GatewayClass", class_reader.wait_until_ready(), deadline),
+            wait_or_name(
+                "CoxswainGatewayParameters",
+                params_reader.wait_until_ready(),
+                deadline,
+            ),
+            wait_or_name("HTTPRoute", routes_reader.wait_until_ready(), deadline),
+            wait_or_name("ReferenceGrant", grants_reader.wait_until_ready(), deadline),
+            wait_or_name("Pod", pods_reader.wait_until_ready(), deadline),
+            wait_or_name("Node", nodes_reader.wait_until_ready(), deadline),
+        );
+        let unsynced: Vec<&'static str> = [a, b, c, d, e, f].into_iter().flatten().collect();
+        if !unsynced.is_empty() {
             tracing::warn!(
                 timeout = ?sync_timeout,
+                unsynced = ?unsynced,
                 "operator: dependency reflectors did not complete initial sync within timeout; \
                  proceeding with partial state — first reconciles may bump resourceVersion until \
-                 watches catch up"
+                 watches catch up. Check RBAC if the unsynced list is non-empty."
             );
         }
 
