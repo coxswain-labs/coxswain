@@ -70,6 +70,13 @@ pub(super) enum ApplyError {
 /// patch. On the first error, subsequent applies in the sequence are skipped
 /// and the reconcile re-queues — the next reconcile retries from the
 /// beginning.
+///
+/// # Panics
+///
+/// Panics if the Gateway has no `metadata.namespace`, or if the rendered
+/// ServiceAccount, Service, or Deployment have no `metadata.name`. All are
+/// apiserver invariants or rendering invariants; their absence indicates a
+/// controller bug.
 pub(super) async fn apply_rendered(
     client: &Client,
     gateway: &Gateway,

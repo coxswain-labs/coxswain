@@ -25,6 +25,12 @@ const CONNECTION_DURATION_BUCKETS: &[f64] = &[0.05, 0.5, 5.0, 30.0, 60.0, 300.0]
 /// Gauge: number of listeners currently in `"serving"` or `"draining"` state.
 ///
 /// Labels: `state ∈ {"serving", "draining"}`.
+///
+/// # Panics
+///
+/// Panics if the prometheus registry already contains a series with this name
+/// via a different registration path. The [`OnceLock`] makes this unreachable
+/// in practice; a failure indicates a duplicate registration bug.
 pub(crate) fn listeners_active() -> &'static IntGaugeVec {
     static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
     GAUGE.get_or_init(|| {
@@ -42,6 +48,10 @@ pub(crate) fn listeners_active() -> &'static IntGaugeVec {
 /// Counter: cumulative listener lifecycle events.
 ///
 /// Labels: `event ∈ {"added", "removed", "drain_completed", "drain_exceeded"}`.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
 pub(crate) fn lifecycle() -> &'static IntCounterVec {
     static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -61,6 +71,10 @@ pub(crate) fn lifecycle() -> &'static IntCounterVec {
 ///
 /// Buckets span 0.1 s – 120 s to cover the default 30 s drain timeout with
 /// headroom.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
 pub(crate) fn drain_duration() -> &'static HistogramVec {
     static HIST: OnceLock<HistogramVec> = OnceLock::new();
     HIST.get_or_init(|| {
@@ -85,6 +99,10 @@ pub(crate) fn drain_duration() -> &'static HistogramVec {
 ///
 /// **This counter is the correctness canary**: under sustained traffic with a
 /// properly-sized drain timeout it must remain at 0.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
 pub(crate) fn requests_force_closed() -> &'static IntCounterVec {
     static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -106,6 +124,10 @@ pub(crate) fn requests_force_closed() -> &'static IntCounterVec {
 /// (`httproute/<ns>/<name>:<rule_index>` or `ingress/<ns>/<name>:<r>.<p>`) —
 /// the same string emitted in the access log so an operator pivoting from
 /// Grafana to logs has an exact join key.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
 pub(crate) fn requests_total() -> &'static IntCounterVec {
     static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -126,6 +148,10 @@ pub(crate) fn requests_total() -> &'static IntCounterVec {
 /// Carries only `listener` and `route` — `status_code` and `method` deliberately
 /// omitted to keep the histogram cardinality bounded. Operators correlate
 /// latency to status via the counter above.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
 pub(crate) fn request_duration_seconds() -> &'static HistogramVec {
     static HIST: OnceLock<HistogramVec> = OnceLock::new();
     HIST.get_or_init(|| {
@@ -148,6 +174,10 @@ pub(crate) fn request_duration_seconds() -> &'static HistogramVec {
 /// `upstream_response_filter` (5xx). The `"other"` bucket catches Pingora
 /// error types not mapped explicitly so unexpected classes don't silently
 /// misattribute.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
 pub(crate) fn upstream_errors_total() -> &'static IntCounterVec {
     static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -170,6 +200,10 @@ pub(crate) fn upstream_errors_total() -> &'static IntCounterVec {
 
 /// Counter: TLS handshakes completed by the proxy, by negotiated version and
 /// success/failure result.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
 pub(crate) fn tls_handshakes_total() -> &'static IntCounterVec {
     static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -185,6 +219,10 @@ pub(crate) fn tls_handshakes_total() -> &'static IntCounterVec {
 }
 
 /// Gauge: open downstream connections to the proxy, by listener.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
 pub(crate) fn connections_active() -> &'static IntGaugeVec {
     static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
     GAUGE.get_or_init(|| {
@@ -200,6 +238,10 @@ pub(crate) fn connections_active() -> &'static IntGaugeVec {
 }
 
 /// Counter: cumulative downstream connections accepted by the proxy.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
 pub(crate) fn connections_total() -> &'static IntCounterVec {
     static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
     COUNTER.get_or_init(|| {
@@ -215,6 +257,10 @@ pub(crate) fn connections_total() -> &'static IntCounterVec {
 }
 
 /// Histogram: downstream connection lifetime in seconds, observed on close.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
 pub(crate) fn connection_duration_seconds() -> &'static HistogramVec {
     static HIST: OnceLock<HistogramVec> = OnceLock::new();
     HIST.get_or_init(|| {
