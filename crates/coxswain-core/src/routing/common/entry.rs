@@ -572,6 +572,10 @@ pub struct RouteInfo {
     pub kind: RouteKind,
     /// Backend group selected when this rule matches.
     pub backend_group: Arc<BackendGroup>,
+    /// Source resource identity `"{namespace}/{name}"` of the Ingress/HTTPRoute
+    /// that produced this rule. Carried through so the operator UI can deep-link
+    /// a compiled row back to its originating resource in the Route Inspector.
+    pub route_id: String,
 }
 
 /// A path rule that was silently dropped because an earlier rule already claimed the same slot.

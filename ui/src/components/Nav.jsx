@@ -18,6 +18,12 @@ export function Nav({ activeScreen }) {
   const menuRef   = useRef(null);
   const btnRef    = useRef(null);
 
+  // Lock body scroll while drawer is open.
+  useEffect(() => {
+    document.body.style.overflow = open ? 'hidden' : '';
+    return () => { document.body.style.overflow = ''; };
+  }, [open]);
+
   // Close the menu on any hash navigation.
   useEffect(() => {
     const onHash = () => setOpen(false);
@@ -51,17 +57,17 @@ export function Nav({ activeScreen }) {
   }, [open]);
 
   const links = [
-    { href: '#/fleet',    key: 'fleet',    label: 'Fleet' },
-    { href: '#/health',   key: 'health',   label: 'Health' },
-    { href: '#/events',   key: 'events',   label: 'Events' },
-    { href: '#/problems', key: 'problems', label: 'Problems' },
+    { href: '#/dashboard', key: 'dashboard', label: 'Dashboard' },
+    { href: '#/fleet',     key: 'fleet',     label: 'Fleet' },
+    { href: '#/routing',   key: 'routing',   label: 'Routing' },
+    { href: '#/events',    key: 'events',    label: 'Events' },
   ];
 
   return (
     <header class="nav" role="banner">
       <a
         class="nav-brand"
-        href="#/fleet"
+        href="#/dashboard"
         aria-label="Coxswain home"
         onClick={() => setOpen(false)}
       >
@@ -88,14 +94,31 @@ export function Nav({ activeScreen }) {
         <span class={`hamburger-icon${open ? ' open' : ''}`} aria-hidden="true" />
       </button>
 
-      {/* Drop-down — shown when open on narrow screens */}
+      {/* Full-screen drawer — shown when open on narrow screens */}
       {open && (
-        <nav
-          id="nav-dropdown"
-          class="nav-dropdown"
-          ref={menuRef}
-          aria-label="Main navigation"
-        >
+        <div class="nav-drawer-backdrop" onClick={() => setOpen(false)} aria-hidden="true" />
+      )}
+      <nav
+        id="nav-drawer"
+        class={`nav-drawer${open ? ' open' : ''}`}
+        ref={menuRef}
+        aria-label="Main navigation"
+        aria-hidden={!open}
+      >
+        <div class="nav-drawer-header">
+          <span class="nav-brand" style="pointer-events:none">
+            <span class="nav-logo" aria-hidden="true">⛵</span>
+            <span class="nav-name">Coxswain</span>
+          </span>
+          <button
+            class="nav-drawer-close"
+            aria-label="Close navigation menu"
+            onClick={() => setOpen(false)}
+          >
+            <span class="hamburger-icon open" aria-hidden="true" />
+          </button>
+        </div>
+        <div class="nav-drawer-links">
           {links.map((l) => (
             <NavLink
               key={l.key}
@@ -103,20 +126,20 @@ export function Nav({ activeScreen }) {
               active={active === l.key}
               label={l.label}
               onClick={() => setOpen(false)}
-              dropdown
+              drawer
             />
           ))}
-        </nav>
-      )}
+        </div>
+      </nav>
     </header>
   );
 }
 
-function NavLink({ href, active, label, onClick, dropdown }) {
+function NavLink({ href, active, label, onClick, drawer }) {
   return (
     <a
       href={href}
-      class={`nav-link${active ? ' active' : ''}${dropdown ? ' nav-link-dropdown' : ''}`}
+      class={`nav-link${active ? ' active' : ''}${drawer ? ' nav-link-drawer' : ''}`}
       aria-current={active ? 'page' : undefined}
       onClick={onClick}
     >

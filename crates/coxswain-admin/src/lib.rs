@@ -385,10 +385,18 @@ fn routes_block<K>(table: &RoutingTable<K>) -> serde_json::Value {
                 .iter()
                 .filter(|r| !r.backend_group.name().is_empty())
                 .map(|r| {
+                    // `route_id` is `"{namespace}/{name}"`; split so the UI can
+                    // deep-link a compiled row back to its source resource.
+                    let (namespace, name) = r
+                        .route_id
+                        .split_once('/')
+                        .unwrap_or(("", r.route_id.as_str()));
                     serde_json::json!({
                         "type": r.kind.as_str(),
                         "path": r.path,
                         "backend_group": r.backend_group.name(),
+                        "namespace": namespace,
+                        "name": name,
                         "endpoints": r.backend_group.endpoints().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                     })
                 })

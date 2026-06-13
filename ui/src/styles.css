@@ -11,6 +11,7 @@
   --amber:   #f59e0b;
   --blue:    #60a5fa;
   --purple:  #a78bfa;
+  --teal:    #2dd4bf;
   --nav-h:   52px;
   --r:       6px;
   --touch:   44px;   /* WCAG 2.5.5 minimum touch target */
@@ -144,22 +145,56 @@ img { max-width: 100%; }
 .hamburger-icon.open::before { transform: translateY(6px) rotate(45deg); }
 .hamburger-icon.open::after  { transform: translateY(-6px) rotate(-45deg); }
 
-/* Drop-down nav panel */
-.nav-dropdown {
-  position: fixed;
-  top: var(--nav-h); left: 0; right: 0;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  display: flex; flex-direction: column;
-  padding: 8px 16px 16px;
-  z-index: 99;
+/* Full-screen drawer */
+.nav-drawer-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 150;
 }
-.nav-link-dropdown {
+.nav-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: min(320px, 100vw);
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  z-index: 200;
+  display: flex; flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.nav-drawer.open { transform: translateX(0); }
+@media (min-width: 640px) {
+  /* Drawer only exists on narrow viewports; keep it offscreen on wide */
+  .nav-drawer { display: none; }
+  .nav-drawer-backdrop { display: none; }
+}
+.nav-drawer-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 8px 0 4px;
+  height: var(--nav-h);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.nav-drawer-close {
+  display: flex; align-items: center; justify-content: center;
+  width: var(--touch); height: var(--touch);
+  border-radius: var(--r); color: var(--muted);
+  flex-shrink: 0;
+}
+.nav-drawer-close:hover { background: var(--surface2); }
+.nav-drawer-links {
+  display: flex; flex-direction: column;
+  padding: 12px 12px 24px;
+  gap: 4px;
+}
+.nav-link-drawer {
   display: flex; align-items: center;
-  min-height: var(--touch);
-  padding: 0 8px;
-  font-size: 15px;
+  min-height: 52px;
+  padding: 0 16px;
+  font-size: 16px;
   border-radius: var(--r);
+  width: 100%;
 }
 
 /* ── SSE connection dot ──────────────────────────────────────────────────── */
@@ -184,6 +219,13 @@ img { max-width: 100%; }
   .screen-title { font-size: 20px; }
 }
 .screen-meta { font-size: 13px; color: var(--muted); word-break: break-all; }
+/* Detail-page header: namespace eyebrow, then the name + copy row, then the
+   secondary meta (IP · gateway ref) stacked underneath — mirrors the Fleet
+   pod-card layout so the same identity reads the same way on both screens. */
+.detail-head { min-width: 0; }
+.detail-title-row { display: flex; align-items: center; gap: 8px; }
+.detail-head .card-ns { margin-bottom: 2px; }
+.detail-head .screen-meta { margin-top: 4px; font-family: monospace; }
 .cluster-meta { font-size: 12px; color: var(--muted); font-family: monospace; }
 .header-badges { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
 .addr-label { font-size: 12px; font-family: monospace; color: var(--muted); }
@@ -221,8 +263,65 @@ section { margin-bottom: 32px; }
   margin-bottom: 20px; color: var(--muted); font-size: 13px;
   flex-wrap: wrap;
 }
-.breadcrumb a { color: var(--blue); }
+.breadcrumb a { color: var(--blue); cursor: pointer; }
 .breadcrumb span { color: var(--border); }
+
+/* ── Dashboard overview tiles ────────────────────────────────────────────── */
+.summary-grid {
+  display: grid; gap: 12px; margin-bottom: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+.stat {
+  position: relative;
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px; text-align: left;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); cursor: pointer; outline: none;
+  transition: border-color .12s, transform .12s;
+}
+/* Health glyph in the tile's top-right corner: green check / amber alert,
+   same vocabulary as the route tabs and health chips. */
+.stat-status { position: absolute; top: 8px; right: 8px; display: inline-flex; }
+.stat-status.ok svg   { color: var(--green); }
+.stat-status.warn svg { color: var(--amber); }
+.stat:hover, .stat:focus-visible { border-color: var(--accent); transform: translateY(-1px); }
+.stat-icon {
+  flex-shrink: 0; width: 40px; height: 40px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.stat-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.stat-value { font-size: 24px; font-weight: 700; color: var(--text); line-height: 1.05; }
+.stat-label { font-size: 12px; font-weight: 600; color: var(--muted); }
+
+/* ── Segmented control (filter toggle) ───────────────────────────────────── */
+.segmented {
+  display: inline-flex; border: 1px solid var(--border);
+  border-radius: var(--r); overflow: hidden;
+}
+.segmented-btn {
+  background: var(--surface); color: var(--muted); border: none;
+  border-right: 1px solid var(--border); padding: 6px 14px;
+  font-size: 13px; cursor: pointer; transition: background .12s, color .12s;
+}
+.segmented-btn:last-child { border-right: none; }
+.segmented-btn:hover { color: var(--text); }
+.segmented-btn.active { background: var(--surface2); color: var(--text); font-weight: 600; }
+.segmented-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
+
+/* Right-aligned cluster of header controls (search + segmented filter), pushed
+   away from the screen title rather than glued to it. */
+.header-controls {
+  margin-left: auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.search-box {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); color: var(--text);
+  padding: 6px 12px; font-size: 13px; min-width: 200px;
+}
+.search-box::placeholder { color: var(--muted); }
+.search-box:focus-visible { outline: 2px solid var(--blue); outline-offset: -1px; border-color: var(--blue); }
 
 /* ── Cards ───────────────────────────────────────────────────────────────── */
 .card-grid {
@@ -249,13 +348,44 @@ section { margin-bottom: 32px; }
   display: flex; justify-content: space-between;
   align-items: flex-start; margin-bottom: 8px;
 }
-.card-name { font-weight: 600; font-size: 13px; margin-bottom: 4px; word-break: break-all; }
+/* Top eyebrow row: namespace on the left, badge on the right. */
+.card-top {
+  display: flex; justify-content: space-between;
+  align-items: center; gap: 8px; margin-bottom: 6px;
+}
+.card-ns {
+  font-size: 13px; font-weight: 600; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.card-name {
+  font-weight: 600; font-size: 13px; margin-bottom: 4px;
+  min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* In the header (name + badge inline), let the name take the remaining width
+   so it ellipsises instead of shoving the badge off-card. */
+.card-header .card-name { flex: 1; margin-bottom: 0; }
+/* Pod-card name line: middle-ellipsised name + copy button. */
+.card-name-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+/* Middle ellipsis: head shrinks + ellipsises, tail stays pinned so replicas
+   (which differ only in their suffix) remain distinguishable. */
+.trunc-name { display: flex; flex: 1; min-width: 0; font-weight: 600; font-size: 13px; }
+.trunc-head { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.trunc-tail { flex-shrink: 0; white-space: nowrap; }
+.copy-btn {
+  flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
+  background: none; border: none; cursor: pointer; padding: 3px;
+  color: var(--muted); border-radius: 4px; line-height: 0;
+  transition: color .12s, background .12s;
+}
+.copy-btn:hover, .copy-btn:focus-visible { color: var(--text); background: var(--border); outline: none; }
+.copy-btn.copied { color: var(--green); }
 .card-foot {
   display: flex; align-items: center;
   justify-content: space-between;
   margin-top: 12px; padding-top: 12px;
   border-top: 1px solid var(--border);
 }
+.card-foot-right { display: inline-flex; align-items: center; gap: 8px; }
 
 /* ── Badges ──────────────────────────────────────────────────────────────── */
 .badge {
@@ -316,6 +446,10 @@ tr:last-child td { border-bottom: none; }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover td { background: var(--surface2); }
 tr.clickable:focus-visible td { outline: 2px solid var(--blue); outline-offset: -2px; }
+/* The row a deep-link anchored to (host/path). Blue — the focus/selection
+   accent — so "you navigated here" never reads as amber "this is broken". */
+tr.row-hit td { background: color-mix(in srgb, var(--blue) 14%, transparent); }
+tr.row-hit td:first-child { box-shadow: inset 3px 0 0 var(--blue); }
 
 /* ── Tabs ────────────────────────────────────────────────────────────────── */
 .tabs {
@@ -334,6 +468,12 @@ tr.clickable:focus-visible td { outline: 2px solid var(--blue); outline-offset: 
 }
 .tab.active { color: var(--text); border-bottom-color: var(--blue); }
 .tab:hover:not(.active) { color: var(--text); }
+/* Tab label with a leading status icon: green check when clean, amber alert
+   when the tab carries an issue. Colour holds regardless of tab selection so
+   health is visible before clicking. */
+.tab-label { display: inline-flex; align-items: center; gap: 6px; }
+.tab-label.ok svg   { color: var(--green); }
+.tab-label.warn svg { color: var(--amber); }
 
 /* ── Panel ───────────────────────────────────────────────────────────────── */
 .panel {
@@ -359,18 +499,26 @@ tr.clickable:focus-visible td { outline: 2px solid var(--blue); outline-offset: 
 .cond-detail { font-size: 12px; color: var(--muted); word-break: break-word; }
 
 /* ── Health rows ─────────────────────────────────────────────────────────── */
-.health-row {
-  display: flex; align-items: center; gap: 12px;
-  flex-wrap: wrap;
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--r); padding: 12px 14px;
-  margin-bottom: 6px;
+/* Health chips — one per subsystem. Quiet green when ready; amber with the
+   failing check names inline when not. Replaces the old row-per-check panel. */
+.health-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.health-chips-empty { font-size: 13px; color: var(--muted); }
+.health-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 10px; border-radius: 999px;
+  font-size: 13px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--surface);
 }
-.health-row.ok   { border-left: 3px solid var(--green); }
-.health-row.fail { border-left: 3px solid var(--red); }
-.health-row.warn { border-left: 3px solid var(--amber); }
-.health-name   { font-weight: 600; font-size: 13px; flex: 1; min-width: 120px; }
-.health-detail { font-size: 12px; color: var(--muted); flex: 2; min-width: 0; word-break: break-word; }
+.health-chip.ok   { color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, transparent); }
+.health-chip.ok svg   { color: var(--green); }
+.health-chip.warn { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, transparent); }
+.health-chip.warn svg { color: var(--amber); }
+.health-chip-name   { color: var(--text); font-weight: 600; }
+.health-chip.ok .health-chip-name,
+.health-chip.warn .health-chip-name { color: inherit; }
+.health-chip-detail { color: var(--muted); font-weight: 400; font-size: 12px; }
+/* Smaller variant for Fleet pod-card footers. */
+.health-chip.sm { padding: 2px 8px; font-size: 12px; gap: 4px; }
 
 /* ── Event log ───────────────────────────────────────────────────────────── */
 .ev-feed {
@@ -456,6 +604,30 @@ input[type=checkbox] { accent-color: var(--blue); }
   display: flex; align-items: center; gap: 8px;
 }
 
+/* ── All-clear status board (the happy-path reward) ──────────────────────── */
+.all-clear {
+  display: flex; gap: 16px; align-items: center;
+  padding: 20px 22px; border-radius: var(--r);
+  background: color-mix(in srgb, var(--green) 9%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--green) 32%, var(--border));
+}
+.all-clear-badge {
+  flex-shrink: 0; width: 48px; height: 48px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 18%, transparent);
+}
+.all-clear-title { font-size: 16px; font-weight: 700; color: var(--green); margin-bottom: 8px; }
+.all-clear-checks { list-style: none; display: grid; gap: 5px; margin: 0; padding: 0; }
+.all-clear-check {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--text);
+}
+.all-clear-check svg { color: var(--green); flex-shrink: 0; }
+@media (min-width: 560px) {
+  .all-clear-checks { grid-template-columns: 1fr 1fr; gap: 5px 24px; }
+}
+
 /* ── Problems screen cards ───────────────────────────────────────────────── */
 .problems-list { display: grid; gap: 8px; margin-bottom: 8px; }
 .problem-card {
@@ -466,12 +638,26 @@ input[type=checkbox] { accent-color: var(--blue); }
 .problem-card.err      { border-left-color: var(--red); }
 .problem-card.conflict { border-left-color: var(--red); }
 .problem-card.dead     { border-left-color: var(--amber); }
+.problem-card.warn     { border-left-color: var(--amber); }
+/* Clickable cards deep-link to the offending resource. */
+.problem-card.clickable {
+  display: flex; align-items: center; gap: 12px;
+  cursor: pointer; outline: none; transition: border-color .12s, background .12s;
+}
+.problem-card.clickable .problem-card-main { flex: 1; min-width: 0; }
+.problem-card.clickable:hover,
+.problem-card.clickable:focus-visible { border-color: var(--blue); background: var(--surface2); }
+.problem-card-chevron {
+  flex-shrink: 0; color: var(--muted); font-size: 16px;
+  transition: transform .12s, color .12s;
+}
+.problem-card.clickable:hover .problem-card-chevron,
+.problem-card.clickable:focus-visible .problem-card-chevron { color: var(--blue); transform: translateX(2px); }
 .problem-card-head {
   display: flex; align-items: center; gap: 8px;
   margin-bottom: 6px; flex-wrap: wrap;
 }
 .problem-card-detail { font-size: 12px; color: var(--muted); word-break: break-word; }
-.problem-card-actions { margin-top: 8px; }
 .pods-label { color: var(--muted); }
 
 /* ── Route inspector ─────────────────────────────────────────────────────── */

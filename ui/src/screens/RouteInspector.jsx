@@ -27,7 +27,35 @@ import { useEffect, useState } from 'preact/hooks';
  * Deep-linkable via `#/routes/httproute/{ns}/{name}` or
  * `#/routes/ingress/{ns}/{name}`.
  */
-export function RouteInspector({ kind, namespace, name }) {
+/**
+ * Path-aware breadcrumb for the route inspector. `from` (the `?from=` origin
+ * param) records which detail page sent us here, so the trail reflects the real
+ * path — `Fleet / proxy-… / route` or `Routing / gateway / route` — instead of
+ * the old hardcoded "Fleet / HTTPRoute". Falls back to Routing (the route's
+ * canonical home) on a cold or shared load with no origin.
+ */
+function buildBreadcrumb(from, current) {
+  const cur = { label: current };
+  if (from?.startsWith('proxy/')) {
+    const pod = from.slice('proxy/'.length);
+    return [
+      { label: 'Fleet', onClick: () => nav.fleet() },
+      { label: pod, onClick: () => nav.proxy(pod) },
+      cur,
+    ];
+  }
+  if (from?.startsWith('gateway/')) {
+    const [, ns, name] = from.split('/');
+    return [
+      { label: 'Routing', onClick: () => nav.routing({ filter: 'gateways' }) },
+      { label: name, onClick: () => nav.gateway(ns, name) },
+      cur,
+    ];
+  }
+  return [{ label: 'Routing', onClick: () => nav.routing() }, cur];
+}
+
+export function RouteInspector({ kind, namespace, name, query }) {
   const isHttp = kind === 'httproute';
   const fetcher = isHttp
     ? () => getHttproute(namespace, name)
@@ -41,11 +69,7 @@ export function RouteInspector({ kind, namespace, name }) {
     return sse.subscribe('rebuild.completed', () => refetch());
   }, [sse.subscribe, refetch]);
 
-  const breadcrumb = [
-    { label: 'Fleet', onClick: () => nav.fleet() },
-    { label: isHttp ? 'HTTPRoute' : 'Ingress', onClick: () => nav.fleet() },
-    { label: `${namespace}/${name}` },
-  ];
+  const breadcrumb = buildBreadcrumb(query?.from, `${namespace}/${name}`);
 
   if (loading) return <Spinner label={`Loading ${kind}…`} />;
   if (error)   return <ErrorState error={error} />;
@@ -174,6 +198,7 @@ function ProxyRoutePanel({ proxy, routeKind, namespace, name }) {
                 <th>Host</th>
                 <th>Port</th>
                 <th>Path</th>
+                <th>Type</th>
                 <th>Backend</th>
                 <th>Endpoints</th>
               </tr>
@@ -206,6 +231,7 @@ function RouteRow({ row }) {
       <td><code>{row.host}</code></td>
       <td>{row.port}</td>
       <td><code>{row.path || '/'}</code></td>
+      <td><Badge variant="neutral">{row.type}</Badge></td>
       <td><code>{row.backend_group}</code></td>
       <td><EndpointHealth endpoints={row.endpoints ?? []} /></td>
     </tr>

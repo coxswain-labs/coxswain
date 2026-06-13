@@ -58,6 +58,8 @@ impl Component {
 pub struct FleetEntry {
     /// Value of `metadata.name`.
     pub pod_name: String,
+    /// Value of `metadata.namespace`.
+    pub pod_namespace: String,
     /// Parsed `status.podIP`.
     pub pod_ip: IpAddr,
     /// Admin server port, from the [`ADMIN_PORT_ANNOTATION`] annotation.
@@ -113,6 +115,7 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
 
     for pod in pods {
         let pod_name = pod.metadata.name.clone().unwrap_or_default();
+        let pod_namespace = pod.metadata.namespace.clone().unwrap_or_default();
 
         // Skip pods that haven't been assigned an IP yet.
         let pod_ip_str = match pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()) {
@@ -189,6 +192,7 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
 
         let entry = FleetEntry {
             pod_name,
+            pod_namespace,
             pod_ip,
             admin_port,
             component,

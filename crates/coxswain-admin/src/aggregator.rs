@@ -114,6 +114,7 @@ impl OperatorAggregator {
         let component = component_str(entry.component);
         let mut obj = serde_json::json!({
             "pod_name": entry.pod_name,
+            "pod_namespace": entry.pod_namespace,
             "pod_ip": entry.pod_ip.to_string(),
             "admin_port": entry.admin_port,
             "component": component,
@@ -123,6 +124,59 @@ impl OperatorAggregator {
         }
         obj
     }
+}
+
+/// Attach a coarse health rollup to a fleet-entry JSON from that pod's
+/// `/api/v1/health` body.
+///
+/// List endpoints already fetch each pod's `/api/v1/health` for liveness; rolling
+/// it down here lets the browser render per-pod health (Fleet chips, Dashboard
+/// "degraded pods") without a second fan-out. Sets `health` (`"ready"` or
+/// `"degraded"`) and `degraded_checks` (the `"subsystem/check"` names that aren't
+/// ready) on the entry.
+fn attach_health_rollup(entry: &mut serde_json::Value, health_body: &serde_json::Value) {
+    let degraded = non_ready_checks(health_body);
+    let state = if degraded.is_empty() {
+        "ready"
+    } else {
+        "degraded"
+    };
+    entry["health"] = serde_json::Value::String(state.to_owned());
+    entry["degraded_checks"] = serde_json::Value::from(degraded);
+}
+
+/// Collect the `"subsystem/check"` identifiers whose state is not `ready` from a
+/// `/api/v1/health` body.
+///
+/// Anything other than the literal `"ready"` state (`degraded`, `pending`,
+/// `failed`) counts as non-ready — the UI surfaces it amber and defers the
+/// reason to the pod's own health view or logs. A subsystem with no checks
+/// contributes its own name when its aggregate state isn't ready.
+fn non_ready_checks(health_body: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(subsystems) = health_body.get("subsystems").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (sub_name, sub) in subsystems {
+        let mut had_check = false;
+        if let Some(checks) = sub.get("checks").and_then(|v| v.as_object()) {
+            for (check_name, check) in checks {
+                had_check = true;
+                if check.get("state").and_then(serde_json::Value::as_str) != Some("ready") {
+                    out.push(format!("{sub_name}/{check_name}"));
+                }
+            }
+        }
+        let agg_ready = sub
+            .get("state")
+            .and_then(|s| s.get("state"))
+            .and_then(serde_json::Value::as_str)
+            == Some("ready");
+        if !had_check && !agg_ready {
+            out.push(sub_name.clone());
+        }
+    }
+    out
 }
 
 // ── /api/v1/proxies ───────────────────────────────────────────────────────────
@@ -137,25 +191,28 @@ impl OperatorAggregator {
             .chain(&snapshot.dedicated_proxies)
             .cloned()
             .collect();
-        let http = &self.http;
         let probes: Vec<_> = entries
             .iter()
-            .map(|e| {
+            .map(|e| async move {
+                // The liveness probe already returns the pod's full health body;
+                // parse it (rather than discard it) so the entry carries a health
+                // rollup without a second per-pod round-trip.
                 let url = format!("{}/api/v1/health", pod_base_url(e));
-                async move {
-                    match http
-                        .get(&url)
-                        .send()
-                        .await
-                        .ok()
-                        .filter(|r| r.status().is_success())
-                    {
-                        Some(_) => {
-                            let mut v = Self::entry_json(e);
-                            v["reachable"] = serde_json::Value::Bool(true);
-                            v
-                        }
-                        None => serde_json::json!({ "pod_name": e.pod_name, "reachable": false }),
+                match self.fetch_json(&url).await {
+                    Some(body) => {
+                        let mut v = Self::entry_json(e);
+                        v["reachable"] = serde_json::Value::Bool(true);
+                        attach_health_rollup(&mut v, &body);
+                        v
+                    }
+                    // Carry the full entry (component, namespace, …) even when
+                    // unreachable so the UI can still bucket the pod by component
+                    // and label it; "unreachable" is a probe outcome, not a loss
+                    // of fleet-snapshot identity.
+                    None => {
+                        let mut v = Self::entry_json(e);
+                        v["reachable"] = serde_json::Value::Bool(false);
+                        v
                     }
                 }
             })
@@ -230,29 +287,41 @@ impl OperatorAggregator {
 // ── /api/v1/controllers ───────────────────────────────────────────────────────
 
 impl OperatorAggregator {
-    /// `GET /api/v1/controllers` — all controller pods with liveness probe.
+    /// `GET /api/v1/controllers` — all controller pods with liveness + leadership.
+    ///
+    /// Probes each controller's `/api/v1/cluster` rather than `/api/v1/health`:
+    /// it doubles as a liveness check (200 ⇒ reachable) and carries that pod's
+    /// live `controller.leader` flag, so the response can report `is_leader` per
+    /// pod. Without it the UI cannot tell who holds the lease and wrongly reads
+    /// a healthy single-leader cluster as having no elected leader.
     pub(crate) async fn list_controllers(&self) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
         let entries: Vec<FleetEntry> = snapshot.controllers.to_vec();
-        let http = &self.http;
         let probes: Vec<_> = entries
             .iter()
-            .map(|e| {
-                let url = format!("{}/api/v1/health", pod_base_url(e));
-                async move {
-                    match http
-                        .get(&url)
-                        .send()
-                        .await
-                        .ok()
-                        .filter(|r| r.status().is_success())
-                    {
-                        Some(_) => {
-                            let mut v = Self::entry_json(e);
-                            v["reachable"] = serde_json::Value::Bool(true);
-                            v
+            .map(|e| async move {
+                let cluster_url = format!("{}/api/v1/cluster", pod_base_url(e));
+                match self.fetch_json(&cluster_url).await {
+                    Some(cluster) => {
+                        let is_leader = cluster["controller"]["leader"].as_bool().unwrap_or(false);
+                        let mut v = Self::entry_json(e);
+                        v["reachable"] = serde_json::Value::Bool(true);
+                        v["is_leader"] = serde_json::Value::Bool(is_leader);
+                        // Second hop for subsystem health: the cluster summary
+                        // carries leadership but not subsystem state. Controllers
+                        // are few, so the extra fetch is cheap.
+                        let health_url = format!("{}/api/v1/health", pod_base_url(e));
+                        if let Some(body) = self.fetch_json(&health_url).await {
+                            attach_health_rollup(&mut v, &body);
                         }
-                        None => serde_json::json!({ "pod_name": e.pod_name, "reachable": false }),
+                        v
+                    }
+                    // Keep the full entry (namespace, …) on the unreachable
+                    // path too, so the card still renders its identity.
+                    None => {
+                        let mut v = Self::entry_json(e);
+                        v["reachable"] = serde_json::Value::Bool(false);
+                        v
                     }
                 }
             })
@@ -262,16 +331,23 @@ impl OperatorAggregator {
     }
 
     /// `GET /api/v1/controllers/{pod-name}` — single controller pod info.
+    ///
+    /// Probes `/api/v1/cluster` (not `/health`): it doubles as a liveness check
+    /// and carries this pod's live `controller.leader` flag, so the controller
+    /// detail page can show leader/standby without a second call — mirroring
+    /// [`Self::list_controllers`].
     pub(crate) async fn get_controller(&self, pod_name: &str) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
         let Some(entry) = snapshot.controllers.iter().find(|e| e.pod_name == pod_name) else {
             return not_found();
         };
-        let url = format!("{}/api/v1/health", pod_base_url(entry));
+        let url = format!("{}/api/v1/cluster", pod_base_url(entry));
         match self.fetch_json(&url).await {
-            Some(_) => {
+            Some(cluster) => {
+                let is_leader = cluster["controller"]["leader"].as_bool().unwrap_or(false);
                 let mut v = Self::entry_json(entry);
                 v["reachable"] = serde_json::Value::Bool(true);
+                v["is_leader"] = serde_json::Value::Bool(is_leader);
                 json_response(v.to_string())
             }
             None => json_response(
@@ -815,15 +891,17 @@ impl OperatorAggregator {
     /// Returns a single snapshot:
     /// ```json
     /// {
-    ///   "conflicts": [{ "host", "path", "rejected_group", "pods": ["…"] }],
-    ///   "dead_routes": [{ "host", "path", "backend_group", "pods": ["…"] }]
+    ///   "conflicts": [{ "host", "path", "rejected_group", "kind", "pods": ["…"] }],
+    ///   "dead_routes": [{ "host", "path", "backend_group", "kind", "pods": ["…"] }]
     /// }
     /// ```
     ///
     /// Conflicts are route-table collisions where a second claim for the same
     /// `(host, path)` was rejected. `dead_routes` are entries present in the
     /// routing table but with zero endpoints — the route is accepted but
-    /// backends are unavailable (Service has no ready Pods).
+    /// backends are unavailable (Service has no ready Pods). `kind`
+    /// (`"ingress"`/`"gateway"`) tags which routing surface owns the problem so
+    /// the UI can attribute it to the right resource.
     ///
     /// Shared proxies carry an identical table: the same conflict appears once
     /// per proxy. Results are de-duplicated by `(host, path, rejected_group)`
@@ -832,12 +910,18 @@ impl OperatorAggregator {
     pub(crate) async fn list_problems(&self) -> Response<Vec<u8>> {
         let raw = self.fan_out_routes().await;
 
-        // (host, path, rejected_group) → pods; BTreeMap for stable output ordering.
-        let mut conflicts: std::collections::BTreeMap<(String, String, String), Vec<String>> =
-            std::collections::BTreeMap::new();
-        // (host, path, backend_group) → pods
-        let mut dead_routes: std::collections::BTreeMap<(String, String, String), Vec<String>> =
-            std::collections::BTreeMap::new();
+        // (host, path, rejected_group, kind) → pods; BTreeMap for stable output
+        // ordering. `kind` ("ingress"/"gateway") is part of the key so the
+        // Dashboard can attribute a problem to the right resource tile.
+        let mut conflicts: std::collections::BTreeMap<
+            (String, String, String, String),
+            Vec<String>,
+        > = std::collections::BTreeMap::new();
+        // (host, path, backend_group, kind) → pods
+        let mut dead_routes: std::collections::BTreeMap<
+            (String, String, String, String),
+            Vec<String>,
+        > = std::collections::BTreeMap::new();
 
         for proxy in &raw {
             let pod_name = proxy["pod_name"].as_str().unwrap_or("").to_owned();
@@ -853,6 +937,7 @@ impl OperatorAggregator {
                             c["host"].as_str().unwrap_or("").to_owned(),
                             c["path"].as_str().unwrap_or("").to_owned(),
                             c["rejected_group"].as_str().unwrap_or("").to_owned(),
+                            spec.to_owned(),
                         );
                         conflicts.entry(key).or_default().push(pod_name.clone());
                     }
@@ -870,6 +955,7 @@ impl OperatorAggregator {
                                         host.clone(),
                                         route["path"].as_str().unwrap_or("").to_owned(),
                                         route["backend_group"].as_str().unwrap_or("").to_owned(),
+                                        spec.to_owned(),
                                     );
                                     dead_routes.entry(key).or_default().push(pod_name.clone());
                                 }
@@ -882,11 +968,12 @@ impl OperatorAggregator {
 
         let conflicts_json: Vec<serde_json::Value> = conflicts
             .into_iter()
-            .map(|((host, path, rejected_group), pods)| {
+            .map(|((host, path, rejected_group, kind), pods)| {
                 serde_json::json!({
                     "host": host,
                     "path": path,
                     "rejected_group": rejected_group,
+                    "kind": kind,
                     "pods": pods,
                 })
             })
@@ -894,11 +981,12 @@ impl OperatorAggregator {
 
         let dead_json: Vec<serde_json::Value> = dead_routes
             .into_iter()
-            .map(|((host, path, backend_group), pods)| {
+            .map(|((host, path, backend_group, kind), pods)| {
                 serde_json::json!({
                     "host": host,
                     "path": path,
                     "backend_group": backend_group,
+                    "kind": kind,
                     "pods": pods,
                 })
             })
@@ -1225,10 +1313,14 @@ mod tests {
         // Exercise the de-dup logic inline (list_problems cannot be tested
         // end-to-end without a live fan-out; test the de-dup and aggregation
         // logic directly on the raw result set).
-        let mut conflicts: std::collections::BTreeMap<(String, String, String), Vec<String>> =
-            std::collections::BTreeMap::new();
-        let mut dead_routes: std::collections::BTreeMap<(String, String, String), Vec<String>> =
-            std::collections::BTreeMap::new();
+        let mut conflicts: std::collections::BTreeMap<
+            (String, String, String, String),
+            Vec<String>,
+        > = std::collections::BTreeMap::new();
+        let mut dead_routes: std::collections::BTreeMap<
+            (String, String, String, String),
+            Vec<String>,
+        > = std::collections::BTreeMap::new();
 
         for proxy in &raw {
             let pod_name = proxy["pod_name"].as_str().unwrap_or("").to_owned();
@@ -1243,6 +1335,7 @@ mod tests {
                             c["host"].as_str().unwrap_or("").to_owned(),
                             c["path"].as_str().unwrap_or("").to_owned(),
                             c["rejected_group"].as_str().unwrap_or("").to_owned(),
+                            spec.to_owned(),
                         );
                         conflicts.entry(key).or_default().push(pod_name.clone());
                     }
@@ -1259,6 +1352,7 @@ mod tests {
                                         host.clone(),
                                         route["path"].as_str().unwrap_or("").to_owned(),
                                         route["backend_group"].as_str().unwrap_or("").to_owned(),
+                                        spec.to_owned(),
                                     );
                                     dead_routes.entry(key).or_default().push(pod_name.clone());
                                 }
@@ -1269,12 +1363,16 @@ mod tests {
             }
         }
 
-        // One unique conflict (de-duped from two pods).
+        // One unique conflict (de-duped from two pods), tagged with its kind.
         assert_eq!(conflicts.len(), 1);
-        let ((host, path, rejected), pods) = conflicts.into_iter().next().unwrap();
+        let ((host, path, rejected, kind), pods) = conflicts.into_iter().next().unwrap();
         assert_eq!(host, "api.example.com");
         assert_eq!(path, "/v1");
         assert_eq!(rejected, "default/shadowed-svc:80");
+        assert_eq!(
+            kind, "ingress",
+            "fake_routes_result populates the ingress block"
+        );
         assert_eq!(
             pods.len(),
             2,
@@ -1283,10 +1381,11 @@ mod tests {
 
         // One unique dead route (de-duped from two pods).
         assert_eq!(dead_routes.len(), 1);
-        let ((host, path, bg), pods) = dead_routes.into_iter().next().unwrap();
+        let ((host, path, bg, kind), pods) = dead_routes.into_iter().next().unwrap();
         assert_eq!(host, "api.example.com");
         assert_eq!(path, "/broken");
         assert_eq!(bg, "default/no-pods:8080");
+        assert_eq!(kind, "ingress");
         assert_eq!(
             pods.len(),
             2,
@@ -1411,6 +1510,56 @@ mod tests {
     ///
     /// Each accepted connection is handled in its own task so concurrent
     /// fan-out probes from `list_proxies` work correctly.
+    #[test]
+    fn health_rollup_ready_when_all_checks_ready() {
+        let body = serde_json::json!({
+            "version": "0.1.0",
+            "subsystems": {
+                "controller": { "state": { "state": "ready" },
+                    "checks": { "ingress": { "state": "ready" }, "service": { "state": "ready" } } },
+                "proxy": { "state": { "state": "ready" },
+                    "checks": { "routing_table_loaded": { "state": "ready" } } }
+            }
+        });
+        assert!(non_ready_checks(&body).is_empty());
+        let mut entry = serde_json::json!({});
+        attach_health_rollup(&mut entry, &body);
+        assert_eq!(entry["health"], "ready");
+        assert_eq!(entry["degraded_checks"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn health_rollup_names_non_ready_checks_as_subsystem_slash_check() {
+        let body = serde_json::json!({
+            "subsystems": {
+                "controller": { "state": { "state": "failed" },
+                    "checks": {
+                        "ingress": { "state": "ready" },
+                        "reflector": { "state": "failed", "reason": "watch desync" }
+                    } }
+            }
+        });
+        let degraded = non_ready_checks(&body);
+        assert_eq!(degraded, vec!["controller/reflector".to_owned()]);
+        let mut entry = serde_json::json!({});
+        attach_health_rollup(&mut entry, &body);
+        assert_eq!(entry["health"], "degraded");
+        assert_eq!(
+            entry["degraded_checks"],
+            serde_json::json!(["controller/reflector"])
+        );
+    }
+
+    #[test]
+    fn health_rollup_falls_back_to_subsystem_name_when_no_checks() {
+        let body = serde_json::json!({
+            "subsystems": {
+                "proxy": { "state": { "state": "pending" }, "checks": {} }
+            }
+        });
+        assert_eq!(non_ready_checks(&body), vec!["proxy".to_owned()]);
+    }
+
     async fn start_mock_http(body: &'static str) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1762,10 +1911,35 @@ mod tests {
             .find(|c| c["pod_name"] == "ctrl-live")
             .unwrap();
         assert_eq!(live["reachable"], true);
+        // /cluster body had no controller.leader → defaults to false.
+        assert_eq!(live["is_leader"], false);
         let dead = controllers
             .iter()
             .find(|c| c["pod_name"] == "ctrl-dead")
             .unwrap();
         assert_eq!(dead["reachable"], false);
+    }
+
+    #[tokio::test]
+    async fn list_controllers_reports_is_leader_from_cluster_endpoint() {
+        // The /cluster probe carries controller.leader; the reachable entry must
+        // surface it as is_leader so the UI doesn't misread a healthy
+        // single-leader cluster as having no elected leader.
+        let port =
+            start_mock_http(r#"{"controller":{"leader":true},"gateways":[],"ingresses":[]}"#).await;
+        let pods = [make_pod(
+            "ctrl-leader",
+            "controller",
+            "127.0.0.1",
+            &port.to_string(),
+            None,
+        )];
+        let agg = make_agg(fleet_with(pods), SharedClusterSummary::default());
+
+        let resp = agg.list_controllers().await;
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        let leader = body["controllers"][0].clone();
+        assert_eq!(leader["reachable"], true);
+        assert_eq!(leader["is_leader"], true);
     }
 }

@@ -4,10 +4,11 @@ import { getProxy, getProxyRoutes, getProxyHealth } from '../api/endpoints.js';
 import { nav } from '../router.js';
 import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { Badge, poolBadge } from '../components/Badge.jsx';
+import { CopyButton } from '../components/CopyButton.jsx';
+import { Icon } from '../components/Icon.jsx';
 import { EndpointHealth } from '../components/EndpointHealth.jsx';
-import { HealthRow } from '../components/HealthRow.jsx';
+import { HealthChips } from '../components/HealthChips.jsx';
 import { Tabs } from '../components/Tabs.jsx';
-import { Panel } from '../components/Panel.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 import { useEffect } from 'preact/hooks';
 
@@ -18,7 +19,7 @@ import { useEffect } from 'preact/hooks';
  * (Ingress | Gateway API). Routing conflicts are called out inline.
  * Clicking a route row navigates to the Route Inspector.
  */
-export function ProxyDetail({ pod }) {
+export function ProxyDetail({ pod, query }) {
   const meta    = useApi(() => getProxy(pod), [pod]);
   const routes  = useApi(() => getProxyRoutes(pod), [pod]);
   const health  = useApi(() => getProxyHealth(pod), [pod]);
@@ -47,12 +48,17 @@ export function ProxyDetail({ pod }) {
       <Breadcrumb items={breadcrumb} />
 
       <div class="screen-header">
-        <div>
-          <h1 class="screen-title">{pod}</h1>
-          <div class="screen-meta">
-            {p.pod_ip && <span>{p.pod_ip}</span>}
-            {p.gateway_ref && <span> · {p.gateway_ref}</span>}
+        <div class="detail-head">
+          <div class="card-ns">{p.pod_namespace || '—'}</div>
+          <div class="detail-title-row">
+            <h1 class="screen-title">{pod}</h1>
+            <CopyButton text={pod} label="Copy pod name" />
           </div>
+          {[p.pod_ip, p.gateway_ref].filter(Boolean).length > 0 && (
+            <div class="screen-meta">
+              {[p.pod_ip, p.gateway_ref].filter(Boolean).join(' · ')}
+            </div>
+          )}
         </div>
         <div class="header-badges">
           {poolBadge(pool)}
@@ -63,15 +69,11 @@ export function ProxyDetail({ pod }) {
         </div>
       </div>
 
-      {/* Subsystem health */}
+      {/* Subsystem health — compact chips; failing checks shown inline. */}
       {health.data?.health?.subsystems && (
         <section aria-label="Subsystem health">
           <h2 class="section-title">Health</h2>
-          <Panel>
-            {Object.entries(health.data.health.subsystems).map(([name, snap]) => (
-              <HealthRow key={name} name={name} snapshot={snap} />
-            ))}
-          </Panel>
+          <HealthChips subsystems={health.data.health.subsystems} />
         </section>
       )}
 
@@ -84,38 +86,37 @@ export function ProxyDetail({ pod }) {
         {routes.error ? (
           <ErrorState error={routes.error} />
         ) : !routes.data ? null : (
-          <RouteTabs routesData={routes.data} />
+          <RouteTabs routesData={routes.data} highlight={query} pod={pod} />
         )}
       </section>
     </div>
   );
 }
 
-function RouteTabs({ routesData }) {
-  const ingressSpec  = routesData?.routes?.ingress;
-  const gatewaySpec  = routesData?.routes?.gateway;
+function RouteTabs({ routesData, highlight, pod }) {
+  const specs = [
+    { id: 'ingress', kind: 'ingress',   label: 'Ingress',     spec: routesData?.routes?.ingress },
+    { id: 'gateway', kind: 'httproute', label: 'Gateway API', spec: routesData?.routes?.gateway },
+  ].filter((s) => s.spec);
 
-  const tabs = [];
-
-  if (ingressSpec) {
-    tabs.push({
-      id: 'ingress',
-      label: `Ingress (${countRoutes(ingressSpec)})`,
-      content: <RouteSection spec={ingressSpec} kind="ingress" />,
-    });
-  }
-  if (gatewaySpec) {
-    tabs.push({
-      id: 'gateway',
-      label: `Gateway API (${countRoutes(gatewaySpec)})`,
-      content: <RouteSection spec={gatewaySpec} kind="httproute" />,
-    });
-  }
+  const tabs = specs.map((s) => {
+    const issues = specHasIssues(s.spec);
+    return {
+      id: s.id,
+      label: (
+        <span class={`tab-label ${issues ? 'warn' : 'ok'}`}>
+          <Icon name={issues ? 'alert' : 'check'} size={13} />
+          {s.label} ({countRoutes(s.spec)})
+        </span>
+      ),
+      content: <RouteSection spec={s.spec} kind={s.kind} highlight={highlight} pod={pod} />,
+    };
+  });
 
   if (tabs.length === 0) return <EmptyState message="No routes synced yet." />;
   if (tabs.length === 1) return tabs[0].content;
 
-  return <Tabs tabs={tabs} />;
+  return <Tabs tabs={tabs} defaultTab={pickDefaultTab(specs, highlight)} />;
 }
 
 function countRoutes(spec) {
@@ -123,9 +124,39 @@ function countRoutes(spec) {
   return spec.hosts.reduce((sum, h) => sum + (h.routes?.length ?? 0), 0);
 }
 
-function RouteSection({ spec, kind }) {
+/** A spec needs attention if it has a conflict or any route with 0 endpoints
+ *  (accepted-but-dead backend). Drives the tab alert icon. */
+function specHasIssues(spec) {
+  if (!spec) return false;
+  if ((spec.conflicts?.length ?? 0) > 0) return true;
+  return (spec.hosts ?? []).some((h) =>
+    (h.routes ?? []).some((r) => (r.endpoints?.length ?? 0) === 0),
+  );
+}
+
+function specContainsRoute(spec, host, path) {
+  const want = path || '/';
+  return (spec?.hosts ?? []).some(
+    (h) => h.host === host && (h.routes ?? []).some((r) => (r.path || '/') === want),
+  );
+}
+
+/** Open on the tab the caller deep-linked into (the host/path that's broken),
+ *  else the first tab carrying any issue, else the first tab. */
+function pickDefaultTab(specs, highlight) {
+  if (highlight?.host) {
+    const hit = specs.find((s) => specContainsRoute(s.spec, highlight.host, highlight.path));
+    if (hit) return hit.id;
+  }
+  const flagged = specs.find((s) => specHasIssues(s.spec));
+  return (flagged ?? specs[0])?.id;
+}
+
+function RouteSection({ spec, kind, highlight, pod }) {
   const hosts     = spec?.hosts ?? [];
   const conflicts = spec?.conflicts ?? [];
+  const wantPath  = highlight?.path || '/';
+  const from      = { from: `proxy/${pod}` };
 
   return (
     <div>
@@ -153,29 +184,37 @@ function RouteSection({ spec, kind }) {
               <thead>
                 <tr>
                   <th>Path</th>
+                  <th>Type</th>
                   <th>Backend</th>
                   <th>Endpoints</th>
-                  <th>Type</th>
                 </tr>
               </thead>
               <tbody>
-                {(h.routes ?? []).map((r, i) => (
-                  <tr
-                    key={i}
-                    class="clickable"
-                    onClick={() =>
-                      kind === 'httproute'
-                        ? nav.httproute(r.namespace ?? '', r.name ?? '')
-                        : nav.ingressRoute(r.namespace ?? '', r.name ?? '')
-                    }
-                    title={`Open ${r.backend_group}`}
-                  >
-                    <td><code>{r.path || '/'}</code></td>
-                    <td><code>{r.backend_group}</code></td>
-                    <td><EndpointHealth endpoints={r.endpoints ?? []} /></td>
-                    <td><Badge variant="neutral">{r.type}</Badge></td>
-                  </tr>
-                ))}
+                {(h.routes ?? []).map((r, i) => {
+                  const hit = highlight?.host === h.host && (r.path || '/') === wantPath;
+                  // The compiled routing table doesn't carry the source route's
+                  // namespace/name, so we can only deep-link to the Route
+                  // Inspector when identity is present. Otherwise the row is
+                  // informational — never a link that resolves to nowhere.
+                  const linkable = Boolean(r.namespace && r.name);
+                  const open = () =>
+                    kind === 'httproute'
+                      ? nav.httproute(r.namespace, r.name, from)
+                      : nav.ingressRoute(r.namespace, r.name, from);
+                  return (
+                    <tr
+                      key={i}
+                      class={`${linkable ? 'clickable' : ''}${hit ? ' row-hit' : ''}`}
+                      onClick={linkable ? open : undefined}
+                      title={linkable ? `Open ${r.backend_group}` : r.backend_group}
+                    >
+                      <td><code>{r.path || '/'}</code></td>
+                      <td><Badge variant="neutral">{r.type}</Badge></td>
+                      <td><code>{r.backend_group}</code></td>
+                      <td><EndpointHealth endpoints={r.endpoints ?? []} /></td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

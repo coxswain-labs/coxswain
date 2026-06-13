@@ -1,12 +1,13 @@
 import { useHashRoute } from './router.js';
 import { Nav } from './components/Nav.jsx';
+import { Dashboard } from './screens/Dashboard.jsx';
 import { Fleet } from './screens/Fleet.jsx';
+import { Routing } from './screens/Routing.jsx';
 import { RouteInspector } from './screens/RouteInspector.jsx';
 import { ProxyDetail } from './screens/ProxyDetail.jsx';
+import { ControllerDetail } from './screens/ControllerDetail.jsx';
 import { GatewayDetail } from './screens/GatewayDetail.jsx';
-import { Health } from './screens/Health.jsx';
 import { Events } from './screens/Events.jsx';
-import { Problems } from './screens/Problems.jsx';
 
 /**
  * Root application component.
@@ -18,25 +19,34 @@ import { Problems } from './screens/Problems.jsx';
  * All screens are loaded eagerly (single-file output, no code splitting needed).
  */
 export function App() {
-  const { screen, params } = useHashRoute();
+  const { screen, params, query } = useHashRoute();
 
   return (
     <div class="app">
       <Nav activeScreen={screen} />
       <main class="content" id="main-content">
-        <ActiveScreen screen={screen} params={params} />
+        <ActiveScreen screen={screen} params={params} query={query} />
       </main>
     </div>
   );
 }
 
-function ActiveScreen({ screen, params }) {
+function ActiveScreen({ screen, params, query }) {
   switch (screen) {
+    case 'dashboard':
+      return <Dashboard />;
+
     case 'fleet':
-      return <Fleet />;
+      return <Fleet query={query} />;
+
+    case 'routing':
+      return <Routing query={query} />;
 
     case 'proxy-detail':
-      return <ProxyDetail pod={params.pod} />;
+      return <ProxyDetail pod={params.pod} query={query} />;
+
+    case 'controller-detail':
+      return <ControllerDetail pod={params.pod} />;
 
     case 'route-inspector':
       return (
@@ -44,22 +54,17 @@ function ActiveScreen({ screen, params }) {
           kind={params.kind}
           namespace={params.ns}
           name={params.name}
+          query={query}
         />
       );
 
     case 'gateway-detail':
       return <GatewayDetail namespace={params.ns} name={params.name} />;
 
-    case 'health':
-      return <Health />;
-
     case 'events':
       return <Events />;
 
-    case 'problems':
-      return <Problems />;
-
     default:
-      return <Fleet />;
+      return <Dashboard />;
   }
 }

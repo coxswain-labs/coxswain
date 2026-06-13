@@ -32,10 +32,11 @@ export function GatewayDetail({ namespace, name }) {
   const [showManifest, setShowManifest] = useState(false);
 
   const breadcrumb = [
-    { label: 'Fleet', onClick: () => nav.fleet() },
-    { label: 'Gateways' },
+    { label: 'Routing', onClick: () => nav.routing({ filter: 'gateways' }) },
     { label: `${namespace}/${name}` },
   ];
+  // Origin tag so the Route Inspector's breadcrumb can trace back here.
+  const from = { from: `gateway/${namespace}/${name}` };
 
   if (loading) return <Spinner label="Loading gateway…" />;
   if (error)   return <ErrorState error={error} />;
@@ -134,8 +135,8 @@ export function GatewayDetail({ namespace, name }) {
                 class="attached-route-row clickable"
                 onClick={() =>
                   r.kind === 'HTTPRoute'
-                    ? nav.httproute(r.namespace, r.name)
-                    : nav.ingressRoute(r.namespace, r.name)
+                    ? nav.httproute(r.namespace, r.name, from)
+                    : nav.ingressRoute(r.namespace, r.name, from)
                 }
               >
                 <Badge variant="neutral">{r.kind}</Badge>

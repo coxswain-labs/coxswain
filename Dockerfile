@@ -45,11 +45,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=planner /app/recipe.json recipe.json
 # Cook only the deps reachable from the coxswain bin — skips the coxswain-e2e
 # dependency tree. Heaviest cached layer; invalidates on Cargo.lock changes only.
-RUN cargo chef cook --release --recipe-path recipe.json --bin coxswain
+ARG CARGO_BUILD_JOBS
+RUN cargo chef cook --release --recipe-path recipe.json --bin coxswain \
+    $([ -n "$CARGO_BUILD_JOBS" ] && echo "--jobs $CARGO_BUILD_JOBS")
 COPY . .
 # Inject the pre-built UI so the include_str! in coxswain-admin resolves.
 COPY --from=ui-builder /app/ui/dist ./ui/dist
-RUN cargo build --release --bin coxswain
+RUN cargo build --release --bin coxswain \
+    $([ -n "$CARGO_BUILD_JOBS" ] && echo "--jobs $CARGO_BUILD_JOBS")
 
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 COPY --from=builder /app/target/release/coxswain /usr/local/bin/coxswain

@@ -201,6 +201,7 @@ impl HostRouterBuilder {
                     path: path.clone(),
                     kind: RouteKind::Exact,
                     backend_group: Arc::clone(&e.backend_group),
+                    route_id: e.route_id.clone(),
                 });
             }
             let frozen = sort_and_freeze(entries);
@@ -232,6 +233,7 @@ impl HostRouterBuilder {
                     path: path.clone(),
                     kind: RouteKind::Prefix,
                     backend_group: Arc::clone(&e.backend_group),
+                    route_id: e.route_id.clone(),
                 });
             }
             let frozen = sort_and_freeze(entries);
@@ -281,6 +283,7 @@ impl HostRouterBuilder {
                     path: pattern.clone(),
                     kind: RouteKind::Regex,
                     backend_group: Arc::clone(&e.backend_group),
+                    route_id: e.route_id.clone(),
                 });
             }
             // RegexSet::new already validates the pattern; the second compile is redundant.

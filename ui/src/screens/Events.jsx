@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { useSSE } from '../hooks/useSSE.js';
+import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { formatEventDetail } from '../components/EventRow.jsx';
 
 /**
@@ -76,6 +77,7 @@ export function Events() {
 
   return (
     <div class="screen">
+      <Breadcrumb items={[{ label: 'Events' }]} />
       <div class="screen-header">
         <h1 class="screen-title">Events</h1>
         <span class={`sse-dot ${sse.connected ? 'live' : 'offline'}`} title={sse.connected ? 'Live' : 'Disconnected'} />
