@@ -458,7 +458,7 @@ impl OperatorAggregator {
             let attaches = refs.iter().any(|p| {
                 // Absent `kind` defaults to "Gateway"; absent `group` defaults to
                 // "gateway.networking.k8s.io" — both are implicitly our target.
-                let kind_ok = p.kind.as_deref().map_or(true, |k| k == "Gateway");
+                let kind_ok = p.kind.as_deref().is_none_or(|k| k == "Gateway");
                 let effective_ns = p.namespace.as_deref().unwrap_or(route_ns);
                 kind_ok && p.name == gw_name && effective_ns == gw_namespace
             });
@@ -863,9 +863,8 @@ impl OperatorAggregator {
                         let host = host_entry["host"].as_str().unwrap_or("").to_owned();
                         if let Some(route_arr) = host_entry["routes"].as_array() {
                             for route in route_arr {
-                                let is_dead = route["endpoints"]
-                                    .as_array()
-                                    .map_or(false, |e| e.is_empty());
+                                let is_dead =
+                                    route["endpoints"].as_array().is_some_and(|e| e.is_empty());
                                 if is_dead {
                                     let key = (
                                         host.clone(),
@@ -1253,9 +1252,8 @@ mod tests {
                         let host = host_entry["host"].as_str().unwrap_or("").to_owned();
                         if let Some(route_arr) = host_entry["routes"].as_array() {
                             for route in route_arr {
-                                let is_dead = route["endpoints"]
-                                    .as_array()
-                                    .map_or(false, |e| e.is_empty());
+                                let is_dead =
+                                    route["endpoints"].as_array().is_some_and(|e| e.is_empty());
                                 if is_dead {
                                     let key = (
                                         host.clone(),
