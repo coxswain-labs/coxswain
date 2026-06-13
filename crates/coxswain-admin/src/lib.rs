@@ -1,6 +1,6 @@
 //! Admin HTTP endpoints for Coxswain: `/metrics`, `/routes`,
 //! `/api/v1/health`, `/api/v1/cluster`, and (controller-only)
-//! the `/api/v1/{proxies,controllers,gateways,ingresses,routes/*,problems}`
+//! the `/api/v1/{proxies,controllers,gateways,ingresses,routes/*,manifests/*,problems}`
 //! aggregator surface, plus the embedded operator UI served at `GET /`.
 
 mod aggregator;
@@ -318,6 +318,9 @@ impl AdminServer {
             // ── routes ───────────────────────────────────────────────────────
             ["routes", "httproute", namespace, name] => agg.get_httproute(namespace, name).await,
             ["routes", "ingress", namespace, name] => agg.get_ingress_route(namespace, name).await,
+
+            // ── manifests ────────────────────────────────────────────────────
+            ["manifests", kind, namespace, name] => agg.get_manifest(kind, namespace, name).await,
 
             // ── problems ─────────────────────────────────────────────────────
             ["problems"] => agg.list_problems().await,

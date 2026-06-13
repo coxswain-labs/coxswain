@@ -523,6 +523,76 @@ input[type=checkbox] { accent-color: var(--blue); }
 .endpoint-health { font-size: 12px; color: var(--muted); }
 .endpoint-health.dead { color: var(--amber); font-weight: 700; }
 
+/* ── Manifest dialog ─────────────────────────────────────────────────────── */
+.dialog-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  z-index: 200;
+}
+.dialog {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 201;
+  width: min(860px, 96vw);
+  max-height: min(86vh, 900px);
+  display: flex; flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.dialog-header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface2);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.dialog-title-group {
+  display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+}
+.dialog-kind-badge {
+  font-size: 11px; font-weight: 700;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 4px; padding: 2px 7px;
+  color: var(--muted); white-space: nowrap; flex-shrink: 0;
+}
+.dialog-title {
+  font-size: 14px; font-weight: 600; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+.dialog-ns { color: var(--muted); }
+.dialog-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.dialog-close { font-size: 16px; padding: 0 10px; }
+.dialog-body {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  flex: 1;
+}
+
+/* Manifest code block — Prism tomorrow theme renders inside this element.
+   We set the background to match our surface so the theme's background
+   doesn't create a colour mismatch with the dialog chrome. */
+.manifest-pre {
+  margin: 0;
+  padding: 16px 20px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  tab-size: 2;
+  white-space: pre;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: 0;
+  /* Override the prism-tomorrow background so it matches our surface */
+  background: #1d1f2b !important;
+}
+@media (min-width: 640px) {
+  .manifest-pre { font-size: 13px; }
+}
+
 /* ── Loading / error / empty states ──────────────────────────────────────── */
 .state-box {
   padding: 40px 20px; text-align: center;

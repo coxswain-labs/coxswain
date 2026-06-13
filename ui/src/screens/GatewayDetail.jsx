@@ -1,3 +1,4 @@
+import { useState } from 'preact/hooks';
 import { useApi } from '../hooks/useApi.js';
 import { getGateway } from '../api/endpoints.js';
 import { nav } from '../router.js';
@@ -5,6 +6,7 @@ import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { Badge, poolBadge } from '../components/Badge.jsx';
 import { ConditionRow } from '../components/ConditionRow.jsx';
 import { ListenerRow } from '../components/ListenerRow.jsx';
+import { ManifestDialog } from '../components/ManifestDialog.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 
 /**
@@ -27,6 +29,7 @@ export function GatewayDetail({ namespace, name }) {
     () => getGateway(namespace, name),
     [namespace, name],
   );
+  const [showManifest, setShowManifest] = useState(false);
 
   const breadcrumb = [
     { label: 'Fleet', onClick: () => nav.fleet() },
@@ -65,8 +68,18 @@ export function GatewayDetail({ namespace, name }) {
               {addresses.join(', ')}
             </span>
           )}
+          <button class="btn" onClick={() => setShowManifest(true)}>View manifest</button>
         </div>
       </div>
+
+      {showManifest && (
+        <ManifestDialog
+          kind="gateway"
+          namespace={namespace}
+          name={name}
+          onClose={() => setShowManifest(false)}
+        />
+      )}
 
       {/* Listeners */}
       <section aria-label="Listeners">

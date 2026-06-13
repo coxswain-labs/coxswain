@@ -9,7 +9,8 @@ import { ConditionRow } from '../components/ConditionRow.jsx';
 import { EndpointHealth } from '../components/EndpointHealth.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 import { Panel } from '../components/Panel.jsx';
-import { useEffect } from 'preact/hooks';
+import { ManifestDialog } from '../components/ManifestDialog.jsx';
+import { useEffect, useState } from 'preact/hooks';
 
 /**
  * Route Inspector — the centrepiece screen.
@@ -34,6 +35,7 @@ export function RouteInspector({ kind, namespace, name }) {
 
   const { data, loading, error, refetch } = useApi(fetcher, [kind, namespace, name]);
   const sse = useSSE('/api/v1/events');
+  const [showManifest, setShowManifest] = useState(false);
 
   useEffect(() => {
     return sse.subscribe('rebuild.completed', () => refetch());
@@ -61,8 +63,20 @@ export function RouteInspector({ kind, namespace, name }) {
           <h1 class="screen-title">{name}</h1>
           <div class="screen-meta">{namespace} · {isHttp ? 'HTTPRoute' : 'Ingress'}</div>
         </div>
-        <span class={`sse-dot ${sse.connected ? 'live' : 'offline'}`} title={sse.connected ? 'Live' : 'Disconnected'} />
+        <div class="header-badges">
+          <span class={`sse-dot ${sse.connected ? 'live' : 'offline'}`} title={sse.connected ? 'Live' : 'Disconnected'} />
+          <button class="btn" onClick={() => setShowManifest(true)}>View manifest</button>
+        </div>
       </div>
+
+      {showManifest && (
+        <ManifestDialog
+          kind={kind === 'httproute' ? 'httproute' : 'ingress'}
+          namespace={namespace}
+          name={name}
+          onClose={() => setShowManifest(false)}
+        />
+      )}
 
       {/* Parent Status Conditions — HTTPRoute only */}
       {isHttp && parentStatuses.length > 0 && (

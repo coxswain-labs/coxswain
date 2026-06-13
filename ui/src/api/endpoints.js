@@ -41,6 +41,13 @@ export const getHttproute = (ns, name) =>
 export const getIngressRoute = (ns, name) =>
   fetchJson(`/api/v1/routes/ingress/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`);
 
+// ── Manifests ─────────────────────────────────────────────────────────────────
+
+export const getManifest = (kind, ns, name) =>
+  fetchJson(
+    `/api/v1/manifests/${encodeURIComponent(kind)}/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`,
+  );
+
 // ── Health ────────────────────────────────────────────────────────────────────
 
 export const getHealth = () => fetchJson('/api/v1/health');
