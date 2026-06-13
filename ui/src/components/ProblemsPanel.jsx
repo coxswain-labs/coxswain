@@ -73,7 +73,7 @@ export function ProblemsPanel({ conflicts = [], dead_routes = [], unreachable = 
           title="Degraded pods"
           count={degraded.length}
           severity="warn"
-          desc="These pods are reachable but report a subsystem that isn't ready. Traffic may still flow, but the impaired subsystem needs attention — open the pod to see (and, soon, follow logs for) the failing check."
+          desc="These pods are reachable but report a subsystem that isn't ready. Traffic may still flow, but the impaired subsystem needs attention — open the pod to see and follow logs for the failing check."
         >
           {degraded.map((p) => (
             <ProblemCard

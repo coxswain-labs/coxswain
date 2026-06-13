@@ -758,7 +758,9 @@ input[type=checkbox] { accent-color: var(--blue); }
   margin-bottom: 4px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.problem-card-meta code {
+/* Every inline value in a problem card (namespace, kind, backend/rejected group,
+   failing checks) renders the same: monospace, text color, no code chip. */
+.problem-card code {
   background: none; padding: 0;
   font-family: ui-monospace, monospace; font-size: 12px; color: var(--text);
 }
