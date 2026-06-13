@@ -659,11 +659,13 @@ mod tests {
         ClusterSummary, ControllerSummary, GatewaySummary, IngressSummary, ProxyAssignment,
     };
     use coxswain_core::fleet::{
-        ADMIN_PORT_ANNOTATION, COMPONENT_LABEL, FleetSnapshot, GATEWAY_NAME_LABEL, build_snapshot,
+        ADMIN_PORT_ANNOTATION, COMPONENT_LABEL, FleetSnapshot, GATEWAY_NAME_LABEL, SharedFleet,
+        build_snapshot,
     };
     use k8s_openapi::api::core::v1::{Pod, PodStatus};
     use kube::api::ObjectMeta;
     use std::collections::BTreeMap;
+    use tokio::sync::OnceCell;
 
     /// Build a fake [`Pod`] recognised by [`build_snapshot`].
     ///
@@ -899,5 +901,397 @@ mod tests {
             Some(&b"application/json"[..])
         );
         assert!(resp.body().ends_with(b"\n"), "body must end with newline");
+    }
+
+    // ── Async test helpers ────────────────────────────────────────────────────
+
+    /// Build an [`OperatorAggregator`] with a short (200 ms) timeout for tests.
+    ///
+    /// Struct literal is allowed here because tests live inside the defining
+    /// crate (`#[non_exhaustive]` only blocks external-crate construction).
+    fn make_agg(fleet: SharedFleet, cluster: SharedClusterSummary) -> OperatorAggregator {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap_or_else(|e| panic!("invariant: {e}"));
+        OperatorAggregator {
+            http,
+            fleet,
+            cluster,
+            kube: OnceCell::new(),
+        }
+    }
+
+    /// Build a [`SharedFleet`] pre-loaded with the given pods.
+    fn fleet_with(pods: impl IntoIterator<Item = Pod>) -> SharedFleet {
+        let pods: Vec<Pod> = pods.into_iter().collect();
+        let snap = build_snapshot(pods.iter());
+        let fleet = SharedFleet::default();
+        fleet.store(std::sync::Arc::new(snap));
+        fleet
+    }
+
+    /// Start a minimal HTTP/1.1 server on a random loopback port that always
+    /// responds 200 with `body`. Returns the bound port.
+    ///
+    /// Each accepted connection is handled in its own task so concurrent
+    /// fan-out probes from `list_proxies` work correctly.
+    async fn start_mock_http(body: &'static str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("invariant: {e}"));
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    let _ = stream.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
+    /// Bind an ephemeral port and immediately release it so the OS reclaims it.
+    ///
+    /// Any connection attempt after release receives ECONNREFUSED — the
+    /// expected outcome for the `reachable: false` path.
+    fn refused_port() -> u16 {
+        let l =
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("invariant: {e}"));
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    // ── response helpers ──────────────────────────────────────────────────────
+
+    #[test]
+    fn not_found_returns_404() {
+        assert_eq!(not_found().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn internal_error_returns_500() {
+        assert_eq!(internal_error().status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn service_unavailable_returns_503_with_error_field() {
+        let resp = service_unavailable("kube unavailable");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["error"], "kube unavailable");
+    }
+
+    // ── component_str ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn entry_json_controller_component_field() {
+        let pod = make_pod("ctrl-0", "controller", "10.0.0.1", "8082", None);
+        let snap = build_snapshot([&pod]);
+        let e = &snap.controllers[0];
+        let v = OperatorAggregator::entry_json(e);
+        assert_eq!(v["component"], "controller");
+        assert_eq!(v["pod_name"], "ctrl-0");
+    }
+
+    // ── fleet-miss 404 ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_proxy_returns_404_when_pod_not_in_fleet() {
+        let agg = make_agg(SharedFleet::default(), SharedClusterSummary::default());
+        assert_eq!(
+            agg.get_proxy("missing").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn get_proxy_routes_returns_404_when_pod_not_in_fleet() {
+        let agg = make_agg(SharedFleet::default(), SharedClusterSummary::default());
+        assert_eq!(
+            agg.get_proxy_routes("missing").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn get_proxy_health_returns_404_when_pod_not_in_fleet() {
+        let agg = make_agg(SharedFleet::default(), SharedClusterSummary::default());
+        assert_eq!(
+            agg.get_proxy_health("missing").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn get_controller_returns_404_when_pod_not_in_fleet() {
+        let agg = make_agg(SharedFleet::default(), SharedClusterSummary::default());
+        assert_eq!(
+            agg.get_controller("missing").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn get_controller_health_returns_404_when_pod_not_in_fleet() {
+        let agg = make_agg(SharedFleet::default(), SharedClusterSummary::default());
+        assert_eq!(
+            agg.get_controller_health("missing").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    // ── list_gateways / list_ingresses handlers ───────────────────────────────
+
+    #[test]
+    fn list_gateways_handler_returns_200_with_gateways_key() {
+        let summary = ClusterSummary::new(
+            vec![GatewaySummary::new("gw-a", "default").with_route_count(2)],
+            vec![],
+            ControllerSummary::new(false),
+        );
+        let cluster = SharedClusterSummary::default();
+        cluster.store(std::sync::Arc::new(summary));
+        let agg = make_agg(SharedFleet::default(), cluster);
+
+        let resp = agg.list_gateways();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["gateways"][0]["name"], "gw-a");
+        assert_eq!(body["gateways"][0]["route_count"], 2);
+    }
+
+    #[test]
+    fn list_ingresses_handler_returns_200_with_ingresses_key() {
+        let summary = ClusterSummary::new(
+            vec![],
+            vec![
+                IngressSummary::new("ing-a", "default")
+                    .with_route_count(1)
+                    .with_load_balancer("10.0.0.5"),
+            ],
+            ControllerSummary::new(false),
+        );
+        let cluster = SharedClusterSummary::default();
+        cluster.store(std::sync::Arc::new(summary));
+        let agg = make_agg(SharedFleet::default(), cluster);
+
+        let resp = agg.list_ingresses();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["ingresses"][0]["name"], "ing-a");
+        assert_eq!(body["ingresses"][0]["load_balancer"], "10.0.0.5");
+    }
+
+    // ── fan-out: list_proxies ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_proxies_empty_fleet_returns_empty_array() {
+        let agg = make_agg(SharedFleet::default(), SharedClusterSummary::default());
+        let resp = agg.list_proxies().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["proxies"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn list_proxies_marks_reachable_and_unreachable_pods() {
+        let live_port = start_mock_http(r#"{"ok":true}"#).await;
+        let dead_port = refused_port();
+        let pods = [
+            make_pod(
+                "proxy-live",
+                "shared-proxy",
+                "127.0.0.1",
+                &live_port.to_string(),
+                None,
+            ),
+            make_pod(
+                "proxy-dead",
+                "shared-proxy",
+                "127.0.0.1",
+                &dead_port.to_string(),
+                None,
+            ),
+        ];
+        let agg = make_agg(fleet_with(pods), SharedClusterSummary::default());
+
+        let resp = agg.list_proxies().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        let proxies = body["proxies"].as_array().unwrap();
+        assert_eq!(proxies.len(), 2);
+        let live = proxies
+            .iter()
+            .find(|p| p["pod_name"] == "proxy-live")
+            .unwrap();
+        assert_eq!(live["reachable"], true);
+        let dead = proxies
+            .iter()
+            .find(|p| p["pod_name"] == "proxy-dead")
+            .unwrap();
+        assert_eq!(dead["reachable"], false);
+    }
+
+    // ── fan-out: get_proxy ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_proxy_reachable_returns_pod_info_with_reachable_true() {
+        let port = start_mock_http(r#"{"ok":true}"#).await;
+        let pod = make_pod(
+            "proxy-0",
+            "shared-proxy",
+            "127.0.0.1",
+            &port.to_string(),
+            None,
+        );
+        let agg = make_agg(fleet_with([pod]), SharedClusterSummary::default());
+
+        let resp = agg.get_proxy("proxy-0").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["pod_name"], "proxy-0");
+        assert_eq!(body["reachable"], true);
+        assert_eq!(body["component"], "shared-proxy");
+    }
+
+    #[tokio::test]
+    async fn get_proxy_unreachable_returns_reachable_false() {
+        let port = refused_port();
+        let pod = make_pod(
+            "proxy-0",
+            "shared-proxy",
+            "127.0.0.1",
+            &port.to_string(),
+            None,
+        );
+        let agg = make_agg(fleet_with([pod]), SharedClusterSummary::default());
+
+        let resp = agg.get_proxy("proxy-0").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["pod_name"], "proxy-0");
+        assert_eq!(body["reachable"], false);
+    }
+
+    // ── fan-out: get_proxy_routes ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_proxy_routes_reachable_returns_routes_key() {
+        let routes_body =
+            r#"{"ingress":{"hosts":[],"conflicts":[]},"gateway":{"hosts":[],"conflicts":[]}}"#;
+        let port = start_mock_http(routes_body).await;
+        let pod = make_pod(
+            "proxy-0",
+            "shared-proxy",
+            "127.0.0.1",
+            &port.to_string(),
+            None,
+        );
+        let agg = make_agg(fleet_with([pod]), SharedClusterSummary::default());
+
+        let resp = agg.get_proxy_routes("proxy-0").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["pod_name"], "proxy-0");
+        assert_eq!(body["reachable"], true);
+        assert!(body.get("routes").is_some());
+    }
+
+    #[tokio::test]
+    async fn get_proxy_routes_unreachable_omits_routes_key() {
+        let port = refused_port();
+        let pod = make_pod(
+            "proxy-0",
+            "shared-proxy",
+            "127.0.0.1",
+            &port.to_string(),
+            None,
+        );
+        let agg = make_agg(fleet_with([pod]), SharedClusterSummary::default());
+
+        let resp = agg.get_proxy_routes("proxy-0").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["reachable"], false);
+        assert!(body.get("routes").is_none());
+    }
+
+    // ── fan-out: get_proxy_health ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_proxy_health_reachable_returns_health_key() {
+        let health_body = r#"{"version":"0.0.1","subsystems":{"reflector":"ok"}}"#;
+        let port = start_mock_http(health_body).await;
+        let pod = make_pod(
+            "proxy-0",
+            "shared-proxy",
+            "127.0.0.1",
+            &port.to_string(),
+            None,
+        );
+        let agg = make_agg(fleet_with([pod]), SharedClusterSummary::default());
+
+        let resp = agg.get_proxy_health("proxy-0").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["pod_name"], "proxy-0");
+        assert_eq!(body["reachable"], true);
+        assert!(body.get("health").is_some());
+    }
+
+    // ── fan-out: list_controllers ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_controllers_marks_reachable_and_unreachable_pods() {
+        let live_port = start_mock_http(r#"{"ok":true}"#).await;
+        let dead_port = refused_port();
+        let pods = [
+            make_pod(
+                "ctrl-live",
+                "controller",
+                "127.0.0.1",
+                &live_port.to_string(),
+                None,
+            ),
+            make_pod(
+                "ctrl-dead",
+                "controller",
+                "127.0.0.1",
+                &dead_port.to_string(),
+                None,
+            ),
+        ];
+        let agg = make_agg(fleet_with(pods), SharedClusterSummary::default());
+
+        let resp = agg.list_controllers().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        let controllers = body["controllers"].as_array().unwrap();
+        assert_eq!(controllers.len(), 2);
+        let live = controllers
+            .iter()
+            .find(|c| c["pod_name"] == "ctrl-live")
+            .unwrap();
+        assert_eq!(live["reachable"], true);
+        let dead = controllers
+            .iter()
+            .find(|c| c["pod_name"] == "ctrl-dead")
+            .unwrap();
+        assert_eq!(dead["reachable"], false);
     }
 }
