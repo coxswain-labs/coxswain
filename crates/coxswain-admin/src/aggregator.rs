@@ -233,7 +233,7 @@ impl OperatorAggregator {
     /// `GET /api/v1/controllers` — all controller pods with liveness probe.
     pub(crate) async fn list_controllers(&self) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
-        let entries: Vec<FleetEntry> = snapshot.controllers.iter().cloned().collect();
+        let entries: Vec<FleetEntry> = snapshot.controllers.to_vec();
         let http = &self.http;
         let probes: Vec<_> = entries
             .iter()
