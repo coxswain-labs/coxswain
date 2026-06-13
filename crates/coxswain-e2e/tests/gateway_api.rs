@@ -1670,10 +1670,12 @@ async fn backend_tls_policy_hostname_mismatch() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `/cluster` aggregate endpoint: after applying a Gateway + HTTPRoute, the
-/// controller's `/cluster` JSON must include the Gateway with `proxy.pool ==
-/// "shared"`, a positive `route_count`, and at least one condition, all within
-/// one reconcile cycle. Also asserts the matching counters appear on `/status`.
+/// `/api/v1/cluster` aggregate endpoint: after applying a Gateway + HTTPRoute,
+/// the controller's `/api/v1/cluster` JSON must include the Gateway with
+/// `proxy.pool == "shared"`, a positive `route_count`, and at least one
+/// condition, all within one reconcile cycle. The aggregate gateway/ingress
+/// counts are derived from the same summary (the standalone `/status` counters
+/// were removed when the admin surface moved under `/api/v1/`).
 #[tokio::test]
 async fn cluster_endpoint() -> anyhow::Result<()> {
     common::init_tracing();
@@ -1690,19 +1692,19 @@ async fn cluster_endpoint() -> anyhow::Result<()> {
     let host = format!("echo.{}.local", ns.name);
     wait::wait_for_route(&h.gateway_http, &host, "/a", Duration::from_secs(60)).await?;
 
-    let cluster_url = h.controller_admin_url("/cluster");
-    let status_url = h.controller_admin_url("/status");
+    let cluster_url = h.controller_admin_url("/api/v1/cluster");
     let client = reqwest::Client::new();
 
-    // Poll /cluster until the Gateway we just applied is visible. The reconciler
-    // rebuilds with a 500 ms trailing-edge debounce so allow a generous window.
+    // Poll /api/v1/cluster until the Gateway we just applied is visible. The
+    // reconciler rebuilds with a 500 ms trailing-edge debounce so allow a
+    // generous window.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let cluster = loop {
         let resp = client.get(&cluster_url).send().await?;
         assert_eq!(
             resp.status(),
             200,
-            "/cluster should be 200 on the controller"
+            "/api/v1/cluster should be 200 on the controller"
         );
         let json: serde_json::Value = resp.json().await?;
         let gateways = json["gateways"].as_array().cloned().unwrap_or_default();
@@ -1751,19 +1753,25 @@ async fn cluster_endpoint() -> anyhow::Result<()> {
         "expected Programmed or Accepted condition, got {cond_types:?}"
     );
 
-    // /status must mirror the same counters now that the cluster summary is wired.
-    let status: serde_json::Value = client.get(&status_url).send().await?.json().await?;
-    let gateway_count = status["gateway_count"]
-        .as_u64()
-        .expect("gateway_count present on controller /status");
-    assert!(gateway_count >= 1, "gateway_count={gateway_count}");
+    // Aggregate counts derive from the same /api/v1/cluster summary (the
+    // standalone /status counters were removed when the admin surface moved
+    // under /api/v1/).
+    let gateways = cluster["gateways"].as_array().expect("gateways array");
+    assert!(
+        !gateways.is_empty(),
+        "expected at least one gateway in the cluster summary"
+    );
+    let dedicated_count = gateways
+        .iter()
+        .filter(|g| g["proxy"]["pool"] == "dedicated")
+        .count();
     assert_eq!(
-        status["dedicated_count"], 0,
-        "no parametersRef in this fixture; dedicated_count must be 0"
+        dedicated_count, 0,
+        "no parametersRef in this fixture; dedicated count must be 0"
     );
     assert!(
-        status["ingress_count"].is_u64(),
-        "ingress_count must be present when /cluster summary is enabled"
+        cluster["ingresses"].is_array(),
+        "ingresses array must be present in the cluster summary"
     );
 
     Ok(())
