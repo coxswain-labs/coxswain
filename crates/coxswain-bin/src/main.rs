@@ -5,7 +5,7 @@ mod args;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
-use coxswain_admin::AdminServer;
+use coxswain_admin::{AdminServer, OperatorAggregator};
 use coxswain_controller::{
     ControllerConfig, IngressPorts, LeaseSettings, Operator, OperatorConfig, SharedClusterSummary,
     SharedGatewayListenerHealth, StatusWriterConfig, spawn_status_writer,
@@ -102,6 +102,10 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     let tls_health = status_writer.outputs.tls_health.clone();
     let route_health = status_writer.reconciler.route_health();
 
+    // Capture the fleet handle before the reconciler is moved into its
+    // background service — same pattern as `route_health` above.
+    let fleet = status_writer.reconciler.fleet();
+
     server.add_service(background_service("controller", status_writer.controller));
     server.add_service(background_service("reconciler", status_writer.reconciler));
 
@@ -121,6 +125,8 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         }),
     ));
 
+    let aggregator = OperatorAggregator::new(fleet, status_writer.outputs.cluster_summary.clone());
+
     let health_addr = SocketAddr::new(args.common.management_bind_address, args.common.health_port);
     server.add_service({
         let mut svc = Service::new(
@@ -134,15 +140,13 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     });
 
     let admin_addr = SocketAddr::new(args.common.management_bind_address, args.common.admin_port);
+    // The controller does NOT wire .with_routes() — its /routes returns 404.
+    // The aggregate routing surface is /api/v1/routes/* via the aggregator.
     server.add_service(
-        AdminServer::new(
-            health,
-            status_writer.leader,
-            status_writer.outputs.ingress_routes,
-            status_writer.outputs.gateway_routes,
-        )
-        .with_cluster_summary(status_writer.outputs.cluster_summary)
-        .into_service(admin_addr),
+        AdminServer::new(health, status_writer.leader)
+            .with_cluster_summary(status_writer.outputs.cluster_summary)
+            .with_aggregator(aggregator)
+            .into_service(admin_addr),
     );
 
     tracing::info!(
@@ -227,11 +231,14 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
     wire_management_servers(
         &mut server,
         &args.common,
-        health,
-        leader,
-        source.ingress_routes(),
-        source.gateway_routes(),
-        None,
+        ManagementServerConfig {
+            health,
+            leader,
+            ingress_routes: source.ingress_routes(),
+            gateway_routes: source.gateway_routes(),
+            cluster: None,
+            aggregator: None,
+        },
     );
 
     tracing::info!(
@@ -336,11 +343,14 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
     wire_management_servers(
         &mut server,
         &args.common,
-        health,
-        leader,
-        source.ingress_routes(),
-        source.gateway_routes(),
-        None,
+        ManagementServerConfig {
+            health,
+            leader,
+            ingress_routes: source.ingress_routes(),
+            gateway_routes: source.gateway_routes(),
+            cluster: None,
+            aggregator: None,
+        },
     );
 
     tracing::info!(
@@ -717,6 +727,8 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
     // Operator's reconcile-all retrigger consumes both health channels — see
     // the `run_controller` arm for the shared rationale (#211).
     let route_health = status_writer.reconciler.route_health();
+    // Capture fleet before the reconciler is moved into its background service.
+    let fleet = status_writer.reconciler.fleet();
 
     server.add_service(background_service("controller", status_writer.controller));
     server.add_service(background_service("reconciler", status_writer.reconciler));
@@ -739,14 +751,20 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
 
     wire_proxy_services(&mut server, &args.common, &args.proxy, &source, &tls_health)?;
 
+    let dev_aggregator =
+        OperatorAggregator::new(fleet, status_writer.outputs.cluster_summary.clone());
+
     wire_management_servers(
         &mut server,
         &args.common,
-        health,
-        status_writer.leader,
-        source.ingress_routes(),
-        source.gateway_routes(),
-        Some(status_writer.outputs.cluster_summary),
+        ManagementServerConfig {
+            health,
+            leader: status_writer.leader,
+            ingress_routes: source.ingress_routes(),
+            gateway_routes: source.gateway_routes(),
+            cluster: Some(status_writer.outputs.cluster_summary),
+            aggregator: Some(dev_aggregator),
+        },
     );
 
     tracing::info!(
@@ -803,21 +821,33 @@ fn build_ingress_listeners(common: &CommonArgs, proxy: &ProxyArgs) -> Vec<Listen
     listeners
 }
 
-fn wire_management_servers(
-    server: &mut Server,
-    common: &CommonArgs,
+/// Configuration bundle for [`wire_management_servers`].
+///
+/// Grouped to keep the function signature under the workspace
+/// `>7-arg` threshold.
+struct ManagementServerConfig {
     health: HealthRegistry,
     leader: Arc<AtomicBool>,
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
+    /// `Some` on the controller and dev roles (enables `/api/v1/cluster`).
     cluster: Option<SharedClusterSummary>,
+    /// `Some` on the dev role (enables the aggregator REST surface on the
+    /// single-process dev binary). Controller wires the aggregator inline.
+    aggregator: Option<OperatorAggregator>,
+}
+
+fn wire_management_servers(
+    server: &mut Server,
+    common: &CommonArgs,
+    config: ManagementServerConfig,
 ) {
     let health_addr = SocketAddr::new(common.management_bind_address, common.health_port);
     server.add_service({
         let mut svc = Service::new(
             "health".to_string(),
             coxswain_health::HealthServer {
-                registry: health.clone(),
+                registry: config.health.clone(),
             },
         );
         svc.add_tcp(&health_addr.to_string());
@@ -825,9 +855,13 @@ fn wire_management_servers(
     });
 
     let admin_addr = SocketAddr::new(common.management_bind_address, common.admin_port);
-    let mut admin = AdminServer::new(health, leader, ingress_routes, gateway_routes);
-    if let Some(cs) = cluster {
+    let mut admin = AdminServer::new(config.health, config.leader)
+        .with_routes(config.ingress_routes, config.gateway_routes);
+    if let Some(cs) = config.cluster {
         admin = admin.with_cluster_summary(cs);
+    }
+    if let Some(ag) = config.aggregator {
+        admin = admin.with_aggregator(ag);
     }
     server.add_service(admin.into_service(admin_addr));
 }

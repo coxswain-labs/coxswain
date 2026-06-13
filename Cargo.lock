@@ -610,11 +610,18 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "coxswain-core",
+ "futures",
+ "gateway-api",
  "http",
+ "k8s-openapi",
+ "kube",
  "pingora-core",
  "prometheus 0.14.0",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 

@@ -1,6 +1,14 @@
-//! Admin HTTP endpoints for Coxswain: `/metrics` (Prometheus), `/routes`,
-//! `/api/v1/health`, and (controller-only) `/api/v1/cluster`.
+//! Admin HTTP endpoints for Coxswain: `/metrics`, `/routes`,
+//! `/api/v1/health`, `/api/v1/cluster`, and (controller-only)
+//! the `/api/v1/{proxies,controllers,gateways,ingresses,routes/*}` aggregator
+//! surface.
 
+mod aggregator;
+mod gw_types;
+
+pub use aggregator::OperatorAggregator;
+
+use aggregator::json_response;
 use async_trait::async_trait;
 use coxswain_core::cluster::{ClusterSummary, ControllerSummary, SharedClusterSummary};
 use coxswain_core::health::{HealthRegistry, SubsystemSnapshot};
@@ -17,47 +25,71 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Pingora HTTP app serving `/metrics`, `/routes`, `/api/v1/health`, and — when
-/// constructed with [`Self::with_cluster_summary`] — `/api/v1/cluster`.
+// ── AdminServer ───────────────────────────────────────────────────────────────
+
+/// Pingora HTTP app serving the Coxswain admin surface.
 ///
-/// The `cluster` handle is the opt-in switch: only the controller and `dev`
-/// pod roles wire it through; `proxy --shared` and `proxy --gateway` leave
-/// it `None`, so `GET /api/v1/cluster` on a proxy pod returns 404. This makes
-/// the proxy / controller surface difference structural rather than convention.
+/// The available endpoints vary by pod role:
+///
+/// | Endpoint | All roles | Controller/dev only |
+/// |---|---|---|
+/// | `/metrics` | ✓ | |
+/// | `/api/v1/health` | ✓ | |
+/// | `/routes` | proxy + dev only | |
+/// | `/api/v1/cluster` | | ✓ |
+/// | `/api/v1/{proxies,controllers,gateways,ingresses,routes/*}` | | ✓ |
+///
+/// Each capability is gated by an `Option` field; missing capabilities return
+/// 404 structurally rather than by convention.
 #[non_exhaustive]
 pub struct AdminServer {
     /// Shared health registry surfaced under `/api/v1/health`.
     pub health: HealthRegistry,
     /// Flipped to `true` while this replica holds the leader-election lease.
     pub leader: Arc<AtomicBool>,
-    /// Live Ingress routing table snapshot used by `/routes`.
-    pub ingress_routes: SharedIngressRoutingTable,
-    /// Live Gateway-API routing table snapshot used by `/routes`.
-    pub gateway_routes: SharedGatewayRoutingTable,
+    /// Routing tables for the `/routes` endpoint. `None` on the controller role
+    /// (its `/routes` returns 404); `Some` on proxy and dev roles.
+    pub routes: Option<(SharedIngressRoutingTable, SharedGatewayRoutingTable)>,
     /// Optional aggregate cluster summary. `None` on proxy roles (returns 404
     /// from `/api/v1/cluster`); `Some` on the controller and `dev` roles.
     pub cluster: Option<SharedClusterSummary>,
+    /// Optional aggregator for the controller's `/api/v1/*` fan-out endpoints.
+    /// `None` on proxy roles (those endpoints return 404).
+    pub aggregator: Option<OperatorAggregator>,
 }
 
 impl AdminServer {
-    /// Construct an `AdminServer` from its runtime collaborators.
+    /// Construct an `AdminServer` with the minimum required collaborators.
+    ///
+    /// Call `.with_routes()`, `.with_cluster_summary()`, and/or
+    /// `.with_aggregator()` to enable optional capabilities.
     #[must_use]
-    pub fn new(
-        health: HealthRegistry,
-        leader: Arc<AtomicBool>,
-        ingress_routes: SharedIngressRoutingTable,
-        gateway_routes: SharedGatewayRoutingTable,
-    ) -> Self {
+    pub fn new(health: HealthRegistry, leader: Arc<AtomicBool>) -> Self {
         Self {
             health,
             leader,
-            ingress_routes,
-            gateway_routes,
+            routes: None,
             cluster: None,
+            aggregator: None,
         }
     }
 
-    /// Attach a cluster-summary snapshot, enabling `GET /api/v1/cluster`.
+    /// Enable `GET /routes` by supplying the proxy's local routing tables.
+    ///
+    /// Called only from proxy and dev pod roles. The controller omits this so
+    /// its `/routes` returns 404 — the controller's routing view is the
+    /// aggregate `/api/v1/routes/*` surface instead.
+    #[must_use]
+    pub fn with_routes(
+        mut self,
+        ingress: SharedIngressRoutingTable,
+        gateway: SharedGatewayRoutingTable,
+    ) -> Self {
+        self.routes = Some((ingress, gateway));
+        self
+    }
+
+    /// Enable `GET /api/v1/cluster` by supplying the cluster-summary snapshot.
     ///
     /// Called only from the `controller` and `dev` pod roles. Proxy roles
     /// omit this so the read-only-proxy invariant extends to "the proxy admin
@@ -65,6 +97,17 @@ impl AdminServer {
     #[must_use]
     pub fn with_cluster_summary(mut self, cluster: SharedClusterSummary) -> Self {
         self.cluster = Some(cluster);
+        self
+    }
+
+    /// Enable the `/api/v1/{proxies,controllers,gateways,ingresses,routes/*}`
+    /// aggregator endpoints.
+    ///
+    /// Called only from the `controller` and `dev` pod roles. Proxy roles
+    /// leave the aggregator `None`, so these endpoints return 404 structurally.
+    #[must_use]
+    pub fn with_aggregator(mut self, aggregator: OperatorAggregator) -> Self {
+        self.aggregator = Some(aggregator);
         self
     }
 
@@ -79,22 +122,65 @@ impl AdminServer {
     }
 }
 
+// ── Request routing ───────────────────────────────────────────────────────────
+
 #[async_trait]
 impl ServeHttp for AdminServer {
     async fn response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
-        match session.req_header().uri.path() {
-            "/metrics" => metrics_response(),
-            "/routes" => routes_response(&self.ingress_routes, &self.gateway_routes),
-            "/api/v1/health" => health_response(&self.health),
-            "/api/v1/cluster" => cluster_response(self.cluster.as_ref(), &self.leader),
-            _ => {
-                let mut r = Response::new(Vec::new());
-                *r.status_mut() = StatusCode::NOT_FOUND;
-                r
+        let path = session.req_header().uri.path();
+
+        // Fast path: exact matches.
+        match path {
+            "/metrics" => return metrics_response(),
+            "/routes" => return self.routes_response(),
+            "/api/v1/health" => return health_response(&self.health),
+            "/api/v1/cluster" => return cluster_response(self.cluster.as_ref(), &self.leader),
+            _ => {}
+        }
+
+        // Aggregator endpoints — all under /api/v1/.
+        // Return 404 when no aggregator is wired (proxy pod roles).
+        let Some(agg) = self.aggregator.as_ref() else {
+            if path.starts_with("/api/v1/") {
+                return aggregator::not_found();
             }
+            return aggregator::not_found();
+        };
+
+        // Split path into non-empty segments after the /api/v1/ prefix.
+        let rest = path.strip_prefix("/api/v1/").unwrap_or(path);
+        let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+
+        match segs.as_slice() {
+            // ── proxies ──────────────────────────────────────────────────────
+            ["proxies"] => agg.list_proxies().await,
+            ["proxies", name] => agg.get_proxy(name).await,
+            ["proxies", name, "routes"] => agg.get_proxy_routes(name).await,
+            ["proxies", name, "health"] => agg.get_proxy_health(name).await,
+
+            // ── controllers ──────────────────────────────────────────────────
+            ["controllers"] => agg.list_controllers().await,
+            ["controllers", name] => agg.get_controller(name).await,
+            ["controllers", name, "health"] => agg.get_controller_health(name).await,
+
+            // ── gateways ─────────────────────────────────────────────────────
+            ["gateways"] => agg.list_gateways(),
+            ["gateways", namespace, name] => agg.get_gateway(namespace, name).await,
+
+            // ── ingresses ────────────────────────────────────────────────────
+            ["ingresses"] => agg.list_ingresses(),
+            ["ingresses", namespace, name] => agg.get_ingress(namespace, name).await,
+
+            // ── routes ───────────────────────────────────────────────────────
+            ["routes", "httproute", namespace, name] => agg.get_httproute(namespace, name).await,
+            ["routes", "ingress", namespace, name] => agg.get_ingress_route(namespace, name).await,
+
+            _ => aggregator::not_found(),
         }
     }
 }
+
+// ── /metrics ──────────────────────────────────────────────────────────────────
 
 fn metrics_response() -> Response<Vec<u8>> {
     let encoder = TextEncoder::new();
@@ -111,6 +197,27 @@ fn metrics_response() -> Response<Vec<u8>> {
     *r.status_mut() = StatusCode::OK;
     r.headers_mut().insert(header::CONTENT_TYPE, content_type);
     r
+}
+
+// ── /routes ───────────────────────────────────────────────────────────────────
+
+impl AdminServer {
+    /// Build the `/routes` response from the local routing tables.
+    ///
+    /// Returns 404 when no routing tables are wired (controller pod role).
+    fn routes_response(&self) -> Response<Vec<u8>> {
+        let Some((ingress, gateway)) = self.routes.as_ref() else {
+            let mut r = Response::new(Vec::new());
+            *r.status_mut() = StatusCode::NOT_FOUND;
+            return r;
+        };
+        let body = serde_json::json!({
+            "ingress": routes_block(ingress.load().as_ref()),
+            "gateway": routes_block(gateway.load().as_ref()),
+        })
+        .to_string();
+        json_response(body)
+    }
 }
 
 /// Build the per-spec block of the `/routes` payload from a typed table.
@@ -155,17 +262,7 @@ fn routes_block<K>(table: &RoutingTable<K>) -> serde_json::Value {
     serde_json::json!({ "hosts": hosts, "conflicts": conflicts })
 }
 
-fn routes_response(
-    ingress: &SharedIngressRoutingTable,
-    gateway: &SharedGatewayRoutingTable,
-) -> Response<Vec<u8>> {
-    let body = serde_json::json!({
-        "ingress": routes_block(ingress.load().as_ref()),
-        "gateway": routes_block(gateway.load().as_ref()),
-    })
-    .to_string();
-    json_response(body)
-}
+// ── /api/v1/health ────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -189,6 +286,8 @@ fn health_response(health: &HealthRegistry) -> Response<Vec<u8>> {
         }
     }
 }
+
+// ── /api/v1/cluster ───────────────────────────────────────────────────────────
 
 /// Borrowed view of a [`ClusterSummary`] whose `controller.leader` is sourced
 /// from the live [`AtomicBool`] instead of the snapshot.
@@ -230,16 +329,7 @@ fn cluster_response(
     }
 }
 
-fn json_response(mut body: String) -> Response<Vec<u8>> {
-    body.push('\n');
-    let mut r = Response::new(body.into_bytes());
-    *r.status_mut() = StatusCode::OK;
-    r.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    r
-}
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -345,26 +435,30 @@ mod tests {
     }
 
     #[test]
-    fn admin_server_without_cluster_summary_serves_404_on_cluster_path() {
-        // Proxy-role contract: no cluster summary wired → /api/v1/cluster returns 404.
-        let admin = AdminServer::new(
-            HealthRegistry::new(),
-            leader_flag(false),
+    fn admin_server_without_routes_returns_404_on_routes_path() {
+        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false));
+        assert!(admin.routes.is_none());
+    }
+
+    #[test]
+    fn admin_server_with_routes_enables_routes_endpoint() {
+        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false)).with_routes(
             SharedIngressRoutingTable::new(),
             SharedGatewayRoutingTable::new(),
         );
+        assert!(admin.routes.is_some());
+    }
+
+    #[test]
+    fn admin_server_without_cluster_summary_serves_404_on_cluster_path() {
+        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false));
         assert!(admin.cluster.is_none());
     }
 
     #[test]
     fn admin_server_with_cluster_summary_enables_cluster_endpoint() {
-        let admin = AdminServer::new(
-            HealthRegistry::new(),
-            leader_flag(false),
-            SharedIngressRoutingTable::new(),
-            SharedGatewayRoutingTable::new(),
-        )
-        .with_cluster_summary(SharedClusterSummary::default());
+        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false))
+            .with_cluster_summary(SharedClusterSummary::default());
         assert!(admin.cluster.is_some());
     }
 }
