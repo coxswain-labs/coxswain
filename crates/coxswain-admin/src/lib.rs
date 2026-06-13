@@ -4,9 +4,11 @@
 //! surface.
 
 mod aggregator;
+mod events;
 mod gw_types;
 
 pub use aggregator::OperatorAggregator;
+pub use events::EventSources;
 
 use aggregator::json_response;
 use async_trait::async_trait;
@@ -14,10 +16,13 @@ use coxswain_core::cluster::{ClusterSummary, ControllerSummary, SharedClusterSum
 use coxswain_core::health::{HealthRegistry, SubsystemSnapshot};
 use coxswain_core::routing::{RoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use http::{HeaderValue, Response, StatusCode, header};
-use pingora_core::apps::http_app::{HttpServer, ServeHttp};
+use pingora_core::apps::{HttpPersistentSettings, HttpServerApp, ReusedHttpStream};
+use pingora_core::modules::http::HttpModules;
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
-use pingora_core::protocols::http::ServerSession;
+use pingora_core::protocols::http::{HttpTask, ServerSession};
+use pingora_core::server::ShutdownWatch;
 use pingora_core::services::listening::Service;
+use pingora_http::ResponseHeader;
 use prometheus::{Encoder, TextEncoder};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -38,9 +43,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// | `/routes` | proxy + dev only | |
 /// | `/api/v1/cluster` | | ✓ |
 /// | `/api/v1/{proxies,controllers,gateways,ingresses,routes/*}` | | ✓ |
+/// | `/api/v1/events` (SSE) | | ✓ |
 ///
 /// Each capability is gated by an `Option` field; missing capabilities return
 /// 404 structurally rather than by convention.
+///
+/// Unlike the rest of the admin surface, `/api/v1/events` is a long-lived
+/// Server-Sent Events stream, which Pingora's buffered
+/// [`ServeHttp`](pingora_core::apps::http_app::ServeHttp) trait cannot drive.
+/// `AdminServer` therefore implements the lower-level
+/// [`HttpServerApp`] directly: it streams the events path and reproduces the
+/// buffered request/response pipeline (including the response-compression
+/// module) for every other endpoint.
 #[non_exhaustive]
 pub struct AdminServer {
     /// Shared health registry surfaced under `/api/v1/health`.
@@ -56,6 +70,13 @@ pub struct AdminServer {
     /// Optional aggregator for the controller's `/api/v1/*` fan-out endpoints.
     /// `None` on proxy roles (those endpoints return 404).
     pub aggregator: Option<OperatorAggregator>,
+    /// Optional live event sources for the `/api/v1/events` SSE stream. `None`
+    /// on proxy roles (the endpoint returns 404 there).
+    pub events: Option<EventSources>,
+    /// HTTP module pipeline (response compression) applied to every buffered
+    /// endpoint. The SSE stream deliberately bypasses it — compression buffers,
+    /// which would defeat streaming.
+    modules: HttpModules,
 }
 
 impl AdminServer {
@@ -65,12 +86,16 @@ impl AdminServer {
     /// `.with_aggregator()` to enable optional capabilities.
     #[must_use]
     pub fn new(health: HealthRegistry, leader: Arc<AtomicBool>) -> Self {
+        let mut modules = HttpModules::new();
+        modules.add_module(ResponseCompressionBuilder::enable(7));
         Self {
             health,
             leader,
             routes: None,
             cluster: None,
             aggregator: None,
+            events: None,
+            modules,
         }
     }
 
@@ -111,22 +136,112 @@ impl AdminServer {
         self
     }
 
-    /// Wraps `self` in a Pingora [`Service`] bound to `addr`.
+    /// Enable the `GET /api/v1/events` Server-Sent Events stream.
+    ///
+    /// Called only from the `controller` and `dev` pod roles. Proxy roles leave
+    /// the event sources `None`, so the endpoint returns 404 structurally — the
+    /// same gate as the aggregator surface.
     #[must_use]
-    pub fn into_service(self, addr: SocketAddr) -> Service<HttpServer<Self>> {
-        let mut http_server = HttpServer::new_app(self);
-        http_server.add_module(ResponseCompressionBuilder::enable(7));
-        let mut svc = Service::new("admin".to_string(), http_server);
+    pub fn with_events(mut self, events: EventSources) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Wraps `self` in a Pingora [`Service`] bound to `addr`.
+    ///
+    /// `AdminServer` is its own [`HttpServerApp`] (it streams `/api/v1/events`),
+    /// so it is registered directly rather than via Pingora's buffered
+    /// `HttpServer` wrapper; the response-compression module lives on the
+    /// `modules` field instead.
+    #[must_use]
+    pub fn into_service(self, addr: SocketAddr) -> Service<Self> {
+        let mut svc = Service::new("admin".to_string(), self);
         svc.add_tcp(&addr.to_string());
         svc
     }
 }
 
-// ── Request routing ───────────────────────────────────────────────────────────
+// ── HttpServerApp: streaming dispatch + buffered pipeline ──────────────────────
 
 #[async_trait]
-impl ServeHttp for AdminServer {
-    async fn response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
+impl HttpServerApp for AdminServer {
+    async fn process_new_http(
+        self: &Arc<Self>,
+        mut session: ServerSession,
+        shutdown: &ShutdownWatch,
+    ) -> Option<ReusedHttpStream> {
+        match session.read_request().await {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(e) => {
+                tracing::error!(error = %e, "admin: failed to read request header");
+                return None;
+            }
+        }
+
+        // SSE stream: hand off to the events driver, which writes a chunked body
+        // until the client disconnects or the server shuts down. Only the
+        // controller/dev roles wire `events`; proxy roles fall through to the
+        // buffered pipeline, where `/api/v1/events` resolves to a 404.
+        if session.req_header().uri.path() == "/api/v1/events"
+            && let Some(sources) = self.events.as_ref()
+        {
+            events::run_until_shutdown(sources, &self.leader, &mut session, shutdown).await;
+            // The stream is torn down; never reuse the connection.
+            return None;
+        }
+
+        if *shutdown.borrow() {
+            session.set_keepalive(None);
+        } else {
+            session.set_keepalive(Some(60));
+        }
+
+        // Buffered pipeline — mirrors Pingora's `HttpServer::process_new_http`
+        // so the response-compression module still runs on these endpoints.
+        let mut module_ctx = self.modules.build_ctx();
+        let req = session.req_header_mut();
+        module_ctx.request_header_filter(req).await.ok()?;
+
+        let response = self.build_response(&mut session).await;
+        let (parts, body) = response.into_parts();
+        let mut resp_header: ResponseHeader = parts.into();
+        module_ctx
+            .response_header_filter(&mut resp_header, body.is_empty())
+            .await
+            .ok()?;
+
+        let header_task = HttpTask::Header(Box::new(resp_header), body.is_empty());
+        if let Err(e) = session.response_duplex_vec(vec![header_task]).await {
+            tracing::error!(error = %e, "admin: failed to write response header");
+        }
+
+        let mut body = Some(body.into());
+        module_ctx.response_body_filter(&mut body, true).ok()?;
+        let body_task = HttpTask::Body(body, true);
+        if let Err(e) = session.response_duplex_vec(vec![body_task]).await {
+            tracing::error!(error = %e, "admin: failed to write response body");
+        }
+
+        let persistent_settings = HttpPersistentSettings::for_session(&session);
+        match session.finish().await {
+            Ok(c) => c.map(|s| ReusedHttpStream::new(s, Some(persistent_settings))),
+            Err(e) => {
+                tracing::error!(error = %e, "admin: failed to finish request");
+                None
+            }
+        }
+    }
+}
+
+// ── Request routing ───────────────────────────────────────────────────────────
+
+impl AdminServer {
+    /// Build a fully-buffered response for a non-streaming admin endpoint.
+    ///
+    /// The exhaustive path match is the single source of truth for which
+    /// endpoints exist per pod role; unwired capabilities resolve to 404.
+    async fn build_response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
         let path = session.req_header().uri.path();
 
         // Fast path: exact matches.

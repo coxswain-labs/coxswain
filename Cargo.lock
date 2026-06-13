@@ -609,6 +609,7 @@ name = "coxswain-admin"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "coxswain-core",
  "futures",
  "gateway-api",
@@ -616,6 +617,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "pingora-core",
+ "pingora-http",
  "prometheus 0.14.0",
  "reqwest",
  "rustls",

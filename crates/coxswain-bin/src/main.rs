@@ -5,7 +5,7 @@ mod args;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
-use coxswain_admin::{AdminServer, OperatorAggregator};
+use coxswain_admin::{AdminServer, EventSources, OperatorAggregator};
 use coxswain_controller::{
     ControllerConfig, IngressPorts, LeaseSettings, Operator, OperatorConfig, SharedClusterSummary,
     SharedGatewayListenerHealth, StatusWriterConfig, spawn_status_writer,
@@ -106,6 +106,16 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // background service — same pattern as `route_health` above.
     let fleet = status_writer.reconciler.fleet();
 
+    // Event sources for the /api/v1/events SSE stream (#250). Capture the
+    // rebuild generation receiver and clones of the fleet / cluster handles
+    // before the originals are moved into the operator and aggregator below.
+    let events = EventSources::new(
+        route_health.subscribe(),
+        fleet.clone(),
+        status_writer.outputs.cluster_summary.clone(),
+        args.common.pod_name.clone(),
+    );
+
     server.add_service(background_service("controller", status_writer.controller));
     server.add_service(background_service("reconciler", status_writer.reconciler));
 
@@ -146,6 +156,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         AdminServer::new(health, status_writer.leader)
             .with_cluster_summary(status_writer.outputs.cluster_summary)
             .with_aggregator(aggregator)
+            .with_events(events)
             .into_service(admin_addr),
     );
 
@@ -238,6 +249,7 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
             gateway_routes: source.gateway_routes(),
             cluster: None,
             aggregator: None,
+            events: None,
         },
     );
 
@@ -350,6 +362,7 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
             gateway_routes: source.gateway_routes(),
             cluster: None,
             aggregator: None,
+            events: None,
         },
     );
 
@@ -730,6 +743,15 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
     // Capture fleet before the reconciler is moved into its background service.
     let fleet = status_writer.reconciler.fleet();
 
+    // Event sources for /api/v1/events (#250); capture before the originals are
+    // moved into the operator and aggregator below.
+    let events = EventSources::new(
+        route_health.subscribe(),
+        fleet.clone(),
+        status_writer.outputs.cluster_summary.clone(),
+        args.common.pod_name.clone(),
+    );
+
     server.add_service(background_service("controller", status_writer.controller));
     server.add_service(background_service("reconciler", status_writer.reconciler));
 
@@ -764,6 +786,7 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
             gateway_routes: source.gateway_routes(),
             cluster: Some(status_writer.outputs.cluster_summary),
             aggregator: Some(dev_aggregator),
+            events: Some(events),
         },
     );
 
@@ -835,6 +858,9 @@ struct ManagementServerConfig {
     /// `Some` on the dev role (enables the aggregator REST surface on the
     /// single-process dev binary). Controller wires the aggregator inline.
     aggregator: Option<OperatorAggregator>,
+    /// `Some` on the dev role (enables the `/api/v1/events` SSE stream).
+    /// Controller wires events inline; proxy roles leave it `None`.
+    events: Option<EventSources>,
 }
 
 fn wire_management_servers(
@@ -862,6 +888,9 @@ fn wire_management_servers(
     }
     if let Some(ag) = config.aggregator {
         admin = admin.with_aggregator(ag);
+    }
+    if let Some(ev) = config.events {
+        admin = admin.with_events(ev);
     }
     server.add_service(admin.into_service(admin_addr));
 }
