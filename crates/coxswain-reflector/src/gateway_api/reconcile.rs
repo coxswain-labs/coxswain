@@ -176,6 +176,13 @@ impl GatewayApiReconciler {
                             .unwrap_or_default()
                     })
                     .collect();
+                // A backendRef that points to an existing Service which currently
+                // has zero ready endpoints drives a 503; invalid refs (missing
+                // Service, wrong kind, denied cross-namespace) and all-zero-weight
+                // rules drive a 500. Computed before `resolved` is consumed below.
+                let has_valid_empty_backend = resolved
+                    .iter()
+                    .any(|(r, w)| *w > 0 && r.service_exists && r.addrs.is_empty());
                 let weighted: Vec<(Vec<SocketAddr>, u16)> = resolved
                     .into_iter()
                     .filter(|(r, w)| *w > 0 && !r.addrs.is_empty())
@@ -209,11 +216,20 @@ impl GatewayApiReconciler {
                     // "upstream not reachable" which matches the spec intent.
                     (Some(group), Some(502u16))
                 } else if group.endpoints().is_empty() {
+                    // HTTPRoute spec: a valid Service with zero ready endpoints
+                    // SHOULD return 503; an invalid/missing backend or all-zero-
+                    // weight rule MUST return 500.
+                    let status = if has_valid_empty_backend {
+                        503u16
+                    } else {
+                        500u16
+                    };
                     tracing::warn!(
                         route = ?route.metadata.name,
-                        "No ready endpoints for rule — installing error route (500)"
+                        status,
+                        "No ready endpoints for rule — installing error route"
                     );
-                    (Some(group), Some(500u16))
+                    (Some(group), Some(status))
                 } else {
                     (Some(group), None)
                 }
@@ -264,6 +280,7 @@ fn resolve_weighted_backends(
                     endpoints::ResolvedEndpoints {
                         addrs: vec![],
                         app_protocol: BackendProtocol::default(),
+                        service_exists: false,
                     },
                     0,
                 );
@@ -276,6 +293,7 @@ fn resolve_weighted_backends(
                     endpoints::ResolvedEndpoints {
                         addrs: vec![],
                         app_protocol: BackendProtocol::default(),
+                        service_exists: false,
                     },
                     weight,
                 );
@@ -295,6 +313,7 @@ fn resolve_weighted_backends(
                     endpoints::ResolvedEndpoints {
                         addrs: vec![],
                         app_protocol: BackendProtocol::default(),
+                        service_exists: false,
                     },
                     weight,
                 );
@@ -1324,6 +1343,69 @@ mod tests {
         assert!(
             matches!(outcome, coxswain_core::routing::RouteOutcome::Error(500)),
             "all-zero-weight rule must resolve to Error(500)"
+        );
+    }
+
+    #[test]
+    fn valid_service_zero_endpoints_installs_503() {
+        // The referenced Service exists but has no ready endpoints (e.g. scaled
+        // to zero). HTTPRoute spec: this SHOULD return 503, not 500.
+        let svc = k8s_openapi::api::core::v1::Service {
+            metadata: ObjectMeta {
+                name: Some("svc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let route = weighted_route("default", &[("svc", Some(1))]);
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            &route,
+            &slice_store(vec![]),
+            &crate::tests::fixtures::make_svc_store(vec![svc]),
+            &default_owned(),
+            &HashSet::new(),
+            crate::gateway_api::RouteResolution {
+                listener_info: &no_listener_info(),
+                policy_index: &HashMap::new(),
+            },
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        assert!(
+            matches!(
+                table.find(80, "example.com", "/", &ctx_get()),
+                coxswain_core::routing::RouteOutcome::Error(503)
+            ),
+            "valid Service with zero ready endpoints must resolve to 503"
+        );
+    }
+
+    #[test]
+    fn missing_service_installs_500() {
+        // No such Service in the store → invalid backendRef → MUST return 500.
+        let route = weighted_route("default", &[("svc", Some(1))]);
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            &route,
+            &slice_store(vec![]),
+            &empty_svc_store(),
+            &default_owned(),
+            &HashSet::new(),
+            crate::gateway_api::RouteResolution {
+                listener_info: &no_listener_info(),
+                policy_index: &HashMap::new(),
+            },
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        assert!(
+            matches!(
+                table.find(80, "example.com", "/", &ctx_get()),
+                coxswain_core::routing::RouteOutcome::Error(500)
+            ),
+            "missing Service backendRef must resolve to 500"
         );
     }
 

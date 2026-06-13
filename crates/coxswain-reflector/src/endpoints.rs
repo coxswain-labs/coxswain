@@ -12,6 +12,10 @@ pub(crate) struct ResolvedEndpoints {
     pub addrs: Vec<SocketAddr>,
     /// Backend wire protocol, parsed from `Service.spec.ports[].appProtocol`.
     pub app_protocol: BackendProtocol,
+    /// Whether the referenced Service exists in the cluster (present in the
+    /// Service store). Lets callers separate "valid Service, zero ready
+    /// endpoints" (Gateway API: SHOULD 503) from "no such Service" (MUST 500).
+    pub service_exists: bool,
 }
 
 struct ServicePortInfo {
@@ -126,9 +130,14 @@ pub(crate) fn resolve(
         count = addrs.len(),
         "Resolved endpoints"
     );
+    let service_exists = {
+        let key = reflector::ObjectRef::<Service>::new(svc).within(ns);
+        services.get(&key).is_some()
+    };
     ResolvedEndpoints {
         addrs,
         app_protocol,
+        service_exists,
     }
 }
 

@@ -827,6 +827,22 @@ fn rebuild(
         .filter_map(|gc| gc.metadata.name.clone())
         .collect();
 
+    // `owned_gateways` deliberately drops Gateways cut over to a dedicated proxy
+    // (#210) so the shared pool stops *routing* them. The cluster summary is an
+    // observability surface, not a routing input: it must still LIST those
+    // Gateways (a dedicated Gateway is just as real as a shared one), so build a
+    // superset keyed on owned GatewayClass — independent of cut-over state.
+    // `build_gateways` then classifies each as shared/dedicated on its own.
+    let summary_gateways: HashSet<ObjectKey> = gateways
+        .iter()
+        .filter(|g| owned_gateway_classes.contains(&g.spec.gateway_class_name))
+        .filter_map(|g| {
+            let ns = g.metadata.namespace.as_deref()?;
+            let name = g.metadata.name.as_deref()?;
+            Some(ObjectKey::new(ns, name))
+        })
+        .collect();
+
     // Publish the cluster summary while we still have access to gateway_tls_health
     // (it's moved into `tls_health.store_and_notify` next). Reads from already-
     // materialised state: nothing kube-side, no allocations beyond the summary.
@@ -835,7 +851,7 @@ fn rebuild(
         .store(Arc::new(build_cluster_summary(&ClusterSummaryInputs {
             gateways: &gateways,
             ingresses: &ingresses,
-            owned_gateways: &owned_gateways,
+            owned_gateways: &summary_gateways,
             dedicated_gateway_class_names: &dedicated_gateway_class_names,
             owned_ingress_classes: &owned_ingress_classes,
             default_ingress_class: owned_default_ingress_class.as_deref(),

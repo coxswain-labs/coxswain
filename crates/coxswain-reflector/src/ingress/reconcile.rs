@@ -95,13 +95,23 @@ impl IngressReconciler {
                 };
 
                 let resolved = endpoints::resolve(ns, &svc.name, port, slices, services);
-                if resolved.addrs.is_empty() {
+                // A backend that resolves but has zero ready endpoints is kept as
+                // a dead route that returns 503 — NOT pruned. Pruning would let
+                // the path fall through to a broader route (a catch-all "/", or
+                // another Ingress claiming the same host) and silently serve the
+                // wrong backend, and it would hide the outage from operators.
+                // This mirrors the Gateway-API path, which installs an error
+                // route for the same case. (503 = Service Unavailable, the
+                // ingress-controller convention for "no ready upstreams";
+                // unresolvable backends — missing Service/port — are still
+                // skipped above, before this point.)
+                let dead = resolved.addrs.is_empty();
+                if dead {
                     tracing::warn!(
                         ingress = ?ingress.metadata.name,
                         svc = %svc.name,
-                        "No ready endpoints — skipping path"
+                        "No ready endpoints — installing dead route (503)"
                     );
-                    continue;
                 }
                 let protocol = resolved.app_protocol;
                 let group = Arc::new(
@@ -123,11 +133,13 @@ impl IngressReconciler {
                 let metric_route_id: Arc<str> = Arc::from(format!(
                     "ingress/{ns}/{ingress_name}:{rule_index}.{path_index}"
                 ));
-                let e = Arc::new(
-                    RouteEntry::path_only(group, route_id.clone(), created_at)
-                        .with_path_pattern(Arc::from(path))
-                        .with_metric_route_id(metric_route_id),
-                );
+                let mut entry = RouteEntry::path_only(group, route_id.clone(), created_at)
+                    .with_path_pattern(Arc::from(path))
+                    .with_metric_route_id(metric_route_id);
+                if dead {
+                    entry.error_status = Some(503);
+                }
+                let e = Arc::new(entry);
                 // "Prefix" and "ImplementationSpecific" both map to prefix matching.
                 for &listener_port in &ports {
                     let host_builder = builder
@@ -916,8 +928,8 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_skips_rule_with_no_endpoints() {
-        let store = slice_store(vec![]); // no slices → no endpoints
+    fn reconcile_keeps_dead_route_when_no_endpoints() {
+        let store = slice_store(vec![]); // no slices → zero ready endpoints
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -938,7 +950,16 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
 
-        assert!(table.route(80, "example.com", "/", &ctx).is_none());
+        // The route is KEPT (not pruned), so the path can't fall through to a
+        // broader route, and it resolves to a 503 error route rather than a
+        // served backend.
+        assert!(
+            matches!(
+                table.find(80, "example.com", "/", &ctx),
+                coxswain_core::routing::RouteOutcome::Error(503)
+            ),
+            "an Ingress path with zero ready endpoints must stay in the table as a 503 route"
+        );
     }
 
     #[test]
