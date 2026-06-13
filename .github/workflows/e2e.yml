@@ -32,6 +32,7 @@ jobs:
               - 'ui/**'
               - 'charts/**'
               - 'Dockerfile'
+              - 'Dockerfile.ci'
               - 'conformance/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -88,7 +89,7 @@ jobs:
           ls -lh test-bins/
 
       - name: Build e2e Docker image
-        run: docker build -f Dockerfile.e2e -t coxswain:e2e .
+        run: docker build -f Dockerfile.ci -t coxswain:e2e .
 
       - name: Save Docker image
         run: docker save coxswain:e2e | gzip > e2e-image.tar.gz
