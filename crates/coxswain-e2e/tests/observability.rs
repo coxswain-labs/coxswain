@@ -438,9 +438,9 @@ async fn problems_dead_backend_carries_route_identity() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A routing conflict (a `/shadow/` rule shadowed by `/shadow`) must appear in
-/// `/api/v1/problems.conflicts` carrying the rejected route's identity — proving
-/// the routing core captures the shadowed route_id end-to-end.
+/// A routing conflict (two distinct Ingresses claiming the same host+path) must
+/// appear in `/api/v1/problems.conflicts` carrying the rejected (shadowed)
+/// route's identity — proving the routing core captures it end-to-end.
 #[tokio::test]
 async fn problems_conflict_carries_rejected_route_identity() -> anyhow::Result<()> {
     common::init_tracing();
@@ -451,10 +451,10 @@ async fn problems_conflict_carries_rejected_route_identity() -> anyhow::Result<(
     wait::wait_for_backends(&ns.name).await?;
     fixtures::apply_fixture(ingress::PROBLEMS_CONFLICT, FixtureVars::new(&ns.name)).await?;
 
-    // The winning `/shadow` rule serves 200 once the table is built; the
-    // shadowed `/shadow/` rule is recorded as a conflict in the same build.
+    // Both Ingresses claim conflict.<ns>.local/; the winner serves 200 once the
+    // table is built, and the shadowed one is recorded as a conflict.
     let host = format!("conflict.{}.local", ns.name);
-    wait::wait_for_route_status(&h.http, &host, "/shadow", 200, Duration::from_secs(60)).await?;
+    wait::wait_for_route_status(&h.http, &host, "/", 200, Duration::from_secs(60)).await?;
 
     let row = wait_for_problem(
         &h,
@@ -467,6 +467,11 @@ async fn problems_conflict_carries_rejected_route_identity() -> anyhow::Result<(
     assert_eq!(row["kind"], "ingress");
     assert_eq!(row["route"]["kind"], "Ingress");
     assert_eq!(row["route"]["namespace"], ns.name);
-    assert_eq!(row["route"]["name"], "conflict-ingress");
+    // The rejected route is whichever of the two lost the precedence tie.
+    let rejected = row["route"]["name"].as_str().unwrap_or("");
+    assert!(
+        rejected == "conflict-a" || rejected == "conflict-b",
+        "rejected route should be one of the two conflicting Ingresses, got {rejected:?}"
+    );
     Ok(())
 }
