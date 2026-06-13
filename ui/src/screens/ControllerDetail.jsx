@@ -60,7 +60,6 @@ export function ControllerDetail({ pod }) {
           {isReachable
             ? <Badge variant="ok">reachable</Badge>
             : <Badge variant="fail">unreachable</Badge>}
-          <span class={`sse-dot ${sse.connected ? 'live' : 'offline'}`} />
         </div>
       </div>
 

@@ -197,15 +197,25 @@ img { max-width: 100%; }
   width: 100%;
 }
 
-/* ── SSE connection dot ──────────────────────────────────────────────────── */
-.sse-dot {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: var(--amber);
-  animation: pulse 2s infinite;
-  flex-shrink: 0;
+/* ── Global stream status (nav bar + drawer foot) ────────────────────────── */
+.nav-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600; white-space: nowrap;
+  padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--border);
 }
-.sse-dot.live { background: var(--green); animation: none; }
-.sse-dot.offline { background: var(--red); animation: none; }
+.nav-status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.nav-status.live            { color: var(--green); }
+.nav-status.live    .nav-status-dot { background: var(--green); }
+.nav-status.offline         { color: var(--red); }
+.nav-status.offline .nav-status-dot { background: var(--red); animation: pulse 2s infinite; }
+/* Inline in the bar on wide screens; folds into the drawer foot on narrow. */
+.nav-status-inline { display: none; margin-left: 16px; }
+@media (min-width: 640px) { .nav-status-inline { display: inline-flex; } }
+.nav-drawer-footer {
+  margin-top: auto; padding: 16px 12px;
+  border-top: 1px solid var(--border);
+}
 @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.4; } }
 
 /* ── Screen layout ───────────────────────────────────────────────────────── */
@@ -302,7 +312,7 @@ section { margin-bottom: 32px; }
 }
 .segmented-btn {
   background: var(--surface); color: var(--muted); border: none;
-  border-right: 1px solid var(--border); padding: 6px 14px;
+  border-right: 1px solid var(--border); padding: 8px 14px;
   font-size: 13px; cursor: pointer; transition: background .12s, color .12s;
 }
 .segmented-btn:last-child { border-right: none; }
@@ -315,13 +325,36 @@ section { margin-bottom: 32px; }
 .header-controls {
   margin-left: auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
 }
-.search-box {
+/* Fleet aligns its filters to the left (no big title above them). */
+.header-controls.left { margin-left: 0; }
+.fleet-cluster-meta { margin-left: auto; }
+.search-box, .filter-select {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--r); color: var(--text);
-  padding: 6px 12px; font-size: 13px; min-width: 200px;
+  padding: 8px 12px; font-size: 13px; line-height: 1.4;
+}
+.search-box { min-width: 200px; }
+/* Strip the native select chrome (which renders taller than the input/buttons)
+   and supply a matching chevron so the dropdown lines up with the rest of the row. */
+.filter-select {
+  min-width: 160px; cursor: pointer;
+  appearance: none; -webkit-appearance: none;
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238892a4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
 }
 .search-box::placeholder { color: var(--muted); }
-.search-box:focus-visible { outline: 2px solid var(--blue); outline-offset: -1px; border-color: var(--blue); }
+.search-box:focus-visible,
+.filter-select:focus-visible { outline: 2px solid var(--blue); outline-offset: -1px; border-color: var(--blue); }
+/* On mobile the namespace dropdown and search expand to fill the row; the
+   segmented type filter keeps its natural width above them. */
+@media (max-width: 639px) {
+  .header-controls { width: 100%; }
+  .header-controls .segmented { width: 100%; }
+  .header-controls .segmented-btn { flex: 1; }
+  .filter-select, .search-box { flex: 1 1 45%; min-width: 0; }
+}
 
 /* ── Cards ───────────────────────────────────────────────────────────────── */
 .card-grid {
@@ -513,6 +546,8 @@ tr.row-hit td:first-child { box-shadow: inset 3px 0 0 var(--blue); }
 .health-chip.ok svg   { color: var(--green); }
 .health-chip.warn { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, transparent); }
 .health-chip.warn svg { color: var(--amber); }
+.health-chip.err  { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, transparent); }
+.health-chip.err svg  { color: var(--red); }
 .health-chip-name   { color: var(--text); font-weight: 600; }
 .health-chip.ok .health-chip-name,
 .health-chip.warn .health-chip-name { color: inherit; }

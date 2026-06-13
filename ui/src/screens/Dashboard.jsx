@@ -101,7 +101,6 @@ export function Dashboard() {
     <div class="screen">
       <div class="screen-header">
         <h1 class="screen-title">Dashboard</h1>
-        <span class={`sse-dot ${sse.connected ? 'live' : 'offline'}`} title={sse.connected ? 'Live' : 'Disconnected'} />
         {clusterData && <span class="cluster-meta">{clusterData.kubernetes_version}</span>}
       </div>
 

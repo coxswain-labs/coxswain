@@ -88,7 +88,6 @@ export function RouteInspector({ kind, namespace, name, query }) {
           <div class="screen-meta">{namespace} · {isHttp ? 'HTTPRoute' : 'Ingress'}</div>
         </div>
         <div class="header-badges">
-          <span class={`sse-dot ${sse.connected ? 'live' : 'offline'}`} title={sse.connected ? 'Live' : 'Disconnected'} />
           <button class="btn" onClick={() => setShowManifest(true)}>View manifest</button>
         </div>
       </div>

@@ -10,7 +10,6 @@ import { SearchBox } from '../components/SearchBox.jsx';
 import { Card, CardFooter, CardGrid } from '../components/Card.jsx';
 import { CopyButton } from '../components/CopyButton.jsx';
 import { TruncatedName } from '../components/TruncatedName.jsx';
-import { ReachableDot } from '../components/StatusDot.jsx';
 import { ErrorState } from '../components/Spinner.jsx';
 import { useEffect } from 'preact/hooks';
 
@@ -64,30 +63,33 @@ export function Fleet({ query }) {
   const controllerList = controllers.data?.controllers ?? [];
   const clusterData    = cluster.data;
 
-  // Bucket proxies by component, then apply the search. Unreachable entries
-  // still carry `component` from the fleet snapshot, so dedicated proxies that
-  // fail their probe land in the right section rather than a catch-all.
-  const shownControllers = controllerList.filter((c) => matchesSearch(c.pod_name, 'controller', q));
+  // Namespace options span every pod, independent of the current filters, so the
+  // dropdown always offers the full set. `?ns=` makes the choice permalinkable.
+  const namespaces = [...new Set(
+    [...controllerList, ...proxyList].map((p) => p.pod_namespace).filter(Boolean),
+  )].sort();
+  const nsFilter = namespaces.includes(query?.ns) ? query.ns : 'all';
+  const inNs = (p) => nsFilter === 'all' || p.pod_namespace === nsFilter;
+
+  // Bucket proxies by component, then apply the namespace + search filters.
+  // Unreachable entries still carry `component`/`pod_namespace` from the fleet
+  // snapshot, so they land in the right section rather than a catch-all.
+  const shownControllers = controllerList.filter((c) => inNs(c) && matchesSearch(c.pod_name, 'controller', q));
   const shownShared = proxyList.filter(
-    (p) => p.component !== 'dedicated-proxy' && matchesSearch(p.pod_name, 'shared proxy', q),
+    (p) => p.component !== 'dedicated-proxy' && inNs(p) && matchesSearch(p.pod_name, 'shared proxy', q),
   );
   const shownDedicated = proxyList.filter(
-    (p) => p.component === 'dedicated-proxy' && matchesSearch(p.pod_name, 'dedicated proxy', q),
+    (p) => p.component === 'dedicated-proxy' && inNs(p) && matchesSearch(p.pod_name, 'dedicated proxy', q),
   );
 
   const show = (key) => filter === 'all' || filter === key;
-  const searching = q !== '';
+  const searching = q !== '' || nsFilter !== 'all';
 
   return (
     <div class="screen">
       <Breadcrumb items={[{ label: 'Fleet' }]} />
       <div class="screen-header">
-        <h1 class="screen-title">Fleet</h1>
-        <span class={`sse-dot ${sse.connected ? 'live' : 'offline'}`} title={sse.connected ? 'Live' : 'Disconnected'} />
-        {clusterData && (
-          <span class="cluster-meta">{clusterData.kubernetes_version}</span>
-        )}
-        <div class="header-controls">
+        <div class="header-controls left">
           <div class="segmented" role="tablist" aria-label="Filter fleet">
             {FILTERS.map((f) => (
               <button
@@ -102,8 +104,22 @@ export function Fleet({ query }) {
               </button>
             ))}
           </div>
+          <select
+            class="filter-select"
+            aria-label="Filter by namespace"
+            value={nsFilter}
+            onChange={(e) => updateQuery({ ns: e.currentTarget.value === 'all' ? null : e.currentTarget.value })}
+          >
+            <option value="all">All namespaces</option>
+            {namespaces.map((ns) => (
+              <option key={ns} value={ns}>{ns}</option>
+            ))}
+          </select>
           <SearchBox value={search} onInput={onSearch} label="Search fleet by pod name or type" />
         </div>
+        {clusterData && (
+          <span class="cluster-meta fleet-cluster-meta">{clusterData.kubernetes_version}</span>
+        )}
       </div>
 
       {/* Controller inventory — leader-elected status writers come first */}
@@ -187,7 +203,7 @@ export function Fleet({ query }) {
  * Namespace sits at the top as an eyebrow line (same font weight/size as the
  * name) with the type/status badge to its right; the long pod name gets its
  * own full-width line below so it can wrap without crowding the badge. The
- * footer carries the secondary meta (IP, gateway ref) and a reachability dot.
+ * footer carries the optional gateway ref and a single status chip.
  */
 function PodCard({ namespace, name, badge, meta, reachable, health, degradedChecks, onClick }) {
   return (
@@ -202,22 +218,25 @@ function PodCard({ namespace, name, badge, meta, reachable, health, degradedChec
       </div>
       <CardFooter
         left={meta}
-        right={
-          <span class="card-foot-right">
-            {reachable && <CardHealthChip health={health} degradedChecks={degradedChecks} />}
-            <ReachableDot reachable={reachable} />
-          </span>
-        }
+        right={<CardStatusChip reachable={reachable} health={health} degradedChecks={degradedChecks} />}
       />
     </Card>
   );
 }
 
-/** Coarse per-pod health from the list-endpoint rollup: green when every
- *  subsystem is ready, amber when any isn't (failing checks in the tooltip). */
-function CardHealthChip({ health, degradedChecks }) {
-  if (!health) return null;
-  const degraded = health !== 'ready';
+/** Single per-pod status chip: one consistent pill for the whole reachable +
+ *  health story (unreachable / degraded / healthy), replacing the old pairing of
+ *  a "healthy" pill next to a differently-styled "reachable" dot. */
+function CardStatusChip({ reachable, health, degradedChecks }) {
+  if (!reachable) {
+    return (
+      <span class="health-chip sm err" title="Did not respond to health probe">
+        <Icon name="alert" size={12} />
+        unreachable
+      </span>
+    );
+  }
+  const degraded = Boolean(health) && health !== 'ready';
   const title = degraded
     ? `Degraded: ${(degradedChecks ?? []).join(', ') || 'subsystem not ready'}`
     : 'All subsystems ready';
@@ -230,59 +249,42 @@ function CardHealthChip({ health, degradedChecks }) {
 }
 
 function ProxyCard({ proxy }) {
-  if (!proxy.reachable) {
-    return (
-      <PodCard
-        namespace={proxy.pod_namespace}
-        name={proxy.pod_name}
-        badge={<Badge variant="fail">unreachable</Badge>}
-        meta=""
-        reachable={false}
-      />
-    );
-  }
-
+  // Pool is known from the snapshot even when unreachable, so the type badge
+  // stays put; the status chip carries reachable/health. Gateway ref only (no
+  // IP) as secondary meta — present for dedicated proxies, empty for shared.
   const pool = proxy.component === 'dedicated-proxy' ? 'dedicated' : 'shared';
-  const meta = `${proxy.pod_ip ?? ''}${proxy.gateway_ref ? ` · ${proxy.gateway_ref}` : ''}`;
   return (
     <PodCard
       namespace={proxy.pod_namespace}
       name={proxy.pod_name}
       badge={poolBadge(pool)}
-      meta={meta}
-      reachable
+      meta={proxy.gateway_ref ?? ''}
+      reachable={proxy.reachable}
       health={proxy.health}
       degradedChecks={proxy.degraded_checks}
-      onClick={() => nav.proxy(proxy.pod_name)}
+      onClick={proxy.reachable ? () => nav.proxy(proxy.pod_name) : undefined}
     />
   );
 }
 
 function ControllerCard({ controller }) {
-  if (!controller.reachable) {
-    return (
-      <PodCard
-        namespace={controller.pod_namespace}
-        name={controller.pod_name}
-        badge={<Badge variant="fail">unreachable</Badge>}
-        meta=""
-        reachable={false}
-      />
-    );
-  }
-
+  // Leadership is only known when reachable; otherwise omit the role badge
+  // rather than imply "standby". The status chip carries reachable/health.
+  const badge = controller.reachable ? (
+    <Badge variant={controller.is_leader ? 'leader' : 'standby'}>
+      {controller.is_leader ? 'leader' : 'standby'}
+    </Badge>
+  ) : null;
   return (
     <PodCard
       namespace={controller.pod_namespace}
       name={controller.pod_name}
-      badge={<Badge variant={controller.is_leader ? 'leader' : 'standby'}>
-        {controller.is_leader ? 'leader' : 'standby'}
-      </Badge>}
-      meta={controller.pod_ip ?? ''}
-      reachable
+      badge={badge}
+      meta=""
+      reachable={controller.reachable}
       health={controller.health}
       degradedChecks={controller.degraded_checks}
-      onClick={() => nav.controller(controller.pod_name)}
+      onClick={controller.reachable ? () => nav.controller(controller.pod_name) : undefined}
     />
   );
 }

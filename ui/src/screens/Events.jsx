@@ -80,7 +80,6 @@ export function Events() {
       <Breadcrumb items={[{ label: 'Events' }]} />
       <div class="screen-header">
         <h1 class="screen-title">Events</h1>
-        <span class={`sse-dot ${sse.connected ? 'live' : 'offline'}`} title={sse.connected ? 'Live' : 'Disconnected'} />
         <div class="event-controls">
           {paused ? (
             <button class="btn" onClick={resume}>

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { nav, navKeyFor } from '../router.js';
+import { useSSE } from '../hooks/useSSE.js';
 
 /**
  * Top navigation bar.
@@ -14,6 +15,7 @@ import { nav, navKeyFor } from '../router.js';
  */
 export function Nav({ activeScreen }) {
   const active    = navKeyFor(activeScreen);
+  const { connected } = useSSE('/api/v1/events');
   const [open, setOpen] = useState(false);
   const menuRef   = useRef(null);
   const btnRef    = useRef(null);
@@ -82,6 +84,9 @@ export function Nav({ activeScreen }) {
         ))}
       </nav>
 
+      {/* Stream status — single source of truth, inline on wide screens */}
+      <SSEStatus connected={connected} class="nav-status-inline" />
+
       {/* Hamburger — visible on narrow screens */}
       <button
         ref={btnRef}
@@ -130,8 +135,29 @@ export function Nav({ activeScreen }) {
             />
           ))}
         </div>
+        {/* Stream status folds to the foot of the drawer on narrow screens */}
+        <div class="nav-drawer-footer">
+          <SSEStatus connected={connected} />
+        </div>
       </nav>
     </header>
+  );
+}
+
+/** Single global stream-connection indicator: Live (green) / Disconnected
+ *  (red). Rendered in the nav bar on wide screens and in the drawer foot on
+ *  narrow ones — never repeated per screen. */
+function SSEStatus({ connected, class: className = '' }) {
+  return (
+    <span
+      class={`nav-status ${connected ? 'live' : 'offline'} ${className}`}
+      role="status"
+      aria-label={connected ? 'Live — receiving events' : 'Disconnected from event stream'}
+      title={connected ? 'Live — receiving events' : 'Disconnected'}
+    >
+      <span class="nav-status-dot" aria-hidden="true" />
+      {connected ? 'Live' : 'Disconnected'}
+    </span>
   );
 }
 
