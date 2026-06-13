@@ -380,3 +380,93 @@ async fn access_log_disabled_emits_nothing() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Poll the controller's `/api/v1/problems` until `pick` returns a matching
+/// problem row, or fail after `timeout`. The aggregator fans out to proxies and
+/// the reconciler debounces, so allow a generous window.
+async fn wait_for_problem(
+    h: &Harness,
+    bucket: &str,
+    pick: impl Fn(&serde_json::Value) -> bool,
+    timeout: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    let url = h.controller_admin_url("/api/v1/problems");
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let json: serde_json::Value = client.get(&url).send().await?.json().await?;
+        if let Some(row) = json[bucket]
+            .as_array()
+            .and_then(|a| a.iter().find(|r| pick(r)))
+        {
+            return Ok(row.clone());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("no matching `{bucket}` problem within timeout: {json}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// A dead backend (Service with zero ready endpoints) must appear in
+/// `/api/v1/problems.dead_routes` carrying its source route's identity, so the
+/// Dashboard card can deep-link to the Route Inspector.
+#[tokio::test]
+async fn problems_dead_backend_carries_route_identity() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-dead").await?;
+
+    fixtures::apply_fixture(ingress::PROBLEMS_DEAD_BACKEND, FixtureVars::new(&ns.name)).await?;
+
+    // The route is installed as a 503 dead route; once it serves 503 the table
+    // is built and the problem is observable.
+    let host = format!("dead.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &host, "/", 503, Duration::from_secs(60)).await?;
+
+    let row = wait_for_problem(
+        &h,
+        "dead_routes",
+        |r| r["host"] == host && r["path"] == "/",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    assert_eq!(row["route"]["kind"], "Ingress");
+    assert_eq!(row["route"]["namespace"], ns.name);
+    assert_eq!(row["route"]["name"], "dead-ingress");
+    Ok(())
+}
+
+/// A routing conflict (a `/shadow/` rule shadowed by `/shadow`) must appear in
+/// `/api/v1/problems.conflicts` carrying the rejected route's identity — proving
+/// the routing core captures the shadowed route_id end-to-end.
+#[tokio::test]
+async fn problems_conflict_carries_rejected_route_identity() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-conflict").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::PROBLEMS_CONFLICT, FixtureVars::new(&ns.name)).await?;
+
+    // The winning `/shadow` rule serves 200 once the table is built; the
+    // shadowed `/shadow/` rule is recorded as a conflict in the same build.
+    let host = format!("conflict.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &host, "/shadow", 200, Duration::from_secs(60)).await?;
+
+    let row = wait_for_problem(
+        &h,
+        "conflicts",
+        |r| r["host"] == host,
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    assert_eq!(row["kind"], "ingress");
+    assert_eq!(row["route"]["kind"], "Ingress");
+    assert_eq!(row["route"]["namespace"], ns.name);
+    assert_eq!(row["route"]["name"], "conflict-ingress");
+    Ok(())
+}

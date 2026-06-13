@@ -172,17 +172,21 @@ impl HostRouterBuilder {
         self
     }
 
-    /// Compiles accumulated routes into an immutable [`HostRouter`].
+    /// Compiles accumulated routes into an immutable [`HostRouter`], returning any
+    /// [`RouteConflict`]s for prefix path groups that were shadowed by an
+    /// earlier-inserted pattern (one per shadowed group, with `host`/`port` left
+    /// for the caller to stamp).
     ///
     /// # Errors
     /// Returns [`RouterError::MatchitInsert`] if an exact-path pattern is rejected
-    /// by the `matchit` router (prefix-path conflicts are logged and silently
-    /// dropped). Returns [`RouterError::Regex`] if a regex pattern fails to compile.
+    /// by the `matchit` router. Returns [`RouterError::Regex`] if a regex pattern
+    /// fails to compile.
     pub(crate) fn build(
         self,
     ) -> Result<(HostRouter, Vec<RouteConflict>), super::table::RouterError> {
         let mut router: Router<Box<[Arc<RouteEntry>]>> = Router::new();
         let mut route_info: Vec<RouteInfo> = Vec::new();
+        let mut conflicts: Vec<RouteConflict> = Vec::new();
         let mut has_query_predicates = false;
 
         // Track whether any entry uses query predicates.
@@ -238,6 +242,12 @@ impl HostRouterBuilder {
             }
             let frozen = sort_and_freeze(entries);
 
+            // A matchit insert failure means this group's pattern collides with an
+            // earlier-inserted pattern, so the whole group is shadowed (silently
+            // dropped). One group triggers up to three insert attempts; `shadowed`
+            // collapses them into a single recorded conflict below.
+            let mut shadowed = false;
+
             // Gateway API prefix semantics:
             //   "/foo"  matches /foo, /foo/, /foo/anything
             //   "/foo/" matches /foo/, /foo/anything (NOT /foo)
@@ -249,24 +259,44 @@ impl HostRouterBuilder {
             if base.is_empty() {
                 if let Err(e) = router.insert("/", frozen.clone()) {
                     log_conflict(&frozen, "/", &e);
+                    shadowed = true;
                 }
                 if let Err(e) = router.insert("/{*rest}", frozen.clone()) {
                     log_conflict(&frozen, "/{*rest}", &e);
+                    shadowed = true;
                 }
             } else {
                 if !had_trailing_slash
                     && let Err(e) = router.insert(base.to_string(), frozen.clone())
                 {
                     log_conflict(&frozen, base, &e);
+                    shadowed = true;
                 }
                 let with_slash = format!("{base}/");
                 if let Err(e) = router.insert(with_slash.clone(), frozen.clone()) {
                     log_conflict(&frozen, &with_slash, &e);
+                    shadowed = true;
                 }
                 let wildcard = format!("{base}/{{*rest}}");
                 if let Err(e) = router.insert(wildcard.clone(), frozen.clone()) {
                     log_conflict(&frozen, &wildcard, &e);
+                    shadowed = true;
                 }
+            }
+
+            // Record one conflict per shadowed group, attributed to the
+            // highest-precedence entry (`frozen` is already specificity-sorted).
+            // `host`/`port` are placeholders; `PortRoutingTableBuilder::build`
+            // stamps the real values.
+            if shadowed && let Some(rep) = frozen.first() {
+                conflicts.push(RouteConflict {
+                    port: 0,
+                    host: String::new(),
+                    path: path.clone(),
+                    kind: RouteKind::Prefix,
+                    rejected_group: rep.backend_group.name().to_string(),
+                    rejected_route_id: rep.route_id.clone(),
+                });
             }
         }
 
@@ -299,7 +329,7 @@ impl HostRouterBuilder {
                 has_query_predicates,
                 route_info,
             },
-            vec![], // no path-level conflicts in the predicate model
+            conflicts,
         ))
     }
 }
@@ -397,25 +427,75 @@ mod tests {
     }
 
     #[test]
-    #[tracing_test::traced_test]
-    fn prefix_insert_collision_emits_debug_log() {
+    fn prefix_shadow_records_conflict_with_rejected_route() {
         let first = make_group("first", "10.0.0.1:80");
         let second = make_group("second", "10.0.0.2:80");
 
         let mut b = RoutingTableBuilder::new();
         let host = b.for_port(PORT).exact_host("example.com");
-        // /foo expands to: /foo, /foo/, /foo/{*rest}
-        // /foo/ expands to: /foo/, /foo/{*rest}
-        // The second group's inserts collide with the first.
-        host.add_prefix_route("/foo", entry(first));
-        host.add_prefix_route("/foo/", entry(second));
+        // /foo (added first) claims /foo, /foo/, /foo/{*rest}; /foo/ (added second)
+        // collides on /foo/ and /foo/{*rest} and is the shadowed group.
+        host.add_prefix_route(
+            "/foo",
+            Arc::new(RouteEntry::path_only(
+                first,
+                "default/first-route".to_string(),
+                None,
+            )),
+        );
+        host.add_prefix_route(
+            "/foo/",
+            Arc::new(RouteEntry::path_only(
+                second,
+                "default/second-route".to_string(),
+                None,
+            )),
+        );
 
-        let _table = b.build().unwrap();
+        let table = b.build().unwrap();
+        let conflicts = table.conflicts();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "exactly one conflict for the shadowed group"
+        );
+        let c = &conflicts[0];
+        assert_eq!(c.host, "example.com");
+        assert_eq!(c.port, PORT);
+        assert_eq!(c.path, "/foo/");
+        assert!(matches!(c.kind, RouteKind::Prefix));
+        assert_eq!(c.rejected_route_id, "default/second-route");
+        assert_eq!(c.rejected_group, "second");
+    }
 
-        assert!(logs_contain(
-            "host router prefix insert shadowed by earlier rule"
+    #[test]
+    fn same_path_different_predicates_is_not_a_conflict() {
+        // Two routes on the SAME path differentiated by predicates are merged into
+        // one group and coexist — legitimate, not a shadow conflict.
+        let specific = make_group("specific", "10.0.0.1:80");
+        let generic = make_group("generic", "10.0.0.2:80");
+        let with_header = Arc::new(RouteEntry::new(
+            specific,
+            make_predicates(None, &[("x-tenant", "acme")], &[]),
+            "default/specific".to_string(),
+            None,
         ));
-        assert!(logs_contain("default/svc"));
+        let plain = Arc::new(RouteEntry::path_only(
+            generic,
+            "default/generic".to_string(),
+            None,
+        ));
+
+        let mut b = RoutingTableBuilder::new();
+        let host = b.for_port(PORT).exact_host("example.com");
+        host.add_prefix_route("/api", with_header);
+        host.add_prefix_route("/api", plain);
+
+        let table = b.build().unwrap();
+        assert!(
+            table.conflicts().is_empty(),
+            "same-path predicate coexistence must not be reported as a conflict"
+        );
     }
 
     #[test]

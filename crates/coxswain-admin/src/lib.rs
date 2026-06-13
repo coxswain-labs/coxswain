@@ -408,12 +408,20 @@ fn routes_block<K>(table: &RoutingTable<K>) -> serde_json::Value {
         .conflicts()
         .iter()
         .map(|c| {
+            // `rejected_route_id` is `"{namespace}/{name}"` of the shadowed route;
+            // split so the UI can deep-link a conflict to that route.
+            let (namespace, name) = c
+                .rejected_route_id
+                .split_once('/')
+                .unwrap_or(("", c.rejected_route_id.as_str()));
             serde_json::json!({
                 "port": c.port,
                 "host": c.host,
                 "type": c.kind.as_str(),
                 "path": c.path,
                 "rejected_group": c.rejected_group,
+                "namespace": namespace,
+                "name": name,
             })
         })
         .collect();

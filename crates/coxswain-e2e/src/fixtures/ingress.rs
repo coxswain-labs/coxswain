@@ -24,3 +24,9 @@ pub const WILDCARD_HOST: &str = fixture!("wildcard_host.yaml");
 pub const NAMED_PORT: &str = fixture!("named_port.yaml");
 /// IngressClass annotated `is-default-class: "true"` for default-class tests.
 pub const DEFAULT_CLASS: &str = fixture!("default_class.yaml");
+/// Ingress whose backend Service has zero ready endpoints (dead route / 503),
+/// for the `/api/v1/problems` dead-backend route-identity test.
+pub const PROBLEMS_DEAD_BACKEND: &str = fixture!("problems_dead_backend.yaml");
+/// Ingress whose `/shadow/` rule is shadowed by its `/shadow` rule (routing
+/// conflict), for the `/api/v1/problems` conflict route-identity test.
+pub const PROBLEMS_CONFLICT: &str = fixture!("problems_conflict.yaml");

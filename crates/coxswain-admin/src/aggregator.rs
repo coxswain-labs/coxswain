@@ -909,110 +909,147 @@ impl OperatorAggregator {
     /// which proxies reported that problem.
     pub(crate) async fn list_problems(&self) -> Response<Vec<u8>> {
         let raw = self.fan_out_routes().await;
+        json_response(aggregate_problems(&raw).to_string())
+    }
+}
 
-        // (host, path, rejected_group, kind) → pods; BTreeMap for stable output
-        // ordering. `kind` ("ingress"/"gateway") is part of the key so the
-        // Dashboard can attribute a problem to the right resource tile.
-        let mut conflicts: std::collections::BTreeMap<
-            (String, String, String, String),
-            Vec<String>,
-        > = std::collections::BTreeMap::new();
-        // (host, path, backend_group, kind) → pods
-        let mut dead_routes: std::collections::BTreeMap<
-            (String, String, String, String),
-            Vec<String>,
-        > = std::collections::BTreeMap::new();
+/// De-dupe and aggregate fanned-out proxy `/routes` results into the
+/// `/api/v1/problems` payload. Split out from [`OperatorAggregator::list_problems`]
+/// so it is unit-testable without a live fan-out.
+///
+/// Shared proxies carry an identical table, so each problem is keyed by
+/// `(host, path, group, kind)` and de-duped across pods; `pods` lists which
+/// proxies reported it. Each problem also carries `route: {kind, namespace, name}`
+/// — the source Ingress/HTTPRoute identity — so the operator UI can deep-link the
+/// card to that route in the Route Inspector. (For a conflict, this is the
+/// rejected/shadowed route.)
+fn aggregate_problems(raw: &[serde_json::Value]) -> serde_json::Value {
+    // (host, path, group, kind) → (route_ns, route_name, pods). BTreeMap for
+    // stable output ordering.
+    type ProblemMap =
+        std::collections::BTreeMap<(String, String, String, String), (String, String, Vec<String>)>;
+    let mut conflicts: ProblemMap = std::collections::BTreeMap::new();
+    let mut dead_routes: ProblemMap = std::collections::BTreeMap::new();
 
-        for proxy in &raw {
-            let pod_name = proxy["pod_name"].as_str().unwrap_or("").to_owned();
-            if !proxy["reachable"].as_bool().unwrap_or(false) {
-                continue;
-            }
-            let routes = &proxy["routes"];
+    for proxy in raw {
+        let pod_name = proxy["pod_name"].as_str().unwrap_or("").to_owned();
+        if !proxy["reachable"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let routes = &proxy["routes"];
 
-            for spec in ["ingress", "gateway"] {
-                if let Some(conflict_arr) = routes[spec]["conflicts"].as_array() {
-                    for c in conflict_arr {
-                        let key = (
-                            c["host"].as_str().unwrap_or("").to_owned(),
-                            c["path"].as_str().unwrap_or("").to_owned(),
-                            c["rejected_group"].as_str().unwrap_or("").to_owned(),
-                            spec.to_owned(),
-                        );
-                        conflicts.entry(key).or_default().push(pod_name.clone());
-                    }
+        for spec in ["ingress", "gateway"] {
+            if let Some(conflict_arr) = routes[spec]["conflicts"].as_array() {
+                for c in conflict_arr {
+                    let key = (
+                        c["host"].as_str().unwrap_or("").to_owned(),
+                        c["path"].as_str().unwrap_or("").to_owned(),
+                        c["rejected_group"].as_str().unwrap_or("").to_owned(),
+                        spec.to_owned(),
+                    );
+                    let route_ns = c["namespace"].as_str().unwrap_or("").to_owned();
+                    let route_name = c["name"].as_str().unwrap_or("").to_owned();
+                    conflicts
+                        .entry(key)
+                        .or_insert_with(|| (route_ns, route_name, Vec::new()))
+                        .2
+                        .push(pod_name.clone());
                 }
+            }
 
-                if let Some(hosts) = routes[spec]["hosts"].as_array() {
-                    for host_entry in hosts {
-                        let host = host_entry["host"].as_str().unwrap_or("").to_owned();
-                        if let Some(route_arr) = host_entry["routes"].as_array() {
-                            for route in route_arr {
-                                let is_dead =
-                                    route["endpoints"].as_array().is_some_and(|e| e.is_empty());
-                                if is_dead {
-                                    let key = (
-                                        host.clone(),
-                                        route["path"].as_str().unwrap_or("").to_owned(),
-                                        route["backend_group"].as_str().unwrap_or("").to_owned(),
-                                        spec.to_owned(),
-                                    );
-                                    dead_routes.entry(key).or_default().push(pod_name.clone());
-                                }
+            if let Some(hosts) = routes[spec]["hosts"].as_array() {
+                for host_entry in hosts {
+                    let host = host_entry["host"].as_str().unwrap_or("").to_owned();
+                    if let Some(route_arr) = host_entry["routes"].as_array() {
+                        for route in route_arr {
+                            let is_dead =
+                                route["endpoints"].as_array().is_some_and(|e| e.is_empty());
+                            if is_dead {
+                                let key = (
+                                    host.clone(),
+                                    route["path"].as_str().unwrap_or("").to_owned(),
+                                    route["backend_group"].as_str().unwrap_or("").to_owned(),
+                                    spec.to_owned(),
+                                );
+                                let route_ns = route["namespace"].as_str().unwrap_or("").to_owned();
+                                let route_name = route["name"].as_str().unwrap_or("").to_owned();
+                                dead_routes
+                                    .entry(key)
+                                    .or_insert_with(|| (route_ns, route_name, Vec::new()))
+                                    .2
+                                    .push(pod_name.clone());
                             }
                         }
                     }
                 }
             }
         }
+    }
 
-        let conflicts_json: Vec<serde_json::Value> = conflicts
-            .into_iter()
-            .map(|((host, path, rejected_group, kind), pods)| {
+    // Map the routing surface to the source resource kind for the deep-link.
+    let route_kind = |spec: &str| {
+        if spec == "ingress" {
+            "Ingress"
+        } else {
+            "HTTPRoute"
+        }
+    };
+
+    let conflicts_json: Vec<serde_json::Value> = conflicts
+        .into_iter()
+        .map(
+            |((host, path, rejected_group, kind), (namespace, name, pods))| {
                 serde_json::json!({
                     "host": host,
                     "path": path,
                     "rejected_group": rejected_group,
                     "kind": kind,
                     "pods": pods,
+                    "route": { "kind": route_kind(&kind), "namespace": namespace, "name": name },
                 })
-            })
-            .collect();
+            },
+        )
+        .collect();
 
-        let dead_json: Vec<serde_json::Value> = dead_routes
-            .into_iter()
-            .map(|((host, path, backend_group, kind), pods)| {
+    let dead_json: Vec<serde_json::Value> = dead_routes
+        .into_iter()
+        .map(
+            |((host, path, backend_group, kind), (namespace, name, pods))| {
                 serde_json::json!({
                     "host": host,
                     "path": path,
                     "backend_group": backend_group,
                     "kind": kind,
                     "pods": pods,
+                    "route": { "kind": route_kind(&kind), "namespace": namespace, "name": name },
                 })
-            })
-            .collect();
-
-        json_response(
-            serde_json::json!({
-                "conflicts": conflicts_json,
-                "dead_routes": dead_json,
-            })
-            .to_string(),
+            },
         )
-    }
+        .collect();
+
+    serde_json::json!({ "conflicts": conflicts_json, "dead_routes": dead_json })
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
 
 /// Build an HTML HTTP response from a static body string.
 ///
-/// Used by `AdminServer::ui_response` to serve the embedded operator UI.
+/// Used by `AdminServer::ui_response` to serve the embedded operator UI. The UI
+/// is a single inlined document served from a stable path (`/`) but rebuilt on
+/// every deploy, so it is sent `no-store` — a cached copy would silently mask a
+/// new rollout. The bundle is tiny and same-origin, so there is no caching
+/// benefit to trade away.
 pub(crate) fn html_response(body: &'static str) -> Response<Vec<u8>> {
     let mut r = Response::new(body.as_bytes().to_vec());
     *r.status_mut() = StatusCode::OK;
-    r.headers_mut().insert(
+    let headers = r.headers_mut();
+    headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
     );
     r
 }
@@ -1277,12 +1314,15 @@ mod tests {
     }
 
     #[test]
-    fn list_problems_aggregates_conflicts_and_dead_routes_from_raw_fan_out() {
-        // Simulate two pods reporting the same conflict (shared table).
+    fn aggregate_problems_dedupes_and_carries_route_identity() {
+        // Two pods report the same conflict + dead route (shared table). Each
+        // carries the source route's namespace/name for deep-linking.
         let conflict = serde_json::json!({
             "host": "api.example.com",
             "path": "/v1",
             "rejected_group": "default/shadowed-svc:80",
+            "namespace": "default",
+            "name": "v1-route",
         });
         let dead_host = serde_json::json!({
             "port": 80,
@@ -1291,6 +1331,8 @@ mod tests {
                 "type": "prefix",
                 "path": "/broken",
                 "backend_group": "default/no-pods:8080",
+                "namespace": "default",
+                "name": "broken-ingress",
                 "endpoints": [],
             }]
         });
@@ -1310,90 +1352,50 @@ mod tests {
             fake_routes_result("proxy-2", false, vec![], vec![]),
         ];
 
-        // Exercise the de-dup logic inline (list_problems cannot be tested
-        // end-to-end without a live fan-out; test the de-dup and aggregation
-        // logic directly on the raw result set).
-        let mut conflicts: std::collections::BTreeMap<
-            (String, String, String, String),
-            Vec<String>,
-        > = std::collections::BTreeMap::new();
-        let mut dead_routes: std::collections::BTreeMap<
-            (String, String, String, String),
-            Vec<String>,
-        > = std::collections::BTreeMap::new();
+        let out = aggregate_problems(&raw);
 
-        for proxy in &raw {
-            let pod_name = proxy["pod_name"].as_str().unwrap_or("").to_owned();
-            if !proxy["reachable"].as_bool().unwrap_or(false) {
-                continue;
-            }
-            let routes = &proxy["routes"];
-            for spec in ["ingress", "gateway"] {
-                if let Some(conflict_arr) = routes[spec]["conflicts"].as_array() {
-                    for c in conflict_arr {
-                        let key = (
-                            c["host"].as_str().unwrap_or("").to_owned(),
-                            c["path"].as_str().unwrap_or("").to_owned(),
-                            c["rejected_group"].as_str().unwrap_or("").to_owned(),
-                            spec.to_owned(),
-                        );
-                        conflicts.entry(key).or_default().push(pod_name.clone());
-                    }
-                }
-                if let Some(hosts) = routes[spec]["hosts"].as_array() {
-                    for host_entry in hosts {
-                        let host = host_entry["host"].as_str().unwrap_or("").to_owned();
-                        if let Some(route_arr) = host_entry["routes"].as_array() {
-                            for route in route_arr {
-                                let is_dead =
-                                    route["endpoints"].as_array().is_some_and(|e| e.is_empty());
-                                if is_dead {
-                                    let key = (
-                                        host.clone(),
-                                        route["path"].as_str().unwrap_or("").to_owned(),
-                                        route["backend_group"].as_str().unwrap_or("").to_owned(),
-                                        spec.to_owned(),
-                                    );
-                                    dead_routes.entry(key).or_default().push(pod_name.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // One unique conflict (de-duped from two pods), tagged with its kind.
+        // One unique conflict (de-duped from two pods), tagged with kind + route.
+        let conflicts = out["conflicts"].as_array().unwrap();
         assert_eq!(conflicts.len(), 1);
-        let ((host, path, rejected, kind), pods) = conflicts.into_iter().next().unwrap();
-        assert_eq!(host, "api.example.com");
-        assert_eq!(path, "/v1");
-        assert_eq!(rejected, "default/shadowed-svc:80");
+        let c = &conflicts[0];
+        assert_eq!(c["host"], "api.example.com");
+        assert_eq!(c["path"], "/v1");
+        assert_eq!(c["rejected_group"], "default/shadowed-svc:80");
         assert_eq!(
-            kind, "ingress",
+            c["kind"], "ingress",
             "fake_routes_result populates the ingress block"
         );
         assert_eq!(
-            pods.len(),
+            c["pods"].as_array().unwrap().len(),
             2,
-            "both reachable proxies reported the conflict"
+            "both reachable proxies reported it"
         );
+        // The card deep-links to the rejected route's Route Inspector.
+        assert_eq!(c["route"]["kind"], "Ingress");
+        assert_eq!(c["route"]["namespace"], "default");
+        assert_eq!(c["route"]["name"], "v1-route");
 
-        // One unique dead route (de-duped from two pods).
-        assert_eq!(dead_routes.len(), 1);
-        let ((host, path, bg, kind), pods) = dead_routes.into_iter().next().unwrap();
-        assert_eq!(host, "api.example.com");
-        assert_eq!(path, "/broken");
-        assert_eq!(bg, "default/no-pods:8080");
-        assert_eq!(kind, "ingress");
-        assert_eq!(
-            pods.len(),
-            2,
-            "both reachable proxies reported the dead route"
-        );
+        // One unique dead route (de-duped from two pods), with route identity.
+        let dead = out["dead_routes"].as_array().unwrap();
+        assert_eq!(dead.len(), 1);
+        let d = &dead[0];
+        assert_eq!(d["host"], "api.example.com");
+        assert_eq!(d["path"], "/broken");
+        assert_eq!(d["backend_group"], "default/no-pods:8080");
+        assert_eq!(d["kind"], "ingress");
+        assert_eq!(d["pods"].as_array().unwrap().len(), 2);
+        assert_eq!(d["route"]["kind"], "Ingress");
+        assert_eq!(d["route"]["namespace"], "default");
+        assert_eq!(d["route"]["name"], "broken-ingress");
 
-        // Unreachable pod (proxy-2) was skipped.
-        assert!(!pods.contains(&"proxy-2".to_owned()));
+        // Unreachable pod (proxy-2) contributed nothing.
+        let all_pods: Vec<&str> = conflicts
+            .iter()
+            .chain(dead.iter())
+            .flat_map(|p| p["pods"].as_array().unwrap())
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert!(!all_pods.contains(&"proxy-2"), "unreachable pod is skipped");
     }
 
     // ── find_entry ────────────────────────────────────────────────────────────
@@ -1455,6 +1457,14 @@ mod tests {
                 .get(header::CONTENT_TYPE)
                 .map(|h| h.as_bytes()),
             Some(&b"text/html; charset=utf-8"[..])
+        );
+        // The UI is rebuilt every deploy from a stable path, so it must never be
+        // cached — a stale copy would silently mask a rollout.
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .map(|h| h.as_bytes()),
+            Some(&b"no-store, no-cache, must-revalidate"[..])
         );
         assert_eq!(resp.body(), b"<html><body>hi</body></html>");
         // No trailing newline (unlike json_response).

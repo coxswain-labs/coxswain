@@ -591,6 +591,12 @@ pub struct RouteConflict {
     pub kind: RouteKind,
     /// [`BackendGroup::name`] of the rule that was rejected.
     pub rejected_group: String,
+    /// Source resource identity `"{namespace}/{name}"` of the rejected (shadowed)
+    /// route, mirroring [`RouteEntry::route_id`]. Lets the operator UI deep-link a
+    /// conflict back to the route that was silently dropped. When a shadowed path
+    /// group holds several distinct routes, this is the representative
+    /// (highest-precedence) one — see `HostRouterBuilder::build`.
+    pub rejected_route_id: String,
 }
 
 /// A single routing candidate: a backend group plus the predicates that must hold

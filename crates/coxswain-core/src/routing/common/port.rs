@@ -150,7 +150,11 @@ impl PortTableBuilder {
             .into_iter()
             .map(|(h, b)| {
                 let (router, cs) = b.build()?;
-                conflicts.extend(cs.into_iter().map(|c| RouteConflict { port, ..c }));
+                conflicts.extend(cs.into_iter().map(|c| RouteConflict {
+                    port,
+                    host: h.clone(),
+                    ..c
+                }));
                 Ok((h, router))
             })
             .collect::<Result<HashMap<_, _>, RouterError>>()?;
@@ -160,7 +164,12 @@ impl PortTableBuilder {
             .into_iter()
             .map(|((suffix, kind), b)| {
                 let (router, cs) = b.build()?;
-                conflicts.extend(cs.into_iter().map(|c| RouteConflict { port, ..c }));
+                let host = format!("*.{suffix}");
+                conflicts.extend(cs.into_iter().map(|c| RouteConflict {
+                    port,
+                    host: host.clone(),
+                    ..c
+                }));
                 Ok((suffix, kind, router))
             })
             .collect::<Result<Vec<_>, RouterError>>()?;
@@ -176,7 +185,11 @@ impl PortTableBuilder {
         let catchall = match self.catchall {
             Some(b) => {
                 let (router, cs) = b.build()?;
-                conflicts.extend(cs.into_iter().map(|c| RouteConflict { port, ..c }));
+                conflicts.extend(cs.into_iter().map(|c| RouteConflict {
+                    port,
+                    host: "*".to_string(),
+                    ..c
+                }));
                 Some(router)
             }
             None => None,
