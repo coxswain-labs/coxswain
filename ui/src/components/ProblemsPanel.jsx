@@ -59,6 +59,7 @@ export function ProblemsPanel({ conflicts = [], dead_routes = [], unreachable = 
               key={p.pod_name}
               variant="err"
               namespace={p.pod_namespace}
+              kind={componentLabel(p.component)}
               badge={<Badge variant="fail">unreachable</Badge>}
               title={p.pod_name}
               detail={`${p.component === 'controller' ? 'Controller' : 'Proxy'} did not respond to health probe.`}
@@ -80,6 +81,7 @@ export function ProblemsPanel({ conflicts = [], dead_routes = [], unreachable = 
               key={p.pod_name}
               variant="warn"
               namespace={p.pod_namespace}
+              kind={componentLabel(p.component)}
               badge={<Badge variant="warn">degraded</Badge>}
               title={p.pod_name}
               detail={degradedDetail(p)}
@@ -185,6 +187,16 @@ function routeTarget(row) {
 function proxyTarget(row) {
   const pod = row.pods?.[0];
   return pod ? () => nav.proxy(pod, { host: row.host, path: row.path }) : undefined;
+}
+
+/** Friendly pod-type label for the problem card's Kind line. */
+function componentLabel(component) {
+  switch (component) {
+    case 'controller': return 'Controller';
+    case 'shared-proxy': return 'Proxy (shared)';
+    case 'dedicated-proxy': return 'Proxy (dedicated)';
+    default: return component || '';
+  }
 }
 
 /** The failing-check detail line for a degraded pod, from the rollup's
