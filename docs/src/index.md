@@ -1,20 +1,13 @@
 # Coxswain
 
-!!! warning "Early development"
-    Coxswain is under active development and not yet ready for production. Contribution guidelines will follow as the project matures.
+!!! info "Pre-1.0 — early adopter release"
+    Coxswain's core proxy is functional and passes the full Gateway API standard conformance suite.
+    The per-Ingress annotation surface is under active development (v0.3).
+    **Production use is at your own risk.** Feedback and contributions are welcome.
 
-A Rust Kubernetes Ingress and Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine.
+Coxswain is a Kubernetes Ingress and Gateway API controller written in Rust, using [Pingora](https://github.com/cloudflare/pingora) — Cloudflare's battle-tested proxy library — as the data plane. It serves both `Ingress` and `HTTPRoute` resources from the same proxy fleet, applies routing changes without restarts, and hot-reloads TLS certificates as Secrets change.
 
-## What Coxswain does
-
-| Feature | Detail |
-|---------|--------|
-| **Routing updates** | Routes are applied via an immutable-snapshot atomic-pointer swap on every reconcile — no config reload, no process restart |
-| **Gateway API + Ingress** | Both `HTTPRoute` and classic `Ingress` resources are served by the same controller and proxy fleet; both contribute to the same routing table |
-| **Multi-replica** | All replicas reconcile and serve traffic; a Kubernetes `Lease` coordinates which replica writes status conditions |
-| **TLS hot-reload** | New and renewed certificates are picked up from `kubernetes.io/tls` Secrets without a restart |
-| **Prometheus metrics** | `/metrics` on the admin port |
-| **Structured logging** | JSON (production) or human-readable console format |
+The controller and proxy run as separate pod roles with a strict RBAC boundary: the controller holds all write permissions; proxy pods are read-only. This split makes multi-replica, multi-tenant, and dedicated-mode deployments straightforward.
 
 ## Quick install
 
@@ -30,4 +23,11 @@ See [Getting started](getting-started.md) for the complete walkthrough, or [Inst
 
 ## Roadmap
 
-The [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2){target=_blank} tracks current scope per milestone.
+| Milestone | Theme | Status |
+|-----------|-------|--------|
+| **v0.1** | Foundation — Gateway API conformant (standard channel), Ingress support, signed OCI image, Helm chart | Done |
+| **v0.2** | Architecture — controller/proxy split, dedicated proxy mode, operator web UI | In progress |
+| **v0.3** | Ingress completeness — `ingress.coxswain-labs.dev/*` annotation surface, nginx migration path | Planned |
+| **v0.4** | Gateway API extended — BackendTLSPolicy, client/backend mTLS, HTTP/2 downstream, ListenerSet | Planned |
+
+The [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2){target=_blank} has the full issue-level breakdown.
