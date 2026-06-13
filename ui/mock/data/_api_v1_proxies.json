@@ -1,0 +1,68 @@
+{
+  "proxies": [
+    {
+      "admin_port": 8082,
+      "component": "shared-proxy",
+      "degraded_checks": [],
+      "health": "ready",
+      "pod_ip": "10.42.0.100",
+      "pod_name": "coxswain-shared-proxy-66d-ah7x2",
+      "pod_namespace": "coxswain-system",
+      "reachable": true
+    },
+    {
+      "admin_port": 8082,
+      "component": "shared-proxy",
+      "degraded_checks": [
+        "routing_table_loaded"
+      ],
+      "health": "degraded",
+      "pod_ip": "10.42.0.101",
+      "pod_name": "coxswain-shared-proxy-66d-bk9p4",
+      "pod_namespace": "coxswain-system",
+      "reachable": true
+    },
+    {
+      "admin_port": 8082,
+      "component": "dedicated-proxy",
+      "degraded_checks": [],
+      "health": "ready",
+      "pod_ip": "10.42.0.102",
+      "pod_name": "tenant-a-gw-coxswain-7db74-j8cjt",
+      "pod_namespace": "tenant-a",
+      "reachable": true,
+      "gateway_ref": "tenant-a-gw"
+    },
+    {
+      "admin_port": 8082,
+      "component": "dedicated-proxy",
+      "degraded_checks": [
+        "routing_table_loaded"
+      ],
+      "health": "degraded",
+      "pod_ip": "10.42.0.103",
+      "pod_name": "tenant-a-gw-coxswain-7db74-r5tfb",
+      "pod_namespace": "tenant-a",
+      "reachable": true,
+      "gateway_ref": "tenant-a-gw"
+    },
+    {
+      "admin_port": 8082,
+      "component": "dedicated-proxy",
+      "degraded_checks": [],
+      "health": "ready",
+      "pod_ip": "10.42.0.104",
+      "pod_name": "tenant-b-gw-coxswain-5cc91-m2qd8",
+      "pod_namespace": "tenant-b",
+      "reachable": true,
+      "gateway_ref": "tenant-b-gw"
+    },
+    {
+      "component": "dedicated-proxy",
+      "gateway_ref": "tenant-b-gw",
+      "pod_name": "tenant-b-gw-coxswain-5cc91-zzz00",
+      "pod_namespace": "tenant-b",
+      "reachable": false
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "pod_name": "tenant-b-gw-coxswain-5cc91-m2qd8",
+  "reachable": true,
+  "routes": {
+    "gateway": {
+      "conflicts": [],
+      "hosts": [
+        {
+          "host": "app.tenant-b.local",
+          "port": 8100,
+          "routes": [
+            {
+              "backend_group": "tenant-b/api",
+              "endpoints": [],
+              "name": "b-api",
+              "namespace": "tenant-b",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        }
+      ]
+    },
+    "ingress": {
+      "conflicts": [],
+      "hosts": []
+    }
+  }
+}

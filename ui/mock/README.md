@@ -1,0 +1,28 @@
+# Mock dev server
+
+`npm run dev` serves the operator UI at <http://localhost:5173> with hot-reload
+and a mock `/api/v1/*` backend — no controller, cluster, or container needed.
+Edit anything under `src/` and the browser updates instantly.
+
+## How it works
+
+`plugin.js` is a Vite dev middleware (wired in `vite.config.js`). It answers
+`/api/v1/*` from JSON fixtures in `data/`, mapping a request path to a file by
+replacing `/` with `_` (e.g. `/api/v1/proxies/foo/routes` →
+`data/_api_v1_proxies_foo_routes.json`). `/api/v1/events` is a synthetic SSE
+stream emitting the controller's named events on a loop, so the live indicator
+goes green. The plugin is dev-only — `vite build` never includes it or the
+fixtures.
+
+## Two ways to (re)generate fixtures
+
+- **Synthetic, comprehensive** — `node mock/generate.mjs` writes one coherent
+  cluster that exercises every distinct UI state (leader/standby/degraded/
+  unreachable pods; programmed/not-programmed/not-accepted gateways; dead
+  backends; conflicts; multi-tenant grouping; …). The state matrix is documented
+  at the top of `generate.mjs`. This is the committed default.
+- **Captured from a real controller** — port-forward the admin port, then
+  `BASE=http://localhost:8082 mock/capture.sh`. Snapshots whatever state the
+  live cluster is in. Use when you need to reproduce something real.
+
+A missing fixture returns 404 with a hint on how to capture it.

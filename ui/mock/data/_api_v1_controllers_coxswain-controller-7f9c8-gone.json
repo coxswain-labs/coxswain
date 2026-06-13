@@ -1,0 +1,6 @@
+{
+  "pod_name": "coxswain-controller-7f9c8-gone",
+  "component": "controller",
+  "pod_namespace": "coxswain-system",
+  "reachable": false
+}

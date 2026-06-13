@@ -1,0 +1,45 @@
+{
+  "controllers": [
+    {
+      "admin_port": 8082,
+      "component": "controller",
+      "degraded_checks": [],
+      "health": "ready",
+      "is_leader": true,
+      "pod_ip": "10.42.0.10",
+      "pod_name": "coxswain-controller-7f9c8-leadr",
+      "pod_namespace": "coxswain-system",
+      "reachable": true
+    },
+    {
+      "admin_port": 8082,
+      "component": "controller",
+      "degraded_checks": [],
+      "health": "ready",
+      "is_leader": false,
+      "pod_ip": "10.42.0.11",
+      "pod_name": "coxswain-controller-7f9c8-stdby",
+      "pod_namespace": "coxswain-system",
+      "reachable": true
+    },
+    {
+      "admin_port": 8082,
+      "component": "controller",
+      "degraded_checks": [
+        "gateway"
+      ],
+      "health": "degraded",
+      "is_leader": false,
+      "pod_ip": "10.42.0.12",
+      "pod_name": "coxswain-controller-7f9c8-degrd",
+      "pod_namespace": "coxswain-system",
+      "reachable": true
+    },
+    {
+      "component": "controller",
+      "pod_name": "coxswain-controller-7f9c8-gone",
+      "pod_namespace": "coxswain-system",
+      "reachable": false
+    }
+  ]
+}

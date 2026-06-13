@@ -1,0 +1,9 @@
+{
+  "admin_port": 8082,
+  "component": "dedicated-proxy",
+  "pod_ip": "10.42.0.104",
+  "pod_name": "tenant-b-gw-coxswain-5cc91-m2qd8",
+  "pod_namespace": "tenant-b",
+  "reachable": true,
+  "gateway_ref": "tenant-b-gw"
+}

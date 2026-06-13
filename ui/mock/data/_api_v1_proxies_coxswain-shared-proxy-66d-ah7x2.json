@@ -1,0 +1,8 @@
+{
+  "admin_port": 8082,
+  "component": "shared-proxy",
+  "pod_ip": "10.42.0.100",
+  "pod_name": "coxswain-shared-proxy-66d-ah7x2",
+  "pod_namespace": "coxswain-system",
+  "reachable": true
+}

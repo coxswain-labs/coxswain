@@ -1,0 +1,45 @@
+{
+  "addresses": [
+    "192.168.194.187"
+  ],
+  "attached_routes_list": [
+    {
+      "kind": "HTTPRoute",
+      "name": "a-web-route",
+      "namespace": "tenant-a"
+    }
+  ],
+  "conditions": [
+    {
+      "type": "Accepted",
+      "status": "True",
+      "reason": "Accepted"
+    },
+    {
+      "type": "Programmed",
+      "status": "True",
+      "reason": "Programmed"
+    },
+    {
+      "type": "gateway.coxswain-labs.dev/DedicatedProxyReady",
+      "status": "True",
+      "reason": "Ready",
+      "message": "Dedicated proxy has at least one Ready pod"
+    }
+  ],
+  "listeners": [
+    {
+      "name": "http",
+      "port": 8100,
+      "protocol": "HTTP",
+      "tls_enabled": false,
+      "attached_routes": 1
+    }
+  ],
+  "name": "tenant-a-gw",
+  "namespace": "tenant-a",
+  "proxy": {
+    "pool": "dedicated"
+  },
+  "route_count": 1
+}

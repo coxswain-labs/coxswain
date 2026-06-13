@@ -1,0 +1,9 @@
+{
+  "admin_port": 8082,
+  "component": "controller",
+  "is_leader": false,
+  "pod_ip": "10.42.0.12",
+  "pod_name": "coxswain-controller-7f9c8-degrd",
+  "pod_namespace": "coxswain-system",
+  "reachable": true
+}

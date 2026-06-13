@@ -1,0 +1,7 @@
+{
+  "component": "dedicated-proxy",
+  "gateway_ref": "tenant-b-gw",
+  "pod_name": "tenant-b-gw-coxswain-5cc91-zzz00",
+  "pod_namespace": "tenant-b",
+  "reachable": false
+}
