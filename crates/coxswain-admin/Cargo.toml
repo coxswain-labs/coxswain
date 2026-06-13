@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 async-trait   = { workspace = true }
+bytes         = { workspace = true }
 coxswain-core = { workspace = true }
 futures       = { workspace = true }
 gateway-api   = { workspace = true }
@@ -18,6 +19,7 @@ http          = { workspace = true }
 k8s-openapi   = { workspace = true }
 kube          = { workspace = true }
 pingora-core  = { workspace = true }
+pingora-http  = { workspace = true }
 prometheus    = { workspace = true }
 reqwest       = { workspace = true }
 rustls        = { workspace = true }
