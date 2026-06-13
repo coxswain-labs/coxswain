@@ -58,6 +58,7 @@ export function ProblemsPanel({ conflicts = [], dead_routes = [], unreachable = 
             <ProblemCard
               key={p.pod_name}
               variant="err"
+              namespace={p.pod_namespace}
               badge={<Badge variant="fail">unreachable</Badge>}
               title={p.pod_name}
               detail={`${p.component === 'controller' ? 'Controller' : 'Proxy'} did not respond to health probe.`}
@@ -78,6 +79,7 @@ export function ProblemsPanel({ conflicts = [], dead_routes = [], unreachable = 
             <ProblemCard
               key={p.pod_name}
               variant="warn"
+              namespace={p.pod_namespace}
               badge={<Badge variant="warn">degraded</Badge>}
               title={p.pod_name}
               detail={degradedDetail(p)}
@@ -98,11 +100,12 @@ export function ProblemsPanel({ conflicts = [], dead_routes = [], unreachable = 
             <ProblemCard
               key={i}
               variant="conflict"
-              code
               badge={<Badge variant="conflict">conflict</Badge>}
               title={`${c.host}${c.path}`}
+              namespace={c.route?.namespace}
+              kind={c.route?.kind}
               detail={<>Rejected: <code>{c.rejected_group}</code>{podsLabel(c.pods)}</>}
-              onClick={proxyTarget(c)}
+              onClick={routeTarget(c)}
             />
           ))}
         </ProblemSection>
@@ -119,11 +122,12 @@ export function ProblemsPanel({ conflicts = [], dead_routes = [], unreachable = 
             <ProblemCard
               key={i}
               variant="dead"
-              code
               badge={<Badge variant="dead">0 endpoints</Badge>}
               title={`${d.host}${d.path}`}
+              namespace={d.route?.namespace}
+              kind={d.route?.kind}
               detail={<>Backend: <code>{d.backend_group}</code>{podsLabel(d.pods)}</>}
-              onClick={proxyTarget(d)}
+              onClick={routeTarget(d)}
             />
           ))}
         </ProblemSection>
@@ -160,8 +164,24 @@ function AllClear() {
   );
 }
 
-/** Deep-link a conflict/dead row to the first proxy that sees it, anchored to
- *  the offending host/path. Undefined (non-clickable) if no pod is recorded. */
+/** Deep-link a routing problem (conflict / dead backend) to its source route in
+ *  the Route Inspector — a routing problem belongs on the Routing axis, not a
+ *  proxy. `row.route` ({kind, namespace, name}) is the route's identity from
+ *  `/problems`; the existing `kind` ("ingress"/"gateway") picks the route type.
+ *  Falls back to the proxy-anchored link when identity is absent (older
+ *  controller / unresolved), so the row is never a dead link. */
+function routeTarget(row) {
+  const r = row.route;
+  if (r?.namespace && r?.name) {
+    return row.kind === 'ingress'
+      ? () => nav.ingressRoute(r.namespace, r.name)
+      : () => nav.httproute(r.namespace, r.name);
+  }
+  return proxyTarget(row);
+}
+
+/** Fallback deep-link to the first proxy that sees the row, anchored to the
+ *  offending host/path. Undefined (non-clickable) if no pod is recorded. */
 function proxyTarget(row) {
   const pod = row.pods?.[0];
   return pod ? () => nav.proxy(pod, { host: row.host, path: row.path }) : undefined;
@@ -178,7 +198,7 @@ function degradedDetail(p) {
 
 function podsLabel(pods) {
   if (!pods?.length) return null;
-  return <span class="pods-label"> · {pods.length} proxy{pods.length !== 1 ? 'ies' : ''}</span>;
+  return <span class="pods-label"> · {pods.length} {pods.length === 1 ? 'proxy' : 'proxies'}</span>;
 }
 
 function ProblemSection({ title, count, severity, desc, children }) {
@@ -194,7 +214,7 @@ function ProblemSection({ title, count, severity, desc, children }) {
   );
 }
 
-function ProblemCard({ variant, badge, title, detail, code, onClick }) {
+function ProblemCard({ variant, badge, title, detail, namespace, kind, onClick }) {
   const clickable = !!onClick;
   return (
     <div
@@ -206,9 +226,11 @@ function ProblemCard({ variant, badge, title, detail, code, onClick }) {
     >
       <div class="problem-card-main">
         <div class="problem-card-head">
+          <strong>{title}</strong>
           {badge}
-          {code ? <code>{title}</code> : <strong>{title}</strong>}
         </div>
+        {namespace && <div class="problem-card-meta">Namespace: <code>{namespace}</code></div>}
+        {kind && <div class="problem-card-meta">Kind: <code>{kind}</code></div>}
         <div class="problem-card-detail">{detail}</div>
       </div>
       {clickable && <span class="problem-card-chevron" aria-hidden="true">→</span>}

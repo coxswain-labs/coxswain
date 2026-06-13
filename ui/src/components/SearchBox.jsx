@@ -1,7 +1,8 @@
 /**
  * Shared header search input. Presentational — the owning screen supplies the
- * value and change handler (see `useSearch`). Sits to the right of a screen's
- * segmented filter so the two compose into one right-aligned control cluster.
+ * value and change handler (see `useSearch`). Sits alongside the type/namespace
+ * `FilterSelect` dropdowns, composing into one control cluster that stacks to a
+ * full-width column on mobile.
  */
 export function SearchBox({ value, onInput, placeholder = 'Search name or type…', label = 'Search by name or type' }) {
   return (

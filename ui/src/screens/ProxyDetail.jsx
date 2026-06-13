@@ -155,7 +155,6 @@ function RouteSection({ spec, kind, highlight, pod }) {
   const hosts     = spec?.hosts ?? [];
   const conflicts = spec?.conflicts ?? [];
   const wantPath  = highlight?.path || '/';
-  const from      = { from: `proxy/${pod}` };
 
   return (
     <div>
@@ -198,8 +197,8 @@ function RouteSection({ spec, kind, highlight, pod }) {
                   const linkable = Boolean(r.namespace && r.name);
                   const open = () =>
                     kind === 'httproute'
-                      ? nav.httproute(r.namespace, r.name, from)
-                      : nav.ingressRoute(r.namespace, r.name, from);
+                      ? nav.httproute(r.namespace, r.name)
+                      : nav.ingressRoute(r.namespace, r.name);
                   return (
                     <tr
                       key={i}

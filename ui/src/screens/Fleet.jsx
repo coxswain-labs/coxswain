@@ -1,33 +1,34 @@
 import { useApi } from '../hooks/useApi.js';
 import { useSSE } from '../hooks/useSSE.js';
-import { getProxies, getControllers, getCluster } from '../api/endpoints.js';
+import { getProxies, getControllers } from '../api/endpoints.js';
 import { nav, updateQuery } from '../router.js';
 import { useSearch, matchesSearch } from '../hooks/useSearch.js';
 import { Badge, poolBadge } from '../components/Badge.jsx';
 import { Icon } from '../components/Icon.jsx';
 import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { SearchBox } from '../components/SearchBox.jsx';
+import { FilterSelect } from '../components/FilterSelect.jsx';
 import { Card, CardFooter, CardGrid } from '../components/Card.jsx';
 import { CopyButton } from '../components/CopyButton.jsx';
 import { TruncatedName } from '../components/TruncatedName.jsx';
 import { ErrorState } from '../components/Spinner.jsx';
 import { useEffect } from 'preact/hooks';
 
-/** Segmented sections, mirroring Routing's filter. `all` shows every section;
+/** Type-filter sections, mirroring Routing's filter. `all` shows every section;
  *  the others narrow to one. The key is encoded in `?filter=` for permalinks
  *  and is what the Dashboard tiles deep-link into. */
 const FILTERS = [
-  { key: 'all',         label: 'All' },
-  { key: 'controllers', label: 'Controllers' },
-  { key: 'shared',      label: 'Shared proxies' },
-  { key: 'dedicated',   label: 'Dedicated proxies' },
+  { value: 'all',         label: 'All types' },
+  { value: 'controllers', label: 'Controllers' },
+  { value: 'shared',      label: 'Shared proxies' },
+  { value: 'dedicated',   label: 'Dedicated proxies' },
 ];
 
 /**
  * Fleet screen — the runtime inventory (compute axis).
  *
  * Controllers first (leader-elected status writers), then shared and dedicated
- * proxy pods. A segmented filter (`?filter=`) narrows to one section — the
+ * proxy pods. A type filter (`?filter=`) narrows to one section — the
  * Dashboard tiles deep-link straight into it — and a search box (`?q=`) filters
  * by pod name or type within the shown sections. Both are permalinkable. Live
  * SSE events refetch on pod connect/disconnect and rebuild.
@@ -35,11 +36,10 @@ const FILTERS = [
 export function Fleet({ query }) {
   const proxies    = useApi(getProxies);
   const controllers = useApi(getControllers);
-  const cluster    = useApi(getCluster);
   const sse        = useSSE('/api/v1/events');
 
   const { search, q, onSearch } = useSearch(query);
-  const filter = FILTERS.some((f) => f.key === query?.filter) ? query.filter : 'all';
+  const filter = FILTERS.some((f) => f.value === query?.filter) ? query.filter : 'all';
 
   // Refresh fleet cards on rebuild.
   useEffect(() => {
@@ -61,7 +61,6 @@ export function Fleet({ query }) {
 
   const proxyList      = proxies.data?.proxies ?? [];
   const controllerList = controllers.data?.controllers ?? [];
-  const clusterData    = cluster.data;
 
   // Namespace options span every pod, independent of the current filters, so the
   // dropdown always offers the full set. `?ns=` makes the choice permalinkable.
@@ -82,6 +81,17 @@ export function Fleet({ query }) {
     (p) => p.component === 'dedicated-proxy' && inNs(p) && matchesSearch(p.pod_name, 'dedicated proxy', q),
   );
 
+  // Dedicated proxies are always grouped under their namespace subheader: the
+  // dedicated proxy → Gateway → namespace hierarchy is the natural axis, and at
+  // many tenants a flat grid of near-identical cards is hard to scan. Controllers
+  // and the shared proxy are cluster singletons in coxswain-system, so they stay
+  // flat. Sorted by namespace for a stable, scannable order.
+  const dedicatedByNs = [...shownDedicated.reduce((m, p) => {
+    const ns = p.pod_namespace || '—';
+    (m.get(ns) ?? m.set(ns, []).get(ns)).push(p);
+    return m;
+  }, new Map())].sort(([a], [b]) => a.localeCompare(b));
+
   const show = (key) => filter === 'all' || filter === key;
   const searching = q !== '' || nsFilter !== 'all';
 
@@ -90,36 +100,20 @@ export function Fleet({ query }) {
       <Breadcrumb items={[{ label: 'Fleet' }]} />
       <div class="screen-header">
         <div class="header-controls left">
-          <div class="segmented" role="tablist" aria-label="Filter fleet">
-            {FILTERS.map((f) => (
-              <button
-                key={f.key}
-                type="button"
-                role="tab"
-                aria-selected={filter === f.key}
-                class={`segmented-btn${filter === f.key ? ' active' : ''}`}
-                onClick={() => updateQuery({ filter: f.key === 'all' ? null : f.key })}
-              >
-                {f.label}
-              </button>
-            ))}
-          </div>
-          <select
-            class="filter-select"
-            aria-label="Filter by namespace"
+          <FilterSelect
+            label="Filter by namespace"
             value={nsFilter}
+            options={[{ value: 'all', label: 'All namespaces' }, ...namespaces.map((ns) => ({ value: ns, label: ns }))]}
             onChange={(e) => updateQuery({ ns: e.currentTarget.value === 'all' ? null : e.currentTarget.value })}
-          >
-            <option value="all">All namespaces</option>
-            {namespaces.map((ns) => (
-              <option key={ns} value={ns}>{ns}</option>
-            ))}
-          </select>
+          />
+          <FilterSelect
+            label="Filter by type"
+            value={filter}
+            options={FILTERS}
+            onChange={(e) => updateQuery({ filter: e.currentTarget.value === 'all' ? null : e.currentTarget.value })}
+          />
           <SearchBox value={search} onInput={onSearch} label="Search fleet by pod name or type" />
         </div>
-        {clusterData && (
-          <span class="cluster-meta fleet-cluster-meta">{clusterData.kubernetes_version}</span>
-        )}
       </div>
 
       {/* Controller inventory — leader-elected status writers come first */}
@@ -179,17 +173,26 @@ export function Fleet({ query }) {
           </div>
           {proxies.error ? (
             <ErrorState error={proxies.error} />
+          ) : dedicatedByNs.length === 0 ? (
+            !proxies.loading && (
+              <div style="color:var(--muted);font-size:13px">
+                {searching ? 'No dedicated proxies match.' : 'No dedicated proxy pods found.'}
+              </div>
+            )
           ) : (
-            <CardGrid>
-              {shownDedicated.map((p) => (
-                <ProxyCard key={p.pod_name} proxy={p} />
-              ))}
-              {!proxies.loading && shownDedicated.length === 0 && (
-                <div style="color:var(--muted);font-size:13px">
-                  {searching ? 'No dedicated proxies match.' : 'No dedicated proxy pods found.'}
+            dedicatedByNs.map(([ns, pods]) => (
+              <div key={ns} class="ns-group">
+                <div class="ns-group-head">
+                  <span class="ns-group-name">{ns}</span>
+                  <span class="ns-group-count">{pods.length} {pods.length === 1 ? 'pod' : 'pods'}</span>
                 </div>
-              )}
-            </CardGrid>
+                <CardGrid>
+                  {pods.map((p) => (
+                    <ProxyCard key={p.pod_name} proxy={p} />
+                  ))}
+                </CardGrid>
+              </div>
+            ))
           )}
         </section>
       )}

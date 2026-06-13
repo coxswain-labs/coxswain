@@ -13,7 +13,7 @@ export function Breadcrumb({ items }) {
     <nav aria-label="breadcrumb" class="breadcrumb">
       {items.map((item, i) => (
         <>
-          {i > 0 && <span aria-hidden="true">/</span>}
+          {i > 0 && <span class="breadcrumb-sep" aria-hidden="true">›</span>}
           {item.onClick ? (
             <a key={item.label} onClick={item.onClick}>{item.label}</a>
           ) : (

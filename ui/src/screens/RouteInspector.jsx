@@ -27,35 +27,7 @@ import { useEffect, useState } from 'preact/hooks';
  * Deep-linkable via `#/routes/httproute/{ns}/{name}` or
  * `#/routes/ingress/{ns}/{name}`.
  */
-/**
- * Path-aware breadcrumb for the route inspector. `from` (the `?from=` origin
- * param) records which detail page sent us here, so the trail reflects the real
- * path — `Fleet / proxy-… / route` or `Routing / gateway / route` — instead of
- * the old hardcoded "Fleet / HTTPRoute". Falls back to Routing (the route's
- * canonical home) on a cold or shared load with no origin.
- */
-function buildBreadcrumb(from, current) {
-  const cur = { label: current };
-  if (from?.startsWith('proxy/')) {
-    const pod = from.slice('proxy/'.length);
-    return [
-      { label: 'Fleet', onClick: () => nav.fleet() },
-      { label: pod, onClick: () => nav.proxy(pod) },
-      cur,
-    ];
-  }
-  if (from?.startsWith('gateway/')) {
-    const [, ns, name] = from.split('/');
-    return [
-      { label: 'Routing', onClick: () => nav.routing({ filter: 'gateways' }) },
-      { label: name, onClick: () => nav.gateway(ns, name) },
-      cur,
-    ];
-  }
-  return [{ label: 'Routing', onClick: () => nav.routing() }, cur];
-}
-
-export function RouteInspector({ kind, namespace, name, query }) {
+export function RouteInspector({ kind, namespace, name }) {
   const isHttp = kind === 'httproute';
   const fetcher = isHttp
     ? () => getHttproute(namespace, name)
@@ -69,7 +41,16 @@ export function RouteInspector({ kind, namespace, name, query }) {
     return sse.subscribe('rebuild.completed', () => refetch());
   }, [sse.subscribe, refetch]);
 
-  const breadcrumb = buildBreadcrumb(query?.from, `${namespace}/${name}`);
+  // Type-canonical breadcrumb: a route's home is always Routing, regardless of
+  // how it was reached (proxy verification table, gateway attached-routes, or a
+  // cold deep link). Flat for every route type — an HTTPRoute can attach to
+  // multiple Gateways, so its parent(s) live in the parent-status panel, not the
+  // trail. Cross-axis origin (e.g. the proxy you drilled from) is the Back
+  // button's job, not the breadcrumb's.
+  const breadcrumb = [
+    { label: 'Routing', onClick: () => nav.routing() },
+    { label: `${namespace}/${name}` },
+  ];
 
   if (loading) return <Spinner label={`Loading ${kind}…`} />;
   if (error)   return <ErrorState error={error} />;

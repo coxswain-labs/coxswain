@@ -15,6 +15,9 @@
   --nav-h:   52px;
   --r:       6px;
   --touch:   44px;   /* WCAG 2.5.5 minimum touch target */
+  --control-h: 44px; /* shared height for row controls (select/search); meets the
+                        --touch target so the generic form-field min-height agrees
+                        rather than fighting it */
 }
 
 /* ── Reset ───────────────────────────────────────────────────────────────── */
@@ -39,6 +42,10 @@ code {
 }
 h1, h2, h3 { font-weight: 600; }
 button { cursor: pointer; border: none; background: none; }
+/* Form controls don't inherit typography from the page by default (they use UA
+   fonts/metrics) — the root cause of <select>/<input>/<button> rendering at
+   different heights. Opt them into the page's font so they share one baseline. */
+button, input, select, textarea { font: inherit; color: inherit; }
 img { max-width: 100%; }
 
 /* ── App shell ───────────────────────────────────────────────────────────── */
@@ -215,7 +222,45 @@ img { max-width: 100%; }
 .nav-drawer-footer {
   margin-top: auto; padding: 16px 12px;
   border-top: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
 }
+/* Drawer (mobile) shows versions inline — the drawer has room, no popover. */
+.drawer-versions { display: grid; gap: 4px; }
+.drawer-version { font-size: 12px; color: var(--muted); }
+.drawer-version-label { margin-right: 6px; }
+.drawer-version code {
+  background: none; padding: 0; color: var(--text);
+  font-family: ui-monospace, monospace; font-size: 12px;
+}
+
+/* ── Version info popover (nav bar) ───────────────────────────────────────────
+   Info button just left of the live indicator on wide screens; click opens a
+   dismissible popover (outside-click + Escape) listing deployment versions. */
+.version-info { position: relative; display: inline-flex; }
+.version-info-inline { display: none; margin-left: 16px; }
+@media (min-width: 640px) { .version-info-inline { display: inline-flex; } }
+.version-info-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border-radius: var(--r);
+  color: var(--muted); background: none; border: none; cursor: pointer;
+}
+.version-info-btn:hover,
+.version-info-btn[aria-expanded="true"] { color: var(--text); background: var(--surface2); }
+.version-popover {
+  position: absolute; z-index: 200;
+  top: calc(100% + 8px); right: 0; min-width: 200px;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 12px 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .4);
+}
+.version-popover-title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--muted); margin-bottom: 8px;
+}
+.version-list { display: grid; gap: 6px; }
+.version-row { display: flex; align-items: baseline; justify-content: space-between; gap: 24px; font-size: 13px; }
+.version-row dt { color: var(--muted); }
+.version-row dd { color: var(--text); font-family: ui-monospace, monospace; }
 @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.4; } }
 
 /* ── Screen layout ───────────────────────────────────────────────────────── */
@@ -236,7 +281,6 @@ img { max-width: 100%; }
 .detail-title-row { display: flex; align-items: center; gap: 8px; }
 .detail-head .card-ns { margin-bottom: 2px; }
 .detail-head .screen-meta { margin-top: 4px; font-family: monospace; }
-.cluster-meta { font-size: 12px; color: var(--muted); font-family: monospace; }
 .header-badges { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
 .addr-label { font-size: 12px; font-family: monospace; color: var(--muted); }
 
@@ -267,6 +311,23 @@ section { margin-bottom: 32px; }
   display: inline-block; flex-shrink: 0;
 }
 
+/* Dedicated proxies are bucketed under per-namespace subheaders (the dedicated
+   proxy → Gateway → namespace hierarchy). The subheader sits a tier below the
+   all-caps section title: a namespace label with a pod count, separated by a
+   hairline so groups read as distinct bands without heavy chrome. */
+.ns-group { margin-bottom: 18px; }
+.ns-group:last-child { margin-bottom: 0; }
+.ns-group-head {
+  display: flex; align-items: baseline; gap: 8px;
+  padding-bottom: 6px; margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.ns-group-name {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  font-family: ui-monospace, monospace;
+}
+.ns-group-count { font-size: 12px; color: var(--muted); }
+
 /* ── Breadcrumb ──────────────────────────────────────────────────────────── */
 .breadcrumb {
   display: flex; align-items: center; gap: 6px;
@@ -274,7 +335,12 @@ section { margin-bottom: 32px; }
   flex-wrap: wrap;
 }
 .breadcrumb a { color: var(--blue); cursor: pointer; }
-.breadcrumb span { color: var(--border); }
+/* Inline-flex + stretch centers the chevron glyph against the smaller crumb
+   text instead of trusting its (off-center) font baseline. */
+.breadcrumb-sep {
+  color: #b6bfce; font-size: 16px;
+  display: inline-flex; align-items: center; align-self: stretch;
+}
 
 /* ── Dashboard overview tiles ────────────────────────────────────────────── */
 .summary-grid {
@@ -305,37 +371,28 @@ section { margin-bottom: 32px; }
 .stat-value { font-size: 24px; font-weight: 700; color: var(--text); line-height: 1.05; }
 .stat-label { font-size: 12px; font-weight: 600; color: var(--muted); }
 
-/* ── Segmented control (filter toggle) ───────────────────────────────────── */
-.segmented {
-  display: inline-flex; border: 1px solid var(--border);
-  border-radius: var(--r); overflow: hidden;
-}
-.segmented-btn {
-  background: var(--surface); color: var(--muted); border: none;
-  border-right: 1px solid var(--border); padding: 8px 14px;
-  font-size: 13px; cursor: pointer; transition: background .12s, color .12s;
-}
-.segmented-btn:last-child { border-right: none; }
-.segmented-btn:hover { color: var(--text); }
-.segmented-btn.active { background: var(--surface2); color: var(--text); font-weight: 600; }
-.segmented-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
-
-/* Right-aligned cluster of header controls (search + segmented filter), pushed
-   away from the screen title rather than glued to it. */
+/* ── Header filter controls (type/namespace dropdowns + search) ──────────────
+   Every header filter is one uniform control type — dropdowns and a search input
+   sharing the --control-h token — so they align on a desktop row and stack to a
+   full-width column on mobile with no special-casing. (The old segmented pill
+   was replaced by a dropdown for exactly this reason; see FilterSelect.jsx.) */
 .header-controls {
   margin-left: auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
 }
 /* Fleet aligns its filters to the left (no big title above them). */
 .header-controls.left { margin-left: 0; }
-.fleet-cluster-meta { margin-left: auto; }
 .search-box, .filter-select {
+  /* height == min-height == --control-h, which equals --touch (44px), so the
+     generic `input[type=text], select { min-height: var(--touch) }` rule agrees
+     with the token instead of clamping these controls past each other. */
+  height: var(--control-h); min-height: var(--control-h);
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--r); color: var(--text);
-  padding: 8px 12px; font-size: 13px; line-height: 1.4;
+  padding: 0 12px; font-size: 13px;
 }
 .search-box { min-width: 200px; }
-/* Strip the native select chrome (which renders taller than the input/buttons)
-   and supply a matching chevron so the dropdown lines up with the rest of the row. */
+/* Strip the native select chrome (which renders taller than the input) and
+   supply a matching chevron so the dropdown lines up with the rest of the row. */
 .filter-select {
   min-width: 160px; cursor: pointer;
   appearance: none; -webkit-appearance: none;
@@ -347,23 +404,27 @@ section { margin-bottom: 32px; }
 .search-box::placeholder { color: var(--muted); }
 .search-box:focus-visible,
 .filter-select:focus-visible { outline: 2px solid var(--blue); outline-offset: -1px; border-color: var(--blue); }
-/* On mobile the namespace dropdown and search expand to fill the row; the
-   segmented type filter keeps its natural width above them. */
+/* On mobile the filter controls stack into a full-width column. */
 @media (max-width: 639px) {
-  .header-controls { width: 100%; }
-  .header-controls .segmented { width: 100%; }
-  .header-controls .segmented-btn { flex: 1; }
-  .filter-select, .search-box { flex: 1 1 45%; min-width: 0; }
+  .header-controls { width: 100%; flex-direction: column; align-items: stretch; }
+  .filter-select, .search-box { width: 100%; min-width: 0; }
 }
 
 /* ── Cards ───────────────────────────────────────────────────────────────── */
+/* Capped at 3 columns rather than auto-fill: at the 1200px content width a 4th
+   column squeezes each card to ~270px and truncates long pod names. Three
+   columns give each card ~380px — enough for a full pod name — and the explicit
+   breakpoints keep the count predictable across widths. */
 .card-grid {
   display: grid;
   grid-template-columns: 1fr;
   gap: 12px;
 }
-@media (min-width: 480px) {
-  .card-grid { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+@media (min-width: 600px) {
+  .card-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (min-width: 960px) {
+  .card-grid { grid-template-columns: repeat(3, 1fr); }
 }
 
 .card {
@@ -438,7 +499,9 @@ section { margin-bottom: 32px; }
 .b-true      { background: #1a3a2d; color: #4ade80; }
 .b-false     { background: #3a1a1a; color: #f87171; }
 .b-neutral   { background: var(--surface2); color: var(--muted); }
-.b-conflict  { background: #3a1a1a; color: #f87171; }
+/* Conflicts and dead backends are both amber (warn tier) — red is reserved for
+   "something is down" (no leader, unreachable pods). They read apart by label. */
+.b-conflict  { background: #3a2d0a; color: #fbbf24; }
 .b-dead      { background: #3a2d0a; color: #fbbf24; }
 
 /* ── Status dot ──────────────────────────────────────────────────────────── */
@@ -671,7 +734,7 @@ input[type=checkbox] { accent-color: var(--blue); }
   border-left: 3px solid var(--border);
 }
 .problem-card.err      { border-left-color: var(--red); }
-.problem-card.conflict { border-left-color: var(--red); }
+.problem-card.conflict { border-left-color: var(--amber); }
 .problem-card.dead     { border-left-color: var(--amber); }
 .problem-card.warn     { border-left-color: var(--amber); }
 /* Clickable cards deep-link to the offending resource. */
@@ -688,10 +751,24 @@ input[type=checkbox] { accent-color: var(--blue); }
 }
 .problem-card.clickable:hover .problem-card-chevron,
 .problem-card.clickable:focus-visible .problem-card-chevron { color: var(--blue); transform: translateX(2px); }
+/* Meta lines (Namespace, Kind) under the problem card's name line, above the
+   detail. Muted label, value in monospace text color. */
+.problem-card-meta {
+  font-size: 12px; color: var(--muted);
+  margin-bottom: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.problem-card-meta code {
+  background: none; padding: 0;
+  font-family: ui-monospace, monospace; font-size: 12px; color: var(--text);
+}
+/* Name leads (so names align at the same x), with the status badge immediately
+   to its right, hugging it — not flung to the card's far edge. */
 .problem-card-head {
   display: flex; align-items: center; gap: 8px;
   margin-bottom: 6px; flex-wrap: wrap;
 }
+.problem-card-head > strong { word-break: break-word; }
 .problem-card-detail { font-size: 12px; color: var(--muted); word-break: break-word; }
 .pods-label { color: var(--muted); }
 
@@ -717,7 +794,7 @@ input[type=checkbox] { accent-color: var(--blue); }
 
 /* ── Conflict callout ────────────────────────────────────────────────────── */
 .conflict-list {
-  background: #1a0a0a; border: 1px solid #5a1a1a;
+  background: #1a140a; border: 1px solid #5a441a;
   border-radius: var(--r); padding: 10px 14px; margin-bottom: 12px;
 }
 .conflict-item {

@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { nav, navKeyFor } from '../router.js';
 import { useSSE } from '../hooks/useSSE.js';
+import { useApi } from '../hooks/useApi.js';
+import { getHealth, getCluster } from '../api/endpoints.js';
+import { VersionInfo } from './VersionInfo.jsx';
 
 /**
  * Top navigation bar.
@@ -16,6 +19,20 @@ import { useSSE } from '../hooks/useSSE.js';
 export function Nav({ activeScreen }) {
   const active    = navKeyFor(activeScreen);
   const { connected } = useSSE('/api/v1/events');
+  // Deployment versions surfaced in the nav's info popover (and the drawer foot
+  // on mobile). One-time fetches — they don't change at runtime. Coxswain's
+  // version comes from the serving controller's /health; the Kubernetes server
+  // version from /cluster.
+  // Normalize to a bare version (no leading "v") at the source — Coxswain's
+  // /health reports "0.1.0" while Kubernetes' GitVersion is "v1.31.2"; the
+  // display adds exactly one "v" prefix, so values must not already carry one.
+  const stripV = (s) => (s ? String(s).replace(/^v/i, '') : s);
+  const version    = stripV(useApi(getHealth).data?.version);
+  const k8sVersion = stripV(useApi(getCluster).data?.kubernetes_version);
+  const versionRows = [
+    { label: 'Coxswain', value: version },
+    { label: 'Kubernetes', value: k8sVersion },
+  ];
   const [open, setOpen] = useState(false);
   const menuRef   = useRef(null);
   const btnRef    = useRef(null);
@@ -84,7 +101,9 @@ export function Nav({ activeScreen }) {
         ))}
       </nav>
 
-      {/* Stream status — single source of truth, inline on wide screens */}
+      {/* Version info popover + stream status — inline on wide screens, the info
+          icon sits just left of the live indicator. */}
+      <VersionInfo rows={versionRows} class="version-info-inline" />
       <SSEStatus connected={connected} class="nav-status-inline" />
 
       {/* Hamburger — visible on narrow screens */}
@@ -135,8 +154,17 @@ export function Nav({ activeScreen }) {
             />
           ))}
         </div>
-        {/* Stream status folds to the foot of the drawer on narrow screens */}
+        {/* On mobile the drawer has room, so versions show inline (no popover);
+            the stream status sits to the right. */}
         <div class="nav-drawer-footer">
+          <div class="drawer-versions">
+            {versionRows.filter((r) => r.value).map((r) => (
+              <div class="drawer-version" key={r.label}>
+                <span class="drawer-version-label">{r.label}</span>
+                <code>v{r.value}</code>
+              </div>
+            ))}
+          </div>
           <SSEStatus connected={connected} />
         </div>
       </nav>

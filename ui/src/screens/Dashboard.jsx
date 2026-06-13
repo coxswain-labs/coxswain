@@ -5,7 +5,6 @@ import {
   getProxies,
   getControllers,
   getProblems,
-  getCluster,
   getGateways,
   getIngresses,
 } from '../api/endpoints.js';
@@ -26,7 +25,6 @@ export function Dashboard() {
   const proxies     = useApi(getProxies);
   const controllers = useApi(getControllers);
   const problems    = useApi(getProblems);
-  const cluster     = useApi(getCluster);
   const gateways    = useApi(getGateways);
   const ingresses   = useApi(getIngresses);
   const sse         = useSSE('/api/v1/events');
@@ -55,7 +53,6 @@ export function Dashboard() {
 
   const proxyList      = proxies.data?.proxies ?? [];
   const controllerList = controllers.data?.controllers ?? [];
-  const clusterData    = cluster.data;
   const { conflicts = [], dead_routes = [] } = problems.data ?? {};
 
   const sharedProxies    = proxyList.filter((p) => p.component !== 'dedicated-proxy');
@@ -101,7 +98,6 @@ export function Dashboard() {
     <div class="screen">
       <div class="screen-header">
         <h1 class="screen-title">Dashboard</h1>
-        {clusterData && <span class="cluster-meta">{clusterData.kubernetes_version}</span>}
       </div>
 
       {/* Overview tiles first — compact at-a-glance scale; problems below. */}
