@@ -10,5 +10,11 @@
   "ingresses": {
     "total": 4,
     "worst": "error"
-  }
+  },
+  "namespaces": [
+    "demo",
+    "staging",
+    "tenant-a",
+    "tenant-b"
+  ]
 }

@@ -204,6 +204,8 @@ paths:
       summary: Gateway list (filter/pagination envelope)
       parameters:
         - { $ref: '#/components/parameters/nameQuery' }
+        - { $ref: '#/components/parameters/namespaceQuery' }
+        - { $ref: '#/components/parameters/status' }
         - { $ref: '#/components/parameters/limit' }
         - { $ref: '#/components/parameters/offset' }
         - { $ref: '#/components/parameters/status' }
@@ -239,6 +241,8 @@ paths:
       summary: HTTPRoute list (first-class, #293; filter/pagination envelope)
       parameters:
         - { $ref: '#/components/parameters/nameQuery' }
+        - { $ref: '#/components/parameters/namespaceQuery' }
+        - { $ref: '#/components/parameters/status' }
         - { $ref: '#/components/parameters/limit' }
         - { $ref: '#/components/parameters/offset' }
         - { $ref: '#/components/parameters/status' }
@@ -262,6 +266,8 @@ paths:
       summary: Ingress list (filter/pagination envelope)
       parameters:
         - { $ref: '#/components/parameters/nameQuery' }
+        - { $ref: '#/components/parameters/namespaceQuery' }
+        - { $ref: '#/components/parameters/status' }
         - { $ref: '#/components/parameters/limit' }
         - { $ref: '#/components/parameters/offset' }
         - { $ref: '#/components/parameters/status' }
@@ -439,6 +445,11 @@ components:
       name: name
       in: query
       description: Case-insensitive substring filter against the resource object name (routing list free-text search; name-only).
+      schema: { type: string }
+    namespaceQuery:
+      name: namespace
+      in: query
+      description: Exact (case-insensitive) namespace filter for the routing lists (the operator UI's namespace dropdown).
       schema: { type: string }
     host:
       name: host

@@ -7,7 +7,7 @@ import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { SearchBox } from '../components/SearchBox.jsx';
 import { ComboFilter } from '../components/ComboFilter.jsx';
 import { Icon } from '../components/Icon.jsx';
-import { useEffect } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { problemRouteKeys, categoryHasProblem } from '../severity.js';
 import { GatewaysSection } from './Gateways.jsx';
 import { HttpRoutesSection } from './HttpRoutes.jsx';
@@ -49,8 +49,42 @@ export function Routing({ query }) {
   const active = TABS.find((t) => t.key === activeKey) ?? TABS[0];
 
   const { search, q, onSearch } = useSearch(query);
-  // Lazy-load only the active tab's list; refetch on tab switch + rebuild.
-  const list = useApi(() => active.fetch(), [activeKey]);
+
+  // Namespace options come from the summary (cluster-wide): the list is now
+  // paginated, so the current page can't enumerate every namespace. `?ns=` makes
+  // the choice permalinkable.
+  const namespaces = summary.data?.namespaces ?? [];
+  const nsFilter = query?.ns ?? 'all';
+
+  // Parent-Gateway filter, set by a Gateway row's "Routes →" deep-link. Only the
+  // HTTPRoutes tab honours it; switching away clears it.
+  const parent = activeKey === 'httproutes' ? (query?.parent ?? '') : '';
+
+  // "Problems only" is client-side on the *effective* (overlaid) status — the
+  // server's `?status=problem` can't see the cross-proxy /problems aggregate, so
+  // filtering server-side would re-open the green-tick blind spot. It narrows the
+  // current page.
+  const problemsOnly = query?.problems === '1';
+
+  // Server-side pagination: name search + namespace narrow the set server-side;
+  // the window is limit/offset. Offset resets whenever the tab or a server-side
+  // filter changes.
+  const PAGE_SIZE = 100;
+  const [offset, setOffset] = useState(0);
+  useEffect(() => {
+    setOffset(0);
+  }, [activeKey, q, nsFilter]);
+
+  const list = useApi(
+    () =>
+      active.fetch({
+        name: q || undefined,
+        namespace: nsFilter === 'all' ? undefined : nsFilter,
+        limit: PAGE_SIZE,
+        offset,
+      }),
+    [activeKey, q, nsFilter, offset],
+  );
   const rows = list.data?.[active.dataKey] ?? [];
 
   useEffect(() => {
@@ -62,18 +96,13 @@ export function Routing({ query }) {
     return off;
   }, [sse.subscribe, activeKey]);
 
-  // Namespace options from the loaded rows; `?ns=` makes the choice permalinkable.
-  const namespaces = [...new Set(rows.map((r) => r.namespace).filter(Boolean))].sort();
-  const nsFilter = namespaces.includes(query?.ns) ? query.ns : 'all';
-
-  // Parent-Gateway filter, set by a Gateway row's "Routes →" deep-link. Only the
-  // HTTPRoutes tab honours it; switching away clears it.
-  const parent = activeKey === 'httproutes' ? (query?.parent ?? '') : '';
-
-  // "Problems only" is client-side on the *effective* (overlaid) status — the
-  // server's `?status=problem` can't see the cross-proxy /problems aggregate, so
-  // filtering server-side would re-open the green-tick blind spot.
-  const problemsOnly = query?.problems === '1';
+  const page = {
+    offset,
+    returned: list.data?.returned ?? rows.length,
+    total: list.data?.total ?? rows.length,
+    pageSize: PAGE_SIZE,
+    onPage: setOffset,
+  };
 
   const Section = active.Section;
 
@@ -152,7 +181,8 @@ export function Routing({ query }) {
 
       <Section
         rows={rows}
-        total={cats[active.key]?.total}
+        total={list.data?.total}
+        page={page}
         loading={list.loading}
         error={list.error}
         q={q}

@@ -397,10 +397,18 @@ function emitHttproutesList() {
 const worst = (sevs) => (sevs.includes('error') ? 'error' : sevs.includes('warn') ? 'warn' : 'ok');
 const cat = (items) => ({ total: items.length, worst: worst(items.map((x) => x.status ?? 'ok')) });
 function emitSummaries() {
+  // Cluster-wide namespace set for the routing namespace dropdown (the list is
+  // paginated, so the dropdown can't be derived from a single page).
+  const namespaces = [...new Set([
+    ...GATEWAYS.map((g) => g.ns),
+    ...HTTPROUTES.map((r) => r.ns),
+    ...INGRESSES.map((i) => i.ns),
+  ])].sort();
   write('/api/v1/routing/summary', {
     gateways: { total: GATEWAYS.length, worst: worst(GATEWAYS.map(gatewayStatus)) },
     httproutes: cat(HTTPROUTES),
     ingresses: cat(INGRESSES),
+    namespaces,
   });
   // A pod's severity: error when unreachable, warn when degraded, else ok.
   const podSev = (p) => (p.reachable === false ? 'error' : (p.degraded?.length ? 'warn' : 'ok'));

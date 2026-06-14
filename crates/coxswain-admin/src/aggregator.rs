@@ -453,17 +453,32 @@ impl OperatorAggregator {
 
 impl OperatorAggregator {
     /// `GET /api/v1/routing/summary` — compact per-category counts + worst
-    /// severity (Gateways/HTTPRoutes/Ingresses) from the cluster summary. Backs
-    /// the routing-tab badges + warning icons without shipping the full lists.
+    /// severity (Gateways/HTTPRoutes/Ingresses) from the cluster summary, plus the
+    /// cluster-wide `namespaces` set. Backs the routing-tab badges + warning icons
+    /// and the namespace dropdown without shipping the full lists.
     pub(crate) fn routing_summary(&self) -> Response<Vec<u8>> {
         let snapshot = self.cluster.load();
-        match serde_json::to_string(&snapshot.routing_summary()) {
-            Ok(body) => json_response(body),
+        let mut v = match serde_json::to_value(snapshot.routing_summary()) {
+            Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = %e, "failed to serialise /api/v1/routing/summary");
-                internal_error()
+                return internal_error();
             }
-        }
+        };
+        // Every namespace holding a routing resource — the namespace dropdown must
+        // list them all regardless of the active page/filter, so it can't be
+        // derived from a single (paginated) list response.
+        let mut namespaces: Vec<&str> = snapshot
+            .gateways
+            .iter()
+            .map(|g| g.namespace.as_str())
+            .chain(snapshot.httproutes.iter().map(|r| r.namespace.as_str()))
+            .chain(snapshot.ingresses.iter().map(|i| i.namespace.as_str()))
+            .collect();
+        namespaces.sort_unstable();
+        namespaces.dedup();
+        v["namespaces"] = serde_json::json!(namespaces);
+        json_response(v.to_string())
     }
 
     /// `GET /api/v1/routing/gateways` — gateway list from the cluster summary (no
@@ -474,6 +489,7 @@ impl OperatorAggregator {
             .gateways
             .iter()
             .filter(|g| !params.problems_only || g.status.is_problem())
+            .filter(|g| params.namespace_matches(&g.namespace))
             .filter(|g| params.name_matches(&g.name))
             .map(|g| serde_json::to_value(g).unwrap_or(serde_json::Value::Null))
             .collect();
@@ -737,6 +753,7 @@ impl OperatorAggregator {
             .ingresses
             .iter()
             .filter(|i| !params.problems_only || i.status.is_problem())
+            .filter(|i| params.namespace_matches(&i.namespace))
             .filter(|i| params.name_matches(&i.name))
             .map(|i| serde_json::to_value(i).unwrap_or(serde_json::Value::Null))
             .collect();
@@ -753,6 +770,7 @@ impl OperatorAggregator {
             .httproutes
             .iter()
             .filter(|r| !params.problems_only || r.status.is_problem())
+            .filter(|r| params.namespace_matches(&r.namespace))
             .filter(|r| params.name_matches(&r.name))
             .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
             .collect();

@@ -679,6 +679,16 @@ tr.sev-error td:first-child { box-shadow: inset 3px 0 0 var(--red); }
 .table-foot {
   padding: 8px 4px; color: var(--muted); font-size: 12px;
 }
+.pager { display: flex; align-items: center; gap: 10px; }
+.pager-info { color: var(--muted); }
+.pager-btn {
+  display: inline-flex; align-items: center;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--r); color: var(--text);
+  padding: 3px 10px; font-size: 12px;
+}
+.pager-btn:hover:not(:disabled) { border-color: var(--blue); }
+.pager-btn:disabled { opacity: 0.4; cursor: default; }
 
 /* ── Tabs ────────────────────────────────────────────────────────────────── */
 .tabs {

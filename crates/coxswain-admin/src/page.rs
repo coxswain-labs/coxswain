@@ -31,6 +31,10 @@ pub(crate) struct ListParams {
     /// the routing list endpoints' free-text search (name-only by design; the
     /// operator UI's search box maps here). Lowercased at parse time.
     pub name: Option<String>,
+    /// Exact (case-insensitive) namespace filter for the routing list endpoints —
+    /// the operator UI's namespace dropdown maps here. Exact, not substring, so a
+    /// page stays scoped to one namespace; lowercased at parse time.
+    pub namespace: Option<String>,
     /// Case-insensitive substring filter against each row's host (meaningful only
     /// for the per-proxy route table; a no-op on the routing resource lists).
     /// Lowercased at parse time.
@@ -57,6 +61,9 @@ impl ListParams {
         for (k, v) in form_urlencoded::parse(q.as_bytes()) {
             match k.as_ref() {
                 "name" if !v.is_empty() => p.name = Some(v.into_owned().to_ascii_lowercase()),
+                "namespace" if !v.is_empty() => {
+                    p.namespace = Some(v.into_owned().to_ascii_lowercase());
+                }
                 "host" if !v.is_empty() => p.host = Some(v.into_owned().to_ascii_lowercase()),
                 "path" if !v.is_empty() => p.path = Some(v.into_owned().to_ascii_lowercase()),
                 "limit" => p.limit = v.parse::<usize>().ok(),
@@ -77,6 +84,7 @@ impl ListParams {
     /// emit its legacy full-dump shape (still wrapped in the envelope).
     pub(crate) fn is_empty(&self) -> bool {
         self.name.is_none()
+            && self.namespace.is_none()
             && self.host.is_none()
             && self.path.is_none()
             && self.limit.is_none()
@@ -91,6 +99,15 @@ impl ListParams {
         match &self.name {
             None => true,
             Some(needle) => haystack.to_ascii_lowercase().contains(needle),
+        }
+    }
+
+    /// `true` when the `namespace` filter is absent or an exact (case-insensitive)
+    /// match of `haystack` — a dropdown selection scopes the page to one namespace.
+    pub(crate) fn namespace_matches(&self, haystack: &str) -> bool {
+        match &self.namespace {
+            None => true,
+            Some(needle) => haystack.eq_ignore_ascii_case(needle),
         }
     }
 
@@ -119,6 +136,9 @@ impl ListParams {
         let mut ser = form_urlencoded::Serializer::new(String::new());
         if let Some(name) = &self.name {
             ser.append_pair("name", name);
+        }
+        if let Some(namespace) = &self.namespace {
+            ser.append_pair("namespace", namespace);
         }
         if let Some(host) = &self.host {
             ser.append_pair("host", host);
@@ -226,6 +246,19 @@ mod tests {
         assert!(!p.host_matches("prod-gw"));
         // path filter absent → always matches
         assert!(p.path_matches("/anything"));
+    }
+
+    #[test]
+    fn namespace_filter_is_case_insensitive_exact() {
+        let p = ListParams::parse(Some("namespace=Demo"));
+        assert_eq!(p.namespace.as_deref(), Some("demo"));
+        assert!(p.namespace_matches("demo"));
+        assert!(p.namespace_matches("DEMO"));
+        assert!(!p.namespace_matches("demo-2")); // exact, not substring
+        assert!(!p.namespace_matches("other"));
+        assert!(!p.is_empty());
+        // absent → always matches
+        assert!(ListParams::default().namespace_matches("anything"));
     }
 
     #[test]

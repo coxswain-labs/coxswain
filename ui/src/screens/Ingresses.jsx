@@ -9,7 +9,7 @@ import { worseSeverity, routeKey, sevClass, sevTitle } from '../severity.js';
  * Presentational: the owning Routing screen supplies the filters (see
  * GatewaysSection).
  */
-export function IngressesSection({ rows = [], total, loading = false, error = null, q = '', ns = 'all', problemsOnly = false, problemKeys }) {
+export function IngressesSection({ rows = [], total, page, loading = false, error = null, q = '', ns = 'all', problemsOnly = false, problemKeys }) {
   // Overlay /problems (conflicts/dead-routes) onto the reflector-computed status.
   const rowStatus = (ing) =>
     worseSeverity(ing.status, problemKeys?.has(routeKey('Ingress', ing.namespace, ing.name)) ? 'warn' : 'ok');
@@ -24,6 +24,7 @@ export function IngressesSection({ rows = [], total, loading = false, error = nu
       columns={['Name', 'Namespace', 'Class', 'Address', 'Rules']}
       rows={shown}
       total={total}
+      page={page}
       loading={loading}
       error={error}
       emptyMsg="No Ingresses."

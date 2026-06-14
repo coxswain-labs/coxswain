@@ -11,6 +11,8 @@ import { fetchJson } from './client.js';
  */
 export function buildQuery(opts = {}) {
   const q = new URLSearchParams();
+  if (opts.name) q.set('name', opts.name);
+  if (opts.namespace) q.set('namespace', opts.namespace);
   if (opts.host) q.set('host', opts.host);
   if (opts.path) q.set('path', opts.path);
   if (opts.limit != null) q.set('limit', String(opts.limit));
