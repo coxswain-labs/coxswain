@@ -299,7 +299,16 @@ impl AdminServer {
             "/metrics" => return metrics_response(),
             "/routes" => return self.routes_response(),
             "/api/v1/health" => return health_response(&self.health),
-            "/api/v1/cluster" => return cluster_response(self.cluster.as_ref(), &self.leader),
+            "/api/v1/cluster" => {
+                // The apiserver version is fetched + cached by the aggregator
+                // (controller/dev roles only); proxy roles wire neither, so the
+                // field is simply omitted there.
+                let version = match self.aggregator.as_ref() {
+                    Some(agg) => agg.kubernetes_version().await,
+                    None => None,
+                };
+                return cluster_response(self.cluster.as_ref(), &self.leader, version);
+            }
             _ => {}
         }
 
@@ -517,6 +526,12 @@ fn health_response(health: &HealthRegistry) -> Response<Vec<u8>> {
 /// summary's gateway/ingress lists on every request.
 #[derive(Serialize)]
 struct ClusterResponse<'a> {
+    /// Apiserver GitVersion (e.g. `v1.31.2`), supplied by the aggregator's
+    /// cached `/version` lookup. Omitted when the version is unavailable
+    /// (no aggregator wired, or the apiserver could not be reached) — the
+    /// operator UI renders an em dash in that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kubernetes_version: Option<&'a str>,
     gateways: &'a [coxswain_core::cluster::GatewaySummary],
     ingresses: &'a [coxswain_core::cluster::IngressSummary],
     controller: ControllerSummary,
@@ -525,6 +540,7 @@ struct ClusterResponse<'a> {
 fn cluster_response(
     cluster: Option<&SharedClusterSummary>,
     leader: &Arc<AtomicBool>,
+    kubernetes_version: Option<&str>,
 ) -> Response<Vec<u8>> {
     let Some(handle) = cluster else {
         let mut r = Response::new(Vec::new());
@@ -533,6 +549,7 @@ fn cluster_response(
     };
     let snapshot: Arc<ClusterSummary> = handle.load();
     let resp = ClusterResponse {
+        kubernetes_version,
         gateways: &snapshot.gateways,
         ingresses: &snapshot.ingresses,
         controller: ControllerSummary::new(leader.load(Ordering::Acquire)),
@@ -587,7 +604,7 @@ mod tests {
     #[test]
     fn cluster_response_returns_404_without_summary() {
         let leader = leader_flag(false);
-        let resp = cluster_response(None, &leader);
+        let resp = cluster_response(None, &leader, None);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -595,7 +612,7 @@ mod tests {
     fn cluster_response_returns_empty_json_when_summary_is_empty() {
         let cs: SharedClusterSummary = SharedClusterSummary::default();
         let leader = leader_flag(true);
-        let resp = cluster_response(Some(&cs), &leader);
+        let resp = cluster_response(Some(&cs), &leader, None);
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -625,7 +642,7 @@ mod tests {
             ControllerSummary::new(false),
         )));
         let leader = leader_flag(true);
-        let resp = cluster_response(Some(&cs), &leader);
+        let resp = cluster_response(Some(&cs), &leader, None);
         let body = std::str::from_utf8(resp.body()).expect("utf8");
         let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
         assert_eq!(v["controller"]["leader"], serde_json::Value::Bool(true));
@@ -644,13 +661,27 @@ mod tests {
             ControllerSummary::new(false),
         )));
         let leader = leader_flag(false);
-        let resp = cluster_response(Some(&cs), &leader);
+        let resp = cluster_response(Some(&cs), &leader, Some("v1.31.2"));
         assert_eq!(resp.status(), StatusCode::OK);
         let body = std::str::from_utf8(resp.body()).expect("utf8");
         let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+        assert_eq!(v["kubernetes_version"], "v1.31.2");
         assert_eq!(v["gateways"][0]["proxy"]["pool"], "dedicated");
         assert_eq!(v["gateways"][0]["route_count"], 12);
         assert_eq!(v["ingresses"][0]["route_count"], 2);
+    }
+
+    #[test]
+    fn cluster_response_omits_kubernetes_version_when_unavailable() {
+        let cs: SharedClusterSummary = SharedClusterSummary::default();
+        let leader = leader_flag(false);
+        let resp = cluster_response(Some(&cs), &leader, None);
+        let body = std::str::from_utf8(resp.body()).expect("utf8");
+        let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+        assert!(
+            v.get("kubernetes_version").is_none(),
+            "field must be omitted when the apiserver version is unavailable"
+        );
     }
 
     #[test]

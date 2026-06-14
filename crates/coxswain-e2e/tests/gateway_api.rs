@@ -1724,6 +1724,25 @@ async fn cluster_endpoint() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
+    // The cluster summary surfaces the apiserver GitVersion (issue #287),
+    // fetched once from the apiserver `/version` endpoint and cached.
+    let k8s_version = cluster["kubernetes_version"]
+        .as_str()
+        .expect("/api/v1/cluster must include kubernetes_version against a live controller");
+    // GitVersion looks like `v1.31.2`: a `v`, then a major.minor numeric prefix.
+    let looks_like_version = k8s_version
+        .strip_prefix('v')
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(major, rest)| {
+            !major.is_empty()
+                && major.bytes().all(|b| b.is_ascii_digit())
+                && rest.bytes().next().is_some_and(|b| b.is_ascii_digit())
+        });
+    assert!(
+        looks_like_version,
+        "kubernetes_version must look like a server GitVersion (got {k8s_version:?})"
+    );
+
     let gw = cluster["gateways"]
         .as_array()
         .unwrap()

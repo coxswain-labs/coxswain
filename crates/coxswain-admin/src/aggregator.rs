@@ -47,6 +47,10 @@ pub struct OperatorAggregator {
     cluster: SharedClusterSummary,
     /// Kubernetes client, initialised lazily on the first K8s-backed request.
     kube: OnceCell<Client>,
+    /// Apiserver GitVersion (e.g. `v1.31.2`), fetched once from the `/version`
+    /// endpoint and cached for the controller's lifetime — the server version
+    /// is static between cluster upgrades, so it is never re-queried.
+    k8s_version: OnceCell<String>,
     /// Bounds concurrent `/api/v1/pods/{name}/logs` streams. Each live stream
     /// holds one kube connection on the controller; the cap stops a few open
     /// tabs (or stuck clients) from piling them up.
@@ -80,6 +84,7 @@ impl OperatorAggregator {
             fleet,
             cluster,
             kube: OnceCell::new(),
+            k8s_version: OnceCell::new(),
             log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),
         }
     }
@@ -94,6 +99,27 @@ impl OperatorAggregator {
         self.kube
             .get_or_try_init(|| async { Client::try_default().await })
             .await
+    }
+
+    /// Return the Kubernetes apiserver GitVersion (e.g. `v1.31.2`), fetched
+    /// once from the `/version` endpoint and cached for the controller's
+    /// lifetime.
+    ///
+    /// Returns `None` if the client can't be initialised or the apiserver is
+    /// unreachable: the `/api/v1/cluster` handler omits the field rather than
+    /// failing the whole response, and a later request retries (a failed
+    /// fetch is not cached). The server version is static between cluster
+    /// upgrades, so the cached value is never re-queried once obtained.
+    pub(crate) async fn kubernetes_version(&self) -> Option<&str> {
+        self.k8s_version
+            .get_or_try_init(|| async {
+                let info = self.kube().await?.apiserver_version().await?;
+                Ok::<_, kube::Error>(info.git_version)
+            })
+            .await
+            .map_err(|e| tracing::warn!(error = %e, "Failed to fetch Kubernetes apiserver version"))
+            .ok()
+            .map(String::as_str)
     }
 }
 
@@ -1604,6 +1630,7 @@ mod tests {
             fleet,
             cluster,
             kube: OnceCell::new(),
+            k8s_version: OnceCell::new(),
             log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),
         }
     }
