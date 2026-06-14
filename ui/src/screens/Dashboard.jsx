@@ -4,6 +4,7 @@ import { useSSE } from '../hooks/useSSE.js';
 import { getFleetSummary, getRoutingSummary, getProblems } from '../api/endpoints.js';
 import { nav } from '../router.js';
 import { ProblemsPanel } from '../components/ProblemsPanel.jsx';
+import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { Icon } from '../components/Icon.jsx';
 import { categoryHasProblem } from '../severity.js';
 
@@ -68,9 +69,7 @@ export function Dashboard() {
 
   return (
     <div class="screen">
-      <div class="screen-header">
-        <h1 class="screen-title">Dashboard</h1>
-      </div>
+      <Breadcrumb items={[{ label: 'Dashboard' }, { label: 'Overview' }]} />
 
       {/* Overview tiles first — compact at-a-glance scale; problems below. */}
       <div class="summary-grid" aria-label="Fleet and routing summary">
