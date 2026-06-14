@@ -30,4 +30,3 @@ See [Getting started](getting-started.md) for the complete walkthrough, or [Inst
 | **v0.3** | Ingress completeness — `ingress.coxswain-labs.dev/*` annotation surface, nginx migration path | Planned |
 | **v0.4** | Gateway API extended — BackendTLSPolicy, client/backend mTLS, HTTP/2 downstream, ListenerSet | Planned |
 
-The [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2){target=_blank} has the full issue-level breakdown.

@@ -4,7 +4,7 @@
 
 ### Is Coxswain production-ready?
 
-Not yet. Coxswain is pre-1.0: the API surface and configuration flags may change between minor releases. The core architecture — a leader-elected controller pod writing status, backed by one or more read-only Pingora proxy pods — is stable and well-tested. See the [Roadmap](https://github.com/orgs/coxswain-labs/projects/2) for what's on the path to 1.0.
+Not yet. Coxswain is pre-1.0: the API surface and configuration flags may change between minor releases. The core architecture — a leader-elected controller pod writing status, backed by one or more read-only Pingora proxy pods — is stable and well-tested.
 
 ### Why another Ingress controller?
 

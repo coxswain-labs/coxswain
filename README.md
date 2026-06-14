@@ -10,7 +10,6 @@ Coxswain runs as a controller pod plus a horizontally-scalable pool of read-only
 
 **Documentation**: [docs.coxswain-labs.dev/coxswain](https://docs.coxswain-labs.dev/coxswain/) — installation guides, configuration reference, architecture overview, and FAQ.
 
-**Roadmap**: see the [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2) for current scope per milestone.
 
 ## Getting started
 
