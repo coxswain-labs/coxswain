@@ -73,7 +73,7 @@ Subsystems have four states:
 Readiness gates differ by mode:
 
 - **Controller pod** — all Kubernetes reflectors must complete their initial list and the controller must have acquired (or be in standby for) the Lease.
-- **Shared-proxy and gateway-proxy pods** — all Kubernetes reflectors must complete their initial list and the routing table must be built at least once. Proxy pods do not participate in leader election and do not wait for the controller.
+- **Shared proxy and dedicated proxy pods** — all Kubernetes reflectors must complete their initial list and the routing table must be built at least once. Proxy pods do not participate in leader election and do not wait for the controller.
 
 Verify the probes are present on the deployed pod:
 

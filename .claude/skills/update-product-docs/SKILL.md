@@ -51,8 +51,8 @@ For mermaid blocks in `docs/src/`:
 
 - `Shared proxy pool` — the multi-replica shared Deployment box
 - `Dedicated proxy pool` — the multi-replica dedicated Deployment box
-- `Controller pod` — single replica (leader-elected)
-- Do NOT use `Per-Gateway proxy pod` (old framing) or `Shared-proxy pods` (hyphenated form in a label).
+- `Controller` — single replica (leader-elected); no `pod` suffix — the `pool` vs bare label contrast encodes cardinality
+- Do NOT use `Per-Gateway proxy pod` (old framing), `Shared-proxy pods` (hyphenated form in a label), or `Controller pod` (the `pod` suffix was dropped to distinguish the singleton from the pools).
 
 ## Phase 1 — Audit
 
@@ -72,7 +72,7 @@ Enumerate findings without editing anything. Categorize each finding by type, se
 2. **Diagram label violations.** For each mermaid block in `docs/src/`:
    - `Per-Gateway proxy pod` (replace with `Dedicated proxy pool`)
    - `Shared-proxy pods` (replace with `Shared proxy pool`)
-   - `Controller pod` (correct — single replica, not a pool)
+   - `Controller pod` (replace with `Controller` — the `pod` suffix was dropped; bare `Controller` is now canonical)
    - Any diagram label that mixes hyphens and spaces inconsistently (`Shared-proxy pool` is wrong; either `Shared proxy pool` or `coxswain-shared-proxy` if labelling the literal K8s identifier)
 
 3. **Broken internal links.** Walk every `[text](relative.md)` / `[text](relative.md#anchor)` link in `docs/src/`; flag any that don't resolve to an existing file + anchor.

@@ -1,6 +1,6 @@
 # Dedicated-mode Gateways
 
-Dedicated-mode runs a per-Gateway data plane: one coxswain-proxy pod that watches only the resources relevant to a single named Gateway. The shared-pool data plane (`serve proxy --shared`) keeps serving Ingress and non-dedicated Gateway traffic; the controller pod provisions and manages the dedicated pod through `CoxswainGatewayParameters`.
+Dedicated-mode runs a dedicated proxy (per Gateway): one coxswain-proxy pod that watches only the resources relevant to a single named Gateway. The shared proxy pool (`serve proxy --shared`) keeps serving Ingress and non-dedicated Gateway traffic; the controller provisions and manages the dedicated proxy through `CoxswainGatewayParameters`.
 
 Two ways to run a dedicated proxy:
 

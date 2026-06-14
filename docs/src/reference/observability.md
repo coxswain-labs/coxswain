@@ -35,7 +35,7 @@ Route id formats:
 | `coxswain_proxy_connections_total` | Counter | `listener` |
 | `coxswain_proxy_connection_duration_seconds` | Histogram | `listener` |
 
-The existing listener-lifecycle series from [#231](https://github.com/coxswain-labs/coxswain/issues/231) are also exposed: `coxswain_proxy_listeners_active`, `coxswain_proxy_listener_lifecycle_total`, `coxswain_proxy_listener_drain_duration_seconds`, `coxswain_proxy_requests_force_closed_total`.
+The following listener-lifecycle metrics are also exposed: `coxswain_proxy_listeners_active`, `coxswain_proxy_listener_lifecycle_total`, `coxswain_proxy_listener_drain_duration_seconds`, `coxswain_proxy_requests_force_closed_total`.
 
 ### Controller-pod metrics (`coxswain_controller_*`)
 
@@ -200,7 +200,7 @@ Use `RUST_LOG` directive syntax for per-crate control:
 
 === "Prometheus operator (PodMonitor)"
 
-    The chart ships a `PodMonitor` template gated on `.Values.podMonitor.enabled`. Enable it with `--set podMonitor.enabled=true` (or `podMonitor.enabled: true` in your values file). One selector matches both the shared-proxy pool and the operator-rendered dedicated proxies; the relabel block injects `gateway_name` / `gateway_namespace` on dedicated metrics only (see [Dedicated-mode label injection](#dedicated-mode-label-injection) above).
+    The chart ships a `PodMonitor` template gated on `.Values.podMonitor.enabled`. Enable it with `--set podMonitor.enabled=true` (or `podMonitor.enabled: true` in your values file). One selector matches both the shared proxy pool and the operator-rendered dedicated proxies; the relabel block injects `gateway_name` / `gateway_namespace` on dedicated metrics only (see [Dedicated-mode label injection](#dedicated-mode-label-injection) above).
 
     Why `PodMonitor` and not `ServiceMonitor`? Dedicated-proxy Services don't expose port `8082` — adding it would leak `/metrics` onto the LoadBalancer IP. PodMonitor scrapes the pod directly (port `admin`, `:8082`) and skips that issue entirely. Shared-pool pods are also discovered the same way, so one resource covers every coxswain proxy in the cluster.
 

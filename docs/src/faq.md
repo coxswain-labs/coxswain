@@ -4,7 +4,7 @@
 
 ### Is Coxswain production-ready?
 
-Not yet. The project is undergoing a significant architectural refactor — splitting the single-binary monolith into a controller pod and a read-only proxy pool (see [Architecture](architecture.md)). Routing, TLS, and leader-election internals are well-tested, but the deployment topology, configuration surface, and several features are still in flux. See the [Roadmap](https://github.com/orgs/coxswain-labs/projects/2).
+Not yet. Coxswain is pre-1.0: the API surface and configuration flags may change between minor releases. The core architecture — a leader-elected controller pod writing status, backed by one or more read-only Pingora proxy pods — is stable and well-tested. See the [Roadmap](https://github.com/orgs/coxswain-labs/projects/2) for what's on the path to 1.0.
 
 ### Why another Ingress controller?
 
@@ -22,11 +22,11 @@ Yes. Both `Ingress` and `HTTPRoute` objects contribute to the same routing table
 
 Embedding status writes in the proxy would force leader election into the data plane: only one replica could write at a time, and horizontal scaling would require electing more leaders. Making the controller the sole Kubernetes writer keeps proxy pods stateless, eliminates inter-replica coordination, and shrinks the proxy's RBAC surface to zero write verbs — a compromised proxy pod cannot write to the API server at all. The read-only invariant is enforced by RBAC, not by convention.
 
-See [Architecture](architecture.md#modes) for the four operating modes.
+See [Architecture](architecture.md#deployment-models) for the two macro deployment models (Shared and Dedicated).
 
 ### How does Ingress fit?
 
-Classic `Ingress` resources are always served by the shared-proxy pool — `Ingress` has no equivalent of `parametersRef`. Gateway API users can opt a `Gateway` into an isolated per-Gateway proxy pod via `parametersRef` on the `GatewayClass` (cluster-wide default) or on the `Gateway` itself; the controller provisions and manages that pod.
+Classic `Ingress` resources are always served by the shared proxy pool — `Ingress` has no equivalent of `parametersRef`. Gateway API users can opt a `Gateway` into a dedicated proxy (per Gateway) via `parametersRef` on the `GatewayClass` (cluster-wide default) or on the `Gateway` itself; the controller provisions and manages that dedicated proxy automatically. See [Dedicated-mode Gateways](guides/dedicated-mode.md) for the full walkthrough.
 
 ## Comparison
 
@@ -36,9 +36,9 @@ Architectural differences only — not performance or quality. All projects belo
 
 | | ingress-nginx | Coxswain |
 |---|---|---|
-| Process model | Go controller + nginx worker processes in the same container | Split controller pod (leader-elected, K8s writes) + horizontally-scalable read-only Pingora proxy pods; Helm renders a controller + shared-proxy by default |
+| Process model | Go controller + nginx worker processes in the same container | Split controller pod (leader-elected, K8s writes) + horizontally-scalable read-only Pingora proxy pods; Helm renders a controller + shared proxy by default |
 | Config-application model | Controller renders `nginx.conf`; nginx reloads on change | Controller publishes an immutable routing-table snapshot; proxy reads via atomic pointer |
-| Gateway API surface | Available via separate [NGINX Gateway Fabric](https://github.com/nginx/nginx-gateway-fabric) project | Same controller manages both; default shared-proxy pool serves both |
+| Gateway API surface | Available via separate [NGINX Gateway Fabric](https://github.com/nginx/nginx-gateway-fabric) project | Same controller manages both; default shared proxy pool serves both |
 | Annotation ecosystem | Large catalogue of `nginx.ingress.kubernetes.io/*` annotations | Coxswain reserves `gateway.coxswain-labs.dev/*` for future per-resource configuration; currently minimal |
 
 ### Traefik vs. Coxswain
@@ -58,3 +58,12 @@ Architectural differences only — not performance or quality. All projects belo
 | Data-plane configuration | xDS over gRPC | In-process atomic pointer swap |
 | Proxy engine | Envoy (C++) | Pingora (Rust) |
 | Gateway API channel | Standard + experimental | Standard only |
+
+## Troubleshooting
+
+See [Troubleshooting](guides/troubleshooting.md) for step-by-step diagnostic commands. Common dedicated-mode questions:
+
+- **Dedicated proxy pod not starting** — see [Dedicated proxy pod never becomes Ready](guides/troubleshooting.md#dedicated-proxy-pod-never-becomes-ready).
+- **`forbidden` errors in proxy logs** — see [RBAC denials in dedicated proxy logs](guides/troubleshooting.md#rbac-denials-in-dedicated-proxy-logs).
+- **Provisioned resources left behind after Gateway deletion** — see [Provisioned resources not garbage-collected after Gateway deletion](guides/troubleshooting.md#provisioned-resources-not-garbage-collected-after-gateway-deletion).
+- **Controller not reconciling Gateway API resources** — see [Controller stuck in Ingress-only mode](guides/troubleshooting.md#controller-stuck-in-ingress-only-mode).

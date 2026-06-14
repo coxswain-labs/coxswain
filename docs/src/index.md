@@ -26,7 +26,7 @@ See [Getting started](getting-started.md) for the complete walkthrough, or [Inst
 | Milestone | Theme | Status |
 |-----------|-------|--------|
 | **v0.1** | Foundation — Gateway API conformant (standard channel), Ingress support, signed OCI image, Helm chart | Done |
-| **v0.2** | Architecture — controller/proxy split, dedicated proxy mode, operator web UI | In progress |
+| **v0.2** | Architecture — controller/proxy split, dedicated proxy mode, operator web UI | Done |
 | **v0.3** | Ingress completeness — `ingress.coxswain-labs.dev/*` annotation surface, nginx migration path | Planned |
 | **v0.4** | Gateway API extended — BackendTLSPolicy, client/backend mTLS, HTTP/2 downstream, ListenerSet | Planned |
 

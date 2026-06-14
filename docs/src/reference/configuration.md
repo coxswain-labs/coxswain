@@ -28,7 +28,7 @@ Coxswain is configured via environment variables. Every setting has a `COXSWAIN_
 
 === "Raw manifests / Kustomize"
 
-    Set environment variables directly on the `Deployment`:
+    Set environment variables directly on the relevant `Deployment` (controller or shared proxy):
 
     ```yaml
     env:
