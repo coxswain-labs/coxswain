@@ -172,6 +172,44 @@ curl -s http://localhost:8082/routes | jq .    # lists all active hostnames
 
 ---
 
+## Operator UI
+
+The operator web UI lives in `ui/` (Vite + Preact, built to a single self-contained `dist/index.html`). That file is embedded into `coxswain-admin` via `include_str!` and served at `GET /` on the **controller admin port** (controller and `dev` roles only — proxy pods return 404). `dist/` is gitignored: the Docker `ui-builder` stage rebuilds it, so it is never committed.
+
+### Fast iteration (no cluster)
+
+```bash
+cd ui
+npm install        # first time only
+npm run dev        # http://localhost:5173
+```
+
+`npm run dev` serves the UI with hot-reload and a mock `/api/v1/*` backend, so you can work on every screen and edge case without a controller, cluster, or container. Fixtures — and how to regenerate or capture them — are documented in `ui/mock/README.md` (`node mock/generate.mjs` writes the synthetic state matrix; `mock/capture.sh` snapshots a live controller). When you add a UI state, extend the mock so it stays reachable in dev.
+
+### Seeing it as the binary serves it
+
+The dev server uses Vite; the binary serves the *embedded* build, which only changes on a rebuild:
+
+```bash
+cd ui && npm run build      # regenerates dist/index.html
+# then restart `serve controller` / `serve dev`
+```
+
+### Testing against a cluster
+
+The full `Dockerfile` builds the UI in its `ui-builder` stage, so a normal image build picks up `ui/src` changes — no separate UI build needed:
+
+```bash
+docker build -t coxswain:ui .                                   # builds UI + binary
+kubectl -n coxswain-system rollout restart deploy/coxswain-controller deploy/coxswain-shared-proxy
+kubectl -n coxswain-system port-forward svc/coxswain-controller 8082:8082
+# open http://localhost:8082/
+```
+
+`deploy/dev/operator-ui-demo.yaml` seeds a representative workload (healthy + dead + conflicting routes across namespaces) so the UI has realistic signals during a live test.
+
+---
+
 ## E2E tests
 
 All Rust e2e suites require a live cluster. The harness builds a Docker image, installs the Helm chart, and runs tests against the deployed pods. Reset the cluster before each run.

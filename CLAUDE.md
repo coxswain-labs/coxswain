@@ -40,6 +40,14 @@ coxswain-bin
 
 `coxswain-proxy` and `coxswain-controller` never depend on each other. The read-only-proxy invariant is enforced at RBAC (proxy SA holds zero write verbs) AND at the crate graph (the proxy never imports the controller). Per-crate responsibilities live in each crate's `src/lib.rs` `//!` header.
 
+## Operator UI
+
+`ui/` is the operator web UI (Vite + Preact). Full dev loop in DEVELOPMENT.md "Operator UI". Essentials:
+
+- Built to one `ui/dist/index.html`, embedded into `coxswain-admin` via `include_str!`, served at `GET /` on the controller admin port (controller + `dev` roles only). `dist/` is gitignored and rebuilt by the Docker `ui-builder` stage — never commit it.
+- Iterate with `cd ui && npm run dev` (`http://localhost:5173`): hot-reload + a mock `/api/v1` backend, no cluster needed. Mocks cover the full UI state matrix — when you add a UI state, extend `ui/mock/generate.mjs` (then `node mock/generate.mjs`) so it stays reachable in dev. See `ui/mock/README.md`.
+- The binary serves the *embedded* build, which only updates on `npm run build`; to test on a cluster, rebuild the image (the full `Dockerfile` builds the UI) and roll out. During a UI review pass, batch the user's comments and rebuild once at the end — not after each comment.
+
 ## Code Quality
 
 **Rule additions go to CI first.** If a new project rule can be expressed as a clippy lint, a `scripts/check-*.sh` grep, or a `deny.toml` policy, encode it there and link from this doc. Don't restate CI-enforced rules in prose. Add prose here only when the rule is a behavioural policy that can't be checked mechanically.
