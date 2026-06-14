@@ -69,6 +69,15 @@ pub struct FleetEntry {
     /// For [`Component::DedicatedProxy`] pods: the owning Gateway name (from
     /// [`GATEWAY_NAME_LABEL`]). `None` for all other components.
     pub gateway_ref: Option<String>,
+    /// Node the pod is scheduled on (`spec.nodeName`); `None` until scheduled.
+    pub node: Option<String>,
+    /// Total container restarts (`sum(status.containerStatuses[].restartCount)`) —
+    /// the crash-loop signal.
+    pub restarts: i32,
+    /// Pod phase (`status.phase`), e.g. `"Running"`.
+    pub phase: Option<String>,
+    /// Pod creation timestamp (`metadata.creationTimestamp`) as RFC3339, for age.
+    pub created_at: Option<String>,
     /// Wall-clock time at which this entry was last observed (i.e. when the
     /// snapshot that contains it was built).
     pub last_seen: Instant,
@@ -190,6 +199,21 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
             None
         };
 
+        // Runtime fields straight off the Pod (the watch already holds it).
+        let node = pod.spec.as_ref().and_then(|s| s.node_name.clone());
+        let restarts = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.container_statuses.as_ref())
+            .map(|cs| cs.iter().map(|c| c.restart_count).sum())
+            .unwrap_or(0);
+        let phase = pod.status.as_ref().and_then(|s| s.phase.clone());
+        let created_at = pod
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|t| t.0.to_string()); // jiff::Timestamp Display is RFC 3339
+
         let entry = FleetEntry {
             pod_name,
             pod_namespace,
@@ -197,6 +221,10 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
             admin_port,
             component,
             gateway_ref,
+            node,
+            restarts,
+            phase,
+            created_at,
             last_seen: now,
         };
         match component {

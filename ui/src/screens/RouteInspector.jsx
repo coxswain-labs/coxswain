@@ -10,6 +10,7 @@ import { EndpointHealth } from '../components/EndpointHealth.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 import { Panel } from '../components/Panel.jsx';
 import { ManifestDialog } from '../components/ManifestDialog.jsx';
+import { Icon } from '../components/Icon.jsx';
 import { useEffect, useState } from 'preact/hooks';
 
 /**
@@ -69,7 +70,9 @@ export function RouteInspector({ kind, namespace, name }) {
           <div class="screen-meta">{namespace} · {isHttp ? 'HTTPRoute' : 'Ingress'}</div>
         </div>
         <div class="header-badges">
-          <button class="btn" onClick={() => setShowManifest(true)}>View manifest</button>
+          <button class="btn btn-icon" onClick={() => setShowManifest(true)}>
+            <Icon name="code" size={15} /> Manifest
+          </button>
         </div>
       </div>
 

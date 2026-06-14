@@ -73,24 +73,118 @@ const CONTROLLERS = [
   { name: 'coxswain-controller-7f9c8-degrd', leader: false, health: 'degraded', degraded: ['gateway'] },
   { name: 'coxswain-controller-7f9c8-gone',  reachable: false },
 ];
+// Pod runtime for the mock. The generator can't call Date.now(), so creation
+// timestamps are fixed (a few days back); the UI renders age relative to today.
+const NODES = ['node-cp-1', 'node-w-1', 'node-w-2'];
+const CTRL_RESTARTS = [0, 0, 2, 7];
+const PROXY_RESTARTS = [0, 0, 0, 1, 0, 4];
+function runtime(i, restarts) {
+  return {
+    node: NODES[i % NODES.length],
+    restarts,
+    phase: 'Running',
+    created_at: `2026-06-${String(8 + (i % 5)).padStart(2, '0')}T0${i % 9}:30:00Z`,
+  };
+}
+
+// A representative Pod manifest for the "View manifest" dialog (kind=pod). The
+// real backend returns the verbatim K8s object; this mirrors its shape closely
+// enough to exercise the YAML rendering. `role` ∈ controller | shared-proxy |
+// dedicated-proxy.
+function podManifest(name, ns, role, i, restarts) {
+  const isCtrl = role === 'controller';
+  const ip = isCtrl ? `10.42.0.${10 + i}` : `10.42.0.${100 + i}`;
+  const created = runtime(i, restarts).created_at;
+  const args =
+    role === 'controller' ? ['serve', 'controller']
+    : role === 'shared-proxy' ? ['serve', 'proxy', '--shared']
+    : ['serve', 'proxy'];
+  return {
+    apiVersion: 'v1',
+    kind: 'Pod',
+    metadata: {
+      name,
+      namespace: ns,
+      uid: `a1b2c3d4-0000-4000-8000-${String(i).padStart(12, '0')}`,
+      resourceVersion: `${1000 + i * 7}`,
+      creationTimestamp: created,
+      labels: {
+        'app.kubernetes.io/name': 'coxswain',
+        'app.kubernetes.io/component': role,
+        'pod-template-hash': name.split('-').slice(-2, -1)[0] ?? 'abcde',
+      },
+      annotations: { 'coxswain-labs.dev/admin-port': '8082' },
+      ownerReferences: [
+        { apiVersion: 'apps/v1', kind: 'ReplicaSet', name: name.replace(/-[^-]+$/, ''), uid: `rs-${role}-${i}`, controller: true, blockOwnerDeletion: true },
+      ],
+    },
+    spec: {
+      serviceAccountName: isCtrl ? 'coxswain-controller' : 'coxswain-proxy',
+      nodeName: NODES[i % NODES.length],
+      containers: [
+        {
+          name: 'coxswain',
+          image: 'ghcr.io/coxswain-labs/coxswain:v0.1.0',
+          args,
+          ports: [
+            { name: 'http', containerPort: 8080, protocol: 'TCP' },
+            { name: 'https', containerPort: 8443, protocol: 'TCP' },
+            { name: 'admin', containerPort: 8082, protocol: 'TCP' },
+          ],
+          env: [
+            { name: 'COXSWAIN_LOG_FORMAT', value: 'json' },
+            { name: 'POD_NAMESPACE', valueFrom: { fieldRef: { fieldPath: 'metadata.namespace' } } },
+          ],
+          resources: { requests: { cpu: '50m', memory: '64Mi' }, limits: { memory: '128Mi' } },
+          readinessProbe: { httpGet: { path: '/readyz', port: 'admin' }, periodSeconds: 10, timeoutSeconds: 1 },
+        },
+      ],
+    },
+    status: {
+      phase: 'Running',
+      podIP: ip,
+      hostIP: '192.168.65.4',
+      startTime: created,
+      conditions: [
+        { type: 'Initialized', status: 'True' },
+        { type: 'Ready', status: 'True' },
+        { type: 'ContainersReady', status: 'True' },
+        { type: 'PodScheduled', status: 'True' },
+      ],
+      containerStatuses: [
+        {
+          name: 'coxswain',
+          image: 'ghcr.io/coxswain-labs/coxswain:v0.1.0',
+          ready: true,
+          started: true,
+          restartCount: restarts,
+          state: { running: { startedAt: created } },
+        },
+      ],
+    },
+  };
+}
+
 function emitControllers() {
   const list = CONTROLLERS.map((c, i) => (c.reachable === false
-    ? { component: 'controller', pod_name: c.name, pod_namespace: SYS, reachable: false }
+    ? { component: 'controller', pod_name: c.name, pod_namespace: SYS, pod_ip: `10.42.0.${10 + i}`, admin_port: 8082, reachable: false, ...runtime(i, CTRL_RESTARTS[i] ?? 0) }
     : {
         admin_port: 8082, component: 'controller', degraded_checks: c.degraded,
         health: c.health, is_leader: c.leader, pod_ip: `10.42.0.${10 + i}`,
-        pod_name: c.name, pod_namespace: SYS, reachable: true,
+        pod_name: c.name, pod_namespace: SYS, reachable: true, ...runtime(i, CTRL_RESTARTS[i] ?? 0),
       }));
   write('/api/v1/controllers', { controllers: list });
   CONTROLLERS.forEach((c, i) => {
+    write(`/api/v1/manifests/pod/${SYS}/${c.name}`, podManifest(c.name, SYS, 'controller', i, CTRL_RESTARTS[i] ?? 0));
     if (c.reachable === false) {
-      write(`/api/v1/controllers/${c.name}`, { pod_name: c.name, component: 'controller', pod_namespace: SYS, reachable: false });
+      write(`/api/v1/controllers/${c.name}`, { pod_name: c.name, component: 'controller', pod_namespace: SYS, pod_ip: `10.42.0.${10 + i}`, admin_port: 8082, reachable: false, ...runtime(i, CTRL_RESTARTS[i] ?? 0) });
       write(`/api/v1/controllers/${c.name}/health`, { pod_name: c.name, reachable: false });
       return;
     }
     write(`/api/v1/controllers/${c.name}`, {
       admin_port: 8082, component: 'controller', is_leader: c.leader,
       pod_ip: `10.42.0.${10 + i}`, pod_name: c.name, pod_namespace: SYS, reachable: true,
+      ...runtime(i, CTRL_RESTARTS[i] ?? 0),
     });
     write(`/api/v1/controllers/${c.name}/health`, {
       pod_name: c.name, reachable: true,
@@ -111,11 +205,12 @@ const PROXIES = [
 ];
 function proxyListEntry(p, i) {
   if (p.reachable === false) {
-    return { component: p.kind, gateway_ref: p.gw, pod_name: p.name, pod_namespace: p.ns, reachable: false };
+    return { component: p.kind, gateway_ref: p.gw, pod_name: p.name, pod_namespace: p.ns, pod_ip: `10.42.0.${100 + i}`, admin_port: 8082, reachable: false, ...runtime(i, PROXY_RESTARTS[i] ?? 0) };
   }
   const e = {
     admin_port: 8082, component: p.kind, degraded_checks: p.degraded, health: p.health,
     pod_ip: `10.42.0.${100 + i}`, pod_name: p.name, pod_namespace: p.ns, reachable: true,
+    ...runtime(i, PROXY_RESTARTS[i] ?? 0),
   };
   if (p.gw) e.gateway_ref = p.gw;
   return e;
@@ -123,13 +218,14 @@ function proxyListEntry(p, i) {
 function emitProxies() {
   write('/api/v1/proxies', { proxies: PROXIES.map(proxyListEntry) });
   PROXIES.forEach((p, i) => {
+    write(`/api/v1/manifests/pod/${p.ns}/${p.name}`, podManifest(p.name, p.ns, p.kind, i, PROXY_RESTARTS[i] ?? 0));
     if (p.reachable === false) {
-      write(`/api/v1/proxies/${p.name}`, { component: p.kind, gateway_ref: p.gw, pod_name: p.name, pod_namespace: p.ns, reachable: false });
+      write(`/api/v1/proxies/${p.name}`, { component: p.kind, gateway_ref: p.gw, pod_name: p.name, pod_namespace: p.ns, pod_ip: `10.42.0.${100 + i}`, admin_port: 8082, reachable: false, ...runtime(i, PROXY_RESTARTS[i] ?? 0) });
       write(`/api/v1/proxies/${p.name}/health`, { pod_name: p.name, reachable: false });
       write(`/api/v1/proxies/${p.name}/routes`, { pod_name: p.name, reachable: false });
       return;
     }
-    const detail = { admin_port: 8082, component: p.kind, pod_ip: `10.42.0.${100 + i}`, pod_name: p.name, pod_namespace: p.ns, reachable: true };
+    const detail = { admin_port: 8082, component: p.kind, pod_ip: `10.42.0.${100 + i}`, pod_name: p.name, pod_namespace: p.ns, reachable: true, ...runtime(i, PROXY_RESTARTS[i] ?? 0) };
     if (p.gw) detail.gateway_ref = p.gw;
     write(`/api/v1/proxies/${p.name}`, detail);
     write(`/api/v1/proxies/${p.name}/health`, {

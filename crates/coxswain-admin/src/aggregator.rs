@@ -20,6 +20,7 @@ use coxswain_core::cluster::{ClusterSummary, GatewayCondition, SharedClusterSumm
 use coxswain_core::fleet::{Component, FleetEntry, SharedFleet};
 use futures::future::join_all;
 use http::{HeaderValue, Response, StatusCode, header};
+use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::{Api, Client};
 use std::net::IpAddr;
@@ -121,6 +122,18 @@ impl OperatorAggregator {
         });
         if let Some(ref gw) = entry.gateway_ref {
             obj["gateway_ref"] = serde_json::Value::String(gw.clone());
+        }
+        // Pod runtime, straight off the fleet snapshot's Pod (present even when the
+        // pod is unreachable — restart count is exactly what you want then).
+        obj["restarts"] = serde_json::json!(entry.restarts);
+        if let Some(ref node) = entry.node {
+            obj["node"] = serde_json::Value::String(node.clone());
+        }
+        if let Some(ref phase) = entry.phase {
+            obj["phase"] = serde_json::Value::String(phase.clone());
+        }
+        if let Some(ref created) = entry.created_at {
+            obj["created_at"] = serde_json::Value::String(created.clone());
         }
         obj
     }
@@ -789,7 +802,7 @@ impl OperatorAggregator {
     /// `GET /api/v1/manifests/{kind}/{namespace}/{name}` — raw Kubernetes
     /// manifest for the named resource, returned as JSON.
     ///
-    /// `kind` ∈ `httproute` | `ingress` | `gateway`.
+    /// `kind` ∈ `httproute` | `ingress` | `gateway` | `pod`.
     ///
     /// The response is the verbatim object returned by the Kubernetes API
     /// server, including `managedFields` and `status`. The operator UI
@@ -863,6 +876,23 @@ impl OperatorAggregator {
                     Err(kube::Error::Api(e)) if e.code == 404 => not_found(),
                     Err(e) => {
                         tracing::warn!(error = %e, namespace, name, "K8s GET Ingress manifest failed");
+                        internal_error()
+                    }
+                }
+            }
+            "pod" => {
+                let api: Api<Pod> = Api::namespaced(kube.clone(), namespace);
+                match api.get(name).await {
+                    Ok(obj) => match serde_json::to_string(&obj) {
+                        Ok(body) => json_response(body),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to serialise Pod manifest");
+                            internal_error()
+                        }
+                    },
+                    Err(kube::Error::Api(e)) if e.code == 404 => not_found(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, namespace, name, "K8s GET Pod manifest failed");
                         internal_error()
                     }
                 }

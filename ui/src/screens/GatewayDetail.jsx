@@ -7,6 +7,7 @@ import { Badge, poolBadge } from '../components/Badge.jsx';
 import { ConditionRow } from '../components/ConditionRow.jsx';
 import { ListenerRow } from '../components/ListenerRow.jsx';
 import { ManifestDialog } from '../components/ManifestDialog.jsx';
+import { Icon } from '../components/Icon.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 
 /**
@@ -67,7 +68,9 @@ export function GatewayDetail({ namespace, name }) {
               {addresses.join(', ')}
             </span>
           )}
-          <button class="btn" onClick={() => setShowManifest(true)}>View manifest</button>
+          <button class="btn btn-icon" onClick={() => setShowManifest(true)}>
+            <Icon name="code" size={15} /> Manifest
+          </button>
         </div>
       </div>
 

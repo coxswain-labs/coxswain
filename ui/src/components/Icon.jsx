@@ -58,6 +58,20 @@ const PATHS = {
       <line x1="15" y1="12" x2="3" y2="12" />
     </>
   ),
+  // code chevrons </> — view raw manifest
+  code: (
+    <>
+      <polyline points="16 18 22 12 16 6" />
+      <polyline points="8 6 2 12 8 18" />
+    </>
+  ),
+  // terminal prompt >_ — pod logs
+  terminal: (
+    <>
+      <polyline points="4 17 10 11 4 5" />
+      <line x1="12" y1="19" x2="20" y2="19" />
+    </>
+  ),
   // info circle — version / about popover
   info: (
     <>

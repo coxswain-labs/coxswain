@@ -164,7 +164,7 @@ export function Fleet({ query }) {
         </section>
       )}
 
-      {/* Dedicated-proxy inventory — one set per Gateway, in user namespaces */}
+      {/* Dedicated-proxy inventory — grouped by tenant namespace */}
       {show('dedicated') && (
         <section aria-label="Dedicated proxy pods">
           <div class="section-head">

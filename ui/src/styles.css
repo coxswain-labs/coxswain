@@ -279,10 +279,43 @@ img { max-width: 100%; }
    pod-card layout so the same identity reads the same way on both screens. */
 .detail-head { min-width: 0; }
 .detail-title-row { display: flex; align-items: center; gap: 8px; }
+/* Breathing room between the resource name and the meta lines below it. */
+.detail-head .detail-title-row { margin-bottom: 6px; }
 .detail-head .card-ns { margin-bottom: 2px; }
 .detail-head .screen-meta { margin-top: 4px; font-family: monospace; }
-.header-badges { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+.header-badges { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; align-self: flex-start; }
+/* Right-hand header column: badges on top, action buttons (View manifest / Logs)
+   below, both right-aligned and pinned to the top of the header. */
+.header-aside { margin-left: auto; align-self: flex-start; display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+.header-aside .header-badges { margin-left: 0; align-self: flex-end; }
+.header-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 639px) {
+  /* Don't cram badges + buttons against the right edge with a dead gap on the
+     left — give the aside full width and left-align it under the title. */
+  .header-aside { width: 100%; margin-left: 0; align-items: stretch; }
+  .header-aside .header-badges { align-self: stretch; justify-content: flex-start; }
+  /* Action buttons fill the row, splitting it evenly (bigger touch targets). */
+  .header-actions { justify-content: flex-start; flex-wrap: nowrap; }
+  .header-actions > .btn { flex: 1; justify-content: center; }
+}
 .addr-label { font-size: 12px; font-family: monospace; color: var(--muted); }
+
+/* Pod info facts grid (shared PodInfo: node / age / restarts / phase / …). */
+.pod-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px 24px; margin-bottom: 16px;
+}
+.pod-fact dt {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; color: var(--muted); margin-bottom: 2px;
+}
+.pod-fact dd { margin: 0; }
+.pod-fact code {
+  background: none; padding: 0;
+  font-family: ui-monospace, monospace; font-size: 13px; color: var(--text);
+}
+.pod-fact code.warn { color: var(--amber); }
 
 /* ── Section ─────────────────────────────────────────────────────────────── */
 section { margin-bottom: 32px; }
@@ -291,7 +324,7 @@ section { margin-bottom: 32px; }
   margin-bottom: 12px;
 }
 .section-title {
-  font-size: 11px; font-weight: 700; margin-bottom: 12px;
+  font-size: 13px; font-weight: 700; margin-bottom: 12px;
   color: var(--muted); text-transform: uppercase; letter-spacing: .07em;
 }
 .section-title.section-err  { color: var(--red); }
@@ -594,11 +627,40 @@ tr.row-hit td:first-child { box-shadow: inset 3px 0 0 var(--blue); }
 .cond-name { font-weight: 600; font-size: 13px; margin-bottom: 2px; }
 .cond-detail { font-size: 12px; color: var(--muted); word-break: break-word; }
 
-/* ── Health rows ─────────────────────────────────────────────────────────── */
-/* Health chips — one per subsystem. Quiet green when ready; amber with the
-   failing check names inline when not. Replaces the old row-per-check panel. */
-.health-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+/* ── Pod health (PodInfo) ────────────────────────────────────────────────── */
+/* Per-subsystem collapsible rows: a summary line (state + N/M ready) that
+   expands to that subsystem's individual checks. Replaces the retired Health
+   page's flat per-check dump (now per-pod and grouped). */
 .health-chips-empty { font-size: 13px; color: var(--muted); }
+.health-subsystems { display: grid; gap: 8px; }
+.health-sub { border: 1px solid var(--border); border-radius: var(--r); background: var(--surface); }
+.health-sub-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 10px 12px; min-height: var(--touch);
+  background: none; border: none; cursor: pointer;
+  color: var(--text); font-size: 13px; text-align: left; outline: none;
+}
+.health-sub-head:hover, .health-sub-head:focus-visible { background: var(--surface2); }
+.health-sub.ok   > .health-sub-head svg { color: var(--green); }
+.health-sub.warn > .health-sub-head svg { color: var(--amber); }
+.health-sub-name { font-weight: 600; text-transform: capitalize; }
+.health-sub-count { color: var(--muted); }
+.health-sub-caret { margin-left: auto; color: var(--muted); transition: transform .12s; }
+.health-sub-caret.open { transform: rotate(90deg); }
+.health-checks {
+  list-style: none; margin: 0; padding: 8px 12px 10px;
+  border-top: 1px solid var(--border);
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 4px 16px;
+}
+.health-check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.health-check.ok svg   { color: var(--green); }
+.health-check.warn { color: var(--text); }
+.health-check.warn svg { color: var(--amber); }
+/* Extra top spacing so Pod → Health reads as far apart as Health → the next
+   section (consistent inter-block rhythm). */
+.pod-health-head { margin-top: 32px; }
+
+/* ── Status chip (Fleet pod-card footers: one per-pod rollup) ─────────────── */
 .health-chip {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 5px 10px; border-radius: 999px;
@@ -611,11 +673,6 @@ tr.row-hit td:first-child { box-shadow: inset 3px 0 0 var(--blue); }
 .health-chip.warn svg { color: var(--amber); }
 .health-chip.err  { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, transparent); }
 .health-chip.err svg  { color: var(--red); }
-.health-chip-name   { color: var(--text); font-weight: 600; }
-.health-chip.ok .health-chip-name,
-.health-chip.warn .health-chip-name { color: inherit; }
-.health-chip-detail { color: var(--muted); font-weight: 400; font-size: 12px; }
-/* Smaller variant for Fleet pod-card footers. */
 .health-chip.sm { padding: 2px 8px; font-size: 12px; gap: 4px; }
 
 /* ── Event log ───────────────────────────────────────────────────────────── */
@@ -661,6 +718,12 @@ tr.row-hit td:first-child { box-shadow: inset 3px 0 0 var(--blue); }
 }
 .btn:hover { border-color: var(--blue); }
 .btn-secondary { color: var(--muted); }
+/* Icon + label button (View manifest / Logs). .btn is already inline-flex. */
+.btn-icon { gap: 6px; }
+.btn-icon svg { flex-shrink: 0; }
+/* Inert placeholder (e.g. Logs, pending #285). */
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn:disabled:hover { border-color: var(--border); }
 input[type=text], select {
   background: var(--surface2); border: 1px solid var(--border);
   border-radius: var(--r); color: var(--text);
@@ -760,7 +823,8 @@ input[type=checkbox] { accent-color: var(--blue); }
 }
 /* Every inline value in a problem card (namespace, kind, backend/rejected group,
    failing checks) renders the same: monospace, text color, no code chip. */
-.problem-card code {
+.problem-card code,
+.problem-card-meta code {
   background: none; padding: 0;
   font-family: ui-monospace, monospace; font-size: 12px; color: var(--text);
 }
@@ -771,6 +835,8 @@ input[type=checkbox] { accent-color: var(--blue); }
   margin-bottom: 6px; flex-wrap: wrap;
 }
 .problem-card-head > strong { word-break: break-word; }
+/* A meta-line value that's a warning rather than a fact (e.g. "no leader"). */
+.meta-warn { color: var(--amber); }
 .problem-card-detail { font-size: 12px; color: var(--muted); word-break: break-word; }
 .pods-label { color: var(--muted); }
 
@@ -815,6 +881,7 @@ input[type=checkbox] { accent-color: var(--blue); }
 }
 .attached-route-row:hover { border-color: var(--blue); }
 .ns-label { color: var(--muted); }
+
 
 /* ── Listener row ────────────────────────────────────────────────────────── */
 .listener-warn td { color: var(--amber); }
@@ -892,12 +959,33 @@ input[type=checkbox] { accent-color: var(--blue); }
 @media (min-width: 640px) {
   .manifest-pre { font-size: 13px; }
 }
+/* On mobile the centred modal wastes edge space and clips long YAML — render it
+   as a full-screen drawer instead. */
+@media (max-width: 639px) {
+  .dialog {
+    inset: 0;
+    transform: none;
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    max-height: none;
+    border: none;
+    border-radius: 0;
+  }
+}
 
 /* ── Loading / error / empty states ──────────────────────────────────────── */
 .state-box {
   padding: 40px 20px; text-align: center;
   color: var(--muted); font-size: 13px;
   display: flex; flex-direction: column; align-items: center; gap: 12px;
+}
+/* Empty state — a contained box rather than floating centered text. */
+.empty-box {
+  border: 1px solid var(--border); border-radius: var(--r);
+  background: var(--surface);
+  padding: 20px; text-align: center;
+  color: var(--muted); font-size: 13px;
 }
 .spinner {
   width: 28px; height: 28px;

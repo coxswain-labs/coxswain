@@ -1,13 +1,14 @@
 import { useApi } from '../hooks/useApi.js';
 import { useSSE } from '../hooks/useSSE.js';
-import { getProxy, getProxyRoutes, getProxyHealth } from '../api/endpoints.js';
+import { getProxy, getProxyRoutes, getProxyHealth, getControllers } from '../api/endpoints.js';
 import { nav } from '../router.js';
 import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { Badge, poolBadge } from '../components/Badge.jsx';
-import { CopyButton } from '../components/CopyButton.jsx';
+import { DetailHeader } from '../components/DetailHeader.jsx';
+import { PodInfo } from '../components/PodInfo.jsx';
+import { PodActions } from '../components/PodActions.jsx';
 import { Icon } from '../components/Icon.jsx';
 import { EndpointHealth } from '../components/EndpointHealth.jsx';
-import { HealthChips } from '../components/HealthChips.jsx';
 import { Tabs } from '../components/Tabs.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 import { useEffect } from 'preact/hooks';
@@ -20,15 +21,21 @@ import { useEffect } from 'preact/hooks';
  * Clicking a route row navigates to the Route Inspector.
  */
 export function ProxyDetail({ pod, query }) {
-  const meta    = useApi(() => getProxy(pod), [pod]);
-  const routes  = useApi(() => getProxyRoutes(pod), [pod]);
-  const health  = useApi(() => getProxyHealth(pod), [pod]);
-  const sse     = useSSE('/api/v1/events');
+  const meta        = useApi(() => getProxy(pod), [pod]);
+  const routes      = useApi(() => getProxyRoutes(pod), [pod]);
+  const health      = useApi(() => getProxyHealth(pod), [pod]);
+  const controllers = useApi(getControllers);
+  const sse         = useSSE('/api/v1/events');
 
   useEffect(() => {
     const off = sse.subscribe('rebuild.completed', () => routes.refetch());
     return off;
   }, [sse.subscribe, routes.refetch]);
+
+  useEffect(() => {
+    const off = sse.subscribe('leader.changed', () => controllers.refetch());
+    return off;
+  }, [sse.subscribe]);
 
   const breadcrumb = [
     { label: 'Fleet', onClick: () => nav.fleet() },
@@ -43,38 +50,48 @@ export function ProxyDetail({ pod, query }) {
   const isReachable = p.reachable ?? false;
   const pool = p.component === 'dedicated-proxy' ? 'dedicated' : 'shared';
 
+  // Navigation aid only: the fleet-wide leader is the active controller, so a
+  // proxy links there as "take me to the control plane". Proxies watch
+  // Kubernetes independently today (no controller→proxy config push), so this
+  // is not a dependency — it'll gain meaning once the controller pushes config.
+  const leaderPod = (controllers.data?.controllers ?? []).find(
+    (x) => x.reachable && x.is_leader,
+  )?.pod_name;
+
   return (
     <div class="screen">
       <Breadcrumb items={breadcrumb} />
 
-      <div class="screen-header">
-        <div class="detail-head">
-          <div class="card-ns">{p.pod_namespace || '—'}</div>
-          <div class="detail-title-row">
-            <h1 class="screen-title">{pod}</h1>
-            <CopyButton text={pod} label="Copy pod name" />
-          </div>
-          {[p.pod_ip, p.gateway_ref].filter(Boolean).length > 0 && (
-            <div class="screen-meta">
-              {[p.pod_ip, p.gateway_ref].filter(Boolean).join(' · ')}
+      <DetailHeader
+        name={pod}
+        namespace={p.pod_namespace}
+        meta={(
+          <>
+            {p.gateway_ref && (
+              <div class="problem-card-meta">
+                Gateway: <a onClick={() => nav.gateway(p.pod_namespace, p.gateway_ref)}>{p.gateway_ref}</a>
+              </div>
+            )}
+            <div class="problem-card-meta">
+              Controller:{' '}
+              {leaderPod
+                ? <a onClick={() => nav.controller(leaderPod)}>{leaderPod}</a>
+                : <span class="meta-warn">no leader</span>}
             </div>
-          )}
-        </div>
-        <div class="header-badges">
-          {poolBadge(pool)}
-          {isReachable
-            ? <Badge variant="ok">reachable</Badge>
-            : <Badge variant="fail">unreachable</Badge>}
-        </div>
-      </div>
+          </>
+        )}
+        badges={(
+          <>
+            {poolBadge(pool)}
+            {isReachable
+              ? <Badge variant="ok">reachable</Badge>
+              : <Badge variant="fail">unreachable</Badge>}
+          </>
+        )}
+        actions={<PodActions namespace={p.pod_namespace} name={pod} />}
+      />
 
-      {/* Subsystem health — compact chips; failing checks shown inline. */}
-      {health.data?.health?.subsystems && (
-        <section aria-label="Subsystem health">
-          <h2 class="section-title">Health</h2>
-          <HealthChips subsystems={health.data.health.subsystems} />
-        </section>
-      )}
+      <PodInfo detail={p} health={health} />
 
       {/* Routes */}
       <section aria-label="Routes">

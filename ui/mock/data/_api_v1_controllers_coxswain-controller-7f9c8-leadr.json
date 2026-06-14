@@ -5,5 +5,9 @@
   "pod_ip": "10.42.0.10",
   "pod_name": "coxswain-controller-7f9c8-leadr",
   "pod_namespace": "coxswain-system",
-  "reachable": true
+  "reachable": true,
+  "node": "node-cp-1",
+  "restarts": 0,
+  "phase": "Running",
+  "created_at": "2026-06-08T00:30:00Z"
 }

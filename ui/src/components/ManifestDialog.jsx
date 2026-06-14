@@ -167,6 +167,7 @@ function kindLabel(kind) {
     case 'httproute': return 'HTTPRoute';
     case 'gateway':   return 'Gateway';
     case 'ingress':   return 'Ingress';
+    case 'pod':       return 'Pod';
     default:          return kind;
   }
 }

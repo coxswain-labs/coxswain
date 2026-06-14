@@ -1,0 +1,130 @@
+{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "coxswain-shared-proxy-66d-bk9p4",
+    "namespace": "coxswain-system",
+    "uid": "a1b2c3d4-0000-4000-8000-000000000001",
+    "resourceVersion": "1007",
+    "creationTimestamp": "2026-06-09T01:30:00Z",
+    "labels": {
+      "app.kubernetes.io/name": "coxswain",
+      "app.kubernetes.io/component": "shared-proxy",
+      "pod-template-hash": "66d"
+    },
+    "annotations": {
+      "coxswain-labs.dev/admin-port": "8082"
+    },
+    "ownerReferences": [
+      {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "coxswain-shared-proxy-66d",
+        "uid": "rs-shared-proxy-1",
+        "controller": true,
+        "blockOwnerDeletion": true
+      }
+    ]
+  },
+  "spec": {
+    "serviceAccountName": "coxswain-proxy",
+    "nodeName": "node-w-1",
+    "containers": [
+      {
+        "name": "coxswain",
+        "image": "ghcr.io/coxswain-labs/coxswain:v0.1.0",
+        "args": [
+          "serve",
+          "proxy",
+          "--shared"
+        ],
+        "ports": [
+          {
+            "name": "http",
+            "containerPort": 8080,
+            "protocol": "TCP"
+          },
+          {
+            "name": "https",
+            "containerPort": 8443,
+            "protocol": "TCP"
+          },
+          {
+            "name": "admin",
+            "containerPort": 8082,
+            "protocol": "TCP"
+          }
+        ],
+        "env": [
+          {
+            "name": "COXSWAIN_LOG_FORMAT",
+            "value": "json"
+          },
+          {
+            "name": "POD_NAMESPACE",
+            "valueFrom": {
+              "fieldRef": {
+                "fieldPath": "metadata.namespace"
+              }
+            }
+          }
+        ],
+        "resources": {
+          "requests": {
+            "cpu": "50m",
+            "memory": "64Mi"
+          },
+          "limits": {
+            "memory": "128Mi"
+          }
+        },
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/readyz",
+            "port": "admin"
+          },
+          "periodSeconds": 10,
+          "timeoutSeconds": 1
+        }
+      }
+    ]
+  },
+  "status": {
+    "phase": "Running",
+    "podIP": "10.42.0.101",
+    "hostIP": "192.168.65.4",
+    "startTime": "2026-06-09T01:30:00Z",
+    "conditions": [
+      {
+        "type": "Initialized",
+        "status": "True"
+      },
+      {
+        "type": "Ready",
+        "status": "True"
+      },
+      {
+        "type": "ContainersReady",
+        "status": "True"
+      },
+      {
+        "type": "PodScheduled",
+        "status": "True"
+      }
+    ],
+    "containerStatuses": [
+      {
+        "name": "coxswain",
+        "image": "ghcr.io/coxswain-labs/coxswain:v0.1.0",
+        "ready": true,
+        "started": true,
+        "restartCount": 0,
+        "state": {
+          "running": {
+            "startedAt": "2026-06-09T01:30:00Z"
+          }
+        }
+      }
+    ]
+  }
+}

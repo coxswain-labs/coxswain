@@ -1,0 +1,129 @@
+{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "tenant-a-gw-coxswain-7db74-r5tfb",
+    "namespace": "tenant-a",
+    "uid": "a1b2c3d4-0000-4000-8000-000000000003",
+    "resourceVersion": "1021",
+    "creationTimestamp": "2026-06-11T03:30:00Z",
+    "labels": {
+      "app.kubernetes.io/name": "coxswain",
+      "app.kubernetes.io/component": "dedicated-proxy",
+      "pod-template-hash": "7db74"
+    },
+    "annotations": {
+      "coxswain-labs.dev/admin-port": "8082"
+    },
+    "ownerReferences": [
+      {
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "name": "tenant-a-gw-coxswain-7db74",
+        "uid": "rs-dedicated-proxy-3",
+        "controller": true,
+        "blockOwnerDeletion": true
+      }
+    ]
+  },
+  "spec": {
+    "serviceAccountName": "coxswain-proxy",
+    "nodeName": "node-cp-1",
+    "containers": [
+      {
+        "name": "coxswain",
+        "image": "ghcr.io/coxswain-labs/coxswain:v0.1.0",
+        "args": [
+          "serve",
+          "proxy"
+        ],
+        "ports": [
+          {
+            "name": "http",
+            "containerPort": 8080,
+            "protocol": "TCP"
+          },
+          {
+            "name": "https",
+            "containerPort": 8443,
+            "protocol": "TCP"
+          },
+          {
+            "name": "admin",
+            "containerPort": 8082,
+            "protocol": "TCP"
+          }
+        ],
+        "env": [
+          {
+            "name": "COXSWAIN_LOG_FORMAT",
+            "value": "json"
+          },
+          {
+            "name": "POD_NAMESPACE",
+            "valueFrom": {
+              "fieldRef": {
+                "fieldPath": "metadata.namespace"
+              }
+            }
+          }
+        ],
+        "resources": {
+          "requests": {
+            "cpu": "50m",
+            "memory": "64Mi"
+          },
+          "limits": {
+            "memory": "128Mi"
+          }
+        },
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/readyz",
+            "port": "admin"
+          },
+          "periodSeconds": 10,
+          "timeoutSeconds": 1
+        }
+      }
+    ]
+  },
+  "status": {
+    "phase": "Running",
+    "podIP": "10.42.0.103",
+    "hostIP": "192.168.65.4",
+    "startTime": "2026-06-11T03:30:00Z",
+    "conditions": [
+      {
+        "type": "Initialized",
+        "status": "True"
+      },
+      {
+        "type": "Ready",
+        "status": "True"
+      },
+      {
+        "type": "ContainersReady",
+        "status": "True"
+      },
+      {
+        "type": "PodScheduled",
+        "status": "True"
+      }
+    ],
+    "containerStatuses": [
+      {
+        "name": "coxswain",
+        "image": "ghcr.io/coxswain-labs/coxswain:v0.1.0",
+        "ready": true,
+        "started": true,
+        "restartCount": 1,
+        "state": {
+          "running": {
+            "startedAt": "2026-06-11T03:30:00Z"
+          }
+        }
+      }
+    ]
+  }
+}

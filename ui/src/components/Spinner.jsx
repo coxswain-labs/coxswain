@@ -17,7 +17,7 @@ export function ErrorState({ error }) {
 
 export function EmptyState({ message = 'Nothing here.' }) {
   return (
-    <div class="state-box" aria-live="polite">
+    <div class="empty-box" aria-live="polite">
       {message}
     </div>
   );
