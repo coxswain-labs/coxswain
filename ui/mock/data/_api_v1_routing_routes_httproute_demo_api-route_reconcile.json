@@ -1,0 +1,43 @@
+{
+  "kind": "httproute",
+  "namespace": "demo",
+  "name": "api-route",
+  "consistent": true,
+  "expected": [
+    {
+      "host": "api.demo.local",
+      "path": "/",
+      "backend_group": "demo/api"
+    }
+  ],
+  "proxies": [
+    {
+      "pod_name": "coxswain-shared-proxy-66d-ah7x2",
+      "reachable": true,
+      "missing": [],
+      "rows": [
+        {
+          "host": "api.demo.local",
+          "path": "/",
+          "backend_group": "demo/api",
+          "endpoints": [],
+          "dead": true
+        }
+      ]
+    },
+    {
+      "pod_name": "coxswain-shared-proxy-66d-bk9p4",
+      "reachable": true,
+      "missing": [],
+      "rows": [
+        {
+          "host": "api.demo.local",
+          "path": "/",
+          "backend_group": "demo/api",
+          "endpoints": [],
+          "dead": true
+        }
+      ]
+    }
+  ]
+}

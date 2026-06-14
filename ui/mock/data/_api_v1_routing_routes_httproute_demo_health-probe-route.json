@@ -1,6 +1,10 @@
 {
   "name": "health-probe-route",
   "namespace": "demo",
+  "status": "error",
+  "hostnames": [
+    "app.demo.local"
+  ],
   "parent_statuses": [
     {
       "conditions": [
@@ -26,35 +30,28 @@
       }
     }
   ],
-  "proxies": [
+  "rules": [
     {
-      "pod_name": "coxswain-shared-proxy-66d-ah7x2",
-      "reachable": true,
-      "routes": {
-        "gateway": {
-          "conflicts": [],
-          "hosts": [
-            {
-              "host": "app.demo.local",
-              "port": 8080,
-              "routes": [
-                {
-                  "backend_group": "demo/api",
-                  "endpoints": [],
-                  "name": "health-probe-route",
-                  "namespace": "demo",
-                  "path": "/health",
-                  "type": "prefix"
-                }
-              ]
-            }
-          ]
-        },
-        "ingress": {
-          "conflicts": [],
-          "hosts": []
+      "matches": [
+        {
+          "path": {
+            "type": "PathPrefix",
+            "value": "/health"
+          },
+          "method": null,
+          "headers": [],
+          "query_params": []
         }
-      }
+      ],
+      "backends": [
+        {
+          "name": "api",
+          "namespace": "demo",
+          "port": 8080,
+          "weight": null
+        }
+      ],
+      "filters": []
     }
   ]
 }

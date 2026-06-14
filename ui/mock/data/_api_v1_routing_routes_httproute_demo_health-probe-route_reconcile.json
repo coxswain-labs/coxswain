@@ -1,0 +1,43 @@
+{
+  "kind": "httproute",
+  "namespace": "demo",
+  "name": "health-probe-route",
+  "consistent": true,
+  "expected": [
+    {
+      "host": "app.demo.local",
+      "path": "/health",
+      "backend_group": "demo/api"
+    }
+  ],
+  "proxies": [
+    {
+      "pod_name": "coxswain-shared-proxy-66d-ah7x2",
+      "reachable": true,
+      "missing": [],
+      "rows": [
+        {
+          "host": "app.demo.local",
+          "path": "/health",
+          "backend_group": "demo/api",
+          "endpoints": [],
+          "dead": true
+        }
+      ]
+    },
+    {
+      "pod_name": "coxswain-shared-proxy-66d-bk9p4",
+      "reachable": true,
+      "missing": [],
+      "rows": [
+        {
+          "host": "app.demo.local",
+          "path": "/health",
+          "backend_group": "demo/api",
+          "endpoints": [],
+          "dead": true
+        }
+      ]
+    }
+  ]
+}

@@ -47,6 +47,21 @@ const row = (name, ns, path, group, endpoints = [], type = 'prefix') =>
   ({ backend_group: group, endpoints, name, namespace: ns, path, type });
 const host = (h, port, routes) => ({ host: h, port, routes });
 
+// ── effective-config builders (route detail bodies) ──────────────────────────
+// HTTPRoute: interpreted spec rules — match predicates + weighted backends +
+// filter kinds, the shape `httproute_rules_json` emits server-side.
+const gmatch = ({ path = '/', pathType = 'PathPrefix', method = null, headers = [], query = [] } = {}) => ({
+  path: { type: pathType, value: path },
+  method,
+  headers: headers.map(([name, value, type = 'Exact']) => ({ name, type, value })),
+  query_params: query.map(([name, value, type = 'Exact']) => ({ name, type, value })),
+});
+const gbackend = (name, port, { namespace = null, weight = null } = {}) => ({ name, namespace, port, weight });
+const grule = (matches, backends, filters = []) => ({ matches, backends, filters });
+// Ingress: host → [{path, path_type, backend}] (flat, single backend per path).
+const ipath = (path, service, port, pathType = 'Prefix') => ({ path, path_type: pathType, backend: { service, port: String(port) } });
+const irule = (host, paths) => ({ host, paths });
+
 const CONTROLLER_CHECKS = [
   'backend_tls_policy', 'config_map', 'endpoint_slice', 'gateway', 'gateway_class',
   'httproute', 'ingress', 'ingress_class', 'reference_grant', 'routing_table_built',
@@ -348,14 +363,25 @@ function emitGateways() {
 // First-class routing resource: name · namespace · parent gateways · rules ·
 // traffic-served status (ok/warn/error), exercising every state.
 const HTTPROUTES = [
-  { ns: 'demo', name: 'web-route', hostnames: ['app.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'warn' },   // shadowed (conflict)
-  { ns: 'demo', name: 'api-route', hostnames: ['api.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'error' },  // dead backend
-  { ns: 'demo', name: 'docs-route', hostnames: ['docs.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'ok' },
-  { ns: 'demo', name: 'multi-gw-route', hostnames: ['app.demo.local', 'app.staging.local'], parents: ['demo/demo-gw', 'staging/staging-gw'], rule_count: 2, status: 'ok' }, // attached to two Gateways
-  { ns: 'demo', name: 'health-probe-route', hostnames: ['app.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'error' }, // dead
-  { ns: 'demo', name: 'payments-route', hostnames: ['pay.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'error' },     // unresolved refs
-  { ns: 'tenant-a', name: 'a-web-route', hostnames: ['app.tenant-a.local'], parents: ['tenant-a/tenant-a-gw'], rule_count: 1, status: 'ok' },
-  { ns: 'tenant-b', name: 'b-api-route', hostnames: ['app.tenant-b.local'], parents: ['tenant-b/tenant-b-gw'], rule_count: 1, status: 'error' }, // dead + proxy not ready
+  { ns: 'demo', name: 'web-route', hostnames: ['app.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'warn',   // shadowed (conflict)
+    rules: [grule([gmatch({ path: '/' })], [gbackend('web', 80, { namespace: 'demo' })])] },
+  { ns: 'demo', name: 'api-route', hostnames: ['api.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'error',  // dead backend
+    rules: [grule([gmatch({ path: '/' })], [gbackend('api', 8080, { namespace: 'demo' })])] },
+  { ns: 'demo', name: 'docs-route', hostnames: ['docs.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'ok',
+    rules: [grule([gmatch({ path: '/' })], [gbackend('web', 80, { namespace: 'demo' })])] },
+  { ns: 'demo', name: 'multi-gw-route', hostnames: ['app.demo.local', 'app.staging.local'], parents: ['demo/demo-gw', 'staging/staging-gw'], rule_count: 2, status: 'ok', // attached to two Gateways
+    rules: [
+      grule([gmatch({ path: '/' })], [gbackend('web', 80, { namespace: 'demo' })]),
+      grule([gmatch({ path: '/admin', method: 'GET', headers: [['x-internal', 'true']] })], [gbackend('admin', 80, { namespace: 'demo' })], ['RequestHeaderModifier']),
+    ] },
+  { ns: 'demo', name: 'health-probe-route', hostnames: ['app.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'error', // dead
+    rules: [grule([gmatch({ path: '/health' })], [gbackend('api', 8080, { namespace: 'demo' })])] },
+  { ns: 'demo', name: 'payments-route', hostnames: ['pay.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'error',     // unresolved refs + weighted canary
+    rules: [grule([gmatch({ path: '/' })], [gbackend('payments', 8080, { namespace: 'demo', weight: 90 }), gbackend('payments-canary', 8080, { namespace: 'demo', weight: 10 })], ['RequestRedirect'])] },
+  { ns: 'tenant-a', name: 'a-web-route', hostnames: ['app.tenant-a.local'], parents: ['tenant-a/tenant-a-gw'], rule_count: 1, status: 'ok',
+    rules: [grule([gmatch({ path: '/' })], [gbackend('web', 80, { namespace: 'tenant-a' })])] },
+  { ns: 'tenant-b', name: 'b-api-route', hostnames: ['app.tenant-b.local'], parents: ['tenant-b/tenant-b-gw'], rule_count: 1, status: 'error', // dead + proxy not ready
+    rules: [grule([gmatch({ path: '/' })], [gbackend('api', 8080, { namespace: 'tenant-b' })])] },
 ];
 function emitHttproutesList() {
   const httproutes = HTTPROUTES.map((r) => ({
@@ -389,55 +415,150 @@ function emitSummaries() {
 }
 
 // ── HTTPRoute details ─────────────────────────────────────────────────────────
-// accepted+healthy · accepted+dead · NOT accepted (unresolved refs)
-function httproute(ns, name, parentGw, conditions, podRoutes) {
+// Detail body is the interpreted object: traffic-served status + hostnames +
+// per-parentRef conditions + effective-config rules (no proxy fan-out — that is
+// the on-demand /reconcile sub-resource below).
+function httproute(ns, name, parentStatuses) {
+  const r = HTTPROUTES.find((h) => h.ns === ns && h.name === name);
   return {
     name, namespace: ns,
-    parent_statuses: [{ conditions, parent_ref: { name: parentGw, namespace: null } }],
-    proxies: podRoutes,
+    status: r?.status ?? 'ok',
+    hostnames: r?.hostnames ?? [],
+    parent_statuses: parentStatuses,
+    rules: r?.rules ?? [],
   };
 }
+const oneParent = (gw, conditions, namespace = null) => [{ conditions, parent_ref: { name: gw, namespace } }];
 function emitHttproutes() {
-  const sharedPod = PROXIES[0].name;
-  const onShared = (gatewaySide) => ([
-    { pod_name: sharedPod, reachable: true, routes: { gateway: gatewaySide, ingress: EMPTY_SIDE } },
-  ]);
-  // demo/web-route — accepted + healthy
-  write('/api/v1/routing/routes/httproute/demo/web-route', httproute('demo', 'web-route', 'demo-gw',
-    [ACCEPTED, PROGRAMMED, RESOLVED],
-    onShared({ conflicts: [], hosts: [host('app.demo.local', 8080, [row('web-route', 'demo', '/', 'demo/web', EP2)])] })));
-  // demo/api-route — accepted but dead backend (0 endpoints)
-  write('/api/v1/routing/routes/httproute/demo/api-route', httproute('demo', 'api-route', 'demo-gw',
-    [ACCEPTED, PROGRAMMED, RESOLVED],
-    onShared({ conflicts: [], hosts: [host('api.demo.local', 8080, [row('api-route', 'demo', '/', 'demo/api', [])])] })));
-  // demo/docs-route — accepted + healthy
-  write('/api/v1/routing/routes/httproute/demo/docs-route', httproute('demo', 'docs-route', 'demo-gw',
-    [ACCEPTED, PROGRAMMED, RESOLVED],
-    onShared({ conflicts: [], hosts: [host('docs.demo.local', 8080, [row('docs-route', 'demo', '/', 'demo/web', EP2)])] })));
-  // demo/health-probe-route — accepted + dead
-  write('/api/v1/routing/routes/httproute/demo/health-probe-route', httproute('demo', 'health-probe-route', 'demo-gw',
-    [ACCEPTED, PROGRAMMED, RESOLVED],
-    onShared({ conflicts: [], hosts: [host('app.demo.local', 8080, [row('health-probe-route', 'demo', '/health', 'demo/api', [])])] })));
-  // demo/payments-route — NOT accepted (unresolved backend ref), not on any proxy
-  write('/api/v1/routing/routes/httproute/demo/payments-route', httproute('demo', 'payments-route', 'demo-gw',
-    [ACCEPTED, cond('Programmed', 'False', 'Invalid', 'Route has an unresolved backendRef'), UNRESOLVED], []));
-  // tenant-a/a-web-route — dedicated proxy, healthy
-  write('/api/v1/routing/routes/httproute/tenant-a/a-web-route', httproute('tenant-a', 'a-web-route', 'tenant-a-gw',
-    [ACCEPTED, PROGRAMMED, RESOLVED],
-    [{ pod_name: PROXIES[2].name, reachable: true, routes: { gateway: { conflicts: [], hosts: [host('app.tenant-a.local', 8100, [row('a-web-route', 'tenant-a', '/', 'tenant-a/web', EP2)])] }, ingress: EMPTY_SIDE } }]));
-  // tenant-b/b-api-route — dedicated, accepted but dead + proxy not ready
-  write('/api/v1/routing/routes/httproute/tenant-b/b-api-route', httproute('tenant-b', 'b-api-route', 'tenant-b-gw',
-    [ACCEPTED, NOT_PROGRAMMED, RESOLVED],
-    [{ pod_name: PROXIES[4].name, reachable: true, routes: { gateway: { conflicts: [], hosts: [host('app.tenant-b.local', 8100, [row('b-api-route', 'tenant-b', '/', 'tenant-b/api', [])])] }, ingress: EMPTY_SIDE } }]));
+  write('/api/v1/routing/routes/httproute/demo/web-route',
+    httproute('demo', 'web-route', oneParent('demo-gw', [ACCEPTED, PROGRAMMED, RESOLVED])));
+  write('/api/v1/routing/routes/httproute/demo/api-route',
+    httproute('demo', 'api-route', oneParent('demo-gw', [ACCEPTED, PROGRAMMED, RESOLVED])));
+  write('/api/v1/routing/routes/httproute/demo/docs-route',
+    httproute('demo', 'docs-route', oneParent('demo-gw', [ACCEPTED, PROGRAMMED, RESOLVED])));
+  // attached to TWO gateways (header shows both links)
+  write('/api/v1/routing/routes/httproute/demo/multi-gw-route',
+    httproute('demo', 'multi-gw-route', [
+      { conditions: [ACCEPTED, PROGRAMMED, RESOLVED], parent_ref: { name: 'demo-gw', namespace: null } },
+      { conditions: [ACCEPTED, PROGRAMMED, RESOLVED], parent_ref: { name: 'staging-gw', namespace: 'staging' } },
+    ]));
+  write('/api/v1/routing/routes/httproute/demo/health-probe-route',
+    httproute('demo', 'health-probe-route', oneParent('demo-gw', [ACCEPTED, PROGRAMMED, RESOLVED])));
+  // NOT accepted — unresolved backend ref (the effective config still shows the
+  // declared weighted canary + filter)
+  write('/api/v1/routing/routes/httproute/demo/payments-route',
+    httproute('demo', 'payments-route', oneParent('demo-gw',
+      [ACCEPTED, cond('Programmed', 'False', 'Invalid', 'Route has an unresolved backendRef'), UNRESOLVED])));
+  write('/api/v1/routing/routes/httproute/tenant-a/a-web-route',
+    httproute('tenant-a', 'a-web-route', oneParent('tenant-a-gw', [ACCEPTED, PROGRAMMED, RESOLVED])));
+  write('/api/v1/routing/routes/httproute/tenant-b/b-api-route',
+    httproute('tenant-b', 'b-api-route', oneParent('tenant-b-gw', [ACCEPTED, NOT_PROGRAMMED, RESOLVED])));
+}
+
+// ── route reconcile (on-demand data-plane consistency) ──────────────────────────
+// Mirrors `reconcile_route`: per serving proxy, the route-tagged rows + the union
+// keys each is missing; `consistent` is false on any unreachable/missing/absent.
+const rrow = (host, path, bg, endpoints) => ({ host, path, backend_group: bg, endpoints, dead: endpoints.length === 0 });
+const rkey = (host, path, bg) => ({ host, path, backend_group: bg });
+function reconcile(kind, ns, name, { expected, proxies }) {
+  // Derive `consistent` the same way the server does.
+  const consistent = expected.length > 0 && proxies.every((p) =>
+    p.reachable && (p.missing ?? []).length === 0);
+  write(`/api/v1/routing/routes/${kind}/${ns}/${name}/reconcile`,
+    { kind, namespace: ns, name, consistent, expected, proxies });
+}
+function emitReconcile() {
+  const [ah, bk] = [PROXIES[0].name, PROXIES[1].name];   // shared pool
+  const taPods = PROXIES.filter((p) => p.gw === 'tenant-a-gw').map((p) => p.name);
+  const tbPods = PROXIES.filter((p) => p.gw === 'tenant-b-gw');
+
+  // healthy + consistent across the shared pool
+  reconcile('httproute', 'demo', 'docs-route', {
+    expected: [rkey('docs.demo.local', '/', 'demo/web')],
+    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
+      rows: [rrow('docs.demo.local', '/', 'demo/web', EP2)] })),
+  });
+  // consistent presence, but dead backend on both (rows flagged dead)
+  reconcile('httproute', 'demo', 'api-route', {
+    expected: [rkey('api.demo.local', '/', 'demo/api')],
+    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
+      rows: [rrow('api.demo.local', '/', 'demo/api', [])] })),
+  });
+  // DRIFT — controller says ok, but the /admin rule is missing on bk9p4
+  reconcile('httproute', 'demo', 'multi-gw-route', {
+    expected: [rkey('app.demo.local', '/', 'demo/web'), rkey('app.demo.local', '/admin', 'demo/admin')],
+    proxies: [
+      { pod_name: ah, reachable: true, missing: [],
+        rows: [rrow('app.demo.local', '/', 'demo/web', EP2), rrow('app.demo.local', '/admin', 'demo/admin', EP1)] },
+      { pod_name: bk, reachable: true, missing: [rkey('app.demo.local', '/admin', 'demo/admin')],
+        rows: [rrow('app.demo.local', '/', 'demo/web', EP2)] },
+    ],
+  });
+  reconcile('httproute', 'demo', 'web-route', {
+    expected: [rkey('app.demo.local', '/', 'demo/web')],
+    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
+      rows: [rrow('app.demo.local', '/', 'demo/web', EP2)] })),
+  });
+  reconcile('httproute', 'demo', 'health-probe-route', {
+    expected: [rkey('app.demo.local', '/health', 'demo/api')],
+    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
+      rows: [rrow('app.demo.local', '/health', 'demo/api', [])] })),
+  });
+  // unresolved refs — absent from every serving proxy (consistent=false, empty)
+  reconcile('httproute', 'demo', 'payments-route', {
+    expected: [],
+    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [], rows: [] })),
+  });
+  // dedicated, healthy + consistent
+  reconcile('httproute', 'tenant-a', 'a-web-route', {
+    expected: [rkey('app.tenant-a.local', '/', 'tenant-a/web')],
+    proxies: taPods.map((pod) => ({ pod_name: pod, reachable: true, missing: [],
+      rows: [rrow('app.tenant-a.local', '/', 'tenant-a/web', EP2)] })),
+  });
+  // dedicated, dead backend + one proxy unreachable (consistent=false)
+  reconcile('httproute', 'tenant-b', 'b-api-route', {
+    expected: [rkey('app.tenant-b.local', '/', 'tenant-b/api')],
+    proxies: tbPods.map((p) => (p.reachable === false
+      ? { pod_name: p.name, reachable: false }
+      : { pod_name: p.name, reachable: true, missing: [],
+          rows: [rrow('app.tenant-b.local', '/', 'tenant-b/api', [])] })),
+  });
+  // Ingress — shared pool, consistent (with one dead path)
+  reconcile('ingress', 'demo', 'demo-ingress', {
+    expected: [rkey('demo.local', '/', 'demo/web'), rkey('demo.local', '/api', 'demo/api')],
+    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
+      rows: [rrow('demo.local', '/', 'demo/web', EP2), rrow('demo.local', '/api', 'demo/api', [])] })),
+  });
+  reconcile('ingress', 'demo', 'frontend-ingress', {
+    expected: [rkey('demo.local', '/', 'demo/frontend')],
+    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
+      rows: [rrow('demo.local', '/', 'demo/frontend', EP1)] })),
+  });
+  reconcile('ingress', 'staging', 'staging-ingress', {
+    expected: [rkey('staging.local', '/', 'staging/app'), rkey('staging.local', '/api', 'staging/app')],
+    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
+      rows: [rrow('staging.local', '/', 'staging/app', []), rrow('staging.local', '/api', 'staging/app', [])] })),
+  });
+  reconcile('ingress', 'tenant-b', 'tenant-b-ingress', {
+    expected: [rkey('app.tenant-b.local', '/', 'tenant-b/web')],
+    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
+      rows: [rrow('app.tenant-b.local', '/', 'tenant-b/web', EP2)] })),
+  });
 }
 
 // ── Ingresses ─────────────────────────────────────────────────────────────────
 // healthy rules · all-dead rules · tenant-namespaced
 const INGRESSES = [
-  { ns: 'demo', name: 'demo-ingress', route_count: 2, ingress_class: 'coxswain', load_balancer: '192.168.194.180', status: 'warn' },     // one dead rule
-  { ns: 'demo', name: 'frontend-ingress', route_count: 1, ingress_class: 'coxswain', load_balancer: '192.168.194.180', status: 'warn' }, // shadowed (conflict)
-  { ns: 'staging', name: 'staging-ingress', route_count: 2, ingress_class: 'coxswain', load_balancer: '', status: 'error' }, // all dead, no address yet
-  { ns: 'tenant-b', name: 'tenant-b-ingress', route_count: 1, ingress_class: '', load_balancer: '192.168.194.181', status: 'ok' }, // default-class fallback
+  { ns: 'demo', name: 'demo-ingress', route_count: 2, ingress_class: 'coxswain', load_balancer: '192.168.194.180', status: 'warn', // one dead rule + inline TLS
+    tls: [{ hosts: ['demo.local'], secret: 'demo-tls' }],
+    rules: [irule('demo.local', [ipath('/', 'web', 80), ipath('/api', 'api', 8080)])] },
+  { ns: 'demo', name: 'frontend-ingress', route_count: 1, ingress_class: 'coxswain', load_balancer: '192.168.194.180', status: 'warn', // shadowed (conflict)
+    rules: [irule('demo.local', [ipath('/', 'frontend', 80)])] },
+  { ns: 'staging', name: 'staging-ingress', route_count: 2, ingress_class: 'coxswain', load_balancer: '', status: 'error', // all dead, no address yet
+    rules: [irule('staging.local', [ipath('/', 'app', 8080), ipath('/api', 'app', 8080)])] },
+  { ns: 'tenant-b', name: 'tenant-b-ingress', route_count: 1, ingress_class: '', load_balancer: '192.168.194.181', status: 'ok', // default-class fallback + defaultBackend
+    default_backend: { service: 'web', port: '80' },
+    rules: [irule('app.tenant-b.local', [ipath('/', 'web', 80)])] },
 ];
 function emitIngresses() {
   const ingresses = INGRESSES.map((i) => ({
@@ -447,21 +568,17 @@ function emitIngresses() {
     status: i.status,
   }));
   write('/api/v1/routing/ingresses', { ingresses, total: ingresses.length, returned: ingresses.length, offset: 0 });
-  const sharedPod = PROXIES[0].name;
-  const ingRoute = (ns, name, ingressSide) => write(`/api/v1/routing/routes/ingress/${ns}/${name}`, {
-    name, namespace: ns,
-    proxies: [{ pod_name: sharedPod, reachable: true, routes: { gateway: EMPTY_SIDE, ingress: ingressSide } }],
+  INGRESSES.forEach((i) => {
+    write(`/api/v1/routing/routes/ingress/${i.ns}/${i.name}`, {
+      name: i.name, namespace: i.ns,
+      status: i.status,
+      class: i.ingress_class ?? '',
+      tls: i.tls ?? [],
+      default_backend: i.default_backend ?? null,
+      rules: i.rules ?? [],
+      ...(i.load_balancer ? { load_balancer: i.load_balancer } : {}),
+    });
   });
-  ingRoute('demo', 'demo-ingress', { conflicts: [], hosts: [host('demo.local', 80, [
-    row('demo-ingress', 'demo', '/', 'demo/web', EP2),
-    row('demo-ingress', 'demo', '/api', 'demo/api', []), // dead
-  ])] });
-  ingRoute('demo', 'frontend-ingress', { conflicts: [], hosts: [host('demo.local', 80, [row('frontend-ingress', 'demo', '/', 'demo/frontend', EP1)])] });
-  ingRoute('staging', 'staging-ingress', { conflicts: [], hosts: [host('staging.local', 80, [
-    row('staging-ingress', 'staging', '/', 'staging/app', []),   // dead
-    row('staging-ingress', 'staging', '/api', 'staging/app', []), // dead
-  ])] });
-  ingRoute('tenant-b', 'tenant-b-ingress', { conflicts: [], hosts: [host('app.tenant-b.local', 80, [row('tenant-b-ingress', 'tenant-b', '/', 'tenant-b/web', EP2)])] });
 }
 
 // ── problems · health · cluster ─────────────────────────────────────────────────
@@ -520,6 +637,7 @@ emitGateways();
 emitHttproutesList();
 emitHttproutes();
 emitIngresses();
+emitReconcile();
 emitSummaries();
 emitProblems();
 emitHealth();

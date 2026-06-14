@@ -293,7 +293,15 @@ paths:
   /api/v1/routing/routes/{kind}/{namespace}/{name}:
     get:
       tags: [routing]
-      summary: Route detail — live status + per-proxy compilation fan-out
+      summary: Route detail — traffic-served status + effective config
+      description: >
+        Interpreted detail for a single route, sourced from the live Kubernetes
+        object (no proxy fan-out — that is the on-demand `/reconcile` sub-resource).
+        HTTPRoute carries `hostnames`, per-parentRef `parent_statuses` (conditions),
+        and `rules` (match predicates, weighted backends, filter kinds). Ingress
+        carries `class`, inline `tls`, optional `default_backend`, `load_balancer`
+        address, and `rules` (host/path/pathType → backend). Both carry the
+        traffic-served `status`.
       parameters:
         - name: kind
           in: path
@@ -303,6 +311,73 @@ paths:
         - { $ref: '#/components/parameters/name' }
       responses:
         '200': { description: Route detail (shape varies by kind) }
+        '404': { description: Unknown kind or route }
+        '503': { description: Kubernetes API unavailable }
+
+  /api/v1/routing/routes/{kind}/{namespace}/{name}/reconcile:
+    get:
+      tags: [routing]
+      summary: Data-plane consistency check for a single route (on-demand)
+      description: >
+        Independent ground-truth: fans out `GET /routes` to the proxies that
+        should serve the route (the shared pool, or the dedicated proxies of the
+        route's parent Gateways) and diffs the route-tagged rows across them.
+        `consistent` is false when a serving proxy is unreachable, is missing a
+        row its peers have, or the route is absent from every proxy. Heavier than
+        the detail endpoint (N-pod fan-out) — fired only on operator request.
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          schema: { type: string, enum: [httproute, ingress] }
+        - { $ref: '#/components/parameters/namespace' }
+        - { $ref: '#/components/parameters/name' }
+      responses:
+        '200':
+          description: Reconcile report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  kind: { type: string, enum: [httproute, ingress] }
+                  namespace: { type: string }
+                  name: { type: string }
+                  consistent: { type: boolean }
+                  expected:
+                    type: array
+                    description: Union of (host, path, backend_group) keys seen across serving proxies.
+                    items:
+                      type: object
+                      properties:
+                        host: { type: string }
+                        path: { type: string }
+                        backend_group: { type: string }
+                  proxies:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        pod_name: { type: string }
+                        reachable: { type: boolean }
+                        rows:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              host: { type: string }
+                              path: { type: string }
+                              backend_group: { type: string }
+                              endpoints: { type: array, items: { type: string } }
+                              dead: { type: boolean }
+                        missing:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              host: { type: string }
+                              path: { type: string }
+                              backend_group: { type: string }
         '404': { description: Unknown kind or route }
         '503': { description: Kubernetes API unavailable }
 

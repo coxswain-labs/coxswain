@@ -338,6 +338,25 @@ section { margin-bottom: 32px; }
   margin-left: 8px;
 }
 .section-desc { font-size: 13px; color: var(--muted); margin-bottom: 12px; }
+.section-title { display: flex; align-items: center; gap: 8px; }
+.section-action { margin-left: auto; text-transform: none; letter-spacing: 0; }
+.section-hint { font-size: 13px; color: var(--muted); margin: -4px 0 12px; max-width: 76ch; }
+.muted { color: var(--muted); }
+
+/* effective-config table cells (route detail) */
+.backend-cell,
+.match-summary { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* per-parentRef conditions (HTTPRoute detail) */
+.parent-conditions { margin-bottom: 16px; }
+.parent-conditions-head { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+.parent-conditions-head a { cursor: pointer; }
+
+/* on-demand data-plane reconcile */
+.reconcile-idle { font-size: 13px; color: var(--muted); padding: 4px 0 8px; }
+.reconcile-verdict { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.reconcile-summary { font-size: 13px; color: var(--muted); }
+.reconcile-missing { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .section-spinner {
   width: 14px; height: 14px;
   border: 2px solid var(--border); border-top-color: var(--blue);
@@ -913,15 +932,6 @@ input[type=checkbox] { accent-color: var(--blue); }
 .problem-card-detail { font-size: 12px; color: var(--muted); word-break: break-word; }
 .pods-label { color: var(--muted); }
 
-/* ── Route inspector ─────────────────────────────────────────────────────── */
-.parent-status {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--r); padding: 14px; margin-bottom: 10px;
-}
-.parent-label {
-  display: flex; align-items: center; gap: 8px;
-  margin-bottom: 10px; font-size: 13px; flex-wrap: wrap;
-}
 .link-text { color: var(--blue); cursor: pointer; }
 .link-text:hover { text-decoration: underline; }
 

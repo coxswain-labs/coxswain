@@ -53,7 +53,7 @@ export const getIngresses = (opts) => fetchJson(`/api/v1/routing/ingresses${buil
 export const getIngress = (ns, name) =>
   fetchJson(`/api/v1/routing/ingresses/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`);
 
-// ── Route detail (Route Inspector) ────────────────────────────────────────────
+// ── Route detail (HTTPRouteDetail / IngressDetail) ────────────────────────────
 
 export const getHttproute = (ns, name) =>
   fetchJson(
@@ -62,6 +62,14 @@ export const getHttproute = (ns, name) =>
 export const getIngressRoute = (ns, name) =>
   fetchJson(
     `/api/v1/routing/routes/ingress/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`,
+  );
+
+// On-demand data-plane consistency check for a single route (`kind` is the URL
+// kind: `httproute` | `ingress`). Heavier than the detail fetch — fired only
+// when the operator clicks "Reconcile".
+export const getRouteReconcile = (kind, ns, name) =>
+  fetchJson(
+    `/api/v1/routing/routes/${encodeURIComponent(kind)}/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/reconcile`,
   );
 
 // ── Manifests ─────────────────────────────────────────────────────────────────

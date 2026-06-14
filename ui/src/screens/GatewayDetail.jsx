@@ -4,22 +4,14 @@ import { getGateway, getProblems } from '../api/endpoints.js';
 import { nav } from '../router.js';
 import { worseSeverity, problemRouteKeys, routeKey, sevClass, sevTitle } from '../severity.js';
 import { Breadcrumb } from '../components/Breadcrumb.jsx';
-import { Badge, poolBadge } from '../components/Badge.jsx';
+import { poolBadge } from '../components/Badge.jsx';
 import { DetailHeader } from '../components/DetailHeader.jsx';
+import { StatusBadge } from '../components/StatusBadge.jsx';
 import { ConditionRow } from '../components/ConditionRow.jsx';
 import { ListenerRow } from '../components/ListenerRow.jsx';
 import { ManifestDialog } from '../components/ManifestDialog.jsx';
 import { Icon } from '../components/Icon.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
-
-/** Map a traffic-served severity to a header status badge (mirrors the fleet's
- *  reachable/unreachable badge). */
-function statusBadge(status) {
-  if (status === 'error') return <Badge variant="fail">not serving</Badge>;
-  if (status === 'warn')  return <Badge variant="warn">degraded</Badge>;
-  if (status === 'ok')    return <Badge variant="ok">serving</Badge>;
-  return null;
-}
 
 /**
  * Gateway detail screen.
@@ -29,7 +21,7 @@ function statusBadge(status) {
  *   Listeners with 0 attached routes are highlighted — the Gateway is
  *   accepted but nothing routes through that listener.
  * - Status conditions.
- * - Attached HTTPRoutes (links to Route Inspector).
+ * - Attached routes (link to the route detail screen).
  * - Proxy pool badge + addresses.
  *
  * The endpoint was expanded (in aggregator.rs) to include `listeners[]`
@@ -85,7 +77,7 @@ export function GatewayDetail({ namespace, name }) {
         )}
         badges={(
           <>
-            {statusBadge(status)}
+            <StatusBadge status={status} />
             {poolBadge(pool)}
           </>
         )}

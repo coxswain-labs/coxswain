@@ -1,6 +1,10 @@
 {
   "name": "b-api-route",
   "namespace": "tenant-b",
+  "status": "error",
+  "hostnames": [
+    "app.tenant-b.local"
+  ],
   "parent_statuses": [
     {
       "conditions": [
@@ -27,35 +31,28 @@
       }
     }
   ],
-  "proxies": [
+  "rules": [
     {
-      "pod_name": "tenant-b-gw-coxswain-5cc91-m2qd8",
-      "reachable": true,
-      "routes": {
-        "gateway": {
-          "conflicts": [],
-          "hosts": [
-            {
-              "host": "app.tenant-b.local",
-              "port": 8100,
-              "routes": [
-                {
-                  "backend_group": "tenant-b/api",
-                  "endpoints": [],
-                  "name": "b-api-route",
-                  "namespace": "tenant-b",
-                  "path": "/",
-                  "type": "prefix"
-                }
-              ]
-            }
-          ]
-        },
-        "ingress": {
-          "conflicts": [],
-          "hosts": []
+      "matches": [
+        {
+          "path": {
+            "type": "PathPrefix",
+            "value": "/"
+          },
+          "method": null,
+          "headers": [],
+          "query_params": []
         }
-      }
+      ],
+      "backends": [
+        {
+          "name": "api",
+          "namespace": "tenant-b",
+          "port": 8080,
+          "weight": null
+        }
+      ],
+      "filters": []
     }
   ]
 }

@@ -54,6 +54,27 @@ export function sevTitle(status) {
   return status === 'error' ? 'Not serving traffic' : status === 'warn' ? 'Degraded' : undefined;
 }
 
+/**
+ * Lookup sets for a single route's `/problems` entries, used to overlay runtime
+ * truth onto the (spec-derived) effective-config table: the `backend_group`s
+ * with dead backends, and the paths whose rule was shadowed by a conflict.
+ * `kind` is the route's own kind (`HTTPRoute` | `Ingress`).
+ */
+export function routeProblemSets(problems, kind, namespace, name) {
+  const routing = problems?.routing ?? {};
+  const mine = (p) =>
+    p.route?.kind === kind && p.route?.namespace === namespace && p.route?.name === name;
+  const dead = new Set();
+  const shadowed = new Set();
+  for (const p of routing.dead_routes ?? []) {
+    if (mine(p) && p.backend_group) dead.add(p.backend_group);
+  }
+  for (const p of routing.conflicts ?? []) {
+    if (mine(p) && p.path != null) shadowed.add(p.path);
+  }
+  return { dead, shadowed };
+}
+
 /** True when any `/problems` routing entry is attributed to a resource of `kind`. */
 export function categoryHasProblem(problems, kind) {
   const routing = problems?.routing ?? {};

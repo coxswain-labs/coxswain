@@ -1,0 +1,21 @@
+{
+  "kind": "httproute",
+  "namespace": "demo",
+  "name": "payments-route",
+  "consistent": false,
+  "expected": [],
+  "proxies": [
+    {
+      "pod_name": "coxswain-shared-proxy-66d-ah7x2",
+      "reachable": true,
+      "missing": [],
+      "rows": []
+    },
+    {
+      "pod_name": "coxswain-shared-proxy-66d-bk9p4",
+      "reachable": true,
+      "missing": [],
+      "rows": []
+    }
+  ]
+}

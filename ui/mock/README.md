@@ -22,7 +22,11 @@ controller's named events on a loop (so the live indicator goes green), and
   cluster that exercises every distinct UI state (leader/standby/degraded/
   unreachable pods; programmed/not-programmed/not-accepted gateways; dead
   backends; conflicts; multi-tenant grouping; …). The state matrix is documented
-  at the top of `generate.mjs`. This is the committed default.
+  at the top of `generate.mjs`. This is the committed default. Route detail
+  fixtures carry the interpreted effective config (rules + per-parentRef
+  conditions), and each route also has a `…/reconcile` fixture so the on-demand
+  data-plane reconcile button reaches its full matrix in dev — consistent, drift
+  (a row missing on one proxy), dead backends, and an unreachable proxy.
 - **Captured from a real controller** — port-forward the admin port, then
   `BASE=http://localhost:8082 mock/capture.sh`. Snapshots whatever state the
   live cluster is in. Use when you need to reproduce something real.

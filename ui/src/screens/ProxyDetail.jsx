@@ -19,7 +19,7 @@ import { useEffect, useState } from 'preact/hooks';
  *
  * Shows pod metadata, subsystem health, and a tabbed route table
  * (Ingress | Gateway API). Routing conflicts are called out inline.
- * Clicking a route row navigates to the Route Inspector.
+ * Clicking a route row navigates to the route detail screen.
  */
 export function ProxyDetail({ pod, query }) {
   const meta        = useApi(() => getProxy(pod), [pod]);
