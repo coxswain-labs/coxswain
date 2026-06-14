@@ -409,7 +409,7 @@ section { margin-bottom: 32px; }
    Every header filter is one uniform control type — dropdowns and a search input
    sharing the --control-h token — so they align on a desktop row and stack to a
    full-width column on mobile with no special-casing. (The old segmented pill
-   was replaced by a dropdown for exactly this reason; see FilterSelect.jsx.) */
+   was replaced by a dropdown for exactly this reason; see ComboFilter.jsx.) */
 .header-controls {
   margin-left: auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
 }
@@ -438,10 +438,53 @@ section { margin-bottom: 32px; }
 .search-box::placeholder { color: var(--muted); }
 .search-box:focus-visible,
 .filter-select:focus-visible { outline: 2px solid var(--blue); outline-offset: -1px; border-color: var(--blue); }
+
+/* ── Combo filter (searchable single-select) ─────────────────────────────────
+   A FilterSelect-styled trigger that opens a popover with a search input + a
+   scrollable filtered list — for high-cardinality filters (namespaces). */
+.combo { position: relative; display: inline-block; }
+.combo-trigger { text-align: left; }
+/* Extra right room for the clear button so a long selected label doesn't slip
+   under it (the chevron already reserves 30px). */
+.combo-trigger.clearable { padding-right: 48px; }
+.combo-clear {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  right: 28px; /* just left of the chevron (which sits at right: 10px) */
+  width: 18px; height: 18px; line-height: 1; font-size: 15px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: none; border: none; cursor: pointer; padding: 0;
+  color: var(--muted); border-radius: 3px;
+}
+.combo-clear:hover, .combo-clear:focus-visible { color: var(--text); background: var(--surface2); }
+.combo-popover {
+  position: absolute; z-index: 30; top: calc(100% + 4px); left: 0;
+  min-width: 220px; max-width: 340px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  padding: 6px;
+}
+.combo-search {
+  width: 100%; box-sizing: border-box;
+  height: var(--control-h); min-height: var(--control-h);
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--r); color: var(--text);
+  padding: 0 10px; font-size: 13px; margin-bottom: 6px;
+}
+.combo-search:focus-visible { outline: 2px solid var(--blue); outline-offset: -1px; border-color: var(--blue); }
+.combo-list { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; }
+.combo-option {
+  text-align: left; padding: 7px 10px; font-size: 13px; color: var(--text);
+  border-radius: var(--r); background: none; border: none; cursor: pointer;
+}
+.combo-option:hover, .combo-option:focus-visible { background: var(--surface2); }
+.combo-option.active { color: var(--blue); }
+.combo-empty { padding: 8px 10px; color: var(--muted); font-size: 12px; }
+
 /* On mobile the filter controls stack into a full-width column. */
 @media (max-width: 639px) {
   .header-controls { width: 100%; flex-direction: column; align-items: stretch; }
-  .filter-select, .search-box { width: 100%; min-width: 0; }
+  .filter-select, .search-box, .combo { width: 100%; min-width: 0; }
+  .combo-popover { width: 100%; }
 }
 
 /* ── Cards ───────────────────────────────────────────────────────────────── */
@@ -454,10 +497,10 @@ section { margin-bottom: 32px; }
   grid-template-columns: 1fr;
   gap: 12px;
 }
-@media (min-width: 600px) {
+@media (min-width: 640px) {
   .card-grid { grid-template-columns: repeat(2, 1fr); }
 }
-@media (min-width: 960px) {
+@media (min-width: 1024px) {
   .card-grid { grid-template-columns: repeat(3, 1fr); }
 }
 
@@ -496,7 +539,9 @@ section { margin-bottom: 32px; }
 .card-name-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
 /* Middle ellipsis: head shrinks + ellipsises, tail stays pinned so replicas
    (which differ only in their suffix) remain distinguishable. */
-.trunc-name { display: flex; flex: 1; min-width: 0; font-weight: 600; font-size: 13px; }
+/* Shrink-but-don't-grow so the copy button sits right after the name text
+   (not pushed to the card's right edge) while long names still ellipsise. */
+.trunc-name { display: flex; flex: 0 1 auto; min-width: 0; font-weight: 600; font-size: 13px; }
 .trunc-head { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .trunc-tail { flex-shrink: 0; white-space: nowrap; }
 .copy-btn {
@@ -791,7 +836,7 @@ input[type=checkbox] { accent-color: var(--blue); }
   font-size: 13px; color: var(--text);
 }
 .all-clear-check svg { color: var(--green); flex-shrink: 0; }
-@media (min-width: 560px) {
+@media (min-width: 640px) {
   .all-clear-checks { grid-template-columns: 1fr 1fr; gap: 5px 24px; }
 }
 

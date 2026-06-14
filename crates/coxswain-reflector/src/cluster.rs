@@ -225,6 +225,9 @@ fn build_httproutes(
 
             let hostnames = route.spec.hostnames.as_deref().unwrap_or(&[]).to_vec();
             let rule_count = route.spec.rules.as_deref().map(<[_]>::len).unwrap_or(0);
+            // Binding/acceptance health. Routing-table conflicts/dead-routes are
+            // overlaid from the cross-proxy `/api/v1/problems` aggregate in the UI
+            // (the controller's table excludes cut-over dedicated gateways, #301).
             let status = httproute_severity(route, route_ns, route_name, inputs, gateway_severity);
 
             Some(
@@ -378,6 +381,10 @@ fn build_ingresses(inputs: &ClusterSummaryInputs<'_>) -> Vec<IngressSummary> {
                         .or_else(|| entry.hostname.clone().filter(|s| !s.is_empty()))
                 })
                 .unwrap_or_default();
+            // Ingress is self-contained (no parent Gateway) and carries no
+            // binding conditions in the summary, so its server-side status stays
+            // `ok`; routing-table conflicts/dead-routes are overlaid in the UI
+            // from `/api/v1/problems` (#301).
             Some(
                 IngressSummary::new(name, ns)
                     .with_route_count(route_count)

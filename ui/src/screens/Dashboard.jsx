@@ -5,6 +5,7 @@ import { getFleetSummary, getRoutingSummary, getProblems } from '../api/endpoint
 import { nav } from '../router.js';
 import { ProblemsPanel } from '../components/ProblemsPanel.jsx';
 import { Icon } from '../components/Icon.jsx';
+import { categoryHasProblem } from '../severity.js';
 
 /**
  * Dashboard — the landing screen.
@@ -51,14 +52,18 @@ export function Dashboard() {
   // status, so the tile needs no client-side route-problem derivation).
   const warnOf = (cat) => (cat && cat.worst && cat.worst !== 'ok' ? 'warn' : 'ok');
   const total = (cat) => cat?.total ?? 0;
+  // Routing tiles also overlay /problems (cross-proxy conflicts/dead-routes) so a
+  // dedicated-gateway problem — absent from the reflector summary — still warns.
+  const routeWarn = (cat, kind) =>
+    warnOf(cat) === 'warn' || categoryHasProblem(problems.data, kind) ? 'warn' : 'ok';
 
   const stats = [
     { key: 'controllers', label: 'Controllers',      icon: 'server',     accent: 'var(--blue)',   value: total(f.controllers),       status: (leaderless || warnOf(f.controllers) === 'warn') ? 'warn' : 'ok', onClick: () => nav.fleet({ filter: 'controllers' }) },
     { key: 'shared',      label: 'Shared proxies',    icon: 'layers',     accent: 'var(--green)',  value: total(f.shared_proxies),    status: warnOf(f.shared_proxies),    onClick: () => nav.fleet({ filter: 'shared' }) },
     { key: 'dedicated',   label: 'Dedicated proxies', icon: 'box',        accent: 'var(--purple)', value: total(f.dedicated_proxies), status: warnOf(f.dedicated_proxies), onClick: () => nav.fleet({ filter: 'dedicated' }) },
-    { key: 'gateways',    label: 'Gateways',          icon: 'git-branch', accent: 'var(--amber)',  value: total(r.gateways),          status: warnOf(r.gateways),          onClick: () => nav.routing({ tab: 'gateways' }) },
-    { key: 'httproutes',  label: 'HTTPRoutes',        icon: 'route',      accent: 'var(--pink)',   value: total(r.httproutes),        status: warnOf(r.httproutes),        onClick: () => nav.routing({ tab: 'httproutes' }) },
-    { key: 'ingresses',   label: 'Ingresses',         icon: 'log-in',     accent: 'var(--teal)',   value: total(r.ingresses),         status: warnOf(r.ingresses),         onClick: () => nav.routing({ tab: 'ingresses' }) },
+    { key: 'gateways',    label: 'Gateways',          icon: 'git-branch', accent: 'var(--amber)',  value: total(r.gateways),          status: warnOf(r.gateways),                       onClick: () => nav.routing({ tab: 'gateways' }) },
+    { key: 'httproutes',  label: 'HTTPRoutes',        icon: 'route',      accent: 'var(--pink)',   value: total(r.httproutes),        status: routeWarn(r.httproutes, 'HTTPRoute'),     onClick: () => nav.routing({ tab: 'httproutes' }) },
+    { key: 'ingresses',   label: 'Ingresses',         icon: 'log-in',     accent: 'var(--teal)',   value: total(r.ingresses),         status: routeWarn(r.ingresses, 'Ingress'),        onClick: () => nav.routing({ tab: 'ingresses' }) },
   ];
 
   return (

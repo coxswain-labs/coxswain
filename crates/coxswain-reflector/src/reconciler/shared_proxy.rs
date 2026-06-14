@@ -857,6 +857,9 @@ fn rebuild(
     // Publish the cluster summary while we still have access to gateway_tls_health
     // (it's moved into `tls_health.store_and_notify` next). Reads from already-
     // materialised state: nothing kube-side, no allocations beyond the summary.
+    // Routing-table conflicts/dead-routes are overlaid in the UI from the
+    // cross-proxy `/api/v1/problems` aggregate (the controller's table excludes
+    // cut-over dedicated gateways, so it can't see all of them, #301).
     outputs
         .cluster_summary
         .store(Arc::new(build_cluster_summary(&ClusterSummaryInputs {

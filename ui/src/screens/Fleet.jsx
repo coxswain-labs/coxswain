@@ -2,12 +2,10 @@ import { useApi } from '../hooks/useApi.js';
 import { useSSE } from '../hooks/useSSE.js';
 import { getProxies, getControllers } from '../api/endpoints.js';
 import { nav, updateQuery } from '../router.js';
-import { useSearch, matchesSearch } from '../hooks/useSearch.js';
 import { Badge, poolBadge } from '../components/Badge.jsx';
 import { Icon } from '../components/Icon.jsx';
 import { Breadcrumb } from '../components/Breadcrumb.jsx';
-import { SearchBox } from '../components/SearchBox.jsx';
-import { FilterSelect } from '../components/FilterSelect.jsx';
+import { ComboFilter } from '../components/ComboFilter.jsx';
 import { Card, CardFooter, CardGrid } from '../components/Card.jsx';
 import { CopyButton } from '../components/CopyButton.jsx';
 import { TruncatedName } from '../components/TruncatedName.jsx';
@@ -28,17 +26,17 @@ const FILTERS = [
  * Fleet screen — the runtime inventory (compute axis).
  *
  * Controllers first (leader-elected status writers), then shared and dedicated
- * proxy pods. A type filter (`?filter=`) narrows to one section — the
- * Dashboard tiles deep-link straight into it — and a search box (`?q=`) filters
- * by pod name or type within the shown sections. Both are permalinkable. Live
- * SSE events refetch on pod connect/disconnect and rebuild.
+ * proxy pods. A type filter (`?filter=`) narrows to one section — the Dashboard
+ * tiles deep-link straight into it — and a namespace filter (`?ns=`) scopes the
+ * view; a section with no matches under the active namespace is hidden. Both
+ * filters are permalinkable. Live SSE events refetch on pod connect/disconnect
+ * and rebuild.
  */
 export function Fleet({ query }) {
   const proxies    = useApi(getProxies);
   const controllers = useApi(getControllers);
   const sse        = useSSE('/api/v1/events');
 
-  const { search, q, onSearch } = useSearch(query);
   const filter = FILTERS.some((f) => f.value === query?.filter) ? query.filter : 'all';
 
   // Refresh fleet cards on rebuild.
@@ -70,16 +68,12 @@ export function Fleet({ query }) {
   const nsFilter = namespaces.includes(query?.ns) ? query.ns : 'all';
   const inNs = (p) => nsFilter === 'all' || p.pod_namespace === nsFilter;
 
-  // Bucket proxies by component, then apply the namespace + search filters.
+  // Bucket proxies by component, then apply the namespace filter.
   // Unreachable entries still carry `component`/`pod_namespace` from the fleet
   // snapshot, so they land in the right section rather than a catch-all.
-  const shownControllers = controllerList.filter((c) => inNs(c) && matchesSearch(c.pod_name, 'controller', q));
-  const shownShared = proxyList.filter(
-    (p) => p.component !== 'dedicated-proxy' && inNs(p) && matchesSearch(p.pod_name, 'shared proxy', q),
-  );
-  const shownDedicated = proxyList.filter(
-    (p) => p.component === 'dedicated-proxy' && inNs(p) && matchesSearch(p.pod_name, 'dedicated proxy', q),
-  );
+  const shownControllers = controllerList.filter(inNs);
+  const shownShared = proxyList.filter((p) => p.component !== 'dedicated-proxy' && inNs(p));
+  const shownDedicated = proxyList.filter((p) => p.component === 'dedicated-proxy' && inNs(p));
 
   // Dedicated proxies are always grouped under their namespace subheader: the
   // dedicated proxy → Gateway → namespace hierarchy is the natural axis, and at
@@ -93,31 +87,35 @@ export function Fleet({ query }) {
   }, new Map())].sort(([a], [b]) => a.localeCompare(b));
 
   const show = (key) => filter === 'all' || filter === key;
-  const searching = q !== '' || nsFilter !== 'all';
+  const searching = nsFilter !== 'all';
+  // When a namespace filter is active, a section with no matches is hidden
+  // entirely rather than showing a placeholder. An unfiltered empty section still
+  // renders its "none found" message so the category stays visible.
+  const sectionVisible = (hasItems, loading, error) =>
+    Boolean(loading || error || hasItems || !searching);
 
   return (
     <div class="screen">
       <Breadcrumb items={[{ label: 'Fleet' }, { label: 'Overview' }]} />
       <div class="screen-header">
         <div class="header-controls left">
-          <FilterSelect
-            label="Filter by namespace"
-            value={nsFilter}
-            options={[{ value: 'all', label: 'All namespaces' }, ...namespaces.map((ns) => ({ value: ns, label: ns }))]}
-            onChange={(e) => updateQuery({ ns: e.currentTarget.value === 'all' ? null : e.currentTarget.value })}
-          />
-          <FilterSelect
+          <ComboFilter
             label="Filter by type"
             value={filter}
             options={FILTERS}
-            onChange={(e) => updateQuery({ filter: e.currentTarget.value === 'all' ? null : e.currentTarget.value })}
+            onChange={(v) => updateQuery({ filter: v === 'all' ? null : v })}
           />
-          <SearchBox value={search} onInput={onSearch} label="Search fleet by pod name or type" />
+          <ComboFilter
+            label="Filter by namespace"
+            value={nsFilter}
+            options={[{ value: 'all', label: 'All namespaces' }, ...namespaces.map((ns) => ({ value: ns, label: ns }))]}
+            onChange={(v) => updateQuery({ ns: v === 'all' ? null : v })}
+          />
         </div>
       </div>
 
       {/* Controller inventory — leader-elected status writers come first */}
-      {show('controllers') && (
+      {show('controllers') && sectionVisible(shownControllers.length > 0, controllers.loading, controllers.error) && (
         <section aria-label="Controller pods">
           <div class="section-head">
             <h2 class="section-title">Controllers</h2>
@@ -141,7 +139,7 @@ export function Fleet({ query }) {
       )}
 
       {/* Shared-proxy inventory */}
-      {show('shared') && (
+      {show('shared') && sectionVisible(shownShared.length > 0, proxies.loading, proxies.error) && (
         <section aria-label="Shared proxy pods">
           <div class="section-head">
             <h2 class="section-title">Shared proxies</h2>
@@ -165,7 +163,7 @@ export function Fleet({ query }) {
       )}
 
       {/* Dedicated-proxy inventory — grouped by tenant namespace */}
-      {show('dedicated') && (
+      {show('dedicated') && sectionVisible(dedicatedByNs.length > 0, proxies.loading, proxies.error) && (
         <section aria-label="Dedicated proxy pods">
           <div class="section-head">
             <h2 class="section-title">Dedicated proxies</h2>

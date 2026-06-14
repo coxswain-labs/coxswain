@@ -2,14 +2,15 @@ import { useApi } from '../hooks/useApi.js';
 import { useSSE } from '../hooks/useSSE.js';
 import { updateQuery } from '../router.js';
 import { useSearch } from '../hooks/useSearch.js';
-import { getRoutingSummary, getGateways, getHttproutes, getIngresses } from '../api/endpoints.js';
+import { getRoutingSummary, getGateways, getHttproutes, getIngresses, getProblems } from '../api/endpoints.js';
 import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { SearchBox } from '../components/SearchBox.jsx';
-import { FilterSelect } from '../components/FilterSelect.jsx';
+import { ComboFilter } from '../components/ComboFilter.jsx';
 import { Icon } from '../components/Icon.jsx';
 import { useEffect } from 'preact/hooks';
+import { problemRouteKeys, categoryHasProblem } from '../severity.js';
 import { GatewaysSection } from './Gateways.jsx';
-import { HttproutesSection } from './Httproutes.jsx';
+import { HttpRoutesSection } from './HttpRoutes.jsx';
 import { IngressesSection } from './Ingresses.jsx';
 
 /**
@@ -23,16 +24,23 @@ import { IngressesSection } from './Ingresses.jsx';
  * the first tab that has a problem, else Gateways. A shared namespace filter +
  * search narrow the active table.
  */
+// `problemKind` is the route kind a tab's `/problems` overlay matches (Gateways
+// warn on binding/condition status only — upstream-only — so they have none).
 const TABS = [
-  { key: 'gateways',   label: 'Gateways',   fetch: getGateways,   dataKey: 'gateways',   Section: GatewaysSection },
-  { key: 'httproutes', label: 'HTTPRoutes', fetch: getHttproutes, dataKey: 'httproutes', Section: HttproutesSection },
-  { key: 'ingresses',  label: 'Ingresses',  fetch: getIngresses,  dataKey: 'ingresses',  Section: IngressesSection },
+  { key: 'gateways',   label: 'Gateways',   fetch: getGateways,   dataKey: 'gateways',   Section: GatewaysSection,    problemKind: null },
+  { key: 'httproutes', label: 'HTTPRoutes', fetch: getHttproutes, dataKey: 'httproutes', Section: HttpRoutesSection,  problemKind: 'HTTPRoute' },
+  { key: 'ingresses',  label: 'Ingresses',  fetch: getIngresses,  dataKey: 'ingresses',  Section: IngressesSection,   problemKind: 'Ingress' },
 ];
 
 export function Routing({ query }) {
   const summary = useApi(getRoutingSummary);
+  const problems = useApi(getProblems);
   const sse = useSSE('/api/v1/events');
   const cats = summary.data ?? {};
+  // Overlay the cross-proxy /problems aggregate onto the reflector status so
+  // dedicated-gateway conflicts/dead-routes (absent from the controller's table)
+  // surface in the per-row status and the tab warning icons.
+  const problemKeys = problemRouteKeys(problems.data);
 
   // Active tab: explicit ?tab=, else the first tab with a problem, else Gateways.
   const explicit = TABS.find((t) => t.key === query?.tab);
@@ -48,6 +56,7 @@ export function Routing({ query }) {
   useEffect(() => {
     const off = sse.subscribe('rebuild.completed', () => {
       summary.refetch();
+      problems.refetch();
       list.refetch();
     });
     return off;
@@ -63,10 +72,27 @@ export function Routing({ query }) {
     <div class="screen">
       <Breadcrumb items={[{ label: 'Routing' }, { label: 'Overview' }]} />
 
+      {/* Filters are shared across all tabs (one namespace/search scope applied to
+          whichever tab is active), so they sit above the tab bar — the tabs only
+          switch which resource type the scope is viewed through. */}
+      <div class="screen-header">
+        <div class="header-controls left">
+          <ComboFilter
+            label="Filter by namespace"
+            value={nsFilter}
+            options={[{ value: 'all', label: 'All namespaces' }, ...namespaces.map((ns) => ({ value: ns, label: ns }))]}
+            onChange={(v) => updateQuery({ ns: v === 'all' ? null : v })}
+          />
+          <SearchBox value={search} onInput={onSearch} label="Search routing by name" />
+        </div>
+      </div>
+
       <div class="tabs" role="tablist">
         {TABS.map((t) => {
           const cat = cats[t.key] ?? {};
-          const warn = cat.worst && cat.worst !== 'ok';
+          const warn =
+            (cat.worst && cat.worst !== 'ok') ||
+            (t.problemKind && categoryHasProblem(problems.data, t.problemKind));
           return (
             <button
               key={t.key}
@@ -84,18 +110,6 @@ export function Routing({ query }) {
         })}
       </div>
 
-      <div class="screen-header">
-        <div class="header-controls left">
-          <FilterSelect
-            label="Filter by namespace"
-            value={nsFilter}
-            options={[{ value: 'all', label: 'All namespaces' }, ...namespaces.map((ns) => ({ value: ns, label: ns }))]}
-            onChange={(e) => updateQuery({ ns: e.currentTarget.value === 'all' ? null : e.currentTarget.value })}
-          />
-          <SearchBox value={search} onInput={onSearch} label="Search routing by name" />
-        </div>
-      </div>
-
       <Section
         rows={rows}
         total={cats[active.key]?.total}
@@ -103,6 +117,7 @@ export function Routing({ query }) {
         error={list.error}
         q={q}
         ns={nsFilter}
+        problemKeys={problemKeys}
       />
     </div>
   );

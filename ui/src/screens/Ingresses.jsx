@@ -1,6 +1,7 @@
 import { matchesSearch } from '../hooks/useSearch.js';
 import { nav } from '../router.js';
 import { DataTable, SeverityDot } from '../components/DataTable.jsx';
+import { worseSeverity, routeKey } from '../severity.js';
 
 /**
  * Ingresses section — a table of all Ingress resources the controller knows
@@ -8,10 +9,13 @@ import { DataTable, SeverityDot } from '../components/DataTable.jsx';
  * Presentational: the owning Routing screen supplies the filters (see
  * GatewaysSection).
  */
-export function IngressesSection({ rows = [], total, loading = false, error = null, q = '', ns = 'all' }) {
+export function IngressesSection({ rows = [], total, loading = false, error = null, q = '', ns = 'all', problemKeys }) {
   const shown = rows.filter(
     (ing) => (ns === 'all' || ing.namespace === ns) && matchesSearch(ing.name, 'ingress', q),
   );
+  // Overlay /problems (conflicts/dead-routes) onto the reflector-computed status.
+  const rowStatus = (ing) =>
+    worseSeverity(ing.status, problemKeys?.has(routeKey('Ingress', ing.namespace, ing.name)) ? 'warn' : 'ok');
   return (
     <DataTable
       columns={['Name', 'Namespace', 'Rules', 'Status']}
@@ -29,7 +33,7 @@ export function IngressesSection({ rows = [], total, loading = false, error = nu
           <td>{ing.name}</td>
           <td>{ing.namespace}</td>
           <td>{ing.route_count ?? 0}</td>
-          <td><SeverityDot status={ing.status} /></td>
+          <td><SeverityDot status={rowStatus(ing)} /></td>
         </tr>
       )}
     />
