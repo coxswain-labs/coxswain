@@ -1,0 +1,91 @@
+{
+  "httproutes": [
+    {
+      "name": "web-route",
+      "namespace": "demo",
+      "hostnames": [
+        "app.demo.local"
+      ],
+      "parent_gateways": [
+        "demo/demo-gw"
+      ],
+      "rule_count": 1,
+      "status": "warn"
+    },
+    {
+      "name": "api-route",
+      "namespace": "demo",
+      "hostnames": [
+        "api.demo.local"
+      ],
+      "parent_gateways": [
+        "demo/demo-gw"
+      ],
+      "rule_count": 1,
+      "status": "error"
+    },
+    {
+      "name": "docs-route",
+      "namespace": "demo",
+      "hostnames": [
+        "docs.demo.local"
+      ],
+      "parent_gateways": [
+        "demo/demo-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "health-probe-route",
+      "namespace": "demo",
+      "hostnames": [
+        "app.demo.local"
+      ],
+      "parent_gateways": [
+        "demo/demo-gw"
+      ],
+      "rule_count": 1,
+      "status": "error"
+    },
+    {
+      "name": "payments-route",
+      "namespace": "demo",
+      "hostnames": [
+        "pay.demo.local"
+      ],
+      "parent_gateways": [
+        "demo/demo-gw"
+      ],
+      "rule_count": 1,
+      "status": "error"
+    },
+    {
+      "name": "a-web-route",
+      "namespace": "tenant-a",
+      "hostnames": [
+        "app.tenant-a.local"
+      ],
+      "parent_gateways": [
+        "tenant-a/tenant-a-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "b-api-route",
+      "namespace": "tenant-b",
+      "hostnames": [
+        "app.tenant-b.local"
+      ],
+      "parent_gateways": [
+        "tenant-b/tenant-b-gw"
+      ],
+      "rule_count": 1,
+      "status": "error"
+    }
+  ],
+  "total": 7,
+  "returned": 7,
+  "offset": 0
+}

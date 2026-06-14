@@ -97,7 +97,7 @@ export function Fleet({ query }) {
 
   return (
     <div class="screen">
-      <Breadcrumb items={[{ label: 'Fleet' }]} />
+      <Breadcrumb items={[{ label: 'Fleet' }, { label: 'Overview' }]} />
       <div class="screen-header">
         <div class="header-controls left">
           <FilterSelect

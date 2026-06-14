@@ -1,23 +1,37 @@
-//! Admin HTTP endpoints for Coxswain: `/metrics`, `/routes`,
-//! `/api/v1/health`, `/api/v1/cluster`, and (controller-only)
-//! the `/api/v1/{proxies,controllers,gateways,ingresses,routes/*,manifests/*,problems}`
-//! aggregator surface, the `/api/v1/pods/{name}/logs` log relay, plus the
-//! embedded operator UI served at `GET /`.
+//! Admin HTTP endpoints for Coxswain.
+//!
+//! Two axes (controller-only) plus a handful of cross-cutting endpoints
+//! (issue #301):
+//! - `/api/v1/fleet/{summary,controllers,proxies}` — all coxswain pods, with
+//!   per-pod `/{name}`, `/{name}/health`, and (proxies) `/{name}/routes`.
+//! - `/api/v1/routing/{summary,gateways,httproutes,ingresses}` — config
+//!   resources, with detail at `/api/v1/routing/routes/{kind}/{ns}/{name}`.
+//! - cross-cutting: `/api/v1/{health,problems,events,manifests/*,pods/*/logs}`.
+//!
+//! The routing list endpoints and `fleet/proxies/{name}/routes` accept the
+//! shared filter/pagination envelope (see [`page`]). Role-local, unversioned:
+//! `/metrics`, `/routes` (proxy-local compiled table), and the embedded operator
+//! UI at `GET /`.
+//!
+//! The full surface (paths + response schemas) is described in
+//! `crates/coxswain-admin/openapi.yaml` — an internal dev aid; keep it in sync
+//! with the dispatch below and the [`aggregator`] handlers.
 
 mod aggregator;
 mod events;
 mod gw_types;
 mod logs;
+mod page;
 
 pub use aggregator::OperatorAggregator;
 pub use events::EventSources;
 
 use aggregator::json_response;
 use async_trait::async_trait;
-use coxswain_core::cluster::{ClusterSummary, ControllerSummary, SharedClusterSummary};
 use coxswain_core::health::{HealthRegistry, SubsystemSnapshot};
 use coxswain_core::routing::{RoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use http::{HeaderValue, Response, StatusCode, header};
+use page::ListParams;
 use pingora_core::apps::{HttpPersistentSettings, HttpServerApp, ReusedHttpStream};
 use pingora_core::modules::http::HttpModules;
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
@@ -54,11 +68,16 @@ const UI_HTML: &str = include_str!(concat!(
 /// | `/metrics` | ✓ | |
 /// | `/api/v1/health` | ✓ | |
 /// | `/routes` | proxy + dev only | |
-/// | `/api/v1/cluster` | | ✓ |
-/// | `/api/v1/{proxies,controllers,gateways,ingresses,routes/*}` | | ✓ |
-/// | `/api/v1/problems` | | ✓ |
+/// | `/api/v1/fleet/{summary,controllers,proxies}` (+ sub-resources) | | ✓ |
+/// | `/api/v1/routing/{summary,gateways,httproutes,ingresses}` | | ✓ |
+/// | `/api/v1/routing/routes/{kind}/{ns}/{name}` | | ✓ |
+/// | `/api/v1/{problems,manifests/*}` | | ✓ |
 /// | `/api/v1/events` (SSE) | | ✓ |
 /// | `/api/v1/pods/{name}/logs` (chunked) | | ✓ |
+///
+/// The routing list endpoints and `fleet/proxies/{name}/routes` accept the
+/// shared filter/pagination envelope (`host`/`path`/`limit`/`offset`/`status`,
+/// default limit 200, max 1000; see [`page`]).
 ///
 /// Each capability is gated by an `Option` or `bool` field; missing
 /// capabilities return 404 structurally rather than by convention.
@@ -80,9 +99,6 @@ pub struct AdminServer {
     /// Routing tables for the `/routes` endpoint. `None` on the controller role
     /// (its `/routes` returns 404); `Some` on proxy and dev roles.
     pub routes: Option<(SharedIngressRoutingTable, SharedGatewayRoutingTable)>,
-    /// Optional aggregate cluster summary. `None` on proxy roles (returns 404
-    /// from `/api/v1/cluster`); `Some` on the controller and `dev` roles.
-    pub cluster: Option<SharedClusterSummary>,
     /// Optional aggregator for the controller's `/api/v1/*` fan-out endpoints.
     /// `None` on proxy roles (those endpoints return 404).
     pub aggregator: Option<OperatorAggregator>,
@@ -102,8 +118,8 @@ pub struct AdminServer {
 impl AdminServer {
     /// Construct an `AdminServer` with the minimum required collaborators.
     ///
-    /// Call `.with_routes()`, `.with_cluster_summary()`, and/or
-    /// `.with_aggregator()` to enable optional capabilities.
+    /// Call `.with_routes()` and/or `.with_aggregator()` to enable optional
+    /// capabilities.
     #[must_use]
     pub fn new(health: HealthRegistry, leader: Arc<AtomicBool>) -> Self {
         let mut modules = HttpModules::new();
@@ -112,7 +128,6 @@ impl AdminServer {
             health,
             leader,
             routes: None,
-            cluster: None,
             aggregator: None,
             events: None,
             serve_ui: false,
@@ -124,7 +139,7 @@ impl AdminServer {
     ///
     /// Called only from proxy and dev pod roles. The controller omits this so
     /// its `/routes` returns 404 — the controller's routing view is the
-    /// aggregate `/api/v1/routes/*` surface instead.
+    /// aggregate `/api/v1/routing/*` surface instead.
     #[must_use]
     pub fn with_routes(
         mut self,
@@ -135,19 +150,7 @@ impl AdminServer {
         self
     }
 
-    /// Enable `GET /api/v1/cluster` by supplying the cluster-summary snapshot.
-    ///
-    /// Called only from the `controller` and `dev` pod roles. Proxy roles
-    /// omit this so the read-only-proxy invariant extends to "the proxy admin
-    /// surface never returns cluster aggregates" structurally.
-    #[must_use]
-    pub fn with_cluster_summary(mut self, cluster: SharedClusterSummary) -> Self {
-        self.cluster = Some(cluster);
-        self
-    }
-
-    /// Enable the `/api/v1/{proxies,controllers,gateways,ingresses,routes/*}`
-    /// aggregator endpoints.
+    /// Enable the controller's `/api/v1/{fleet,routing}/*` aggregator endpoints.
     ///
     /// Called only from the `controller` and `dev` pod roles. Proxy roles
     /// leave the aggregator `None`, so these endpoints return 404 structurally.
@@ -292,22 +295,24 @@ impl AdminServer {
     /// endpoints exist per pod role; unwired capabilities resolve to 404.
     async fn build_response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
         let path = session.req_header().uri.path();
+        // Shared filter/pagination params for the list endpoints (and the
+        // proxy-local `/routes`). Cheap to parse unconditionally.
+        let params = ListParams::parse(session.req_header().uri.query());
 
         // Fast path: exact matches.
         match path {
             "/" => return self.ui_response(),
             "/metrics" => return metrics_response(),
-            "/routes" => return self.routes_response(),
-            "/api/v1/health" => return health_response(&self.health),
-            "/api/v1/cluster" => {
+            "/routes" => return self.routes_response(&params),
+            "/api/v1/health" => {
                 // The apiserver version is fetched + cached by the aggregator
-                // (controller/dev roles only); proxy roles wire neither, so the
+                // (controller/dev roles only); proxy roles wire none, so the
                 // field is simply omitted there.
                 let version = match self.aggregator.as_ref() {
                     Some(agg) => agg.kubernetes_version().await,
                     None => None,
                 };
-                return cluster_response(self.cluster.as_ref(), &self.leader, version);
+                return health_response(&self.health, version, self.leader.load(Ordering::Acquire));
             }
             _ => {}
         }
@@ -315,9 +320,6 @@ impl AdminServer {
         // Aggregator endpoints — all under /api/v1/.
         // Return 404 when no aggregator is wired (proxy pod roles).
         let Some(agg) = self.aggregator.as_ref() else {
-            if path.starts_with("/api/v1/") {
-                return aggregator::not_found();
-            }
             return aggregator::not_found();
         };
 
@@ -326,33 +328,29 @@ impl AdminServer {
         let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
 
         match segs.as_slice() {
-            // ── proxies ──────────────────────────────────────────────────────
-            ["proxies"] => agg.list_proxies().await,
-            ["proxies", name] => agg.get_proxy(name).await,
-            ["proxies", name, "routes"] => agg.get_proxy_routes(name).await,
-            ["proxies", name, "health"] => agg.get_proxy_health(name).await,
+            // ── fleet (all coxswain pods) ─────────────────────────────────────
+            ["fleet", "summary"] => agg.fleet_summary().await,
+            ["fleet", "controllers"] => agg.list_controllers().await,
+            ["fleet", "controllers", name] => agg.get_controller(name).await,
+            ["fleet", "controllers", name, "health"] => agg.get_controller_health(name).await,
+            ["fleet", "proxies"] => agg.list_proxies().await,
+            ["fleet", "proxies", name] => agg.get_proxy(name).await,
+            ["fleet", "proxies", name, "routes"] => agg.get_proxy_routes(name, &params).await,
+            ["fleet", "proxies", name, "health"] => agg.get_proxy_health(name).await,
 
-            // ── controllers ──────────────────────────────────────────────────
-            ["controllers"] => agg.list_controllers().await,
-            ["controllers", name] => agg.get_controller(name).await,
-            ["controllers", name, "health"] => agg.get_controller_health(name).await,
+            // ── routing (config resources) ────────────────────────────────────
+            ["routing", "summary"] => agg.routing_summary(),
+            ["routing", "gateways"] => agg.list_gateways(&params),
+            ["routing", "gateways", namespace, name] => agg.get_gateway(namespace, name).await,
+            ["routing", "httproutes"] => agg.list_httproutes(&params),
+            ["routing", "ingresses"] => agg.list_ingresses(&params),
+            ["routing", "ingresses", namespace, name] => agg.get_ingress(namespace, name).await,
+            ["routing", "routes", kind, namespace, name] => {
+                agg.get_route(kind, namespace, name).await
+            }
 
-            // ── gateways ─────────────────────────────────────────────────────
-            ["gateways"] => agg.list_gateways(),
-            ["gateways", namespace, name] => agg.get_gateway(namespace, name).await,
-
-            // ── ingresses ────────────────────────────────────────────────────
-            ["ingresses"] => agg.list_ingresses(),
-            ["ingresses", namespace, name] => agg.get_ingress(namespace, name).await,
-
-            // ── routes ───────────────────────────────────────────────────────
-            ["routes", "httproute", namespace, name] => agg.get_httproute(namespace, name).await,
-            ["routes", "ingress", namespace, name] => agg.get_ingress_route(namespace, name).await,
-
-            // ── manifests ────────────────────────────────────────────────────
+            // ── cross-cutting ─────────────────────────────────────────────────
             ["manifests", kind, namespace, name] => agg.get_manifest(kind, namespace, name).await,
-
-            // ── problems ─────────────────────────────────────────────────────
             ["problems"] => agg.list_problems().await,
 
             _ => aggregator::not_found(),
@@ -398,16 +396,20 @@ fn metrics_response() -> Response<Vec<u8>> {
 impl AdminServer {
     /// Build the `/routes` response from the local routing tables.
     ///
-    /// Returns 404 when no routing tables are wired (controller pod role).
-    fn routes_response(&self) -> Response<Vec<u8>> {
+    /// Returns 404 when no routing tables are wired (controller pod role). When
+    /// `params` carry a `host`/`path` filter or `limit`/`offset`, each spec block
+    /// is filtered + windowed and gains `total`/`returned`/`offset` counts; with
+    /// no params the legacy `{hosts, conflicts}` shape is reproduced (#286). The
+    /// controller relays this whole body through `fleet/proxies/{name}/routes`.
+    fn routes_response(&self, params: &ListParams) -> Response<Vec<u8>> {
         let Some((ingress, gateway)) = self.routes.as_ref() else {
             let mut r = Response::new(Vec::new());
             *r.status_mut() = StatusCode::NOT_FOUND;
             return r;
         };
         let body = serde_json::json!({
-            "ingress": routes_block(ingress.load().as_ref()),
-            "gateway": routes_block(gateway.load().as_ref()),
+            "ingress": routes_block(ingress.load().as_ref(), params),
+            "gateway": routes_block(gateway.load().as_ref(), params),
         })
         .to_string();
         json_response(body)
@@ -419,35 +421,76 @@ impl AdminServer {
 /// Generic over `Kind` so the same body serialises both the Ingress and the
 /// Gateway-API tables; the type parameter prevents the caller from passing the
 /// wrong table to the wrong block label.
-fn routes_block<K>(table: &RoutingTable<K>) -> serde_json::Value {
-    let hosts: Vec<serde_json::Value> = table
-        .host_routes()
-        .into_iter()
-        .map(|(port, host, router)| {
-            let routes: Vec<serde_json::Value> = router
-                .routes()
-                .iter()
-                .filter(|r| !r.backend_group.name().is_empty())
-                .map(|r| {
-                    // `route_id` is `"{namespace}/{name}"`; split so the UI can
-                    // deep-link a compiled row back to its source resource.
-                    let (namespace, name) = r
-                        .route_id
-                        .split_once('/')
-                        .unwrap_or(("", r.route_id.as_str()));
-                    serde_json::json!({
-                        "type": r.kind.as_str(),
-                        "path": r.path,
-                        "backend_group": r.backend_group.name(),
-                        "namespace": namespace,
-                        "name": name,
-                        "endpoints": r.backend_group.endpoints().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-                    })
-                })
-                .collect();
-            serde_json::json!({ "port": port, "host": host, "routes": routes })
-        })
-        .collect();
+///
+/// `params` filter the flattened route rows by `host`/`path` (case-insensitive
+/// substrings) and window them by `limit`/`offset`; when [`ListParams::is_empty`]
+/// the output is byte-identical to the legacy full dump (the conflict list is
+/// always included whole — it is bounded by definition). When any param is set
+/// the block also carries `total`/`returned`/`offset` over the post-filter rows.
+fn routes_block<K>(table: &RoutingTable<K>, params: &ListParams) -> serde_json::Value {
+    // Flatten to (port, host, route_json) so host/path filtering and the
+    // offset/limit window apply across the whole table, not per host-group.
+    let mut matched: Vec<(u16, String, serde_json::Value)> = Vec::new();
+    for (port, host, router) in table.host_routes() {
+        if !params.host_matches(&host) {
+            continue;
+        }
+        for r in router
+            .routes()
+            .iter()
+            .filter(|r| !r.backend_group.name().is_empty())
+        {
+            if !params.path_matches(&r.path) {
+                continue;
+            }
+            // `route_id` is `"{namespace}/{name}"`; split so the UI can deep-link
+            // a compiled row back to its source resource.
+            let (namespace, name) = r
+                .route_id
+                .split_once('/')
+                .unwrap_or(("", r.route_id.as_str()));
+            matched.push((
+                port,
+                host.clone(),
+                serde_json::json!({
+                    "type": r.kind.as_str(),
+                    "path": r.path,
+                    "backend_group": r.backend_group.name(),
+                    "namespace": namespace,
+                    "name": name,
+                    "endpoints": r.backend_group.endpoints().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                }),
+            ));
+        }
+    }
+
+    let total = matched.len();
+    let offset = params.offset.min(total);
+    let limit = params.effective_limit();
+    let windowed = if params.is_empty() {
+        matched
+    } else {
+        matched.into_iter().skip(offset).take(limit).collect()
+    };
+    let returned = windowed.len();
+
+    // Regroup the (possibly windowed) rows back into the `{port, host, routes}`
+    // host-group shape the UI renders.
+    let mut hosts: Vec<serde_json::Value> = Vec::new();
+    for (port, host, route) in windowed {
+        match hosts.last_mut() {
+            Some(last)
+                if last["port"] == serde_json::json!(port)
+                    && last["host"] == serde_json::json!(host) =>
+            {
+                if let Some(arr) = last["routes"].as_array_mut() {
+                    arr.push(route);
+                }
+            }
+            _ => hosts.push(serde_json::json!({ "port": port, "host": host, "routes": [route] })),
+        }
+    }
+
     let conflicts: Vec<serde_json::Value> = table
         .conflicts()
         .iter()
@@ -469,7 +512,17 @@ fn routes_block<K>(table: &RoutingTable<K>) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({ "hosts": hosts, "conflicts": conflicts })
+    if params.is_empty() {
+        serde_json::json!({ "hosts": hosts, "conflicts": conflicts })
+    } else {
+        serde_json::json!({
+            "hosts": hosts,
+            "conflicts": conflicts,
+            "total": total,
+            "returned": returned,
+            "offset": offset,
+        })
+    }
 }
 
 // ── GET / (operator UI) ───────────────────────────────────────────────────────
@@ -493,15 +546,32 @@ impl AdminServer {
 // ── /api/v1/health ────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct HealthResponse {
+struct HealthResponse<'a> {
     version: &'static str,
+    /// Kubernetes apiserver GitVersion (e.g. `v1.31.2`), supplied by the
+    /// aggregator's cached `/version` lookup. Omitted when unavailable (proxy
+    /// roles wire no aggregator, or the apiserver could not be reached) — the
+    /// operator UI renders an em dash in that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kubernetes_version: Option<&'a str>,
+    /// `true` while this pod holds the leader-election lease. Always `false` on
+    /// proxy roles. The controller aggregator reads this off each peer's
+    /// `/api/v1/health` to report per-pod leadership (it replaced the retired
+    /// `/api/v1/cluster` leader probe).
+    leader: bool,
     subsystems: BTreeMap<Arc<str>, SubsystemSnapshot>,
 }
 
-fn health_response(health: &HealthRegistry) -> Response<Vec<u8>> {
+fn health_response(
+    health: &HealthRegistry,
+    kubernetes_version: Option<&str>,
+    leader: bool,
+) -> Response<Vec<u8>> {
     let snapshot = health.snapshot();
     let resp = HealthResponse {
         version: env!("CARGO_PKG_VERSION"),
+        kubernetes_version,
+        leader,
         subsystems: snapshot.subsystems,
     };
     match serde_json::to_string(&resp) {
@@ -515,73 +585,20 @@ fn health_response(health: &HealthRegistry) -> Response<Vec<u8>> {
     }
 }
 
-// ── /api/v1/cluster ───────────────────────────────────────────────────────────
-
-/// Borrowed view of a [`ClusterSummary`] whose `controller.leader` is sourced
-/// from the live [`AtomicBool`] instead of the snapshot.
-///
-/// The reflector publishes a fresh `ClusterSummary` per debounce window (~500 ms);
-/// leader-election transitions are seconds-scale, so reading the leader flag at
-/// response time keeps the surface honest without introducing a clone of the
-/// summary's gateway/ingress lists on every request.
-#[derive(Serialize)]
-struct ClusterResponse<'a> {
-    /// Apiserver GitVersion (e.g. `v1.31.2`), supplied by the aggregator's
-    /// cached `/version` lookup. Omitted when the version is unavailable
-    /// (no aggregator wired, or the apiserver could not be reached) — the
-    /// operator UI renders an em dash in that case.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kubernetes_version: Option<&'a str>,
-    gateways: &'a [coxswain_core::cluster::GatewaySummary],
-    ingresses: &'a [coxswain_core::cluster::IngressSummary],
-    controller: ControllerSummary,
-}
-
-fn cluster_response(
-    cluster: Option<&SharedClusterSummary>,
-    leader: &Arc<AtomicBool>,
-    kubernetes_version: Option<&str>,
-) -> Response<Vec<u8>> {
-    let Some(handle) = cluster else {
-        let mut r = Response::new(Vec::new());
-        *r.status_mut() = StatusCode::NOT_FOUND;
-        return r;
-    };
-    let snapshot: Arc<ClusterSummary> = handle.load();
-    let resp = ClusterResponse {
-        kubernetes_version,
-        gateways: &snapshot.gateways,
-        ingresses: &snapshot.ingresses,
-        controller: ControllerSummary::new(leader.load(Ordering::Acquire)),
-    };
-    match serde_json::to_string(&resp) {
-        Ok(body) => json_response(body),
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to encode /api/v1/cluster response");
-            let mut r = Response::new(Vec::new());
-            *r.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            r
-        }
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coxswain_core::cluster::{
-        ClusterSummary, ControllerSummary, GatewaySummary, IngressSummary, ProxyAssignment,
-    };
 
     fn leader_flag(value: bool) -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(value))
     }
 
     #[test]
-    fn health_response_returns_version_and_subsystems() {
+    fn health_response_carries_version_kubernetes_version_leader_and_subsystems() {
         let registry = HealthRegistry::new();
-        let resp = health_response(&registry);
+        let resp = health_response(&registry, Some("v1.31.2"), true);
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -592,96 +609,25 @@ mod tests {
         let body = std::str::from_utf8(resp.body()).expect("utf8 body");
         let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
         assert!(v.get("version").is_some(), "response must carry `version`");
+        assert_eq!(v["kubernetes_version"], "v1.31.2");
+        assert_eq!(v["leader"], serde_json::Value::Bool(true));
         assert!(
             v.get("subsystems").is_some(),
             "response must carry `subsystems`"
         );
-        assert!(v.get("synced").is_none(), "dropped field `synced`");
-        assert!(v.get("leader").is_none(), "dropped field `leader`");
-        assert!(v.get("host_count").is_none(), "dropped field `host_count`");
     }
 
     #[test]
-    fn cluster_response_returns_404_without_summary() {
-        let leader = leader_flag(false);
-        let resp = cluster_response(None, &leader, None);
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn cluster_response_returns_empty_json_when_summary_is_empty() {
-        let cs: SharedClusterSummary = SharedClusterSummary::default();
-        let leader = leader_flag(true);
-        let resp = cluster_response(Some(&cs), &leader, None);
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get(header::CONTENT_TYPE)
-                .map(|h| h.as_bytes()),
-            Some(&b"application/json"[..])
-        );
+    fn health_response_omits_kubernetes_version_when_unavailable() {
+        let registry = HealthRegistry::new();
+        let resp = health_response(&registry, None, false);
         let body = std::str::from_utf8(resp.body()).expect("utf8 body");
-        let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
-        assert_eq!(
-            v,
-            serde_json::json!({
-                "gateways": [],
-                "ingresses": [],
-                "controller": { "leader": true }
-            })
-        );
-    }
-
-    #[test]
-    fn cluster_response_reflects_live_leader_flag_not_snapshot_value() {
-        let cs: SharedClusterSummary = SharedClusterSummary::default();
-        // Snapshot says leader=false; live flag says true. Response should follow the live flag.
-        cs.store(Arc::new(ClusterSummary::new(
-            vec![],
-            vec![],
-            ControllerSummary::new(false),
-        )));
-        let leader = leader_flag(true);
-        let resp = cluster_response(Some(&cs), &leader, None);
-        let body = std::str::from_utf8(resp.body()).expect("utf8");
-        let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
-        assert_eq!(v["controller"]["leader"], serde_json::Value::Bool(true));
-    }
-
-    #[test]
-    fn cluster_response_serialises_populated_summary() {
-        let cs: SharedClusterSummary = SharedClusterSummary::default();
-        cs.store(Arc::new(ClusterSummary::new(
-            vec![
-                GatewaySummary::new("public-gw", "tenant-a")
-                    .with_proxy(ProxyAssignment::dedicated())
-                    .with_route_count(12),
-            ],
-            vec![IngressSummary::new("foo", "default").with_route_count(2)],
-            ControllerSummary::new(false),
-        )));
-        let leader = leader_flag(false);
-        let resp = cluster_response(Some(&cs), &leader, Some("v1.31.2"));
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = std::str::from_utf8(resp.body()).expect("utf8");
-        let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
-        assert_eq!(v["kubernetes_version"], "v1.31.2");
-        assert_eq!(v["gateways"][0]["proxy"]["pool"], "dedicated");
-        assert_eq!(v["gateways"][0]["route_count"], 12);
-        assert_eq!(v["ingresses"][0]["route_count"], 2);
-    }
-
-    #[test]
-    fn cluster_response_omits_kubernetes_version_when_unavailable() {
-        let cs: SharedClusterSummary = SharedClusterSummary::default();
-        let leader = leader_flag(false);
-        let resp = cluster_response(Some(&cs), &leader, None);
-        let body = std::str::from_utf8(resp.body()).expect("utf8");
         let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
         assert!(
             v.get("kubernetes_version").is_none(),
             "field must be omitted when the apiserver version is unavailable"
         );
+        assert_eq!(v["leader"], serde_json::Value::Bool(false));
     }
 
     #[test]
@@ -697,19 +643,6 @@ mod tests {
             SharedGatewayRoutingTable::new(),
         );
         assert!(admin.routes.is_some());
-    }
-
-    #[test]
-    fn admin_server_without_cluster_summary_serves_404_on_cluster_path() {
-        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false));
-        assert!(admin.cluster.is_none());
-    }
-
-    #[test]
-    fn admin_server_with_cluster_summary_enables_cluster_endpoint() {
-        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false))
-            .with_cluster_summary(SharedClusterSummary::default());
-        assert!(admin.cluster.is_some());
     }
 
     #[test]

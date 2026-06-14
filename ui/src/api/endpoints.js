@@ -1,45 +1,68 @@
 import { fetchJson } from './client.js';
 
-// ── Fleet overview ────────────────────────────────────────────────────────────
+// ── Query helper ────────────────────────────────────────────────────────────
 
-export const getCluster = () => fetchJson('/api/v1/cluster');
-export const getProxies = () => fetchJson('/api/v1/proxies');
-export const getControllers = () => fetchJson('/api/v1/controllers');
+/**
+ * Build a `?…` query string from the shared list-endpoint params, omitting
+ * empties so a no-arg call yields the param-less URL (the backend then returns
+ * the full dump). `status: 'problem'` filters to non-ok rows.
+ *
+ * @param {{host?: string, path?: string, limit?: number, offset?: number, status?: string}} [opts]
+ */
+export function buildQuery(opts = {}) {
+  const q = new URLSearchParams();
+  if (opts.host) q.set('host', opts.host);
+  if (opts.path) q.set('path', opts.path);
+  if (opts.limit != null) q.set('limit', String(opts.limit));
+  if (opts.offset) q.set('offset', String(opts.offset));
+  if (opts.status) q.set('status', opts.status);
+  const s = q.toString();
+  return s ? `?${s}` : '';
+}
+
+// ── Summaries (Dashboard tiles + routing tab badges) ──────────────────────────
+
+export const getFleetSummary = () => fetchJson('/api/v1/fleet/summary');
+export const getRoutingSummary = () => fetchJson('/api/v1/routing/summary');
 export const getProblems = () => fetchJson('/api/v1/problems');
 
-// ── Proxy detail ──────────────────────────────────────────────────────────────
+// ── Fleet (all coxswain pods) ─────────────────────────────────────────────────
 
-export const getProxy = (pod) => fetchJson(`/api/v1/proxies/${encodeURIComponent(pod)}`);
-export const getProxyRoutes = (pod) =>
-  fetchJson(`/api/v1/proxies/${encodeURIComponent(pod)}/routes`);
+export const getProxies = () => fetchJson('/api/v1/fleet/proxies');
+export const getProxy = (pod) => fetchJson(`/api/v1/fleet/proxies/${encodeURIComponent(pod)}`);
+export const getProxyRoutes = (pod, opts) =>
+  fetchJson(`/api/v1/fleet/proxies/${encodeURIComponent(pod)}/routes${buildQuery(opts)}`);
 export const getProxyHealth = (pod) =>
-  fetchJson(`/api/v1/proxies/${encodeURIComponent(pod)}/health`);
+  fetchJson(`/api/v1/fleet/proxies/${encodeURIComponent(pod)}/health`);
 
-// ── Controller detail ─────────────────────────────────────────────────────────
-
+export const getControllers = () => fetchJson('/api/v1/fleet/controllers');
 export const getController = (pod) =>
-  fetchJson(`/api/v1/controllers/${encodeURIComponent(pod)}`);
+  fetchJson(`/api/v1/fleet/controllers/${encodeURIComponent(pod)}`);
 export const getControllerHealth = (pod) =>
-  fetchJson(`/api/v1/controllers/${encodeURIComponent(pod)}/health`);
+  fetchJson(`/api/v1/fleet/controllers/${encodeURIComponent(pod)}/health`);
 
-// ── Gateways ──────────────────────────────────────────────────────────────────
+// ── Routing (config resources) ────────────────────────────────────────────────
 
-export const getGateways = () => fetchJson('/api/v1/gateways');
+export const getGateways = (opts) => fetchJson(`/api/v1/routing/gateways${buildQuery(opts)}`);
 export const getGateway = (ns, name) =>
-  fetchJson(`/api/v1/gateways/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`);
+  fetchJson(`/api/v1/routing/gateways/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`);
 
-// ── Ingresses ─────────────────────────────────────────────────────────────────
+export const getHttproutes = (opts) => fetchJson(`/api/v1/routing/httproutes${buildQuery(opts)}`);
 
-export const getIngresses = () => fetchJson('/api/v1/ingresses');
+export const getIngresses = (opts) => fetchJson(`/api/v1/routing/ingresses${buildQuery(opts)}`);
 export const getIngress = (ns, name) =>
-  fetchJson(`/api/v1/ingresses/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`);
+  fetchJson(`/api/v1/routing/ingresses/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`);
 
-// ── Routes (Route Inspector) ──────────────────────────────────────────────────
+// ── Route detail (Route Inspector) ────────────────────────────────────────────
 
 export const getHttproute = (ns, name) =>
-  fetchJson(`/api/v1/routes/httproute/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`);
+  fetchJson(
+    `/api/v1/routing/routes/httproute/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`,
+  );
 export const getIngressRoute = (ns, name) =>
-  fetchJson(`/api/v1/routes/ingress/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`);
+  fetchJson(
+    `/api/v1/routing/routes/ingress/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`,
+  );
 
 // ── Manifests ─────────────────────────────────────────────────────────────────
 
@@ -48,7 +71,7 @@ export const getManifest = (kind, ns, name) =>
     `/api/v1/manifests/${encodeURIComponent(kind)}/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`,
   );
 
-// ── Health ────────────────────────────────────────────────────────────────────
+// ── Health (also carries coxswain version + kubernetes_version + leader) ───────
 
 export const getHealth = () => fetchJson('/api/v1/health');
 

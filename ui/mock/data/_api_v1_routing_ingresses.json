@@ -3,22 +3,29 @@
     {
       "name": "demo-ingress",
       "namespace": "demo",
-      "route_count": 2
+      "route_count": 2,
+      "status": "warn"
     },
     {
       "name": "frontend-ingress",
       "namespace": "demo",
-      "route_count": 1
+      "route_count": 1,
+      "status": "warn"
     },
     {
       "name": "staging-ingress",
       "namespace": "staging",
-      "route_count": 2
+      "route_count": 2,
+      "status": "error"
     },
     {
       "name": "tenant-b-ingress",
       "namespace": "tenant-b",
-      "route_count": 1
+      "route_count": 1,
+      "status": "ok"
     }
-  ]
+  ],
+  "total": 4,
+  "returned": 4,
+  "offset": 0
 }

@@ -14,7 +14,7 @@ import { Icon } from '../components/Icon.jsx';
 import { useEffect, useState } from 'preact/hooks';
 
 /**
- * Route Inspector — the centrepiece screen.
+ * Route Detail — the centrepiece route screen (per-proxy compilation view).
  *
  * For HTTPRoutes: shows parent status conditions + per-proxy per-host route
  * table with endpoint health and conflict flags.
@@ -28,7 +28,7 @@ import { useEffect, useState } from 'preact/hooks';
  * Deep-linkable via `#/routes/httproute/{ns}/{name}` or
  * `#/routes/ingress/{ns}/{name}`.
  */
-export function RouteInspector({ kind, namespace, name }) {
+export function RouteDetail({ kind, namespace, name }) {
   const isHttp = kind === 'httproute';
   const fetcher = isHttp
     ? () => getHttproute(namespace, name)

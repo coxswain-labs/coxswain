@@ -1,0 +1,586 @@
+openapi: 3.1.0
+info:
+  title: Coxswain Operator Admin API
+  version: 0.1.0
+  description: >-
+    **Internal** HTTP surface served by `coxswain-admin` on the controller's
+    admin port (default 8082). It backs the embedded operator UI and is not a
+    stable public contract — this spec is a developer aid that tracks the
+    dispatch in `crates/coxswain-admin/src/lib.rs` and the handlers in
+    `aggregator.rs`. Keep it in sync when those change.
+
+    Two axes plus cross-cutting endpoints (issue #301):
+      - `fleet/*`   — all coxswain pods (controllers + proxies)
+      - `routing/*` — config resources (Gateways, HTTPRoutes, Ingresses)
+
+    The `/api/v1/*` surface is served only by the controller and `dev` roles;
+    proxy pods return 404 for everything except `/api/v1/health`, `/metrics`,
+    and the proxy-local `/routes`.
+
+servers:
+  - url: http://localhost:8082
+    description: Controller admin port (typically reached via kubectl port-forward)
+
+tags:
+  - name: fleet
+  - name: routing
+  - name: cross-cutting
+  - name: role-local
+
+paths:
+  /:
+    get:
+      tags: [role-local]
+      summary: Embedded operator UI (controller/dev only)
+      responses:
+        '200': { description: HTML, content: { text/html: {} } }
+        '404': { description: UI not enabled (proxy roles) }
+
+  /metrics:
+    get:
+      tags: [role-local]
+      summary: Prometheus metrics (all roles)
+      responses:
+        '200': { description: Prometheus text exposition, content: { text/plain: {} } }
+
+  /routes:
+    get:
+      tags: [role-local]
+      summary: Proxy-local compiled routing table (proxy/dev only; 404 on controller)
+      description: >-
+        Accepts the shared list filter/pagination params; with none, returns the
+        legacy `{ingress, gateway}` full dump. With params, each spec block is
+        filtered/windowed and gains `total`/`returned`/`offset` (#286).
+      parameters:
+        - { $ref: '#/components/parameters/host' }
+        - { $ref: '#/components/parameters/path' }
+        - { $ref: '#/components/parameters/limit' }
+        - { $ref: '#/components/parameters/offset' }
+      responses:
+        '200':
+          description: Per-spec compiled routes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ingress: { $ref: '#/components/schemas/RouteBlock' }
+                  gateway: { $ref: '#/components/schemas/RouteBlock' }
+
+  /api/v1/health:
+    get:
+      tags: [cross-cutting]
+      summary: Pod health, version, and leadership (all roles)
+      responses:
+        '200':
+          description: Health snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+  /api/v1/fleet/summary:
+    get:
+      tags: [fleet]
+      summary: Per-category counts + worst severity for controllers and proxies
+      responses:
+        '200':
+          description: Fleet summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  controllers: { $ref: '#/components/schemas/CategorySummary' }
+                  shared_proxies: { $ref: '#/components/schemas/CategorySummary' }
+                  dedicated_proxies: { $ref: '#/components/schemas/CategorySummary' }
+
+  /api/v1/fleet/controllers:
+    get:
+      tags: [fleet]
+      summary: All controller pods (liveness + leadership + health rollup)
+      responses:
+        '200':
+          description: Controller list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  controllers:
+                    type: array
+                    items: { $ref: '#/components/schemas/PodEntry' }
+
+  /api/v1/fleet/controllers/{name}:
+    get:
+      tags: [fleet]
+      parameters: [{ $ref: '#/components/parameters/podName' }]
+      responses:
+        '200': { description: Controller pod, content: { application/json: { schema: { $ref: '#/components/schemas/PodEntry' } } } }
+        '404': { description: Unknown pod }
+
+  /api/v1/fleet/controllers/{name}/health:
+    get:
+      tags: [fleet]
+      parameters: [{ $ref: '#/components/parameters/podName' }]
+      responses:
+        '200': { description: Relayed pod health, content: { application/json: { schema: { $ref: '#/components/schemas/PodHealthRelay' } } } }
+
+  /api/v1/fleet/proxies:
+    get:
+      tags: [fleet]
+      summary: All shared + dedicated proxy pods (liveness + health rollup)
+      responses:
+        '200':
+          description: Proxy list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  proxies:
+                    type: array
+                    items: { $ref: '#/components/schemas/PodEntry' }
+
+  /api/v1/fleet/proxies/{name}:
+    get:
+      tags: [fleet]
+      parameters: [{ $ref: '#/components/parameters/podName' }]
+      responses:
+        '200': { description: Proxy pod, content: { application/json: { schema: { $ref: '#/components/schemas/PodEntry' } } } }
+        '404': { description: Unknown pod }
+
+  /api/v1/fleet/proxies/{name}/routes:
+    get:
+      tags: [fleet]
+      summary: A proxy's compiled routing table (filter/pagination relayed to the proxy, #286)
+      parameters:
+        - { $ref: '#/components/parameters/podName' }
+        - { $ref: '#/components/parameters/host' }
+        - { $ref: '#/components/parameters/path' }
+        - { $ref: '#/components/parameters/limit' }
+        - { $ref: '#/components/parameters/offset' }
+      responses:
+        '200':
+          description: Wrapped proxy routes (or reachable=false on timeout)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pod_name: { type: string }
+                  reachable: { type: boolean }
+                  routes:
+                    type: object
+                    properties:
+                      ingress: { $ref: '#/components/schemas/RouteBlock' }
+                      gateway: { $ref: '#/components/schemas/RouteBlock' }
+
+  /api/v1/fleet/proxies/{name}/health:
+    get:
+      tags: [fleet]
+      parameters: [{ $ref: '#/components/parameters/podName' }]
+      responses:
+        '200': { description: Relayed pod health, content: { application/json: { schema: { $ref: '#/components/schemas/PodHealthRelay' } } } }
+
+  /api/v1/routing/summary:
+    get:
+      tags: [routing]
+      summary: Per-category counts + worst severity for the routing resources
+      responses:
+        '200':
+          description: Routing summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  gateways: { $ref: '#/components/schemas/CategorySummary' }
+                  httproutes: { $ref: '#/components/schemas/CategorySummary' }
+                  ingresses: { $ref: '#/components/schemas/CategorySummary' }
+
+  /api/v1/routing/gateways:
+    get:
+      tags: [routing]
+      summary: Gateway list (filter/pagination envelope)
+      parameters:
+        - { $ref: '#/components/parameters/host' }
+        - { $ref: '#/components/parameters/limit' }
+        - { $ref: '#/components/parameters/offset' }
+        - { $ref: '#/components/parameters/status' }
+      responses:
+        '200':
+          description: Gateway list envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/ListEnvelope' }
+                  - type: object
+                    properties:
+                      gateways:
+                        type: array
+                        items: { $ref: '#/components/schemas/GatewaySummary' }
+
+  /api/v1/routing/gateways/{namespace}/{name}:
+    get:
+      tags: [routing]
+      summary: Gateway detail (summary enriched with live listeners + attached routes)
+      parameters:
+        - { $ref: '#/components/parameters/namespace' }
+        - { $ref: '#/components/parameters/name' }
+      responses:
+        '200': { description: Gateway detail, content: { application/json: { schema: { $ref: '#/components/schemas/GatewayDetail' } } } }
+        '404': { description: Unknown gateway }
+        '503': { description: Kubernetes API unavailable }
+
+  /api/v1/routing/httproutes:
+    get:
+      tags: [routing]
+      summary: HTTPRoute list (first-class, #293; filter/pagination envelope)
+      parameters:
+        - { $ref: '#/components/parameters/host' }
+        - { $ref: '#/components/parameters/limit' }
+        - { $ref: '#/components/parameters/offset' }
+        - { $ref: '#/components/parameters/status' }
+      responses:
+        '200':
+          description: HTTPRoute list envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/ListEnvelope' }
+                  - type: object
+                    properties:
+                      httproutes:
+                        type: array
+                        items: { $ref: '#/components/schemas/HttpRouteSummary' }
+
+  /api/v1/routing/ingresses:
+    get:
+      tags: [routing]
+      summary: Ingress list (filter/pagination envelope)
+      parameters:
+        - { $ref: '#/components/parameters/host' }
+        - { $ref: '#/components/parameters/limit' }
+        - { $ref: '#/components/parameters/offset' }
+        - { $ref: '#/components/parameters/status' }
+      responses:
+        '200':
+          description: Ingress list envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/ListEnvelope' }
+                  - type: object
+                    properties:
+                      ingresses:
+                        type: array
+                        items: { $ref: '#/components/schemas/IngressSummary' }
+
+  /api/v1/routing/ingresses/{namespace}/{name}:
+    get:
+      tags: [routing]
+      summary: Ingress detail (summary enriched with live load-balancer status)
+      parameters:
+        - { $ref: '#/components/parameters/namespace' }
+        - { $ref: '#/components/parameters/name' }
+      responses:
+        '200': { description: Ingress detail, content: { application/json: { schema: { $ref: '#/components/schemas/IngressSummary' } } } }
+        '404': { description: Unknown ingress }
+
+  /api/v1/routing/routes/{kind}/{namespace}/{name}:
+    get:
+      tags: [routing]
+      summary: Route detail — live status + per-proxy compilation fan-out
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          schema: { type: string, enum: [httproute, ingress] }
+        - { $ref: '#/components/parameters/namespace' }
+        - { $ref: '#/components/parameters/name' }
+      responses:
+        '200': { description: Route detail (shape varies by kind) }
+        '404': { description: Unknown kind or route }
+        '503': { description: Kubernetes API unavailable }
+
+  /api/v1/problems:
+    get:
+      tags: [cross-cutting]
+      summary: Cross-cutting problem aggregate, namespaced by axis (#301)
+      responses:
+        '200':
+          description: Problems
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Problems' }
+
+  /api/v1/manifests/{kind}/{namespace}/{name}:
+    get:
+      tags: [cross-cutting]
+      summary: Raw Kubernetes manifest for a resource
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          schema: { type: string, enum: [httproute, ingress, gateway, pod] }
+        - { $ref: '#/components/parameters/namespace' }
+        - { $ref: '#/components/parameters/name' }
+      responses:
+        '200': { description: Verbatim Kubernetes object (JSON) }
+        '400': { description: Unknown kind }
+        '404': { description: Not found }
+        '503': { description: Kubernetes API unavailable }
+
+  /api/v1/events:
+    get:
+      tags: [cross-cutting]
+      summary: Server-Sent Events stream of cluster state changes
+      responses:
+        '200':
+          description: SSE stream (rebuild/fleet/leadership/ownership events)
+          content:
+            text/event-stream: {}
+
+  /api/v1/pods/{name}/logs:
+    get:
+      tags: [cross-cutting]
+      summary: Chunked NDJSON log relay for a tracked pod
+      parameters:
+        - { $ref: '#/components/parameters/podName' }
+        - { name: tail, in: query, schema: { type: integer } }
+        - { name: follow, in: query, schema: { type: boolean } }
+      responses:
+        '200': { description: Chunked NDJSON log stream }
+        '404': { description: Pod not tracked in the fleet }
+        '429': { description: Too many concurrent log streams }
+        '503': { description: Kubernetes API unavailable }
+
+components:
+  parameters:
+    host:
+      name: host
+      in: query
+      description: Case-insensitive substring filter against host-like fields.
+      schema: { type: string }
+    path:
+      name: path
+      in: query
+      description: Case-insensitive substring filter against the route path (proxy routes only).
+      schema: { type: string }
+    limit:
+      name: limit
+      in: query
+      description: Page size over the post-filter set. Default 200, max 1000.
+      schema: { type: integer, default: 200, maximum: 1000 }
+    offset:
+      name: offset
+      in: query
+      schema: { type: integer, default: 0 }
+    status:
+      name: status
+      in: query
+      description: Set to `problem` to keep only rows whose health is not `ok`.
+      schema: { type: string, enum: [problem] }
+    namespace: { name: namespace, in: path, required: true, schema: { type: string } }
+    name: { name: name, in: path, required: true, schema: { type: string } }
+    podName: { name: name, in: path, required: true, schema: { type: string } }
+
+  schemas:
+    Severity:
+      type: string
+      enum: [ok, warn, error]
+      description: >-
+        Traffic-served health: `ok` = all paths serve, `warn` = partial/degraded,
+        `error` = serves no traffic.
+
+    CategorySummary:
+      type: object
+      description: Compact per-category aggregate (counts + worst severity).
+      properties:
+        total: { type: integer }
+        worst: { $ref: '#/components/schemas/Severity' }
+
+    ListEnvelope:
+      type: object
+      description: >-
+        Filter/pagination envelope shared by the list endpoints. The named item
+        array (e.g. `gateways`) sits alongside these counts.
+      properties:
+        total: { type: integer, description: Post-filter, pre-limit count. }
+        returned: { type: integer, description: Rows in this page. }
+        offset: { type: integer }
+
+    Health:
+      type: object
+      properties:
+        version: { type: string, description: Coxswain version. }
+        kubernetes_version: { type: string, description: Apiserver GitVersion; omitted when unavailable. }
+        leader: { type: boolean, description: Whether this pod holds the leader-election lease. }
+        subsystems: { type: object, additionalProperties: true }
+
+    PodEntry:
+      type: object
+      description: A fleet pod with liveness + health rollup; fields vary by reachability/role.
+      properties:
+        pod_name: { type: string }
+        pod_namespace: { type: string }
+        pod_ip: { type: string }
+        admin_port: { type: integer }
+        component: { type: string, enum: [controller, shared-proxy, dedicated-proxy] }
+        reachable: { type: boolean }
+        health: { type: string, enum: [ready, degraded], description: Rollup; reachable pods only. }
+        degraded_checks: { type: array, items: { type: string } }
+        is_leader: { type: boolean, description: Controllers only. }
+        gateway_ref: { type: string, description: Dedicated proxies only. }
+        restarts: { type: integer }
+        node: { type: string }
+        phase: { type: string }
+        created_at: { type: string }
+
+    PodHealthRelay:
+      type: object
+      properties:
+        pod_name: { type: string }
+        reachable: { type: boolean }
+        health: { type: object, additionalProperties: true }
+
+    GatewaySummary:
+      type: object
+      properties:
+        name: { type: string }
+        namespace: { type: string }
+        proxy:
+          type: object
+          properties:
+            pool: { type: string, enum: [shared, dedicated] }
+        route_count: { type: integer }
+        addresses: { type: array, items: { type: string } }
+        conditions: { type: array, items: { $ref: '#/components/schemas/Condition' } }
+        status: { $ref: '#/components/schemas/Severity' }
+
+    GatewayDetail:
+      allOf:
+        - { $ref: '#/components/schemas/GatewaySummary' }
+        - type: object
+          properties:
+            listeners:
+              type: array
+              items:
+                type: object
+                properties:
+                  name: { type: string }
+                  port: { type: integer }
+                  protocol: { type: string }
+                  tls_enabled: { type: boolean }
+                  attached_routes: { type: integer }
+            attached_routes_list:
+              type: array
+              items:
+                type: object
+                properties:
+                  kind: { type: string }
+                  namespace: { type: string }
+                  name: { type: string }
+
+    HttpRouteSummary:
+      type: object
+      properties:
+        name: { type: string }
+        namespace: { type: string }
+        hostnames: { type: array, items: { type: string } }
+        parent_gateways: { type: array, items: { type: string }, description: '`namespace/name` of attached Gateways.' }
+        rule_count: { type: integer }
+        status: { $ref: '#/components/schemas/Severity' }
+
+    IngressSummary:
+      type: object
+      properties:
+        name: { type: string }
+        namespace: { type: string }
+        route_count: { type: integer }
+        load_balancer: { type: string, description: Omitted when unassigned. }
+        status: { $ref: '#/components/schemas/Severity' }
+
+    Condition:
+      type: object
+      properties:
+        type: { type: string }
+        status: { type: string, enum: ['True', 'False', 'Unknown'] }
+        reason: { type: string }
+        message: { type: string }
+
+    RouteBlock:
+      type: object
+      description: Per-spec compiled routes; gains envelope counts when filtered.
+      properties:
+        hosts:
+          type: array
+          items:
+            type: object
+            properties:
+              port: { type: integer }
+              host: { type: string }
+              routes:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    type: { type: string }
+                    path: { type: string }
+                    backend_group: { type: string }
+                    namespace: { type: string }
+                    name: { type: string }
+                    endpoints: { type: array, items: { type: string } }
+        conflicts:
+          type: array
+          items:
+            type: object
+            properties:
+              port: { type: integer }
+              host: { type: string }
+              type: { type: string }
+              path: { type: string }
+              rejected_group: { type: string }
+              namespace: { type: string }
+              name: { type: string }
+        total: { type: integer, description: Present only when filter/pagination params were supplied. }
+        returned: { type: integer }
+        offset: { type: integer }
+
+    Problems:
+      type: object
+      properties:
+        fleet:
+          type: object
+          properties:
+            leaderless: { type: boolean, description: No reachable controller holds the lease. }
+            unreachable: { type: array, items: { $ref: '#/components/schemas/PodEntry' } }
+            degraded: { type: array, items: { $ref: '#/components/schemas/PodEntry' } }
+        routing:
+          type: object
+          properties:
+            conflicts:
+              type: array
+              items: { $ref: '#/components/schemas/Problem' }
+            dead_routes:
+              type: array
+              items: { $ref: '#/components/schemas/Problem' }
+
+    Problem:
+      type: object
+      properties:
+        host: { type: string }
+        path: { type: string }
+        kind: { type: string, enum: [ingress, gateway] }
+        rejected_group: { type: string, description: Conflicts only. }
+        backend_group: { type: string, description: Dead routes only. }
+        pods: { type: array, items: { type: string } }
+        route:
+          type: object
+          properties:
+            kind: { type: string }
+            namespace: { type: string }
+            name: { type: string }

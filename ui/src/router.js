@@ -35,9 +35,9 @@ function parseHash(hash) {
   if (s0 === 'proxies' && s1) return { screen: 'proxy-detail', params: { pod: s1 }, query };
   if (s0 === 'controllers' && s1) return { screen: 'controller-detail', params: { pod: s1 }, query };
   if (s0 === 'routes' && s1 === 'httproute' && s2 && s3)
-    return { screen: 'route-inspector', params: { kind: 'httproute', ns: s2, name: s3 }, query };
+    return { screen: 'route-detail', params: { kind: 'httproute', ns: s2, name: s3 }, query };
   if (s0 === 'routes' && s1 === 'ingress' && s2 && s3)
-    return { screen: 'route-inspector', params: { kind: 'ingress', ns: s2, name: s3 }, query };
+    return { screen: 'route-detail', params: { kind: 'ingress', ns: s2, name: s3 }, query };
   if (s0 === 'gateways' && s1 && s2)
     return { screen: 'gateway-detail', params: { ns: s1, name: s2 }, query };
 
@@ -59,7 +59,7 @@ export function navKeyFor(screen) {
     case 'proxy-detail':
     case 'controller-detail':
       return 'fleet';
-    case 'route-inspector':
+    case 'route-detail':
     case 'gateway-detail':
       return 'routing';
     default:

@@ -1,0 +1,14 @@
+{
+  "controllers": {
+    "total": 4,
+    "worst": "error"
+  },
+  "shared_proxies": {
+    "total": 2,
+    "worst": "warn"
+  },
+  "dedicated_proxies": {
+    "total": 4,
+    "worst": "error"
+  }
+}

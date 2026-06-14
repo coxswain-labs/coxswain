@@ -581,7 +581,7 @@ mod tests {
     // ── ownership diff ────────────────────────────────────────────────────────
 
     fn cluster_with(gateways: Vec<GatewaySummary>) -> ClusterSummary {
-        ClusterSummary::new(gateways, vec![], ControllerSummary::new(false))
+        ClusterSummary::new(gateways, vec![], vec![], ControllerSummary::new(false))
     }
 
     #[test]

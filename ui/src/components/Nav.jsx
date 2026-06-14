@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'preact/hooks';
 import { nav, navKeyFor } from '../router.js';
 import { useSSE } from '../hooks/useSSE.js';
 import { useApi } from '../hooks/useApi.js';
-import { getHealth, getCluster } from '../api/endpoints.js';
+import { getHealth } from '../api/endpoints.js';
 import { VersionInfo } from './VersionInfo.jsx';
 
 /**
@@ -20,15 +20,16 @@ export function Nav({ activeScreen }) {
   const active    = navKeyFor(activeScreen);
   const { connected } = useSSE('/api/v1/events');
   // Deployment versions surfaced in the nav's info popover (and the drawer foot
-  // on mobile). One-time fetches — they don't change at runtime. Coxswain's
-  // version comes from the serving controller's /health; the Kubernetes server
-  // version from /cluster.
+  // on mobile). One-time fetch — they don't change at runtime. Both come from
+  // the serving controller's /health: `version` (Coxswain) and the discovered
+  // `kubernetes_version` (apiserver GitVersion).
   // Normalize to a bare version (no leading "v") at the source — Coxswain's
   // /health reports "0.1.0" while Kubernetes' GitVersion is "v1.31.2"; the
   // display adds exactly one "v" prefix, so values must not already carry one.
   const stripV = (s) => (s ? String(s).replace(/^v/i, '') : s);
-  const version    = stripV(useApi(getHealth).data?.version);
-  const k8sVersion = stripV(useApi(getCluster).data?.kubernetes_version);
+  const health     = useApi(getHealth).data;
+  const version    = stripV(health?.version);
+  const k8sVersion = stripV(health?.kubernetes_version);
   const versionRows = [
     { label: 'Coxswain', value: version },
     { label: 'Kubernetes', value: k8sVersion },

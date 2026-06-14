@@ -55,5 +55,6 @@
   "proxy": {
     "pool": "shared"
   },
-  "route_count": 4
+  "route_count": 4,
+  "status": "ok"
 }

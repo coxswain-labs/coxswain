@@ -843,6 +843,17 @@ fn rebuild(
         })
         .collect();
 
+    // Per-(route, parent) health feeds both the route-status writer and the
+    // cluster summary's traffic-served HTTPRoute status, so compute it before
+    // publishing the summary.
+    let route_health_map = GatewayApiReconciler::compute_route_health(
+        &routes,
+        &gateways,
+        &owned_gateways,
+        &backend_grants,
+        stores.services,
+    );
+
     // Publish the cluster summary while we still have access to gateway_tls_health
     // (it's moved into `tls_health.store_and_notify` next). Reads from already-
     // materialised state: nothing kube-side, no allocations beyond the summary.
@@ -856,18 +867,12 @@ fn rebuild(
             owned_ingress_classes: &owned_ingress_classes,
             default_ingress_class: owned_default_ingress_class.as_deref(),
             gateway_tls_health: &gateway_tls_health,
+            routes: &routes,
+            http_route_health: &route_health_map,
             leader,
         })));
 
     outputs.tls_health.store_and_notify(gateway_tls_health);
-
-    let route_health_map = GatewayApiReconciler::compute_route_health(
-        &routes,
-        &gateways,
-        &owned_gateways,
-        &backend_grants,
-        stores.services,
-    );
     outputs.route_health.store_and_notify(route_health_map);
 
     // Compute per-policy ancestor lists and merge with the validity health from index build.

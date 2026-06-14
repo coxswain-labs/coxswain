@@ -91,7 +91,7 @@ To run a dedicated-mode proxy (per-Gateway data plane) locally, see [docs/src/gu
 | `80`   | HTTP proxy (data plane)                          |
 | `443`  | HTTPS proxy (data plane, SNI TLS)                |
 | `8081` | Health endpoints (`/healthz`, `/readyz`)         |
-| `8082` | Admin endpoints (`/metrics`, `/routes`, `/status`) |
+| `8082` | Admin endpoints (`/metrics`, `/routes`, `/api/v1/health`, operator UI + `/api/v1/*`) |
 
 The bind address for all listeners defaults to `0.0.0.0`. Pass `--proxy-bind-address 127.0.0.1` to restrict to localhost.
 
@@ -103,15 +103,17 @@ curl -s http://localhost:8081/healthz      # ok
 curl -s http://localhost:8081/readyz       # ok (after every subsystem check is Ready)
 
 # Admin diagnostics
-curl -s http://localhost:8082/status       # {"version":"...","synced":true,...}
-curl -s http://localhost:8082/routes       # {"hosts":[]}
-curl -s http://localhost:8082/metrics      # Prometheus text
+curl -s http://localhost:8082/api/v1/health  # {"version":"...","kubernetes_version":"...","leader":...,"subsystems":{...}}
+curl -s http://localhost:8082/routes         # {"ingress":{"hosts":[]},"gateway":{"hosts":[]}} (proxy/dev only)
+curl -s http://localhost:8082/metrics        # Prometheus text
 
 # Kubernetes
 kubectl get gatewayclass                   # should show "coxswain" accepted
 ```
 
-`/readyz` returns 200 iff every registered subsystem check is `Ready` or `Degraded` (`Pending` and `Failed` flip it to 503). `/status.subsystems` exposes the full per-subsystem detail. If the Gateway API CRDs (or RBAC for any watched resource) are missing, the corresponding reflector errors out instead of emitting `InitDone`, its check stays `Pending`, and `/readyz` stays 503 — the pod is not actually ready until its dependencies are installed.
+The full controller admin API (the `/api/v1/{fleet,routing}/*` surface, summaries, problems, health) is described in `crates/coxswain-admin/openapi.yaml` — an internal dev aid kept in sync with the dispatch.
+
+`/readyz` returns 200 iff every registered subsystem check is `Ready` or `Degraded` (`Pending` and `Failed` flip it to 503). `/api/v1/health`'s `subsystems` exposes the full per-subsystem detail. If the Gateway API CRDs (or RBAC for any watched resource) are missing, the corresponding reflector errors out instead of emitting `InitDone`, its check stays `Pending`, and `/readyz` stays 503 — the pod is not actually ready until its dependencies are installed.
 
 ---
 

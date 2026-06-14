@@ -1,50 +1,89 @@
 import { useApi } from '../hooks/useApi.js';
+import { useSSE } from '../hooks/useSSE.js';
 import { updateQuery } from '../router.js';
 import { useSearch } from '../hooks/useSearch.js';
-import { getGateways, getIngresses } from '../api/endpoints.js';
+import { getRoutingSummary, getGateways, getHttproutes, getIngresses } from '../api/endpoints.js';
 import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { SearchBox } from '../components/SearchBox.jsx';
 import { FilterSelect } from '../components/FilterSelect.jsx';
+import { Icon } from '../components/Icon.jsx';
+import { useEffect } from 'preact/hooks';
 import { GatewaysSection } from './Gateways.jsx';
+import { HttproutesSection } from './Httproutes.jsx';
 import { IngressesSection } from './Ingresses.jsx';
 
 /**
- * Routing — the unified live-configuration surface (config axis).
+ * Routing — the config axis, as tabs of scalable tables (#292/#293).
  *
- * One page for all routing resources: Gateways and Ingresses. A type filter
- * (All · Gateways · Ingresses) and a namespace filter narrow the view; the
- * choices are encoded in the hash query (`?filter=gateways`, `?ns=tenant-a`) so
- * the view is permalinkable. Routing owns the data fetch and computes the
- * namespace options, passing filtered lists down to the presentational
- * sections, which link into the existing detail screens (Gateway Detail, Route
- * Inspector). Chunk 4 replaces the flat sections with traffic trees.
+ * Three typed tabs (Gateways · HTTPRoutes · Ingresses), each a `DataTable`. The
+ * tab bar's per-tab count + warning icon come from the compact
+ * `routing/summary` aggregate (cluster-wide, pagination-independent), so a
+ * warned tab is honest even though only the active tab's full list is fetched.
+ * The active tab is permalinked via `?tab=`; with none set, the view opens on
+ * the first tab that has a problem, else Gateways. A shared namespace filter +
+ * search narrow the active table.
  */
-const FILTERS = [
-  { value: 'all',       label: 'All types' },
-  { value: 'gateways',  label: 'Gateways' },
-  { value: 'ingresses', label: 'Ingresses' },
+const TABS = [
+  { key: 'gateways',   label: 'Gateways',   fetch: getGateways,   dataKey: 'gateways',   Section: GatewaysSection },
+  { key: 'httproutes', label: 'HTTPRoutes', fetch: getHttproutes, dataKey: 'httproutes', Section: HttproutesSection },
+  { key: 'ingresses',  label: 'Ingresses',  fetch: getIngresses,  dataKey: 'ingresses',  Section: IngressesSection },
 ];
 
 export function Routing({ query }) {
-  const filter = FILTERS.some((f) => f.value === query?.filter) ? query.filter : 'all';
+  const summary = useApi(getRoutingSummary);
+  const sse = useSSE('/api/v1/events');
+  const cats = summary.data ?? {};
+
+  // Active tab: explicit ?tab=, else the first tab with a problem, else Gateways.
+  const explicit = TABS.find((t) => t.key === query?.tab);
+  const firstProblem = TABS.find((t) => cats[t.key]?.worst && cats[t.key].worst !== 'ok');
+  const activeKey = explicit?.key ?? firstProblem?.key ?? 'gateways';
+  const active = TABS.find((t) => t.key === activeKey) ?? TABS[0];
+
   const { search, q, onSearch } = useSearch(query);
+  // Lazy-load only the active tab's list; refetch on tab switch + rebuild.
+  const list = useApi(() => active.fetch(), [activeKey]);
+  const rows = list.data?.[active.dataKey] ?? [];
 
-  const gateways  = useApi(getGateways);
-  const ingresses = useApi(getIngresses);
-  const gwList  = gateways.data?.gateways ?? [];
-  const ingList = ingresses.data?.ingresses ?? [];
+  useEffect(() => {
+    const off = sse.subscribe('rebuild.completed', () => {
+      summary.refetch();
+      list.refetch();
+    });
+    return off;
+  }, [sse.subscribe, activeKey]);
 
-  // Namespace options span every routing resource, independent of the type and
-  // search filters, so the dropdown always offers the full set. `?ns=` makes the
-  // choice permalinkable.
-  const namespaces = [...new Set(
-    [...gwList, ...ingList].map((r) => r.namespace).filter(Boolean),
-  )].sort();
+  // Namespace options from the loaded rows; `?ns=` makes the choice permalinkable.
+  const namespaces = [...new Set(rows.map((r) => r.namespace).filter(Boolean))].sort();
   const nsFilter = namespaces.includes(query?.ns) ? query.ns : 'all';
+
+  const Section = active.Section;
 
   return (
     <div class="screen">
-      <Breadcrumb items={[{ label: 'Routing' }]} />
+      <Breadcrumb items={[{ label: 'Routing' }, { label: 'Overview' }]} />
+
+      <div class="tabs" role="tablist">
+        {TABS.map((t) => {
+          const cat = cats[t.key] ?? {};
+          const warn = cat.worst && cat.worst !== 'ok';
+          return (
+            <button
+              key={t.key}
+              role="tab"
+              aria-selected={t.key === activeKey}
+              class={`tab${t.key === activeKey ? ' active' : ''}`}
+              onClick={() => updateQuery({ tab: t.key })}
+            >
+              <span class={`tab-label ${warn ? 'warn' : 'ok'}`}>
+                <Icon name={warn ? 'alert' : 'check'} size={13} />
+                {t.label} ({cat.total ?? 0})
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
       <div class="screen-header">
         <div class="header-controls left">
           <FilterSelect
@@ -53,22 +92,18 @@ export function Routing({ query }) {
             options={[{ value: 'all', label: 'All namespaces' }, ...namespaces.map((ns) => ({ value: ns, label: ns }))]}
             onChange={(e) => updateQuery({ ns: e.currentTarget.value === 'all' ? null : e.currentTarget.value })}
           />
-          <FilterSelect
-            label="Filter routing resources by type"
-            value={filter}
-            options={FILTERS}
-            onChange={(e) => updateQuery({ filter: e.currentTarget.value === 'all' ? null : e.currentTarget.value })}
-          />
-          <SearchBox value={search} onInput={onSearch} label="Search routing by name or type" />
+          <SearchBox value={search} onInput={onSearch} label="Search routing by name" />
         </div>
       </div>
 
-      {filter !== 'ingresses' && (
-        <GatewaysSection gateways={gwList} loading={gateways.loading} error={gateways.error} q={q} ns={nsFilter} />
-      )}
-      {filter !== 'gateways' && (
-        <IngressesSection ingresses={ingList} loading={ingresses.loading} error={ingresses.error} q={q} ns={nsFilter} />
-      )}
+      <Section
+        rows={rows}
+        total={cats[active.key]?.total}
+        loading={list.loading}
+        error={list.error}
+        q={q}
+        ns={nsFilter}
+      />
     </div>
   );
 }

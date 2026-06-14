@@ -1,19 +1,97 @@
-//! Aggregate cluster summary surfaced on the controller's admin `/cluster` endpoint.
+//! Aggregate cluster summary the reflector publishes for the controller's admin API.
 //!
 //! The reflector publishes a fresh [`ClusterSummary`] into a [`SharedClusterSummary`]
 //! at the end of each rebuild cycle; the admin server reads the latest snapshot
-//! atomically to serialise the response. Compared to the per-pod `/routes`
-//! endpoint, this view is cluster-wide and intentionally read-only.
+//! atomically. This is the controller's cluster-wide, read-only view of every
+//! routing resource it owns. It is **not** served directly as one HTTP dump
+//! (the former `/cluster` endpoint was retired in #301): instead it backs the
+//! paginated `routing/{gateways,httproutes,ingresses}` list endpoints and the
+//! compact `routing/summary` aggregate.
 //!
-//! Field shape is the **minimal honest v0** agreed in issue #205: every field is
-//! backed by state the controller already watches. Per-Gateway `proxy.deployment`
-//! / `proxy.replicas` / `proxy.ready`, the `shared_proxy` block, and
-//! `controller.lease_holder` are tracked under #221 and slot in additively as
-//! siblings under the existing nested objects.
+//! Each resource carries a [`Severity`] `status` computed at rebuild on the
+//! **traffic-served** principle — `error` = serves no traffic, `warn` = partial,
+//! `ok` = all paths serve (issue #301). For HTTPRoutes the status propagates the
+//! health of the specific listener(s) the route binds, plus the Gateway-wide
+//! dedicated-proxy readiness.
 
 use crate::shared::Shared;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use serde::Serialize;
+
+/// Per-resource health severity, computed at rebuild on the traffic-served
+/// principle: how much of the resource's configured traffic actually serves.
+///
+/// Drives the operator UI's per-row status badge, the `?status=problem` list
+/// filter, and (aggregated per category) the routing-tab warning icon and the
+/// Dashboard tiles. Ordered so `worst` reductions take the max variant.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// Every path the resource configures serves traffic.
+    #[default]
+    Ok,
+    /// Some paths serve, some don't (partial/degraded).
+    Warn,
+    /// The resource serves no traffic at all.
+    Error,
+}
+
+impl Severity {
+    /// Reduce two severities to the worse (higher) of the pair.
+    #[must_use]
+    pub fn worse(self, other: Self) -> Self {
+        self.max(other)
+    }
+
+    /// `true` when the resource is anything other than fully healthy — the
+    /// predicate behind the `?status=problem` list filter.
+    #[must_use]
+    pub fn is_problem(self) -> bool {
+        self != Severity::Ok
+    }
+}
+
+/// Compact per-category aggregate: how many resources of a kind exist and the
+/// worst severity among them.
+///
+/// Returned by the `fleet/summary` and `routing/summary` endpoints so the
+/// operator UI can render tab counts + a warning icon without fetching the full
+/// (potentially huge) resource lists.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct CategorySummary {
+    /// Total resources in this category.
+    pub total: usize,
+    /// Worst severity across the category (`ok` when empty or all healthy).
+    pub worst: Severity,
+}
+
+impl CategorySummary {
+    /// Aggregate a category from an iterator of per-resource severities.
+    #[must_use]
+    pub fn from_severities(severities: impl IntoIterator<Item = Severity>) -> Self {
+        let mut total = 0;
+        let mut worst = Severity::Ok;
+        for s in severities {
+            total += 1;
+            worst = worst.worse(s);
+        }
+        Self { total, worst }
+    }
+}
+
+/// Per-category aggregate for the routing axis (`GET /api/v1/routing/summary`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RoutingSummary {
+    /// Gateway resources.
+    pub gateways: CategorySummary,
+    /// HTTPRoute resources.
+    pub httproutes: CategorySummary,
+    /// Ingress resources.
+    pub ingresses: CategorySummary,
+}
 
 /// CRD group that identifies a `parametersRef` pointing at `CoxswainGatewayParameters`.
 ///
@@ -39,24 +117,39 @@ pub struct ClusterSummary {
     /// All Ingresses owned by this controller (filtered by `IngressClass.controller`
     /// plus the default-class fallback).
     pub ingresses: Vec<IngressSummary>,
+    /// All HTTPRoutes in the controller's route store (#293).
+    pub httproutes: Vec<HttpRouteSummary>,
     /// Per-instance controller state (leader flag today; `lease_holder` deferred to #221).
     pub controller: ControllerSummary,
 }
 
 impl ClusterSummary {
-    /// Assemble a summary from its three components.
+    /// Assemble a summary from its components.
     ///
     /// External-crate constructor for the `#[non_exhaustive]` struct.
     #[must_use]
     pub fn new(
         gateways: Vec<GatewaySummary>,
         ingresses: Vec<IngressSummary>,
+        httproutes: Vec<HttpRouteSummary>,
         controller: ControllerSummary,
     ) -> Self {
         Self {
             gateways,
             ingresses,
+            httproutes,
             controller,
+        }
+    }
+
+    /// Reduce the routing resources to the compact per-category aggregate the
+    /// `routing/summary` endpoint serves (counts + worst severity per kind).
+    #[must_use]
+    pub fn routing_summary(&self) -> RoutingSummary {
+        RoutingSummary {
+            gateways: CategorySummary::from_severities(self.gateways.iter().map(|g| g.status)),
+            httproutes: CategorySummary::from_severities(self.httproutes.iter().map(|r| r.status)),
+            ingresses: CategorySummary::from_severities(self.ingresses.iter().map(|i| i.status)),
         }
     }
 }
@@ -83,6 +176,10 @@ pub struct GatewaySummary {
     /// from this summary; consumers wanting detail should read the Gateway
     /// object directly.
     pub conditions: Vec<GatewayCondition>,
+    /// Traffic-served health of this Gateway as a binding. Derived from its own
+    /// `Accepted`/`Programmed`/`DedicatedProxyReady` conditions — propagation is
+    /// upstream-only, so a route conflict under this Gateway does not flip it.
+    pub status: Severity,
 }
 
 impl GatewaySummary {
@@ -97,6 +194,7 @@ impl GatewaySummary {
             route_count: 0,
             addresses: Vec::new(),
             conditions: Vec::new(),
+            status: Severity::Ok,
         }
     }
 
@@ -104,6 +202,13 @@ impl GatewaySummary {
     #[must_use]
     pub fn with_proxy(mut self, proxy: ProxyAssignment) -> Self {
         self.proxy = proxy;
+        self
+    }
+
+    /// Set the computed traffic-served health.
+    #[must_use]
+    pub fn with_status(mut self, status: Severity) -> Self {
+        self.status = status;
         self
     }
 
@@ -227,6 +332,9 @@ pub struct IngressSummary {
     /// when the address has not been assigned.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub load_balancer: String,
+    /// Traffic-served health. Derived from the Ingress's own status (address
+    /// assigned) plus any `ingress`-kind conflicts/dead-routes attributed to it.
+    pub status: Severity,
 }
 
 impl IngressSummary {
@@ -238,6 +346,7 @@ impl IngressSummary {
             namespace: namespace.into(),
             route_count: 0,
             load_balancer: String::new(),
+            status: Severity::Ok,
         }
     }
 
@@ -252,6 +361,82 @@ impl IngressSummary {
     #[must_use]
     pub fn with_load_balancer(mut self, address: impl Into<String>) -> Self {
         self.load_balancer = address.into();
+        self
+    }
+
+    /// Set the computed traffic-served health.
+    #[must_use]
+    pub fn with_status(mut self, status: Severity) -> Self {
+        self.status = status;
+        self
+    }
+}
+
+/// Per-HTTPRoute summary entry.
+///
+/// HTTPRoute is a first-class routing resource (#293): listed alongside Gateways
+/// and Ingresses. Its [`status`](Self::status) is the traffic-served health with
+/// listener-precise parent propagation — a route bound to a listener whose
+/// `Programmed=False`, or attached to a Gateway whose dedicated proxy isn't
+/// ready, is surfaced as degraded/dark here even when its own `Accepted` is true.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HttpRouteSummary {
+    /// HTTPRoute object name.
+    pub name: String,
+    /// HTTPRoute object namespace.
+    pub namespace: String,
+    /// Hostnames declared in `spec.hostnames` (may be empty — inherits the
+    /// listener's hostname then).
+    pub hostnames: Vec<String>,
+    /// Parent Gateways this route attaches to, as `namespace/name`, deduplicated
+    /// across `parentRefs`. The operator UI links each back to its Gateway.
+    pub parent_gateways: Vec<String>,
+    /// Number of rules configured (`spec.rules.len()`).
+    pub rule_count: usize,
+    /// Traffic-served health (see the struct docs).
+    pub status: Severity,
+}
+
+impl HttpRouteSummary {
+    /// Start a new entry with the required identifiers; chain `with_*` for the rest.
+    #[must_use]
+    pub fn new(name: impl Into<String>, namespace: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            namespace: namespace.into(),
+            hostnames: Vec::new(),
+            parent_gateways: Vec::new(),
+            rule_count: 0,
+            status: Severity::Ok,
+        }
+    }
+
+    /// Set the declared hostnames.
+    #[must_use]
+    pub fn with_hostnames(mut self, hostnames: Vec<String>) -> Self {
+        self.hostnames = hostnames;
+        self
+    }
+
+    /// Set the parent Gateways (`namespace/name`).
+    #[must_use]
+    pub fn with_parent_gateways(mut self, parents: Vec<String>) -> Self {
+        self.parent_gateways = parents;
+        self
+    }
+
+    /// Set the configured-rules count.
+    #[must_use]
+    pub fn with_rule_count(mut self, count: usize) -> Self {
+        self.rule_count = count;
+        self
+    }
+
+    /// Set the computed traffic-served health.
+    #[must_use]
+    pub fn with_status(mut self, status: Severity) -> Self {
+        self.status = status;
         self
     }
 }
@@ -296,6 +481,7 @@ mod tests {
             serde_json::json!({
                 "gateways": [],
                 "ingresses": [],
+                "httproutes": [],
                 "controller": { "leader": false }
             })
         );
@@ -327,7 +513,8 @@ mod tests {
                     "status": "True",
                     "reason": "Programmed",
                     "message": "Gateway is programmed"
-                }]
+                }],
+                "status": "ok"
             })
         );
     }
@@ -344,7 +531,8 @@ mod tests {
                 "proxy": { "pool": "shared" },
                 "route_count": 0,
                 "addresses": [],
-                "conditions": []
+                "conditions": [],
+                "status": "ok"
             })
         );
     }
@@ -359,6 +547,7 @@ mod tests {
                 "name": "foo",
                 "namespace": "default",
                 "route_count": 2,
+                "status": "ok"
             })
         );
     }
@@ -375,7 +564,8 @@ mod tests {
                 "name": "foo",
                 "namespace": "default",
                 "route_count": 2,
-                "load_balancer": "10.0.0.4"
+                "load_balancer": "10.0.0.4",
+                "status": "ok"
             })
         );
     }
@@ -428,6 +618,95 @@ mod tests {
         assert_eq!(snapshot.gateways.len(), 0);
         assert_eq!(snapshot.ingresses.len(), 0);
         assert!(!snapshot.controller.leader);
+    }
+
+    #[test]
+    fn severity_worse_takes_the_higher_variant_and_serialises_lowercase() {
+        assert_eq!(Severity::Ok.worse(Severity::Warn), Severity::Warn);
+        assert_eq!(Severity::Error.worse(Severity::Warn), Severity::Error);
+        assert_eq!(Severity::Ok.worse(Severity::Ok), Severity::Ok);
+        assert!(Severity::Warn.is_problem());
+        assert!(Severity::Error.is_problem());
+        assert!(!Severity::Ok.is_problem());
+        assert_eq!(
+            serde_json::to_value(Severity::Error).expect("serialise"),
+            serde_json::json!("error")
+        );
+    }
+
+    #[test]
+    fn category_summary_counts_and_takes_worst() {
+        let c = CategorySummary::from_severities([Severity::Ok, Severity::Warn, Severity::Ok]);
+        assert_eq!(c.total, 3);
+        assert_eq!(c.worst, Severity::Warn);
+        let empty = CategorySummary::from_severities([]);
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.worst, Severity::Ok);
+    }
+
+    #[test]
+    fn routing_summary_aggregates_each_category_independently() {
+        let summary = ClusterSummary::new(
+            vec![
+                GatewaySummary::new("gw", "ns").with_status(Severity::Ok),
+                GatewaySummary::new("gw2", "ns").with_status(Severity::Error),
+            ],
+            vec![IngressSummary::new("ing", "ns").with_status(Severity::Warn)],
+            vec![HttpRouteSummary::new("r", "ns").with_status(Severity::Ok)],
+            ControllerSummary::new(true),
+        );
+        let rs = summary.routing_summary();
+        assert_eq!(
+            rs.gateways,
+            CategorySummary {
+                total: 2,
+                worst: Severity::Error
+            }
+        );
+        assert_eq!(
+            rs.ingresses,
+            CategorySummary {
+                total: 1,
+                worst: Severity::Warn
+            }
+        );
+        assert_eq!(
+            rs.httproutes,
+            CategorySummary {
+                total: 1,
+                worst: Severity::Ok
+            }
+        );
+        let v: serde_json::Value = serde_json::to_value(rs).expect("serialise");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "gateways": { "total": 2, "worst": "error" },
+                "httproutes": { "total": 1, "worst": "ok" },
+                "ingresses": { "total": 1, "worst": "warn" }
+            })
+        );
+    }
+
+    #[test]
+    fn httproute_summary_round_trips() {
+        let r = HttpRouteSummary::new("api", "demo")
+            .with_hostnames(vec!["api.example.com".to_string()])
+            .with_parent_gateways(vec!["demo/demo-gw".to_string()])
+            .with_rule_count(3)
+            .with_status(Severity::Warn);
+        let v: serde_json::Value = serde_json::to_value(&r).expect("serialise");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "name": "api",
+                "namespace": "demo",
+                "hostnames": ["api.example.com"],
+                "parent_gateways": ["demo/demo-gw"],
+                "rule_count": 3,
+                "status": "warn"
+            })
+        );
     }
 
     #[test]

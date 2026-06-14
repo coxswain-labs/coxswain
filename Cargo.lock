@@ -611,6 +611,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "coxswain-core",
+ "form_urlencoded",
  "futures",
  "gateway-api",
  "http",

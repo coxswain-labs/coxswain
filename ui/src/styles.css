@@ -12,6 +12,7 @@
   --blue:    #60a5fa;
   --purple:  #a78bfa;
   --teal:    #2dd4bf;
+  --pink:    #f472b6;
   --nav-h:   52px;
   --r:       6px;
   --touch:   44px;   /* WCAG 2.5.5 minimum touch target */
@@ -579,6 +580,11 @@ tr.clickable:focus-visible td { outline: 2px solid var(--blue); outline-offset: 
    accent — so "you navigated here" never reads as amber "this is broken". */
 tr.row-hit td { background: color-mix(in srgb, var(--blue) 14%, transparent); }
 tr.row-hit td:first-child { box-shadow: inset 3px 0 0 var(--blue); }
+
+/* "Showing X of Y" footer under a DataTable (no-silent-truncation surface). */
+.table-foot {
+  padding: 8px 4px; color: var(--muted); font-size: 12px;
+}
 
 /* ── Tabs ────────────────────────────────────────────────────────────────── */
 .tabs {

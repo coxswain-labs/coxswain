@@ -10,8 +10,9 @@ import { PodActions } from '../components/PodActions.jsx';
 import { Icon } from '../components/Icon.jsx';
 import { EndpointHealth } from '../components/EndpointHealth.jsx';
 import { Tabs } from '../components/Tabs.jsx';
+import { SearchBox } from '../components/SearchBox.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
-import { useEffect } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 
 /**
  * Proxy detail screen.
@@ -181,7 +182,7 @@ function pickDefaultTab(specs, highlight) {
 }
 
 function RouteSection({ spec, kind, highlight, pod }) {
-  const hosts     = spec?.hosts ?? [];
+  const allHosts  = spec?.hosts ?? [];
   // A routing conflict is a property of the host+path routing key (two routes
   // claim it; one is rejected) — not of a listener port. The shared proxy serves
   // the same routes on every listener, so the compiled table reports the *same*
@@ -190,6 +191,28 @@ function RouteSection({ spec, kind, highlight, pod }) {
   // group at the same path) have a different key and are kept.
   const conflicts = dedupeConflicts(spec?.conflicts ?? []);
   const wantPath  = highlight?.path || '/';
+
+  // Client-side host/path filter for large tables (#286). At scale an operator
+  // looks up a specific host/path rather than eyeballing thousands of rows; the
+  // count line always states matched-of-total so nothing is silently hidden.
+  // (Server-side filtering + windowing are wired in the backend envelope and are
+  // a follow-up to push the filter to the proxy for very large tables.)
+  const [filter, setFilter] = useState('');
+  const needle = filter.trim().toLowerCase();
+  const hosts = needle
+    ? allHosts
+        .map((h) => {
+          if (h.host.toLowerCase().includes(needle)) return h;
+          const routes = (h.routes ?? []).filter((r) =>
+            (r.path || '/').toLowerCase().includes(needle),
+          );
+          return routes.length ? { ...h, routes } : null;
+        })
+        .filter(Boolean)
+    : allHosts;
+
+  const total = countRoutes(spec);
+  const shown = hosts.reduce((sum, h) => sum + (h.routes?.length ?? 0), 0);
 
   return (
     <div>
@@ -204,7 +227,22 @@ function RouteSection({ spec, kind, highlight, pod }) {
         </div>
       )}
 
-      {hosts.length === 0 && <EmptyState message="No routes." />}
+      {total > 0 && (
+        <div class="header-controls left" style="margin-bottom:8px">
+          <SearchBox
+            value={filter}
+            onInput={(e) => setFilter(e.currentTarget.value)}
+            placeholder="Filter by host or path…"
+            label="Filter routes by host or path"
+          />
+          <span class="table-foot" style="padding:0;align-self:center">
+            {shown === total ? `${total} routes` : `Showing ${shown} of ${total}`}
+          </span>
+        </div>
+      )}
+
+      {allHosts.length === 0 && <EmptyState message="No routes." />}
+      {allHosts.length > 0 && hosts.length === 0 && <EmptyState message="No routes match." />}
 
       {hosts.map((h) => (
         <div key={`${h.port}-${h.host}`} class="host-group">

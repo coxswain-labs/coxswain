@@ -23,5 +23,6 @@
   "proxy": {
     "pool": "shared"
   },
-  "route_count": 0
+  "route_count": 0,
+  "status": "error"
 }

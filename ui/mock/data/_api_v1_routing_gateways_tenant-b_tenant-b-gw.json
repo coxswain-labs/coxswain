@@ -1,12 +1,10 @@
 {
-  "addresses": [
-    "192.168.194.187"
-  ],
+  "addresses": [],
   "attached_routes_list": [
     {
       "kind": "HTTPRoute",
-      "name": "a-web-route",
-      "namespace": "tenant-a"
+      "name": "b-api-route",
+      "namespace": "tenant-b"
     }
   ],
   "conditions": [
@@ -17,14 +15,15 @@
     },
     {
       "type": "Programmed",
-      "status": "True",
-      "reason": "Programmed"
+      "status": "False",
+      "reason": "Pending",
+      "message": "Waiting for dedicated proxy to become Ready"
     },
     {
       "type": "gateway.coxswain-labs.dev/DedicatedProxyReady",
-      "status": "True",
-      "reason": "Ready",
-      "message": "Dedicated proxy has at least one Ready pod"
+      "status": "False",
+      "reason": "NoReadyPods",
+      "message": "Dedicated proxy has no Ready pods yet"
     }
   ],
   "listeners": [
@@ -36,10 +35,11 @@
       "attached_routes": 1
     }
   ],
-  "name": "tenant-a-gw",
-  "namespace": "tenant-a",
+  "name": "tenant-b-gw",
+  "namespace": "tenant-b",
   "proxy": {
     "pool": "dedicated"
   },
-  "route_count": 1
+  "route_count": 1,
+  "status": "error"
 }

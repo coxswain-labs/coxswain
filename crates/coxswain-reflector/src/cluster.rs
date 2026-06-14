@@ -9,18 +9,25 @@
 //! snapshots are stable when nothing has changed — keeps polling diffs minimal
 //! and tests deterministic.
 
+use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gateways::Gateway;
 use crate::ingress::claimed_ingress_class;
-use crate::tls::GatewayListenerHealth;
+use crate::keys::RouteParentKey;
+use crate::tls::{GatewayListenerHealth, HttpRouteHealthMap};
 use coxswain_core::cluster::{
-    ClusterSummary, ControllerSummary, GatewayCondition, GatewaySummary, IngressSummary,
-    PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, ProxyAssignment,
+    ClusterSummary, ControllerSummary, GatewayCondition, GatewaySummary, HttpRouteSummary,
+    IngressSummary, PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, ProxyAssignment, Severity,
 };
 use coxswain_core::ownership::ObjectKey;
 use k8s_openapi::api::networking::v1::Ingress;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+
+/// Gateway condition type set by the dedicated-mode operator once the per-Gateway
+/// proxy has at least one Ready pod. `False` means traffic cannot flow through
+/// the Gateway yet even when the Gateway is otherwise `Accepted`.
+const DEDICATED_PROXY_READY: &str = "gateway.coxswain-labs.dev/DedicatedProxyReady";
 
 /// Inputs required to build a [`ClusterSummary`].
 ///
@@ -46,8 +53,14 @@ pub struct ClusterSummaryInputs<'a> {
     /// Name of the default IngressClass owned by this controller (if any) — claims
     /// Ingresses that don't set an explicit class.
     pub default_ingress_class: Option<&'a str>,
-    /// Per-Gateway listener health, used to sum `attached_routes` for route counts.
+    /// Per-Gateway listener health, used to sum `attached_routes` for route counts
+    /// and (via each listener's TLS outcome) to compute listener-precise health.
     pub gateway_tls_health: &'a HashMap<ObjectKey, GatewayListenerHealth>,
+    /// Snapshot of all HTTPRoutes in scope (from `Store<HttpRoute>::state()`).
+    pub routes: &'a [Arc<HttpRoute>],
+    /// Per-(route, parent) health produced by `compute_route_health` — supplies
+    /// each route's own `Accepted`/`ResolvedRefs` for the traffic-served status.
+    pub http_route_health: &'a HttpRouteHealthMap,
     /// Whether this controller pod currently holds the leader-election lease.
     pub leader: bool,
 }
@@ -57,14 +70,47 @@ pub struct ClusterSummaryInputs<'a> {
 /// Sorted by `(namespace, name)` for stable output across rebuilds.
 #[must_use]
 pub fn build_cluster_summary(inputs: &ClusterSummaryInputs<'_>) -> ClusterSummary {
-    let mut gateways = build_gateways(inputs);
+    // Per-Gateway severity, keyed by ObjectKey — computed once so HTTPRoutes can
+    // inherit their parent Gateway's health without recomputing it per route.
+    let gateway_severity = gateway_severity_map(inputs);
+
+    let mut gateways = build_gateways(inputs, &gateway_severity);
     let mut ingresses = build_ingresses(inputs);
+    let mut httproutes = build_httproutes(inputs, &gateway_severity);
     gateways.sort_by(cmp_ns_name_gateway);
     ingresses.sort_by(cmp_ns_name_ingress);
-    ClusterSummary::new(gateways, ingresses, ControllerSummary::new(inputs.leader))
+    httproutes.sort_by(cmp_ns_name_httproute);
+    ClusterSummary::new(
+        gateways,
+        ingresses,
+        httproutes,
+        ControllerSummary::new(inputs.leader),
+    )
 }
 
-fn build_gateways(inputs: &ClusterSummaryInputs<'_>) -> Vec<GatewaySummary> {
+/// Compute the traffic-served [`Severity`] for every owned Gateway, keyed by
+/// [`ObjectKey`].
+fn gateway_severity_map(inputs: &ClusterSummaryInputs<'_>) -> HashMap<ObjectKey, Severity> {
+    inputs
+        .gateways
+        .iter()
+        .filter_map(|gw| {
+            let ns = gw.metadata.namespace.as_deref()?;
+            let name = gw.metadata.name.as_deref()?;
+            let key = ObjectKey::new(ns, name);
+            if !inputs.owned_gateways.contains(&key) {
+                return None;
+            }
+            let sev = gateway_severity(gw, inputs.gateway_tls_health.get(&key));
+            Some((key, sev))
+        })
+        .collect()
+}
+
+fn build_gateways(
+    inputs: &ClusterSummaryInputs<'_>,
+    gateway_severity: &HashMap<ObjectKey, Severity>,
+) -> Vec<GatewaySummary> {
     inputs
         .gateways
         .iter()
@@ -106,15 +152,191 @@ fn build_gateways(inputs: &ClusterSummaryInputs<'_>) -> Vec<GatewaySummary> {
                 .and_then(|s| s.conditions.as_ref())
                 .map(|conds| conds.iter().map(GatewayCondition::from_kube).collect())
                 .unwrap_or_default();
+            let status = gateway_severity.get(&key).copied().unwrap_or_default();
             Some(
                 GatewaySummary::new(name, ns)
                     .with_proxy(proxy)
                     .with_route_count(route_count)
                     .with_addresses(addresses)
-                    .with_conditions(conditions),
+                    .with_conditions(conditions)
+                    .with_status(status),
             )
         })
         .collect()
+}
+
+/// Traffic-served health of a Gateway as a binding (upstream-only propagation —
+/// route conflicts under it never flip the Gateway itself).
+///
+/// `Error` when the binding can't serve at all (`Accepted=False`,
+/// `Programmed=False`, or `DedicatedProxyReady=False`); `Warn` when the binding
+/// is up but at least one listener's TLS is unresolved (partial); else `Ok`.
+fn gateway_severity(gw: &Gateway, listener_health: Option<&GatewayListenerHealth>) -> Severity {
+    let conditions = gw.status.as_ref().and_then(|s| s.conditions.as_ref());
+    let condition_false = |type_: &str| {
+        conditions.is_some_and(|cs| cs.iter().any(|c| c.type_ == type_ && c.status == "False"))
+    };
+    if condition_false("Accepted")
+        || condition_false("Programmed")
+        || condition_false(DEDICATED_PROXY_READY)
+    {
+        return Severity::Error;
+    }
+    let any_listener_unhealthy = listener_health
+        .is_some_and(|h| h.listeners.values().any(|li| !li.tls_outcome.is_healthy()));
+    if any_listener_unhealthy {
+        Severity::Warn
+    } else {
+        Severity::Ok
+    }
+}
+
+/// Build the HTTPRoute summaries, listing only routes that attach to at least
+/// one owned Gateway (routes targeting foreign Gateways are not ours to report).
+fn build_httproutes(
+    inputs: &ClusterSummaryInputs<'_>,
+    gateway_severity: &HashMap<ObjectKey, Severity>,
+) -> Vec<HttpRouteSummary> {
+    inputs
+        .routes
+        .iter()
+        .filter_map(|route| {
+            let route_ns = route.metadata.namespace.as_deref()?;
+            let route_name = route.metadata.name.as_deref()?;
+
+            // Owned parent Gateways, deduplicated as `namespace/name`.
+            let mut parent_gateways: Vec<String> = Vec::new();
+            for pr in route.spec.parent_refs.as_deref().unwrap_or(&[]) {
+                let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
+                let gw_key = ObjectKey::new(gw_ns, pr.name.as_str());
+                if !inputs.owned_gateways.contains(&gw_key) {
+                    continue;
+                }
+                let label = format!("{gw_ns}/{}", pr.name);
+                if !parent_gateways.contains(&label) {
+                    parent_gateways.push(label);
+                }
+            }
+            // Not attached to any owned Gateway → not in our purview.
+            if parent_gateways.is_empty() {
+                return None;
+            }
+            parent_gateways.sort();
+
+            let hostnames = route.spec.hostnames.as_deref().unwrap_or(&[]).to_vec();
+            let rule_count = route.spec.rules.as_deref().map(<[_]>::len).unwrap_or(0);
+            let status = httproute_severity(route, route_ns, route_name, inputs, gateway_severity);
+
+            Some(
+                HttpRouteSummary::new(route_name, route_ns)
+                    .with_hostnames(hostnames)
+                    .with_parent_gateways(parent_gateways)
+                    .with_rule_count(rule_count)
+                    .with_status(status),
+            )
+        })
+        .collect()
+}
+
+/// Traffic-served health of one HTTPRoute, reduced across the (owned) parent
+/// paths it binds.
+///
+/// Per parent path, "serves" requires the route's own `Accepted`+`ResolvedRefs`
+/// (from `compute_route_health`), the parent Gateway binding being up, and the
+/// **specific listener(s)** the route binds being TLS-healthy (listener-precise).
+/// Reduction: all paths serve → `Ok`; none → `Error`; mixed → `Warn`.
+fn httproute_severity(
+    route: &HttpRoute,
+    route_ns: &str,
+    route_name: &str,
+    inputs: &ClusterSummaryInputs<'_>,
+    gateway_severity: &HashMap<ObjectKey, Severity>,
+) -> Severity {
+    let mut path_severities: Vec<Severity> = Vec::new();
+
+    for pr in route.spec.parent_refs.as_deref().unwrap_or(&[]) {
+        let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
+        let gw_name = pr.name.as_str();
+        let gw_key = ObjectKey::new(gw_ns, gw_name);
+        let Some(&gw_sev) = gateway_severity.get(&gw_key) else {
+            continue; // foreign / unowned parent — not counted
+        };
+        let section = pr.section_name.as_deref().unwrap_or("");
+
+        // The route's own acceptance + backend resolution against this parent.
+        // `compute_route_health` only populates entries for shared-pool owned
+        // Gateways; a dedicated/cut-over Gateway has no entry, so an absent entry
+        // defers to the Gateway's binding health rather than counting as dark.
+        let own_ok = inputs
+            .http_route_health
+            .get(&RouteParentKey::new(
+                route_ns, route_name, gw_ns, gw_name, section,
+            ))
+            .is_none_or(|h| h.accepted && h.resolved_refs);
+
+        let path = if !own_ok || gw_sev == Severity::Error {
+            // Route rejected/unresolved, or the binding itself is dark.
+            Severity::Error
+        } else {
+            // Binding is up and the route is accepted: the path's health is the
+            // health of the listener(s) it binds (listener-precise).
+            listener_path_severity(inputs.gateway_tls_health.get(&gw_key), section)
+        };
+        path_severities.push(path);
+    }
+
+    reduce_paths(&path_severities)
+}
+
+/// Severity of the listener(s) a parent path binds. With a `sectionName`, the
+/// single named listener; without one, the route binds every listener, so the
+/// path is `Ok` only when all are healthy, `Error` when none are, else `Warn`.
+fn listener_path_severity(
+    listener_health: Option<&GatewayListenerHealth>,
+    section: &str,
+) -> Severity {
+    let Some(health) = listener_health else {
+        return Severity::Ok; // no TLS detail (e.g. cleartext) — treat as healthy
+    };
+    if !section.is_empty() {
+        return match health.listeners.get(section) {
+            Some(li) if li.tls_outcome.is_healthy() => Severity::Ok,
+            Some(_) => Severity::Error,
+            None => Severity::Ok, // unmatched section is reflected in own_ok, not here
+        };
+    }
+    if health.listeners.is_empty() {
+        return Severity::Ok;
+    }
+    let healthy = health
+        .listeners
+        .values()
+        .filter(|li| li.tls_outcome.is_healthy())
+        .count();
+    if healthy == health.listeners.len() {
+        Severity::Ok
+    } else if healthy == 0 {
+        Severity::Error
+    } else {
+        Severity::Warn
+    }
+}
+
+/// Reduce per-path severities to the resource severity on the traffic-served
+/// principle: all serve → `Ok`; none serve → `Error`; mixed → `Warn`. A route
+/// with no owned parent paths is `Error` (it attaches nowhere we serve).
+fn reduce_paths(paths: &[Severity]) -> Severity {
+    if paths.is_empty() {
+        return Severity::Error;
+    }
+    let dark = paths.iter().filter(|s| **s == Severity::Error).count();
+    if dark == 0 && paths.iter().all(|s| *s == Severity::Ok) {
+        Severity::Ok
+    } else if dark == paths.len() {
+        Severity::Error
+    } else {
+        Severity::Warn
+    }
 }
 
 fn build_ingresses(inputs: &ClusterSummaryInputs<'_>) -> Vec<IngressSummary> {
@@ -192,6 +414,10 @@ fn cmp_ns_name_ingress(a: &IngressSummary, b: &IngressSummary) -> std::cmp::Orde
     (a.namespace.as_str(), a.name.as_str()).cmp(&(b.namespace.as_str(), b.name.as_str()))
 }
 
+fn cmp_ns_name_httproute(a: &HttpRouteSummary, b: &HttpRouteSummary) -> std::cmp::Ordering {
+    (a.namespace.as_str(), a.name.as_str()).cmp(&(b.namespace.as_str(), b.name.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
@@ -199,7 +425,7 @@ mod tests {
         Gateway, GatewayInfrastructure, GatewayInfrastructureParametersRef, GatewaySpec,
         GatewayStatus, GatewayStatusAddresses,
     };
-    use crate::tls::{GatewayListenerHealth, ListenerInfo};
+    use crate::tls::{GatewayListenerHealth, HttpRouteHealthMap, ListenerInfo};
     use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, ProxyPool};
     use coxswain_core::ownership::ObjectKey;
     use k8s_openapi::api::networking::v1::{
@@ -375,6 +601,8 @@ mod tests {
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: None,
             gateway_tls_health: &health,
+            routes: &[],
+            http_route_health: &HttpRouteHealthMap::new(),
             leader: false,
         });
 
@@ -415,6 +643,8 @@ mod tests {
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: None,
             gateway_tls_health: &health,
+            routes: &[],
+            http_route_health: &HttpRouteHealthMap::new(),
             leader: false,
         });
 
@@ -440,6 +670,8 @@ mod tests {
             owned_ingress_classes: &owned_classes,
             default_ingress_class: None,
             gateway_tls_health: &empty_health(),
+            routes: &[],
+            http_route_health: &HttpRouteHealthMap::new(),
             leader: true,
         });
 
@@ -487,6 +719,8 @@ mod tests {
             owned_ingress_classes: &owned_classes,
             default_ingress_class: None,
             gateway_tls_health: &health,
+            routes: &[],
+            http_route_health: &HttpRouteHealthMap::new(),
             leader: false,
         });
 
@@ -531,6 +765,8 @@ mod tests {
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: None,
             gateway_tls_health: &empty_health(),
+            routes: &[],
+            http_route_health: &HttpRouteHealthMap::new(),
             leader: false,
         });
         assert_eq!(summary.gateways.len(), 0);
@@ -550,6 +786,8 @@ mod tests {
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: None,
             gateway_tls_health: &empty_health(),
+            routes: &[],
+            http_route_health: &HttpRouteHealthMap::new(),
             leader: false,
         });
         assert_eq!(summary.ingresses.len(), 0);
@@ -569,6 +807,8 @@ mod tests {
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: Some("coxswain"),
             gateway_tls_health: &empty_health(),
+            routes: &[],
+            http_route_health: &HttpRouteHealthMap::new(),
             leader: false,
         });
         assert_eq!(summary.ingresses.len(), 1);
@@ -611,6 +851,8 @@ mod tests {
             owned_ingress_classes: &owned_classes,
             default_ingress_class: None,
             gateway_tls_health: &empty_health(),
+            routes: &[],
+            http_route_health: &HttpRouteHealthMap::new(),
             leader: false,
         });
         assert_eq!(summary.ingresses[0].load_balancer, "lb.example.com");
@@ -652,8 +894,126 @@ mod tests {
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: None,
             gateway_tls_health: &empty_health(),
+            routes: &[],
+            http_route_health: &HttpRouteHealthMap::new(),
             leader: false,
         });
         assert_eq!(summary.gateways[0].proxy.pool, ProxyPool::Shared);
+    }
+
+    // ── traffic-served health (#301) ───────────────────────────────────────────
+
+    use crate::cluster::{gateway_severity, listener_path_severity, reduce_paths};
+    use crate::tls::ListenerTlsOutcome;
+    use coxswain_core::cluster::Severity;
+
+    fn listener(name: &str, outcome: ListenerTlsOutcome) -> (String, ListenerInfo) {
+        (
+            name.to_string(),
+            ListenerInfo {
+                tls_outcome: outcome,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn health_with(listeners: Vec<(String, ListenerInfo)>) -> GatewayListenerHealth {
+        GatewayListenerHealth {
+            listeners: listeners.into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn reduce_paths_follows_traffic_served_principle() {
+        // No owned parent path → attaches nowhere → dark.
+        assert_eq!(reduce_paths(&[]), Severity::Error);
+        // Every path serves.
+        assert_eq!(reduce_paths(&[Severity::Ok, Severity::Ok]), Severity::Ok);
+        // No path serves.
+        assert_eq!(
+            reduce_paths(&[Severity::Error, Severity::Error]),
+            Severity::Error
+        );
+        // Some serve, some don't → degraded.
+        assert_eq!(
+            reduce_paths(&[Severity::Ok, Severity::Error]),
+            Severity::Warn
+        );
+        assert_eq!(reduce_paths(&[Severity::Warn]), Severity::Warn);
+    }
+
+    #[test]
+    fn listener_path_severity_is_listener_precise() {
+        let health = health_with(vec![
+            listener("web", ListenerTlsOutcome::Resolved),
+            listener(
+                "secure",
+                ListenerTlsOutcome::Invalid {
+                    message: "bad cert".to_string(),
+                },
+            ),
+        ]);
+        // Bound to the healthy listener → unaffected by the sibling's bad cert.
+        assert_eq!(listener_path_severity(Some(&health), "web"), Severity::Ok);
+        // Bound to the broken listener → dark.
+        assert_eq!(
+            listener_path_severity(Some(&health), "secure"),
+            Severity::Error
+        );
+        // No sectionName → binds every listener; mixed health → partial.
+        assert_eq!(listener_path_severity(Some(&health), ""), Severity::Warn);
+        // No TLS detail (cleartext) → healthy.
+        assert_eq!(listener_path_severity(None, ""), Severity::Ok);
+    }
+
+    #[test]
+    fn gateway_severity_error_on_dedicated_proxy_not_ready() {
+        let gw = gateway(
+            "tenant",
+            "gw",
+            "coxswain",
+            true,
+            vec![],
+            vec![
+                ("Programmed", "True"),
+                ("gateway.coxswain-labs.dev/DedicatedProxyReady", "False"),
+            ],
+        );
+        assert_eq!(gateway_severity(&gw, None), Severity::Error);
+    }
+
+    #[test]
+    fn gateway_severity_error_when_not_programmed() {
+        let gw = gateway(
+            "ns",
+            "gw",
+            "coxswain",
+            false,
+            vec![],
+            vec![("Programmed", "False")],
+        );
+        assert_eq!(gateway_severity(&gw, None), Severity::Error);
+    }
+
+    #[test]
+    fn gateway_severity_warn_on_unhealthy_listener_else_ok() {
+        let gw = gateway(
+            "ns",
+            "gw",
+            "coxswain",
+            false,
+            vec![],
+            vec![("Accepted", "True"), ("Programmed", "True")],
+        );
+        // Healthy conditions, no listener detail → ok.
+        assert_eq!(gateway_severity(&gw, None), Severity::Ok);
+        // Healthy conditions but a listener with a bad cert → warn (binding up, partial).
+        let bad = health_with(vec![listener(
+            "l",
+            ListenerTlsOutcome::Invalid {
+                message: "x".to_string(),
+            },
+        )]);
+        assert_eq!(gateway_severity(&gw, Some(&bad)), Severity::Warn);
     }
 }

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use clap::Parser;
 use coxswain_admin::{AdminServer, EventSources, OperatorAggregator};
 use coxswain_controller::{
-    ControllerConfig, IngressPorts, LeaseSettings, Operator, OperatorConfig, SharedClusterSummary,
+    ControllerConfig, IngressPorts, LeaseSettings, Operator, OperatorConfig,
     SharedGatewayListenerHealth, StatusWriterConfig, spawn_status_writer,
 };
 use coxswain_core::health::HealthRegistry;
@@ -135,7 +135,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         }),
     ));
 
-    let aggregator = OperatorAggregator::new(fleet, status_writer.outputs.cluster_summary.clone());
+    let aggregator = OperatorAggregator::new(fleet, status_writer.outputs.cluster_summary);
 
     let health_addr = SocketAddr::new(args.common.management_bind_address, args.common.health_port);
     server.add_service({
@@ -154,7 +154,6 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // The aggregate routing surface is /api/v1/routes/* via the aggregator.
     server.add_service(
         AdminServer::new(health, status_writer.leader)
-            .with_cluster_summary(status_writer.outputs.cluster_summary)
             .with_aggregator(aggregator)
             .with_events(events)
             .with_ui()
@@ -248,7 +247,6 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
             leader,
             ingress_routes: source.ingress_routes(),
             gateway_routes: source.gateway_routes(),
-            cluster: None,
             aggregator: None,
             events: None,
             serve_ui: false,
@@ -362,7 +360,6 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
             leader,
             ingress_routes: source.ingress_routes(),
             gateway_routes: source.gateway_routes(),
-            cluster: None,
             aggregator: None,
             events: None,
             serve_ui: false,
@@ -776,8 +773,7 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
 
     wire_proxy_services(&mut server, &args.common, &args.proxy, &source, &tls_health)?;
 
-    let dev_aggregator =
-        OperatorAggregator::new(fleet, status_writer.outputs.cluster_summary.clone());
+    let dev_aggregator = OperatorAggregator::new(fleet, status_writer.outputs.cluster_summary);
 
     wire_management_servers(
         &mut server,
@@ -787,7 +783,6 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
             leader: status_writer.leader,
             ingress_routes: source.ingress_routes(),
             gateway_routes: source.gateway_routes(),
-            cluster: Some(status_writer.outputs.cluster_summary),
             aggregator: Some(dev_aggregator),
             events: Some(events),
             serve_ui: true,
@@ -857,8 +852,6 @@ struct ManagementServerConfig {
     leader: Arc<AtomicBool>,
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
-    /// `Some` on the controller and dev roles (enables `/api/v1/cluster`).
-    cluster: Option<SharedClusterSummary>,
     /// `Some` on the dev role (enables the aggregator REST surface on the
     /// single-process dev binary). Controller wires the aggregator inline.
     aggregator: Option<OperatorAggregator>,
@@ -890,9 +883,6 @@ fn wire_management_servers(
     let admin_addr = SocketAddr::new(common.management_bind_address, common.admin_port);
     let mut admin = AdminServer::new(config.health, config.leader)
         .with_routes(config.ingress_routes, config.gateway_routes);
-    if let Some(cs) = config.cluster {
-        admin = admin.with_cluster_summary(cs);
-    }
     if let Some(ag) = config.aggregator {
         admin = admin.with_aggregator(ag);
     }

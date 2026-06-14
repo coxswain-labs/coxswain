@@ -491,14 +491,14 @@ async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
 
     // Discover a live controller pod name from the aggregator's fleet view.
     let controllers: serde_json::Value = client
-        .get(h.controller_admin_url("/api/v1/controllers"))
+        .get(h.controller_admin_url("/api/v1/fleet/controllers"))
         .send()
         .await?
         .json()
         .await?;
     let pod = controllers["controllers"][0]["pod_name"]
         .as_str()
-        .expect("/api/v1/controllers must list at least one controller pod");
+        .expect("/api/v1/fleet/controllers must list at least one controller pod");
     let logs_path = format!("/api/v1/pods/{pod}/logs?tail=10&follow=false");
 
     // Controller relays the snapshot: 200 with a non-empty body.

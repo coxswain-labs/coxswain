@@ -1,0 +1,14 @@
+{
+  "gateways": {
+    "total": 4,
+    "worst": "error"
+  },
+  "httproutes": {
+    "total": 7,
+    "worst": "error"
+  },
+  "ingresses": {
+    "total": 4,
+    "worst": "error"
+  }
+}
