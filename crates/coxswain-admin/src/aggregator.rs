@@ -16,16 +16,20 @@
 //! is synchronous and has no tokio runtime until `server.run_forever()`.
 
 use crate::gw_types::{self, HttpRoute};
+use crate::logs::{self, LogQuery};
 use coxswain_core::cluster::{ClusterSummary, GatewayCondition, SharedClusterSummary};
-use coxswain_core::fleet::{Component, FleetEntry, SharedFleet};
+use coxswain_core::fleet::{Component, FleetEntry, FleetSnapshot, SharedFleet};
 use futures::future::join_all;
 use http::{HeaderValue, Response, StatusCode, header};
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::{Api, Client};
+use pingora_core::protocols::http::ServerSession;
+use pingora_core::server::ShutdownWatch;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 
 // ── OperatorAggregator ────────────────────────────────────────────────────────
 
@@ -43,7 +47,14 @@ pub struct OperatorAggregator {
     cluster: SharedClusterSummary,
     /// Kubernetes client, initialised lazily on the first K8s-backed request.
     kube: OnceCell<Client>,
+    /// Bounds concurrent `/api/v1/pods/{name}/logs` streams. Each live stream
+    /// holds one kube connection on the controller; the cap stops a few open
+    /// tabs (or stuck clients) from piling them up.
+    log_permits: Arc<Semaphore>,
 }
+
+/// Maximum number of concurrent pod-log streams the controller will relay.
+const MAX_CONCURRENT_LOG_STREAMS: usize = 8;
 
 impl OperatorAggregator {
     /// Construct an aggregator with the given fleet and cluster handles.
@@ -69,6 +80,7 @@ impl OperatorAggregator {
             fleet,
             cluster,
             kube: OnceCell::new(),
+            log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),
         }
     }
 
@@ -93,6 +105,16 @@ fn pod_base_url(entry: &FleetEntry) -> String {
         IpAddr::V4(_) => format!("http://{}:{}", entry.pod_ip, entry.admin_port),
         IpAddr::V6(_) => format!("http://[{}]:{}", entry.pod_ip, entry.admin_port),
     }
+}
+
+/// Find a [`FleetEntry`] by `pod_name` across all fleet buckets.
+fn find_entry<'a>(snapshot: &'a FleetSnapshot, pod_name: &str) -> Option<&'a FleetEntry> {
+    snapshot
+        .controllers
+        .iter()
+        .chain(&snapshot.shared_proxies)
+        .chain(&snapshot.dedicated_proxies)
+        .find(|e| e.pod_name == pod_name)
 }
 
 // ── Fan-out helpers ───────────────────────────────────────────────────────────
@@ -943,6 +965,69 @@ impl OperatorAggregator {
     }
 }
 
+// ── /api/v1/pods/{name}/logs ──────────────────────────────────────────────────
+
+impl OperatorAggregator {
+    /// Relay a coxswain pod's logs to the client as a chunked NDJSON stream.
+    ///
+    /// Unlike the buffered endpoints, this writes its full response (header and
+    /// body, including error statuses) directly on `session` — it is dispatched
+    /// out of the streaming arm of `process_new_http`, past the buffered
+    /// pipeline. The flow is: acquire a concurrency permit (→ 429 when the cap
+    /// is saturated); resolve `pod_name` to its namespace from the trusted fleet
+    /// snapshot (→ 404 when unknown — never the request URL, so an arbitrary
+    /// cluster pod can't be tailed); obtain the kube client (→ 503 on failure);
+    /// then delegate the byte pump to [`logs::run_until_shutdown`]. The permit is
+    /// released by RAII when the stream ends.
+    pub(crate) async fn stream_logs(
+        &self,
+        pod_name: &str,
+        query: &str,
+        session: &mut ServerSession,
+        shutdown: &ShutdownWatch,
+    ) {
+        let Ok(_permit) = Arc::clone(&self.log_permits).try_acquire_owned() else {
+            logs::write_status(
+                session,
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent log streams",
+            )
+            .await;
+            return;
+        };
+
+        // Resolve namespace from the fleet, not the URL — this is what scopes
+        // the endpoint to pods coxswain already tracks.
+        let namespace = {
+            let snapshot = self.fleet.load();
+            match find_entry(&snapshot, pod_name) {
+                Some(entry) => entry.pod_namespace.clone(),
+                None => {
+                    logs::write_status(session, StatusCode::NOT_FOUND, "pod not found").await;
+                    return;
+                }
+            }
+        };
+
+        let kube = match self.kube().await {
+            Ok(c) => c.clone(),
+            Err(e) => {
+                tracing::warn!(error = %e, "kube client unavailable for /api/v1/pods/.../logs");
+                logs::write_status(
+                    session,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "kubernetes client not available",
+                )
+                .await;
+                return;
+            }
+        };
+
+        let query = LogQuery::parse(query);
+        logs::run_until_shutdown(&kube, &namespace, pod_name, &query, session, shutdown).await;
+    }
+}
+
 /// De-dupe and aggregate fanned-out proxy `/routes` results into the
 /// `/api/v1/problems` payload. Split out from [`OperatorAggregator::list_problems`]
 /// so it is unit-testable without a live fan-out.
@@ -1140,8 +1225,7 @@ mod tests {
         ClusterSummary, ControllerSummary, GatewaySummary, IngressSummary, ProxyAssignment,
     };
     use coxswain_core::fleet::{
-        ADMIN_PORT_ANNOTATION, COMPONENT_LABEL, FleetSnapshot, GATEWAY_NAME_LABEL, SharedFleet,
-        build_snapshot,
+        ADMIN_PORT_ANNOTATION, COMPONENT_LABEL, GATEWAY_NAME_LABEL, SharedFleet, build_snapshot,
     };
     use k8s_openapi::api::core::v1::{Pod, PodStatus};
     use kube::api::ObjectMeta;
@@ -1430,19 +1514,6 @@ mod tests {
 
     // ── find_entry ────────────────────────────────────────────────────────────
 
-    /// Find a [`FleetEntry`] by `pod_name` across all fleet buckets.
-    pub(super) fn find_entry<'a>(
-        snapshot: &'a FleetSnapshot,
-        pod_name: &str,
-    ) -> Option<&'a FleetEntry> {
-        snapshot
-            .controllers
-            .iter()
-            .chain(&snapshot.shared_proxies)
-            .chain(&snapshot.dedicated_proxies)
-            .find(|e| e.pod_name == pod_name)
-    }
-
     #[test]
     fn find_entry_locates_across_buckets() {
         let pods = [
@@ -1533,6 +1604,7 @@ mod tests {
             fleet,
             cluster,
             kube: OnceCell::new(),
+            log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),
         }
     }
 

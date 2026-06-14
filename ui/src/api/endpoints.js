@@ -51,3 +51,20 @@ export const getManifest = (kind, ns, name) =>
 // ── Health ────────────────────────────────────────────────────────────────────
 
 export const getHealth = () => fetchJson('/api/v1/health');
+
+// ── Pod logs ──────────────────────────────────────────────────────────────────
+
+/**
+ * Build the URL for the pod-log relay (`/api/v1/pods/{pod}/logs`). Returns a URL
+ * string rather than a parsed JSON response — the body is a long-lived chunked
+ * NDJSON stream consumed by `useLogStream`, not a one-shot fetch. The endpoint
+ * is generic over component: any pod the controller's fleet tracks resolves by
+ * name (namespace is resolved server-side from the fleet, never the URL).
+ *
+ * @param {string} pod                  pod name
+ * @param {{tail?: number, follow?: boolean}} [opts]
+ */
+export function logStreamUrl(pod, { tail = 1000, follow = true } = {}) {
+  const q = new URLSearchParams({ tail: String(tail), follow: String(follow) });
+  return `/api/v1/pods/${encodeURIComponent(pod)}/logs?${q}`;
+}

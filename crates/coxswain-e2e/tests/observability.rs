@@ -14,6 +14,8 @@
 //! - `access_log_*` — five cases that pin the access-log contract: required
 //!   fields (including the new `route_id` join key), path-mode behaviour,
 //!   error-path emission, and disabled-mode silence.
+//! - `pod_logs_stream_from_controller_not_proxy` — the `/api/v1/pods/{name}/logs`
+//!   relay (#285): controller serves it, proxy 404s, unknown pod 404s.
 
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, Harness, NamespaceGuard,
@@ -473,5 +475,57 @@ async fn problems_conflict_carries_rejected_route_identity() -> anyhow::Result<(
         rejected == "conflict-a" || rejected == "conflict-b",
         "rejected route should be one of the two conflicting Ingresses, got {rejected:?}"
     );
+    Ok(())
+}
+
+/// The controller relays a pod's logs at `/api/v1/pods/{name}/logs` (#285). A
+/// bounded snapshot (`follow=false`) returns a non-empty body, and the
+/// read-only-proxy invariant holds: the same path 404s on a proxy admin port
+/// (proxy roles wire no aggregator), and an unknown pod 404s on the controller
+/// (the name is resolved against the fleet, never the URL).
+#[tokio::test]
+async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let client = reqwest::Client::new();
+
+    // Discover a live controller pod name from the aggregator's fleet view.
+    let controllers: serde_json::Value = client
+        .get(h.controller_admin_url("/api/v1/controllers"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let pod = controllers["controllers"][0]["pod_name"]
+        .as_str()
+        .expect("/api/v1/controllers must list at least one controller pod");
+    let logs_path = format!("/api/v1/pods/{pod}/logs?tail=10&follow=false");
+
+    // Controller relays the snapshot: 200 with a non-empty body.
+    let resp = client
+        .get(h.controller_admin_url(&logs_path))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200, "controller must relay pod logs");
+    let body = resp.text().await?;
+    assert!(
+        !body.trim().is_empty(),
+        "controller log snapshot must be non-empty"
+    );
+
+    // Proxy admin: same path 404s — proxies wire no aggregator.
+    let proxy_status = client.get(h.admin_url(&logs_path)).send().await?.status();
+    assert_eq!(
+        proxy_status, 404,
+        "proxy admin must not expose pod logs (read-only-proxy invariant)"
+    );
+
+    // Unknown pod: 404 from the controller (resolved against the fleet).
+    let unknown = client
+        .get(h.controller_admin_url("/api/v1/pods/does-not-exist/logs?tail=10&follow=false"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(unknown, 404, "unknown pod name must 404");
     Ok(())
 }

@@ -1,11 +1,13 @@
 //! Admin HTTP endpoints for Coxswain: `/metrics`, `/routes`,
 //! `/api/v1/health`, `/api/v1/cluster`, and (controller-only)
 //! the `/api/v1/{proxies,controllers,gateways,ingresses,routes/*,manifests/*,problems}`
-//! aggregator surface, plus the embedded operator UI served at `GET /`.
+//! aggregator surface, the `/api/v1/pods/{name}/logs` log relay, plus the
+//! embedded operator UI served at `GET /`.
 
 mod aggregator;
 mod events;
 mod gw_types;
+mod logs;
 
 pub use aggregator::OperatorAggregator;
 pub use events::EventSources;
@@ -56,15 +58,17 @@ const UI_HTML: &str = include_str!(concat!(
 /// | `/api/v1/{proxies,controllers,gateways,ingresses,routes/*}` | | ✓ |
 /// | `/api/v1/problems` | | ✓ |
 /// | `/api/v1/events` (SSE) | | ✓ |
+/// | `/api/v1/pods/{name}/logs` (chunked) | | ✓ |
 ///
 /// Each capability is gated by an `Option` or `bool` field; missing
 /// capabilities return 404 structurally rather than by convention.
 ///
-/// Unlike the rest of the admin surface, `/api/v1/events` is a long-lived
-/// Server-Sent Events stream, which Pingora's buffered
+/// Unlike the rest of the admin surface, `/api/v1/events` and
+/// `/api/v1/pods/{name}/logs` are long-lived streams (Server-Sent Events and a
+/// chunked log relay), which Pingora's buffered
 /// [`ServeHttp`](pingora_core::apps::http_app::ServeHttp) trait cannot drive.
 /// `AdminServer` therefore implements the lower-level
-/// [`HttpServerApp`] directly: it streams the events path and reproduces the
+/// [`HttpServerApp`] directly: it streams those two paths and reproduces the
 /// buffered request/response pipeline (including the response-compression
 /// module) for every other endpoint.
 #[non_exhaustive]
@@ -219,6 +223,23 @@ impl HttpServerApp for AdminServer {
             return None;
         }
 
+        // Pod-log relay: another long-lived chunked stream that the buffered
+        // pipeline can't drive. Only the controller/dev roles wire `aggregator`;
+        // proxy roles fall through, where the path resolves to a 404. The pod
+        // name is a single path segment, so this carries no `%2F`-decoding risk.
+        if let Some(pod) = logs_pod_name(session.req_header().uri.path()).map(str::to_string)
+            && let Some(agg) = self.aggregator.as_ref()
+        {
+            let query = session
+                .req_header()
+                .uri
+                .query()
+                .unwrap_or_default()
+                .to_string();
+            agg.stream_logs(&pod, &query, &mut session, shutdown).await;
+            return None;
+        }
+
         if *shutdown.borrow() {
             session.set_keepalive(None);
         } else {
@@ -327,6 +348,20 @@ impl AdminServer {
 
             _ => aggregator::not_found(),
         }
+    }
+}
+
+/// Extract the pod name from `/api/v1/pods/{name}/logs`, or `None` for any
+/// other path.
+///
+/// The middle segment is a single DNS-1123 pod name (no embedded `/`), so a
+/// three-way split is sufficient and unambiguous.
+fn logs_pod_name(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/api/v1/")?;
+    let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    match segs.as_slice() {
+        ["pods", name, "logs"] => Some(name),
+        _ => None,
     }
 }
 
@@ -644,6 +679,23 @@ mod tests {
         let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false))
             .with_cluster_summary(SharedClusterSummary::default());
         assert!(admin.cluster.is_some());
+    }
+
+    #[test]
+    fn logs_pod_name_matches_pods_logs_path() {
+        assert_eq!(
+            logs_pod_name("/api/v1/pods/coxswain-abc/logs"),
+            Some("coxswain-abc")
+        );
+    }
+
+    #[test]
+    fn logs_pod_name_rejects_other_paths() {
+        assert_eq!(logs_pod_name("/api/v1/pods/coxswain-abc"), None);
+        assert_eq!(logs_pod_name("/api/v1/pods"), None);
+        assert_eq!(logs_pod_name("/api/v1/proxies/p/logs"), None);
+        assert_eq!(logs_pod_name("/api/v1/events"), None);
+        assert_eq!(logs_pod_name("/metrics"), None);
     }
 
     #[test]

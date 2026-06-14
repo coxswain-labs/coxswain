@@ -983,6 +983,72 @@ input[type=checkbox] { accent-color: var(--blue); }
   }
 }
 
+/* ── Logs dialog ─────────────────────────────────────────────────────────── */
+/* Taller than the manifest modal — a log tail wants vertical room. */
+.logs-dialog { width: min(1000px, 96vw); height: min(86vh, 900px); max-height: min(86vh, 900px); }
+/* `min-height: 0` lets the body shrink inside the fixed-height flex column so
+   the inner `.log-feed` (not the body, nor the page) owns the scroll; `overflow:
+   hidden` keeps the body itself from becoming a second scroll container. */
+.logs-dialog .dialog-body {
+  display: flex; flex-direction: column;
+  min-height: 0; overflow: hidden;
+  background: var(--bg);
+}
+
+/* Connection state pill next to the title. */
+.log-status { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.log-status-streaming { color: var(--green); }
+.log-status-error { color: var(--red); }
+
+/* tail selector in the header actions. */
+.log-tail-label {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--muted);
+}
+.log-tail-select { min-height: var(--touch); }
+
+/* Level filter row reuses the .ev-filter-chip chips. */
+.log-filter {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+  background: var(--surface2); flex-shrink: 0;
+}
+
+/* The scrolling log pane: oldest at top, newest at bottom (chronological). */
+.log-feed {
+  flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
+  padding: 6px 0;
+}
+.log-empty { color: var(--muted); font-size: 13px; padding: 12px 16px; }
+.log-row {
+  display: flex; gap: 10px; align-items: baseline;
+  padding: 2px 16px; word-break: break-word;
+}
+.log-row:hover { background: var(--surface); }
+.log-time { color: var(--muted); flex-shrink: 0; }
+.log-level {
+  flex-shrink: 0; width: 48px; font-weight: 700; font-size: 11px;
+  text-align: right; text-transform: uppercase;
+}
+.log-level-error { color: var(--red); }
+.log-level-warn  { color: var(--amber); }
+.log-level-info  { color: var(--green); }
+.log-level-debug { color: var(--blue); }
+.log-level-trace { color: var(--purple); }
+.log-level-other { color: var(--muted); }
+.log-msg { color: var(--text); flex: 1; min-width: 0; white-space: pre-wrap; }
+/* Error lines get a faint red wash so they stand out while scrolling. */
+.log-row.log-error { background: rgba(239, 68, 68, 0.08); }
+
+/* On mobile, render as a full-screen drawer like the manifest dialog. The base
+   `.dialog` mobile rule sets inset/transform/border; this resets the explicit
+   `.logs-dialog` width/height (which would otherwise win by source order). */
+@media (max-width: 639px) {
+  .logs-dialog { width: 100%; height: 100%; max-height: none; }
+}
+
 /* ── Loading / error / empty states ──────────────────────────────────────── */
 .state-box {
   padding: 40px 20px; text-align: center;
