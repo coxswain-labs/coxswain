@@ -14,8 +14,8 @@
     "prismjs": "^1.30.0"
   },
   "devDependencies": {
-    "@preact/preset-vite": "^2.9.4",
-    "vite": "^6.3.5",
-    "vite-plugin-singlefile": "^2.0.3"
+    "@preact/preset-vite": "^2.10.5",
+    "vite": "^8.0.0",
+    "vite-plugin-singlefile": "^2.3.3"
   }
 }

@@ -14,7 +14,9 @@
 # cargo-chef caches it in the deps layer so PR rebuilds that don't touch
 # Cargo.lock skip recompiling it entirely.
 
-FROM node:22-alpine AS ui-builder
+# Node 24 (Active LTS) — matches the CI workflows' setup-node and satisfies
+# Vite 8's engine requirement (^20.19 || >=22.12).
+FROM node:24-alpine AS ui-builder
 WORKDIR /app
 COPY ui/package.json ui/package-lock.json ./ui/
 RUN cd ui && npm ci
