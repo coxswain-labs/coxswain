@@ -54,7 +54,7 @@ Implementation-specific capabilities — such as `RegularExpression` path, heade
 A `Gateway` object defines one or more listeners, each binding a port and protocol to a set of allowed routes. Only `HTTP` and `HTTPS` listeners are processed; other protocol values are ignored.
 
 !!! tip "Dedicated proxy per Gateway"
-    A `Gateway` can be opted into its own isolated proxy pool via `spec.infrastructure.parametersRef`. See [Dedicated-mode Gateways](dedicated-mode.md) for the full walkthrough.
+    A `Gateway` can be opted into its own isolated proxy pool via `spec.infrastructure.parametersRef`. See [Dedicated proxy pools](dedicated-mode.md) for the full walkthrough.
 
 ### Example
 

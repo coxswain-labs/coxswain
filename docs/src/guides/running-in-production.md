@@ -4,12 +4,12 @@ Review each section below before directing production traffic to Coxswain.
 
 ## Replicas and availability
 
-The Helm chart defaults to `replicaCount: 1`, which is fine for evaluation but inadequate for production: a single replica is a single point of failure, and the default `PodDisruptionBudget` (`maxUnavailable: 1`) combined with one replica means a voluntary disruption can take the entire data plane offline. Run at least two replicas. Leader election only coordinates status writes, so all replicas serve traffic independently.
+The Helm chart defaults to `proxy.shared.replicas: 1`, which is fine for evaluation but inadequate for production: a single replica is a single point of failure, and the default `PodDisruptionBudget` (`maxUnavailable: 1`) combined with one replica means a voluntary disruption can take the entire data plane offline. Run at least two replicas. Leader election only coordinates status writes, so all replicas serve traffic independently.
 
 ```bash
 helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --namespace coxswain-system \
-  --set replicaCount=2
+  --set proxy.shared.replicas=2
 ```
 
 Verify the `PodDisruptionBudget` is in place:
@@ -18,18 +18,21 @@ Verify the `PodDisruptionBudget` is in place:
 kubectl -n coxswain-system get pdb
 ```
 
-Pod anti-affinity is not set by default. Add it via your `values.yaml` to spread replicas across nodes:
+Pod anti-affinity is not set by default. Add it via your `values.yaml` to spread shared-proxy replicas across nodes:
 
 ```yaml
-affinity:
-  podAntiAffinity:
-    preferredDuringSchedulingIgnoredDuringExecution:
-      - weight: 100
-        podAffinityTerm:
-          topologyKey: kubernetes.io/hostname
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: coxswain
+proxy:
+  shared:
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: coxswain
+                  app.kubernetes.io/component: shared-proxy
 ```
 
 ## Resource requests and limits
@@ -42,16 +45,16 @@ The Helm chart defaults are sized for evaluation: requests `100m` CPU / `128Mi` 
 | Medium (1k–10k rps) | 500m–1 | 128Mi–256Mi | 4 |
 | Heavy (> 10k rps) | 2–4 | 256Mi–512Mi | ≥ CPU core count |
 
-Set `proxy.threads` to match the CPU cores allocated to the container:
+Set `proxy.shared.threads` to match the CPU cores allocated to the container:
 
 ```bash
 helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --namespace coxswain-system \
-  --set resources.requests.cpu=500m \
-  --set resources.requests.memory=128Mi \
-  --set resources.limits.cpu=2 \
-  --set resources.limits.memory=512Mi \
-  --set proxy.threads=4
+  --set proxy.shared.resources.requests.cpu=500m \
+  --set proxy.shared.resources.requests.memory=128Mi \
+  --set proxy.shared.resources.limits.cpu=2 \
+  --set proxy.shared.resources.limits.memory=512Mi \
+  --set proxy.shared.threads=4
 ```
 
 ## Health probes
@@ -78,7 +81,7 @@ Readiness gates differ by mode:
 Verify the probes are present on the deployed pod:
 
 ```bash
-kubectl -n coxswain-system get deploy coxswain \
+kubectl -n coxswain-system get deploy coxswain-shared-proxy \
   -o jsonpath='{.spec.template.spec.containers[0].readinessProbe}'
 ```
 
@@ -138,7 +141,7 @@ The default `ClusterRole` grants Coxswain cluster-wide:
 
 A separate namespaced `Role` (in `coxswain-system`) grants `get`, `create`, `patch` on `coordination.k8s.io/leases` — used only by the controller pod for leader election. Review the rendered manifests with `helm template` or read `deploy/manifests/controller-rbac.yaml` and `deploy/manifests/shared-proxy-rbac.yaml` before deploying. The shared-proxy ServiceAccount has zero write verbs; verify with `kubectl auth can-i --list --as=system:serviceaccount:coxswain-system:coxswain-shared-proxy`.
 
-If Coxswain should only manage resources in a single namespace, set `controller.watchNamespace`. Note that this only restricts what the controller reads; the chart still installs the cluster-wide `ClusterRole`/`ClusterRoleBinding`. To scope RBAC as well, edit the rendered manifests by hand.
+If Coxswain should only manage resources in a single namespace, set `watchNamespace`. Note that this only restricts what the controller reads; the chart still installs the cluster-wide `ClusterRole`/`ClusterRoleBinding`. To scope RBAC as well, edit the rendered manifests by hand.
 
 ## Signed image verification
 
