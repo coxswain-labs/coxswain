@@ -20,6 +20,7 @@ use coxswain_core::cluster::{ClusterSummary, GatewayCondition, SharedClusterSumm
 use coxswain_core::fleet::{Component, FleetEntry, SharedFleet};
 use futures::future::join_all;
 use http::{HeaderValue, Response, StatusCode, header};
+use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::{Api, Client};
 use std::net::IpAddr;
@@ -114,6 +115,7 @@ impl OperatorAggregator {
         let component = component_str(entry.component);
         let mut obj = serde_json::json!({
             "pod_name": entry.pod_name,
+            "pod_namespace": entry.pod_namespace,
             "pod_ip": entry.pod_ip.to_string(),
             "admin_port": entry.admin_port,
             "component": component,
@@ -121,8 +123,73 @@ impl OperatorAggregator {
         if let Some(ref gw) = entry.gateway_ref {
             obj["gateway_ref"] = serde_json::Value::String(gw.clone());
         }
+        // Pod runtime, straight off the fleet snapshot's Pod (present even when the
+        // pod is unreachable — restart count is exactly what you want then).
+        obj["restarts"] = serde_json::json!(entry.restarts);
+        if let Some(ref node) = entry.node {
+            obj["node"] = serde_json::Value::String(node.clone());
+        }
+        if let Some(ref phase) = entry.phase {
+            obj["phase"] = serde_json::Value::String(phase.clone());
+        }
+        if let Some(ref created) = entry.created_at {
+            obj["created_at"] = serde_json::Value::String(created.clone());
+        }
         obj
     }
+}
+
+/// Attach a coarse health rollup to a fleet-entry JSON from that pod's
+/// `/api/v1/health` body.
+///
+/// List endpoints already fetch each pod's `/api/v1/health` for liveness; rolling
+/// it down here lets the browser render per-pod health (Fleet chips, Dashboard
+/// "degraded pods") without a second fan-out. Sets `health` (`"ready"` or
+/// `"degraded"`) and `degraded_checks` (the `"subsystem/check"` names that aren't
+/// ready) on the entry.
+fn attach_health_rollup(entry: &mut serde_json::Value, health_body: &serde_json::Value) {
+    let degraded = non_ready_checks(health_body);
+    let state = if degraded.is_empty() {
+        "ready"
+    } else {
+        "degraded"
+    };
+    entry["health"] = serde_json::Value::String(state.to_owned());
+    entry["degraded_checks"] = serde_json::Value::from(degraded);
+}
+
+/// Collect the `"subsystem/check"` identifiers whose state is not `ready` from a
+/// `/api/v1/health` body.
+///
+/// Anything other than the literal `"ready"` state (`degraded`, `pending`,
+/// `failed`) counts as non-ready — the UI surfaces it amber and defers the
+/// reason to the pod's own health view or logs. A subsystem with no checks
+/// contributes its own name when its aggregate state isn't ready.
+fn non_ready_checks(health_body: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(subsystems) = health_body.get("subsystems").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (sub_name, sub) in subsystems {
+        let mut had_check = false;
+        if let Some(checks) = sub.get("checks").and_then(|v| v.as_object()) {
+            for (check_name, check) in checks {
+                had_check = true;
+                if check.get("state").and_then(serde_json::Value::as_str) != Some("ready") {
+                    out.push(format!("{sub_name}/{check_name}"));
+                }
+            }
+        }
+        let agg_ready = sub
+            .get("state")
+            .and_then(|s| s.get("state"))
+            .and_then(serde_json::Value::as_str)
+            == Some("ready");
+        if !had_check && !agg_ready {
+            out.push(sub_name.clone());
+        }
+    }
+    out
 }
 
 // ── /api/v1/proxies ───────────────────────────────────────────────────────────
@@ -137,25 +204,28 @@ impl OperatorAggregator {
             .chain(&snapshot.dedicated_proxies)
             .cloned()
             .collect();
-        let http = &self.http;
         let probes: Vec<_> = entries
             .iter()
-            .map(|e| {
+            .map(|e| async move {
+                // The liveness probe already returns the pod's full health body;
+                // parse it (rather than discard it) so the entry carries a health
+                // rollup without a second per-pod round-trip.
                 let url = format!("{}/api/v1/health", pod_base_url(e));
-                async move {
-                    match http
-                        .get(&url)
-                        .send()
-                        .await
-                        .ok()
-                        .filter(|r| r.status().is_success())
-                    {
-                        Some(_) => {
-                            let mut v = Self::entry_json(e);
-                            v["reachable"] = serde_json::Value::Bool(true);
-                            v
-                        }
-                        None => serde_json::json!({ "pod_name": e.pod_name, "reachable": false }),
+                match self.fetch_json(&url).await {
+                    Some(body) => {
+                        let mut v = Self::entry_json(e);
+                        v["reachable"] = serde_json::Value::Bool(true);
+                        attach_health_rollup(&mut v, &body);
+                        v
+                    }
+                    // Carry the full entry (component, namespace, …) even when
+                    // unreachable so the UI can still bucket the pod by component
+                    // and label it; "unreachable" is a probe outcome, not a loss
+                    // of fleet-snapshot identity.
+                    None => {
+                        let mut v = Self::entry_json(e);
+                        v["reachable"] = serde_json::Value::Bool(false);
+                        v
                     }
                 }
             })
@@ -230,29 +300,41 @@ impl OperatorAggregator {
 // ── /api/v1/controllers ───────────────────────────────────────────────────────
 
 impl OperatorAggregator {
-    /// `GET /api/v1/controllers` — all controller pods with liveness probe.
+    /// `GET /api/v1/controllers` — all controller pods with liveness + leadership.
+    ///
+    /// Probes each controller's `/api/v1/cluster` rather than `/api/v1/health`:
+    /// it doubles as a liveness check (200 ⇒ reachable) and carries that pod's
+    /// live `controller.leader` flag, so the response can report `is_leader` per
+    /// pod. Without it the UI cannot tell who holds the lease and wrongly reads
+    /// a healthy single-leader cluster as having no elected leader.
     pub(crate) async fn list_controllers(&self) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
         let entries: Vec<FleetEntry> = snapshot.controllers.to_vec();
-        let http = &self.http;
         let probes: Vec<_> = entries
             .iter()
-            .map(|e| {
-                let url = format!("{}/api/v1/health", pod_base_url(e));
-                async move {
-                    match http
-                        .get(&url)
-                        .send()
-                        .await
-                        .ok()
-                        .filter(|r| r.status().is_success())
-                    {
-                        Some(_) => {
-                            let mut v = Self::entry_json(e);
-                            v["reachable"] = serde_json::Value::Bool(true);
-                            v
+            .map(|e| async move {
+                let cluster_url = format!("{}/api/v1/cluster", pod_base_url(e));
+                match self.fetch_json(&cluster_url).await {
+                    Some(cluster) => {
+                        let is_leader = cluster["controller"]["leader"].as_bool().unwrap_or(false);
+                        let mut v = Self::entry_json(e);
+                        v["reachable"] = serde_json::Value::Bool(true);
+                        v["is_leader"] = serde_json::Value::Bool(is_leader);
+                        // Second hop for subsystem health: the cluster summary
+                        // carries leadership but not subsystem state. Controllers
+                        // are few, so the extra fetch is cheap.
+                        let health_url = format!("{}/api/v1/health", pod_base_url(e));
+                        if let Some(body) = self.fetch_json(&health_url).await {
+                            attach_health_rollup(&mut v, &body);
                         }
-                        None => serde_json::json!({ "pod_name": e.pod_name, "reachable": false }),
+                        v
+                    }
+                    // Keep the full entry (namespace, …) on the unreachable
+                    // path too, so the card still renders its identity.
+                    None => {
+                        let mut v = Self::entry_json(e);
+                        v["reachable"] = serde_json::Value::Bool(false);
+                        v
                     }
                 }
             })
@@ -262,16 +344,23 @@ impl OperatorAggregator {
     }
 
     /// `GET /api/v1/controllers/{pod-name}` — single controller pod info.
+    ///
+    /// Probes `/api/v1/cluster` (not `/health`): it doubles as a liveness check
+    /// and carries this pod's live `controller.leader` flag, so the controller
+    /// detail page can show leader/standby without a second call — mirroring
+    /// [`Self::list_controllers`].
     pub(crate) async fn get_controller(&self, pod_name: &str) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
         let Some(entry) = snapshot.controllers.iter().find(|e| e.pod_name == pod_name) else {
             return not_found();
         };
-        let url = format!("{}/api/v1/health", pod_base_url(entry));
+        let url = format!("{}/api/v1/cluster", pod_base_url(entry));
         match self.fetch_json(&url).await {
-            Some(_) => {
+            Some(cluster) => {
+                let is_leader = cluster["controller"]["leader"].as_bool().unwrap_or(false);
                 let mut v = Self::entry_json(entry);
                 v["reachable"] = serde_json::Value::Bool(true);
+                v["is_leader"] = serde_json::Value::Bool(is_leader);
                 json_response(v.to_string())
             }
             None => json_response(
@@ -345,28 +434,134 @@ impl OperatorAggregator {
         };
 
         let api: Api<gw_types::v::gateways::Gateway> = Api::namespaced(kube.clone(), namespace);
-        let conditions = match api.get(name).await {
-            Ok(gw) => gw
-                .status
-                .as_ref()
-                .and_then(|s| s.conditions.as_deref())
-                .unwrap_or_default()
-                .iter()
-                .map(GatewayCondition::from_kube)
-                .collect::<Vec<_>>(),
+        // Fetch the live Gateway object once; use it for both conditions and
+        // listener detail so we only make one K8s call.
+        let (conditions, listeners) = match api.get(name).await {
+            Ok(gw) => {
+                let conds = gw
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.conditions.as_deref())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(GatewayCondition::from_kube)
+                    .collect::<Vec<_>>();
+
+                // Join spec listeners with per-listener status (attached-route
+                // count).  Status may be absent before the first reconcile.
+                let status_attached: std::collections::HashMap<&str, i32> = gw
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.listeners.as_deref())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|l| (l.name.as_str(), l.attached_routes))
+                    .collect();
+
+                let lsnrs: Vec<serde_json::Value> = gw
+                    .spec
+                    .listeners
+                    .iter()
+                    .map(|l| {
+                        let attached = status_attached.get(l.name.as_str()).copied().unwrap_or(0);
+                        serde_json::json!({
+                            "name": l.name,
+                            "port": l.port,
+                            "protocol": l.protocol,
+                            "tls_enabled": l.tls.is_some(),
+                            "attached_routes": attached,
+                        })
+                    })
+                    .collect();
+
+                (conds, lsnrs)
+            }
             Err(kube::Error::Api(e)) if e.code == 404 => {
                 // Deleted since the last cluster-summary rebuild.
                 return not_found();
             }
             Err(e) => {
                 tracing::warn!(error = %e, namespace, name, "K8s GET Gateway failed; using summary conditions");
-                summary.conditions.clone()
+                (summary.conditions.clone(), Vec::new())
             }
         };
 
+        let attached_routes_list = self.list_attached_httproutes(kube, namespace, name).await;
+
         let mut v = gateway_summary_json(summary, &snapshot);
         v["conditions"] = serde_json::to_value(&conditions).unwrap_or(serde_json::Value::Null);
+        v["listeners"] = serde_json::Value::Array(listeners);
+        v["attached_routes_list"] = serde_json::Value::Array(attached_routes_list);
         json_response(v.to_string())
+    }
+
+    /// List all HTTPRoutes cluster-wide and return those whose `parentRefs`
+    /// reference the given Gateway (`gw_namespace/gw_name`).
+    ///
+    /// A `parentRef` is considered to target the Gateway when its `name`
+    /// matches `gw_name` and its effective namespace (the `namespace` field
+    /// if present, otherwise the route's own namespace) matches `gw_namespace`.
+    /// An absent `kind` or `group` is treated as `Gateway` /
+    /// `gateway.networking.k8s.io` per the Gateway API spec.
+    ///
+    /// On any Kubernetes error the list degrades gracefully to an empty slice.
+    async fn list_attached_httproutes(
+        &self,
+        kube: &Client,
+        gw_namespace: &str,
+        gw_name: &str,
+    ) -> Vec<serde_json::Value> {
+        let api: Api<gw_types::HttpRoute> = Api::all(kube.clone());
+        let routes = match api.list(&kube::api::ListParams::default()).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    gw_namespace,
+                    gw_name,
+                    "K8s list HTTPRoutes failed; attached_routes_list will be empty"
+                );
+                return Vec::new();
+            }
+        };
+
+        // De-dup: a route can have multiple parentRefs targeting the same
+        // Gateway (different sections); count the route once, not once per ref.
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+
+        for route in &routes {
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or_default();
+            let route_name = match route.metadata.name.as_deref() {
+                Some(n) => n,
+                None => continue,
+            };
+
+            // Skip if we've already recorded this route (multiple matching parentRefs).
+            if !seen.insert((route_ns, route_name)) {
+                continue;
+            }
+
+            let refs = route.spec.parent_refs.as_deref().unwrap_or_default();
+
+            let attaches = refs.iter().any(|p| {
+                // Absent `kind` defaults to "Gateway"; absent `group` defaults to
+                // "gateway.networking.k8s.io" — both are implicitly our target.
+                let kind_ok = p.kind.as_deref().is_none_or(|k| k == "Gateway");
+                let effective_ns = p.namespace.as_deref().unwrap_or(route_ns);
+                kind_ok && p.name == gw_name && effective_ns == gw_namespace
+            });
+
+            if attaches {
+                result.push(serde_json::json!({
+                    "kind": "HTTPRoute",
+                    "namespace": route_ns,
+                    "name": route_name,
+                }));
+            }
+        }
+
+        result
     }
 }
 
@@ -601,7 +796,293 @@ impl OperatorAggregator {
     }
 }
 
+// ── /api/v1/manifests ────────────────────────────────────────────────────────
+
+impl OperatorAggregator {
+    /// `GET /api/v1/manifests/{kind}/{namespace}/{name}` — raw Kubernetes
+    /// manifest for the named resource, returned as JSON.
+    ///
+    /// `kind` ∈ `httproute` | `ingress` | `gateway` | `pod`.
+    ///
+    /// The response is the verbatim object returned by the Kubernetes API
+    /// server, including `managedFields` and `status`. The operator UI
+    /// converts it to YAML client-side for display in the manifest popup.
+    ///
+    /// # Errors
+    ///
+    /// Returns 400 for an unrecognised kind, 404 when the resource does not
+    /// exist, 503 when the Kubernetes client cannot be initialised, and 500
+    /// for other Kubernetes errors.
+    pub(crate) async fn get_manifest(
+        &self,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Response<Vec<u8>> {
+        let kube = match self.kube().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "kube client unavailable for /api/v1/manifests");
+                return service_unavailable("kubernetes client not available");
+            }
+        };
+
+        match kind {
+            "httproute" => {
+                let api: Api<gw_types::HttpRoute> = Api::namespaced(kube.clone(), namespace);
+                match api.get(name).await {
+                    Ok(obj) => match serde_json::to_string(&obj) {
+                        Ok(body) => json_response(body),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to serialise HTTPRoute manifest");
+                            internal_error()
+                        }
+                    },
+                    Err(kube::Error::Api(e)) if e.code == 404 => not_found(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, namespace, name, "K8s GET HTTPRoute manifest failed");
+                        internal_error()
+                    }
+                }
+            }
+            "gateway" => {
+                let api: Api<gw_types::v::gateways::Gateway> =
+                    Api::namespaced(kube.clone(), namespace);
+                match api.get(name).await {
+                    Ok(obj) => match serde_json::to_string(&obj) {
+                        Ok(body) => json_response(body),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to serialise Gateway manifest");
+                            internal_error()
+                        }
+                    },
+                    Err(kube::Error::Api(e)) if e.code == 404 => not_found(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, namespace, name, "K8s GET Gateway manifest failed");
+                        internal_error()
+                    }
+                }
+            }
+            "ingress" => {
+                let api: Api<Ingress> = Api::namespaced(kube.clone(), namespace);
+                match api.get(name).await {
+                    Ok(obj) => match serde_json::to_string(&obj) {
+                        Ok(body) => json_response(body),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to serialise Ingress manifest");
+                            internal_error()
+                        }
+                    },
+                    Err(kube::Error::Api(e)) if e.code == 404 => not_found(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, namespace, name, "K8s GET Ingress manifest failed");
+                        internal_error()
+                    }
+                }
+            }
+            "pod" => {
+                let api: Api<Pod> = Api::namespaced(kube.clone(), namespace);
+                match api.get(name).await {
+                    Ok(obj) => match serde_json::to_string(&obj) {
+                        Ok(body) => json_response(body),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to serialise Pod manifest");
+                            internal_error()
+                        }
+                    },
+                    Err(kube::Error::Api(e)) if e.code == 404 => not_found(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, namespace, name, "K8s GET Pod manifest failed");
+                        internal_error()
+                    }
+                }
+            }
+            _ => {
+                let body =
+                    serde_json::json!({ "error": format!("unknown kind: {kind}") }).to_string();
+                let mut r = Response::new(body.into_bytes());
+                *r.status_mut() = StatusCode::BAD_REQUEST;
+                r.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                r
+            }
+        }
+    }
+}
+
+// ── /api/v1/problems ──────────────────────────────────────────────────────────
+
+impl OperatorAggregator {
+    /// `GET /api/v1/problems` — cluster-wide routing problems derived from
+    /// fan-out to all proxy `/routes` endpoints.
+    ///
+    /// Returns a single snapshot:
+    /// ```json
+    /// {
+    ///   "conflicts": [{ "host", "path", "rejected_group", "kind", "pods": ["…"] }],
+    ///   "dead_routes": [{ "host", "path", "backend_group", "kind", "pods": ["…"] }]
+    /// }
+    /// ```
+    ///
+    /// Conflicts are route-table collisions where a second claim for the same
+    /// `(host, path)` was rejected. `dead_routes` are entries present in the
+    /// routing table but with zero endpoints — the route is accepted but
+    /// backends are unavailable (Service has no ready Pods). `kind`
+    /// (`"ingress"`/`"gateway"`) tags which routing surface owns the problem so
+    /// the UI can attribute it to the right resource.
+    ///
+    /// Shared proxies carry an identical table: the same conflict appears once
+    /// per proxy. Results are de-duplicated by `(host, path, rejected_group)`
+    /// and `(host, path, backend_group)` respectively, with `pods` listing
+    /// which proxies reported that problem.
+    pub(crate) async fn list_problems(&self) -> Response<Vec<u8>> {
+        let raw = self.fan_out_routes().await;
+        json_response(aggregate_problems(&raw).to_string())
+    }
+}
+
+/// De-dupe and aggregate fanned-out proxy `/routes` results into the
+/// `/api/v1/problems` payload. Split out from [`OperatorAggregator::list_problems`]
+/// so it is unit-testable without a live fan-out.
+///
+/// Shared proxies carry an identical table, so each problem is keyed by
+/// `(host, path, group, kind)` and de-duped across pods; `pods` lists which
+/// proxies reported it. Each problem also carries `route: {kind, namespace, name}`
+/// — the source Ingress/HTTPRoute identity — so the operator UI can deep-link the
+/// card to that route in the Route Inspector. (For a conflict, this is the
+/// rejected/shadowed route.)
+fn aggregate_problems(raw: &[serde_json::Value]) -> serde_json::Value {
+    // (host, path, group, kind) → (route_ns, route_name, pods). BTreeMap for
+    // stable output ordering.
+    type ProblemMap =
+        std::collections::BTreeMap<(String, String, String, String), (String, String, Vec<String>)>;
+    let mut conflicts: ProblemMap = std::collections::BTreeMap::new();
+    let mut dead_routes: ProblemMap = std::collections::BTreeMap::new();
+
+    for proxy in raw {
+        let pod_name = proxy["pod_name"].as_str().unwrap_or("").to_owned();
+        if !proxy["reachable"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let routes = &proxy["routes"];
+
+        for spec in ["ingress", "gateway"] {
+            if let Some(conflict_arr) = routes[spec]["conflicts"].as_array() {
+                for c in conflict_arr {
+                    let key = (
+                        c["host"].as_str().unwrap_or("").to_owned(),
+                        c["path"].as_str().unwrap_or("").to_owned(),
+                        c["rejected_group"].as_str().unwrap_or("").to_owned(),
+                        spec.to_owned(),
+                    );
+                    let route_ns = c["namespace"].as_str().unwrap_or("").to_owned();
+                    let route_name = c["name"].as_str().unwrap_or("").to_owned();
+                    conflicts
+                        .entry(key)
+                        .or_insert_with(|| (route_ns, route_name, Vec::new()))
+                        .2
+                        .push(pod_name.clone());
+                }
+            }
+
+            if let Some(hosts) = routes[spec]["hosts"].as_array() {
+                for host_entry in hosts {
+                    let host = host_entry["host"].as_str().unwrap_or("").to_owned();
+                    if let Some(route_arr) = host_entry["routes"].as_array() {
+                        for route in route_arr {
+                            let is_dead =
+                                route["endpoints"].as_array().is_some_and(|e| e.is_empty());
+                            if is_dead {
+                                let key = (
+                                    host.clone(),
+                                    route["path"].as_str().unwrap_or("").to_owned(),
+                                    route["backend_group"].as_str().unwrap_or("").to_owned(),
+                                    spec.to_owned(),
+                                );
+                                let route_ns = route["namespace"].as_str().unwrap_or("").to_owned();
+                                let route_name = route["name"].as_str().unwrap_or("").to_owned();
+                                dead_routes
+                                    .entry(key)
+                                    .or_insert_with(|| (route_ns, route_name, Vec::new()))
+                                    .2
+                                    .push(pod_name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Map the routing surface to the source resource kind for the deep-link.
+    let route_kind = |spec: &str| {
+        if spec == "ingress" {
+            "Ingress"
+        } else {
+            "HTTPRoute"
+        }
+    };
+
+    let conflicts_json: Vec<serde_json::Value> = conflicts
+        .into_iter()
+        .map(
+            |((host, path, rejected_group, kind), (namespace, name, pods))| {
+                serde_json::json!({
+                    "host": host,
+                    "path": path,
+                    "rejected_group": rejected_group,
+                    "kind": kind,
+                    "pods": pods,
+                    "route": { "kind": route_kind(&kind), "namespace": namespace, "name": name },
+                })
+            },
+        )
+        .collect();
+
+    let dead_json: Vec<serde_json::Value> = dead_routes
+        .into_iter()
+        .map(
+            |((host, path, backend_group, kind), (namespace, name, pods))| {
+                serde_json::json!({
+                    "host": host,
+                    "path": path,
+                    "backend_group": backend_group,
+                    "kind": kind,
+                    "pods": pods,
+                    "route": { "kind": route_kind(&kind), "namespace": namespace, "name": name },
+                })
+            },
+        )
+        .collect();
+
+    serde_json::json!({ "conflicts": conflicts_json, "dead_routes": dead_json })
+}
+
 // ── Response helpers ──────────────────────────────────────────────────────────
+
+/// Build an HTML HTTP response from a static body string.
+///
+/// Used by `AdminServer::ui_response` to serve the embedded operator UI. The UI
+/// is a single inlined document served from a stable path (`/`) but rebuilt on
+/// every deploy, so it is sent `no-store` — a cached copy would silently mask a
+/// new rollout. The bundle is tiny and same-origin, so there is no caching
+/// benefit to trade away.
+pub(crate) fn html_response(body: &'static str) -> Response<Vec<u8>> {
+    let mut r = Response::new(body.as_bytes().to_vec());
+    *r.status_mut() = StatusCode::OK;
+    let headers = r.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    r
+}
 
 /// Build a JSON HTTP response from a serialised body string.
 pub(crate) fn json_response(mut body: String) -> Response<Vec<u8>> {
@@ -840,6 +1321,113 @@ mod tests {
         assert_eq!(entry["routes"]["gateway"]["hosts"], serde_json::json!([]));
     }
 
+    // ── list_problems ─────────────────────────────────────────────────────────
+
+    /// Build a fake proxy-routes fan-out result for list_problems testing.
+    fn fake_routes_result(
+        pod_name: &str,
+        reachable: bool,
+        ingress_conflicts: Vec<serde_json::Value>,
+        ingress_hosts: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        if !reachable {
+            return serde_json::json!({ "pod_name": pod_name, "reachable": false });
+        }
+        serde_json::json!({
+            "pod_name": pod_name,
+            "reachable": true,
+            "routes": {
+                "ingress": { "hosts": ingress_hosts, "conflicts": ingress_conflicts },
+                "gateway": { "hosts": [], "conflicts": [] }
+            }
+        })
+    }
+
+    #[test]
+    fn aggregate_problems_dedupes_and_carries_route_identity() {
+        // Two pods report the same conflict + dead route (shared table). Each
+        // carries the source route's namespace/name for deep-linking.
+        let conflict = serde_json::json!({
+            "host": "api.example.com",
+            "path": "/v1",
+            "rejected_group": "default/shadowed-svc:80",
+            "namespace": "default",
+            "name": "v1-route",
+        });
+        let dead_host = serde_json::json!({
+            "port": 80,
+            "host": "api.example.com",
+            "routes": [{
+                "type": "prefix",
+                "path": "/broken",
+                "backend_group": "default/no-pods:8080",
+                "namespace": "default",
+                "name": "broken-ingress",
+                "endpoints": [],
+            }]
+        });
+        let raw = vec![
+            fake_routes_result(
+                "proxy-0",
+                true,
+                vec![conflict.clone()],
+                vec![dead_host.clone()],
+            ),
+            fake_routes_result(
+                "proxy-1",
+                true,
+                vec![conflict.clone()],
+                vec![dead_host.clone()],
+            ),
+            fake_routes_result("proxy-2", false, vec![], vec![]),
+        ];
+
+        let out = aggregate_problems(&raw);
+
+        // One unique conflict (de-duped from two pods), tagged with kind + route.
+        let conflicts = out["conflicts"].as_array().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        let c = &conflicts[0];
+        assert_eq!(c["host"], "api.example.com");
+        assert_eq!(c["path"], "/v1");
+        assert_eq!(c["rejected_group"], "default/shadowed-svc:80");
+        assert_eq!(
+            c["kind"], "ingress",
+            "fake_routes_result populates the ingress block"
+        );
+        assert_eq!(
+            c["pods"].as_array().unwrap().len(),
+            2,
+            "both reachable proxies reported it"
+        );
+        // The card deep-links to the rejected route's Route Inspector.
+        assert_eq!(c["route"]["kind"], "Ingress");
+        assert_eq!(c["route"]["namespace"], "default");
+        assert_eq!(c["route"]["name"], "v1-route");
+
+        // One unique dead route (de-duped from two pods), with route identity.
+        let dead = out["dead_routes"].as_array().unwrap();
+        assert_eq!(dead.len(), 1);
+        let d = &dead[0];
+        assert_eq!(d["host"], "api.example.com");
+        assert_eq!(d["path"], "/broken");
+        assert_eq!(d["backend_group"], "default/no-pods:8080");
+        assert_eq!(d["kind"], "ingress");
+        assert_eq!(d["pods"].as_array().unwrap().len(), 2);
+        assert_eq!(d["route"]["kind"], "Ingress");
+        assert_eq!(d["route"]["namespace"], "default");
+        assert_eq!(d["route"]["name"], "broken-ingress");
+
+        // Unreachable pod (proxy-2) contributed nothing.
+        let all_pods: Vec<&str> = conflicts
+            .iter()
+            .chain(dead.iter())
+            .flat_map(|p| p["pods"].as_array().unwrap())
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert!(!all_pods.contains(&"proxy-2"), "unreachable pod is skipped");
+    }
+
     // ── find_entry ────────────────────────────────────────────────────────────
 
     /// Find a [`FleetEntry`] by `pod_name` across all fleet buckets.
@@ -886,6 +1474,31 @@ mod tests {
         let snap = build_snapshot([&pod]);
         let e = &snap.shared_proxies[0];
         assert_eq!(pod_base_url(e), "http://10.0.0.1:8082");
+    }
+
+    // ── html_response ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn html_response_sets_content_type_and_body() {
+        let resp = html_response("<html><body>hi</body></html>");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .map(|h| h.as_bytes()),
+            Some(&b"text/html; charset=utf-8"[..])
+        );
+        // The UI is rebuilt every deploy from a stable path, so it must never be
+        // cached — a stale copy would silently mask a rollout.
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .map(|h| h.as_bytes()),
+            Some(&b"no-store, no-cache, must-revalidate"[..])
+        );
+        assert_eq!(resp.body(), b"<html><body>hi</body></html>");
+        // No trailing newline (unlike json_response).
+        assert!(!resp.body().ends_with(b"\n"));
     }
 
     // ── json_response ─────────────────────────────────────────────────────────
@@ -937,6 +1550,56 @@ mod tests {
     ///
     /// Each accepted connection is handled in its own task so concurrent
     /// fan-out probes from `list_proxies` work correctly.
+    #[test]
+    fn health_rollup_ready_when_all_checks_ready() {
+        let body = serde_json::json!({
+            "version": "0.1.0",
+            "subsystems": {
+                "controller": { "state": { "state": "ready" },
+                    "checks": { "ingress": { "state": "ready" }, "service": { "state": "ready" } } },
+                "proxy": { "state": { "state": "ready" },
+                    "checks": { "routing_table_loaded": { "state": "ready" } } }
+            }
+        });
+        assert!(non_ready_checks(&body).is_empty());
+        let mut entry = serde_json::json!({});
+        attach_health_rollup(&mut entry, &body);
+        assert_eq!(entry["health"], "ready");
+        assert_eq!(entry["degraded_checks"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn health_rollup_names_non_ready_checks_as_subsystem_slash_check() {
+        let body = serde_json::json!({
+            "subsystems": {
+                "controller": { "state": { "state": "failed" },
+                    "checks": {
+                        "ingress": { "state": "ready" },
+                        "reflector": { "state": "failed", "reason": "watch desync" }
+                    } }
+            }
+        });
+        let degraded = non_ready_checks(&body);
+        assert_eq!(degraded, vec!["controller/reflector".to_owned()]);
+        let mut entry = serde_json::json!({});
+        attach_health_rollup(&mut entry, &body);
+        assert_eq!(entry["health"], "degraded");
+        assert_eq!(
+            entry["degraded_checks"],
+            serde_json::json!(["controller/reflector"])
+        );
+    }
+
+    #[test]
+    fn health_rollup_falls_back_to_subsystem_name_when_no_checks() {
+        let body = serde_json::json!({
+            "subsystems": {
+                "proxy": { "state": { "state": "pending" }, "checks": {} }
+            }
+        });
+        assert_eq!(non_ready_checks(&body), vec!["proxy".to_owned()]);
+    }
+
     async fn start_mock_http(body: &'static str) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1288,10 +1951,35 @@ mod tests {
             .find(|c| c["pod_name"] == "ctrl-live")
             .unwrap();
         assert_eq!(live["reachable"], true);
+        // /cluster body had no controller.leader → defaults to false.
+        assert_eq!(live["is_leader"], false);
         let dead = controllers
             .iter()
             .find(|c| c["pod_name"] == "ctrl-dead")
             .unwrap();
         assert_eq!(dead["reachable"], false);
+    }
+
+    #[tokio::test]
+    async fn list_controllers_reports_is_leader_from_cluster_endpoint() {
+        // The /cluster probe carries controller.leader; the reachable entry must
+        // surface it as is_leader so the UI doesn't misread a healthy
+        // single-leader cluster as having no elected leader.
+        let port =
+            start_mock_http(r#"{"controller":{"leader":true},"gateways":[],"ingresses":[]}"#).await;
+        let pods = [make_pod(
+            "ctrl-leader",
+            "controller",
+            "127.0.0.1",
+            &port.to_string(),
+            None,
+        )];
+        let agg = make_agg(fleet_with(pods), SharedClusterSummary::default());
+
+        let resp = agg.list_controllers().await;
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        let leader = body["controllers"][0].clone();
+        assert_eq!(leader["reachable"], true);
+        assert_eq!(leader["is_leader"], true);
     }
 }

@@ -1,0 +1,52 @@
+{
+  "pod_name": "coxswain-controller-7f9c8-degrd",
+  "reachable": true,
+  "health": {
+    "version": "0.1.0",
+    "subsystems": {
+      "controller": {
+        "state": {
+          "state": "degraded"
+        },
+        "checks": {
+          "backend_tls_policy": {
+            "state": "ready"
+          },
+          "config_map": {
+            "state": "ready"
+          },
+          "endpoint_slice": {
+            "state": "ready"
+          },
+          "gateway": {
+            "state": "degraded"
+          },
+          "gateway_class": {
+            "state": "ready"
+          },
+          "httproute": {
+            "state": "ready"
+          },
+          "ingress": {
+            "state": "ready"
+          },
+          "ingress_class": {
+            "state": "ready"
+          },
+          "reference_grant": {
+            "state": "ready"
+          },
+          "routing_table_built": {
+            "state": "ready"
+          },
+          "secret": {
+            "state": "ready"
+          },
+          "service": {
+            "state": "ready"
+          }
+        }
+      }
+    }
+  }
+}

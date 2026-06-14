@@ -2,14 +2,24 @@
 
 # Multi-stage build for coxswain.
 #
-# Stage 1 (planner): generate a cargo-chef recipe describing the dependency tree.
-# Stage 2 (builder): cook dependencies into a cached layer (BoringSSL builds here,
-#                    ~5-10 min on amd64) then compile the coxswain binary.
-# Stage 3 (runtime): copy the binary onto distroless/cc-debian13:nonroot.
+# Stage 0 (ui-builder): compile the Vite + Preact operator UI into a single
+#                       self-contained dist/index.html that the Rust build
+#                       embeds at compile time via include_str!.
+# Stage 1 (planner):   generate a cargo-chef recipe for the dependency tree.
+# Stage 2 (builder):   cook deps into a cached layer (BoringSSL builds here,
+#                      ~5-10 min on amd64) then compile the coxswain binary.
+# Stage 3 (runtime):   copy the binary onto distroless/cc-debian13:nonroot.
 #
 # BoringSSL (vendored by pingora's boring-sys) is the dominant build cost.
 # cargo-chef caches it in the deps layer so PR rebuilds that don't touch
 # Cargo.lock skip recompiling it entirely.
+
+FROM node:22-alpine AS ui-builder
+WORKDIR /app
+COPY ui/package.json ui/package-lock.json ./ui/
+RUN cd ui && npm ci
+COPY ui/ ./ui/
+RUN cd ui && npm run build
 
 FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-bookworm AS chef
 WORKDIR /app
@@ -35,9 +45,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=planner /app/recipe.json recipe.json
 # Cook only the deps reachable from the coxswain bin — skips the coxswain-e2e
 # dependency tree. Heaviest cached layer; invalidates on Cargo.lock changes only.
-RUN cargo chef cook --release --recipe-path recipe.json --bin coxswain
+ARG CARGO_BUILD_JOBS
+RUN cargo chef cook --release --recipe-path recipe.json --bin coxswain \
+    $([ -n "$CARGO_BUILD_JOBS" ] && echo "--jobs $CARGO_BUILD_JOBS")
 COPY . .
-RUN cargo build --release --bin coxswain
+# Inject the pre-built UI so the include_str! in coxswain-admin resolves.
+COPY --from=ui-builder /app/ui/dist ./ui/dist
+RUN cargo build --release --bin coxswain \
+    $([ -n "$CARGO_BUILD_JOBS" ] && echo "--jobs $CARGO_BUILD_JOBS")
 
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 COPY --from=builder /app/target/release/coxswain /usr/local/bin/coxswain

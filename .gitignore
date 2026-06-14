@@ -1,3 +1,5 @@
+ui/node_modules/
+ui/dist/
 .architecture-plan.md
 .cargo/config.toml
 .claude/settings.local.json

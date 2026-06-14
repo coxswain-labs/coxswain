@@ -1,0 +1,32 @@
+{
+  "pod_name": "tenant-a-gw-coxswain-7db74-j8cjt",
+  "reachable": true,
+  "routes": {
+    "gateway": {
+      "conflicts": [],
+      "hosts": [
+        {
+          "host": "app.tenant-a.local",
+          "port": 8100,
+          "routes": [
+            {
+              "backend_group": "tenant-a/web",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "a-web",
+              "namespace": "tenant-a",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        }
+      ]
+    },
+    "ingress": {
+      "conflicts": [],
+      "hosts": []
+    }
+  }
+}

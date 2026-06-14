@@ -1,0 +1,34 @@
+# Dead-backend fixture for the /api/v1/problems route-identity test.
+# A Service whose selector matches no pods has zero ready endpoints, so the
+# reflector installs the route as a 503 dead route. TESTNS is substituted with
+# the test namespace at runtime.
+#
+# Route: dead.TESTNS.local / → no-pods (0 endpoints → 503 dead route)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: no-pods
+spec:
+  selector:
+    app: no-such-app
+  ports:
+    - port: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dead-ingress
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: dead.TESTNS.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: no-pods
+                port:
+                  number: 3000

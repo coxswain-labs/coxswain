@@ -1,0 +1,32 @@
+{
+  "name": "payments-route",
+  "namespace": "demo",
+  "parent_statuses": [
+    {
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "False",
+          "reason": "Invalid",
+          "message": "Route has an unresolved backendRef"
+        },
+        {
+          "type": "ResolvedRefs",
+          "status": "False",
+          "reason": "BackendNotFound",
+          "message": "Service \"payments\" not found"
+        }
+      ],
+      "parent_ref": {
+        "name": "demo-gw",
+        "namespace": null
+      }
+    }
+  ],
+  "proxies": []
+}

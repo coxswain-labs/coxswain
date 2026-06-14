@@ -1,0 +1,94 @@
+{
+  "proxies": [
+    {
+      "admin_port": 8082,
+      "component": "shared-proxy",
+      "degraded_checks": [],
+      "health": "ready",
+      "pod_ip": "10.42.0.100",
+      "pod_name": "coxswain-shared-proxy-66d-ah7x2",
+      "pod_namespace": "coxswain-system",
+      "reachable": true,
+      "node": "node-cp-1",
+      "restarts": 0,
+      "phase": "Running",
+      "created_at": "2026-06-08T00:30:00Z"
+    },
+    {
+      "admin_port": 8082,
+      "component": "shared-proxy",
+      "degraded_checks": [
+        "routing_table_loaded"
+      ],
+      "health": "degraded",
+      "pod_ip": "10.42.0.101",
+      "pod_name": "coxswain-shared-proxy-66d-bk9p4",
+      "pod_namespace": "coxswain-system",
+      "reachable": true,
+      "node": "node-w-1",
+      "restarts": 0,
+      "phase": "Running",
+      "created_at": "2026-06-09T01:30:00Z"
+    },
+    {
+      "admin_port": 8082,
+      "component": "dedicated-proxy",
+      "degraded_checks": [],
+      "health": "ready",
+      "pod_ip": "10.42.0.102",
+      "pod_name": "tenant-a-gw-coxswain-7db74-j8cjt",
+      "pod_namespace": "tenant-a",
+      "reachable": true,
+      "node": "node-w-2",
+      "restarts": 0,
+      "phase": "Running",
+      "created_at": "2026-06-10T02:30:00Z",
+      "gateway_ref": "tenant-a-gw"
+    },
+    {
+      "admin_port": 8082,
+      "component": "dedicated-proxy",
+      "degraded_checks": [
+        "routing_table_loaded"
+      ],
+      "health": "degraded",
+      "pod_ip": "10.42.0.103",
+      "pod_name": "tenant-a-gw-coxswain-7db74-r5tfb",
+      "pod_namespace": "tenant-a",
+      "reachable": true,
+      "node": "node-cp-1",
+      "restarts": 1,
+      "phase": "Running",
+      "created_at": "2026-06-11T03:30:00Z",
+      "gateway_ref": "tenant-a-gw"
+    },
+    {
+      "admin_port": 8082,
+      "component": "dedicated-proxy",
+      "degraded_checks": [],
+      "health": "ready",
+      "pod_ip": "10.42.0.104",
+      "pod_name": "tenant-b-gw-coxswain-5cc91-m2qd8",
+      "pod_namespace": "tenant-b",
+      "reachable": true,
+      "node": "node-w-1",
+      "restarts": 0,
+      "phase": "Running",
+      "created_at": "2026-06-12T04:30:00Z",
+      "gateway_ref": "tenant-b-gw"
+    },
+    {
+      "component": "dedicated-proxy",
+      "gateway_ref": "tenant-b-gw",
+      "pod_name": "tenant-b-gw-coxswain-5cc91-zzz00",
+      "pod_namespace": "tenant-b",
+      "pod_ip": "10.42.0.105",
+      "admin_port": 8082,
+      "reachable": false,
+      "node": "node-w-2",
+      "restarts": 4,
+      "phase": "Running",
+      "created_at": "2026-06-08T05:30:00Z"
+    }
+  ]
+}

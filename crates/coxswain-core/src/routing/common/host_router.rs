@@ -3,7 +3,7 @@
 use super::entry::{
     BackendGroup, FilterAction, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts,
 };
-use super::predicate::RequestContext;
+use super::predicate::{MatchPredicates, RequestContext, ValueMatch};
 use matchit::Router;
 use regex::RegexSet;
 use std::cmp::Reverse;
@@ -133,6 +133,82 @@ fn group_by_path(routes: Vec<(String, Arc<RouteEntry>)>) -> PathGroups {
     groups
 }
 
+/// Normalize a PathPrefix value by stripping a trailing slash (the root "/" is
+/// preserved). Both Ingress and Gateway API define PathPrefix matching with a
+/// trailing "/" ignored — "/foo" and "/foo/" are the same prefix — so the table
+/// keys prefix groups on the normalized form.
+fn normalize_prefix(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Canonical signature of a predicate set. Two routes on the same (host, path)
+/// with equal signatures are not differentiated by predicates and therefore
+/// shadow each other — only the highest-precedence one ever fires.
+fn predicate_signature(p: &MatchPredicates) -> String {
+    let value_sig = |v: &ValueMatch| match v {
+        ValueMatch::Exact(s) => format!("e:{s}"),
+        ValueMatch::Regex(r) => format!("r:{}", r.as_str()),
+    };
+    let mut headers: Vec<String> = p
+        .headers
+        .iter()
+        .map(|h| format!("{}={}", h.name.as_str(), value_sig(&h.matcher)))
+        .collect();
+    headers.sort();
+    let mut query: Vec<String> = p
+        .query
+        .iter()
+        .map(|q| format!("{}={}", q.name, value_sig(&q.matcher)))
+        .collect();
+    query.sort();
+    format!(
+        "m={}|h={}|q={}",
+        p.method.as_ref().map_or("", |m| m.as_str()),
+        headers.join(","),
+        query.join(",")
+    )
+}
+
+/// Conflicts for routes in a single path group that are shadowed by an earlier
+/// route with the same predicate signature — i.e. distinct routes claiming the
+/// same (host, path) without anything to tell them apart (e.g. two Ingresses on
+/// `demo.local/`). The group is specificity-sorted, so the first entry per
+/// signature wins and later distinct routes are shadowed. One conflict per
+/// distinct shadowed route; `host`/`port` are stamped by the caller. Routes that
+/// differ by method/header/query get distinct signatures and legitimately
+/// coexist (no conflict).
+fn dup_conflicts(path: &str, kind: RouteKind, frozen: &[Arc<RouteEntry>]) -> Vec<RouteConflict> {
+    use std::collections::{HashMap, HashSet};
+    let mut winner: HashMap<String, &str> = HashMap::new();
+    let mut emitted: HashSet<&str> = HashSet::new();
+    let mut conflicts = Vec::new();
+    for e in frozen {
+        let sig = predicate_signature(&e.predicates);
+        match winner.get(&sig) {
+            None => {
+                winner.insert(sig, e.route_id.as_str());
+            }
+            Some(&win) if win != e.route_id.as_str() && emitted.insert(e.route_id.as_str()) => {
+                conflicts.push(RouteConflict {
+                    port: 0,
+                    host: String::new(),
+                    path: path.to_string(),
+                    kind,
+                    rejected_group: e.backend_group.name().to_string(),
+                    rejected_route_id: e.route_id.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    conflicts
+}
+
 /// Sorts a group's entries by specificity and freezes them into a boxed slice.
 fn sort_and_freeze(entries: Vec<(usize, Arc<RouteEntry>)>) -> Box<[Arc<RouteEntry>]> {
     let mut entries = entries;
@@ -172,17 +248,21 @@ impl HostRouterBuilder {
         self
     }
 
-    /// Compiles accumulated routes into an immutable [`HostRouter`].
+    /// Compiles accumulated routes into an immutable [`HostRouter`], returning any
+    /// [`RouteConflict`]s for prefix path groups that were shadowed by an
+    /// earlier-inserted pattern (one per shadowed group, with `host`/`port` left
+    /// for the caller to stamp).
     ///
     /// # Errors
     /// Returns [`RouterError::MatchitInsert`] if an exact-path pattern is rejected
-    /// by the `matchit` router (prefix-path conflicts are logged and silently
-    /// dropped). Returns [`RouterError::Regex`] if a regex pattern fails to compile.
+    /// by the `matchit` router. Returns [`RouterError::Regex`] if a regex pattern
+    /// fails to compile.
     pub(crate) fn build(
         self,
     ) -> Result<(HostRouter, Vec<RouteConflict>), super::table::RouterError> {
         let mut router: Router<Box<[Arc<RouteEntry>]>> = Router::new();
         let mut route_info: Vec<RouteInfo> = Vec::new();
+        let mut conflicts: Vec<RouteConflict> = Vec::new();
         let mut has_query_predicates = false;
 
         // Track whether any entry uses query predicates.
@@ -201,9 +281,11 @@ impl HostRouterBuilder {
                     path: path.clone(),
                     kind: RouteKind::Exact,
                     backend_group: Arc::clone(&e.backend_group),
+                    route_id: e.route_id.clone(),
                 });
             }
             let frozen = sort_and_freeze(entries);
+            conflicts.extend(dup_conflicts(&path, RouteKind::Exact, &frozen));
             // Inserting into a fresh router; unique patterns won't conflict.
             router.insert(path, frozen)?;
         }
@@ -222,7 +304,18 @@ impl HostRouterBuilder {
                 );
             };
 
-        let prefix_groups = group_by_path(self.prefix_routes);
+        // Prefix paths are normalized by stripping the trailing slash (the root
+        // "/" is preserved): both Ingress and Gateway API define PathPrefix
+        // matching with a trailing "/" ignored, so "/foo" and "/foo/" are the same
+        // prefix. Grouping by the normalized path merges them; genuine duplicates
+        // (distinct routes on the same prefix) are surfaced by `dup_conflicts`.
+        // Normalization is build-time only — request matching is unchanged.
+        let prefix_routes: Vec<(String, Arc<RouteEntry>)> = self
+            .prefix_routes
+            .into_iter()
+            .map(|(p, e)| (normalize_prefix(&p), e))
+            .collect();
+        let prefix_groups = group_by_path(prefix_routes);
         for (path, entries) in prefix_groups {
             if check_query(&entries) {
                 has_query_predicates = true;
@@ -232,19 +325,20 @@ impl HostRouterBuilder {
                     path: path.clone(),
                     kind: RouteKind::Prefix,
                     backend_group: Arc::clone(&e.backend_group),
+                    route_id: e.route_id.clone(),
                 });
             }
             let frozen = sort_and_freeze(entries);
+            conflicts.extend(dup_conflicts(&path, RouteKind::Prefix, &frozen));
 
-            // Gateway API prefix semantics:
-            //   "/foo"  matches /foo, /foo/, /foo/anything
-            //   "/foo/" matches /foo/, /foo/anything (NOT /foo)
-            //   "/"     matches everything
-            // matchit 0.9.2 does not route "/v2/" to "/v2/{*rest}" — we must
-            // insert "/v2/" explicitly to bridge the gap.
-            let had_trailing_slash = path.ends_with('/');
-            let base = path.trim_end_matches('/');
-            if base.is_empty() {
+            // Prefix semantics (path already normalized — no trailing slash except
+            // the root):
+            //   "/foo" matches /foo, /foo/, /foo/anything
+            //   "/"    matches everything
+            // matchit 0.9.2 does not route "/foo/" to "/foo/{*rest}", so insert
+            // "/foo/" explicitly to bridge the gap. A genuine insert failure here
+            // is unexpected (groups are keyed by normalized path) — log it.
+            if path == "/" {
                 if let Err(e) = router.insert("/", frozen.clone()) {
                     log_conflict(&frozen, "/", &e);
                 }
@@ -252,16 +346,14 @@ impl HostRouterBuilder {
                     log_conflict(&frozen, "/{*rest}", &e);
                 }
             } else {
-                if !had_trailing_slash
-                    && let Err(e) = router.insert(base.to_string(), frozen.clone())
-                {
-                    log_conflict(&frozen, base, &e);
+                if let Err(e) = router.insert(path.clone(), frozen.clone()) {
+                    log_conflict(&frozen, &path, &e);
                 }
-                let with_slash = format!("{base}/");
+                let with_slash = format!("{path}/");
                 if let Err(e) = router.insert(with_slash.clone(), frozen.clone()) {
                     log_conflict(&frozen, &with_slash, &e);
                 }
-                let wildcard = format!("{base}/{{*rest}}");
+                let wildcard = format!("{path}/{{*rest}}");
                 if let Err(e) = router.insert(wildcard.clone(), frozen.clone()) {
                     log_conflict(&frozen, &wildcard, &e);
                 }
@@ -281,6 +373,7 @@ impl HostRouterBuilder {
                     path: pattern.clone(),
                     kind: RouteKind::Regex,
                     backend_group: Arc::clone(&e.backend_group),
+                    route_id: e.route_id.clone(),
                 });
             }
             // RegexSet::new already validates the pattern; the second compile is redundant.
@@ -296,7 +389,7 @@ impl HostRouterBuilder {
                 has_query_predicates,
                 route_info,
             },
-            vec![], // no path-level conflicts in the predicate model
+            conflicts,
         ))
     }
 }
@@ -394,25 +487,107 @@ mod tests {
     }
 
     #[test]
-    #[tracing_test::traced_test]
-    fn prefix_insert_collision_emits_debug_log() {
+    fn trailing_slash_prefix_matches_bare_path() {
+        // Both specs ignore a trailing slash in a PathPrefix value: "/foo/" must
+        // match a bare "/foo" request (as well as "/foo/" and "/foo/bar").
+        let up = make_group("svc", "10.0.0.1:80");
+        let mut b = RoutingTableBuilder::new();
+        b.for_port(PORT)
+            .exact_host("example.com")
+            .add_prefix_route("/foo/", entry(up));
+
+        let table = b.build().unwrap();
+        assert!(
+            table
+                .route(PORT, "example.com", "/foo", &ctx_get())
+                .is_some()
+        );
+        assert!(
+            table
+                .route(PORT, "example.com", "/foo/", &ctx_get())
+                .is_some()
+        );
+        assert!(
+            table
+                .route(PORT, "example.com", "/foo/bar", &ctx_get())
+                .is_some()
+        );
+        // A sibling that merely shares a prefix string must NOT match.
+        assert!(
+            table
+                .route(PORT, "example.com", "/foobar", &ctx_get())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn normalized_prefix_distinct_routes_conflict() {
+        // "/foo" and "/foo/" normalize to the same prefix, so two distinct routes
+        // claiming them collide — one is shadowed and recorded as a conflict at the
+        // normalized path.
         let first = make_group("first", "10.0.0.1:80");
         let second = make_group("second", "10.0.0.2:80");
 
         let mut b = RoutingTableBuilder::new();
         let host = b.for_port(PORT).exact_host("example.com");
-        // /foo expands to: /foo, /foo/, /foo/{*rest}
-        // /foo/ expands to: /foo/, /foo/{*rest}
-        // The second group's inserts collide with the first.
-        host.add_prefix_route("/foo", entry(first));
-        host.add_prefix_route("/foo/", entry(second));
+        host.add_prefix_route(
+            "/foo",
+            Arc::new(RouteEntry::path_only(
+                first,
+                "default/first-route".to_string(),
+                None,
+            )),
+        );
+        host.add_prefix_route(
+            "/foo/",
+            Arc::new(RouteEntry::path_only(
+                second,
+                "default/second-route".to_string(),
+                None,
+            )),
+        );
 
-        let _table = b.build().unwrap();
+        let table = b.build().unwrap();
+        let conflicts = table.conflicts();
+        assert_eq!(conflicts.len(), 1, "one conflict for the shadowed route");
+        let c = &conflicts[0];
+        assert_eq!(c.host, "example.com");
+        assert_eq!(c.port, PORT);
+        assert_eq!(c.path, "/foo", "conflict reported at the normalized prefix");
+        assert!(matches!(c.kind, RouteKind::Prefix));
+        // first-route wins the tie (route_id order); second-route is shadowed.
+        assert_eq!(c.rejected_route_id, "default/second-route");
+        assert_eq!(c.rejected_group, "second");
+    }
 
-        assert!(logs_contain(
-            "host router prefix insert shadowed by earlier rule"
+    #[test]
+    fn same_path_different_predicates_is_not_a_conflict() {
+        // Two routes on the SAME path differentiated by predicates are merged into
+        // one group and coexist — legitimate, not a shadow conflict.
+        let specific = make_group("specific", "10.0.0.1:80");
+        let generic = make_group("generic", "10.0.0.2:80");
+        let with_header = Arc::new(RouteEntry::new(
+            specific,
+            make_predicates(None, &[("x-tenant", "acme")], &[]),
+            "default/specific".to_string(),
+            None,
         ));
-        assert!(logs_contain("default/svc"));
+        let plain = Arc::new(RouteEntry::path_only(
+            generic,
+            "default/generic".to_string(),
+            None,
+        ));
+
+        let mut b = RoutingTableBuilder::new();
+        let host = b.for_port(PORT).exact_host("example.com");
+        host.add_prefix_route("/api", with_header);
+        host.add_prefix_route("/api", plain);
+
+        let table = b.build().unwrap();
+        assert!(
+            table.conflicts().is_empty(),
+            "same-path predicate coexistence must not be reported as a conflict"
+        );
     }
 
     #[test]

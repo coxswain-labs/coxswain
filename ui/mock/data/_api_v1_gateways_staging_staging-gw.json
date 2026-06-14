@@ -1,0 +1,27 @@
+{
+  "addresses": [],
+  "attached_routes_list": [],
+  "conditions": [
+    {
+      "type": "Accepted",
+      "status": "False",
+      "reason": "NoMatchingListener",
+      "message": "No listener matches this parent ref"
+    }
+  ],
+  "listeners": [
+    {
+      "name": "http",
+      "port": 80,
+      "protocol": "HTTP",
+      "tls_enabled": false,
+      "attached_routes": 0
+    }
+  ],
+  "name": "staging-gw",
+  "namespace": "staging",
+  "proxy": {
+    "pool": "shared"
+  },
+  "route_count": 0
+}

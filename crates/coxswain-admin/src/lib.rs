@@ -1,7 +1,7 @@
 //! Admin HTTP endpoints for Coxswain: `/metrics`, `/routes`,
 //! `/api/v1/health`, `/api/v1/cluster`, and (controller-only)
-//! the `/api/v1/{proxies,controllers,gateways,ingresses,routes/*}` aggregator
-//! surface.
+//! the `/api/v1/{proxies,controllers,gateways,ingresses,routes/*,manifests/*,problems}`
+//! aggregator surface, plus the embedded operator UI served at `GET /`.
 
 mod aggregator;
 mod events;
@@ -32,21 +32,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── AdminServer ───────────────────────────────────────────────────────────────
 
+/// Embedded operator UI HTML, built from `ui/` by `npm run build`.
+///
+/// The build step must run before `cargo build`; CI and `Dockerfile` ensure
+/// this ordering. `include_str!` resolves at compile time relative to this
+/// source file — the path escapes to the workspace root via `../../`.
+const UI_HTML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../ui/dist/index.html"
+));
+
 /// Pingora HTTP app serving the Coxswain admin surface.
 ///
 /// The available endpoints vary by pod role:
 ///
 /// | Endpoint | All roles | Controller/dev only |
 /// |---|---|---|
+/// | `GET /` (operator UI) | | ✓ |
 /// | `/metrics` | ✓ | |
 /// | `/api/v1/health` | ✓ | |
 /// | `/routes` | proxy + dev only | |
 /// | `/api/v1/cluster` | | ✓ |
 /// | `/api/v1/{proxies,controllers,gateways,ingresses,routes/*}` | | ✓ |
+/// | `/api/v1/problems` | | ✓ |
 /// | `/api/v1/events` (SSE) | | ✓ |
 ///
-/// Each capability is gated by an `Option` field; missing capabilities return
-/// 404 structurally rather than by convention.
+/// Each capability is gated by an `Option` or `bool` field; missing
+/// capabilities return 404 structurally rather than by convention.
 ///
 /// Unlike the rest of the admin surface, `/api/v1/events` is a long-lived
 /// Server-Sent Events stream, which Pingora's buffered
@@ -73,6 +85,10 @@ pub struct AdminServer {
     /// Optional live event sources for the `/api/v1/events` SSE stream. `None`
     /// on proxy roles (the endpoint returns 404 there).
     pub events: Option<EventSources>,
+    /// Whether to serve the embedded operator UI at `GET /`. Enabled only on
+    /// the controller and dev roles — proxy roles leave this `false` so `GET /`
+    /// returns 404 structurally, the same gate as the aggregator surface.
+    serve_ui: bool,
     /// HTTP module pipeline (response compression) applied to every buffered
     /// endpoint. The SSE stream deliberately bypasses it — compression buffers,
     /// which would defeat streaming.
@@ -95,6 +111,7 @@ impl AdminServer {
             cluster: None,
             aggregator: None,
             events: None,
+            serve_ui: false,
             modules,
         }
     }
@@ -144,6 +161,17 @@ impl AdminServer {
     #[must_use]
     pub fn with_events(mut self, events: EventSources) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Enable `GET /` to serve the embedded operator UI.
+    ///
+    /// Called only from the `controller` and `dev` pod roles — the same gate
+    /// as the aggregator surface. Proxy roles omit this call so `GET /`
+    /// returns 404 structurally.
+    #[must_use]
+    pub fn with_ui(mut self) -> Self {
+        self.serve_ui = true;
         self
     }
 
@@ -246,6 +274,7 @@ impl AdminServer {
 
         // Fast path: exact matches.
         match path {
+            "/" => return self.ui_response(),
             "/metrics" => return metrics_response(),
             "/routes" => return self.routes_response(),
             "/api/v1/health" => return health_response(&self.health),
@@ -289,6 +318,12 @@ impl AdminServer {
             // ── routes ───────────────────────────────────────────────────────
             ["routes", "httproute", namespace, name] => agg.get_httproute(namespace, name).await,
             ["routes", "ingress", namespace, name] => agg.get_ingress_route(namespace, name).await,
+
+            // ── manifests ────────────────────────────────────────────────────
+            ["manifests", kind, namespace, name] => agg.get_manifest(kind, namespace, name).await,
+
+            // ── problems ─────────────────────────────────────────────────────
+            ["problems"] => agg.list_problems().await,
 
             _ => aggregator::not_found(),
         }
@@ -350,10 +385,18 @@ fn routes_block<K>(table: &RoutingTable<K>) -> serde_json::Value {
                 .iter()
                 .filter(|r| !r.backend_group.name().is_empty())
                 .map(|r| {
+                    // `route_id` is `"{namespace}/{name}"`; split so the UI can
+                    // deep-link a compiled row back to its source resource.
+                    let (namespace, name) = r
+                        .route_id
+                        .split_once('/')
+                        .unwrap_or(("", r.route_id.as_str()));
                     serde_json::json!({
                         "type": r.kind.as_str(),
                         "path": r.path,
                         "backend_group": r.backend_group.name(),
+                        "namespace": namespace,
+                        "name": name,
                         "endpoints": r.backend_group.endpoints().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                     })
                 })
@@ -365,16 +408,42 @@ fn routes_block<K>(table: &RoutingTable<K>) -> serde_json::Value {
         .conflicts()
         .iter()
         .map(|c| {
+            // `rejected_route_id` is `"{namespace}/{name}"` of the shadowed route;
+            // split so the UI can deep-link a conflict to that route.
+            let (namespace, name) = c
+                .rejected_route_id
+                .split_once('/')
+                .unwrap_or(("", c.rejected_route_id.as_str()));
             serde_json::json!({
                 "port": c.port,
                 "host": c.host,
                 "type": c.kind.as_str(),
                 "path": c.path,
                 "rejected_group": c.rejected_group,
+                "namespace": namespace,
+                "name": name,
             })
         })
         .collect();
     serde_json::json!({ "hosts": hosts, "conflicts": conflicts })
+}
+
+// ── GET / (operator UI) ───────────────────────────────────────────────────────
+
+impl AdminServer {
+    /// Serve the embedded operator UI HTML, or 404 when the UI is not enabled.
+    ///
+    /// The HTML is a single self-contained file (produced by
+    /// `vite-plugin-singlefile`): all JavaScript and CSS are inlined; no
+    /// external network requests at runtime. This satisfies air-gapped
+    /// deployments reached via `kubectl port-forward`.
+    fn ui_response(&self) -> Response<Vec<u8>> {
+        if self.serve_ui {
+            aggregator::html_response(UI_HTML)
+        } else {
+            aggregator::not_found()
+        }
+    }
 }
 
 // ── /api/v1/health ────────────────────────────────────────────────────────────
@@ -575,5 +644,39 @@ mod tests {
         let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false))
             .with_cluster_summary(SharedClusterSummary::default());
         assert!(admin.cluster.is_some());
+    }
+
+    #[test]
+    fn ui_disabled_by_default() {
+        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false));
+        assert!(!admin.serve_ui);
+    }
+
+    #[test]
+    fn ui_enabled_after_with_ui() {
+        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false)).with_ui();
+        assert!(admin.serve_ui);
+    }
+
+    #[test]
+    fn ui_response_returns_404_when_serve_ui_false() {
+        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false));
+        let resp = admin.ui_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn ui_response_returns_200_html_when_serve_ui_true() {
+        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false)).with_ui();
+        let resp = admin.ui_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .map(|h| h.as_bytes()),
+            Some(&b"text/html; charset=utf-8"[..])
+        );
+        // The body should be non-empty and contain the Vite-generated HTML.
+        assert!(!resp.body().is_empty());
     }
 }

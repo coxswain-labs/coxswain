@@ -1,0 +1,338 @@
+# Operator UI demo seed — local dev only.
+#
+# Seeds a local cluster with a deliberate mix of healthy, dead, and conflicting
+# routes across two namespaces so the operator UI (Dashboard problems panel,
+# Fleet, Routing) has realistic signals to show:
+#
+#   kubectl apply -f deploy/dev/operator-ui-demo.yaml
+#
+# Produces:
+#   - demo/web   — healthy (2 replicas)
+#   - demo/api   — 0 replicas → dead-route 503 (dead-backend signal)
+#   - demo-ingress + frontend-ingress both claim demo.local/ → routing CONFLICT
+#   - demo-gw + HTTPRoutes: web-route (healthy), api-route (dead),
+#     docs-route, health-probe-route
+#   - staging/ namespace with its own app + ingress (multi-namespace fleet)
+#
+# Not a deployment manifest — see deploy/manifests/ for the real install, and
+# deploy/dev/{echo-backends,ingress,httproute,cross-namespace}.yaml for the
+# routing-correctness curl seeds.
+---
+# Demo namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+# Healthy web backend (nginx, 2 replicas)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: demo
+spec:
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 80
+---
+# Dead API backend (0 replicas — shows "Needs attention" dead-route signal)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: demo
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: demo
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 80
+---
+# Ingress — classic style, two rules
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-ingress
+  namespace: demo
+  annotations:
+    kubernetes.io/ingress.class: coxswain
+spec:
+  rules:
+    - host: demo.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+---
+# Gateway — HTTP listener on port 8080 (local dev)
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: demo-gw
+  namespace: demo
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 8080
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+# HTTPRoute — attaches to demo-gw, routes to web (healthy)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web-route
+  namespace: demo
+spec:
+  parentRefs:
+    - name: demo-gw
+  hostnames:
+    - "app.demo.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: web
+          port: 80
+---
+# HTTPRoute — attaches to demo-gw, routes to api (dead backend)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-route
+  namespace: demo
+spec:
+  parentRefs:
+    - name: demo-gw
+  hostnames:
+    - "api.demo.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: api
+          port: 80
+---
+# Extra services in demo namespace
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: demo
+spec:
+  selector:
+    app: frontend
+  ports:
+    - port: 80
+      targetPort: 80
+---
+# Second Ingress in demo namespace — conflicts with demo-ingress on /
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend-ingress
+  namespace: demo
+  annotations:
+    kubernetes.io/ingress.class: coxswain
+spec:
+  rules:
+    - host: demo.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+---
+# Third HTTPRoute — wildcard hostname, healthy backend
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: docs-route
+  namespace: demo
+spec:
+  parentRefs:
+    - name: demo-gw
+  hostnames:
+    - "docs.demo.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: web
+          port: 80
+---
+# Fourth HTTPRoute — /health prefix on the app host
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: health-probe-route
+  namespace: demo
+spec:
+  parentRefs:
+    - name: demo-gw
+  hostnames:
+    - "app.demo.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /health
+      backendRefs:
+        - name: api
+          port: 80
+---
+# A second namespace with its own Gateway (dedicated proxy territory)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: staging
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: staging-app
+  template:
+    metadata:
+      labels:
+        app: staging-app
+    spec:
+      containers:
+        - name: app
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+  namespace: staging
+spec:
+  selector:
+    app: staging-app
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: staging-ingress
+  namespace: staging
+  annotations:
+    kubernetes.io/ingress.class: coxswain
+spec:
+  rules:
+    - host: staging.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app
+                port:
+                  number: 80
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: app
+                port:
+                  number: 80

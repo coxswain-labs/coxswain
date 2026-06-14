@@ -187,7 +187,7 @@ cargo test -p coxswain-e2e --test observability     -- --test-threads=1
 
 The bootstrap fails fast with a clear message if `target/release/coxswain` is missing.
 
-> **On macOS the harness uses the production multi-stage `Dockerfile`.** macOS produces Mach-O binaries that won't run in Linux containers, so the COPY-only `Dockerfile.e2e` (the fast Linux-CI path) is bypassed. First build is ~5–10 min for BoringSSL; cached afterwards. CI Linux runners keep the fast `Dockerfile.e2e` path.
+> **On macOS the harness uses the production multi-stage `Dockerfile`.** macOS produces Mach-O binaries that won't run in Linux containers, so the COPY-only `Dockerfile.ci` (the fast Linux-CI path) is bypassed. First build is ~5–10 min for BoringSSL; cached afterwards. CI Linux runners keep the fast `Dockerfile.ci` path.
 
 ### Conformance
 

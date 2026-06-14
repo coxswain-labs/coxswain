@@ -28,7 +28,7 @@
 #
 # Exits non-zero if any step fails. Conformance must validate the artifact
 # published to GHCR, so this script ALWAYS builds with the production
-# `Dockerfile` — never `Dockerfile.e2e`.
+# `Dockerfile` — never `Dockerfile.ci`.
 
 set -euo pipefail
 

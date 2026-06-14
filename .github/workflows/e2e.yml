@@ -29,8 +29,10 @@ jobs:
           filters: |
             code:
               - 'crates/**'
+              - 'ui/**'
               - 'charts/**'
               - 'Dockerfile'
+              - 'Dockerfile.ci'
               - 'conformance/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -45,6 +47,15 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+      - name: Build operator UI
+        run: npm ci && npm run build
+        working-directory: ui
 
       - uses: ./.github/actions/setup-rust-with-cache
         with:
@@ -78,7 +89,7 @@ jobs:
           ls -lh test-bins/
 
       - name: Build e2e Docker image
-        run: docker build -f Dockerfile.e2e -t coxswain:e2e .
+        run: docker build -f Dockerfile.ci -t coxswain:e2e .
 
       - name: Save Docker image
         run: docker save coxswain:e2e | gzip > e2e-image.tar.gz

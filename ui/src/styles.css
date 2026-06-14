@@ -1,0 +1,1006 @@
+/* ── Design tokens ───────────────────────────────────────────────────────── */
+:root {
+  --bg:      #0f1117;
+  --surface: #1a1d27;
+  --surface2:#222536;
+  --border:  #2d3148;
+  --text:    #e2e8f0;
+  --muted:   #8892a4;
+  --green:   #22c55e;
+  --red:     #ef4444;
+  --amber:   #f59e0b;
+  --blue:    #60a5fa;
+  --purple:  #a78bfa;
+  --teal:    #2dd4bf;
+  --nav-h:   52px;
+  --r:       6px;
+  --touch:   44px;   /* WCAG 2.5.5 minimum touch target */
+  --control-h: 44px; /* shared height for row controls (select/search); meets the
+                        --touch target so the generic form-field min-height agrees
+                        rather than fighting it */
+}
+
+/* ── Reset ───────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+a { color: var(--blue); text-decoration: none; cursor: pointer; }
+a:hover { text-decoration: underline; }
+code {
+  background: var(--surface2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+  word-break: break-all;
+}
+h1, h2, h3 { font-weight: 600; }
+button { cursor: pointer; border: none; background: none; }
+/* Form controls don't inherit typography from the page by default (they use UA
+   fonts/metrics) — the root cause of <select>/<input>/<button> rendering at
+   different heights. Opt them into the page's font so they share one baseline. */
+button, input, select, textarea { font: inherit; color: inherit; }
+img { max-width: 100%; }
+
+/* ── App shell ───────────────────────────────────────────────────────────── */
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+.content {
+  margin-top: var(--nav-h);
+  padding: 24px 16px;
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+  width: 100%;
+}
+@media (min-width: 640px) {
+  .content { padding: 28px 24px; }
+}
+
+/* ── Nav bar ─────────────────────────────────────────────────────────────── */
+.nav {
+  position: fixed; top: 0; left: 0; right: 0;
+  height: var(--nav-h);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center;
+  padding: 0 16px; z-index: 100; gap: 0;
+}
+@media (min-width: 640px) {
+  .nav { padding: 0 20px; }
+}
+
+.nav-brand {
+  display: flex; align-items: center; gap: 8px;
+  font-weight: 700; font-size: 15px;
+  border-radius: var(--r); padding: 4px 8px;
+  color: var(--text); text-decoration: none;
+  min-height: var(--touch); /* touch target */
+  flex-shrink: 0;
+}
+.nav-brand:hover { background: var(--surface2); text-decoration: none; }
+.nav-logo { font-size: 18px; }
+.nav-name { color: var(--text); }
+
+/* Inline links: hidden on mobile, visible on wide */
+.nav-links-inline {
+  display: none;
+  flex: 1;
+  gap: 2px;
+  margin-left: 8px;
+}
+@media (min-width: 640px) {
+  .nav-links-inline { display: flex; }
+}
+
+.nav-link {
+  display: inline-flex; align-items: center;
+  min-height: var(--touch);
+  padding: 0 12px; border-radius: var(--r);
+  color: var(--muted); font-size: 14px;
+  text-decoration: none;
+  transition: background 0.12s, color 0.12s;
+  white-space: nowrap;
+}
+.nav-link:hover { background: var(--surface2); color: var(--text); text-decoration: none; }
+.nav-link.active { background: var(--surface2); color: var(--text); }
+
+/* Hamburger: visible on mobile, hidden on wide */
+.nav-hamburger {
+  display: flex; align-items: center; justify-content: center;
+  margin-left: auto;
+  width: var(--touch); height: var(--touch);
+  border-radius: var(--r);
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.nav-hamburger:hover { background: var(--surface2); }
+@media (min-width: 640px) {
+  .nav-hamburger { display: none; }
+}
+
+/* Three-line hamburger icon drawn with box shadows */
+.hamburger-icon,
+.hamburger-icon::before,
+.hamburger-icon::after {
+  display: block;
+  width: 20px; height: 2px;
+  background: currentColor;
+  border-radius: 2px;
+  transition: transform 0.2s, opacity 0.2s;
+}
+.hamburger-icon { position: relative; }
+.hamburger-icon::before,
+.hamburger-icon::after {
+  content: '';
+  position: absolute; left: 0;
+}
+.hamburger-icon::before { top: -6px; }
+.hamburger-icon::after  { top:  6px; }
+
+/* Animated X state when open */
+.hamburger-icon.open { background: transparent; }
+.hamburger-icon.open::before { transform: translateY(6px) rotate(45deg); }
+.hamburger-icon.open::after  { transform: translateY(-6px) rotate(-45deg); }
+
+/* Full-screen drawer */
+.nav-drawer-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 150;
+}
+.nav-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: min(320px, 100vw);
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  z-index: 200;
+  display: flex; flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.nav-drawer.open { transform: translateX(0); }
+@media (min-width: 640px) {
+  /* Drawer only exists on narrow viewports; keep it offscreen on wide */
+  .nav-drawer { display: none; }
+  .nav-drawer-backdrop { display: none; }
+}
+.nav-drawer-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 8px 0 4px;
+  height: var(--nav-h);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.nav-drawer-close {
+  display: flex; align-items: center; justify-content: center;
+  width: var(--touch); height: var(--touch);
+  border-radius: var(--r); color: var(--muted);
+  flex-shrink: 0;
+}
+.nav-drawer-close:hover { background: var(--surface2); }
+.nav-drawer-links {
+  display: flex; flex-direction: column;
+  padding: 12px 12px 24px;
+  gap: 4px;
+}
+.nav-link-drawer {
+  display: flex; align-items: center;
+  min-height: 52px;
+  padding: 0 16px;
+  font-size: 16px;
+  border-radius: var(--r);
+  width: 100%;
+}
+
+/* ── Global stream status (nav bar + drawer foot) ────────────────────────── */
+.nav-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600; white-space: nowrap;
+  padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.nav-status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.nav-status.live            { color: var(--green); }
+.nav-status.live    .nav-status-dot { background: var(--green); }
+.nav-status.offline         { color: var(--red); }
+.nav-status.offline .nav-status-dot { background: var(--red); animation: pulse 2s infinite; }
+/* Inline in the bar on wide screens; folds into the drawer foot on narrow. */
+.nav-status-inline { display: none; margin-left: 16px; }
+@media (min-width: 640px) { .nav-status-inline { display: inline-flex; } }
+.nav-drawer-footer {
+  margin-top: auto; padding: 16px 12px;
+  border-top: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+/* Drawer (mobile) shows versions inline — the drawer has room, no popover. */
+.drawer-versions { display: grid; gap: 4px; }
+.drawer-version { font-size: 12px; color: var(--muted); }
+.drawer-version-label { margin-right: 6px; }
+.drawer-version code {
+  background: none; padding: 0; color: var(--text);
+  font-family: ui-monospace, monospace; font-size: 12px;
+}
+
+/* ── Version info popover (nav bar) ───────────────────────────────────────────
+   Info button just left of the live indicator on wide screens; click opens a
+   dismissible popover (outside-click + Escape) listing deployment versions. */
+.version-info { position: relative; display: inline-flex; }
+.version-info-inline { display: none; margin-left: 16px; }
+@media (min-width: 640px) { .version-info-inline { display: inline-flex; } }
+.version-info-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border-radius: var(--r);
+  color: var(--muted); background: none; border: none; cursor: pointer;
+}
+.version-info-btn:hover,
+.version-info-btn[aria-expanded="true"] { color: var(--text); background: var(--surface2); }
+.version-popover {
+  position: absolute; z-index: 200;
+  top: calc(100% + 8px); right: 0; min-width: 200px;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 12px 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .4);
+}
+.version-popover-title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--muted); margin-bottom: 8px;
+}
+.version-list { display: grid; gap: 6px; }
+.version-row { display: flex; align-items: baseline; justify-content: space-between; gap: 24px; font-size: 13px; }
+.version-row dt { color: var(--muted); }
+.version-row dd { color: var(--text); font-family: ui-monospace, monospace; }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.4; } }
+
+/* ── Screen layout ───────────────────────────────────────────────────────── */
+.screen { width: 100%; }
+.screen-header {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 24px; flex-wrap: wrap;
+}
+.screen-title { font-size: 18px; font-weight: 700; }
+@media (min-width: 640px) {
+  .screen-title { font-size: 20px; }
+}
+.screen-meta { font-size: 13px; color: var(--muted); word-break: break-all; }
+/* Detail-page header: namespace eyebrow, then the name + copy row, then the
+   secondary meta (IP · gateway ref) stacked underneath — mirrors the Fleet
+   pod-card layout so the same identity reads the same way on both screens. */
+.detail-head { min-width: 0; }
+.detail-title-row { display: flex; align-items: center; gap: 8px; }
+/* Breathing room between the resource name and the meta lines below it. */
+.detail-head .detail-title-row { margin-bottom: 6px; }
+.detail-head .card-ns { margin-bottom: 2px; }
+.detail-head .screen-meta { margin-top: 4px; font-family: monospace; }
+.header-badges { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; align-self: flex-start; }
+/* Right-hand header column: badges on top, action buttons (View manifest / Logs)
+   below, both right-aligned and pinned to the top of the header. */
+.header-aside { margin-left: auto; align-self: flex-start; display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+.header-aside .header-badges { margin-left: 0; align-self: flex-end; }
+.header-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 639px) {
+  /* Don't cram badges + buttons against the right edge with a dead gap on the
+     left — give the aside full width and left-align it under the title. */
+  .header-aside { width: 100%; margin-left: 0; align-items: stretch; }
+  .header-aside .header-badges { align-self: stretch; justify-content: flex-start; }
+  /* Action buttons fill the row, splitting it evenly (bigger touch targets). */
+  .header-actions { justify-content: flex-start; flex-wrap: nowrap; }
+  .header-actions > .btn { flex: 1; justify-content: center; }
+}
+.addr-label { font-size: 12px; font-family: monospace; color: var(--muted); }
+
+/* Pod info facts grid (shared PodInfo: node / age / restarts / phase / …). */
+.pod-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px 24px; margin-bottom: 16px;
+}
+.pod-fact dt {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; color: var(--muted); margin-bottom: 2px;
+}
+.pod-fact dd { margin: 0; }
+.pod-fact code {
+  background: none; padding: 0;
+  font-family: ui-monospace, monospace; font-size: 13px; color: var(--text);
+}
+.pod-fact code.warn { color: var(--amber); }
+
+/* ── Section ─────────────────────────────────────────────────────────────── */
+section { margin-bottom: 32px; }
+.section-head {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 12px;
+}
+.section-title {
+  font-size: 13px; font-weight: 700; margin-bottom: 12px;
+  color: var(--muted); text-transform: uppercase; letter-spacing: .07em;
+}
+.section-title.section-err  { color: var(--red); }
+.section-title.section-warn { color: var(--amber); }
+.section-count {
+  display: inline-flex; align-items: center;
+  background: var(--surface2); color: var(--muted);
+  padding: 1px 7px; border-radius: 999px;
+  font-size: 11px; font-weight: 600;
+  margin-left: 8px;
+}
+.section-desc { font-size: 13px; color: var(--muted); margin-bottom: 12px; }
+.section-spinner {
+  width: 14px; height: 14px;
+  border: 2px solid var(--border); border-top-color: var(--blue);
+  border-radius: 50%; animation: spin 0.7s linear infinite;
+  display: inline-block; flex-shrink: 0;
+}
+
+/* Dedicated proxies are bucketed under per-namespace subheaders (the dedicated
+   proxy → Gateway → namespace hierarchy). The subheader sits a tier below the
+   all-caps section title: a namespace label with a pod count, separated by a
+   hairline so groups read as distinct bands without heavy chrome. */
+.ns-group { margin-bottom: 18px; }
+.ns-group:last-child { margin-bottom: 0; }
+.ns-group-head {
+  display: flex; align-items: baseline; gap: 8px;
+  padding-bottom: 6px; margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.ns-group-name {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  font-family: ui-monospace, monospace;
+}
+.ns-group-count { font-size: 12px; color: var(--muted); }
+
+/* ── Breadcrumb ──────────────────────────────────────────────────────────── */
+.breadcrumb {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 20px; color: var(--muted); font-size: 13px;
+  flex-wrap: wrap;
+}
+.breadcrumb a { color: var(--blue); cursor: pointer; }
+/* Inline-flex + stretch centers the chevron glyph against the smaller crumb
+   text instead of trusting its (off-center) font baseline. */
+.breadcrumb-sep {
+  color: #b6bfce; font-size: 16px;
+  display: inline-flex; align-items: center; align-self: stretch;
+}
+
+/* ── Dashboard overview tiles ────────────────────────────────────────────── */
+.summary-grid {
+  display: grid; gap: 12px; margin-bottom: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+.stat {
+  position: relative;
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px; text-align: left;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); cursor: pointer; outline: none;
+  transition: border-color .12s, transform .12s;
+}
+/* Health glyph in the tile's top-right corner: green check / amber alert,
+   same vocabulary as the route tabs and health chips. */
+.stat-status { position: absolute; top: 8px; right: 8px; display: inline-flex; }
+.stat-status.ok svg   { color: var(--green); }
+.stat-status.warn svg { color: var(--amber); }
+.stat:hover, .stat:focus-visible { border-color: var(--accent); transform: translateY(-1px); }
+.stat-icon {
+  flex-shrink: 0; width: 40px; height: 40px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.stat-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.stat-value { font-size: 24px; font-weight: 700; color: var(--text); line-height: 1.05; }
+.stat-label { font-size: 12px; font-weight: 600; color: var(--muted); }
+
+/* ── Header filter controls (type/namespace dropdowns + search) ──────────────
+   Every header filter is one uniform control type — dropdowns and a search input
+   sharing the --control-h token — so they align on a desktop row and stack to a
+   full-width column on mobile with no special-casing. (The old segmented pill
+   was replaced by a dropdown for exactly this reason; see FilterSelect.jsx.) */
+.header-controls {
+  margin-left: auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+/* Fleet aligns its filters to the left (no big title above them). */
+.header-controls.left { margin-left: 0; }
+.search-box, .filter-select {
+  /* height == min-height == --control-h, which equals --touch (44px), so the
+     generic `input[type=text], select { min-height: var(--touch) }` rule agrees
+     with the token instead of clamping these controls past each other. */
+  height: var(--control-h); min-height: var(--control-h);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); color: var(--text);
+  padding: 0 12px; font-size: 13px;
+}
+.search-box { min-width: 200px; }
+/* Strip the native select chrome (which renders taller than the input) and
+   supply a matching chevron so the dropdown lines up with the rest of the row. */
+.filter-select {
+  min-width: 160px; cursor: pointer;
+  appearance: none; -webkit-appearance: none;
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238892a4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+.search-box::placeholder { color: var(--muted); }
+.search-box:focus-visible,
+.filter-select:focus-visible { outline: 2px solid var(--blue); outline-offset: -1px; border-color: var(--blue); }
+/* On mobile the filter controls stack into a full-width column. */
+@media (max-width: 639px) {
+  .header-controls { width: 100%; flex-direction: column; align-items: stretch; }
+  .filter-select, .search-box { width: 100%; min-width: 0; }
+}
+
+/* ── Cards ───────────────────────────────────────────────────────────────── */
+/* Capped at 3 columns rather than auto-fill: at the 1200px content width a 4th
+   column squeezes each card to ~270px and truncates long pod names. Three
+   columns give each card ~380px — enough for a full pod name — and the explicit
+   breakpoints keep the count predictable across widths. */
+.card-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+@media (min-width: 600px) {
+  .card-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (min-width: 960px) {
+  .card-grid { grid-template-columns: repeat(3, 1fr); }
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 16px; cursor: pointer;
+  transition: border-color .12s;
+  outline: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.card:hover, .card:focus-visible { border-color: var(--blue); }
+.card.err { border-color: var(--red); cursor: default; }
+.card-header {
+  display: flex; justify-content: space-between;
+  align-items: flex-start; margin-bottom: 8px;
+}
+/* Top eyebrow row: namespace on the left, badge on the right. */
+.card-top {
+  display: flex; justify-content: space-between;
+  align-items: center; gap: 8px; margin-bottom: 6px;
+}
+.card-ns {
+  font-size: 13px; font-weight: 600; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.card-name {
+  font-weight: 600; font-size: 13px; margin-bottom: 4px;
+  min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* In the header (name + badge inline), let the name take the remaining width
+   so it ellipsises instead of shoving the badge off-card. */
+.card-header .card-name { flex: 1; margin-bottom: 0; }
+/* Pod-card name line: middle-ellipsised name + copy button. */
+.card-name-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+/* Middle ellipsis: head shrinks + ellipsises, tail stays pinned so replicas
+   (which differ only in their suffix) remain distinguishable. */
+.trunc-name { display: flex; flex: 1; min-width: 0; font-weight: 600; font-size: 13px; }
+.trunc-head { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.trunc-tail { flex-shrink: 0; white-space: nowrap; }
+.copy-btn {
+  flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
+  background: none; border: none; cursor: pointer; padding: 3px;
+  color: var(--muted); border-radius: 4px; line-height: 0;
+  transition: color .12s, background .12s;
+}
+.copy-btn:hover, .copy-btn:focus-visible { color: var(--text); background: var(--border); outline: none; }
+.copy-btn.copied { color: var(--green); }
+.card-foot {
+  display: flex; align-items: center;
+  justify-content: space-between;
+  margin-top: 12px; padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.card-foot-right { display: inline-flex; align-items: center; gap: 8px; }
+
+/* ── Badges ──────────────────────────────────────────────────────────────── */
+.badge {
+  display: inline-flex; align-items: center;
+  padding: 3px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 700;
+  letter-spacing: .04em; text-transform: uppercase;
+  white-space: nowrap; flex-shrink: 0;
+}
+.b-leader    { background: #1a3a2d; color: #4ade80; }
+.b-standby   { background: var(--surface2); color: var(--muted); }
+.b-shared    { background: #1a2d4a; color: #60a5fa; }
+.b-dedicated { background: #2d1b69; color: #a78bfa; }
+.b-ok        { background: #1a3a2d; color: #4ade80; }
+.b-fail      { background: #3a1a1a; color: #f87171; }
+.b-warn      { background: #3a2d0a; color: #fbbf24; }
+.b-true      { background: #1a3a2d; color: #4ade80; }
+.b-false     { background: #3a1a1a; color: #f87171; }
+.b-neutral   { background: var(--surface2); color: var(--muted); }
+/* Conflicts and dead backends are both amber (warn tier) — red is reserved for
+   "something is down" (no leader, unreachable pods). They read apart by label. */
+.b-conflict  { background: #3a2d0a; color: #fbbf24; }
+.b-dead      { background: #3a2d0a; color: #fbbf24; }
+
+/* ── Status dot ──────────────────────────────────────────────────────────── */
+.dot {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+}
+.dot::before {
+  content: ''; display: block;
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+}
+.dot.ok::before    { background: var(--green); }
+.dot.err::before   { background: var(--red); }
+.dot.warn::before  { background: var(--amber); }
+.dot.muted::before { background: var(--muted); }
+
+/* ── Table ───────────────────────────────────────────────────────────────── */
+.tbl-wrap {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  overflow-x: auto;     /* horizontal scroll on narrow screens */
+  margin-bottom: 12px;
+  -webkit-overflow-scrolling: touch;
+}
+table { width: 100%; border-collapse: collapse; min-width: 400px; }
+th {
+  text-align: left; padding: 10px 14px;
+  font-size: 11px; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase;
+  color: var(--muted); border-bottom: 1px solid var(--border);
+  background: var(--surface2); white-space: nowrap;
+}
+td {
+  padding: 10px 14px; border-bottom: 1px solid var(--border);
+  font-size: 13px; vertical-align: middle;
+}
+tr:last-child td { border-bottom: none; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: var(--surface2); }
+tr.clickable:focus-visible td { outline: 2px solid var(--blue); outline-offset: -2px; }
+/* The row a deep-link anchored to (host/path). Blue — the focus/selection
+   accent — so "you navigated here" never reads as amber "this is broken". */
+tr.row-hit td { background: color-mix(in srgb, var(--blue) 14%, transparent); }
+tr.row-hit td:first-child { box-shadow: inset 3px 0 0 var(--blue); }
+
+/* ── Tabs ────────────────────────────────────────────────────────────────── */
+.tabs {
+  display: flex; border-bottom: 1px solid var(--border);
+  margin-bottom: 20px; overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.tab {
+  display: inline-flex; align-items: center;
+  min-height: var(--touch);
+  padding: 0 16px; cursor: pointer;
+  color: var(--muted); font-size: 13px;
+  border: none; background: none;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  white-space: nowrap; flex-shrink: 0;
+}
+.tab.active { color: var(--text); border-bottom-color: var(--blue); }
+.tab:hover:not(.active) { color: var(--text); }
+/* Tab label with a leading status icon: green check when clean, amber alert
+   when the tab carries an issue. Colour holds regardless of tab selection so
+   health is visible before clicking. */
+.tab-label { display: inline-flex; align-items: center; gap: 6px; }
+.tab-label.ok svg   { color: var(--green); }
+.tab-label.warn svg { color: var(--amber); }
+
+/* ── Panel ───────────────────────────────────────────────────────────────── */
+.panel {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 16px;
+  margin-bottom: 12px;
+}
+.panel-title {
+  font-size: 12px; font-weight: 700; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .06em; margin-bottom: 14px;
+}
+.panel-title-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* ── Condition row ───────────────────────────────────────────────────────── */
+.cond-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 0; border-bottom: 1px solid var(--border);
+}
+.cond-row:last-child { border-bottom: none; }
+.cond-list { padding: 0 4px; }
+.cond-body { flex: 1; min-width: 0; }
+.cond-name { font-weight: 600; font-size: 13px; margin-bottom: 2px; }
+.cond-detail { font-size: 12px; color: var(--muted); word-break: break-word; }
+
+/* ── Pod health (PodInfo) ────────────────────────────────────────────────── */
+/* Per-subsystem collapsible rows: a summary line (state + N/M ready) that
+   expands to that subsystem's individual checks. Replaces the retired Health
+   page's flat per-check dump (now per-pod and grouped). */
+.health-chips-empty { font-size: 13px; color: var(--muted); }
+.health-subsystems { display: grid; gap: 8px; }
+.health-sub { border: 1px solid var(--border); border-radius: var(--r); background: var(--surface); }
+.health-sub-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 10px 12px; min-height: var(--touch);
+  background: none; border: none; cursor: pointer;
+  color: var(--text); font-size: 13px; text-align: left; outline: none;
+}
+.health-sub-head:hover, .health-sub-head:focus-visible { background: var(--surface2); }
+.health-sub.ok   > .health-sub-head svg { color: var(--green); }
+.health-sub.warn > .health-sub-head svg { color: var(--amber); }
+.health-sub-name { font-weight: 600; text-transform: capitalize; }
+.health-sub-count { color: var(--muted); }
+.health-sub-caret { margin-left: auto; color: var(--muted); transition: transform .12s; }
+.health-sub-caret.open { transform: rotate(90deg); }
+.health-checks {
+  list-style: none; margin: 0; padding: 8px 12px 10px;
+  border-top: 1px solid var(--border);
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 4px 16px;
+}
+.health-check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.health-check.ok svg   { color: var(--green); }
+.health-check.warn { color: var(--text); }
+.health-check.warn svg { color: var(--amber); }
+/* Extra top spacing so Pod → Health reads as far apart as Health → the next
+   section (consistent inter-block rhythm). */
+.pod-health-head { margin-top: 32px; }
+
+/* ── Status chip (Fleet pod-card footers: one per-pod rollup) ─────────────── */
+.health-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 10px; border-radius: 999px;
+  font-size: 13px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--surface);
+}
+.health-chip.ok   { color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, transparent); }
+.health-chip.ok svg   { color: var(--green); }
+.health-chip.warn { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, transparent); }
+.health-chip.warn svg { color: var(--amber); }
+.health-chip.err  { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, transparent); }
+.health-chip.err svg  { color: var(--red); }
+.health-chip.sm { padding: 2px 8px; font-size: 12px; gap: 4px; }
+
+/* ── Event log ───────────────────────────────────────────────────────────── */
+.ev-feed {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r);
+  max-height: calc(100vh - 260px);
+  min-height: 200px;
+  overflow-y: auto;
+  font-family: ui-monospace, monospace; font-size: 12px;
+  -webkit-overflow-scrolling: touch;
+}
+.ev-row {
+  display: flex; gap: 10px;
+  padding: 8px 14px; border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;           /* wraps detail onto next line on narrow screens */
+}
+.ev-row:last-child { border-bottom: none; }
+.ev-time   { color: var(--muted); flex-shrink: 0; width: 72px; }
+.ev-type   { color: var(--blue); flex-shrink: 0; min-width: 160px; }
+@media (min-width: 640px) {
+  .ev-type { min-width: 220px; }
+}
+.ev-detail { color: var(--text); flex: 1; min-width: 0; word-break: break-all; }
+.event-controls { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+.ev-filter {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  margin-bottom: 14px;
+}
+.ev-filter-chip {
+  display: flex; align-items: center; gap: 4px; min-height: var(--touch);
+  font-size: 12px; color: var(--muted); cursor: pointer;
+}
+.ev-filter-chip input { cursor: pointer; width: 16px; height: 16px; }
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex; align-items: center;
+  min-height: var(--touch);
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--r); color: var(--text);
+  padding: 0 14px; font-size: 13px;
+}
+.btn:hover { border-color: var(--blue); }
+.btn-secondary { color: var(--muted); }
+/* Icon + label button (View manifest / Logs). .btn is already inline-flex. */
+.btn-icon { gap: 6px; }
+.btn-icon svg { flex-shrink: 0; }
+/* Inert placeholder (e.g. Logs, pending #285). */
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn:disabled:hover { border-color: var(--border); }
+input[type=text], select {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--r); color: var(--text);
+  padding: 8px 10px; font-size: 13px; outline: none;
+  min-height: var(--touch);
+}
+input[type=text] { width: 100%; max-width: 280px; }
+input[type=text]:focus, select:focus { border-color: var(--blue); }
+input[type=text]::placeholder { color: var(--muted); }
+input[type=checkbox] { accent-color: var(--blue); }
+
+/* ── Needs Attention panel ───────────────────────────────────────────────── */
+.needs-attention {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  margin-bottom: 28px;
+  overflow: hidden;
+}
+.needs-attention-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; gap: 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface2);
+}
+.needs-attention-title { font-weight: 600; font-size: 13px; }
+.problem-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+  min-height: var(--touch);
+}
+.problem-row:last-child { border-bottom: none; }
+.problem-icon { flex-shrink: 0; padding-top: 2px; font-size: 15px; }
+.problem-body { flex: 1; min-width: 0; }
+.problem-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; word-break: break-word; }
+.problem-detail { font-size: 12px; color: var(--muted); }
+.all-good {
+  padding: 16px; color: var(--muted); font-size: 13px;
+  display: flex; align-items: center; gap: 8px;
+}
+
+/* ── All-clear status board (the happy-path reward) ──────────────────────── */
+.all-clear {
+  display: flex; gap: 16px; align-items: center;
+  padding: 20px 22px; border-radius: var(--r);
+  background: color-mix(in srgb, var(--green) 9%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--green) 32%, var(--border));
+}
+.all-clear-badge {
+  flex-shrink: 0; width: 48px; height: 48px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 18%, transparent);
+}
+.all-clear-title { font-size: 16px; font-weight: 700; color: var(--green); margin-bottom: 8px; }
+.all-clear-checks { list-style: none; display: grid; gap: 5px; margin: 0; padding: 0; }
+.all-clear-check {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--text);
+}
+.all-clear-check svg { color: var(--green); flex-shrink: 0; }
+@media (min-width: 560px) {
+  .all-clear-checks { grid-template-columns: 1fr 1fr; gap: 5px 24px; }
+}
+
+/* ── Problems screen cards ───────────────────────────────────────────────── */
+.problems-list { display: grid; gap: 8px; margin-bottom: 8px; }
+.problem-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 14px 16px;
+  border-left: 3px solid var(--border);
+}
+.problem-card.err      { border-left-color: var(--red); }
+.problem-card.conflict { border-left-color: var(--amber); }
+.problem-card.dead     { border-left-color: var(--amber); }
+.problem-card.warn     { border-left-color: var(--amber); }
+/* Clickable cards deep-link to the offending resource. */
+.problem-card.clickable {
+  display: flex; align-items: center; gap: 12px;
+  cursor: pointer; outline: none; transition: border-color .12s, background .12s;
+}
+.problem-card.clickable .problem-card-main { flex: 1; min-width: 0; }
+.problem-card.clickable:hover,
+.problem-card.clickable:focus-visible { border-color: var(--blue); background: var(--surface2); }
+.problem-card-chevron {
+  flex-shrink: 0; color: var(--muted); font-size: 16px;
+  transition: transform .12s, color .12s;
+}
+.problem-card.clickable:hover .problem-card-chevron,
+.problem-card.clickable:focus-visible .problem-card-chevron { color: var(--blue); transform: translateX(2px); }
+/* Meta lines (Namespace, Kind) under the problem card's name line, above the
+   detail. Muted label, value in monospace text color. */
+.problem-card-meta {
+  font-size: 12px; color: var(--muted);
+  margin-bottom: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Every inline value in a problem card (namespace, kind, backend/rejected group,
+   failing checks) renders the same: monospace, text color, no code chip. */
+.problem-card code,
+.problem-card-meta code {
+  background: none; padding: 0;
+  font-family: ui-monospace, monospace; font-size: 12px; color: var(--text);
+}
+/* Name leads (so names align at the same x), with the status badge immediately
+   to its right, hugging it — not flung to the card's far edge. */
+.problem-card-head {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 6px; flex-wrap: wrap;
+}
+.problem-card-head > strong { word-break: break-word; }
+/* A meta-line value that's a warning rather than a fact (e.g. "no leader"). */
+.meta-warn { color: var(--amber); }
+.problem-card-detail { font-size: 12px; color: var(--muted); word-break: break-word; }
+.pods-label { color: var(--muted); }
+
+/* ── Route inspector ─────────────────────────────────────────────────────── */
+.parent-status {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 14px; margin-bottom: 10px;
+}
+.parent-label {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 10px; font-size: 13px; flex-wrap: wrap;
+}
+.link-text { color: var(--blue); cursor: pointer; }
+.link-text:hover { text-decoration: underline; }
+
+/* ── Proxy-detail host groups ────────────────────────────────────────────── */
+.host-group { margin-bottom: 20px; }
+/* One <table> per host-group, so fix the column layout — otherwise each table
+   auto-sizes to its own content and Path/Type/Backend/Endpoints drift between
+   groups. Fixed widths keep every group's columns aligned. */
+.host-group table { table-layout: fixed; }
+.host-group th:nth-child(1), .host-group td:nth-child(1) { width: 28%; }  /* Path */
+.host-group th:nth-child(2), .host-group td:nth-child(2) { width: 14%; }  /* Type */
+.host-group th:nth-child(3), .host-group td:nth-child(3) { width: 34%; }  /* Backend */
+.host-group th:nth-child(4), .host-group td:nth-child(4) { width: 24%; }  /* Endpoints */
+.host-group td code { overflow-wrap: anywhere; }
+.host-label {
+  display: flex; align-items: center; gap: 6px;
+  font-weight: 600; font-size: 14px; margin-bottom: 8px; flex-wrap: wrap;
+}
+.host-port { color: var(--muted); font-family: monospace; }
+
+/* ── Conflict callout ────────────────────────────────────────────────────── */
+.conflict-list {
+  background: #1a140a; border: 1px solid #5a441a;
+  border-radius: var(--r); padding: 10px 14px; margin-bottom: 12px;
+}
+.conflict-item {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; padding: 4px 0; color: var(--text);
+}
+
+/* ── Gateway detail ──────────────────────────────────────────────────────── */
+.attached-routes { display: grid; gap: 6px; }
+.attached-route-row {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 12px 14px; font-size: 13px;
+  cursor: pointer; transition: border-color .12s;
+  min-height: var(--touch);
+}
+.attached-route-row:hover { border-color: var(--blue); }
+.ns-label { color: var(--muted); }
+
+
+/* ── Listener row ────────────────────────────────────────────────────────── */
+.listener-warn td { color: var(--amber); }
+
+/* ── Endpoint health ─────────────────────────────────────────────────────── */
+.endpoint-health { font-size: 12px; color: var(--muted); }
+.endpoint-health.dead { color: var(--amber); font-weight: 700; }
+
+/* ── Manifest dialog ─────────────────────────────────────────────────────── */
+.dialog-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  z-index: 200;
+}
+.dialog {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 201;
+  width: min(860px, 96vw);
+  max-height: min(86vh, 900px);
+  display: flex; flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.dialog-header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface2);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.dialog-title-group {
+  display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+}
+.dialog-kind-badge {
+  font-size: 11px; font-weight: 700;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 4px; padding: 2px 7px;
+  color: var(--muted); white-space: nowrap; flex-shrink: 0;
+}
+.dialog-title {
+  font-size: 14px; font-weight: 600; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+.dialog-ns { color: var(--muted); }
+.dialog-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.dialog-close { font-size: 16px; padding: 0 10px; }
+.dialog-body {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  flex: 1;
+}
+
+/* Manifest code block — Prism tomorrow theme renders inside this element.
+   We set the background to match our surface so the theme's background
+   doesn't create a colour mismatch with the dialog chrome. */
+.manifest-pre {
+  margin: 0;
+  padding: 16px 20px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  tab-size: 2;
+  white-space: pre;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: 0;
+  /* Override the prism-tomorrow background so it matches our surface */
+  background: #1d1f2b !important;
+}
+@media (min-width: 640px) {
+  .manifest-pre { font-size: 13px; }
+}
+/* On mobile the centred modal wastes edge space and clips long YAML — render it
+   as a full-screen drawer instead. */
+@media (max-width: 639px) {
+  .dialog {
+    inset: 0;
+    transform: none;
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    max-height: none;
+    border: none;
+    border-radius: 0;
+  }
+}
+
+/* ── Loading / error / empty states ──────────────────────────────────────── */
+.state-box {
+  padding: 40px 20px; text-align: center;
+  color: var(--muted); font-size: 13px;
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+}
+/* Empty state — a contained box rather than floating centered text. */
+.empty-box {
+  border: 1px solid var(--border); border-radius: var(--r);
+  background: var(--surface);
+  padding: 20px; text-align: center;
+  color: var(--muted); font-size: 13px;
+}
+.spinner {
+  width: 28px; height: 28px;
+  border: 3px solid var(--border); border-top-color: var(--blue);
+  border-radius: 50%; animation: spin 0.7s linear infinite;
+  display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.error-msg { color: var(--red); }

@@ -157,6 +157,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             .with_cluster_summary(status_writer.outputs.cluster_summary)
             .with_aggregator(aggregator)
             .with_events(events)
+            .with_ui()
             .into_service(admin_addr),
     );
 
@@ -250,6 +251,7 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
             cluster: None,
             aggregator: None,
             events: None,
+            serve_ui: false,
         },
     );
 
@@ -363,6 +365,7 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
             cluster: None,
             aggregator: None,
             events: None,
+            serve_ui: false,
         },
     );
 
@@ -787,6 +790,7 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
             cluster: Some(status_writer.outputs.cluster_summary),
             aggregator: Some(dev_aggregator),
             events: Some(events),
+            serve_ui: true,
         },
     );
 
@@ -861,6 +865,9 @@ struct ManagementServerConfig {
     /// `Some` on the dev role (enables the `/api/v1/events` SSE stream).
     /// Controller wires events inline; proxy roles leave it `None`.
     events: Option<EventSources>,
+    /// `true` on the dev role (serves the embedded operator UI at `GET /`).
+    /// Controller wires `.with_ui()` inline; proxy roles leave this `false`.
+    serve_ui: bool,
 }
 
 fn wire_management_servers(
@@ -891,6 +898,9 @@ fn wire_management_servers(
     }
     if let Some(ev) = config.events {
         admin = admin.with_events(ev);
+    }
+    if config.serve_ui {
+        admin = admin.with_ui();
     }
     server.add_service(admin.into_service(admin_addr));
 }

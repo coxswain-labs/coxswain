@@ -1,0 +1,43 @@
+{
+  "name": "staging-ingress",
+  "namespace": "staging",
+  "proxies": [
+    {
+      "pod_name": "coxswain-shared-proxy-66d-ah7x2",
+      "reachable": true,
+      "routes": {
+        "gateway": {
+          "conflicts": [],
+          "hosts": []
+        },
+        "ingress": {
+          "conflicts": [],
+          "hosts": [
+            {
+              "host": "staging.local",
+              "port": 80,
+              "routes": [
+                {
+                  "backend_group": "staging/app",
+                  "endpoints": [],
+                  "name": "staging-ingress",
+                  "namespace": "staging",
+                  "path": "/",
+                  "type": "prefix"
+                },
+                {
+                  "backend_group": "staging/app",
+                  "endpoints": [],
+                  "name": "staging-ingress",
+                  "namespace": "staging",
+                  "path": "/api",
+                  "type": "prefix"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

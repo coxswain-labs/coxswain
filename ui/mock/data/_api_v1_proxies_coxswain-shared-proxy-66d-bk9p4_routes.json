@@ -1,0 +1,206 @@
+{
+  "pod_name": "coxswain-shared-proxy-66d-bk9p4",
+  "reachable": true,
+  "routes": {
+    "gateway": {
+      "conflicts": [
+        {
+          "port": 8080,
+          "host": "app.demo.local",
+          "type": "prefix",
+          "path": "/",
+          "rejected_group": "demo/legacy-api",
+          "namespace": "demo",
+          "name": "web-route"
+        }
+      ],
+      "hosts": [
+        {
+          "host": "api.demo.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "demo/api",
+              "endpoints": [],
+              "name": "api-route",
+              "namespace": "demo",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "docs.demo.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "demo/web",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "docs-route",
+              "namespace": "demo",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "app.demo.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "demo/web",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "web-route",
+              "namespace": "demo",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "demo/api",
+              "endpoints": [],
+              "name": "health-probe-route",
+              "namespace": "demo",
+              "path": "/health",
+              "type": "prefix"
+            }
+          ]
+        }
+      ]
+    },
+    "ingress": {
+      "conflicts": [
+        {
+          "port": 443,
+          "host": "demo.local",
+          "type": "prefix",
+          "path": "/",
+          "rejected_group": "demo/old-frontend",
+          "namespace": "demo",
+          "name": "frontend-ingress"
+        }
+      ],
+      "hosts": [
+        {
+          "host": "demo.local",
+          "port": 443,
+          "routes": [
+            {
+              "backend_group": "demo/frontend",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "frontend-ingress",
+              "namespace": "demo",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "demo/web",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "demo-ingress",
+              "namespace": "demo",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "demo/api",
+              "endpoints": [],
+              "name": "demo-ingress",
+              "namespace": "demo",
+              "path": "/api",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "staging.local",
+          "port": 443,
+          "routes": [
+            {
+              "backend_group": "staging/app",
+              "endpoints": [],
+              "name": "staging-ingress",
+              "namespace": "staging",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "staging/app",
+              "endpoints": [],
+              "name": "staging-ingress",
+              "namespace": "staging",
+              "path": "/api",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "demo.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "demo/frontend",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "frontend-ingress",
+              "namespace": "demo",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "demo/web",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "demo-ingress",
+              "namespace": "demo",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "demo/api",
+              "endpoints": [],
+              "name": "demo-ingress",
+              "namespace": "demo",
+              "path": "/api",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "staging.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "staging/app",
+              "endpoints": [],
+              "name": "staging-ingress",
+              "namespace": "staging",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "staging/app",
+              "endpoints": [],
+              "name": "staging-ingress",
+              "namespace": "staging",
+              "path": "/api",
+              "type": "prefix"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

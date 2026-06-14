@@ -1,0 +1,12 @@
+{
+  "pod_name": "coxswain-controller-7f9c8-gone",
+  "component": "controller",
+  "pod_namespace": "coxswain-system",
+  "pod_ip": "10.42.0.13",
+  "admin_port": 8082,
+  "reachable": false,
+  "node": "node-cp-1",
+  "restarts": 7,
+  "phase": "Running",
+  "created_at": "2026-06-11T03:30:00Z"
+}
