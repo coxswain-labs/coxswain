@@ -44,29 +44,34 @@ export function DataTable({
   if (error) return <ErrorState error={error} />;
   const labels = columns.map((c) => (typeof c === 'string' ? c : c.label));
   const paged = page && page.total > 0;
-  const shownOfTotal =
+  const simple =
     total != null && total !== rows.length
       ? `Showing ${rows.length} of ${total}`
       : `${rows.length} ${rows.length === 1 ? 'item' : 'items'}`;
 
+  // The footer lives in the table's <tfoot> so it spans the columns and stays
+  // attached. While loading, omit it (the body shows the loading text).
+  const footer = loading
+    ? null
+    : paged
+      ? <Pager page={page} />
+      : <span class="pager-info">{simple}</span>;
+
   return (
-    <>
-      <Table columns={labels} rows={rows} renderRow={renderRow} emptyMsg={emptyMsg} />
-      <div class="table-foot" aria-live="polite">
-        {loading ? (
-          'Loading…'
-        ) : paged ? (
-          <Pager page={page} />
-        ) : (
-          shownOfTotal
-        )}
-      </div>
-    </>
+    <Table
+      columns={labels}
+      rows={rows}
+      renderRow={renderRow}
+      emptyMsg={loading ? 'Loading…' : emptyMsg}
+      footer={footer}
+    />
   );
 }
 
-/** Page-size selector + First/Prev/Next/Last + `Showing A–B of N` window for
- *  server-side pagination. */
+/**
+ * Datatable footer: the row range on the left, the page-size selector +
+ * First/Prev/Next/Last nav grouped on the right.
+ */
 function Pager({ page }) {
   const { offset, returned, total, pageSize, pageSizes = [], onPage, onPageSize } = page;
   const from = total === 0 ? 0 : offset + 1;
@@ -75,22 +80,28 @@ function Pager({ page }) {
   const atEnd = to >= total;
   const lastOffset = total === 0 ? 0 : Math.floor((total - 1) / pageSize) * pageSize;
   return (
-    <span class="pager">
-      {onPageSize && pageSizes.length > 0 && (
-        <label class="pager-size">
-          Rows:
-          <select value={pageSize} onChange={(e) => onPageSize(Number(e.target.value))}>
-            {pageSizes.map((n) => (
-              <option key={n} value={n}>{n}</option>
-            ))}
-          </select>
-        </label>
-      )}
-      <span class="pager-info">Showing {from}–{to} of {total}</span>
-      <button class="pager-btn" disabled={atStart} aria-label="First page" onClick={() => onPage(0)}>«</button>
-      <button class="pager-btn" disabled={atStart} aria-label="Previous page" onClick={() => onPage(Math.max(0, offset - pageSize))}>‹</button>
-      <button class="pager-btn" disabled={atEnd} aria-label="Next page" onClick={() => onPage(offset + pageSize)}>›</button>
-      <button class="pager-btn" disabled={atEnd} aria-label="Last page" onClick={() => onPage(lastOffset)}>»</button>
-    </span>
+    <div class="pager">
+      <span class="pager-info">
+        Showing <strong>{from}–{to}</strong> of <strong>{total}</strong>
+      </span>
+      <div class="pager-controls">
+        {onPageSize && pageSizes.length > 0 && (
+          <label class="pager-size">
+            Rows per page
+            <select value={pageSize} onChange={(e) => onPageSize(Number(e.target.value))}>
+              {pageSizes.map((n) => (
+                <option key={n} value={n}>{n}</option>
+              ))}
+            </select>
+          </label>
+        )}
+        <div class="pager-nav" role="group" aria-label="Pagination">
+          <button class="pager-btn" disabled={atStart} aria-label="First page" onClick={() => onPage(0)}>«</button>
+          <button class="pager-btn" disabled={atStart} aria-label="Previous page" onClick={() => onPage(Math.max(0, offset - pageSize))}>‹</button>
+          <button class="pager-btn" disabled={atEnd} aria-label="Next page" onClick={() => onPage(offset + pageSize)}>›</button>
+          <button class="pager-btn" disabled={atEnd} aria-label="Last page" onClick={() => onPage(lastOffset)}>»</button>
+        </div>
+      </div>
+    </div>
   );
 }

@@ -675,26 +675,36 @@ tr.row-hit td:first-child { box-shadow: inset 3px 0 0 var(--blue); }
 tr.sev-warn td:first-child  { box-shadow: inset 3px 0 0 var(--amber); }
 tr.sev-error td:first-child { box-shadow: inset 3px 0 0 var(--red); }
 
-/* "Showing X of Y" footer under a DataTable (no-silent-truncation surface). */
-.table-foot {
-  padding: 8px 4px; color: var(--muted); font-size: 12px;
-  display: flex; align-items: center;
+/* Empty-state row (spans all columns inside the table shell). */
+.tbl-empty { padding: 16px 14px; color: var(--muted); font-size: 13px; }
+
+/* Datatable footer, rendered in <tfoot> so it spans the columns and stays
+   attached: row range on the left, page-size + First/Prev/Next/Last on the
+   right (no-silent-truncation surface). */
+td.table-foot {
+  padding: 8px 12px; border-top: 1px solid var(--border); border-bottom: none;
+  background: var(--surface2); color: var(--muted); font-size: 12px;
 }
-.pager { display: flex; align-items: center; gap: 8px; margin-left: auto; }
-.pager-info { color: var(--muted); }
-.pager-size { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+.pager {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
+}
+.pager-info strong { color: var(--text); font-weight: 600; }
+.pager-controls { display: flex; align-items: center; gap: 16px; }
+.pager-size { display: inline-flex; align-items: center; gap: 6px; }
 .pager-size select {
-  background: var(--surface2); border: 1px solid var(--border);
-  border-radius: var(--r); color: var(--text); padding: 2px 6px; font-size: 12px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); color: var(--text); padding: 3px 6px; font-size: 12px;
 }
+.pager-nav { display: inline-flex; gap: 2px; }
 .pager-btn {
-  display: inline-flex; align-items: center;
-  background: var(--surface2); border: 1px solid var(--border);
-  border-radius: var(--r); color: var(--text);
-  padding: 3px 10px; font-size: 12px;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 28px; height: 28px; padding: 0;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); color: var(--text); font-size: 14px; line-height: 1;
 }
-.pager-btn:hover:not(:disabled) { border-color: var(--blue); }
-.pager-btn:disabled { opacity: 0.4; cursor: default; }
+.pager-btn:hover:not(:disabled) { border-color: var(--blue); color: var(--blue); }
+.pager-btn:disabled { opacity: 0.35; cursor: default; }
 
 /* ── Tabs ────────────────────────────────────────────────────────────────── */
 .tabs {
