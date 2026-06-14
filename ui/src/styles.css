@@ -678,9 +678,15 @@ tr.sev-error td:first-child { box-shadow: inset 3px 0 0 var(--red); }
 /* "Showing X of Y" footer under a DataTable (no-silent-truncation surface). */
 .table-foot {
   padding: 8px 4px; color: var(--muted); font-size: 12px;
+  display: flex; align-items: center;
 }
-.pager { display: flex; align-items: center; gap: 10px; }
+.pager { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .pager-info { color: var(--muted); }
+.pager-size { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+.pager-size select {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--r); color: var(--text); padding: 2px 6px; font-size: 12px;
+}
 .pager-btn {
   display: inline-flex; align-items: center;
   background: var(--surface2); border: 1px solid var(--border);

@@ -65,32 +65,32 @@ export function DataTable({
   );
 }
 
-/** Prev/Next pager + `Showing A–B of N` window for server-side pagination. */
+/** Page-size selector + First/Prev/Next/Last + `Showing A–B of N` window for
+ *  server-side pagination. */
 function Pager({ page }) {
-  const { offset, returned, total, pageSize, onPage } = page;
+  const { offset, returned, total, pageSize, pageSizes = [], onPage, onPageSize } = page;
   const from = total === 0 ? 0 : offset + 1;
   const to = offset + returned;
-  const hasPrev = offset > 0;
-  const hasNext = to < total;
+  const atStart = offset <= 0;
+  const atEnd = to >= total;
+  const lastOffset = total === 0 ? 0 : Math.floor((total - 1) / pageSize) * pageSize;
   return (
     <span class="pager">
+      {onPageSize && pageSizes.length > 0 && (
+        <label class="pager-size">
+          Rows:
+          <select value={pageSize} onChange={(e) => onPageSize(Number(e.target.value))}>
+            {pageSizes.map((n) => (
+              <option key={n} value={n}>{n}</option>
+            ))}
+          </select>
+        </label>
+      )}
       <span class="pager-info">Showing {from}–{to} of {total}</span>
-      <button
-        class="pager-btn"
-        disabled={!hasPrev}
-        aria-label="Previous page"
-        onClick={() => onPage(Math.max(0, offset - pageSize))}
-      >
-        ‹ Prev
-      </button>
-      <button
-        class="pager-btn"
-        disabled={!hasNext}
-        aria-label="Next page"
-        onClick={() => onPage(offset + pageSize)}
-      >
-        Next ›
-      </button>
+      <button class="pager-btn" disabled={atStart} aria-label="First page" onClick={() => onPage(0)}>«</button>
+      <button class="pager-btn" disabled={atStart} aria-label="Previous page" onClick={() => onPage(Math.max(0, offset - pageSize))}>‹</button>
+      <button class="pager-btn" disabled={atEnd} aria-label="Next page" onClick={() => onPage(offset + pageSize)}>›</button>
+      <button class="pager-btn" disabled={atEnd} aria-label="Last page" onClick={() => onPage(lastOffset)}>»</button>
     </span>
   );
 }

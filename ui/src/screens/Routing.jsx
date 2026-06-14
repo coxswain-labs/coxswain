@@ -69,21 +69,22 @@ export function Routing({ query }) {
   // Server-side pagination: name search + namespace narrow the set server-side;
   // the window is limit/offset. Offset resets whenever the tab or a server-side
   // filter changes.
-  const PAGE_SIZE = 100;
+  const PAGE_SIZES = [25, 50, 100, 200];
+  const [pageSize, setPageSize] = useState(100);
   const [offset, setOffset] = useState(0);
   useEffect(() => {
     setOffset(0);
-  }, [activeKey, q, nsFilter]);
+  }, [activeKey, q, nsFilter, pageSize]);
 
   const list = useApi(
     () =>
       active.fetch({
         name: q || undefined,
         namespace: nsFilter === 'all' ? undefined : nsFilter,
-        limit: PAGE_SIZE,
+        limit: pageSize,
         offset,
       }),
-    [activeKey, q, nsFilter, offset],
+    [activeKey, q, nsFilter, pageSize, offset],
   );
   const rows = list.data?.[active.dataKey] ?? [];
 
@@ -100,8 +101,10 @@ export function Routing({ query }) {
     offset,
     returned: list.data?.returned ?? rows.length,
     total: list.data?.total ?? rows.length,
-    pageSize: PAGE_SIZE,
+    pageSize,
+    pageSizes: PAGE_SIZES,
     onPage: setOffset,
+    onPageSize: setPageSize,
   };
 
   const Section = active.Section;
