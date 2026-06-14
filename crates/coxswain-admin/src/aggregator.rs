@@ -17,7 +17,10 @@
 
 use crate::gw_types::{self, HttpRoute};
 use crate::logs::{self, LogQuery};
-use coxswain_core::cluster::{ClusterSummary, GatewayCondition, SharedClusterSummary};
+use crate::page::{ListParams, Page, page_response};
+use coxswain_core::cluster::{
+    CategorySummary, ClusterSummary, GatewayCondition, Severity, SharedClusterSummary,
+};
 use coxswain_core::fleet::{Component, FleetEntry, FleetSnapshot, SharedFleet};
 use futures::future::join_all;
 use http::{HeaderValue, Response, StatusCode, header};
@@ -306,8 +309,15 @@ impl OperatorAggregator {
         }
     }
 
-    /// `GET /api/v1/proxies/{pod-name}/routes` — fan-out to the pod's `/routes`.
-    pub(crate) async fn get_proxy_routes(&self, pod_name: &str) -> Response<Vec<u8>> {
+    /// `GET /api/v1/fleet/proxies/{pod-name}/routes` — fan-out to the pod's
+    /// `/routes`, relaying the filter/pagination `params` so the **proxy** does
+    /// the filtering at the source (the typed routing table lives there, #286).
+    /// The controller is a transparent relay: it never receives non-matching rows.
+    pub(crate) async fn get_proxy_routes(
+        &self,
+        pod_name: &str,
+        params: &ListParams,
+    ) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
         let entry = snapshot
             .shared_proxies
@@ -317,7 +327,12 @@ impl OperatorAggregator {
         let Some(entry) = entry else {
             return not_found();
         };
-        let url = format!("{}/routes", pod_base_url(entry));
+        let base = pod_base_url(entry);
+        let url = if params.is_empty() {
+            format!("{base}/routes")
+        } else {
+            format!("{base}/routes?{}", params.to_query())
+        };
         match self.fetch_json(&url).await {
             Some(routes) => json_response(
                 serde_json::json!({ "pod_name": pod_name, "reachable": true, "routes": routes })
@@ -350,31 +365,24 @@ impl OperatorAggregator {
 impl OperatorAggregator {
     /// `GET /api/v1/controllers` — all controller pods with liveness + leadership.
     ///
-    /// Probes each controller's `/api/v1/cluster` rather than `/api/v1/health`:
-    /// it doubles as a liveness check (200 ⇒ reachable) and carries that pod's
-    /// live `controller.leader` flag, so the response can report `is_leader` per
-    /// pod. Without it the UI cannot tell who holds the lease and wrongly reads
-    /// a healthy single-leader cluster as having no elected leader.
+    /// Probes each controller's `/api/v1/health`: it doubles as a liveness check
+    /// (200 ⇒ reachable) and carries that pod's live `leader` flag and subsystem
+    /// state in one hop, so the response reports `is_leader` per pod. (This
+    /// replaced the retired `/api/v1/cluster` leader probe.)
     pub(crate) async fn list_controllers(&self) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
         let entries: Vec<FleetEntry> = snapshot.controllers.to_vec();
         let probes: Vec<_> = entries
             .iter()
             .map(|e| async move {
-                let cluster_url = format!("{}/api/v1/cluster", pod_base_url(e));
-                match self.fetch_json(&cluster_url).await {
-                    Some(cluster) => {
-                        let is_leader = cluster["controller"]["leader"].as_bool().unwrap_or(false);
+                let health_url = format!("{}/api/v1/health", pod_base_url(e));
+                match self.fetch_json(&health_url).await {
+                    Some(body) => {
+                        let is_leader = body["leader"].as_bool().unwrap_or(false);
                         let mut v = Self::entry_json(e);
                         v["reachable"] = serde_json::Value::Bool(true);
                         v["is_leader"] = serde_json::Value::Bool(is_leader);
-                        // Second hop for subsystem health: the cluster summary
-                        // carries leadership but not subsystem state. Controllers
-                        // are few, so the extra fetch is cheap.
-                        let health_url = format!("{}/api/v1/health", pod_base_url(e));
-                        if let Some(body) = self.fetch_json(&health_url).await {
-                            attach_health_rollup(&mut v, &body);
-                        }
+                        attach_health_rollup(&mut v, &body);
                         v
                     }
                     // Keep the full entry (namespace, …) on the unreachable
@@ -393,19 +401,18 @@ impl OperatorAggregator {
 
     /// `GET /api/v1/controllers/{pod-name}` — single controller pod info.
     ///
-    /// Probes `/api/v1/cluster` (not `/health`): it doubles as a liveness check
-    /// and carries this pod's live `controller.leader` flag, so the controller
-    /// detail page can show leader/standby without a second call — mirroring
-    /// [`Self::list_controllers`].
+    /// Probes `/api/v1/health`: it doubles as a liveness check and carries this
+    /// pod's live `leader` flag, so the controller detail page can show
+    /// leader/standby without a second call — mirroring [`Self::list_controllers`].
     pub(crate) async fn get_controller(&self, pod_name: &str) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
         let Some(entry) = snapshot.controllers.iter().find(|e| e.pod_name == pod_name) else {
             return not_found();
         };
-        let url = format!("{}/api/v1/cluster", pod_base_url(entry));
+        let url = format!("{}/api/v1/health", pod_base_url(entry));
         match self.fetch_json(&url).await {
-            Some(cluster) => {
-                let is_leader = cluster["controller"]["leader"].as_bool().unwrap_or(false);
+            Some(body) => {
+                let is_leader = body["leader"].as_bool().unwrap_or(false);
                 let mut v = Self::entry_json(entry);
                 v["reachable"] = serde_json::Value::Bool(true);
                 v["is_leader"] = serde_json::Value::Bool(is_leader);
@@ -445,17 +452,48 @@ impl OperatorAggregator {
 // ── /api/v1/gateways ─────────────────────────────────────────────────────────
 
 impl OperatorAggregator {
-    /// `GET /api/v1/gateways` — gateway list from the cluster summary (no
-    /// fan-out).
-    pub(crate) fn list_gateways(&self) -> Response<Vec<u8>> {
+    /// `GET /api/v1/routing/summary` — compact per-category counts + worst
+    /// severity (Gateways/HTTPRoutes/Ingresses) from the cluster summary, plus the
+    /// cluster-wide `namespaces` set. Backs the routing-tab badges + warning icons
+    /// and the namespace dropdown without shipping the full lists.
+    pub(crate) fn routing_summary(&self) -> Response<Vec<u8>> {
         let snapshot = self.cluster.load();
-        match serde_json::to_string(&serde_json::json!({ "gateways": snapshot.gateways })) {
-            Ok(body) => json_response(body),
+        let mut v = match serde_json::to_value(snapshot.routing_summary()) {
+            Ok(v) => v,
             Err(e) => {
-                tracing::error!(error = %e, "failed to serialise /api/v1/gateways");
-                internal_error()
+                tracing::error!(error = %e, "failed to serialise /api/v1/routing/summary");
+                return internal_error();
             }
-        }
+        };
+        // Every namespace holding a routing resource — the namespace dropdown must
+        // list them all regardless of the active page/filter, so it can't be
+        // derived from a single (paginated) list response.
+        let mut namespaces: Vec<&str> = snapshot
+            .gateways
+            .iter()
+            .map(|g| g.namespace.as_str())
+            .chain(snapshot.httproutes.iter().map(|r| r.namespace.as_str()))
+            .chain(snapshot.ingresses.iter().map(|i| i.namespace.as_str()))
+            .collect();
+        namespaces.sort_unstable();
+        namespaces.dedup();
+        v["namespaces"] = serde_json::json!(namespaces);
+        json_response(v.to_string())
+    }
+
+    /// `GET /api/v1/routing/gateways` — gateway list from the cluster summary (no
+    /// fan-out), with the shared filter/pagination envelope.
+    pub(crate) fn list_gateways(&self, params: &ListParams) -> Response<Vec<u8>> {
+        let snapshot = self.cluster.load();
+        let filtered: Vec<serde_json::Value> = snapshot
+            .gateways
+            .iter()
+            .filter(|g| !params.problems_only || g.status.is_problem())
+            .filter(|g| params.namespace_matches(&g.namespace))
+            .filter(|g| params.name_matches(&g.name))
+            .map(|g| serde_json::to_value(g).unwrap_or(serde_json::Value::Null))
+            .collect();
+        page_response("gateways", Page::paginate(filtered, params))
     }
 
     /// `GET /api/v1/gateways/{namespace}/{name}` — cluster-summary entry
@@ -496,14 +534,15 @@ impl OperatorAggregator {
                     .collect::<Vec<_>>();
 
                 // Join spec listeners with per-listener status (attached-route
-                // count).  Status may be absent before the first reconcile.
-                let status_attached: std::collections::HashMap<&str, i32> = gw
+                // count + conditions for TLS health). Status may be absent before
+                // the first reconcile.
+                let status_by_name: std::collections::HashMap<&str, &_> = gw
                     .status
                     .as_ref()
                     .and_then(|s| s.listeners.as_deref())
                     .unwrap_or_default()
                     .iter()
-                    .map(|l| (l.name.as_str(), l.attached_routes))
+                    .map(|l| (l.name.as_str(), l))
                     .collect();
 
                 let lsnrs: Vec<serde_json::Value> = gw
@@ -511,12 +550,28 @@ impl OperatorAggregator {
                     .listeners
                     .iter()
                     .map(|l| {
-                        let attached = status_attached.get(l.name.as_str()).copied().unwrap_or(0);
+                        let st = status_by_name.get(l.name.as_str()).copied();
+                        let attached = st.map(|s| s.attached_routes).unwrap_or(0);
+                        // Listener-precise TLS health: a configured listener's
+                        // badge reflects whether its certificate refs resolved and
+                        // it programmed — not merely that a TLS block exists.
+                        let (tls_status, tls_reason) = if l.tls.is_some() {
+                            let (sev, why) =
+                                listener_tls_health(st.map(|s| s.conditions.as_slice()));
+                            (
+                                serde_json::to_value(sev).unwrap_or(serde_json::Value::Null),
+                                why,
+                            )
+                        } else {
+                            (serde_json::Value::Null, None)
+                        };
                         serde_json::json!({
                             "name": l.name,
                             "port": l.port,
                             "protocol": l.protocol,
                             "tls_enabled": l.tls.is_some(),
+                            "tls_status": tls_status,
+                            "tls_reason": tls_reason,
                             "attached_routes": attached,
                         })
                     })
@@ -534,7 +589,9 @@ impl OperatorAggregator {
             }
         };
 
-        let attached_routes_list = self.list_attached_httproutes(kube, namespace, name).await;
+        let attached_routes_list = self
+            .list_attached_httproutes(kube, &snapshot, namespace, name)
+            .await;
 
         let mut v = gateway_summary_json(summary, &snapshot);
         v["conditions"] = serde_json::to_value(&conditions).unwrap_or(serde_json::Value::Null);
@@ -556,6 +613,7 @@ impl OperatorAggregator {
     async fn list_attached_httproutes(
         &self,
         kube: &Client,
+        snapshot: &ClusterSummary,
         gw_namespace: &str,
         gw_name: &str,
     ) -> Vec<serde_json::Value> {
@@ -601,10 +659,26 @@ impl OperatorAggregator {
             });
 
             if attaches {
+                // Enrich with hostnames + rule count straight from the route spec
+                // so the Gateway-detail table mirrors the routing HTTPRoutes table
+                // (Parent is implicit here — it's this Gateway).
+                let hostnames = route.spec.hostnames.as_deref().unwrap_or(&[]).to_vec();
+                let rule_count = route.spec.rules.as_deref().map(<[_]>::len).unwrap_or(0);
+                // Reflector-computed traffic-served status (same field the routing
+                // HTTPRoutes table shows). The UI overlays /problems on top, so
+                // dead/conflict routes on a dedicated gateway still surface.
+                let status = snapshot
+                    .httproutes
+                    .iter()
+                    .find(|h| h.namespace == route_ns && h.name == route_name)
+                    .map(|h| h.status);
                 result.push(serde_json::json!({
                     "kind": "HTTPRoute",
                     "namespace": route_ns,
                     "name": route_name,
+                    "hostnames": hostnames,
+                    "rule_count": rule_count,
+                    "status": status,
                 }));
             }
         }
@@ -626,23 +700,81 @@ fn gateway_summary_json(
         "route_count": summary.route_count,
         "addresses": summary.addresses,
         "conditions": summary.conditions,
+        "status": summary.status,
     })
+}
+
+/// Listener-precise TLS health from a listener's Gateway API status conditions.
+///
+/// `ResolvedRefs=False` (its `certificateRefs` didn't resolve — missing/invalid
+/// Secret or a cross-namespace ref not permitted) means no TLS traffic serves on
+/// this listener → [`Severity::Error`]. `Programmed=False` means it isn't yet
+/// realized in the data plane → [`Severity::Warn`]. Both `True` → [`Severity::Ok`].
+/// Absent status (pre-reconcile) is reported as `Warn`, never a confident lock —
+/// the badge must not claim a certificate is good when we don't yet know.
+fn listener_tls_health(
+    conditions: Option<&[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]>,
+) -> (Severity, Option<String>) {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+    let Some(conds) = conditions else {
+        return (
+            Severity::Warn,
+            Some("listener status not reported yet".to_string()),
+        );
+    };
+    let why = |c: &Condition| {
+        if c.message.is_empty() {
+            c.reason.clone()
+        } else {
+            c.message.clone()
+        }
+    };
+    if let Some(c) = conds.iter().find(|c| c.type_ == "ResolvedRefs")
+        && c.status != "True"
+    {
+        return (Severity::Error, Some(why(c)));
+    }
+    if let Some(c) = conds.iter().find(|c| c.type_ == "Programmed")
+        && c.status != "True"
+    {
+        return (Severity::Warn, Some(why(c)));
+    }
+    (Severity::Ok, None)
 }
 
 // ── /api/v1/ingresses ────────────────────────────────────────────────────────
 
 impl OperatorAggregator {
-    /// `GET /api/v1/ingresses` — ingress list from the cluster summary (no
-    /// fan-out).
-    pub(crate) fn list_ingresses(&self) -> Response<Vec<u8>> {
+    /// `GET /api/v1/routing/ingresses` — ingress list from the cluster summary
+    /// (no fan-out), with the shared filter/pagination envelope.
+    pub(crate) fn list_ingresses(&self, params: &ListParams) -> Response<Vec<u8>> {
         let snapshot = self.cluster.load();
-        match serde_json::to_string(&serde_json::json!({ "ingresses": snapshot.ingresses })) {
-            Ok(body) => json_response(body),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to serialise /api/v1/ingresses");
-                internal_error()
-            }
-        }
+        let filtered: Vec<serde_json::Value> = snapshot
+            .ingresses
+            .iter()
+            .filter(|i| !params.problems_only || i.status.is_problem())
+            .filter(|i| params.namespace_matches(&i.namespace))
+            .filter(|i| params.name_matches(&i.name))
+            .map(|i| serde_json::to_value(i).unwrap_or(serde_json::Value::Null))
+            .collect();
+        page_response("ingresses", Page::paginate(filtered, params))
+    }
+
+    /// `GET /api/v1/routing/httproutes` — HTTPRoute list from the cluster summary
+    /// (no fan-out, #293), with the shared filter/pagination envelope. The `name`
+    /// filter matches the route's object name (name-only, like the other routing
+    /// lists); declared hostnames are not part of the free-text search.
+    pub(crate) fn list_httproutes(&self, params: &ListParams) -> Response<Vec<u8>> {
+        let snapshot = self.cluster.load();
+        let filtered: Vec<serde_json::Value> = snapshot
+            .httproutes
+            .iter()
+            .filter(|r| !params.problems_only || r.status.is_problem())
+            .filter(|r| params.namespace_matches(&r.namespace))
+            .filter(|r| params.name_matches(&r.name))
+            .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+            .collect();
+        page_response("httproutes", Page::paginate(filtered, params))
     }
 
     /// `GET /api/v1/ingresses/{namespace}/{name}` — cluster-summary entry
@@ -703,11 +835,27 @@ fn ingress_summary_json(
     v
 }
 
-// ── /api/v1/routes ────────────────────────────────────────────────────────────
+// ── /api/v1/routing/routes/{kind}/{ns}/{name} ──────────────────────────────────
 
 impl OperatorAggregator {
-    /// `GET /api/v1/routes/httproute/{namespace}/{name}` — live HTTPRoute status
-    /// conditions from Kubernetes + parallel `/routes` fan-out to all proxy pods.
+    /// `GET /api/v1/routing/routes/{kind}/{namespace}/{name}` — kind-dispatching
+    /// route detail. `kind` is `httproute` or `ingress`; anything else is 404
+    /// (mirrors `get_manifest`'s kind validation).
+    pub(crate) async fn get_route(
+        &self,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Response<Vec<u8>> {
+        match kind {
+            "httproute" => self.get_httproute(namespace, name).await,
+            "ingress" => self.get_ingress_route(namespace, name).await,
+            _ => not_found(),
+        }
+    }
+
+    /// Live HTTPRoute status conditions from Kubernetes + parallel `/routes`
+    /// fan-out to all proxy pods.
     pub(crate) async fn get_httproute(&self, namespace: &str, name: &str) -> Response<Vec<u8>> {
         let kube = match self.kube().await {
             Ok(c) => c,
@@ -718,28 +866,8 @@ impl OperatorAggregator {
         };
 
         let api: Api<HttpRoute> = Api::namespaced(kube.clone(), namespace);
-        let parent_statuses = match api.get(name).await {
-            Ok(route) => route
-                .status
-                .as_ref()
-                .map(|s| s.parents.as_slice())
-                .unwrap_or_default()
-                .iter()
-                .map(|p| {
-                    let conditions: Vec<GatewayCondition> = p
-                        .conditions
-                        .iter()
-                        .map(GatewayCondition::from_kube)
-                        .collect();
-                    serde_json::json!({
-                        "parent_ref": {
-                            "name": p.parent_ref.name,
-                            "namespace": p.parent_ref.namespace,
-                        },
-                        "conditions": conditions,
-                    })
-                })
-                .collect::<Vec<_>>(),
+        let route = match api.get(name).await {
+            Ok(route) => route,
             Err(kube::Error::Api(e)) if e.code == 404 => return not_found(),
             Err(e) => {
                 tracing::warn!(error = %e, namespace, name, "K8s GET HTTPRoute failed");
@@ -747,13 +875,53 @@ impl OperatorAggregator {
             }
         };
 
-        let proxy_results = self.fan_out_routes().await;
+        // Per-parentRef conditions — the richest Gateway-API troubleshooting
+        // surface, rendered as the route's conditions table.
+        let parent_statuses = route
+            .status
+            .as_ref()
+            .map(|s| s.parents.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(|p| {
+                let conditions: Vec<GatewayCondition> = p
+                    .conditions
+                    .iter()
+                    .map(GatewayCondition::from_kube)
+                    .collect();
+                serde_json::json!({
+                    "parent_ref": {
+                        "name": p.parent_ref.name,
+                        "namespace": p.parent_ref.namespace,
+                    },
+                    "conditions": conditions,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // Effective config (the route's declared intent, interpreted) for the
+        // detail body — sourced from the object we just fetched, no extra calls.
+        let hostnames = route.spec.hostnames.clone().unwrap_or_default();
+        let rules = httproute_rules_json(&route.spec);
+
+        // Reflector traffic-served status (same field the routing table shows);
+        // the UI overlays /problems on top for the header status badge.
+        let status = self
+            .cluster
+            .load()
+            .httproutes
+            .iter()
+            .find(|h| h.namespace == namespace && h.name == name)
+            .map(|h| h.status);
+
         json_response(
             serde_json::json!({
                 "namespace": namespace,
                 "name": name,
+                "status": status,
+                "hostnames": hostnames,
                 "parent_statuses": parent_statuses,
-                "proxies": proxy_results,
+                "rules": rules,
             })
             .to_string(),
         )
@@ -771,16 +939,8 @@ impl OperatorAggregator {
         };
 
         let api: Api<Ingress> = Api::namespaced(kube.clone(), namespace);
-        let load_balancer = match api.get(name).await {
-            Ok(ing) => ing
-                .status
-                .as_ref()
-                .and_then(|s| s.load_balancer.as_ref())
-                .and_then(|lb| lb.ingress.as_deref())
-                .and_then(|items| items.first())
-                .and_then(|i| i.ip.as_deref().or(i.hostname.as_deref()))
-                .map(str::to_owned)
-                .unwrap_or_default(),
+        let ing = match api.get(name).await {
+            Ok(ing) => ing,
             Err(kube::Error::Api(e)) if e.code == 404 => return not_found(),
             Err(e) => {
                 tracing::warn!(error = %e, namespace, name, "K8s GET Ingress (routes) failed");
@@ -788,16 +948,209 @@ impl OperatorAggregator {
             }
         };
 
-        let proxy_results = self.fan_out_routes().await;
+        let load_balancer = ing
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+            .and_then(|lb| lb.ingress.as_deref())
+            .and_then(|items| items.first())
+            .and_then(|i| i.ip.as_deref().or(i.hostname.as_deref()))
+            .map(str::to_owned)
+            .unwrap_or_default();
+
+        // Effective config (class, TLS blocks, host/path → backend rules) from
+        // the object we just fetched — Ingress is flat, so this is most of what
+        // the resource *is*.
+        let empty_spec = k8s_openapi::api::networking::v1::IngressSpec::default();
+        let spec = ing.spec.as_ref().unwrap_or(&empty_spec);
+        let class = spec.ingress_class_name.clone().unwrap_or_default();
+        let tls = ingress_tls_json(spec);
+        let default_backend = spec.default_backend.as_ref().map(ingress_backend_json);
+        let rules = ingress_rules_json(spec);
+
+        let status = self
+            .cluster
+            .load()
+            .ingresses
+            .iter()
+            .find(|i| i.namespace == namespace && i.name == name)
+            .map(|i| i.status);
+
         let mut v = serde_json::json!({
             "namespace": namespace,
             "name": name,
-            "proxies": proxy_results,
+            "status": status,
+            "class": class,
+            "tls": tls,
+            "default_backend": default_backend,
+            "rules": rules,
         });
         if !load_balancer.is_empty() {
             v["load_balancer"] = serde_json::Value::String(load_balancer);
         }
         json_response(v.to_string())
+    }
+
+    /// `GET …/routes/{kind}/{ns}/{name}/check` — on-demand data-plane
+    /// consistency check against the controller for a single route.
+    ///
+    /// Everything else on the route detail page reflects the *controller's*
+    /// view (status, conditions, `/problems`). This is the one check that asks
+    /// each proxy directly. It targets only the proxies that *should* serve the
+    /// route — the shared pool, or the dedicated proxies of the route's parent
+    /// Gateways (matched by the `gateway-name` label) — fans out to their
+    /// `/routes`, and diffs the route-tagged rows across them: a proxy missing a
+    /// row its peers have is drift.
+    ///
+    /// # Errors
+    ///
+    /// 400 for an unknown kind, 404 when the route does not exist, 503 when the
+    /// Kubernetes client is unavailable, 500 for other Kubernetes errors.
+    pub(crate) async fn check_route(
+        &self,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Response<Vec<u8>> {
+        let Some(spec_key) = route_kind_key(kind) else {
+            return not_found();
+        };
+
+        let kube = match self.kube().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "kube client unavailable for route check");
+                return service_unavailable("kubernetes client not available");
+            }
+        };
+
+        // Resolve which proxies should serve this route. HTTPRoute follows its
+        // parent Gateways (dedicated → those pods, otherwise the shared pool);
+        // Ingress is always served by the shared pool.
+        let snapshot = self.fleet.load();
+        let serving: Vec<FleetEntry> = match kind {
+            "httproute" => {
+                let api: Api<HttpRoute> = Api::namespaced(kube.clone(), namespace);
+                let route = match api.get(name).await {
+                    Ok(r) => r,
+                    Err(kube::Error::Api(e)) if e.code == 404 => return not_found(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, namespace, name, "K8s GET HTTPRoute (check) failed");
+                        return internal_error();
+                    }
+                };
+                let parents = route.spec.parent_refs.as_deref().unwrap_or_default();
+                serving_proxies_for_parents(&snapshot, namespace, parents)
+            }
+            "ingress" => {
+                let api: Api<Ingress> = Api::namespaced(kube.clone(), namespace);
+                match api.get(name).await {
+                    Ok(_) => {}
+                    Err(kube::Error::Api(e)) if e.code == 404 => return not_found(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, namespace, name, "K8s GET Ingress (check) failed");
+                        return internal_error();
+                    }
+                }
+                snapshot.shared_proxies.clone()
+            }
+            _ => return not_found(),
+        };
+
+        let pod_results = self.fan_out_routes_to(&serving).await;
+
+        // Pass 1: per-pod route-tagged rows + the union of (host, path, backend)
+        // keys seen across all reachable serving proxies — the expected set.
+        let mut union: Vec<(String, String, String)> = Vec::new();
+        let mut union_seen: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+        let mut pod_rows: Vec<(String, bool, Vec<serde_json::Value>)> = Vec::new();
+        for pr in &pod_results {
+            let pod_name = pr
+                .get("pod_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let reachable = pr
+                .get("reachable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !reachable {
+                pod_rows.push((pod_name, false, Vec::new()));
+                continue;
+            }
+            let routes = pr.get("routes").cloned().unwrap_or(serde_json::Value::Null);
+            let rows = route_rows_for(&routes, spec_key, namespace, name);
+            for r in &rows {
+                let key = row_key(r);
+                if union_seen.insert(key.clone()) {
+                    union.push(key);
+                }
+            }
+            pod_rows.push((pod_name, true, rows));
+        }
+
+        // Pass 2: per-pod present rows (flagging dead backends) + the union keys
+        // each pod is missing. Any unreachable pod, any missing key, or a route
+        // absent from every proxy means the data plane disagrees.
+        let mut consistent = !union.is_empty();
+        let mut proxies_json: Vec<serde_json::Value> = Vec::new();
+        for (pod_name, reachable, rows) in &pod_rows {
+            if !reachable {
+                consistent = false;
+                proxies_json.push(serde_json::json!({ "pod_name": pod_name, "reachable": false }));
+                continue;
+            }
+            let present: std::collections::HashSet<(String, String, String)> =
+                rows.iter().map(row_key).collect();
+            let missing: Vec<serde_json::Value> = union
+                .iter()
+                .filter(|k| !present.contains(*k))
+                .map(|(host, path, backend_group)| {
+                    serde_json::json!({ "host": host, "path": path, "backend_group": backend_group })
+                })
+                .collect();
+            if !missing.is_empty() {
+                consistent = false;
+            }
+            let rows_json: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    let dead = r
+                        .get("endpoints")
+                        .and_then(|e| e.as_array())
+                        .is_none_or(|a| a.is_empty());
+                    let mut rr = r.clone();
+                    rr["dead"] = serde_json::Value::Bool(dead);
+                    rr
+                })
+                .collect();
+            proxies_json.push(serde_json::json!({
+                "pod_name": pod_name,
+                "reachable": true,
+                "rows": rows_json,
+                "missing": missing,
+            }));
+        }
+
+        let expected: Vec<serde_json::Value> = union
+            .iter()
+            .map(|(host, path, backend_group)| {
+                serde_json::json!({ "host": host, "path": path, "backend_group": backend_group })
+            })
+            .collect();
+
+        json_response(
+            serde_json::json!({
+                "kind": kind,
+                "namespace": namespace,
+                "name": name,
+                "consistent": consistent,
+                "expected": expected,
+                "proxies": proxies_json,
+            })
+            .to_string(),
+        )
     }
 
     /// Fan out `GET /routes` to all proxy pods in parallel.
@@ -813,6 +1166,13 @@ impl OperatorAggregator {
             .chain(&snapshot.dedicated_proxies)
             .cloned()
             .collect();
+        self.fan_out_routes_to(&entries).await
+    }
+
+    /// Fan out `GET /routes` to a specific set of proxy pods in parallel — the
+    /// check path targets only the proxies that should serve a given route,
+    /// not the whole fleet.
+    async fn fan_out_routes_to(&self, entries: &[FleetEntry]) -> Vec<serde_json::Value> {
         let http = &self.http;
         let futures: Vec<_> = entries
             .iter()
@@ -842,6 +1202,314 @@ impl OperatorAggregator {
             .collect();
         join_all(futures).await
     }
+}
+
+// ── Route check (data-plane consistency) ─────────────────────────────────────────────────────────────
+
+/// The proxy `/routes` sub-key for a route kind: Gateway-API routes live under
+/// `gateway`, classic Ingress under `ingress`. `None` for an unknown kind.
+fn route_kind_key(kind: &str) -> Option<&'static str> {
+    match kind {
+        "httproute" => Some("gateway"),
+        "ingress" => Some("ingress"),
+        _ => None,
+    }
+}
+
+/// The proxies that should serve a route, given its parent Gateways. Each parent
+/// is served by its dedicated proxies (matched by namespace + `gateway-name`
+/// label) when any exist, otherwise by the shared pool. Pods are de-duplicated
+/// across parents.
+fn serving_proxies_for_parents(
+    snapshot: &FleetSnapshot,
+    route_ns: &str,
+    parents: &[gw_types::v::httproutes::HttpRouteParentRefs],
+) -> Vec<FleetEntry> {
+    let mut out: Vec<FleetEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in parents {
+        let gw_ns = p.namespace.as_deref().unwrap_or(route_ns);
+        let gw_name = p.name.as_str();
+        let dedicated: Vec<&FleetEntry> = snapshot
+            .dedicated_proxies
+            .iter()
+            .filter(|e| e.pod_namespace == gw_ns && e.gateway_ref.as_deref() == Some(gw_name))
+            .collect();
+        let targets: Vec<&FleetEntry> = if dedicated.is_empty() {
+            snapshot.shared_proxies.iter().collect()
+        } else {
+            dedicated
+        };
+        for e in targets {
+            if seen.insert(e.pod_name.clone()) {
+                out.push(e.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Flatten the rows in one proxy's `/routes` payload that are tagged with the
+/// given route object to `{host, path, backend_group, endpoints}`.
+fn route_rows_for(
+    routes: &serde_json::Value,
+    spec_key: &str,
+    namespace: &str,
+    name: &str,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let hosts = routes
+        .get(spec_key)
+        .and_then(|s| s.get("hosts"))
+        .and_then(|h| h.as_array());
+    for host_entry in hosts.into_iter().flatten() {
+        let host = host_entry
+            .get("host")
+            .and_then(|h| h.as_str())
+            .unwrap_or("");
+        let rows = host_entry.get("routes").and_then(|r| r.as_array());
+        for r in rows.into_iter().flatten() {
+            if r.get("namespace").and_then(|v| v.as_str()) == Some(namespace)
+                && r.get("name").and_then(|v| v.as_str()) == Some(name)
+            {
+                out.push(serde_json::json!({
+                    "host": host,
+                    "path": r.get("path").cloned().unwrap_or(serde_json::Value::Null),
+                    "backend_group": r.get("backend_group").cloned().unwrap_or(serde_json::Value::Null),
+                    "endpoints": r.get("endpoints").cloned().unwrap_or_else(|| serde_json::json!([])),
+                }));
+            }
+        }
+    }
+    out
+}
+
+/// `(host, path, backend_group)` identity for a check row, for set membership.
+fn row_key(r: &serde_json::Value) -> (String, String, String) {
+    let s = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    (s("host"), s("path"), s("backend_group"))
+}
+
+// ── Effective-config serialization (route detail bodies) ──────────────────────
+
+/// Gateway-API spelling for a path-match type. Absent ⇒ the spec default of a
+/// `PathPrefix` match on `/`.
+fn path_match_str(
+    t: Option<&gw_types::v::httproutes::HttpRouteRulesMatchesPathType>,
+) -> &'static str {
+    use gw_types::v::httproutes::HttpRouteRulesMatchesPathType as T;
+    match t {
+        Some(T::Exact) => "Exact",
+        Some(T::PathPrefix) | None => "PathPrefix",
+        Some(T::RegularExpression) => "RegularExpression",
+    }
+}
+
+/// Gateway-API spelling for an HTTP method matcher.
+fn method_match_str(m: &gw_types::v::httproutes::HttpRouteRulesMatchesMethod) -> &'static str {
+    use gw_types::v::httproutes::HttpRouteRulesMatchesMethod as M;
+    match m {
+        M::Get => "GET",
+        M::Head => "HEAD",
+        M::Post => "POST",
+        M::Put => "PUT",
+        M::Delete => "DELETE",
+        M::Connect => "CONNECT",
+        M::Options => "OPTIONS",
+        M::Trace => "TRACE",
+        M::Patch => "PATCH",
+    }
+}
+
+/// Gateway-API spelling for a header match type. Absent ⇒ `Exact` (the spec
+/// default).
+fn header_match_str(
+    t: Option<&gw_types::v::httproutes::HttpRouteRulesMatchesHeadersType>,
+) -> &'static str {
+    use gw_types::v::httproutes::HttpRouteRulesMatchesHeadersType as T;
+    match t {
+        Some(T::RegularExpression) => "RegularExpression",
+        Some(T::Exact) | None => "Exact",
+    }
+}
+
+/// Gateway-API spelling for a query-param match type. Absent ⇒ `Exact`.
+fn query_match_str(
+    t: Option<&gw_types::v::httproutes::HttpRouteRulesMatchesQueryParamsType>,
+) -> &'static str {
+    use gw_types::v::httproutes::HttpRouteRulesMatchesQueryParamsType as T;
+    match t {
+        Some(T::RegularExpression) => "RegularExpression",
+        Some(T::Exact) | None => "Exact",
+    }
+}
+
+/// Gateway-API spelling for a filter kind (the `type` discriminant only — the
+/// effective-config table lists which filters are in play, not their bodies).
+fn filter_kind_str(t: &gw_types::v::httproutes::HttpRouteRulesFiltersType) -> &'static str {
+    use gw_types::v::httproutes::HttpRouteRulesFiltersType as F;
+    match t {
+        F::RequestHeaderModifier => "RequestHeaderModifier",
+        F::ResponseHeaderModifier => "ResponseHeaderModifier",
+        F::RequestMirror => "RequestMirror",
+        F::RequestRedirect => "RequestRedirect",
+        F::UrlRewrite => "URLRewrite",
+        F::ExtensionRef => "ExtensionRef",
+        F::Cors => "CORS",
+    }
+}
+
+/// Interpreted HTTPRoute spec rules for the detail screen's effective-config
+/// table.
+///
+/// Flattens each rule to the fields an operator reads — match predicates
+/// (path/method/headers/query), weighted backends, and the filter kinds in
+/// play. Sourced from the already-fetched object, so it costs no extra API
+/// call. Empty inner collections are emitted as empty arrays for a stable shape.
+fn httproute_rules_json(spec: &gw_types::v::httproutes::HttpRouteSpec) -> serde_json::Value {
+    let rules: Vec<serde_json::Value> = spec
+        .rules
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|rule| {
+            let matches: Vec<serde_json::Value> = rule
+                .matches
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|m| {
+                    let headers: Vec<serde_json::Value> = m
+                        .headers
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|h| {
+                            serde_json::json!({
+                                "name": h.name,
+                                "type": header_match_str(h.r#type.as_ref()),
+                                "value": h.value,
+                            })
+                        })
+                        .collect();
+                    let query_params: Vec<serde_json::Value> = m
+                        .query_params
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|q| {
+                            serde_json::json!({
+                                "name": q.name,
+                                "type": query_match_str(q.r#type.as_ref()),
+                                "value": q.value,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "path": {
+                            "type": path_match_str(m.path.as_ref().and_then(|p| p.r#type.as_ref())),
+                            "value": m.path.as_ref().and_then(|p| p.value.clone()).unwrap_or_else(|| "/".to_owned()),
+                        },
+                        "method": m.method.as_ref().map(method_match_str),
+                        "headers": headers,
+                        "query_params": query_params,
+                    })
+                })
+                .collect();
+            let backends: Vec<serde_json::Value> = rule
+                .backend_refs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|b| {
+                    serde_json::json!({
+                        "name": b.name,
+                        "namespace": b.namespace,
+                        "port": b.port,
+                        "weight": b.weight,
+                    })
+                })
+                .collect();
+            let filters: Vec<&str> = rule
+                .filters
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|f| filter_kind_str(&f.r#type))
+                .collect();
+            serde_json::json!({
+                "matches": matches,
+                "backends": backends,
+                "filters": filters,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rules)
+}
+
+/// Render an [`IngressBackend`] to `{service, port}` (the common case) or
+/// `{resource}` for a resource backend. Port renders as the number, falling
+/// back to the named port.
+fn ingress_backend_json(b: &k8s_openapi::api::networking::v1::IngressBackend) -> serde_json::Value {
+    if let Some(s) = &b.service {
+        let port = s
+            .port
+            .as_ref()
+            .and_then(|p| p.number.map(|n| n.to_string()).or_else(|| p.name.clone()));
+        serde_json::json!({ "service": s.name, "port": port })
+    } else if let Some(r) = &b.resource {
+        serde_json::json!({ "resource": format!("{}/{}", r.kind, r.name) })
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+/// TLS blocks (`{hosts, secret}`) declared inline on the Ingress.
+fn ingress_tls_json(spec: &k8s_openapi::api::networking::v1::IngressSpec) -> serde_json::Value {
+    let tls: Vec<serde_json::Value> = spec
+        .tls
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "hosts": t.hosts.clone().unwrap_or_default(),
+                "secret": t.secret_name,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(tls)
+}
+
+/// Interpreted Ingress spec rules: `host` → `[{path, path_type, backend}]`.
+fn ingress_rules_json(spec: &k8s_openapi::api::networking::v1::IngressSpec) -> serde_json::Value {
+    let rules: Vec<serde_json::Value> = spec
+        .rules
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let paths: Vec<serde_json::Value> = r
+                .http
+                .as_ref()
+                .map(|h| h.paths.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "path": p.path.clone().unwrap_or_else(|| "/".to_owned()),
+                        "path_type": p.path_type,
+                        "backend": ingress_backend_json(&p.backend),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "host": r.host,
+                "paths": paths,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rules)
 }
 
 // ── /api/v1/manifests ────────────────────────────────────────────────────────
@@ -966,28 +1634,118 @@ impl OperatorAggregator {
     /// `GET /api/v1/problems` — cluster-wide routing problems derived from
     /// fan-out to all proxy `/routes` endpoints.
     ///
-    /// Returns a single snapshot:
+    /// Cross-cutting problem aggregate, namespaced by the two API axes (#301):
     /// ```json
     /// {
-    ///   "conflicts": [{ "host", "path", "rejected_group", "kind", "pods": ["…"] }],
-    ///   "dead_routes": [{ "host", "path", "backend_group", "kind", "pods": ["…"] }]
+    ///   "fleet":   { "leaderless": bool, "unreachable": [pod…], "degraded": [pod…] },
+    ///   "routing": { "conflicts": [...], "dead_routes": [...] }
     /// }
     /// ```
     ///
-    /// Conflicts are route-table collisions where a second claim for the same
-    /// `(host, path)` was rejected. `dead_routes` are entries present in the
-    /// routing table but with zero endpoints — the route is accepted but
-    /// backends are unavailable (Service has no ready Pods). `kind`
-    /// (`"ingress"`/`"gateway"`) tags which routing surface owns the problem so
-    /// the UI can attribute it to the right resource.
-    ///
-    /// Shared proxies carry an identical table: the same conflict appears once
-    /// per proxy. Results are de-duplicated by `(host, path, rejected_group)`
-    /// and `(host, path, backend_group)` respectively, with `pods` listing
-    /// which proxies reported that problem.
+    /// `routing` conflicts/dead-routes come from fanning out to every proxy's
+    /// `/routes` (deduped, `kind`-tagged). `fleet` classes come from probing each
+    /// pod's `/api/v1/health`: `unreachable` pods don't answer, `degraded` pods
+    /// answer with failing checks, and `leaderless` is `true` when no reachable
+    /// controller reports `leader`. The operator UI renders this directly rather
+    /// than re-deriving severity client-side.
     pub(crate) async fn list_problems(&self) -> Response<Vec<u8>> {
-        let raw = self.fan_out_routes().await;
-        json_response(aggregate_problems(&raw).to_string())
+        let (raw, fleet) = tokio::join!(self.fan_out_routes(), self.fleet_problems());
+        let routing = aggregate_problems(&raw);
+        json_response(serde_json::json!({ "fleet": fleet, "routing": routing }).to_string())
+    }
+
+    /// Probe every coxswain pod's `/api/v1/health` and bucket the fleet problem
+    /// classes (`leaderless`/`unreachable`/`degraded`). See [`Self::list_problems`].
+    async fn fleet_problems(&self) -> serde_json::Value {
+        let snapshot = self.fleet.load();
+        // (entry, is_controller) for every pod in the fleet.
+        let pods: Vec<(FleetEntry, bool)> = snapshot
+            .controllers
+            .iter()
+            .map(|e| (e.clone(), true))
+            .chain(
+                snapshot
+                    .shared_proxies
+                    .iter()
+                    .chain(&snapshot.dedicated_proxies)
+                    .map(|e| (e.clone(), false)),
+            )
+            .collect();
+        let any_controller = pods.iter().any(|(_, is_ctrl)| *is_ctrl);
+
+        let probes = pods.iter().map(|(e, is_ctrl)| async move {
+            let url = format!("{}/api/v1/health", pod_base_url(e));
+            (e, *is_ctrl, self.fetch_json(&url).await)
+        });
+        let results = join_all(probes).await;
+
+        let mut unreachable = Vec::new();
+        let mut degraded = Vec::new();
+        let mut any_leader = false;
+        for (e, is_ctrl, body) in results {
+            match body {
+                None => {
+                    let mut v = Self::entry_json(e);
+                    v["reachable"] = serde_json::Value::Bool(false);
+                    unreachable.push(v);
+                }
+                Some(body) => {
+                    if is_ctrl && body["leader"].as_bool().unwrap_or(false) {
+                        any_leader = true;
+                    }
+                    let checks = non_ready_checks(&body);
+                    if !checks.is_empty() {
+                        let mut v = Self::entry_json(e);
+                        v["reachable"] = serde_json::Value::Bool(true);
+                        v["degraded_checks"] = serde_json::Value::from(checks);
+                        degraded.push(v);
+                    }
+                }
+            }
+        }
+
+        serde_json::json!({
+            "leaderless": any_controller && !any_leader,
+            "unreachable": unreachable,
+            "degraded": degraded,
+        })
+    }
+
+    /// `GET /api/v1/fleet/summary` — compact per-category counts + worst severity
+    /// for controllers, shared proxies, and dedicated proxies (the Dashboard's
+    /// three fleet tiles). Backs the tiles without shipping the full pod lists.
+    /// Reuses the per-pod `/health` probe (a pod is `error` when unreachable,
+    /// `warn` when degraded, else `ok`).
+    pub(crate) async fn fleet_summary(&self) -> Response<Vec<u8>> {
+        let snapshot = self.fleet.load();
+        let controllers: Vec<FleetEntry> = snapshot.controllers.to_vec();
+        let shared: Vec<FleetEntry> = snapshot.shared_proxies.to_vec();
+        let dedicated: Vec<FleetEntry> = snapshot.dedicated_proxies.to_vec();
+        let (controllers, shared_proxies, dedicated_proxies) = tokio::join!(
+            self.category_health(&controllers),
+            self.category_health(&shared),
+            self.category_health(&dedicated),
+        );
+        let body = serde_json::json!({
+            "controllers": controllers,
+            "shared_proxies": shared_proxies,
+            "dedicated_proxies": dedicated_proxies,
+        });
+        json_response(body.to_string())
+    }
+
+    /// Probe a set of pods and reduce to a [`CategorySummary`] (count + worst
+    /// severity).
+    async fn category_health(&self, entries: &[FleetEntry]) -> CategorySummary {
+        let probes = entries.iter().map(|e| async move {
+            let url = format!("{}/api/v1/health", pod_base_url(e));
+            match self.fetch_json(&url).await {
+                None => Severity::Error,
+                Some(body) if non_ready_checks(&body).is_empty() => Severity::Ok,
+                Some(_) => Severity::Warn,
+            }
+        });
+        CategorySummary::from_severities(join_all(probes).await)
     }
 }
 
@@ -1296,6 +2054,42 @@ mod tests {
     // ── entry_json ────────────────────────────────────────────────────────────
 
     #[test]
+    fn listener_tls_health_maps_conditions_to_severity() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+        let cond = |t: &str, s: &str| Condition {
+            last_transition_time: Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH),
+            message: String::new(),
+            observed_generation: None,
+            reason: format!("{t}Reason"),
+            status: s.to_string(),
+            type_: t.to_string(),
+        };
+        // Both conditions True → genuinely good.
+        let (sev, why) = listener_tls_health(Some(&[
+            cond("ResolvedRefs", "True"),
+            cond("Programmed", "True"),
+        ]));
+        assert_eq!(sev, Severity::Ok);
+        assert!(why.is_none());
+        // Cert ref unresolved → serves no TLS traffic → error, with the reason.
+        let (sev, why) = listener_tls_health(Some(&[
+            cond("ResolvedRefs", "False"),
+            cond("Programmed", "True"),
+        ]));
+        assert_eq!(sev, Severity::Error);
+        assert_eq!(why.as_deref(), Some("ResolvedRefsReason"));
+        // Resolved but not yet programmed → warn.
+        let (sev, _) = listener_tls_health(Some(&[
+            cond("ResolvedRefs", "True"),
+            cond("Programmed", "False"),
+        ]));
+        assert_eq!(sev, Severity::Warn);
+        // No status reported yet → warn, never a confident ok.
+        let (sev, _) = listener_tls_health(None);
+        assert_eq!(sev, Severity::Warn);
+    }
+
+    #[test]
     fn entry_json_shared_proxy_has_no_gateway_ref() {
         let pod = make_pod("proxy-0", "shared-proxy", "10.0.0.1", "8082", None);
         let snap = build_snapshot([&pod]);
@@ -1351,6 +2145,7 @@ mod tests {
                 GatewaySummary::new("gw-b", "infra").with_route_count(1),
             ],
             vec![],
+            vec![],
             ControllerSummary::new(false),
         );
         let cluster = SharedClusterSummary::default();
@@ -1375,6 +2170,7 @@ mod tests {
                 IngressSummary::new("ing-a", "default").with_route_count(2),
                 IngressSummary::new("ing-b", "other").with_load_balancer("10.0.0.5"),
             ],
+            vec![],
             ControllerSummary::new(false),
         );
         let cluster = SharedClusterSummary::default();
@@ -1785,7 +2581,9 @@ mod tests {
     async fn get_proxy_routes_returns_404_when_pod_not_in_fleet() {
         let agg = make_agg(SharedFleet::default(), SharedClusterSummary::default());
         assert_eq!(
-            agg.get_proxy_routes("missing").await.status(),
+            agg.get_proxy_routes("missing", &ListParams::default())
+                .await
+                .status(),
             StatusCode::NOT_FOUND
         );
     }
@@ -1824,13 +2622,14 @@ mod tests {
         let summary = ClusterSummary::new(
             vec![GatewaySummary::new("gw-a", "default").with_route_count(2)],
             vec![],
+            vec![],
             ControllerSummary::new(false),
         );
         let cluster = SharedClusterSummary::default();
         cluster.store(std::sync::Arc::new(summary));
         let agg = make_agg(SharedFleet::default(), cluster);
 
-        let resp = agg.list_gateways();
+        let resp = agg.list_gateways(&ListParams::default());
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
         assert_eq!(body["gateways"][0]["name"], "gw-a");
@@ -1846,13 +2645,14 @@ mod tests {
                     .with_route_count(1)
                     .with_load_balancer("10.0.0.5"),
             ],
+            vec![],
             ControllerSummary::new(false),
         );
         let cluster = SharedClusterSummary::default();
         cluster.store(std::sync::Arc::new(summary));
         let agg = make_agg(SharedFleet::default(), cluster);
 
-        let resp = agg.list_ingresses();
+        let resp = agg.list_ingresses(&ListParams::default());
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
         assert_eq!(body["ingresses"][0]["name"], "ing-a");
@@ -1966,7 +2766,9 @@ mod tests {
         );
         let agg = make_agg(fleet_with([pod]), SharedClusterSummary::default());
 
-        let resp = agg.get_proxy_routes("proxy-0").await;
+        let resp = agg
+            .get_proxy_routes("proxy-0", &ListParams::default())
+            .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
         assert_eq!(body["pod_name"], "proxy-0");
@@ -1986,7 +2788,9 @@ mod tests {
         );
         let agg = make_agg(fleet_with([pod]), SharedClusterSummary::default());
 
-        let resp = agg.get_proxy_routes("proxy-0").await;
+        let resp = agg
+            .get_proxy_routes("proxy-0", &ListParams::default())
+            .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
         assert_eq!(body["reachable"], false);
@@ -2060,12 +2864,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_controllers_reports_is_leader_from_cluster_endpoint() {
-        // The /cluster probe carries controller.leader; the reachable entry must
-        // surface it as is_leader so the UI doesn't misread a healthy
-        // single-leader cluster as having no elected leader.
-        let port =
-            start_mock_http(r#"{"controller":{"leader":true},"gateways":[],"ingresses":[]}"#).await;
+    async fn list_controllers_reports_is_leader_from_health_endpoint() {
+        // The /api/v1/health probe carries the top-level `leader` flag; the
+        // reachable entry must surface it as is_leader so the UI doesn't misread a
+        // healthy single-leader cluster as having no elected leader.
+        let port = start_mock_http(r#"{"version":"0.0.0","leader":true,"subsystems":{}}"#).await;
         let pods = [make_pod(
             "ctrl-leader",
             "controller",
@@ -2080,5 +2883,159 @@ mod tests {
         let leader = body["controllers"][0].clone();
         assert_eq!(leader["reachable"], true);
         assert_eq!(leader["is_leader"], true);
+    }
+
+    // ── effective-config serialization ────────────────────────────────────────
+
+    #[test]
+    fn httproute_rules_json_flattens_matches_backends_filters() {
+        let spec: gw_types::v::httproutes::HttpRouteSpec =
+            serde_json::from_value(serde_json::json!({
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "GET",
+                        "headers": [{"name": "x-env", "value": "prod"}],
+                        "queryParams": [{"name": "v", "value": "2"}]
+                    }],
+                    "backendRefs": [
+                        {"name": "api", "port": 8080, "weight": 90},
+                        {"name": "api-canary", "port": 8080, "weight": 10}
+                    ],
+                    "filters": [{"type": "RequestRedirect", "requestRedirect": {}}]
+                }]
+            }))
+            .expect("valid HTTPRoute spec");
+        let v = httproute_rules_json(&spec);
+        let rule = &v[0];
+        assert_eq!(rule["matches"][0]["path"]["type"], "PathPrefix");
+        assert_eq!(rule["matches"][0]["path"]["value"], "/api");
+        assert_eq!(rule["matches"][0]["method"], "GET");
+        assert_eq!(rule["matches"][0]["headers"][0]["name"], "x-env");
+        assert_eq!(rule["matches"][0]["headers"][0]["type"], "Exact");
+        assert_eq!(rule["matches"][0]["query_params"][0]["value"], "2");
+        assert_eq!(rule["backends"][0]["weight"], 90);
+        assert_eq!(rule["backends"][1]["name"], "api-canary");
+        assert_eq!(rule["filters"][0], "RequestRedirect");
+    }
+
+    #[test]
+    fn httproute_rules_json_defaults_path_when_match_omits_it() {
+        // A rule with no `matches` still renders its backends; a match with no
+        // path defaults to a PathPrefix on "/".
+        let spec: gw_types::v::httproutes::HttpRouteSpec =
+            serde_json::from_value(serde_json::json!({
+                "rules": [
+                    { "backendRefs": [{"name": "web", "port": 80}] },
+                    { "matches": [{"method": "POST"}] }
+                ]
+            }))
+            .expect("valid HTTPRoute spec");
+        let v = httproute_rules_json(&spec);
+        assert_eq!(
+            v[0]["matches"].as_array().expect("matches is array").len(),
+            0
+        );
+        assert_eq!(v[0]["backends"][0]["name"], "web");
+        assert_eq!(v[1]["matches"][0]["path"]["type"], "PathPrefix");
+        assert_eq!(v[1]["matches"][0]["path"]["value"], "/");
+    }
+
+    #[test]
+    fn filter_kind_str_uses_gateway_api_spelling() {
+        use gw_types::v::httproutes::HttpRouteRulesFiltersType as F;
+        assert_eq!(filter_kind_str(&F::UrlRewrite), "URLRewrite");
+        assert_eq!(filter_kind_str(&F::Cors), "CORS");
+        assert_eq!(
+            filter_kind_str(&F::RequestHeaderModifier),
+            "RequestHeaderModifier"
+        );
+    }
+
+    #[test]
+    fn ingress_rules_json_maps_host_paths_backend_and_tls() {
+        let spec: k8s_openapi::api::networking::v1::IngressSpec =
+            serde_json::from_value(serde_json::json!({
+                "ingressClassName": "coxswain",
+                "tls": [{"hosts": ["demo.local"], "secretName": "demo-tls"}],
+                "rules": [{
+                    "host": "demo.local",
+                    "http": {"paths": [
+                        {"path": "/", "pathType": "Prefix",
+                         "backend": {"service": {"name": "web", "port": {"number": 80}}}}
+                    ]}
+                }]
+            }))
+            .expect("valid Ingress spec");
+        let rules = ingress_rules_json(&spec);
+        assert_eq!(rules[0]["host"], "demo.local");
+        assert_eq!(rules[0]["paths"][0]["path"], "/");
+        assert_eq!(rules[0]["paths"][0]["path_type"], "Prefix");
+        assert_eq!(rules[0]["paths"][0]["backend"]["service"], "web");
+        assert_eq!(rules[0]["paths"][0]["backend"]["port"], "80");
+
+        let tls = ingress_tls_json(&spec);
+        assert_eq!(tls[0]["hosts"][0], "demo.local");
+        assert_eq!(tls[0]["secret"], "demo-tls");
+    }
+
+    // ── route check helpers ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn route_rows_for_filters_to_tagged_rows() {
+        let routes = serde_json::json!({
+            "gateway": { "hosts": [
+                { "host": "api.demo.local", "port": 8080, "routes": [
+                    {"name": "api-route", "namespace": "demo", "path": "/",
+                     "backend_group": "demo/api", "endpoints": []},
+                    {"name": "other", "namespace": "demo", "path": "/x",
+                     "backend_group": "demo/other", "endpoints": ["1.2.3.4:80"]}
+                ]}
+            ]}
+        });
+        let rows = route_rows_for(&routes, "gateway", "demo", "api-route");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["host"], "api.demo.local");
+        assert_eq!(rows[0]["path"], "/");
+        assert_eq!(rows[0]["backend_group"], "demo/api");
+        assert!(
+            rows[0]["endpoints"]
+                .as_array()
+                .expect("endpoints array")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn serving_proxies_for_parents_picks_dedicated_else_shared() {
+        let pods = [
+            make_pod("shared-0", "shared-proxy", "10.0.0.1", "8082", None),
+            make_pod("shared-1", "shared-proxy", "10.0.0.2", "8082", None),
+            make_pod(
+                "ded-demo",
+                "dedicated-proxy",
+                "10.0.0.3",
+                "8082",
+                Some("demo-gw"),
+            ),
+        ];
+        let snap = build_snapshot(pods.iter());
+
+        // Parent that owns a dedicated proxy → only that pod serves it.
+        let dedicated_parent: Vec<gw_types::v::httproutes::HttpRouteParentRefs> =
+            serde_json::from_value(serde_json::json!([{"name": "demo-gw"}]))
+                .expect("valid parentRefs");
+        let serving = serving_proxies_for_parents(&snap, "", &dedicated_parent);
+        let names: Vec<&str> = serving.iter().map(|e| e.pod_name.as_str()).collect();
+        assert_eq!(names, ["ded-demo"]);
+
+        // Parent with no dedicated proxy → the shared pool serves it.
+        let shared_parent: Vec<gw_types::v::httproutes::HttpRouteParentRefs> =
+            serde_json::from_value(serde_json::json!([{"name": "shared-gw"}]))
+                .expect("valid parentRefs");
+        let serving = serving_proxies_for_parents(&snap, "", &shared_parent);
+        let mut names: Vec<&str> = serving.iter().map(|e| e.pod_name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["shared-0", "shared-1"]);
     }
 }

@@ -1,0 +1,39 @@
+{
+  "name": "demo-ingress",
+  "namespace": "demo",
+  "status": "warn",
+  "class": "coxswain",
+  "tls": [
+    {
+      "hosts": [
+        "demo.local"
+      ],
+      "secret": "demo-tls"
+    }
+  ],
+  "default_backend": null,
+  "rules": [
+    {
+      "host": "demo.local",
+      "paths": [
+        {
+          "path": "/",
+          "path_type": "Prefix",
+          "backend": {
+            "service": "web",
+            "port": "80"
+          }
+        },
+        {
+          "path": "/api",
+          "path_type": "Prefix",
+          "backend": {
+            "service": "api",
+            "port": "8080"
+          }
+        }
+      ]
+    }
+  ],
+  "load_balancer": "192.168.194.180"
+}

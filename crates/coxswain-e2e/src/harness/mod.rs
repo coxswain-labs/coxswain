@@ -76,7 +76,7 @@ impl Harness {
     }
 
     /// Build an admin endpoint URL targeting the controller pod.
-    /// Use for controller-specific paths like `/api/v1/cluster`.
+    /// Use for controller-specific paths like `/api/v1/routing/gateways`.
     pub fn controller_admin_url(&self, path: &str) -> String {
         format!("http://{}{path}", self.controller.controller_admin_addr)
     }

@@ -384,8 +384,12 @@ async fn access_log_disabled_emits_nothing() -> anyhow::Result<()> {
 }
 
 /// Poll the controller's `/api/v1/problems` until `pick` returns a matching
-/// problem row, or fail after `timeout`. The aggregator fans out to proxies and
-/// the reconciler debounces, so allow a generous window.
+/// problem row in the routing aggregate, or fail after `timeout`. The aggregator
+/// fans out to proxies and the reconciler debounces, so allow a generous window.
+///
+/// `/problems` is the namespaced shape `{ fleet, routing: { conflicts,
+/// dead_routes } }` (#301), so `bucket` (`conflicts` | `dead_routes`) is read
+/// under `routing`, not at the top level.
 async fn wait_for_problem(
     h: &Harness,
     bucket: &str,
@@ -397,14 +401,14 @@ async fn wait_for_problem(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let json: serde_json::Value = client.get(&url).send().await?.json().await?;
-        if let Some(row) = json[bucket]
+        if let Some(row) = json["routing"][bucket]
             .as_array()
             .and_then(|a| a.iter().find(|r| pick(r)))
         {
             return Ok(row.clone());
         }
         if std::time::Instant::now() >= deadline {
-            anyhow::bail!("no matching `{bucket}` problem within timeout: {json}");
+            anyhow::bail!("no matching `routing.{bucket}` problem within timeout: {json}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -491,14 +495,14 @@ async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
 
     // Discover a live controller pod name from the aggregator's fleet view.
     let controllers: serde_json::Value = client
-        .get(h.controller_admin_url("/api/v1/controllers"))
+        .get(h.controller_admin_url("/api/v1/fleet/controllers"))
         .send()
         .await?
         .json()
         .await?;
     let pod = controllers["controllers"][0]["pod_name"]
         .as_str()
-        .expect("/api/v1/controllers must list at least one controller pod");
+        .expect("/api/v1/fleet/controllers must list at least one controller pod");
     let logs_path = format!("/api/v1/pods/{pod}/logs?tail=10&follow=false");
 
     // Controller relays the snapshot: 200 with a non-empty body.

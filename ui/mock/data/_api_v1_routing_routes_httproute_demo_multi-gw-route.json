@@ -1,0 +1,111 @@
+{
+  "name": "multi-gw-route",
+  "namespace": "demo",
+  "status": "ok",
+  "hostnames": [
+    "app.demo.local",
+    "app.staging.local"
+  ],
+  "parent_statuses": [
+    {
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        },
+        {
+          "type": "ResolvedRefs",
+          "status": "True",
+          "reason": "ResolvedRefs"
+        }
+      ],
+      "parent_ref": {
+        "name": "demo-gw",
+        "namespace": null
+      }
+    },
+    {
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        },
+        {
+          "type": "ResolvedRefs",
+          "status": "True",
+          "reason": "ResolvedRefs"
+        }
+      ],
+      "parent_ref": {
+        "name": "staging-gw",
+        "namespace": "staging"
+      }
+    }
+  ],
+  "rules": [
+    {
+      "matches": [
+        {
+          "path": {
+            "type": "PathPrefix",
+            "value": "/"
+          },
+          "method": null,
+          "headers": [],
+          "query_params": []
+        }
+      ],
+      "backends": [
+        {
+          "name": "web",
+          "namespace": "demo",
+          "port": 80,
+          "weight": null
+        }
+      ],
+      "filters": []
+    },
+    {
+      "matches": [
+        {
+          "path": {
+            "type": "PathPrefix",
+            "value": "/admin"
+          },
+          "method": "GET",
+          "headers": [
+            {
+              "name": "x-internal",
+              "type": "Exact",
+              "value": "true"
+            }
+          ],
+          "query_params": []
+        }
+      ],
+      "backends": [
+        {
+          "name": "admin",
+          "namespace": "demo",
+          "port": 80,
+          "weight": null
+        }
+      ],
+      "filters": [
+        "RequestHeaderModifier"
+      ]
+    }
+  ]
+}

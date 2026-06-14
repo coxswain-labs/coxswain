@@ -1,0 +1,37 @@
+{
+  "ingresses": [
+    {
+      "name": "demo-ingress",
+      "namespace": "demo",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.168.194.180",
+      "status": "warn"
+    },
+    {
+      "name": "frontend-ingress",
+      "namespace": "demo",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.168.194.180",
+      "status": "warn"
+    },
+    {
+      "name": "staging-ingress",
+      "namespace": "staging",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "status": "error"
+    },
+    {
+      "name": "tenant-b-ingress",
+      "namespace": "tenant-b",
+      "route_count": 1,
+      "load_balancer": "192.168.194.181",
+      "status": "ok"
+    }
+  ],
+  "total": 4,
+  "returned": 4,
+  "offset": 0
+}

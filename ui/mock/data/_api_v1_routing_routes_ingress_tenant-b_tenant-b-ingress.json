@@ -1,0 +1,27 @@
+{
+  "name": "tenant-b-ingress",
+  "namespace": "tenant-b",
+  "status": "ok",
+  "class": "",
+  "tls": [],
+  "default_backend": {
+    "service": "web",
+    "port": "80"
+  },
+  "rules": [
+    {
+      "host": "app.tenant-b.local",
+      "paths": [
+        {
+          "path": "/",
+          "path_type": "Prefix",
+          "backend": {
+            "service": "web",
+            "port": "80"
+          }
+        }
+      ]
+    }
+  ],
+  "load_balancer": "192.168.194.181"
+}

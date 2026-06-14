@@ -181,9 +181,10 @@ The dedicated-proxy permissions come from a single static `ClusterRole` `coxswai
 |---|:-:|:-:|:-:|
 | `/healthz`, `/readyz` | ✓ | ✓ | ✓ |
 | `/metrics` | ✓ (reconcile counts, leader status) | ✓ (traffic, errors) | ✓ (scoped to this Gateway) |
-| `/api/v1/health` | ✓ (subsystem detail) | ✓ | ✓ |
+| `/api/v1/health` | ✓ (subsystem detail, version, leader) | ✓ | ✓ |
 | `/routes` | — | ✓ | ✓ |
-| `/api/v1/cluster` | ✓ (all Gateways/Ingresses aggregate) | — | — |
+| `GET /` (operator UI) + `/api/v1/{fleet,routing}/*` | ✓ (cluster-wide aggregate + summaries) | — | — |
+| `/api/v1/{problems,events,manifests/*,pods/*/logs}` | ✓ | — | — |
 
 ## Request path
 

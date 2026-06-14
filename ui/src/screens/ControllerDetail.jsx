@@ -45,6 +45,7 @@ export function ControllerDetail({ pod }) {
 
   const breadcrumb = [
     { label: 'Fleet', onClick: () => nav.fleet() },
+    { label: 'Controllers', onClick: () => nav.fleet({ filter: 'controllers' }) },
     { label: pod },
   ];
 

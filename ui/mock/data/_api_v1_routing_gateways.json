@@ -1,16 +1,6 @@
 {
-  "kubernetes_version": "v1.31.2",
-  "controller": {
-    "leader": true
-  },
   "gateways": [
     {
-      "name": "demo-gw",
-      "namespace": "demo",
-      "proxy": {
-        "pool": "shared"
-      },
-      "route_count": 4,
       "addresses": [],
       "conditions": [
         {
@@ -23,15 +13,16 @@
           "status": "True",
           "reason": "Programmed"
         }
-      ]
+      ],
+      "name": "demo-gw",
+      "namespace": "demo",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
     },
     {
-      "name": "tenant-a-gw",
-      "namespace": "tenant-a",
-      "proxy": {
-        "pool": "dedicated"
-      },
-      "route_count": 1,
       "addresses": [
         "192.168.194.187"
       ],
@@ -52,15 +43,16 @@
           "reason": "Ready",
           "message": "Dedicated proxy has at least one Ready pod"
         }
-      ]
-    },
-    {
-      "name": "tenant-b-gw",
-      "namespace": "tenant-b",
+      ],
+      "name": "tenant-a-gw",
+      "namespace": "tenant-a",
       "proxy": {
         "pool": "dedicated"
       },
       "route_count": 1,
+      "status": "ok"
+    },
+    {
       "addresses": [],
       "conditions": [
         {
@@ -80,15 +72,16 @@
           "reason": "NoReadyPods",
           "message": "Dedicated proxy has no Ready pods yet"
         }
-      ]
+      ],
+      "name": "tenant-b-gw",
+      "namespace": "tenant-b",
+      "proxy": {
+        "pool": "dedicated"
+      },
+      "route_count": 1,
+      "status": "error"
     },
     {
-      "name": "staging-gw",
-      "namespace": "staging",
-      "proxy": {
-        "pool": "shared"
-      },
-      "route_count": 0,
       "addresses": [],
       "conditions": [
         {
@@ -97,29 +90,17 @@
           "reason": "NoMatchingListener",
           "message": "No listener matches this parent ref"
         }
-      ]
+      ],
+      "name": "staging-gw",
+      "namespace": "staging",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 0,
+      "status": "error"
     }
   ],
-  "ingresses": [
-    {
-      "name": "demo-ingress",
-      "namespace": "demo",
-      "route_count": 2
-    },
-    {
-      "name": "frontend-ingress",
-      "namespace": "demo",
-      "route_count": 1
-    },
-    {
-      "name": "staging-ingress",
-      "namespace": "staging",
-      "route_count": 2
-    },
-    {
-      "name": "tenant-b-ingress",
-      "namespace": "tenant-b",
-      "route_count": 1
-    }
-  ]
+  "total": 4,
+  "returned": 4,
+  "offset": 0
 }

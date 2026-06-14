@@ -69,8 +69,8 @@ pub struct ControllerProcess {
     /// the shared-proxy pod.
     pub admin_addr: SocketAddr,
     /// Local port-forwarded address for the controller pod's admin endpoint.
-    /// Serves `/api/v1/cluster`, `/api/v1/health`, and the aggregator surface
-    /// `/api/v1/{proxies,controllers,gateways,ingresses,routes/*}`.
+    /// Serves `/api/v1/health` and the aggregator surface
+    /// `/api/v1/{fleet,routing}/*` plus `/api/v1/{problems,manifests/*}`.
     /// The unprefixed `/routes` returns 404 on the controller — use the proxy
     /// admin (`admin_addr`) for the raw per-pod routing table.
     pub controller_admin_addr: SocketAddr,

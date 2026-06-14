@@ -1,8 +1,9 @@
 /**
  * Endpoint-health indicator for a route table row.
  *
- * Renders "N endpoints" when healthy, or a bold amber warning when 0
- * endpoints — the most common cause of "route accepted but returns 503".
+ * Renders "N endpoints" when healthy, or "0 endpoints" in amber when none — the
+ * most common cause of "route accepted but returns 503". No glyph: the row's
+ * severity edge carries the alert; this is just the count.
  */
 export function EndpointHealth({ endpoints = [] }) {
   const count = endpoints.length;
@@ -13,7 +14,7 @@ export function EndpointHealth({ endpoints = [] }) {
         title="No ready endpoints — Service has no ready Pods"
         aria-label="0 endpoints: no ready pods"
       >
-        ⚠ 0 endpoints
+        0 endpoints
       </span>
     );
   }

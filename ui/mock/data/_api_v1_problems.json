@@ -1,125 +1,173 @@
 {
-  "conflicts": [
-    {
-      "host": "demo.local",
-      "path": "/",
-      "rejected_group": "demo/old-frontend",
-      "kind": "ingress",
-      "pods": [
-        "coxswain-shared-proxy-66d-ah7x2",
-        "coxswain-shared-proxy-66d-bk9p4"
-      ],
-      "route": {
-        "kind": "Ingress",
-        "namespace": "demo",
-        "name": "frontend-ingress"
+  "fleet": {
+    "leaderless": false,
+    "unreachable": [
+      {
+        "pod_name": "coxswain-controller-7f9c8-gone",
+        "pod_namespace": "coxswain-system",
+        "component": "controller",
+        "reachable": false
+      },
+      {
+        "pod_name": "tenant-b-gw-coxswain-5cc91-zzz00",
+        "pod_namespace": "tenant-b",
+        "component": "dedicated-proxy",
+        "reachable": false
       }
-    },
-    {
-      "host": "app.demo.local",
-      "path": "/",
-      "rejected_group": "demo/legacy-api",
-      "kind": "gateway",
-      "pods": [
-        "coxswain-shared-proxy-66d-ah7x2",
-        "coxswain-shared-proxy-66d-bk9p4"
-      ],
-      "route": {
-        "kind": "HTTPRoute",
-        "namespace": "demo",
-        "name": "web-route"
+    ],
+    "degraded": [
+      {
+        "pod_name": "coxswain-controller-7f9c8-degrd",
+        "pod_namespace": "coxswain-system",
+        "component": "controller",
+        "reachable": true,
+        "degraded_checks": [
+          "gateway"
+        ]
+      },
+      {
+        "pod_name": "coxswain-shared-proxy-66d-bk9p4",
+        "pod_namespace": "coxswain-system",
+        "component": "shared-proxy",
+        "reachable": true,
+        "degraded_checks": [
+          "routing_table_loaded"
+        ]
+      },
+      {
+        "pod_name": "tenant-a-gw-coxswain-7db74-r5tfb",
+        "pod_namespace": "tenant-a",
+        "component": "dedicated-proxy",
+        "reachable": true,
+        "degraded_checks": [
+          "routing_table_loaded"
+        ]
       }
-    }
-  ],
-  "dead_routes": [
-    {
-      "host": "api.demo.local",
-      "path": "/",
-      "backend_group": "demo/api",
-      "kind": "gateway",
-      "pods": [
-        "coxswain-shared-proxy-66d-ah7x2",
-        "coxswain-shared-proxy-66d-bk9p4"
-      ],
-      "route": {
-        "kind": "HTTPRoute",
-        "namespace": "demo",
-        "name": "api-route"
+    ]
+  },
+  "routing": {
+    "conflicts": [
+      {
+        "host": "demo.local",
+        "path": "/",
+        "rejected_group": "demo/old-frontend",
+        "kind": "ingress",
+        "pods": [
+          "coxswain-shared-proxy-66d-ah7x2",
+          "coxswain-shared-proxy-66d-bk9p4"
+        ],
+        "route": {
+          "kind": "Ingress",
+          "namespace": "demo",
+          "name": "frontend-ingress"
+        }
+      },
+      {
+        "host": "app.demo.local",
+        "path": "/",
+        "rejected_group": "demo/legacy-api",
+        "kind": "gateway",
+        "pods": [
+          "coxswain-shared-proxy-66d-ah7x2",
+          "coxswain-shared-proxy-66d-bk9p4"
+        ],
+        "route": {
+          "kind": "HTTPRoute",
+          "namespace": "demo",
+          "name": "web-route"
+        }
       }
-    },
-    {
-      "host": "app.demo.local",
-      "path": "/health",
-      "backend_group": "demo/api",
-      "kind": "gateway",
-      "pods": [
-        "coxswain-shared-proxy-66d-ah7x2",
-        "coxswain-shared-proxy-66d-bk9p4"
-      ],
-      "route": {
-        "kind": "HTTPRoute",
-        "namespace": "demo",
-        "name": "health-probe-route"
+    ],
+    "dead_routes": [
+      {
+        "host": "api.demo.local",
+        "path": "/",
+        "backend_group": "demo/api",
+        "kind": "gateway",
+        "pods": [
+          "coxswain-shared-proxy-66d-ah7x2",
+          "coxswain-shared-proxy-66d-bk9p4"
+        ],
+        "route": {
+          "kind": "HTTPRoute",
+          "namespace": "demo",
+          "name": "api-route"
+        }
+      },
+      {
+        "host": "app.demo.local",
+        "path": "/health",
+        "backend_group": "demo/api",
+        "kind": "gateway",
+        "pods": [
+          "coxswain-shared-proxy-66d-ah7x2",
+          "coxswain-shared-proxy-66d-bk9p4"
+        ],
+        "route": {
+          "kind": "HTTPRoute",
+          "namespace": "demo",
+          "name": "health-probe-route"
+        }
+      },
+      {
+        "host": "demo.local",
+        "path": "/api",
+        "backend_group": "demo/api",
+        "kind": "ingress",
+        "pods": [
+          "coxswain-shared-proxy-66d-ah7x2",
+          "coxswain-shared-proxy-66d-bk9p4"
+        ],
+        "route": {
+          "kind": "Ingress",
+          "namespace": "demo",
+          "name": "demo-ingress"
+        }
+      },
+      {
+        "host": "staging.local",
+        "path": "/",
+        "backend_group": "staging/app",
+        "kind": "ingress",
+        "pods": [
+          "coxswain-shared-proxy-66d-ah7x2",
+          "coxswain-shared-proxy-66d-bk9p4"
+        ],
+        "route": {
+          "kind": "Ingress",
+          "namespace": "staging",
+          "name": "staging-ingress"
+        }
+      },
+      {
+        "host": "staging.local",
+        "path": "/api",
+        "backend_group": "staging/app",
+        "kind": "ingress",
+        "pods": [
+          "coxswain-shared-proxy-66d-ah7x2",
+          "coxswain-shared-proxy-66d-bk9p4"
+        ],
+        "route": {
+          "kind": "Ingress",
+          "namespace": "staging",
+          "name": "staging-ingress"
+        }
+      },
+      {
+        "host": "app.tenant-b.local",
+        "path": "/",
+        "backend_group": "tenant-b/api",
+        "kind": "gateway",
+        "pods": [
+          "tenant-b-gw-coxswain-5cc91-m2qd8"
+        ],
+        "route": {
+          "kind": "HTTPRoute",
+          "namespace": "tenant-b",
+          "name": "b-api-route"
+        }
       }
-    },
-    {
-      "host": "demo.local",
-      "path": "/api",
-      "backend_group": "demo/api",
-      "kind": "ingress",
-      "pods": [
-        "coxswain-shared-proxy-66d-ah7x2",
-        "coxswain-shared-proxy-66d-bk9p4"
-      ],
-      "route": {
-        "kind": "Ingress",
-        "namespace": "demo",
-        "name": "demo-ingress"
-      }
-    },
-    {
-      "host": "staging.local",
-      "path": "/",
-      "backend_group": "staging/app",
-      "kind": "ingress",
-      "pods": [
-        "coxswain-shared-proxy-66d-ah7x2",
-        "coxswain-shared-proxy-66d-bk9p4"
-      ],
-      "route": {
-        "kind": "Ingress",
-        "namespace": "staging",
-        "name": "staging-ingress"
-      }
-    },
-    {
-      "host": "staging.local",
-      "path": "/api",
-      "backend_group": "staging/app",
-      "kind": "ingress",
-      "pods": [
-        "coxswain-shared-proxy-66d-ah7x2",
-        "coxswain-shared-proxy-66d-bk9p4"
-      ],
-      "route": {
-        "kind": "Ingress",
-        "namespace": "staging",
-        "name": "staging-ingress"
-      }
-    },
-    {
-      "host": "app.tenant-b.local",
-      "path": "/",
-      "backend_group": "tenant-b/api",
-      "kind": "gateway",
-      "pods": [
-        "tenant-b-gw-coxswain-5cc91-m2qd8"
-      ],
-      "route": {
-        "kind": "HTTPRoute",
-        "namespace": "tenant-b",
-        "name": "b-api-route"
-      }
-    }
-  ]
+    ]
+  }
 }

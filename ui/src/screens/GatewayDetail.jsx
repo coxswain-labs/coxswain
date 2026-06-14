@@ -1,9 +1,12 @@
 import { useState } from 'preact/hooks';
 import { useApi } from '../hooks/useApi.js';
-import { getGateway } from '../api/endpoints.js';
+import { getGateway, getProblems } from '../api/endpoints.js';
 import { nav } from '../router.js';
+import { worseSeverity, problemRouteKeys, routeKey, sevClass, sevTitle } from '../severity.js';
 import { Breadcrumb } from '../components/Breadcrumb.jsx';
-import { Badge, poolBadge } from '../components/Badge.jsx';
+import { poolBadge } from '../components/Badge.jsx';
+import { DetailHeader } from '../components/DetailHeader.jsx';
+import { StatusBadge } from '../components/StatusBadge.jsx';
 import { ConditionRow } from '../components/ConditionRow.jsx';
 import { ListenerRow } from '../components/ListenerRow.jsx';
 import { ManifestDialog } from '../components/ManifestDialog.jsx';
@@ -18,7 +21,7 @@ import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
  *   Listeners with 0 attached routes are highlighted — the Gateway is
  *   accepted but nothing routes through that listener.
  * - Status conditions.
- * - Attached HTTPRoutes (links to Route Inspector).
+ * - Attached routes (link to the route detail screen).
  * - Proxy pool badge + addresses.
  *
  * The endpoint was expanded (in aggregator.rs) to include `listeners[]`
@@ -30,11 +33,17 @@ export function GatewayDetail({ namespace, name }) {
     () => getGateway(namespace, name),
     [namespace, name],
   );
+  // Overlay the cross-proxy /problems aggregate so dead/conflict routes on this
+  // Gateway light up even when the controller's table dropped them (cut-over
+  // dedicated gateways) — same overlay the routing tables use.
+  const problems = useApi(getProblems);
+  const problemKeys = problemRouteKeys(problems.data);
   const [showManifest, setShowManifest] = useState(false);
 
   const breadcrumb = [
-    { label: 'Routing', onClick: () => nav.routing({ filter: 'gateways' }) },
-    { label: `${namespace}/${name}` },
+    { label: 'Routing', onClick: () => nav.routing() },
+    { label: 'Gateways', onClick: () => nav.routing({ tab: 'gateways' }) },
+    { label: name },
   ];
 
   if (loading) return <Spinner label="Loading gateway…" />;
@@ -48,6 +57,7 @@ export function GatewayDetail({ namespace, name }) {
     proxy,
     addresses = [],
     route_count,
+    status,
   } = data;
 
   const pool = proxy?.pool ?? 'shared';
@@ -56,23 +66,27 @@ export function GatewayDetail({ namespace, name }) {
     <div class="screen">
       <Breadcrumb items={breadcrumb} />
 
-      <div class="screen-header">
-        <div>
-          <h1 class="screen-title">{name}</h1>
-          <div class="screen-meta">{namespace}</div>
-        </div>
-        <div class="header-badges">
-          {poolBadge(pool)}
-          {addresses.length > 0 && (
-            <span class="addr-label" title="Load-balancer addresses">
-              {addresses.join(', ')}
-            </span>
-          )}
+      <DetailHeader
+        name={name}
+        namespace={namespace}
+        copyLabel="Copy gateway name"
+        meta={addresses.length > 0 && (
+          <div class="problem-card-meta" title="Load-balancer addresses">
+            Address: <code>{addresses.join(', ')}</code>
+          </div>
+        )}
+        badges={(
+          <>
+            <StatusBadge status={status} />
+            {poolBadge(pool)}
+          </>
+        )}
+        actions={(
           <button class="btn btn-icon" onClick={() => setShowManifest(true)}>
             <Icon name="code" size={15} /> Manifest
           </button>
-        </div>
-      </div>
+        )}
+      />
 
       {showManifest && (
         <ManifestDialog
@@ -114,10 +128,20 @@ export function GatewayDetail({ namespace, name }) {
       {conditions.length > 0 && (
         <section aria-label="Status conditions">
           <h2 class="section-title">Conditions</h2>
-          <div class="cond-list">
-            {conditions.map((c) => (
-              <ConditionRow key={c.type} condition={c} />
-            ))}
+          <div class="tbl-wrap">
+            <table class="cond-table">
+              <thead>
+                <tr>
+                  <th>Condition</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {conditions.map((c) => (
+                  <ConditionRow key={c.type} condition={c} />
+                ))}
+              </tbody>
+            </table>
           </div>
         </section>
       )}
@@ -129,24 +153,42 @@ export function GatewayDetail({ namespace, name }) {
             Attached routes
             <span class="section-count">{route_count ?? attached_routes_list.length}</span>
           </h2>
-          <div class="attached-routes">
-            {attached_routes_list.map((r) => (
-              <div
-                key={`${r.namespace}/${r.name}`}
-                class="attached-route-row clickable"
-                onClick={() =>
-                  r.kind === 'HTTPRoute'
-                    ? nav.httproute(r.namespace, r.name)
-                    : nav.ingressRoute(r.namespace, r.name)
-                }
-              >
-                <Badge variant="neutral">{r.kind}</Badge>
-                <span>
-                  <span class="ns-label">{r.namespace}/</span>
-                  <strong>{r.name}</strong>
-                </span>
-              </div>
-            ))}
+          <div class="tbl-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Namespace</th>
+                  <th>Hostnames</th>
+                  <th>Rules</th>
+                </tr>
+              </thead>
+              <tbody>
+                {attached_routes_list.map((r) => {
+                  const status = worseSeverity(
+                    r.status,
+                    problemKeys.has(routeKey(r.kind, r.namespace, r.name)) ? 'warn' : 'ok',
+                  );
+                  return (
+                    <tr
+                      key={`${r.namespace}/${r.name}`}
+                      class={`clickable ${sevClass(status)}`}
+                      title={sevTitle(status)}
+                      onClick={() =>
+                        r.kind === 'HTTPRoute'
+                          ? nav.httproute(r.namespace, r.name)
+                          : nav.ingressRoute(r.namespace, r.name)
+                      }
+                    >
+                      <td>{r.name}</td>
+                      <td>{r.namespace}</td>
+                      <td>{(r.hostnames ?? []).join(', ') || '—'}</td>
+                      <td>{r.rule_count ?? 0}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         </section>
       )}

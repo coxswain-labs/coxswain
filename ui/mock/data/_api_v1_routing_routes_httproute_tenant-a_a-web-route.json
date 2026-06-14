@@ -1,0 +1,57 @@
+{
+  "name": "a-web-route",
+  "namespace": "tenant-a",
+  "status": "ok",
+  "hostnames": [
+    "app.tenant-a.local"
+  ],
+  "parent_statuses": [
+    {
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        },
+        {
+          "type": "ResolvedRefs",
+          "status": "True",
+          "reason": "ResolvedRefs"
+        }
+      ],
+      "parent_ref": {
+        "name": "tenant-a-gw",
+        "namespace": null
+      }
+    }
+  ],
+  "rules": [
+    {
+      "matches": [
+        {
+          "path": {
+            "type": "PathPrefix",
+            "value": "/"
+          },
+          "method": null,
+          "headers": [],
+          "query_params": []
+        }
+      ],
+      "backends": [
+        {
+          "name": "web",
+          "namespace": "tenant-a",
+          "port": 80,
+          "weight": null
+        }
+      ],
+      "filters": []
+    }
+  ]
+}

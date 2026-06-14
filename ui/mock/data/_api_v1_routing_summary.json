@@ -1,0 +1,21 @@
+{
+  "gateways": {
+    "total": 4,
+    "worst": "error"
+  },
+  "httproutes": {
+    "total": 138,
+    "worst": "error"
+  },
+  "ingresses": {
+    "total": 4,
+    "worst": "error"
+  },
+  "namespaces": [
+    "bulk",
+    "demo",
+    "staging",
+    "tenant-a",
+    "tenant-b"
+  ]
+}

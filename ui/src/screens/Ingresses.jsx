@@ -1,53 +1,47 @@
 import { matchesSearch } from '../hooks/useSearch.js';
 import { nav } from '../router.js';
-import { Badge } from '../components/Badge.jsx';
-import { Card, CardHeader, CardFooter, CardGrid } from '../components/Card.jsx';
-import { ErrorState, EmptyState } from '../components/Spinner.jsx';
+import { DataTable } from '../components/DataTable.jsx';
+import { worseSeverity, routeKey, sevClass, sevTitle } from '../severity.js';
 
 /**
- * Ingresses section — a list of all Ingress resources the controller knows
- * about, each card linking to the Route Inspector. Presentational: the owning
- * Routing screen fetches the data and supplies the type/namespace/search
- * filters (see GatewaysSection).
+ * Ingresses section — a table of all Ingress resources the controller knows
+ * about, each row linking to the Route Detail (per-proxy compilation view).
+ * Presentational: the owning Routing screen supplies the filters (see
+ * GatewaysSection).
  */
-export function IngressesSection({ ingresses = [], loading = false, error = null, q = '', ns = 'all' }) {
-  const shown = ingresses.filter(
-    (ing) => (ns === 'all' || ing.namespace === ns) && matchesSearch(ing.name, 'ingress', q),
+export function IngressesSection({ rows = [], total, page, loading = false, error = null, q = '', ns = 'all', problemsOnly = false, problemKeys }) {
+  // Overlay /problems (conflicts/dead-routes) onto the reflector-computed status.
+  const rowStatus = (ing) =>
+    worseSeverity(ing.status, problemKeys?.has(routeKey('Ingress', ing.namespace, ing.name)) ? 'warn' : 'ok');
+  const shown = rows.filter(
+    (ing) =>
+      (ns === 'all' || ing.namespace === ns) &&
+      (!problemsOnly || rowStatus(ing) !== 'ok') &&
+      matchesSearch(ing.name, 'ingress', q),
   );
-  const filtering = q !== '' || ns !== 'all';
-
   return (
-    <section aria-label="Ingresses">
-      <div class="section-head">
-        <h2 class="section-title">Ingresses</h2>
-        <span class="section-count">{shown.length}</span>
-        {loading && <span class="section-spinner" aria-label="Loading" />}
-      </div>
-      {error ? (
-        <ErrorState error={error} />
-      ) : shown.length === 0 && !loading ? (
-        <EmptyState message={filtering ? 'No Ingresses match.' : 'No Ingresses found.'} />
-      ) : (
-        <CardGrid>
-          {shown.map((ing) => (
-            <IngressCard key={`${ing.namespace}/${ing.name}`} ing={ing} />
-          ))}
-        </CardGrid>
+    <DataTable
+      columns={['Name', 'Namespace', 'Class', 'Address', 'Rules']}
+      rows={shown}
+      total={total}
+      page={page}
+      loading={loading}
+      error={error}
+      emptyMsg="No Ingresses."
+      renderRow={(ing) => (
+        <tr
+          key={`${ing.namespace}/${ing.name}`}
+          class={`clickable ${sevClass(rowStatus(ing))}`}
+          title={sevTitle(rowStatus(ing))}
+          onClick={() => nav.ingressRoute(ing.namespace, ing.name)}
+        >
+          <td>{ing.name}</td>
+          <td>{ing.namespace}</td>
+          <td>{ing.ingress_class || '—'}</td>
+          <td>{ing.load_balancer || '—'}</td>
+          <td>{ing.route_count ?? 0}</td>
+        </tr>
       )}
-    </section>
-  );
-}
-
-function IngressCard({ ing }) {
-  return (
-    <Card onClick={() => nav.ingressRoute(ing.namespace, ing.name)}>
-      <CardHeader
-        name={ing.name}
-        badge={<Badge variant="neutral">ingress</Badge>}
-      />
-      <CardFooter
-        left={`${ing.namespace} · ${ing.route_count ?? 0} rule${ing.route_count !== 1 ? 's' : ''}`}
-      />
-    </Card>
+    />
   );
 }

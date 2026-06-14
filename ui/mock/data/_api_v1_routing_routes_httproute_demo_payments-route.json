@@ -1,6 +1,10 @@
 {
   "name": "payments-route",
   "namespace": "demo",
+  "status": "error",
+  "hostnames": [
+    "pay.demo.local"
+  ],
   "parent_statuses": [
     {
       "conditions": [
@@ -28,5 +32,36 @@
       }
     }
   ],
-  "proxies": []
+  "rules": [
+    {
+      "matches": [
+        {
+          "path": {
+            "type": "PathPrefix",
+            "value": "/"
+          },
+          "method": null,
+          "headers": [],
+          "query_params": []
+        }
+      ],
+      "backends": [
+        {
+          "name": "payments",
+          "namespace": "demo",
+          "port": 8080,
+          "weight": 90
+        },
+        {
+          "name": "payments-canary",
+          "namespace": "demo",
+          "port": 8080,
+          "weight": 10
+        }
+      ],
+      "filters": [
+        "RequestRedirect"
+      ]
+    }
+  ]
 }

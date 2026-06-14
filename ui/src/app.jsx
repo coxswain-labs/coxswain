@@ -3,7 +3,8 @@ import { Nav } from './components/Nav.jsx';
 import { Dashboard } from './screens/Dashboard.jsx';
 import { Fleet } from './screens/Fleet.jsx';
 import { Routing } from './screens/Routing.jsx';
-import { RouteInspector } from './screens/RouteInspector.jsx';
+import { HTTPRouteDetail } from './screens/HTTPRouteDetail.jsx';
+import { IngressDetail } from './screens/IngressDetail.jsx';
 import { ProxyDetail } from './screens/ProxyDetail.jsx';
 import { ControllerDetail } from './screens/ControllerDetail.jsx';
 import { GatewayDetail } from './screens/GatewayDetail.jsx';
@@ -48,15 +49,10 @@ function ActiveScreen({ screen, params, query }) {
     case 'controller-detail':
       return <ControllerDetail pod={params.pod} />;
 
-    case 'route-inspector':
-      return (
-        <RouteInspector
-          kind={params.kind}
-          namespace={params.ns}
-          name={params.name}
-          query={query}
-        />
-      );
+    case 'route-detail':
+      return params.kind === 'ingress'
+        ? <IngressDetail namespace={params.ns} name={params.name} />
+        : <HTTPRouteDetail namespace={params.ns} name={params.name} />;
 
     case 'gateway-detail':
       return <GatewayDetail namespace={params.ns} name={params.name} />;

@@ -1,0 +1,57 @@
+{
+  "name": "web-route",
+  "namespace": "demo",
+  "status": "warn",
+  "hostnames": [
+    "app.demo.local"
+  ],
+  "parent_statuses": [
+    {
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        },
+        {
+          "type": "ResolvedRefs",
+          "status": "True",
+          "reason": "ResolvedRefs"
+        }
+      ],
+      "parent_ref": {
+        "name": "demo-gw",
+        "namespace": null
+      }
+    }
+  ],
+  "rules": [
+    {
+      "matches": [
+        {
+          "path": {
+            "type": "PathPrefix",
+            "value": "/"
+          },
+          "method": null,
+          "headers": [],
+          "query_params": []
+        }
+      ],
+      "backends": [
+        {
+          "name": "web",
+          "namespace": "demo",
+          "port": 80,
+          "weight": null
+        }
+      ],
+      "filters": []
+    }
+  ]
+}

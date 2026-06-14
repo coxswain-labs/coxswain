@@ -1,0 +1,57 @@
+{
+  "name": "health-probe-route",
+  "namespace": "demo",
+  "status": "error",
+  "hostnames": [
+    "app.demo.local"
+  ],
+  "parent_statuses": [
+    {
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        },
+        {
+          "type": "ResolvedRefs",
+          "status": "True",
+          "reason": "ResolvedRefs"
+        }
+      ],
+      "parent_ref": {
+        "name": "demo-gw",
+        "namespace": null
+      }
+    }
+  ],
+  "rules": [
+    {
+      "matches": [
+        {
+          "path": {
+            "type": "PathPrefix",
+            "value": "/health"
+          },
+          "method": null,
+          "headers": [],
+          "query_params": []
+        }
+      ],
+      "backends": [
+        {
+          "name": "api",
+          "namespace": "demo",
+          "port": 8080,
+          "weight": null
+        }
+      ],
+      "filters": []
+    }
+  ]
+}

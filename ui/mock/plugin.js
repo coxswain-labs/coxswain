@@ -33,6 +33,31 @@ function fixtureFile(urlPath) {
   return join(DATA_DIR, `${urlPath.replace(/\//g, '_')}.json`);
 }
 
+/** Routing list endpoints → the array key in their fixture. These honour the
+ *  shared filter/pagination params (name/namespace/status/limit/offset) so dev
+ *  matches the controller: filter the fixture's rows, then window them. */
+const LIST_KEYS = {
+  '/api/v1/routing/gateways': 'gateways',
+  '/api/v1/routing/httproutes': 'httproutes',
+  '/api/v1/routing/ingresses': 'ingresses',
+};
+
+/** Apply `?name=&namespace=&status=&limit=&offset=` to a list fixture, mirroring
+ *  the backend's filter + window + envelope. */
+function pageList(fixture, key, params) {
+  let rows = fixture[key] ?? [];
+  const name = (params.get('name') || '').toLowerCase();
+  const ns = (params.get('namespace') || '').toLowerCase();
+  if (name) rows = rows.filter((r) => (r.name || '').toLowerCase().includes(name));
+  if (ns) rows = rows.filter((r) => (r.namespace || '').toLowerCase() === ns);
+  if (params.get('status') === 'problem') rows = rows.filter((r) => r.status && r.status !== 'ok');
+  const total = rows.length;
+  const offset = Math.max(0, Number.parseInt(params.get('offset') || '0', 10) || 0);
+  const limit = Math.min(1000, Number.parseInt(params.get('limit') || '200', 10) || 200);
+  const windowed = rows.slice(offset, offset + limit);
+  return { [key]: windowed, total, returned: windowed.length, offset };
+}
+
 /** Named events mirroring `events.rs`, looped to drive the live UI. */
 const SSE_EVENTS = [
   ['rebuild.completed', { cycle: 7, published: true }],
@@ -102,6 +127,17 @@ export function mockApi() {
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'no-store');
         const file = fixtureFile(url);
+
+        // Routing list endpoints: serve a filtered + windowed page from the full
+        // fixture so search/namespace/pagination behave like the controller.
+        const listKey = LIST_KEYS[url];
+        if (listKey && existsSync(file)) {
+          const params = new URLSearchParams((req.url || '').split('?')[1] || '');
+          const fixture = JSON.parse(readFileSync(file, 'utf8'));
+          res.end(JSON.stringify(pageList(fixture, listKey, params)));
+          return;
+        }
+
         if (existsSync(file)) {
           res.end(readFileSync(file));
         } else {

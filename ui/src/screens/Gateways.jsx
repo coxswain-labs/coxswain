@@ -1,58 +1,66 @@
 import { matchesSearch } from '../hooks/useSearch.js';
 import { nav } from '../router.js';
-import { Badge } from '../components/Badge.jsx';
-import { Card, CardHeader, CardFooter, CardGrid } from '../components/Card.jsx';
-import { StatusDot } from '../components/StatusDot.jsx';
-import { ErrorState, EmptyState } from '../components/Spinner.jsx';
+import { poolBadge } from '../components/Badge.jsx';
+import { DataTable } from '../components/DataTable.jsx';
+import { sevClass, sevTitle } from '../severity.js';
 
 /**
- * Gateways section — a list of all Gateways the controller knows about, each
- * card linking to the Gateway detail. Presentational: the owning Routing screen
- * fetches the data and supplies the type/namespace/search filters, so a single
- * fetch backs both this and the Ingresses section and feeds the namespace
- * dropdown.
+ * Gateways section — a table of all Gateways the controller knows about, each
+ * row linking to the Gateway detail. Presentational: the owning Routing screen
+ * fetches the active tab's list (and the routing summary that drives the tab
+ * badge) and supplies the namespace/search filters; `total` is the cluster-wide
+ * count so the footer can show how many are hidden.
+ *
+ * The `Routes` cell deep-links to the HTTPRoutes tab pre-filtered to this
+ * Gateway (`?tab=httproutes&parent=ns/name`) — the inverse of the HTTPRoutes
+ * `Parents` links — so an operator can pivot between a Gateway and the routes
+ * attached to it without losing the binding context.
  */
-export function GatewaysSection({ gateways = [], loading = false, error = null, q = '', ns = 'all' }) {
-  const shown = gateways.filter(
-    (gw) => (ns === 'all' || gw.namespace === ns) && matchesSearch(gw.name, 'gateway', q),
+export function GatewaysSection({ rows = [], total, page, loading = false, error = null, q = '', ns = 'all', problemsOnly = false }) {
+  const shown = rows.filter(
+    (gw) =>
+      (ns === 'all' || gw.namespace === ns) &&
+      (!problemsOnly || gw.status !== 'ok') &&
+      matchesSearch(gw.name, 'gateway', q),
   );
-  const filtering = q !== '' || ns !== 'all';
-
   return (
-    <section aria-label="Gateways">
-      <div class="section-head">
-        <h2 class="section-title">Gateways</h2>
-        <span class="section-count">{shown.length}</span>
-        {loading && <span class="section-spinner" aria-label="Loading" />}
-      </div>
-      {error ? (
-        <ErrorState error={error} />
-      ) : shown.length === 0 && !loading ? (
-        <EmptyState message={filtering ? 'No Gateways match.' : 'No Gateways found.'} />
-      ) : (
-        <CardGrid>
-          {shown.map((gw) => (
-            <GatewayCard key={`${gw.namespace}/${gw.name}`} gw={gw} />
-          ))}
-        </CardGrid>
+    <DataTable
+      columns={['Name', 'Namespace', 'Pool', 'Address', 'Routes']}
+      rows={shown}
+      total={total}
+      page={page}
+      loading={loading}
+      error={error}
+      emptyMsg="No Gateways."
+      renderRow={(gw) => (
+        <tr
+          key={`${gw.namespace}/${gw.name}`}
+          class={`clickable ${sevClass(gw.status)}`}
+          title={sevTitle(gw.status)}
+          onClick={() => nav.gateway(gw.namespace, gw.name)}
+        >
+          <td>{gw.name}</td>
+          <td>{gw.namespace}</td>
+          <td>{poolBadge(gw.proxy?.pool ?? 'shared')}</td>
+          <td>{(gw.addresses ?? []).join(', ') || '—'}</td>
+          <td>
+            {(gw.route_count ?? 0) > 0 ? (
+              <span
+                class="link-text"
+                title={`Show HTTPRoutes attached to ${gw.namespace}/${gw.name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  nav.routing({ tab: 'httproutes', parent: `${gw.namespace}/${gw.name}` });
+                }}
+              >
+                {gw.route_count} →
+              </span>
+            ) : (
+              0
+            )}
+          </td>
+        </tr>
       )}
-    </section>
-  );
-}
-
-function GatewayCard({ gw }) {
-  const programmed = gw.conditions?.some((c) => c.type === 'Programmed' && c.status === 'True');
-  const pool = gw.proxy?.pool ?? 'shared';
-  return (
-    <Card onClick={() => nav.gateway(gw.namespace, gw.name)}>
-      <CardHeader
-        name={gw.name}
-        badge={<Badge variant={programmed ? 'ok' : 'fail'}>{programmed ? 'programmed' : 'not programmed'}</Badge>}
-      />
-      <CardFooter
-        left={`${gw.namespace} · ${gw.route_count ?? 0} route${gw.route_count !== 1 ? 's' : ''} · ${pool}`}
-        right={<StatusDot state={programmed ? 'ok' : 'err'} />}
-      />
-    </Card>
+    />
   );
 }
