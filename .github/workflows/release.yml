@@ -38,14 +38,16 @@ concurrency:
 # Multi-arch build distributes across native runners (no QEMU) per
 # https://docs.docker.com/build/ci/github-actions/multi-platform/#distribute-build-across-multiple-runners
 #
-# Job graph (main: up to trivy-scan; tag: full pipeline):
-#   cargo-deny ──┬──► build       ──┐
-#               └──► conformance ──┴──► publish-image ──► trivy-scan ──┬──► publish-kustomize ──┐
-#                                                                       └──► publish-chart    ──┴──► publish-docs
-#   (cargo-deny gates all publishing; conformance gates image publish;
-#    trivy-scan gates both release artifacts; publish-docs is the last step
-#    and is skipped if any prior release job fails, so a broken release
-#    never promotes the docs site to a tag that lacks signed artifacts.)
+# Job graph (main: through publish-image + publish-docs; tag: full pipeline):
+#   cargo-deny ──► build ──► trivy-scan ──► conformance ──► publish-image ──┬──► publish-kustomize ──┐
+#                                                                            └──► publish-chart    ──┴──► publish-docs
+#   (cargo-deny gates the build; trivy-scan scans the freshly-built amd64 image
+#    by digest and fails fast on HIGH/CRITICAL CVEs *before* the expensive
+#    conformance suite, so we never run conformance on an artifact we'd discard;
+#    conformance then runs the Gateway API suite against those exact bytes; both
+#    gate image publish. publish-docs is the last step and is skipped if any
+#    prior release job fails, so a broken release never promotes the docs site
+#    to a tag that lacks signed artifacts.)
 jobs:
   cargo-deny:
     name: cargo-deny
@@ -133,36 +135,103 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  conformance:
-    name: conformance
-    needs: cargo-deny
+  trivy-scan:
+    name: trivy-scan
+    # Cheap CVE gate, run before the expensive conformance suite. Scans the
+    # amd64 image build pushed — by digest, since no tag exists until
+    # publish-image — and fails fast on HIGH/CRITICAL CVEs. trivy resolves a
+    # multi-arch ref to amd64 anyway and the findings live in the shared
+    # distroless base, so scanning the amd64 digest matches the published image.
+    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
     steps:
       - uses: actions/checkout@v6
 
-      # The operator UI is embedded into coxswain-admin via include_str! of
-      # ui/dist/index.html, so the workspace can't compile without it. The
-      # Dockerfile builds the UI in its ui-builder stage, but this job builds
-      # the binary directly on the runner, so build it here too (matches ci.yml).
-      - uses: actions/setup-node@v6
+      - name: Download amd64 image digest
+        uses: actions/download-artifact@v8
         with:
-          node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: ui/package-lock.json
-      - name: Build operator UI
-        run: npm ci && npm run build
-        working-directory: ui
+          name: digest-linux-amd64
+          path: /tmp/cox-digest
 
-      - uses: ./.github/actions/setup-rust-with-cache
+      - uses: docker/login-action@v4
         with:
-          cache-key-prefix: release-conformance
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build coxswain release binary
+      - name: Resolve built image ref by digest
+        id: img
         run: |
-          mkdir -p bin
-          cargo build --release --bin coxswain
-          cp target/release/coxswain bin/coxswain
+          DIGEST="$(basename /tmp/cox-digest/*)"
+          echo "ref=ghcr.io/${{ github.repository_owner }}/coxswain@sha256:${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan image for HIGH/CRITICAL CVEs
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.img.outputs.ref }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          limit-severities-for-sarif: true
+          version: v0.71.0
+
+      - name: Upload scan results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+
+  conformance:
+    name: conformance
+    # Gate image publish on the Gateway API suite passing against the *exact*
+    # image the build job pushed — not a separately-compiled binary. Runs after
+    # trivy-scan so a CVE failure fails fast without burning a full conformance
+    # run on an artifact we'd discard (trivy-scan needs build, so build → the
+    # digest this job pulls is available transitively).
+    needs: [build, trivy-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v6
+
+      # The build job pushed each arch to ghcr by digest (untagged until
+      # publish-image). Pull the amd64 image — the kind node is amd64 — by its
+      # digest and retag it `coxswain:e2e`, the tag run-conformance loads into
+      # kind. This validates the precise bytes amd64 consumers will run, and the
+      # build job's ui-builder stage already embedded the operator UI, so there
+      # is nothing to compile here.
+      - name: Download amd64 image digest
+        uses: actions/download-artifact@v8
+        with:
+          name: digest-linux-amd64
+          path: /tmp/cox-digest
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull built image by digest and tag as coxswain:e2e
+        run: |
+          # build pushed the amd64 image to ghcr by digest with no tag (tags are
+          # applied later by publish-image), so it is only addressable by digest
+          # here. The artifact is one empty file whose name is the bare sha256
+          # hex; name-canonical=true makes the name@sha256:… reference pullable.
+          DIGEST="$(basename /tmp/cox-digest/*)"
+          IMAGE="ghcr.io/${{ github.repository_owner }}/coxswain@sha256:${DIGEST}"
+          docker pull "$IMAGE"
+          docker tag "$IMAGE" coxswain:e2e
 
       - uses: ./.github/actions/run-conformance
         id: conformance
@@ -240,42 +309,6 @@ jobs:
         run: |
           cosign sign --yes \
             ghcr.io/${{ github.repository_owner }}/coxswain:${{ github.ref_name }}
-
-  trivy-scan:
-    name: trivy-scan
-    needs: publish-image
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Scan image for HIGH/CRITICAL CVEs
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ghcr.io/${{ github.repository_owner }}/coxswain:${{ github.ref_name }}
-          format: sarif
-          output: trivy-results.sarif
-          severity: HIGH,CRITICAL
-          exit-code: '1'
-          ignore-unfixed: true
-          limit-severities-for-sarif: true
-          version: v0.71.0
-
-      - name: Upload scan results to GitHub Security tab
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy-results.sarif
 
   publish-chart:
     name: publish-chart
