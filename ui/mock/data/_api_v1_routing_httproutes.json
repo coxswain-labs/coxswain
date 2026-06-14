@@ -97,9 +97,1569 @@
       ],
       "rule_count": 1,
       "status": "error"
+    },
+    {
+      "name": "route-001",
+      "namespace": "bulk",
+      "hostnames": [
+        "r001.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-002",
+      "namespace": "bulk",
+      "hostnames": [
+        "r002.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-003",
+      "namespace": "bulk",
+      "hostnames": [
+        "r003.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-004",
+      "namespace": "bulk",
+      "hostnames": [
+        "r004.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-005",
+      "namespace": "bulk",
+      "hostnames": [
+        "r005.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-006",
+      "namespace": "bulk",
+      "hostnames": [
+        "r006.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-007",
+      "namespace": "bulk",
+      "hostnames": [
+        "r007.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-008",
+      "namespace": "bulk",
+      "hostnames": [
+        "r008.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-009",
+      "namespace": "bulk",
+      "hostnames": [
+        "r009.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-010",
+      "namespace": "bulk",
+      "hostnames": [
+        "r010.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-011",
+      "namespace": "bulk",
+      "hostnames": [
+        "r011.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-012",
+      "namespace": "bulk",
+      "hostnames": [
+        "r012.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-013",
+      "namespace": "bulk",
+      "hostnames": [
+        "r013.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-014",
+      "namespace": "bulk",
+      "hostnames": [
+        "r014.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-015",
+      "namespace": "bulk",
+      "hostnames": [
+        "r015.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-016",
+      "namespace": "bulk",
+      "hostnames": [
+        "r016.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-017",
+      "namespace": "bulk",
+      "hostnames": [
+        "r017.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-018",
+      "namespace": "bulk",
+      "hostnames": [
+        "r018.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-019",
+      "namespace": "bulk",
+      "hostnames": [
+        "r019.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-020",
+      "namespace": "bulk",
+      "hostnames": [
+        "r020.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-021",
+      "namespace": "bulk",
+      "hostnames": [
+        "r021.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-022",
+      "namespace": "bulk",
+      "hostnames": [
+        "r022.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-023",
+      "namespace": "bulk",
+      "hostnames": [
+        "r023.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-024",
+      "namespace": "bulk",
+      "hostnames": [
+        "r024.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-025",
+      "namespace": "bulk",
+      "hostnames": [
+        "r025.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-026",
+      "namespace": "bulk",
+      "hostnames": [
+        "r026.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-027",
+      "namespace": "bulk",
+      "hostnames": [
+        "r027.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-028",
+      "namespace": "bulk",
+      "hostnames": [
+        "r028.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-029",
+      "namespace": "bulk",
+      "hostnames": [
+        "r029.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-030",
+      "namespace": "bulk",
+      "hostnames": [
+        "r030.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-031",
+      "namespace": "bulk",
+      "hostnames": [
+        "r031.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-032",
+      "namespace": "bulk",
+      "hostnames": [
+        "r032.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-033",
+      "namespace": "bulk",
+      "hostnames": [
+        "r033.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-034",
+      "namespace": "bulk",
+      "hostnames": [
+        "r034.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-035",
+      "namespace": "bulk",
+      "hostnames": [
+        "r035.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-036",
+      "namespace": "bulk",
+      "hostnames": [
+        "r036.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-037",
+      "namespace": "bulk",
+      "hostnames": [
+        "r037.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-038",
+      "namespace": "bulk",
+      "hostnames": [
+        "r038.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-039",
+      "namespace": "bulk",
+      "hostnames": [
+        "r039.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-040",
+      "namespace": "bulk",
+      "hostnames": [
+        "r040.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-041",
+      "namespace": "bulk",
+      "hostnames": [
+        "r041.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-042",
+      "namespace": "bulk",
+      "hostnames": [
+        "r042.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-043",
+      "namespace": "bulk",
+      "hostnames": [
+        "r043.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-044",
+      "namespace": "bulk",
+      "hostnames": [
+        "r044.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-045",
+      "namespace": "bulk",
+      "hostnames": [
+        "r045.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-046",
+      "namespace": "bulk",
+      "hostnames": [
+        "r046.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-047",
+      "namespace": "bulk",
+      "hostnames": [
+        "r047.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-048",
+      "namespace": "bulk",
+      "hostnames": [
+        "r048.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-049",
+      "namespace": "bulk",
+      "hostnames": [
+        "r049.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-050",
+      "namespace": "bulk",
+      "hostnames": [
+        "r050.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-051",
+      "namespace": "bulk",
+      "hostnames": [
+        "r051.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-052",
+      "namespace": "bulk",
+      "hostnames": [
+        "r052.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-053",
+      "namespace": "bulk",
+      "hostnames": [
+        "r053.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-054",
+      "namespace": "bulk",
+      "hostnames": [
+        "r054.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-055",
+      "namespace": "bulk",
+      "hostnames": [
+        "r055.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-056",
+      "namespace": "bulk",
+      "hostnames": [
+        "r056.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-057",
+      "namespace": "bulk",
+      "hostnames": [
+        "r057.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-058",
+      "namespace": "bulk",
+      "hostnames": [
+        "r058.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-059",
+      "namespace": "bulk",
+      "hostnames": [
+        "r059.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-060",
+      "namespace": "bulk",
+      "hostnames": [
+        "r060.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-061",
+      "namespace": "bulk",
+      "hostnames": [
+        "r061.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-062",
+      "namespace": "bulk",
+      "hostnames": [
+        "r062.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-063",
+      "namespace": "bulk",
+      "hostnames": [
+        "r063.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-064",
+      "namespace": "bulk",
+      "hostnames": [
+        "r064.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-065",
+      "namespace": "bulk",
+      "hostnames": [
+        "r065.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-066",
+      "namespace": "bulk",
+      "hostnames": [
+        "r066.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-067",
+      "namespace": "bulk",
+      "hostnames": [
+        "r067.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-068",
+      "namespace": "bulk",
+      "hostnames": [
+        "r068.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-069",
+      "namespace": "bulk",
+      "hostnames": [
+        "r069.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-070",
+      "namespace": "bulk",
+      "hostnames": [
+        "r070.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-071",
+      "namespace": "bulk",
+      "hostnames": [
+        "r071.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-072",
+      "namespace": "bulk",
+      "hostnames": [
+        "r072.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-073",
+      "namespace": "bulk",
+      "hostnames": [
+        "r073.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-074",
+      "namespace": "bulk",
+      "hostnames": [
+        "r074.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-075",
+      "namespace": "bulk",
+      "hostnames": [
+        "r075.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-076",
+      "namespace": "bulk",
+      "hostnames": [
+        "r076.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-077",
+      "namespace": "bulk",
+      "hostnames": [
+        "r077.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-078",
+      "namespace": "bulk",
+      "hostnames": [
+        "r078.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-079",
+      "namespace": "bulk",
+      "hostnames": [
+        "r079.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-080",
+      "namespace": "bulk",
+      "hostnames": [
+        "r080.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-081",
+      "namespace": "bulk",
+      "hostnames": [
+        "r081.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-082",
+      "namespace": "bulk",
+      "hostnames": [
+        "r082.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-083",
+      "namespace": "bulk",
+      "hostnames": [
+        "r083.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-084",
+      "namespace": "bulk",
+      "hostnames": [
+        "r084.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-085",
+      "namespace": "bulk",
+      "hostnames": [
+        "r085.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-086",
+      "namespace": "bulk",
+      "hostnames": [
+        "r086.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-087",
+      "namespace": "bulk",
+      "hostnames": [
+        "r087.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-088",
+      "namespace": "bulk",
+      "hostnames": [
+        "r088.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-089",
+      "namespace": "bulk",
+      "hostnames": [
+        "r089.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-090",
+      "namespace": "bulk",
+      "hostnames": [
+        "r090.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-091",
+      "namespace": "bulk",
+      "hostnames": [
+        "r091.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-092",
+      "namespace": "bulk",
+      "hostnames": [
+        "r092.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-093",
+      "namespace": "bulk",
+      "hostnames": [
+        "r093.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-094",
+      "namespace": "bulk",
+      "hostnames": [
+        "r094.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-095",
+      "namespace": "bulk",
+      "hostnames": [
+        "r095.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-096",
+      "namespace": "bulk",
+      "hostnames": [
+        "r096.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-097",
+      "namespace": "bulk",
+      "hostnames": [
+        "r097.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-098",
+      "namespace": "bulk",
+      "hostnames": [
+        "r098.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-099",
+      "namespace": "bulk",
+      "hostnames": [
+        "r099.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-100",
+      "namespace": "bulk",
+      "hostnames": [
+        "r100.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-101",
+      "namespace": "bulk",
+      "hostnames": [
+        "r101.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-102",
+      "namespace": "bulk",
+      "hostnames": [
+        "r102.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-103",
+      "namespace": "bulk",
+      "hostnames": [
+        "r103.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-104",
+      "namespace": "bulk",
+      "hostnames": [
+        "r104.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-105",
+      "namespace": "bulk",
+      "hostnames": [
+        "r105.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-106",
+      "namespace": "bulk",
+      "hostnames": [
+        "r106.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-107",
+      "namespace": "bulk",
+      "hostnames": [
+        "r107.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-108",
+      "namespace": "bulk",
+      "hostnames": [
+        "r108.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-109",
+      "namespace": "bulk",
+      "hostnames": [
+        "r109.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-110",
+      "namespace": "bulk",
+      "hostnames": [
+        "r110.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-111",
+      "namespace": "bulk",
+      "hostnames": [
+        "r111.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-112",
+      "namespace": "bulk",
+      "hostnames": [
+        "r112.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-113",
+      "namespace": "bulk",
+      "hostnames": [
+        "r113.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-114",
+      "namespace": "bulk",
+      "hostnames": [
+        "r114.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-115",
+      "namespace": "bulk",
+      "hostnames": [
+        "r115.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-116",
+      "namespace": "bulk",
+      "hostnames": [
+        "r116.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-117",
+      "namespace": "bulk",
+      "hostnames": [
+        "r117.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-118",
+      "namespace": "bulk",
+      "hostnames": [
+        "r118.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-119",
+      "namespace": "bulk",
+      "hostnames": [
+        "r119.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-120",
+      "namespace": "bulk",
+      "hostnames": [
+        "r120.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-121",
+      "namespace": "bulk",
+      "hostnames": [
+        "r121.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-122",
+      "namespace": "bulk",
+      "hostnames": [
+        "r122.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-123",
+      "namespace": "bulk",
+      "hostnames": [
+        "r123.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-124",
+      "namespace": "bulk",
+      "hostnames": [
+        "r124.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-125",
+      "namespace": "bulk",
+      "hostnames": [
+        "r125.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-126",
+      "namespace": "bulk",
+      "hostnames": [
+        "r126.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-127",
+      "namespace": "bulk",
+      "hostnames": [
+        "r127.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-128",
+      "namespace": "bulk",
+      "hostnames": [
+        "r128.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-129",
+      "namespace": "bulk",
+      "hostnames": [
+        "r129.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
+    },
+    {
+      "name": "route-130",
+      "namespace": "bulk",
+      "hostnames": [
+        "r130.bulk.local"
+      ],
+      "parent_gateways": [
+        "bulk/bulk-gw"
+      ],
+      "rule_count": 1,
+      "status": "ok"
     }
   ],
-  "total": 8,
-  "returned": 8,
+  "total": 138,
+  "returned": 138,
   "offset": 0
 }

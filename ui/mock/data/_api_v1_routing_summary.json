@@ -4,7 +4,7 @@
     "worst": "error"
   },
   "httproutes": {
-    "total": 8,
+    "total": 138,
     "worst": "error"
   },
   "ingresses": {
@@ -12,6 +12,7 @@
     "worst": "error"
   },
   "namespaces": [
+    "bulk",
     "demo",
     "staging",
     "tenant-a",

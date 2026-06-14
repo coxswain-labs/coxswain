@@ -383,6 +383,15 @@ const HTTPROUTES = [
   { ns: 'tenant-b', name: 'b-api-route', hostnames: ['app.tenant-b.local'], parents: ['tenant-b/tenant-b-gw'], rule_count: 1, status: 'error', // dead + proxy not ready
     rules: [grule([gmatch({ path: '/' })], [gbackend('api', 8080, { namespace: 'tenant-b' })])] },
 ];
+// Synthetic bulk routes (list-only — no detail fixtures) so the routing table's
+// pagination is reachable in dev. They live in a `bulk` namespace; clicking one
+// in dev 404s (intentional — they exist to fill pages, not to inspect).
+const BULK_HTTPROUTES = Array.from({ length: 130 }, (_, i) => {
+  const n = String(i + 1).padStart(3, '0');
+  return { ns: 'bulk', name: `route-${n}`, hostnames: [`r${n}.bulk.local`], parents: ['bulk/bulk-gw'], rule_count: 1, status: 'ok' };
+});
+HTTPROUTES.push(...BULK_HTTPROUTES);
+
 function emitHttproutesList() {
   const httproutes = HTTPROUTES.map((r) => ({
     name: r.name, namespace: r.ns, hostnames: r.hostnames,
