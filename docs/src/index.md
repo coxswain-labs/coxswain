@@ -5,9 +5,9 @@
     The per-Ingress annotation surface is under active development (v0.3).
     **Production use is at your own risk.** Feedback and contributions are welcome.
 
-A Kubernetes Ingress and Gateway API controller written in Rust, backed by [Pingora](https://github.com/cloudflare/pingora).
+A Kubernetes Ingress and Gateway API controller written in Rust, backed by [Pingora](https://github.com/cloudflare/pingora) — Cloudflare's battle-tested proxy library.
 
-- Serves `Ingress` and `HTTPRoute` resources from the same proxy fleet
+- Bridges classic `Ingress` and Gateway API `HTTPRoute` in a single proxy fleet
 - Routing changes and TLS certificate rotations take effect without restarting the proxy
 - Controller/proxy split with a strict RBAC boundary — proxy pods hold zero write permissions
 
