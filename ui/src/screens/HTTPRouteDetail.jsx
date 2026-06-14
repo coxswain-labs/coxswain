@@ -7,7 +7,7 @@ import { DetailHeader } from '../components/DetailHeader.jsx';
 import { StatusBadge } from '../components/StatusBadge.jsx';
 import { ConditionRow } from '../components/ConditionRow.jsx';
 import { Badge } from '../components/Badge.jsx';
-import { RouteReconcile } from '../components/RouteReconcile.jsx';
+import { CheckDialog } from '../components/CheckDialog.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 import { ManifestDialog } from '../components/ManifestDialog.jsx';
 import { Icon } from '../components/Icon.jsx';
@@ -27,7 +27,7 @@ import { useEffect, useState } from 'preact/hooks';
  * acceptance/resolution verdict — the richest Gateway-API troubleshooting
  * surface), the effective config (declared rules: match predicates, weighted
  * backends, filters — overlaid with runtime problems from `/problems`), and the
- * on-demand data-plane reconcile. No eager proxy fan-out.
+ * on-demand data-plane check. No eager proxy fan-out.
  *
  * Deep-linkable via `#/routes/httproute/{ns}/{name}`. Refreshes on
  * `rebuild.completed` SSE so a route can be watched converging after an apply.
@@ -40,6 +40,7 @@ export function HTTPRouteDetail({ namespace, name }) {
   const problems = useApi(getProblems);
   const sse = useSSE('/api/v1/events');
   const [showManifest, setShowManifest] = useState(false);
+  const [showCheck, setShowCheck] = useState(false);
 
   useEffect(() => {
     return sse.subscribe('rebuild.completed', () => {
@@ -51,7 +52,7 @@ export function HTTPRouteDetail({ namespace, name }) {
   const breadcrumb = [
     { label: 'Routing', onClick: () => nav.routing() },
     { label: 'HTTP Routes', onClick: () => nav.routing({ tab: 'httproutes' }) },
-    { label: `${namespace}/${name}` },
+    { label: name },
   ];
 
   if (loading) return <Spinner label="Loading HTTPRoute…" />;
@@ -100,9 +101,14 @@ export function HTTPRouteDetail({ namespace, name }) {
         )}
         badges={<StatusBadge status={status} />}
         actions={(
-          <button class="btn btn-icon" onClick={() => setShowManifest(true)}>
-            <Icon name="code" size={15} /> Manifest
-          </button>
+          <>
+            <button class="btn btn-icon" onClick={() => setShowCheck(true)}>
+              <Icon name="refresh" size={15} /> Check
+            </button>
+            <button class="btn btn-icon" onClick={() => setShowManifest(true)}>
+              <Icon name="code" size={15} /> Manifest
+            </button>
+          </>
         )}
       />
 
@@ -115,19 +121,26 @@ export function HTTPRouteDetail({ namespace, name }) {
         />
       )}
 
-      {/* Per-parentRef conditions — one table per attached Gateway. */}
+      {showCheck && (
+        <CheckDialog
+          kind="httproute"
+          kindLabel="HTTPRoute"
+          namespace={namespace}
+          name={name}
+          onClose={() => setShowCheck(false)}
+        />
+      )}
+
+      {/* Conditions — one table per attached Gateway (the parent Gateways are
+          already named in the header, so the tables aren't re-labelled). */}
       {parentStatuses.length > 0 && (
-        <section aria-label="Parent conditions">
-          <h2 class="section-title">Parent conditions</h2>
+        <section aria-label="Conditions">
+          <h2 class="section-title">Conditions</h2>
           {parentStatuses.map((ps) => {
             const ref = ps.parent_ref ?? {};
             const pns = ref.namespace ?? namespace;
             return (
               <div class="parent-conditions" key={`${pns}/${ref.name}`}>
-                <div class="parent-conditions-head">
-                  Gateway{' '}
-                  <a onClick={() => nav.gateway(pns, ref.name)}>{pns}/{ref.name}</a>
-                </div>
                 <div class="tbl-wrap">
                   <table class="cond-table">
                     <thead>
@@ -182,8 +195,6 @@ export function HTTPRouteDetail({ namespace, name }) {
           </div>
         )}
       </section>
-
-      <RouteReconcile kind="httproute" namespace={namespace} name={name} />
     </div>
   );
 }

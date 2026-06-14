@@ -43,7 +43,7 @@ export function GatewayDetail({ namespace, name }) {
   const breadcrumb = [
     { label: 'Routing', onClick: () => nav.routing() },
     { label: 'Gateways', onClick: () => nav.routing({ tab: 'gateways' }) },
-    { label: `${namespace}/${name}` },
+    { label: name },
   ];
 
   if (loading) return <Spinner label="Loading gateway…" />;

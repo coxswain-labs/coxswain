@@ -348,8 +348,8 @@ impl AdminServer {
             ["routing", "routes", kind, namespace, name] => {
                 agg.get_route(kind, namespace, name).await
             }
-            ["routing", "routes", kind, namespace, name, "reconcile"] => {
-                agg.reconcile_route(kind, namespace, name).await
+            ["routing", "routes", kind, namespace, name, "check"] => {
+                agg.check_route(kind, namespace, name).await
             }
 
             // ── cross-cutting ─────────────────────────────────────────────────

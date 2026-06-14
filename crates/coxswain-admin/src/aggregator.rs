@@ -973,8 +973,8 @@ impl OperatorAggregator {
         json_response(v.to_string())
     }
 
-    /// `GET …/routes/{kind}/{ns}/{name}/reconcile` — on-demand consistency
-    /// check of the data plane against the controller for a single route.
+    /// `GET …/routes/{kind}/{ns}/{name}/check` — on-demand data-plane
+    /// consistency check against the controller for a single route.
     ///
     /// Everything else on the route detail page reflects the *controller's*
     /// view (status, conditions, `/problems`). This is the one check that asks
@@ -988,7 +988,7 @@ impl OperatorAggregator {
     ///
     /// 400 for an unknown kind, 404 when the route does not exist, 503 when the
     /// Kubernetes client is unavailable, 500 for other Kubernetes errors.
-    pub(crate) async fn reconcile_route(
+    pub(crate) async fn check_route(
         &self,
         kind: &str,
         namespace: &str,
@@ -1001,7 +1001,7 @@ impl OperatorAggregator {
         let kube = match self.kube().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "kube client unavailable for route reconcile");
+                tracing::warn!(error = %e, "kube client unavailable for route check");
                 return service_unavailable("kubernetes client not available");
             }
         };
@@ -1017,7 +1017,7 @@ impl OperatorAggregator {
                     Ok(r) => r,
                     Err(kube::Error::Api(e)) if e.code == 404 => return not_found(),
                     Err(e) => {
-                        tracing::warn!(error = %e, namespace, name, "K8s GET HTTPRoute (reconcile) failed");
+                        tracing::warn!(error = %e, namespace, name, "K8s GET HTTPRoute (check) failed");
                         return internal_error();
                     }
                 };
@@ -1030,7 +1030,7 @@ impl OperatorAggregator {
                     Ok(_) => {}
                     Err(kube::Error::Api(e)) if e.code == 404 => return not_found(),
                     Err(e) => {
-                        tracing::warn!(error = %e, namespace, name, "K8s GET Ingress (reconcile) failed");
+                        tracing::warn!(error = %e, namespace, name, "K8s GET Ingress (check) failed");
                         return internal_error();
                     }
                 }
@@ -1152,7 +1152,7 @@ impl OperatorAggregator {
     }
 
     /// Fan out `GET /routes` to a specific set of proxy pods in parallel — the
-    /// reconcile path targets only the proxies that should serve a given route,
+    /// check path targets only the proxies that should serve a given route,
     /// not the whole fleet.
     async fn fan_out_routes_to(&self, entries: &[FleetEntry]) -> Vec<serde_json::Value> {
         let http = &self.http;
@@ -1186,7 +1186,7 @@ impl OperatorAggregator {
     }
 }
 
-// ── Route reconcile (data-plane consistency check) ────────────────────────────
+// ── Route check (data-plane consistency) ─────────────────────────────────────────────────────────────
 
 /// The proxy `/routes` sub-key for a route kind: Gateway-API routes live under
 /// `gateway`, classic Ingress under `ingress`. `None` for an unknown kind.
@@ -1266,7 +1266,7 @@ fn route_rows_for(
     out
 }
 
-/// `(host, path, backend_group)` identity for a reconcile row, for set membership.
+/// `(host, path, backend_group)` identity for a check row, for set membership.
 fn row_key(r: &serde_json::Value) -> (String, String, String) {
     let s = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
     (s("host"), s("path"), s("backend_group"))
@@ -2961,7 +2961,7 @@ mod tests {
         assert_eq!(tls[0]["secret"], "demo-tls");
     }
 
-    // ── route reconcile helpers ───────────────────────────────────────────────
+    // ── route check helpers ─────────────────────────────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn route_rows_for_filters_to_tagged_rows() {

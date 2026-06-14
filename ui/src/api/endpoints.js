@@ -66,10 +66,10 @@ export const getIngressRoute = (ns, name) =>
 
 // On-demand data-plane consistency check for a single route (`kind` is the URL
 // kind: `httproute` | `ingress`). Heavier than the detail fetch — fired only
-// when the operator clicks "Reconcile".
-export const getRouteReconcile = (kind, ns, name) =>
+// when the operator clicks "Check".
+export const getRouteCheck = (kind, ns, name) =>
   fetchJson(
-    `/api/v1/routing/routes/${encodeURIComponent(kind)}/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/reconcile`,
+    `/api/v1/routing/routes/${encodeURIComponent(kind)}/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/check`,
   );
 
 // ── Manifests ─────────────────────────────────────────────────────────────────

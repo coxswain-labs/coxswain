@@ -296,7 +296,7 @@ paths:
       summary: Route detail — traffic-served status + effective config
       description: >
         Interpreted detail for a single route, sourced from the live Kubernetes
-        object (no proxy fan-out — that is the on-demand `/reconcile` sub-resource).
+        object (no proxy fan-out — that is the on-demand `/check` sub-resource).
         HTTPRoute carries `hostnames`, per-parentRef `parent_statuses` (conditions),
         and `rules` (match predicates, weighted backends, filter kinds). Ingress
         carries `class`, inline `tls`, optional `default_backend`, `load_balancer`
@@ -314,7 +314,7 @@ paths:
         '404': { description: Unknown kind or route }
         '503': { description: Kubernetes API unavailable }
 
-  /api/v1/routing/routes/{kind}/{namespace}/{name}/reconcile:
+  /api/v1/routing/routes/{kind}/{namespace}/{name}/check:
     get:
       tags: [routing]
       summary: Data-plane consistency check for a single route (on-demand)

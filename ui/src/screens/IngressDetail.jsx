@@ -6,7 +6,7 @@ import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { DetailHeader } from '../components/DetailHeader.jsx';
 import { StatusBadge } from '../components/StatusBadge.jsx';
 import { Badge } from '../components/Badge.jsx';
-import { RouteReconcile } from '../components/RouteReconcile.jsx';
+import { CheckDialog } from '../components/CheckDialog.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 import { ManifestDialog } from '../components/ManifestDialog.jsx';
 import { Icon } from '../components/Icon.jsx';
@@ -25,7 +25,7 @@ import { useEffect, useState } from 'preact/hooks';
  * Ingress is a flat resource — no parent Gateways, no per-parent conditions —
  * so the page is deliberately leaner than HTTPRoute: header (address + class),
  * inline TLS blocks, the effective config (host/path → backend, overlaid with
- * runtime problems), and the on-demand data-plane reconcile.
+ * runtime problems), and the on-demand data-plane check.
  *
  * Deep-linkable via `#/routes/ingress/{ns}/{name}`. Refreshes on
  * `rebuild.completed` SSE.
@@ -38,6 +38,7 @@ export function IngressDetail({ namespace, name }) {
   const problems = useApi(getProblems);
   const sse = useSSE('/api/v1/events');
   const [showManifest, setShowManifest] = useState(false);
+  const [showCheck, setShowCheck] = useState(false);
 
   useEffect(() => {
     return sse.subscribe('rebuild.completed', () => {
@@ -49,7 +50,7 @@ export function IngressDetail({ namespace, name }) {
   const breadcrumb = [
     { label: 'Routing', onClick: () => nav.routing() },
     { label: 'Ingresses', onClick: () => nav.routing({ tab: 'ingresses' }) },
-    { label: `${namespace}/${name}` },
+    { label: name },
   ];
 
   if (loading) return <Spinner label="Loading Ingress…" />;
@@ -94,9 +95,14 @@ export function IngressDetail({ namespace, name }) {
         )}
         badges={<StatusBadge status={status} />}
         actions={(
-          <button class="btn btn-icon" onClick={() => setShowManifest(true)}>
-            <Icon name="code" size={15} /> Manifest
-          </button>
+          <>
+            <button class="btn btn-icon" onClick={() => setShowCheck(true)}>
+              <Icon name="refresh" size={15} /> Check
+            </button>
+            <button class="btn btn-icon" onClick={() => setShowManifest(true)}>
+              <Icon name="code" size={15} /> Manifest
+            </button>
+          </>
         )}
       />
 
@@ -109,10 +115,26 @@ export function IngressDetail({ namespace, name }) {
         />
       )}
 
-      {/* Inline TLS blocks (Ingress terminates TLS itself). */}
+      {showCheck && (
+        <CheckDialog
+          kind="ingress"
+          kindLabel="Ingress"
+          namespace={namespace}
+          name={name}
+          onClose={() => setShowCheck(false)}
+        />
+      )}
+
+      {/* Inline TLS blocks. Declared intent from spec.tls — Ingress carries no
+          per-block status, so the cert/Secret is shown as a reference, never as
+          verified health (no teal "good" lock — that would be the Gateway's
+          listener-condition signal, which Ingress doesn't have). */}
       {tls.length > 0 && (
         <section aria-label="TLS">
           <h2 class="section-title">TLS</h2>
+          <p class="section-hint">
+            Declared TLS termination. Certificate validity isn't verified here.
+          </p>
           <div class="tbl-wrap">
             <table>
               <thead>
@@ -126,7 +148,10 @@ export function IngressDetail({ namespace, name }) {
                   <tr key={i}>
                     <td><code>{(t.hosts ?? []).join(', ') || '*'}</code></td>
                     <td>
-                      <Badge variant="tls"><Icon name="lock" size={11} /> {t.secret || '—'}</Badge>
+                      <span class="backend-cell">
+                        <Icon name="lock" size={12} />
+                        <code>{t.secret || '—'}</code>
+                      </span>
                     </td>
                   </tr>
                 ))}
@@ -151,7 +176,6 @@ export function IngressDetail({ namespace, name }) {
                 <tr>
                   <th>Host</th>
                   <th>Path</th>
-                  <th>Type</th>
                   <th>Backend</th>
                 </tr>
               </thead>
@@ -163,8 +187,7 @@ export function IngressDetail({ namespace, name }) {
                   return (
                     <tr key={i} class={sevClass(sev)}>
                       <td><code>{r.host || '*'}</code></td>
-                      <td><code>{r.path || '/'}</code></td>
-                      <td><Badge variant="neutral">{r.path_type}</Badge></td>
+                      <td><code>{r.path_type} {r.path || '/'}</code></td>
                       <td>
                         <span class="backend-cell">
                           <code>{backendLabel(r.backend, namespace)}</code>
@@ -185,8 +208,6 @@ export function IngressDetail({ namespace, name }) {
           </p>
         )}
       </section>
-
-      <RouteReconcile kind="ingress" namespace={namespace} name={name} />
     </div>
   );
 }

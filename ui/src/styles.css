@@ -339,7 +339,6 @@ section { margin-bottom: 32px; }
 }
 .section-desc { font-size: 13px; color: var(--muted); margin-bottom: 12px; }
 .section-title { display: flex; align-items: center; gap: 8px; }
-.section-action { margin-left: auto; text-transform: none; letter-spacing: 0; }
 .section-hint { font-size: 13px; color: var(--muted); margin: -4px 0 12px; max-width: 76ch; }
 .muted { color: var(--muted); }
 
@@ -349,14 +348,22 @@ section { margin-bottom: 32px; }
 
 /* per-parentRef conditions (HTTPRoute detail) */
 .parent-conditions { margin-bottom: 16px; }
-.parent-conditions-head { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
-.parent-conditions-head a { cursor: pointer; }
 
-/* on-demand data-plane reconcile */
-.reconcile-idle { font-size: 13px; color: var(--muted); padding: 4px 0 8px; }
-.reconcile-verdict { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-.reconcile-summary { font-size: 13px; color: var(--muted); }
-.reconcile-missing { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+/* on-demand data-plane check */
+.btn-primary { background: var(--blue); border-color: var(--blue); color: #0b1220; font-weight: 600; }
+.btn-primary:hover { filter: brightness(1.08); }
+.check-confirm { display: flex; flex-direction: column; gap: 12px; font-size: 14px; line-height: 1.5; }
+.check-confirm p { margin: 0; }
+.check-confirm .btn-primary { align-self: flex-start; margin-top: 4px; }
+.check-idle { font-size: 13px; color: var(--muted); padding: 4px 0 8px; }
+.check-proxy { margin-top: 16px; }
+.check-proxy-head {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+  font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+}
+.check-verdict { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.check-summary { font-size: 13px; color: var(--muted); }
+.check-missing { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .section-spinner {
   width: 14px; height: 14px;
   border: 2px solid var(--border); border-top-color: var(--blue);
@@ -1004,6 +1011,12 @@ input[type=checkbox] { accent-color: var(--blue); }
   border-radius: var(--r);
   overflow: hidden;
 }
+/* Flowing-content dialogs (e.g. the data-plane check) don't need the wide
+   manifest width — narrower keeps line length readable and avoids a right
+   gutter. Desktop-only so the mobile full-screen drawer rule still wins. */
+@media (min-width: 640px) {
+  .dialog.dialog-narrow { width: min(600px, 96vw); }
+}
 .dialog-header {
   display: flex; align-items: center; gap: 12px;
   padding: 14px 16px;
@@ -1028,12 +1041,19 @@ input[type=checkbox] { accent-color: var(--blue); }
 }
 .dialog-ns { color: var(--muted); }
 .dialog-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.dialog-close { font-size: 16px; padding: 0 10px; }
+/* Icon-only close: sized to its glyph, not the 44px control height. */
+.dialog-close {
+  font-size: 16px; padding: 0;
+  min-height: 0; width: 30px; height: 30px;
+  justify-content: center;
+}
 .dialog-body {
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   flex: 1;
 }
+/* Dialogs whose body is flowing content (not a full-bleed <pre>) need padding. */
+.dialog-body-padded { padding: 16px 20px; }
 
 /* Manifest code block — Prism tomorrow theme renders inside this element.
    We set the background to match our surface so the theme's background
