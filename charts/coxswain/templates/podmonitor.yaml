@@ -32,6 +32,6 @@ spec:
             - __meta_kubernetes_pod_label_gateway_networking_k8s_io_gateway_name
           targetLabel: gateway_name
         - sourceLabels:
-            - __meta_kubernetes_pod_label_gateway_networking_k8s_io_gateway_namespace
+            - __meta_kubernetes_pod_label_gateway_coxswain_labs_dev_gateway_namespace
           targetLabel: gateway_namespace
 {{- end }}

@@ -1,6 +1,6 @@
 ---
 name: update-product-docs
-description: Audit and update the product documentation under `docs/src/` (the mkdocs site that ships to coxswain-labs.github.io/coxswain) against the canonical conventions embedded in this skill (two macro deployment models — Shared and Dedicated — and the supporting naming and diagram rules). Audits first, presents the proposed diff, applies on user approval. Covers naming-convention violations in prose and mermaid diagrams (e.g. "Per-Gateway proxy pod" → "Dedicated proxy pool"), broken internal links, pages referenced in `docs/mkdocs.yml` nav but missing on disk (or vice versa), and `mkdocs build --strict` warnings. Sibling to `audit-guardrails` but action-oriented — the verb is `update`, not `audit`. Triggers on phrases like "update the product docs", "fix the docs", "the docs are drifting", "refresh the architecture page", "the diagrams are out of sync".
+description: Audit and update the product documentation under `docs/src/` (the mkdocs site that ships to coxswain-labs.github.io/coxswain) against the canonical conventions embedded in this skill (two macro deployment models — Shared and Dedicated — and the supporting naming and diagram rules). Audits first, presents the proposed diff, applies on user approval. Covers naming-convention violations in prose and mermaid diagrams (e.g. "Per-Gateway proxy pod" → "Proxy pool (dedicated)"), broken internal links, pages referenced in `docs/mkdocs.yml` nav but missing on disk (or vice versa), and `mkdocs build --strict` warnings. Sibling to `audit-guardrails` but action-oriented — the verb is `update`, not `audit`. Triggers on phrases like "update the product docs", "fix the docs", "the docs are drifting", "refresh the architecture page", "the diagrams are out of sync".
 ---
 
 Maintain `docs/src/` (the mkdocs site published to `coxswain-labs.github.io/coxswain`) against the project's naming conventions, link integrity, and build cleanliness. The skill runs in three phases — audit, apply, verify — and pauses for user approval before any edit lands.
@@ -49,10 +49,11 @@ These rules ARE the source of truth — don't go looking for them elsewhere. If 
 
 For mermaid blocks in `docs/src/`:
 
-- `Shared proxy pool` — the multi-replica shared Deployment box
-- `Dedicated proxy pool` — the multi-replica dedicated Deployment box
-- `Controller` — single replica (leader-elected); no `pod` suffix — the `pool` vs bare label contrast encodes cardinality
-- Do NOT use `Per-Gateway proxy pod` (old framing), `Shared-proxy pods` (hyphenated form in a label), or `Controller pod` (the `pod` suffix was dropped to distinguish the singleton from the pools).
+- `Proxy pool (shared)` — the multi-replica shared Deployment box (quote the label in mermaid: `SP["Proxy pool (shared)"]`, because the parentheses need escaping)
+- `Proxy pool (dedicated)` — the multi-replica dedicated Deployment box (quote it: `GP["Proxy pool (dedicated)"]`)
+- `Controller` — single replica (leader-elected); no `pod` suffix
+- Backend workloads are concrete example apps `app-1`, `app-2`, … each in its own namespace box `ns-1`, `ns-2`, …; the namespace a dedicated proxy lives in is `gw-namespace-1`, `gw-namespace-2`, … Never label a workload node with a vague word like `Backend workloads` or `Gateway workloads`.
+- Do NOT use `Per-Gateway proxy pod` (old framing), `Shared-proxy pods` (hyphenated form), `Controller pod` (the `pod` suffix was dropped), or the older `Shared proxy pool` / `Dedicated proxy pool` forms (superseded by the parenthetical `Proxy pool (…)` labels).
 
 ## Phase 1 — Audit
 
@@ -70,10 +71,10 @@ Enumerate findings without editing anything. Categorize each finding by type, se
    - `proxy --gateway` (the CLI flag is `proxy --dedicated`; `--gateway` is the legacy name)
 
 2. **Diagram label violations.** For each mermaid block in `docs/src/`:
-   - `Per-Gateway proxy pod` (replace with `Dedicated proxy pool`)
-   - `Shared-proxy pods` (replace with `Shared proxy pool`)
+   - `Per-Gateway proxy pod` (replace with `Proxy pool (dedicated)`)
+   - `Shared-proxy pods` / `Shared proxy pool` / `Dedicated proxy pool` (replace with the parenthetical `Proxy pool (shared)` / `Proxy pool (dedicated)` labels)
    - `Controller pod` (replace with `Controller` — the `pod` suffix was dropped; bare `Controller` is now canonical)
-   - Any diagram label that mixes hyphens and spaces inconsistently (`Shared-proxy pool` is wrong; either `Shared proxy pool` or `coxswain-shared-proxy` if labelling the literal K8s identifier)
+   - Any vague workload node (`Backend workloads`, `Gateway workloads`) — replace with concrete `app-N` nodes in `ns-N` namespace boxes
 
 3. **Broken internal links.** Walk every `[text](relative.md)` / `[text](relative.md#anchor)` link in `docs/src/`; flag any that don't resolve to an existing file + anchor.
 

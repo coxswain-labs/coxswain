@@ -8,25 +8,37 @@ flowchart LR
     K8s[Kubernetes\nAPI Server]
 
     subgraph cs[coxswain-system]
-        SP[Shared proxy pool]
+        SP["Proxy pool (shared)"]
         C[Controller]
     end
 
-    subgraph ns[gateway-namespace]
-        GP[Dedicated proxy pool]
+    subgraph ns[gw-namespace-1]
+        GP["Proxy pool (dedicated)"]
+        A1(app-1)
+    end
+
+    subgraph n1[ns-1]
+        A2(app-2)
+    end
+
+    subgraph n2[ns-2]
+        A3(app-3)
     end
 
     Clients --> SP & GP
     K8s -->|watch, read-only| SP & GP
     K8s -->|watch| C
     C -->|status writes\nleader only| K8s
+    SP --> A2 & A3
+    GP --> A1
+    GP -.->|cross-namespace\nvia ReferenceGrant| A2
 ```
 
 ## Roles
 
 ### `serve controller`
 
-Watches Ingress, GatewayClass, Gateway, HTTPRoute, and related resources cluster-wide; writes status conditions back to them; provisions per-Gateway proxy `Deployment` and `Service` objects when a Gateway opts into dedicated mode. Leader-elected via a Kubernetes `Lease` in `coxswain-system` — status writes pause for up to one Lease TTL during a leader transition; traffic is unaffected. Scales vertically (one active replica + optional warm standby).
+Watches Ingress, GatewayClass, Gateway, HTTPRoute, and related resources cluster-wide; writes status conditions back to them; provisions per-Gateway proxy `Deployment`, `Service`, and `ServiceAccount` objects when a Gateway opts into dedicated mode. Leader-elected via a Kubernetes `Lease` in `coxswain-system` — status writes pause for up to one Lease TTL during a leader transition; traffic is unaffected. Scales vertically (one active replica + optional warm standby).
 
 The provisioning operator runs as a kube-rs `Controller` alongside the status writer in the same pod. Its reconcile loop resolves each Gateway's effective `CoxswainGatewayParameters` (per-field overlay: Gateway's `parametersRef` wins per-field, GatewayClass's fills the rest; `podTemplate` strategic-merges across both layers) and renders the desired `Deployment` / `Service` / `ServiceAccount`. The `podTemplate` escape hatch is merged onto the rendered Deployment with `kubectl apply` strategic-merge semantics — `containers` merges by `name`, `tolerations` by `(key, operator)`, container-level `env` by `name`, and so on — so sidecar injection and env overlays behave the way operators expect from native K8s tooling.
 
@@ -38,7 +50,7 @@ Stateless read-only Pingora data plane. Serves every `Ingress` and every `Gatewa
 
 ### `serve proxy --dedicated`
 
-Read-only proxy scoped to a single Gateway (identified by `--gateway-name` and `--gateway-namespace`). Provisioned by the controller in the Gateway's namespace (or a namespace specified via `parametersRef`). Has its own rollout, failure domain, and `/metrics`.
+Read-only proxy scoped to a single Gateway (identified by `--gateway-name` and `--gateway-namespace`). Provisioned by the controller in the Gateway's own namespace. Has its own rollout, failure domain, and `/metrics`.
 
 The dedicated proxy runs with **per-namespace narrowed RBAC**: the controller renders `--proxy-watch-namespaces=<ns1>,<ns2>,...` into the container args, and the proxy spawns one reflector per (resource, namespace) pair scoped to exactly the namespaces the controller has provisioned `RoleBinding`s for. The binding set and the watch set are derived from the same desired-namespace computation in the controller, so they can't drift. The `GatewayClass` watch is dropped on this path — the controller is the authority on "this Gateway is dedicated and mine".
 
@@ -65,7 +77,15 @@ flowchart LR
 
     subgraph cs[coxswain-system]
         C[Controller]
-        SP[Shared proxy pool]
+        SP["Proxy pool (shared)"]
+    end
+
+    subgraph n1[ns-1]
+        A1(app-1)
+    end
+
+    subgraph n2[ns-2]
+        A2(app-2)
     end
 
     K8s -->|watch| C
@@ -73,6 +93,7 @@ flowchart LR
     K8s -->|watch| SP
 
     Clients([Clients]) -->|Ingress +\nGateway traffic| SP
+    SP --> A1 & A2
 ```
 
 **Ingress-only (runtime variant):** when Gateway API CRDs are absent at startup, the controller detects their absence, skips Gateway API reconciliation, and the shared proxy pool serves all `Ingress` resources.
@@ -83,7 +104,15 @@ flowchart LR
 
     subgraph cs[coxswain-system]
         C[Controller]
-        SP[Shared proxy pool]
+        SP["Proxy pool (shared)"]
+    end
+
+    subgraph n1[ns-1]
+        A1(app-1)
+    end
+
+    subgraph n2[ns-2]
+        A2(app-2)
     end
 
     K8s -->|watch\nIngress only| C
@@ -91,6 +120,7 @@ flowchart LR
     K8s -->|watch\nIngress only| SP
 
     Clients([Clients]) -->|Ingress traffic| SP
+    SP --> A1 & A2
 ```
 
 ### Dedicated (per Gateway)
@@ -105,11 +135,20 @@ flowchart LR
 
     subgraph cs[coxswain-system]
         C[Controller]
-        SP[Shared proxy pool]
+        SP["Proxy pool (shared)"]
     end
 
-    subgraph ns[team-namespace]
-        GP[Dedicated proxy pool]
+    subgraph ns[gw-namespace-1]
+        GP["Proxy pool (dedicated)"]
+        A1(app-1)
+    end
+
+    subgraph n1[ns-1]
+        A2(app-2)
+    end
+
+    subgraph n2[ns-2]
+        A3(app-3)
     end
 
     K8s -->|watch| C
@@ -119,7 +158,9 @@ flowchart LR
     K8s -->|watch| GP
 
     Clients([Clients]) -->|Ingress +\nother Gateways| SP
-    Clients -->|team Gateway\ntraffic| GP
+    Clients -->|gw-namespace-1 Gateway\ntraffic| GP
+    SP --> A2 & A3
+    GP --> A1
 ```
 
 When every Gateway opts into dedicated mode and the shared proxy `Deployment` is scaled to `replicas: 0`, each team's Gateway gets a fully isolated data plane. Classic `Ingress` is unavailable in this arrangement.
@@ -132,12 +173,14 @@ flowchart LR
         C[Controller]
     end
 
-    subgraph ns_a[team-a-namespace]
-        GPA[Dedicated proxy pool\n— team A]
+    subgraph ns_a[gw-namespace-1]
+        GPA["Proxy pool (dedicated)"]
+        A1(app-1)
     end
 
-    subgraph ns_b[team-b-namespace]
-        GPB[Dedicated proxy pool\n— team B]
+    subgraph ns_b[gw-namespace-2]
+        GPB["Proxy pool (dedicated)"]
+        A2(app-2)
     end
 
     K8s -->|watch| C
@@ -147,13 +190,11 @@ flowchart LR
     K8s -->|watch| GPA
     K8s -->|watch| GPB
 
-    ClientsA([Team A clients]) --> GPA
-    ClientsB([Team B clients]) --> GPB
+    ClientsA([Clients]) --> GPA
+    ClientsB([Clients]) --> GPB
+    GPA --> A1
+    GPB --> A2
 ```
-
-### Why per-namespace isn't a third model
-
-The Gateway API spec provides two axes of per-data-plane customisation: per-Gateway (`Gateway.spec.infrastructure.parametersRef`, GEP-1762) and per-class (`GatewayClass.spec.parametersRef`). There is no namespace-scoped data-plane axis in the spec. The per-Gateway and per-namespace granularities are nested, not orthogonal — per-Gateway is strictly more granular and subsumes any per-namespace arrangement. Comparable implementations (Envoy Gateway, Istio Gateway, Contour, NGINX Gateway Fabric, Cilium) ship Shared and/or Dedicated; none ships a separate per-namespace pool. Introducing a per-namespace model would be an extrapolation beyond what the spec supports and what comparable projects do.
 
 ## State transport
 
@@ -162,7 +203,7 @@ Each proxy pod self-watches Kubernetes directly:
 - A **shared proxy** uses a broad cluster-wide filter covering all routing CRs (HTTPRoute, Ingress, Gateway, Service, EndpointSlice).
 - A **dedicated proxy** (`--dedicated`) narrows its routing-table build to a single named Gateway; cross-namespace backends and TLS Secrets resolve via `ReferenceGrant` as usual. It also narrows its **watches** to the namespaces the controller has rendered into `--proxy-watch-namespaces`, matching the per-namespace `RoleBinding`s the same reconcile cycle provisioned for the proxy SA.
 
-There is no xDS server and no IPC between the controller and any proxy — the controller never pushes data, and a controller crash never disrupts proxy traffic. A future `--source=xds` mode could be added behind the same `RoutingSource` trait boundary without touching proxy code.
+There is no xDS server and no IPC between the controller and any proxy — the controller never pushes data, and a controller crash never disrupts proxy traffic. This self-watch model may be revisited in the future for scenarios such as very large clusters, where having every proxy replica watch the full set of resources independently becomes expensive.
 
 ## RBAC by mode
 
@@ -175,7 +216,7 @@ There is no xDS server and no IPC between the controller and any proxy — the c
 | HTTPRoute, Gateway, Ingress `/status` | update, patch | ✓ (cluster) | — | — |
 | Gateway | patch | ✓ (cluster — finalizers only) | — | — |
 | Deployment, Service, ServiceAccount, RoleBinding | create, update, delete | ✓ (cluster) | — | — |
-| Lease | create, update, get | ✓ (`coxswain-system`) | — | — |
+| Lease | get, create, patch | ✓ (`coxswain-system`) | — | — |
 
 The dedicated-proxy permissions come from a single static `ClusterRole` `coxswain-gateway-proxy-reader` (shipped by the Helm chart and `deploy/manifests/dedicated-proxy-clusterrole.yaml`) bound via per-namespace `RoleBinding`s reconciled by the controller. A compromised dedicated-proxy `ServiceAccount` holds reads only in the namespaces its Gateway has routes into — not in any other namespace, and zero write verbs anywhere.
 
