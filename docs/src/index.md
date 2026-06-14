@@ -7,7 +7,7 @@
 
 Coxswain is a Kubernetes Ingress and Gateway API controller written in Rust, using [Pingora](https://github.com/cloudflare/pingora) — Cloudflare's battle-tested proxy library — as the data plane. It serves both `Ingress` and `HTTPRoute` resources from the same proxy fleet, applies routing changes without restarts, and hot-reloads TLS certificates as Secrets change.
 
-The controller and proxy run as separate pod roles with a strict RBAC boundary: the controller holds all write permissions; proxy pods are read-only. This split makes multi-replica, multi-tenant, and dedicated-mode deployments straightforward.
+See [Architecture](architecture.md) for the deployment models and RBAC boundary.
 
 ## Quick install
 
