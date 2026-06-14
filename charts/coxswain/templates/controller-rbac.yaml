@@ -87,6 +87,13 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # Read pod logs (#285) so the operator UI can tail controller/proxy logs
+  # through the controller admin port. `pods/log` is a separate subresource not
+  # covered by the `pods` get/list/watch above. Read-only; the proxy SA has no
+  # `pods` access at all, so this never reaches the data plane.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
   # Read cluster Nodes (#211): the dedicated Gateway status writer
   # enumerates Node ExternalIP / InternalIP to populate
   # `Gateway.status.addresses` when the dedicated Service is `NodePort`-typed.

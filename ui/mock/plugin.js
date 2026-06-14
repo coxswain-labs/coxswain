@@ -14,6 +14,11 @@
  * named events the real controller does, on a loop, so the live indicator goes
  * green and the Events screen has traffic.
  *
+ * `/api/v1/pods/{name}/logs` is answered with a synthetic chunked NDJSON stream
+ * (the same wire shape the controller relays from kubelet) so the Logs dialog
+ * tails real-looking lines — a mix of levels plus a non-JSON line to exercise
+ * the raw fallback — with no cluster in the loop.
+ *
  * This plugin only registers a dev middleware (`configureServer`), so it is a
  * no-op in `vite build` — the production bundle never includes mock data.
  */
@@ -37,6 +42,23 @@ const SSE_EVENTS = [
   ['leader.changed', { pod: 'coxswain-controller-7f9c8-leadr', is_leader: true }],
 ];
 
+/** Matches `/api/v1/pods/{name}/logs`. */
+const LOGS_RE = /^\/api\/v1\/pods\/[^/]+\/logs$/;
+
+/**
+ * Synthetic log lines looped to drive the Logs dialog. Mostly JSON
+ * (tracing-subscriber shape) across levels, plus one non-JSON line so the raw
+ * fallback path stays exercised in dev.
+ */
+const LOG_LINES = [
+  () => JSON.stringify({ timestamp: new Date().toISOString(), level: 'INFO', fields: { message: 'request_filter host=app.example.com path=/api status=200' }, target: 'coxswain_proxy::proxy' }),
+  () => JSON.stringify({ timestamp: new Date().toISOString(), level: 'DEBUG', fields: { message: 'upstream_peer selected 10.42.0.7:8080' }, target: 'coxswain_proxy::peer' }),
+  () => JSON.stringify({ timestamp: new Date().toISOString(), level: 'WARN', fields: { message: 'backend group has zero ready endpoints' }, target: 'coxswain_reflector::endpoints' }),
+  () => 'plain non-JSON line: pingora listening on 0.0.0.0:8080',
+  () => JSON.stringify({ timestamp: new Date().toISOString(), level: 'ERROR', fields: { message: 'TLS handshake failed: unknown SNI tenant-z.example.com' }, target: 'coxswain_proxy::tls' }),
+  () => JSON.stringify({ timestamp: new Date().toISOString(), level: 'TRACE', fields: { message: 'routing table snapshot swapped (gen 42)' }, target: 'coxswain_core::routing' }),
+];
+
 export function mockApi() {
   return {
     name: 'coxswain-mock-api',
@@ -44,6 +66,22 @@ export function mockApi() {
       server.middlewares.use((req, res, next) => {
         const url = (req.url || '').split('?')[0];
         if (!url.startsWith('/api/v1/')) return next();
+
+        if (LOGS_RE.test(url)) {
+          res.writeHead(200, {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+          });
+          // Seed a few backlog lines immediately, then tail on an interval.
+          let i = 0;
+          for (let s = 0; s < 4; s++) res.write(`${LOG_LINES[i++ % LOG_LINES.length]()}\n`);
+          const timer = setInterval(() => {
+            res.write(`${LOG_LINES[i++ % LOG_LINES.length]()}\n`);
+          }, 1200);
+          req.on('close', () => clearInterval(timer));
+          return;
+        }
 
         if (url === '/api/v1/events') {
           res.writeHead(200, {

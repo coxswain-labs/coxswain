@@ -9,10 +9,12 @@ Edit anything under `src/` and the browser updates instantly.
 `plugin.js` is a Vite dev middleware (wired in `vite.config.js`). It answers
 `/api/v1/*` from JSON fixtures in `data/`, mapping a request path to a file by
 replacing `/` with `_` (e.g. `/api/v1/proxies/foo/routes` →
-`data/_api_v1_proxies_foo_routes.json`). `/api/v1/events` is a synthetic SSE
-stream emitting the controller's named events on a loop, so the live indicator
-goes green. The plugin is dev-only — `vite build` never includes it or the
-fixtures.
+`data/_api_v1_proxies_foo_routes.json`). Two paths are answered with synthetic
+streams instead of fixtures: `/api/v1/events` is an SSE stream emitting the
+controller's named events on a loop (so the live indicator goes green), and
+`/api/v1/pods/{name}/logs` is a chunked NDJSON stream of mixed-level log lines
+(so the Logs dialog tails real-looking output). The plugin is dev-only —
+`vite build` never includes it or the fixtures.
 
 ## Two ways to (re)generate fixtures
 

@@ -206,6 +206,13 @@ kubectl -n coxswain-system port-forward svc/coxswain-controller 8082:8082
 # open http://localhost:8082/
 ```
 
+`rollout restart` only re-pulls the image — it does **not** apply chart changes. If your change also touches RBAC or any other rendered resource (e.g. a new `pods/log` grant under `charts/coxswain/templates/`), apply the chart first, then restart for the new binary:
+
+```bash
+helm upgrade coxswain charts/coxswain -n coxswain-system --reuse-values --set image.tag=ui
+kubectl -n coxswain-system rollout restart deploy/coxswain-controller deploy/coxswain-shared-proxy
+```
+
 `deploy/dev/operator-ui-demo.yaml` seeds a representative workload (healthy + dead + conflicting routes across namespaces) so the UI has realistic signals during a live test.
 
 ---
