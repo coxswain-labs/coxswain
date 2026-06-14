@@ -141,6 +141,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # The operator UI is embedded into coxswain-admin via include_str! of
+      # ui/dist/index.html, so the workspace can't compile without it. The
+      # Dockerfile builds the UI in its ui-builder stage, but this job builds
+      # the binary directly on the runner, so build it here too (matches ci.yml).
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+      - name: Build operator UI
+        run: npm ci && npm run build
+        working-directory: ui
+
       - uses: ./.github/actions/setup-rust-with-cache
         with:
           cache-key-prefix: release-conformance
