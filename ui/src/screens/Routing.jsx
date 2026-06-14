@@ -110,7 +110,7 @@ export function Routing({ query }) {
   const Section = active.Section;
 
   return (
-    <div class="screen">
+    <div class="screen screen-fill">
       <Breadcrumb items={[{ label: 'Routing' }, { label: 'Overview' }]} />
 
       {/* Filters are shared across all tabs (one namespace/search scope applied to

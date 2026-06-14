@@ -1,5 +1,6 @@
 import { Table } from './Table.jsx';
 import { ErrorState } from './Spinner.jsx';
+import { Icon } from './Icon.jsx';
 
 /**
  * Shared list table for the routing screens (#292/#296).
@@ -64,6 +65,7 @@ export function DataTable({
       renderRow={renderRow}
       emptyMsg={loading ? 'Loading…' : emptyMsg}
       footer={footer}
+      scrollKey={page ? page.offset : undefined}
     />
   );
 }
@@ -96,10 +98,18 @@ function Pager({ page }) {
           </label>
         )}
         <div class="pager-nav" role="group" aria-label="Pagination">
-          <button class="pager-btn" disabled={atStart} aria-label="First page" onClick={() => onPage(0)}>«</button>
-          <button class="pager-btn" disabled={atStart} aria-label="Previous page" onClick={() => onPage(Math.max(0, offset - pageSize))}>‹</button>
-          <button class="pager-btn" disabled={atEnd} aria-label="Next page" onClick={() => onPage(offset + pageSize)}>›</button>
-          <button class="pager-btn" disabled={atEnd} aria-label="Last page" onClick={() => onPage(lastOffset)}>»</button>
+          <button class="pager-btn" disabled={atStart} aria-label="First page" onClick={() => onPage(0)}>
+            <Icon name="chevrons-left" size={16} />
+          </button>
+          <button class="pager-btn" disabled={atStart} aria-label="Previous page" onClick={() => onPage(Math.max(0, offset - pageSize))}>
+            <Icon name="chevron-left" size={16} />
+          </button>
+          <button class="pager-btn" disabled={atEnd} aria-label="Next page" onClick={() => onPage(offset + pageSize)}>
+            <Icon name="chevron-right" size={16} />
+          </button>
+          <button class="pager-btn" disabled={atEnd} aria-label="Last page" onClick={() => onPage(lastOffset)}>
+            <Icon name="chevrons-right" size={16} />
+          </button>
         </div>
       </div>
     </div>

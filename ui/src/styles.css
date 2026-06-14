@@ -57,6 +57,10 @@ img { max-width: 100%; }
 }
 .content {
   margin-top: var(--nav-h);
+  /* Fill the viewport below the fixed nav and own the scroll, so a screen can
+     flex its table into the remaining height instead of growing the page. */
+  height: calc(100vh - var(--nav-h));
+  overflow-y: auto;
   padding: 24px 16px;
   max-width: 1200px;
   margin-left: auto;
@@ -646,10 +650,24 @@ section { margin-bottom: 32px; }
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--r);
-  overflow-x: auto;     /* horizontal scroll on narrow screens */
+  overflow: auto;       /* horizontal scroll on narrow screens + vertical scroll */
   margin-bottom: 12px;
   -webkit-overflow-scrolling: touch;
 }
+/* A "fill" screen (the routing tabs) is a flex column that owns the content
+   height; its table flexes into the remaining vertical space — bound to the
+   window, with a floor — so the body scrolls internally with a sticky header
+   and pager rather than growing the page. */
+.screen-fill { display: flex; flex-direction: column; height: 100%; }
+/* Everything except the table holds its natural size — without this the tab bar
+   (a flex item with overflow-x:auto, so its min-size collapses to 0) gets shrunk
+   away when the tall table competes for space. */
+.screen-fill > :not(.tbl-wrap) { flex: 0 0 auto; }
+/* Don't grow past the rows (no stretched, mostly-empty table), but shrink and
+   scroll internally when the rows exceed the remaining space — so the table is
+   bound to the viewport. min-height:0 lets it shrink below content height to
+   enable the inner scroll. */
+.screen-fill .tbl-wrap { flex: 0 1 auto; min-height: 0; margin-bottom: 0; }
 table { width: 100%; border-collapse: collapse; min-width: 400px; }
 th {
   text-align: left; padding: 10px 14px;
@@ -657,6 +675,7 @@ th {
   letter-spacing: .06em; text-transform: uppercase;
   color: var(--muted); border-bottom: 1px solid var(--border);
   background: var(--surface2); white-space: nowrap;
+  position: sticky; top: 0; z-index: 2;   /* header stays while the body scrolls */
 }
 td {
   padding: 10px 14px; border-bottom: 1px solid var(--border);
@@ -684,6 +703,7 @@ tr.sev-error td:first-child { box-shadow: inset 3px 0 0 var(--red); }
 td.table-foot {
   padding: 8px 12px; border-top: 1px solid var(--border); border-bottom: none;
   background: var(--surface2); color: var(--muted); font-size: 12px;
+  position: sticky; bottom: 0; z-index: 2;   /* pager stays visible while scrolling */
 }
 .pager {
   display: flex; align-items: center; justify-content: space-between;
@@ -693,15 +713,16 @@ td.table-foot {
 .pager-controls { display: flex; align-items: center; gap: 16px; }
 .pager-size { display: inline-flex; align-items: center; gap: 6px; }
 .pager-size select {
+  height: 32px; min-height: 32px; padding: 0 8px;
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--r); color: var(--text); padding: 3px 6px; font-size: 12px;
+  border-radius: var(--r); color: var(--text); font-size: 12px;
 }
-.pager-nav { display: inline-flex; gap: 2px; }
+.pager-nav { display: inline-flex; gap: 4px; }
 .pager-btn {
   display: inline-flex; align-items: center; justify-content: center;
-  min-width: 28px; height: 28px; padding: 0;
+  width: 32px; height: 32px; padding: 0;
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--r); color: var(--text); font-size: 14px; line-height: 1;
+  border-radius: var(--r); color: var(--text); font-size: 15px; line-height: 1;
 }
 .pager-btn:hover:not(:disabled) { border-color: var(--blue); color: var(--blue); }
 .pager-btn:disabled { opacity: 0.35; cursor: default; }
