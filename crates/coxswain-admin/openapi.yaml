@@ -203,7 +203,7 @@ paths:
       tags: [routing]
       summary: Gateway list (filter/pagination envelope)
       parameters:
-        - { $ref: '#/components/parameters/host' }
+        - { $ref: '#/components/parameters/nameQuery' }
         - { $ref: '#/components/parameters/limit' }
         - { $ref: '#/components/parameters/offset' }
         - { $ref: '#/components/parameters/status' }
@@ -238,7 +238,7 @@ paths:
       tags: [routing]
       summary: HTTPRoute list (first-class, #293; filter/pagination envelope)
       parameters:
-        - { $ref: '#/components/parameters/host' }
+        - { $ref: '#/components/parameters/nameQuery' }
         - { $ref: '#/components/parameters/limit' }
         - { $ref: '#/components/parameters/offset' }
         - { $ref: '#/components/parameters/status' }
@@ -261,7 +261,7 @@ paths:
       tags: [routing]
       summary: Ingress list (filter/pagination envelope)
       parameters:
-        - { $ref: '#/components/parameters/host' }
+        - { $ref: '#/components/parameters/nameQuery' }
         - { $ref: '#/components/parameters/limit' }
         - { $ref: '#/components/parameters/offset' }
         - { $ref: '#/components/parameters/status' }
@@ -360,10 +360,15 @@ paths:
 
 components:
   parameters:
+    nameQuery:
+      name: name
+      in: query
+      description: Case-insensitive substring filter against the resource object name (routing list free-text search; name-only).
+      schema: { type: string }
     host:
       name: host
       in: query
-      description: Case-insensitive substring filter against host-like fields.
+      description: Case-insensitive substring filter against the route host (proxy routes only).
       schema: { type: string }
     path:
       name: path
@@ -475,6 +480,12 @@ components:
                   port: { type: integer }
                   protocol: { type: string }
                   tls_enabled: { type: boolean }
+                  tls_status:
+                    description: Listener-precise TLS health (null for cleartext listeners); error = certificateRefs unresolved, warn = not programmed yet.
+                    oneOf:
+                      - { $ref: '#/components/schemas/Severity' }
+                      - { type: 'null' }
+                  tls_reason: { type: [string, 'null'], description: Reason/message when tls_status is not ok. }
                   attached_routes: { type: integer }
             attached_routes_list:
               type: array
@@ -484,6 +495,13 @@ components:
                   kind: { type: string }
                   namespace: { type: string }
                   name: { type: string }
+                  hostnames: { type: array, items: { type: string } }
+                  rule_count: { type: integer }
+                  status:
+                    description: Reflector traffic-served status (null when the route is absent from the controller's table, e.g. a cut-over dedicated gateway — the UI then relies on the /problems overlay).
+                    oneOf:
+                      - { $ref: '#/components/schemas/Severity' }
+                      - { type: 'null' }
 
     HttpRouteSummary:
       type: object

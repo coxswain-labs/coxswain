@@ -28,7 +28,7 @@ import { IngressesSection } from './Ingresses.jsx';
 // warn on binding/condition status only — upstream-only — so they have none).
 const TABS = [
   { key: 'gateways',   label: 'Gateways',   fetch: getGateways,   dataKey: 'gateways',   Section: GatewaysSection,    problemKind: null },
-  { key: 'httproutes', label: 'HTTPRoutes', fetch: getHttproutes, dataKey: 'httproutes', Section: HttpRoutesSection,  problemKind: 'HTTPRoute' },
+  { key: 'httproutes', label: 'HTTP Routes', fetch: getHttproutes, dataKey: 'httproutes', Section: HttpRoutesSection,  problemKind: 'HTTPRoute' },
   { key: 'ingresses',  label: 'Ingresses',  fetch: getIngresses,  dataKey: 'ingresses',  Section: IngressesSection,   problemKind: 'Ingress' },
 ];
 
@@ -70,6 +70,11 @@ export function Routing({ query }) {
   // HTTPRoutes tab honours it; switching away clears it.
   const parent = activeKey === 'httproutes' ? (query?.parent ?? '') : '';
 
+  // "Problems only" is client-side on the *effective* (overlaid) status — the
+  // server's `?status=problem` can't see the cross-proxy /problems aggregate, so
+  // filtering server-side would re-open the green-tick blind spot.
+  const problemsOnly = query?.problems === '1';
+
   const Section = active.Section;
 
   return (
@@ -79,29 +84,48 @@ export function Routing({ query }) {
       {/* Filters are shared across all tabs (one namespace/search scope applied to
           whichever tab is active), so they sit above the tab bar — the tabs only
           switch which resource type the scope is viewed through. */}
+      {/* Scoping filters (namespace · problems-only) group left; free-text name
+          search anchors right — the conventional toolbar split. */}
       <div class="screen-header">
-        <div class="header-controls left">
-          <ComboFilter
-            label="Filter by namespace"
-            value={nsFilter}
-            options={[{ value: 'all', label: 'All namespaces' }, ...namespaces.map((ns) => ({ value: ns, label: ns }))]}
-            onChange={(v) => updateQuery({ ns: v === 'all' ? null : v })}
-          />
-          <SearchBox value={search} onInput={onSearch} label="Search routing by name" />
-          {parent && (
-            <span class="active-filter" title="Filtered to routes attached to this Gateway">
-              Parent: {parent}
-              <button
-                class="active-filter-x"
-                aria-label="Clear parent filter"
-                onClick={() => updateQuery({ parent: null })}
-              >
-                ×
-              </button>
-            </span>
-          )}
+        <div class="header-controls left routing-filters">
+          <div class="filter-group">
+            <ComboFilter
+              label="Filter by namespace"
+              value={nsFilter}
+              options={[{ value: 'all', label: 'All namespaces' }, ...namespaces.map((ns) => ({ value: ns, label: ns }))]}
+              onChange={(v) => updateQuery({ ns: v === 'all' ? null : v })}
+            />
+            <button
+              type="button"
+              class={`toggle-pill${problemsOnly ? ' active' : ''}`}
+              aria-pressed={problemsOnly}
+              title="Show only resources that aren't fully serving traffic"
+              onClick={() => updateQuery({ problems: problemsOnly ? null : '1' })}
+            >
+              <Icon name="alert" size={13} />
+              Problems only
+            </button>
+          </div>
+          <SearchBox value={search} onInput={onSearch} placeholder="Search by name…" label="Search routing by name" />
         </div>
       </div>
+
+      {/* Deep-link-driven parent filter sits on its own row below the toolbar —
+          it's a transient, dismissable scope, not a standing filter control. */}
+      {parent && (
+        <div class="filter-row-below">
+          <span class="active-filter" title="Filtered to routes attached to this Gateway">
+            Parent: {parent}
+            <button
+              class="active-filter-x"
+              aria-label="Clear parent filter"
+              onClick={() => updateQuery({ parent: null })}
+            >
+              ×
+            </button>
+          </span>
+        </div>
+      )}
 
       <div class="tabs" role="tablist">
         {TABS.map((t) => {
@@ -134,6 +158,7 @@ export function Routing({ query }) {
         q={q}
         ns={nsFilter}
         parent={parent}
+        problemsOnly={problemsOnly}
         problemKeys={problemKeys}
       />
     </div>

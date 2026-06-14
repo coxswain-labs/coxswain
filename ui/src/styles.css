@@ -365,7 +365,7 @@ section { margin-bottom: 32px; }
 /* ── Breadcrumb ──────────────────────────────────────────────────────────── */
 .breadcrumb {
   display: flex; align-items: center; gap: 6px;
-  margin-bottom: 20px; color: var(--muted); font-size: 13px;
+  margin-bottom: 20px; color: var(--muted); font-size: 14px;
   flex-wrap: wrap;
 }
 .breadcrumb a { color: var(--blue); cursor: pointer; }
@@ -422,6 +422,30 @@ section { margin-bottom: 32px; }
 }
 /* Fleet aligns its filters to the left (no big title above them). */
 .header-controls.left { margin-left: 0; }
+/* Routing toolbar: scoping filters group left, search anchored right. The row
+   spans full width so the search can push to the far edge; on wrap the search
+   drops to its own line full-width rather than getting squeezed. */
+.routing-filters { width: 100%; }
+.filter-group { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.routing-filters .search-box { margin-left: auto; }
+/* "Problems only" toggle — a pill that lights amber when engaged, matching the
+   warn visual language of the Dashboard tiles (.stat.warn) and the tab icons. */
+.toggle-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: var(--control-h); padding: 0 12px;
+  border: 1px solid var(--border); border-radius: var(--r);
+  background: var(--surface); color: var(--muted);
+  font-size: 13px; font-weight: 500; white-space: nowrap; cursor: pointer;
+}
+.toggle-pill svg { color: var(--muted); }
+.toggle-pill:hover { border-color: var(--amber); color: var(--text); }
+.toggle-pill:hover svg { color: var(--amber); }
+.toggle-pill.active {
+  border-color: color-mix(in srgb, var(--amber) 45%, var(--border));
+  background: color-mix(in srgb, var(--amber) 12%, var(--surface));
+  color: var(--amber);
+}
+.toggle-pill.active svg { color: var(--amber); }
 .search-box, .filter-select {
   /* height == min-height == --control-h, which equals --touch (44px), so the
      generic `input[type=text], select { min-height: var(--touch) }` rule agrees
@@ -569,7 +593,7 @@ section { margin-bottom: 32px; }
 
 /* ── Badges ──────────────────────────────────────────────────────────────── */
 .badge {
-  display: inline-flex; align-items: center;
+  display: inline-flex; align-items: center; gap: 4px;
   padding: 3px 8px; border-radius: 999px;
   font-size: 11px; font-weight: 700;
   letter-spacing: .04em; text-transform: uppercase;
@@ -585,6 +609,7 @@ section { margin-bottom: 32px; }
 .b-true      { background: #1a3a2d; color: #4ade80; }
 .b-false     { background: #3a1a1a; color: #f87171; }
 .b-neutral   { background: var(--surface2); color: var(--muted); }
+.b-tls       { background: #0f3330; color: #2dd4bf; }
 /* Conflicts and dead backends are both amber (warn tier) — red is reserved for
    "something is down" (no leader, unreachable pods). They read apart by label. */
 .b-conflict  { background: #3a2d0a; color: #fbbf24; }
@@ -666,15 +691,14 @@ tr.sev-error td:first-child { box-shadow: inset 3px 0 0 var(--red); }
 .panel-title-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 /* ── Condition row ───────────────────────────────────────────────────────── */
-.cond-row {
-  display: flex; align-items: flex-start; gap: 10px;
-  padding: 10px 0; border-bottom: 1px solid var(--border);
-}
-.cond-row:last-child { border-bottom: none; }
-.cond-list { padding: 0 4px; }
-.cond-body { flex: 1; min-width: 0; }
-.cond-name { font-weight: 600; font-size: 13px; margin-bottom: 2px; }
-.cond-detail { font-size: 12px; color: var(--muted); word-break: break-word; }
+/* Listener with 0 attached routes: an informational amber count, not a row
+   border (a healthy listener with no routes isn't a fault). */
+.routes-none { color: var(--amber); font-weight: 600; }
+/* Conditions table: shrink the Condition column to its content so Reason — the
+   column that actually needs room — takes the rest. */
+.cond-table td:first-child, .cond-table th:first-child { width: 1%; white-space: nowrap; }
+/* Secondary (message) line under a condition's reason cell. */
+.cond-detail { font-size: 12px; color: var(--muted); word-break: break-word; margin-top: 2px; }
 
 /* ── Pod health (PodInfo) ────────────────────────────────────────────────── */
 /* Per-subsystem collapsible rows: a summary line (state + N/M ready) that
@@ -901,6 +925,12 @@ input[type=checkbox] { accent-color: var(--blue); }
 .link-text { color: var(--blue); cursor: pointer; }
 .link-text:hover { text-decoration: underline; }
 
+/* Multi-value table cell rendered as a vertical stack (e.g. an HTTPRoute's
+   parent Gateways) instead of a comma-separated run. */
+.cell-list { display: flex; flex-direction: column; gap: 2px; }
+
+/* Row hosting the transient deep-link filter chip, below the main toolbar. */
+.filter-row-below { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 /* Active deep-link filter chip (e.g. Routing "Parent: ns/name ×"). */
 .active-filter {
   display: inline-flex; align-items: center; gap: 6px;
@@ -940,22 +970,6 @@ input[type=checkbox] { accent-color: var(--blue); }
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   font-size: 12px; padding: 4px 0; color: var(--text);
 }
-
-/* ── Gateway detail ──────────────────────────────────────────────────────── */
-.attached-routes { display: grid; gap: 6px; }
-.attached-route-row {
-  display: flex; align-items: center; gap: 8px;
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--r); padding: 12px 14px; font-size: 13px;
-  cursor: pointer; transition: border-color .12s;
-  min-height: var(--touch);
-}
-.attached-route-row:hover { border-color: var(--blue); }
-.ns-label { color: var(--muted); }
-
-
-/* ── Listener row ────────────────────────────────────────────────────────── */
-.listener-warn td { color: var(--amber); }
 
 /* ── Endpoint health ─────────────────────────────────────────────────────── */
 .endpoint-health { font-size: 12px; color: var(--muted); }

@@ -62,7 +62,7 @@ export function Dashboard() {
     { key: 'shared',      label: 'Shared proxies',    icon: 'layers',     accent: 'var(--green)',  value: total(f.shared_proxies),    status: warnOf(f.shared_proxies),    onClick: () => nav.fleet({ filter: 'shared' }) },
     { key: 'dedicated',   label: 'Dedicated proxies', icon: 'box',        accent: 'var(--purple)', value: total(f.dedicated_proxies), status: warnOf(f.dedicated_proxies), onClick: () => nav.fleet({ filter: 'dedicated' }) },
     { key: 'gateways',    label: 'Gateways',          icon: 'git-branch', accent: 'var(--amber)',  value: total(r.gateways),          status: warnOf(r.gateways),                       onClick: () => nav.routing({ tab: 'gateways' }) },
-    { key: 'httproutes',  label: 'HTTPRoutes',        icon: 'route',      accent: 'var(--pink)',   value: total(r.httproutes),        status: routeWarn(r.httproutes, 'HTTPRoute'),     onClick: () => nav.routing({ tab: 'httproutes' }) },
+    { key: 'httproutes',  label: 'HTTP Routes',       icon: 'route',      accent: 'var(--pink)',   value: total(r.httproutes),        status: routeWarn(r.httproutes, 'HTTPRoute'),     onClick: () => nav.routing({ tab: 'httproutes' }) },
     { key: 'ingresses',   label: 'Ingresses',         icon: 'log-in',     accent: 'var(--teal)',   value: total(r.ingresses),         status: routeWarn(r.ingresses, 'Ingress'),        onClick: () => nav.routing({ tab: 'ingresses' }) },
   ];
 

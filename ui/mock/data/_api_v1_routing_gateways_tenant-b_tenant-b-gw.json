@@ -4,7 +4,12 @@
     {
       "kind": "HTTPRoute",
       "name": "b-api-route",
-      "namespace": "tenant-b"
+      "namespace": "tenant-b",
+      "hostnames": [
+        "app.tenant-b.local"
+      ],
+      "rule_count": 1,
+      "status": "error"
     }
   ],
   "conditions": [

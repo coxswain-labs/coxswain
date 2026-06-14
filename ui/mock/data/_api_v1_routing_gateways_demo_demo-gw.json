@@ -4,22 +4,42 @@
     {
       "kind": "HTTPRoute",
       "name": "api-route",
-      "namespace": "demo"
+      "namespace": "demo",
+      "hostnames": [
+        "api.demo.local"
+      ],
+      "rule_count": 1,
+      "status": "error"
     },
     {
       "kind": "HTTPRoute",
       "name": "docs-route",
-      "namespace": "demo"
+      "namespace": "demo",
+      "hostnames": [
+        "docs.demo.local"
+      ],
+      "rule_count": 1,
+      "status": "ok"
     },
     {
       "kind": "HTTPRoute",
       "name": "health-probe-route",
-      "namespace": "demo"
+      "namespace": "demo",
+      "hostnames": [
+        "app.demo.local"
+      ],
+      "rule_count": 1,
+      "status": "error"
     },
     {
       "kind": "HTTPRoute",
       "name": "web-route",
-      "namespace": "demo"
+      "namespace": "demo",
+      "hostnames": [
+        "app.demo.local"
+      ],
+      "rule_count": 1,
+      "status": "warn"
     }
   ],
   "conditions": [
@@ -47,7 +67,26 @@
       "port": 8443,
       "protocol": "HTTPS",
       "tls_enabled": true,
+      "tls_status": "ok",
       "attached_routes": 0
+    },
+    {
+      "name": "https-broken",
+      "port": 8444,
+      "protocol": "HTTPS",
+      "tls_enabled": true,
+      "tls_status": "error",
+      "tls_reason": "certificate Secret \"demo-tls\" not found",
+      "attached_routes": 0
+    },
+    {
+      "name": "https-pending",
+      "port": 8445,
+      "protocol": "HTTPS",
+      "tls_enabled": true,
+      "tls_status": "warn",
+      "tls_reason": "listener not programmed yet",
+      "attached_routes": 1
     }
   ],
   "name": "demo-gw",

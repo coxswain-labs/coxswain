@@ -474,7 +474,7 @@ impl OperatorAggregator {
             .gateways
             .iter()
             .filter(|g| !params.problems_only || g.status.is_problem())
-            .filter(|g| params.host_matches(&g.name) || params.host_matches(&g.namespace))
+            .filter(|g| params.name_matches(&g.name))
             .map(|g| serde_json::to_value(g).unwrap_or(serde_json::Value::Null))
             .collect();
         page_response("gateways", Page::paginate(filtered, params))
@@ -518,14 +518,15 @@ impl OperatorAggregator {
                     .collect::<Vec<_>>();
 
                 // Join spec listeners with per-listener status (attached-route
-                // count).  Status may be absent before the first reconcile.
-                let status_attached: std::collections::HashMap<&str, i32> = gw
+                // count + conditions for TLS health). Status may be absent before
+                // the first reconcile.
+                let status_by_name: std::collections::HashMap<&str, &_> = gw
                     .status
                     .as_ref()
                     .and_then(|s| s.listeners.as_deref())
                     .unwrap_or_default()
                     .iter()
-                    .map(|l| (l.name.as_str(), l.attached_routes))
+                    .map(|l| (l.name.as_str(), l))
                     .collect();
 
                 let lsnrs: Vec<serde_json::Value> = gw
@@ -533,12 +534,28 @@ impl OperatorAggregator {
                     .listeners
                     .iter()
                     .map(|l| {
-                        let attached = status_attached.get(l.name.as_str()).copied().unwrap_or(0);
+                        let st = status_by_name.get(l.name.as_str()).copied();
+                        let attached = st.map(|s| s.attached_routes).unwrap_or(0);
+                        // Listener-precise TLS health: a configured listener's
+                        // badge reflects whether its certificate refs resolved and
+                        // it programmed — not merely that a TLS block exists.
+                        let (tls_status, tls_reason) = if l.tls.is_some() {
+                            let (sev, why) =
+                                listener_tls_health(st.map(|s| s.conditions.as_slice()));
+                            (
+                                serde_json::to_value(sev).unwrap_or(serde_json::Value::Null),
+                                why,
+                            )
+                        } else {
+                            (serde_json::Value::Null, None)
+                        };
                         serde_json::json!({
                             "name": l.name,
                             "port": l.port,
                             "protocol": l.protocol,
                             "tls_enabled": l.tls.is_some(),
+                            "tls_status": tls_status,
+                            "tls_reason": tls_reason,
                             "attached_routes": attached,
                         })
                     })
@@ -556,7 +573,9 @@ impl OperatorAggregator {
             }
         };
 
-        let attached_routes_list = self.list_attached_httproutes(kube, namespace, name).await;
+        let attached_routes_list = self
+            .list_attached_httproutes(kube, &snapshot, namespace, name)
+            .await;
 
         let mut v = gateway_summary_json(summary, &snapshot);
         v["conditions"] = serde_json::to_value(&conditions).unwrap_or(serde_json::Value::Null);
@@ -578,6 +597,7 @@ impl OperatorAggregator {
     async fn list_attached_httproutes(
         &self,
         kube: &Client,
+        snapshot: &ClusterSummary,
         gw_namespace: &str,
         gw_name: &str,
     ) -> Vec<serde_json::Value> {
@@ -623,10 +643,26 @@ impl OperatorAggregator {
             });
 
             if attaches {
+                // Enrich with hostnames + rule count straight from the route spec
+                // so the Gateway-detail table mirrors the routing HTTPRoutes table
+                // (Parent is implicit here — it's this Gateway).
+                let hostnames = route.spec.hostnames.as_deref().unwrap_or(&[]).to_vec();
+                let rule_count = route.spec.rules.as_deref().map(<[_]>::len).unwrap_or(0);
+                // Reflector-computed traffic-served status (same field the routing
+                // HTTPRoutes table shows). The UI overlays /problems on top, so
+                // dead/conflict routes on a dedicated gateway still surface.
+                let status = snapshot
+                    .httproutes
+                    .iter()
+                    .find(|h| h.namespace == route_ns && h.name == route_name)
+                    .map(|h| h.status);
                 result.push(serde_json::json!({
                     "kind": "HTTPRoute",
                     "namespace": route_ns,
                     "name": route_name,
+                    "hostnames": hostnames,
+                    "rule_count": rule_count,
+                    "status": status,
                 }));
             }
         }
@@ -648,7 +684,46 @@ fn gateway_summary_json(
         "route_count": summary.route_count,
         "addresses": summary.addresses,
         "conditions": summary.conditions,
+        "status": summary.status,
     })
+}
+
+/// Listener-precise TLS health from a listener's Gateway API status conditions.
+///
+/// `ResolvedRefs=False` (its `certificateRefs` didn't resolve — missing/invalid
+/// Secret or a cross-namespace ref not permitted) means no TLS traffic serves on
+/// this listener → [`Severity::Error`]. `Programmed=False` means it isn't yet
+/// realized in the data plane → [`Severity::Warn`]. Both `True` → [`Severity::Ok`].
+/// Absent status (pre-reconcile) is reported as `Warn`, never a confident lock —
+/// the badge must not claim a certificate is good when we don't yet know.
+fn listener_tls_health(
+    conditions: Option<&[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]>,
+) -> (Severity, Option<String>) {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+    let Some(conds) = conditions else {
+        return (
+            Severity::Warn,
+            Some("listener status not reported yet".to_string()),
+        );
+    };
+    let why = |c: &Condition| {
+        if c.message.is_empty() {
+            c.reason.clone()
+        } else {
+            c.message.clone()
+        }
+    };
+    if let Some(c) = conds.iter().find(|c| c.type_ == "ResolvedRefs")
+        && c.status != "True"
+    {
+        return (Severity::Error, Some(why(c)));
+    }
+    if let Some(c) = conds.iter().find(|c| c.type_ == "Programmed")
+        && c.status != "True"
+    {
+        return (Severity::Warn, Some(why(c)));
+    }
+    (Severity::Ok, None)
 }
 
 // ── /api/v1/ingresses ────────────────────────────────────────────────────────
@@ -662,26 +737,23 @@ impl OperatorAggregator {
             .ingresses
             .iter()
             .filter(|i| !params.problems_only || i.status.is_problem())
-            .filter(|i| params.host_matches(&i.name) || params.host_matches(&i.namespace))
+            .filter(|i| params.name_matches(&i.name))
             .map(|i| serde_json::to_value(i).unwrap_or(serde_json::Value::Null))
             .collect();
         page_response("ingresses", Page::paginate(filtered, params))
     }
 
     /// `GET /api/v1/routing/httproutes` — HTTPRoute list from the cluster summary
-    /// (no fan-out, #293), with the shared filter/pagination envelope. The `host`
-    /// filter also matches declared hostnames.
+    /// (no fan-out, #293), with the shared filter/pagination envelope. The `name`
+    /// filter matches the route's object name (name-only, like the other routing
+    /// lists); declared hostnames are not part of the free-text search.
     pub(crate) fn list_httproutes(&self, params: &ListParams) -> Response<Vec<u8>> {
         let snapshot = self.cluster.load();
         let filtered: Vec<serde_json::Value> = snapshot
             .httproutes
             .iter()
             .filter(|r| !params.problems_only || r.status.is_problem())
-            .filter(|r| {
-                params.host_matches(&r.name)
-                    || params.host_matches(&r.namespace)
-                    || r.hostnames.iter().any(|h| params.host_matches(h))
-            })
+            .filter(|r| params.name_matches(&r.name))
             .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
             .collect();
         page_response("httproutes", Page::paginate(filtered, params))
@@ -1442,6 +1514,42 @@ mod tests {
     }
 
     // ── entry_json ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn listener_tls_health_maps_conditions_to_severity() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+        let cond = |t: &str, s: &str| Condition {
+            last_transition_time: Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH),
+            message: String::new(),
+            observed_generation: None,
+            reason: format!("{t}Reason"),
+            status: s.to_string(),
+            type_: t.to_string(),
+        };
+        // Both conditions True → genuinely good.
+        let (sev, why) = listener_tls_health(Some(&[
+            cond("ResolvedRefs", "True"),
+            cond("Programmed", "True"),
+        ]));
+        assert_eq!(sev, Severity::Ok);
+        assert!(why.is_none());
+        // Cert ref unresolved → serves no TLS traffic → error, with the reason.
+        let (sev, why) = listener_tls_health(Some(&[
+            cond("ResolvedRefs", "False"),
+            cond("Programmed", "True"),
+        ]));
+        assert_eq!(sev, Severity::Error);
+        assert_eq!(why.as_deref(), Some("ResolvedRefsReason"));
+        // Resolved but not yet programmed → warn.
+        let (sev, _) = listener_tls_health(Some(&[
+            cond("ResolvedRefs", "True"),
+            cond("Programmed", "False"),
+        ]));
+        assert_eq!(sev, Severity::Warn);
+        // No status reported yet → warn, never a confident ok.
+        let (sev, _) = listener_tls_health(None);
+        assert_eq!(sev, Severity::Warn);
+    }
 
     #[test]
     fn entry_json_shared_proxy_has_no_gateway_ref() {

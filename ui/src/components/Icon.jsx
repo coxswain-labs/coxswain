@@ -80,6 +80,13 @@ const PATHS = {
       <line x1="12" y1="19" x2="20" y2="19" />
     </>
   ),
+  // padlock — TLS-enabled listener
+  lock: (
+    <>
+      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+    </>
+  ),
   // info circle — version / about popover
   info: (
     <>

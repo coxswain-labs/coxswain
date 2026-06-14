@@ -1,31 +1,31 @@
-import { Badge } from './Badge.jsx';
+import { sevClass } from '../severity.js';
+
+/** Condition status → row severity (the table warning left-edge). Positive
+ *  polarity (Gateway API standard conditions): True = ok, False = error,
+ *  Unknown = warn. */
+const SEV = { True: 'ok', False: 'error', Unknown: 'warn' };
 
 /**
- * One Kubernetes status condition row.
+ * One Kubernetes status condition as a table row, using the same warning visual
+ * language as the other tables: a severity-coloured left edge for the status
+ * (calm when True, red/amber otherwise), the condition type, and its reason +
+ * message. The raw status is in the row tooltip.
  *
  * @param {{ type: string, status: string, reason?: string, message?: string }} condition
  */
 export function ConditionRow({ condition }) {
-  const isTrue = condition.status === 'True';
-  const isUnknown = condition.status === 'Unknown';
-  const variant = isTrue ? 'ok' : isUnknown ? 'neutral' : 'fail';
-  const icon = isTrue ? '✔' : isUnknown ? '—' : '✖';
+  const { type, status, reason, message } = condition;
+  const sev = SEV[status] ?? 'warn';
+  const primary = reason || message || '—';
+  const secondary = message && message !== reason ? message : null;
 
   return (
-    <div class="cond-row">
-      <Badge variant={variant} label={condition.status}>{icon}</Badge>
-      <div class="cond-body">
-        <div class="cond-name">{condition.type}</div>
-        {condition.reason && (
-          <div class="cond-detail">reason: {condition.reason}</div>
-        )}
-        {condition.message && condition.message !== condition.reason && (
-          <div class="cond-detail">{condition.message}</div>
-        )}
-        {!condition.reason && !condition.message && (
-          <div class="cond-detail" style="color:var(--muted)">no detail</div>
-        )}
-      </div>
-    </div>
+    <tr class={sevClass(sev)} title={`status: ${status}`}>
+      <td><strong>{type}</strong></td>
+      <td>
+        {primary}
+        {secondary && <div class="cond-detail">{secondary}</div>}
+      </td>
+    </tr>
   );
 }

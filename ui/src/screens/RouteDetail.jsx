@@ -50,6 +50,9 @@ export function RouteDetail({ kind, namespace, name }) {
   // button's job, not the breadcrumb's.
   const breadcrumb = [
     { label: 'Routing', onClick: () => nav.routing() },
+    isHttp
+      ? { label: 'HTTP Routes', onClick: () => nav.routing({ tab: 'httproutes' }) }
+      : { label: 'Ingresses', onClick: () => nav.routing({ tab: 'ingresses' }) },
     { label: `${namespace}/${name}` },
   ];
 
@@ -106,10 +109,20 @@ export function RouteDetail({ kind, namespace, name }) {
                     {gw}
                   </span>
                 </div>
-                <div class="cond-list">
-                  {(ps.conditions ?? []).map((c) => (
-                    <ConditionRow key={c.type} condition={c} />
-                  ))}
+                <div class="tbl-wrap">
+                  <table class="cond-table">
+                    <thead>
+                      <tr>
+                        <th>Condition</th>
+                        <th>Reason</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(ps.conditions ?? []).map((c) => (
+                        <ConditionRow key={c.type} condition={c} />
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               </div>
             );

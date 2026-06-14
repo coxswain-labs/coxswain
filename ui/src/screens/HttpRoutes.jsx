@@ -13,17 +13,18 @@ import { worseSeverity, routeKey, sevClass, sevTitle } from '../severity.js';
  * parent (`parent` prop). Presentational: the owning Routing screen supplies the
  * shared namespace/search filters (see GatewaysSection).
  */
-export function HttpRoutesSection({ rows = [], total, loading = false, error = null, q = '', ns = 'all', parent = '', problemKeys }) {
-  const shown = rows.filter(
-    (r) =>
-      (ns === 'all' || r.namespace === ns) &&
-      (!parent || (r.parent_gateways ?? []).includes(parent)) &&
-      matchesSearch(r.name, 'httproute', q),
-  );
+export function HttpRoutesSection({ rows = [], total, loading = false, error = null, q = '', ns = 'all', parent = '', problemsOnly = false, problemKeys }) {
   // Overlay /problems (conflicts/dead-routes) onto the reflector-computed status,
   // so dedicated-gateway routes (absent from the controller's table) still flag.
   const rowStatus = (r) =>
     worseSeverity(r.status, problemKeys?.has(routeKey('HTTPRoute', r.namespace, r.name)) ? 'warn' : 'ok');
+  const shown = rows.filter(
+    (r) =>
+      (ns === 'all' || r.namespace === ns) &&
+      (!parent || (r.parent_gateways ?? []).includes(parent)) &&
+      (!problemsOnly || rowStatus(r) !== 'ok') &&
+      matchesSearch(r.name, 'httproute', q),
+  );
   return (
     <DataTable
       columns={['Name', 'Namespace', 'Hostnames', 'Parents', 'Rules']}
@@ -50,25 +51,31 @@ export function HttpRoutesSection({ rows = [], total, loading = false, error = n
   );
 }
 
-/** Render each `ns/name` parent Gateway as a link to its Gateway detail. */
+/**
+ * Render each `ns/name` parent Gateway as a link to its Gateway detail, stacked
+ * vertically — a route attached to several Gateways lists them one per line
+ * rather than as a hard-to-scan comma run.
+ */
 function renderParents(parents = []) {
   if (parents.length === 0) return '—';
-  return parents.map((p, i) => {
-    const [pns, pname] = p.split('/');
-    return (
-      <span key={p}>
-        {i > 0 && ', '}
-        <span
-          class="link-text"
-          title={`Open Gateway ${p}`}
-          onClick={(e) => {
-            e.stopPropagation();
-            if (pns && pname) nav.gateway(pns, pname);
-          }}
-        >
-          {p}
-        </span>
-      </span>
-    );
-  });
+  return (
+    <div class="cell-list">
+      {parents.map((p) => {
+        const [pns, pname] = p.split('/');
+        return (
+          <span
+            key={p}
+            class="link-text"
+            title={`Open Gateway ${p}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (pns && pname) nav.gateway(pns, pname);
+            }}
+          >
+            {p}
+          </span>
+        );
+      })}
+    </div>
+  );
 }

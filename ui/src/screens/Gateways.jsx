@@ -16,9 +16,12 @@ import { sevClass, sevTitle } from '../severity.js';
  * `Parents` links — so an operator can pivot between a Gateway and the routes
  * attached to it without losing the binding context.
  */
-export function GatewaysSection({ rows = [], total, loading = false, error = null, q = '', ns = 'all' }) {
+export function GatewaysSection({ rows = [], total, loading = false, error = null, q = '', ns = 'all', problemsOnly = false }) {
   const shown = rows.filter(
-    (gw) => (ns === 'all' || gw.namespace === ns) && matchesSearch(gw.name, 'gateway', q),
+    (gw) =>
+      (ns === 'all' || gw.namespace === ns) &&
+      (!problemsOnly || gw.status !== 'ok') &&
+      matchesSearch(gw.name, 'gateway', q),
   );
   return (
     <DataTable

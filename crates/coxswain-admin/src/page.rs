@@ -27,8 +27,13 @@ pub(crate) const MAX_LIMIT: usize = 1000;
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ListParams {
-    /// Case-insensitive substring filter against each row's host-like fields
-    /// (already lowercased at parse time).
+    /// Case-insensitive substring filter against each resource's object name —
+    /// the routing list endpoints' free-text search (name-only by design; the
+    /// operator UI's search box maps here). Lowercased at parse time.
+    pub name: Option<String>,
+    /// Case-insensitive substring filter against each row's host (meaningful only
+    /// for the per-proxy route table; a no-op on the routing resource lists).
+    /// Lowercased at parse time.
     pub host: Option<String>,
     /// Case-insensitive substring filter against each row's path (meaningful only
     /// for the per-proxy route table; a no-op on the routing resource lists).
@@ -51,6 +56,7 @@ impl ListParams {
         let Some(q) = query else { return p };
         for (k, v) in form_urlencoded::parse(q.as_bytes()) {
             match k.as_ref() {
+                "name" if !v.is_empty() => p.name = Some(v.into_owned().to_ascii_lowercase()),
                 "host" if !v.is_empty() => p.host = Some(v.into_owned().to_ascii_lowercase()),
                 "path" if !v.is_empty() => p.path = Some(v.into_owned().to_ascii_lowercase()),
                 "limit" => p.limit = v.parse::<usize>().ok(),
@@ -70,11 +76,22 @@ impl ListParams {
     /// `true` when no filter/pagination params were supplied — the caller may
     /// emit its legacy full-dump shape (still wrapped in the envelope).
     pub(crate) fn is_empty(&self) -> bool {
-        self.host.is_none()
+        self.name.is_none()
+            && self.host.is_none()
             && self.path.is_none()
             && self.limit.is_none()
             && self.offset == 0
             && !self.problems_only
+    }
+
+    /// `true` when the `name` filter is absent or a case-insensitive substring of
+    /// `haystack`. Substring (not exact) so the operator UI's search box narrows
+    /// progressively as the operator types.
+    pub(crate) fn name_matches(&self, haystack: &str) -> bool {
+        match &self.name {
+            None => true,
+            Some(needle) => haystack.to_ascii_lowercase().contains(needle),
+        }
     }
 
     /// `true` when the `host` filter is absent or a case-insensitive substring of
@@ -100,6 +117,9 @@ impl ListParams {
     /// the filtering at the source (#286).
     pub(crate) fn to_query(&self) -> String {
         let mut ser = form_urlencoded::Serializer::new(String::new());
+        if let Some(name) = &self.name {
+            ser.append_pair("name", name);
+        }
         if let Some(host) = &self.host {
             ser.append_pair("host", host);
         }
@@ -206,6 +226,17 @@ mod tests {
         assert!(!p.host_matches("prod-gw"));
         // path filter absent → always matches
         assert!(p.path_matches("/anything"));
+    }
+
+    #[test]
+    fn name_filter_is_case_insensitive_substring() {
+        let p = ListParams::parse(Some("name=API"));
+        assert!(p.name_matches("api-route"));
+        assert!(p.name_matches("public-API")); // substring, not a prefix
+        assert!(!p.name_matches("web-route"));
+        assert!(!p.is_empty());
+        // absent → always matches
+        assert!(ListParams::default().name_matches("anything"));
     }
 
     #[test]

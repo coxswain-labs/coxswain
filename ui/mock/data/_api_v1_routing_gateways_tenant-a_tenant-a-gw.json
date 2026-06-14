@@ -6,7 +6,12 @@
     {
       "kind": "HTTPRoute",
       "name": "a-web-route",
-      "namespace": "tenant-a"
+      "namespace": "tenant-a",
+      "hostnames": [
+        "app.tenant-a.local"
+      ],
+      "rule_count": 1,
+      "status": "ok"
     }
   ],
   "conditions": [

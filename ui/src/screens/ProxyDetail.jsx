@@ -38,11 +38,6 @@ export function ProxyDetail({ pod, query }) {
     return off;
   }, [sse.subscribe]);
 
-  const breadcrumb = [
-    { label: 'Fleet', onClick: () => nav.fleet() },
-    { label: pod },
-  ];
-
   if (meta.loading) return <Spinner label="Loading proxy…" />;
   if (meta.error)   return <ErrorState error={meta.error} />;
   if (!meta.data)   return <EmptyState message="Proxy not found." />;
@@ -50,6 +45,14 @@ export function ProxyDetail({ pod, query }) {
   const p = meta.data;
   const isReachable = p.reachable ?? false;
   const pool = p.component === 'dedicated-proxy' ? 'dedicated' : 'shared';
+
+  const breadcrumb = [
+    { label: 'Fleet', onClick: () => nav.fleet() },
+    pool === 'dedicated'
+      ? { label: 'Dedicated proxies', onClick: () => nav.fleet({ filter: 'dedicated' }) }
+      : { label: 'Shared proxies', onClick: () => nav.fleet({ filter: 'shared' }) },
+    { label: pod },
+  ];
 
   // Navigation aid only: the fleet-wide leader is the active controller, so a
   // proxy links there as "take me to the control plane". Proxies watch
@@ -228,16 +231,16 @@ function RouteSection({ spec, kind, highlight, pod }) {
       )}
 
       {total > 0 && (
-        <div class="header-controls left" style="margin-bottom:8px">
+        <div class="header-controls left routing-filters" style="margin-bottom:8px">
+          <span class="table-foot" style="padding:0;align-self:center">
+            {shown === total ? `${total} routes` : `Showing ${shown} of ${total}`}
+          </span>
           <SearchBox
             value={filter}
             onInput={(e) => setFilter(e.currentTarget.value)}
             placeholder="Filter by host or path…"
             label="Filter routes by host or path"
           />
-          <span class="table-foot" style="padding:0;align-self:center">
-            {shown === total ? `${total} routes` : `Showing ${shown} of ${total}`}
-          </span>
         </div>
       )}
 

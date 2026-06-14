@@ -298,7 +298,9 @@ const GATEWAYS = [
     conditions: [ACCEPTED, PROGRAMMED],
     listeners: [
       { name: 'http', port: 8080, protocol: 'HTTP', tls_enabled: false, attached_routes: 4 },
-      { name: 'https', port: 8443, protocol: 'HTTPS', tls_enabled: true, attached_routes: 0 }, // TLS + 0 attached (warn)
+      { name: 'https', port: 8443, protocol: 'HTTPS', tls_enabled: true, tls_status: 'ok', attached_routes: 0 },           // cert good, but 0 routes (warn row, teal lock)
+      { name: 'https-broken', port: 8444, protocol: 'HTTPS', tls_enabled: true, tls_status: 'error', tls_reason: 'certificate Secret "demo-tls" not found', attached_routes: 0 }, // broken cert (error)
+      { name: 'https-pending', port: 8445, protocol: 'HTTPS', tls_enabled: true, tls_status: 'warn', tls_reason: 'listener not programmed yet', attached_routes: 1 },             // not programmed (warn)
     ],
     routes: [['demo', 'api-route'], ['demo', 'docs-route'], ['demo', 'health-probe-route'], ['demo', 'web-route']],
   },
@@ -333,7 +335,10 @@ function emitGateways() {
   write('/api/v1/routing/gateways', { gateways, total: gateways.length, returned: gateways.length, offset: 0 });
   GATEWAYS.forEach((g) => write(`/api/v1/routing/gateways/${g.ns}/${g.name}`, {
     addresses: g.addresses,
-    attached_routes_list: g.routes.map(([ns, name]) => ({ kind: 'HTTPRoute', name, namespace: ns })),
+    attached_routes_list: g.routes.map(([ns, name]) => {
+      const r = HTTPROUTES.find((h) => h.ns === ns && h.name === name);
+      return { kind: 'HTTPRoute', name, namespace: ns, hostnames: r?.hostnames ?? [], rule_count: r?.rule_count ?? 0, status: r?.status ?? 'ok' };
+    }),
     conditions: g.conditions, listeners: g.listeners, name: g.name, namespace: g.ns,
     proxy: { pool: g.pool }, route_count: g.route_count, status: gatewayStatus(g),
   }));
@@ -346,6 +351,7 @@ const HTTPROUTES = [
   { ns: 'demo', name: 'web-route', hostnames: ['app.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'warn' },   // shadowed (conflict)
   { ns: 'demo', name: 'api-route', hostnames: ['api.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'error' },  // dead backend
   { ns: 'demo', name: 'docs-route', hostnames: ['docs.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'ok' },
+  { ns: 'demo', name: 'multi-gw-route', hostnames: ['app.demo.local', 'app.staging.local'], parents: ['demo/demo-gw', 'staging/staging-gw'], rule_count: 2, status: 'ok' }, // attached to two Gateways
   { ns: 'demo', name: 'health-probe-route', hostnames: ['app.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'error' }, // dead
   { ns: 'demo', name: 'payments-route', hostnames: ['pay.demo.local'], parents: ['demo/demo-gw'], rule_count: 1, status: 'error' },     // unresolved refs
   { ns: 'tenant-a', name: 'a-web-route', hostnames: ['app.tenant-a.local'], parents: ['tenant-a/tenant-a-gw'], rule_count: 1, status: 'ok' },
