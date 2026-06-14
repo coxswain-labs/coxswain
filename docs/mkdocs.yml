@@ -13,15 +13,21 @@ theme:
   name: material
   custom_dir: overrides
   palette:
-    - scheme: default
-      primary: indigo
-      accent: indigo
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue
+      accent: blue
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
-    - scheme: slate
-      primary: indigo
-      accent: indigo
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: teal
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
@@ -73,13 +79,16 @@ nav:
     - Kustomize: installation/kustomize.md
     - Raw manifests: installation/manifests.md
   - Guides:
-    - Ingress: guides/ingress.md
-    - Gateway API: guides/gateway-api.md
-    - Dedicated-mode Gateways: guides/dedicated-mode.md
-    - TLS: guides/tls.md
-    - Running in production: guides/running-in-production.md
-    - Verifying releases: guides/verifying-releases.md
-    - Troubleshooting: guides/troubleshooting.md
+    - Ingress:
+      - Overview: guides/ingress.md
+    - Gateway API:
+      - Overview: guides/gateway-api.md
+      - Dedicated proxy pools: guides/dedicated-mode.md
+    - Operations:
+      - Running in production: guides/running-in-production.md
+      - TLS: guides/tls.md
+      - Verifying releases: guides/verifying-releases.md
+      - Troubleshooting: guides/troubleshooting.md
   - Reference:
     - Configuration: reference/configuration.md
     - Observability: reference/observability.md

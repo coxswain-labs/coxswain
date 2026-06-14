@@ -53,6 +53,9 @@ Implementation-specific capabilities — such as `RegularExpression` path, heade
 
 A `Gateway` object defines one or more listeners, each binding a port and protocol to a set of allowed routes. Only `HTTP` and `HTTPS` listeners are processed; other protocol values are ignored.
 
+!!! tip "Dedicated proxy per Gateway"
+    A `Gateway` can be opted into its own isolated proxy pool via `spec.infrastructure.parametersRef`. See [Dedicated proxy pools](dedicated-mode.md) for the full walkthrough.
+
 ### Example
 
 ```yaml
@@ -82,7 +85,7 @@ Controls which namespaces may attach `HTTPRoute`s to this listener.
 | `All` | Routes from any namespace can attach. |
 | `Selector` | Routes from namespaces matching `namespaces.selector` (a label selector) can attach. |
 
-`All` and `Selector` cause the controller to automatically grant the dedicated proxy cluster-wide `HTTPRoute` reads. No extra fields on `CoxswainGatewayParameters` are required — the listener spec is the single source of truth. See the [dedicated-mode guide](dedicated-mode.md#cross-namespace-route-attachment-from-all--from-selector) for details.
+`All` and `Selector` cause the controller to automatically grant the dedicated proxy cluster-wide `HTTPRoute` reads. No extra fields on `CoxswainGatewayParameters` are required — the listener spec is the single source of truth. See the [dedicated-mode guide](dedicated-mode.md#cross-namespace-route-attachment-from-all-from-selector) for details.
 
 ### Supported fields
 
@@ -255,7 +258,7 @@ parentRefs:
     port: 443                    # attach to the listener on port 443 only
 ```
 
-The route must be in the same namespace as the Gateway unless the listener's [`allowedRoutes.namespaces.from`](#allowedroutesnamespacesconfigfrom) is set to `All` or `Selector`.
+The route must be in the same namespace as the Gateway unless the listener's [`allowedRoutes.namespaces.from`](#allowedroutesnamespacesfrom) is set to `All` or `Selector`.
 
 ### Path matching
 

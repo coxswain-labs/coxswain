@@ -12,9 +12,11 @@ concurrency:
 # `e2e-*` matrix entries and `e2e-conformance` are required status checks.
 # A workflow-level path filter that excludes the whole workflow leaves those
 # checks pending forever on docs-only PRs. Instead we always start on PRs and
-# gate the heavy jobs on the `changes` job. A job whose `if:` evaluates to
-# false reports `skipped`, which counts as success for required-status-check
-# enforcement.
+# gate every job on the `changes` output via an explicit `if:`. A job with an
+# explicit `if: false` reports `skipped` and GitHub instantiates the matrix
+# so all named checks are reported — satisfying branch-protection enforcement.
+# Implicit skips (job omitted because a `needs` dep was skipped) do NOT
+# instantiate the matrix, leaving named checks pending forever.
 jobs:
   changes:
     name: changes
@@ -137,7 +139,8 @@ jobs:
 
   e2e:
     name: e2e-${{ matrix.suite }}
-    needs: build
+    needs: [changes, build]
+    if: needs.changes.outputs.code == 'true'
     # Matrix jobs only run pre-compiled binaries — no Rust toolchain, no cargo.
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -214,7 +217,8 @@ jobs:
 
   e2e-conformance:
     name: e2e-conformance
-    needs: build
+    needs: [changes, build]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # `contents: read` is needed by actions/checkout and the composite action's

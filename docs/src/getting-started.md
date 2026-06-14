@@ -2,9 +2,6 @@
 
 This guide installs Coxswain into an existing cluster, creates a `GatewayClass`, deploys a test `HTTPRoute`, and verifies traffic flows end-to-end. It takes about 10 minutes.
 
-!!! warning "Early development"
-    Coxswain is under active development and not yet ready for production. Use this walkthrough on a sandbox cluster.
-
 ## Prerequisites
 
 - Kubernetes 1.30 or later
@@ -158,8 +155,20 @@ curl -H "Host: echo.example.com" http://<proxy-address>/
 # {"host":"echo.example.com","method":"GET","path":"/", ...}
 ```
 
+## Step 7 — Open the operator console
+
+The controller exposes a built-in web UI on its admin port. Forward it locally:
+
+```bash
+kubectl -n coxswain-system port-forward svc/coxswain-controller 8082:8082
+```
+
+Then open `http://localhost:8082` in your browser. The console shows cluster health, the live routing table across Gateways and Ingresses, per-pod fleet status, and recent events.
+
 ## What's next?
 
-- **Ingress** — see the [Ingress guide](guides/ingress.md) to use classic `Ingress` resources alongside Gateway API.
+- **Gateway API** — see the [Gateway API guide](guides/gateway-api.md) for the full `HTTPRoute` feature surface, TLS listeners, and cross-namespace routing.
+- **Ingress** — see the [Ingress guide](guides/ingress.md) to use classic `Ingress` resources.
 - **TLS** — see the [TLS guide](guides/tls.md) to add HTTPS with cert-manager or a manual Secret.
 - **Production** — see [Running in production](guides/running-in-production.md) before going live.
+- **Troubleshooting** — if something isn't working, see the [Troubleshooting guide](guides/troubleshooting.md).

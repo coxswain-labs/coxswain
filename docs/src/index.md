@@ -5,9 +5,13 @@
     The per-Ingress annotation surface is under active development (v0.3).
     **Production use is at your own risk.** Feedback and contributions are welcome.
 
-Coxswain is a Kubernetes Ingress and Gateway API controller written in Rust, using [Pingora](https://github.com/cloudflare/pingora) — Cloudflare's battle-tested proxy library — as the data plane. It serves both `Ingress` and `HTTPRoute` resources from the same proxy fleet, applies routing changes without restarts, and hot-reloads TLS certificates as Secrets change.
+A Kubernetes Ingress and Gateway API controller written in Rust, backed by [Pingora](https://github.com/cloudflare/pingora) — Cloudflare's battle-tested proxy library.
 
-The controller and proxy run as separate pod roles with a strict RBAC boundary: the controller holds all write permissions; proxy pods are read-only. This split makes multi-replica, multi-tenant, and dedicated-mode deployments straightforward.
+- Bridges classic `Ingress` and Gateway API `HTTPRoute` in a single proxy fleet
+- Routing changes and TLS certificate rotations take effect without restarting the proxy
+- Controller/proxy split with a strict RBAC boundary — proxy pods hold zero write permissions
+
+See [Architecture](architecture.md) for the deployment models and RBAC boundary.
 
 ## Quick install
 
@@ -26,8 +30,7 @@ See [Getting started](getting-started.md) for the complete walkthrough, or [Inst
 | Milestone | Theme | Status |
 |-----------|-------|--------|
 | **v0.1** | Foundation — Gateway API conformant (standard channel), Ingress support, signed OCI image, Helm chart | Done |
-| **v0.2** | Architecture — controller/proxy split, dedicated proxy mode, operator web UI | In progress |
+| **v0.2** | Architecture — controller/proxy split, dedicated proxy mode, operator web UI | Done |
 | **v0.3** | Ingress completeness — `ingress.coxswain-labs.dev/*` annotation surface, nginx migration path | Planned |
 | **v0.4** | Gateway API extended — BackendTLSPolicy, client/backend mTLS, HTTP/2 downstream, ListenerSet | Planned |
 
-The [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2){target=_blank} has the full issue-level breakdown.

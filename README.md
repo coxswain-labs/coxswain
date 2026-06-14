@@ -2,15 +2,14 @@
 
 [![E2E & Conformance](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml/badge.svg)](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml)
 
-A pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora) as the proxy engine.
+A Kubernetes controller that bridges classic `Ingress` and Gateway API `HTTPRoute` in a single proxy fleet, written in Rust and backed by [Pingora](https://github.com/cloudflare/pingora) — Cloudflare's battle-tested proxy library.
 
-Coxswain runs as a controller pod plus a horizontally-scalable pool of read-only Pingora proxy pods. The controller is the sole Kubernetes writer (status conditions, provisioning); proxy pods build their routing table directly from Kubernetes watch events and serve traffic with no inter-replica coordination. Gateways can be opted into dedicated per-Gateway proxy pods for stricter tenant isolation — see [Architecture](https://docs.coxswain-labs.dev/coxswain/latest/architecture/).
+Coxswain runs as a controller pod plus a horizontally-scalable pool of read-only Pingora proxy pods. The controller is the sole Kubernetes writer (status conditions, provisioning); proxy pods build their routing table directly from Kubernetes watch events and serve traffic with no inter-replica coordination. Gateways can be opted into a dedicated proxy pool for stricter tenant isolation — see [Architecture](https://docs.coxswain-labs.dev/coxswain/latest/architecture/).
 
-> **Note**: This project is currently in early development and not accepting external contributions. Bug reports and feature requests in issues are welcome; we'll revisit contribution guidelines as the project matures.
+> **Pre-1.0:** Coxswain is a work in progress — early adopters are welcome to try it out. The API surface and configuration flags may change between minor releases. Bug reports and feature requests are welcome; external contribution guidelines will follow as the project matures.
 
 **Documentation**: [docs.coxswain-labs.dev/coxswain](https://docs.coxswain-labs.dev/coxswain/) — installation guides, configuration reference, architecture overview, and FAQ.
 
-**Roadmap**: see the [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2) for current scope per milestone.
 
 ## Getting started
 

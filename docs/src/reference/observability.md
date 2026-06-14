@@ -35,7 +35,7 @@ Route id formats:
 | `coxswain_proxy_connections_total` | Counter | `listener` |
 | `coxswain_proxy_connection_duration_seconds` | Histogram | `listener` |
 
-The existing listener-lifecycle series from [#231](https://github.com/coxswain-labs/coxswain/issues/231) are also exposed: `coxswain_proxy_listeners_active`, `coxswain_proxy_listener_lifecycle_total`, `coxswain_proxy_listener_drain_duration_seconds`, `coxswain_proxy_requests_force_closed_total`.
+The following listener-lifecycle metrics are also exposed: `coxswain_proxy_listeners_active`, `coxswain_proxy_listener_lifecycle_total`, `coxswain_proxy_listener_drain_duration_seconds`, `coxswain_proxy_requests_force_closed_total`.
 
 ### Controller-pod metrics (`coxswain_controller_*`)
 
@@ -56,9 +56,16 @@ The existing listener-lifecycle series from [#231](https://github.com/coxswain-l
 | `coxswain_controller_routing_table_rebuild_duration_seconds` | Histogram | — |
 | `coxswain_controller_tls_certs_loaded` | Gauge | `bucket` |
 
-### Dedicated-mode label injection
+### Metric labels per Gateway
 
-The proxy never bakes a `gateway_name` / `gateway_namespace` label into its emitted series — doing so would multiply request-counter cardinality across every dedicated Gateway. Instead, the operator-rendered dedicated-proxy pods carry the Gateway identity as **pod labels** (`gateway.networking.k8s.io/gateway-name`, `gateway.networking.k8s.io/gateway-namespace`), and the chart's PodMonitor copies those onto the scraped samples as target labels:
+When you run a [dedicated proxy pool](../guides/dedicated-mode.md), you usually want to slice its metrics by Gateway. Coxswain does **not** bake the Gateway identity into the emitted series — a `gateway_name` / `gateway_namespace` label on every counter would multiply request-counter cardinality across every dedicated Gateway, and the shared pool has no single Gateway to name.
+
+Instead the identity rides in as a **scrape-time target label**. Each proxy pod the controller provisions carries the Gateway it serves as two pod labels:
+
+- `gateway.networking.k8s.io/gateway-name` — the Gateway name (the GEP-1762 well-known label).
+- `gateway.coxswain-labs.dev/gateway-namespace` — the Gateway namespace (a Coxswain label; the upstream group defines no namespace label).
+
+The chart's PodMonitor then copies those pod labels onto every scraped sample via `relabelings`, so they appear on the metrics without ever touching the series the proxy emits:
 
 ```yaml
 relabelings:
@@ -66,11 +73,11 @@ relabelings:
       - __meta_kubernetes_pod_label_gateway_networking_k8s_io_gateway_name
     targetLabel: gateway_name
   - sourceLabels:
-      - __meta_kubernetes_pod_label_gateway_networking_k8s_io_gateway_namespace
+      - __meta_kubernetes_pod_label_gateway_coxswain_labs_dev_gateway_namespace
     targetLabel: gateway_namespace
 ```
 
-Shared-pool pods don't carry those labels; the relabel leaves the target empty, which is the intended behaviour.
+(The `__meta_kubernetes_pod_label_*` source names are Prometheus's mangling of the pod-label keys — dots and slashes become underscores.) Pods in the shared pool don't carry those labels, so the relabel leaves `gateway_name` / `gateway_namespace` empty on shared pool samples — which is how you tell the two apart in a query.
 
 ## Health endpoints
 
@@ -84,7 +91,7 @@ Shared-pool pods don't carry those labels; the relabel leaves the target empty, 
 1. All Kubernetes reflectors emit their first `InitDone` event (CRDs must be installed)
 2. The routing table is built for the first time
 
-Inspect the per-subsystem detail via the admin port (open `kubectl -n coxswain-system port-forward svc/coxswain-shared-proxy-internal 8082:8082` in a separate terminal first; Helm installs use the Service name `<release>-internal`):
+Inspect the per-subsystem detail via the admin port (open `kubectl -n coxswain-system port-forward svc/coxswain-shared-proxy-internal 8082:8082` in a separate terminal first; a non-default Helm release name `<rel>` prefixes the Service as `<rel>-coxswain-shared-proxy-internal`):
 
 ```bash
 curl -s http://localhost:8082/api/v1/health | jq .
@@ -200,25 +207,25 @@ Use `RUST_LOG` directive syntax for per-crate control:
 
 === "Prometheus operator (PodMonitor)"
 
-    The chart ships a `PodMonitor` template gated on `.Values.podMonitor.enabled`. Enable it with `--set podMonitor.enabled=true` (or `podMonitor.enabled: true` in your values file). One selector matches both the shared-proxy pool and the operator-rendered dedicated proxies; the relabel block injects `gateway_name` / `gateway_namespace` on dedicated metrics only (see [Dedicated-mode label injection](#dedicated-mode-label-injection) above).
+    The chart ships a `PodMonitor` template gated on `.Values.podMonitor.enabled`. Enable it with `--set podMonitor.enabled=true` (or `podMonitor.enabled: true` in your values file). One selector matches both the shared proxy pool and the operator-rendered dedicated proxies; the relabel block injects `gateway_name` / `gateway_namespace` on dedicated metrics only (see [Metric labels per Gateway](#metric-labels-per-gateway) above).
 
-    Why `PodMonitor` and not `ServiceMonitor`? Dedicated-proxy Services don't expose port `8082` — adding it would leak `/metrics` onto the LoadBalancer IP. PodMonitor scrapes the pod directly (port `admin`, `:8082`) and skips that issue entirely. Shared-pool pods are also discovered the same way, so one resource covers every coxswain proxy in the cluster.
+    Why `PodMonitor` and not `ServiceMonitor`? Dedicated proxy Services don't expose port `8082` — adding it would leak `/metrics` onto the LoadBalancer IP. PodMonitor scrapes the pod directly (port `admin`, `:8082`) and skips that issue entirely. Shared pool pods are also discovered the same way, so one resource covers every coxswain proxy in the cluster.
 
     Hardened installs that pin `podMonitorSelector` on the `Prometheus` resource must update it to include the chart's labels (`app.kubernetes.io/name: coxswain`) — by default kube-prometheus-stack matches both `ServiceMonitor` and `PodMonitor` broadly.
 
 === "Prometheus scrape_configs"
 
-    Replace `<release>` with the Helm release name (or use the literal `coxswain-shared-proxy-internal` for raw-manifest installs). Dedicated-proxy metrics aren't reachable through this Service surface — use the PodMonitor path for full coverage.
+    The Service names below are for the default `coxswain` release and for raw-manifest installs; a non-default Helm release name `<rel>` prefixes them as `<rel>-coxswain-shared-proxy-internal` and `<rel>-coxswain-controller`. Dedicated proxy metrics aren't reachable through this Service surface — use the PodMonitor path for full coverage.
 
     ```yaml
     scrape_configs:
       - job_name: coxswain-shared
         static_configs:
-          - targets: ['<release>-internal.coxswain-system.svc:8082']
+          - targets: ['coxswain-shared-proxy-internal.coxswain-system.svc:8082']
         metrics_path: /metrics
       - job_name: coxswain-controller
         static_configs:
-          - targets: ['<release>-controller.coxswain-system.svc:8082']
+          - targets: ['coxswain-controller.coxswain-system.svc:8082']
         metrics_path: /metrics
     ```
 

@@ -1,6 +1,6 @@
 # Raw manifests install
 
-Every Coxswain release publishes a pre-rendered `install.yaml` as a GitHub Release asset. It includes the `Namespace`, `RBAC`, `GatewayClass`, `IngressClass`, `Services`, `PodDisruptionBudget`, and `Deployment`, with the image pinned to the exact release tag.
+Every Coxswain release publishes a pre-rendered `install.yaml` as a GitHub Release asset. It includes the `Namespace`, `RBAC`, `GatewayClass`, `IngressClass`, `Services`, `PodDisruptionBudget`, and `Deployments` (controller and shared proxy), with the image pinned to the exact release tag.
 
 ## Install the latest release
 
@@ -27,7 +27,7 @@ kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/download/vX.
 kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/download/vX.Y.Z/install.yaml
 ```
 
-The `Deployment` rolling update strategy ensures zero-downtime upgrades when `replicaCount` ≥ 2.
+The rolling update strategy on each Deployment ensures zero-downtime upgrades when `replicaCount` ≥ 2.
 
 ## Uninstall
 
