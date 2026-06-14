@@ -140,6 +140,18 @@ function countRoutes(spec) {
   return spec.hosts.reduce((sum, h) => sum + (h.routes?.length ?? 0), 0);
 }
 
+/** Collapse conflicts that render identically (same host+path+rejected group)
+ *  but differ only by listener port — the row doesn't show the port. */
+function dedupeConflicts(conflicts) {
+  const seen = new Set();
+  return conflicts.filter((c) => {
+    const k = `${c.host}|${c.path}|${c.rejected_group}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 /** A spec needs attention if it has a conflict or any route with 0 endpoints
  *  (accepted-but-dead backend). Drives the tab alert icon. */
 function specHasIssues(spec) {
@@ -170,7 +182,13 @@ function pickDefaultTab(specs, highlight) {
 
 function RouteSection({ spec, kind, highlight, pod }) {
   const hosts     = spec?.hosts ?? [];
-  const conflicts = spec?.conflicts ?? [];
+  // A routing conflict is a property of the host+path routing key (two routes
+  // claim it; one is rejected) — not of a listener port. The shared proxy serves
+  // the same routes on every listener, so the compiled table reports the *same*
+  // conflict once per port (demo.local/ on :80 and :443); collapse those to the
+  // one logical conflict. Genuinely distinct conflicts (a different rejected
+  // group at the same path) have a different key and are kept.
+  const conflicts = dedupeConflicts(spec?.conflicts ?? []);
   const wantPath  = highlight?.path || '/';
 
   return (

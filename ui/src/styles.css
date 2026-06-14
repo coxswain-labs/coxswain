@@ -854,6 +854,15 @@ input[type=checkbox] { accent-color: var(--blue); }
 
 /* ── Proxy-detail host groups ────────────────────────────────────────────── */
 .host-group { margin-bottom: 20px; }
+/* One <table> per host-group, so fix the column layout — otherwise each table
+   auto-sizes to its own content and Path/Type/Backend/Endpoints drift between
+   groups. Fixed widths keep every group's columns aligned. */
+.host-group table { table-layout: fixed; }
+.host-group th:nth-child(1), .host-group td:nth-child(1) { width: 28%; }  /* Path */
+.host-group th:nth-child(2), .host-group td:nth-child(2) { width: 14%; }  /* Type */
+.host-group th:nth-child(3), .host-group td:nth-child(3) { width: 34%; }  /* Backend */
+.host-group th:nth-child(4), .host-group td:nth-child(4) { width: 24%; }  /* Endpoints */
+.host-group td code { overflow-wrap: anywhere; }
 .host-label {
   display: flex; align-items: center; gap: 6px;
   font-weight: 600; font-size: 14px; margin-bottom: 8px; flex-wrap: wrap;
