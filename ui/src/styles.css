@@ -394,7 +394,14 @@ section { margin-bottom: 32px; }
 .stat-status { position: absolute; top: 8px; right: 8px; display: inline-flex; }
 .stat-status.ok svg   { color: var(--green); }
 .stat-status.warn svg { color: var(--amber); }
+/* A warning tile tints amber (border + faint fill) so it reads at a glance, not
+   just via the corner glyph. */
+.stat.warn {
+  border-color: color-mix(in srgb, var(--amber) 45%, var(--border));
+  background: color-mix(in srgb, var(--amber) 8%, var(--surface));
+}
 .stat:hover, .stat:focus-visible { border-color: var(--accent); transform: translateY(-1px); }
+.stat.warn:hover, .stat.warn:focus-visible { border-color: var(--amber); }
 .stat-icon {
   flex-shrink: 0; width: 40px; height: 40px; border-radius: 10px;
   display: flex; align-items: center; justify-content: center;
@@ -583,19 +590,6 @@ section { margin-bottom: 32px; }
 .b-conflict  { background: #3a2d0a; color: #fbbf24; }
 .b-dead      { background: #3a2d0a; color: #fbbf24; }
 
-/* ── Status dot ──────────────────────────────────────────────────────────── */
-.dot {
-  display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
-}
-.dot::before {
-  content: ''; display: block;
-  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
-}
-.dot.ok::before    { background: var(--green); }
-.dot.err::before   { background: var(--red); }
-.dot.warn::before  { background: var(--amber); }
-.dot.muted::before { background: var(--muted); }
-
 /* ── Table ───────────────────────────────────────────────────────────────── */
 .tbl-wrap {
   background: var(--surface);
@@ -625,6 +619,10 @@ tr.clickable:focus-visible td { outline: 2px solid var(--blue); outline-offset: 
    accent — so "you navigated here" never reads as amber "this is broken". */
 tr.row-hit td { background: color-mix(in srgb, var(--blue) 14%, transparent); }
 tr.row-hit td:first-child { box-shadow: inset 3px 0 0 var(--blue); }
+/* Per-row severity accent: a coloured left edge (amber=warn, red=error; ok has
+   none), the same flag-problems vocabulary as the Dashboard tiles. */
+tr.sev-warn td:first-child  { box-shadow: inset 3px 0 0 var(--amber); }
+tr.sev-error td:first-child { box-shadow: inset 3px 0 0 var(--red); }
 
 /* "Showing X of Y" footer under a DataTable (no-silent-truncation surface). */
 .table-foot {
@@ -902,6 +900,19 @@ input[type=checkbox] { accent-color: var(--blue); }
 }
 .link-text { color: var(--blue); cursor: pointer; }
 .link-text:hover { text-decoration: underline; }
+
+/* Active deep-link filter chip (e.g. Routing "Parent: ns/name ×"). */
+.active-filter {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 8px; border-radius: var(--r);
+  background: var(--surface-2); border: 1px solid var(--border);
+  font-size: 12px; white-space: nowrap;
+}
+.active-filter-x {
+  background: none; border: none; cursor: pointer; padding: 0;
+  color: var(--muted); font-size: 15px; line-height: 1;
+}
+.active-filter-x:hover { color: var(--fg); }
 
 /* ── Proxy-detail host groups ────────────────────────────────────────────── */
 .host-group { margin-bottom: 20px; }

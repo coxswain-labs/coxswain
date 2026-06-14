@@ -332,6 +332,11 @@ pub struct IngressSummary {
     /// when the address has not been assigned.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub load_balancer: String,
+    /// The IngressClass this object is claimed by (`spec.ingressClassName` or the
+    /// legacy annotation). Empty when claimed only via the default-class fallback;
+    /// the operator UI shows `—` then.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ingress_class: String,
     /// Traffic-served health. Derived from the Ingress's own status (address
     /// assigned) plus any `ingress`-kind conflicts/dead-routes attributed to it.
     pub status: Severity,
@@ -346,6 +351,7 @@ impl IngressSummary {
             namespace: namespace.into(),
             route_count: 0,
             load_balancer: String::new(),
+            ingress_class: String::new(),
             status: Severity::Ok,
         }
     }
@@ -361,6 +367,13 @@ impl IngressSummary {
     #[must_use]
     pub fn with_load_balancer(mut self, address: impl Into<String>) -> Self {
         self.load_balancer = address.into();
+        self
+    }
+
+    /// Set the claimed IngressClass name.
+    #[must_use]
+    pub fn with_ingress_class(mut self, class: impl Into<String>) -> Self {
+        self.ingress_class = class.into();
         self
     }
 
@@ -565,6 +578,24 @@ mod tests {
                 "namespace": "default",
                 "route_count": 2,
                 "load_balancer": "10.0.0.4",
+                "status": "ok"
+            })
+        );
+    }
+
+    #[test]
+    fn ingress_summary_includes_ingress_class_when_set() {
+        let i = IngressSummary::new("foo", "default")
+            .with_route_count(1)
+            .with_ingress_class("coxswain");
+        let v: serde_json::Value = serde_json::to_value(&i).expect("serialise");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "name": "foo",
+                "namespace": "default",
+                "route_count": 1,
+                "ingress_class": "coxswain",
                 "status": "ok"
             })
         );

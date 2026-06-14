@@ -43,6 +43,17 @@ export function routeKey(kind, namespace, name) {
   return `${kind}/${namespace}/${name}`;
 }
 
+/** Table-row class for a severity — a coloured left edge (no class for `ok`),
+ *  the flag-problems vocabulary shared with the Dashboard tiles. */
+export function sevClass(status) {
+  return status === 'error' ? 'sev-error' : status === 'warn' ? 'sev-warn' : '';
+}
+
+/** Hover/title text for a non-`ok` severity (a11y affordance for the colour). */
+export function sevTitle(status) {
+  return status === 'error' ? 'Not serving traffic' : status === 'warn' ? 'Degraded' : undefined;
+}
+
 /** True when any `/problems` routing entry is attributed to a resource of `kind`. */
 export function categoryHasProblem(problems, kind) {
   const routing = problems?.routing ?? {};

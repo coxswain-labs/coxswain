@@ -75,7 +75,7 @@ export function Dashboard() {
       {/* Overview tiles first — compact at-a-glance scale; problems below. */}
       <div class="summary-grid" aria-label="Fleet and routing summary">
         {stats.map((s) => (
-          <button key={s.key} type="button" class="stat" style={`--accent:${s.accent}`} onClick={s.onClick}>
+          <button key={s.key} type="button" class={`stat${s.status === 'warn' ? ' warn' : ''}`} style={`--accent:${s.accent}`} onClick={s.onClick}>
             <span class={`stat-status ${s.status}`} title={s.status === 'warn' ? 'Needs attention' : 'Healthy'}>
               <Icon name={s.status === 'warn' ? 'alert' : 'check'} size={15} />
             </span>

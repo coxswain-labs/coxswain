@@ -1,7 +1,7 @@
 import { matchesSearch } from '../hooks/useSearch.js';
 import { nav } from '../router.js';
-import { DataTable, SeverityDot } from '../components/DataTable.jsx';
-import { worseSeverity, routeKey } from '../severity.js';
+import { DataTable } from '../components/DataTable.jsx';
+import { worseSeverity, routeKey, sevClass, sevTitle } from '../severity.js';
 
 /**
  * Ingresses section — a table of all Ingress resources the controller knows
@@ -18,7 +18,7 @@ export function IngressesSection({ rows = [], total, loading = false, error = nu
     worseSeverity(ing.status, problemKeys?.has(routeKey('Ingress', ing.namespace, ing.name)) ? 'warn' : 'ok');
   return (
     <DataTable
-      columns={['Name', 'Namespace', 'Rules', 'Status']}
+      columns={['Name', 'Namespace', 'Class', 'Address', 'Rules']}
       rows={shown}
       total={total}
       loading={loading}
@@ -27,13 +27,15 @@ export function IngressesSection({ rows = [], total, loading = false, error = nu
       renderRow={(ing) => (
         <tr
           key={`${ing.namespace}/${ing.name}`}
-          class="clickable"
+          class={`clickable ${sevClass(rowStatus(ing))}`}
+          title={sevTitle(rowStatus(ing))}
           onClick={() => nav.ingressRoute(ing.namespace, ing.name)}
         >
           <td>{ing.name}</td>
           <td>{ing.namespace}</td>
+          <td>{ing.ingress_class || '—'}</td>
+          <td>{ing.load_balancer || '—'}</td>
           <td>{ing.route_count ?? 0}</td>
-          <td><SeverityDot status={rowStatus(ing)} /></td>
         </tr>
       )}
     />

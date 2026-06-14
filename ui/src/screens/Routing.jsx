@@ -66,6 +66,10 @@ export function Routing({ query }) {
   const namespaces = [...new Set(rows.map((r) => r.namespace).filter(Boolean))].sort();
   const nsFilter = namespaces.includes(query?.ns) ? query.ns : 'all';
 
+  // Parent-Gateway filter, set by a Gateway row's "Routes →" deep-link. Only the
+  // HTTPRoutes tab honours it; switching away clears it.
+  const parent = activeKey === 'httproutes' ? (query?.parent ?? '') : '';
+
   const Section = active.Section;
 
   return (
@@ -84,6 +88,18 @@ export function Routing({ query }) {
             onChange={(v) => updateQuery({ ns: v === 'all' ? null : v })}
           />
           <SearchBox value={search} onInput={onSearch} label="Search routing by name" />
+          {parent && (
+            <span class="active-filter" title="Filtered to routes attached to this Gateway">
+              Parent: {parent}
+              <button
+                class="active-filter-x"
+                aria-label="Clear parent filter"
+                onClick={() => updateQuery({ parent: null })}
+              >
+                ×
+              </button>
+            </span>
+          )}
         </div>
       </div>
 
@@ -117,6 +133,7 @@ export function Routing({ query }) {
         error={list.error}
         q={q}
         ns={nsFilter}
+        parent={parent}
         problemKeys={problemKeys}
       />
     </div>

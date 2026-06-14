@@ -428,13 +428,18 @@ function emitHttproutes() {
 // ── Ingresses ─────────────────────────────────────────────────────────────────
 // healthy rules · all-dead rules · tenant-namespaced
 const INGRESSES = [
-  { ns: 'demo', name: 'demo-ingress', route_count: 2, status: 'warn' },     // one dead rule
-  { ns: 'demo', name: 'frontend-ingress', route_count: 1, status: 'warn' }, // shadowed (conflict)
-  { ns: 'staging', name: 'staging-ingress', route_count: 2, status: 'error' }, // all dead
-  { ns: 'tenant-b', name: 'tenant-b-ingress', route_count: 1, status: 'ok' },
+  { ns: 'demo', name: 'demo-ingress', route_count: 2, ingress_class: 'coxswain', load_balancer: '192.168.194.180', status: 'warn' },     // one dead rule
+  { ns: 'demo', name: 'frontend-ingress', route_count: 1, ingress_class: 'coxswain', load_balancer: '192.168.194.180', status: 'warn' }, // shadowed (conflict)
+  { ns: 'staging', name: 'staging-ingress', route_count: 2, ingress_class: 'coxswain', load_balancer: '', status: 'error' }, // all dead, no address yet
+  { ns: 'tenant-b', name: 'tenant-b-ingress', route_count: 1, ingress_class: '', load_balancer: '192.168.194.181', status: 'ok' }, // default-class fallback
 ];
 function emitIngresses() {
-  const ingresses = INGRESSES.map((i) => ({ name: i.name, namespace: i.ns, route_count: i.route_count, status: i.status }));
+  const ingresses = INGRESSES.map((i) => ({
+    name: i.name, namespace: i.ns, route_count: i.route_count,
+    ...(i.ingress_class ? { ingress_class: i.ingress_class } : {}),
+    ...(i.load_balancer ? { load_balancer: i.load_balancer } : {}),
+    status: i.status,
+  }));
   write('/api/v1/routing/ingresses', { ingresses, total: ingresses.length, returned: ingresses.length, offset: 0 });
   const sharedPod = PROXIES[0].name;
   const ingRoute = (ns, name, ingressSide) => write(`/api/v1/routing/routes/ingress/${ns}/${name}`, {

@@ -502,6 +502,7 @@ components:
         namespace: { type: string }
         route_count: { type: integer }
         load_balancer: { type: string, description: Omitted when unassigned. }
+        ingress_class: { type: string, description: Claimed IngressClass; omitted when claimed via the default-class fallback. }
         status: { $ref: '#/components/schemas/Severity' }
 
     Condition:

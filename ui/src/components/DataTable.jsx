@@ -1,5 +1,4 @@
 import { Table } from './Table.jsx';
-import { StatusDot } from './StatusDot.jsx';
 import { ErrorState } from './Spinner.jsx';
 
 /**
@@ -47,15 +46,4 @@ export function DataTable({
       </div>
     </>
   );
-}
-
-/**
- * Tri-state health badge for a routing resource's `status`
- * (`ok`/`warn`/`error`), reusing the shared dot styling. `error` maps to the
- * `err` dot state.
- */
-export function SeverityDot({ status }) {
-  const state = status === 'error' ? 'err' : status === 'warn' ? 'warn' : 'ok';
-  const label = status === 'error' ? 'error' : status === 'warn' ? 'degraded' : 'healthy';
-  return <StatusDot state={state} label={label}>{label}</StatusDot>;
 }

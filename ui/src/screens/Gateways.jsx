@@ -1,7 +1,8 @@
 import { matchesSearch } from '../hooks/useSearch.js';
 import { nav } from '../router.js';
 import { poolBadge } from '../components/Badge.jsx';
-import { DataTable, SeverityDot } from '../components/DataTable.jsx';
+import { DataTable } from '../components/DataTable.jsx';
+import { sevClass, sevTitle } from '../severity.js';
 
 /**
  * Gateways section — a table of all Gateways the controller knows about, each
@@ -9,6 +10,11 @@ import { DataTable, SeverityDot } from '../components/DataTable.jsx';
  * fetches the active tab's list (and the routing summary that drives the tab
  * badge) and supplies the namespace/search filters; `total` is the cluster-wide
  * count so the footer can show how many are hidden.
+ *
+ * The `Routes` cell deep-links to the HTTPRoutes tab pre-filtered to this
+ * Gateway (`?tab=httproutes&parent=ns/name`) — the inverse of the HTTPRoutes
+ * `Parents` links — so an operator can pivot between a Gateway and the routes
+ * attached to it without losing the binding context.
  */
 export function GatewaysSection({ rows = [], total, loading = false, error = null, q = '', ns = 'all' }) {
   const shown = rows.filter(
@@ -16,7 +22,7 @@ export function GatewaysSection({ rows = [], total, loading = false, error = nul
   );
   return (
     <DataTable
-      columns={['Name', 'Namespace', 'Pool', 'Routes', 'Status']}
+      columns={['Name', 'Namespace', 'Pool', 'Address', 'Routes']}
       rows={shown}
       total={total}
       loading={loading}
@@ -25,14 +31,30 @@ export function GatewaysSection({ rows = [], total, loading = false, error = nul
       renderRow={(gw) => (
         <tr
           key={`${gw.namespace}/${gw.name}`}
-          class="clickable"
+          class={`clickable ${sevClass(gw.status)}`}
+          title={sevTitle(gw.status)}
           onClick={() => nav.gateway(gw.namespace, gw.name)}
         >
           <td>{gw.name}</td>
           <td>{gw.namespace}</td>
           <td>{poolBadge(gw.proxy?.pool ?? 'shared')}</td>
-          <td>{gw.route_count ?? 0}</td>
-          <td><SeverityDot status={gw.status} /></td>
+          <td>{(gw.addresses ?? []).join(', ') || '—'}</td>
+          <td>
+            {(gw.route_count ?? 0) > 0 ? (
+              <span
+                class="link-text"
+                title={`Show HTTPRoutes attached to ${gw.namespace}/${gw.name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  nav.routing({ tab: 'httproutes', parent: `${gw.namespace}/${gw.name}` });
+                }}
+              >
+                {gw.route_count} →
+              </span>
+            ) : (
+              0
+            )}
+          </td>
         </tr>
       )}
     />

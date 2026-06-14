@@ -381,6 +381,8 @@ fn build_ingresses(inputs: &ClusterSummaryInputs<'_>) -> Vec<IngressSummary> {
                         .or_else(|| entry.hostname.clone().filter(|s| !s.is_empty()))
                 })
                 .unwrap_or_default();
+            // Empty when claimed via the default-class fallback; the UI shows `—`.
+            let ingress_class = claimed_ingress_class(ing).unwrap_or_default().to_string();
             // Ingress is self-contained (no parent Gateway) and carries no
             // binding conditions in the summary, so its server-side status stays
             // `ok`; routing-table conflicts/dead-routes are overlaid in the UI
@@ -388,7 +390,8 @@ fn build_ingresses(inputs: &ClusterSummaryInputs<'_>) -> Vec<IngressSummary> {
             Some(
                 IngressSummary::new(name, ns)
                     .with_route_count(route_count)
-                    .with_load_balancer(load_balancer),
+                    .with_load_balancer(load_balancer)
+                    .with_ingress_class(ingress_class),
             )
         })
         .collect()
@@ -863,6 +866,7 @@ mod tests {
             leader: false,
         });
         assert_eq!(summary.ingresses[0].load_balancer, "lb.example.com");
+        assert_eq!(summary.ingresses[0].ingress_class, "coxswain");
     }
 
     #[test]
