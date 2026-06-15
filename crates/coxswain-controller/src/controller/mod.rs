@@ -422,8 +422,8 @@ impl Controller {
                                     Some(c) => owned_ingress_classes.contains(c),
                                     None => !owned_default_ingress_classes.is_empty(),
                                 };
-                                if is_leader && owned && !ingress_lb_already_matches(&ing, addr) {
-                                    ingress_events::patch_ingress_status(&client, &ing, addr).await;
+                                if is_leader && owned && !ingress_lb_already_matches(&ing, addr, self.config.ingress_ports) {
+                                    ingress_events::patch_ingress_status(&client, &ing, addr, self.config.ingress_ports).await;
                                 }
                             }
                             Ok(_) => {}

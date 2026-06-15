@@ -2,20 +2,26 @@
 
 use super::config::StatusAddress;
 use super::ingress_status::build_ingress_status_patch;
+use coxswain_reflector::ingress::IngressPorts;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::{
     Client,
     api::{Api, Patch, PatchParams},
 };
 
-pub(super) async fn patch_ingress_status(client: &Client, ingress: &Ingress, addr: &StatusAddress) {
+pub(super) async fn patch_ingress_status(
+    client: &Client,
+    ingress: &Ingress,
+    addr: &StatusAddress,
+    ports: IngressPorts,
+) {
     let name = match ingress.metadata.name.as_deref() {
         Some(n) => n,
         None => return,
     };
     let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
     let api: Api<Ingress> = Api::namespaced(client.clone(), ns);
-    let patch = build_ingress_status_patch(addr);
+    let patch = build_ingress_status_patch(addr, ports);
     let started = std::time::Instant::now();
     let result = api
         .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
