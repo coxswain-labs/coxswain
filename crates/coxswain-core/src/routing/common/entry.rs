@@ -417,6 +417,7 @@ impl BackendGroup {
     }
 
     /// Set the upstream transport protocol (builder-style).
+    #[must_use]
     pub fn with_protocol(mut self, protocol: BackendProtocol) -> Self {
         self.protocol = protocol;
         self
@@ -426,6 +427,7 @@ impl BackendGroup {
     ///
     /// When set, the proxy uses `tls.sni` for SNI and `tls.ca` for upstream cert
     /// verification, overriding `appProtocol`-based TLS defaults.
+    #[must_use]
     pub fn with_tls(mut self, tls: Arc<UpstreamTls>) -> Self {
         self.tls = Some(tls);
         self
