@@ -62,6 +62,7 @@ coxswain-bin
 | Library crates never use `anyhow` | `scripts/check-no-anyhow-libs.sh` |
 | `[lints] workspace = true` in every `crates/*/Cargo.toml` | `scripts/check-workspace-lints-decl.sh` |
 | No per-site `#[allow]` / `#[expect]` in non-test source | `scripts/check-no-per-site-allow.sh` |
+| Builder `with_*` methods + `is_/has_/can_` predicates carry `#[must_use]` | `scripts/check-must-use-builders.sh` |
 | Gateway API SupportedFeatures Rust↔Go parity | `scripts/check-supported-features.sh` |
 
 `[workspace.lints]` in `Cargo.toml` is the source of truth for lint configuration. Workspace-wide opt-outs in `[workspace.lints]` are acceptable when an entire lint *group* is too broad for the project (current: `clippy::pedantic = "allow"`). For upstream-imposed names that trip a lint (e.g. `HTTPRoute` from codegen tripping `upper_case_acronyms`): re-export with a project-canonical alias at the crate boundary (`gw_types.rs`) and use the alias everywhere internally — a one-time fix; per-site annotations lock the inconsistency in forever.

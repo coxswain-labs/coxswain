@@ -80,6 +80,7 @@ impl HostRouter {
     /// Whether any registered route on this host uses query-parameter predicates.
     ///
     /// The proxy uses this to skip query-string parsing when it's unnecessary.
+    #[must_use]
     pub fn has_query_predicates(&self) -> bool {
         self.has_query_predicates
     }

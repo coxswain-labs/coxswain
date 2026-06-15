@@ -1,7 +1,6 @@
 ui/node_modules/
 ui/dist/
 ui/.vite/
-.architecture-plan.md
 .cargo/config.toml
 .claude/settings.local.json
 .claude/scheduled_tasks.lock

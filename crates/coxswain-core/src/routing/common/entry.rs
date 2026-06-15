@@ -61,6 +61,7 @@ pub enum BackendProtocol {
 
 impl BackendProtocol {
     /// Returns `true` for protocols that require TLS to the upstream.
+    #[must_use]
     pub fn is_tls(self) -> bool {
         match self {
             Self::Https | Self::WebSocketTls => true,
@@ -69,6 +70,7 @@ impl BackendProtocol {
     }
 
     /// Returns `true` for protocols using HTTP/2 cleartext prior knowledge.
+    #[must_use]
     pub fn is_h2(self) -> bool {
         match self {
             Self::H2c => true,
@@ -703,6 +705,7 @@ impl RouteEntry {
     }
 
     /// Returns `true` for redirect-only entries that carry no upstream backend.
+    #[must_use]
     pub fn is_redirect_only(&self) -> bool {
         self.backend_group.name().is_empty()
     }

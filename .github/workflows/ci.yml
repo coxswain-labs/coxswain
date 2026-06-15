@@ -53,6 +53,7 @@ jobs:
               - 'scripts/check-no-anyhow-libs.sh'
               - 'scripts/check-workspace-lints-decl.sh'
               - 'scripts/check-no-per-site-allow.sh'
+              - 'scripts/check-must-use-builders.sh'
               - '.github/workflows/ci.yml'
 
   fmt:
@@ -174,3 +175,5 @@ jobs:
         run: bash scripts/check-workspace-lints-decl.sh
       - name: No per-site #[allow] / #[expect] in non-test source
         run: bash scripts/check-no-per-site-allow.sh
+      - name: Builders / predicates carry #[must_use]
+        run: bash scripts/check-must-use-builders.sh

@@ -84,6 +84,7 @@ impl ListParams {
 
     /// `true` when no filter/pagination params were supplied — the caller may
     /// emit its legacy full-dump shape (still wrapped in the envelope).
+    #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.name.is_none()
             && self.namespace.is_none()
