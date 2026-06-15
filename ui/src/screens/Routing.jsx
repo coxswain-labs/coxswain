@@ -7,7 +7,8 @@ import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { SearchBox } from '../components/SearchBox.jsx';
 import { ComboFilter } from '../components/ComboFilter.jsx';
 import { Icon } from '../components/Icon.jsx';
-import { PAGE_SIZES } from '../components/DataTable.jsx';
+import { PAGE_SIZES, Pager } from '../components/DataTable.jsx';
+import { useElementHeight } from '../hooks/useElementHeight.js';
 import { useEffect, useState } from 'preact/hooks';
 import { problemRouteKeys, categoryHasProblem } from '../severity.js';
 import { GatewaysSection } from './Gateways.jsx';
@@ -109,16 +110,24 @@ export function Routing({ query }) {
 
   const Section = active.Section;
 
+  // Measured height of the pinned controls bar → the table header docks just
+  // below it instead of sliding up behind it as the rows scroll the window
+  // (shared with ProxyDetail; see .routes-controls / .routes-screen).
+  const [chromeRef, chromeH] = useElementHeight();
+
   return (
-    <div class="screen screen-fill">
+    <div class="screen routes-screen" style={`--routes-chrome-h:${chromeH}px`}>
       <Breadcrumb items={[{ label: 'Routing' }, { label: 'Overview' }]} />
 
-      {/* Filters are shared across all tabs (one namespace/search scope applied to
-          whichever tab is active), so they sit above the tab bar — the tabs only
-          switch which resource type the scope is viewed through. */}
-      {/* Scoping filters (namespace · problems-only) group left; free-text name
-          search anchors right — the conventional toolbar split. */}
-      <div class="screen-header">
+      {/* Filters + tabs + pager are pinned to the top of the viewport so they
+          stay reachable while the row list scrolls the window underneath — the
+          same model as ProxyDetail (window scroll, no fixed-height inner box). */}
+      <div class="routes-controls" ref={chromeRef}>
+        {/* Filters are shared across all tabs (one namespace/search scope applied
+            to whichever tab is active), so they sit above the tab bar — the tabs
+            only switch which resource type the scope is viewed through. Scoping
+            filters (namespace · problems-only) group left; free-text name search
+            anchors right — the conventional toolbar split. */}
         <div class="header-controls left routing-filters">
           <div class="filter-group">
             <ComboFilter
@@ -140,52 +149,62 @@ export function Routing({ query }) {
           </div>
           <SearchBox value={search} onInput={onSearch} placeholder="Search by name…" label="Search routing by name" />
         </div>
-      </div>
 
-      {/* Deep-link-driven parent filter sits on its own row below the toolbar —
-          it's a transient, dismissable scope, not a standing filter control. */}
-      {parent && (
-        <div class="filter-row-below">
-          <span class="active-filter" title="Filtered to routes attached to this Gateway">
-            Parent: {parent}
-            <button
-              class="active-filter-x"
-              aria-label="Clear parent filter"
-              onClick={() => updateQuery({ parent: null })}
-            >
-              ×
-            </button>
-          </span>
+        {/* Deep-link-driven parent filter sits on its own row below the toolbar —
+            it's a transient, dismissable scope, not a standing filter control. */}
+        {parent && (
+          <div class="filter-row-below">
+            <span class="active-filter" title="Filtered to routes attached to this Gateway">
+              Parent: {parent}
+              <button
+                class="active-filter-x"
+                aria-label="Clear parent filter"
+                onClick={() => updateQuery({ parent: null })}
+              >
+                ×
+              </button>
+            </span>
+          </div>
+        )}
+
+        <div class="tabs" role="tablist">
+          {TABS.map((t) => {
+            const cat = cats[t.key] ?? {};
+            const warn =
+              (cat.worst && cat.worst !== 'ok') ||
+              (t.problemKind && categoryHasProblem(problems.data, t.problemKind));
+            return (
+              <button
+                key={t.key}
+                role="tab"
+                aria-selected={t.key === activeKey}
+                class={`tab${t.key === activeKey ? ' active' : ''}`}
+                onClick={() => updateQuery({ tab: t.key })}
+              >
+                <span class={`tab-label ${warn ? 'warn' : 'ok'}`}>
+                  <Icon name={warn ? 'alert' : 'check'} size={13} />
+                  {t.label} ({cat.total ?? 0})
+                </span>
+              </button>
+            );
+          })}
         </div>
-      )}
 
-      <div class="tabs" role="tablist">
-        {TABS.map((t) => {
-          const cat = cats[t.key] ?? {};
-          const warn =
-            (cat.worst && cat.worst !== 'ok') ||
-            (t.problemKind && categoryHasProblem(problems.data, t.problemKind));
-          return (
-            <button
-              key={t.key}
-              role="tab"
-              aria-selected={t.key === activeKey}
-              class={`tab${t.key === activeKey ? ' active' : ''}`}
-              onClick={() => updateQuery({ tab: t.key })}
-            >
-              <span class={`tab-label ${warn ? 'warn' : 'ok'}`}>
-                <Icon name={warn ? 'alert' : 'check'} size={13} />
-                {t.label} ({cat.total ?? 0})
-              </span>
-            </button>
-          );
-        })}
+        {/* Pager ABOVE the (potentially long) table so the page controls + the
+            "X–Y of N" count are reachable without scrolling past every row. The
+            Section omits its own footer pager (hidePager) to avoid a double. */}
+        {page.total > 0 && (
+          <div class="pager-bar">
+            <Pager page={page} />
+          </div>
+        )}
       </div>
 
       <Section
         rows={rows}
         total={list.data?.total}
         page={page}
+        hidePager
         loading={list.loading}
         error={list.error}
         q={q}

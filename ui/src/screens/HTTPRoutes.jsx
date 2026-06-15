@@ -13,7 +13,7 @@ import { worseSeverity, routeKey, sevClass, sevTitle } from '../severity.js';
  * parent (`parent` prop). Presentational: the owning Routing screen supplies the
  * shared namespace/search filters (see GatewaysSection).
  */
-export function HttpRoutesSection({ rows = [], total, page, loading = false, error = null, q = '', ns = 'all', parent = '', problemsOnly = false, problemKeys }) {
+export function HttpRoutesSection({ rows = [], total, page, hidePager = false, loading = false, error = null, q = '', ns = 'all', parent = '', problemsOnly = false, problemKeys }) {
   // Overlay /problems (conflicts/dead-routes) onto the reflector-computed status,
   // so dedicated-gateway routes (absent from the controller's table) still flag.
   const rowStatus = (r) =>
@@ -31,6 +31,7 @@ export function HttpRoutesSection({ rows = [], total, page, loading = false, err
       rows={shown}
       total={total}
       page={page}
+      hidePager={hidePager}
       loading={loading}
       error={error}
       emptyMsg="No HTTPRoutes."

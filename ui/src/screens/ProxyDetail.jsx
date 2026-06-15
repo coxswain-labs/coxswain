@@ -15,7 +15,8 @@ import { ComboFilter } from '../components/ComboFilter.jsx';
 import { Table } from '../components/Table.jsx';
 import { Pager, PAGE_SIZES } from '../components/DataTable.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useElementHeight } from '../hooks/useElementHeight.js';
+import { useEffect, useState } from 'preact/hooks';
 
 /**
  * Proxy detail screen.
@@ -182,25 +183,6 @@ export function ProxyDetail({ pod, query }) {
       </section>
     </div>
   );
-}
-
-/** Track an element's height into a CSS variable so the table header can dock
- *  directly below the pinned controls bar. The bar's height isn't fixed — it
- *  grows when the filters wrap and shrinks when the tab bar or pager are absent —
- *  so a measured value beats a hard-coded offset. Returns [ref, heightPx]. */
-function useElementHeight() {
-  const ref = useRef(null);
-  const [height, setHeight] = useState(0);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return undefined;
-    const update = () => setHeight(el.offsetHeight);
-    update();
-    const ro = new ResizeObserver(update);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-  return [ref, height];
 }
 
 /** Debounce a rapidly-changing value (search keystrokes) so each character

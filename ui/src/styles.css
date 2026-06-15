@@ -65,15 +65,6 @@ img { max-width: 100%; }
   margin-right: auto;
   width: 100%;
 }
-/* Only a `screen-fill` page (the routing tabs) pins the content to the viewport
-   below the fixed nav and owns the scroll, so its table can flex into the
-   remaining height and scroll internally with a sticky header. Every other
-   screen (detail pages, etc.) grows naturally and scrolls the page — one normal
-   window scrollbar, not a detached inner one. */
-.content:has(.screen-fill) {
-  height: calc(100vh - var(--nav-h));
-  overflow-y: auto;
-}
 @media (min-width: 640px) {
   .content { padding: 28px 24px; }
 }
@@ -667,20 +658,6 @@ section { margin-bottom: 32px; }
   margin-bottom: 12px;
   -webkit-overflow-scrolling: touch;
 }
-/* A "fill" screen (the routing tabs) is a flex column that owns the content
-   height; its table flexes into the remaining vertical space — bound to the
-   window, with a floor — so the body scrolls internally with a sticky header
-   and pager rather than growing the page. */
-.screen-fill { display: flex; flex-direction: column; height: 100%; }
-/* Everything except the table holds its natural size — without this the tab bar
-   (a flex item with overflow-x:auto, so its min-size collapses to 0) gets shrunk
-   away when the tall table competes for space. */
-.screen-fill > :not(.tbl-wrap) { flex: 0 0 auto; }
-/* Don't grow past the rows (no stretched, mostly-empty table), but shrink and
-   scroll internally when the rows exceed the remaining space — so the table is
-   bound to the viewport. min-height:0 lets it shrink below content height to
-   enable the inner scroll. */
-.screen-fill .tbl-wrap { flex: 0 1 auto; min-height: 0; margin-bottom: 0; }
 table { width: 100%; border-collapse: collapse; min-width: 400px; }
 th {
   text-align: left; padding: 10px 14px;

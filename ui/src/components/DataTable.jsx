@@ -35,6 +35,8 @@ export const PAGE_SIZES = [25, 50, 100, 200];
  * @param {string} [emptyMsg]
  * @param {boolean} [loading]
  * @param {any} [error]
+ * @param {boolean} [hidePager] when the owning screen renders the pager itself
+ *        (e.g. in a sticky top toolbar), omit the in-`<tfoot>` pager/count here
  */
 export function DataTable({
   columns,
@@ -45,6 +47,7 @@ export function DataTable({
   emptyMsg = 'No data.',
   loading = false,
   error = null,
+  hidePager = false,
 }) {
   if (error) return <ErrorState error={error} />;
   const labels = columns.map((c) => (typeof c === 'string' ? c : c.label));
@@ -55,8 +58,9 @@ export function DataTable({
       : `${rows.length} ${rows.length === 1 ? 'item' : 'items'}`;
 
   // The footer lives in the table's <tfoot> so it spans the columns and stays
-  // attached. While loading, omit it (the body shows the loading text).
-  const footer = loading
+  // attached. While loading, omit it (the body shows the loading text); when the
+  // screen pins its own pager in a top toolbar, omit it too (no double pager).
+  const footer = loading || hidePager
     ? null
     : paged
       ? <Pager page={page} />

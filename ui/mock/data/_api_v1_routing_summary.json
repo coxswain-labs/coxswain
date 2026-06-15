@@ -1,6 +1,6 @@
 {
   "gateways": {
-    "total": 4,
+    "total": 74,
     "worst": "error"
   },
   "httproutes": {
@@ -8,7 +8,7 @@
     "worst": "error"
   },
   "ingresses": {
-    "total": 4,
+    "total": 74,
     "worst": "error"
   },
   "namespaces": [
