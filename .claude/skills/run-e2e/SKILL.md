@@ -1,6 +1,6 @@
 ---
 name: run-e2e
-description: Reset the local Kubernetes cluster and run one or more of the coxswain e2e suites (ingress, gateway_api, dedicated_proxy, proxy_hot_reconfig, observability, conformance) against it. Use when the user wants to validate a change against a live cluster — for example "run e2e", "test e2e", "run conformance", or "run the full e2e suite". Asks which suites to run; auto-detects the local cluster type (caches the reset command in memory after first use); reports a clean summary; offers to debug on failure.
+description: Reset the local Kubernetes cluster and run one or more of the coxswain by-plane e2e suites (routing, tls, traffic_policy, status_conditions, provisioning_rbac, resilience, observability, conformance) against it. Use when the user wants to validate a change against a live cluster — for example "run e2e", "test e2e", "run conformance", or "run the full e2e suite". Asks which suites to run; auto-detects the local cluster type (caches the reset command in memory after first use); reports a clean summary; offers to debug on failure.
 ---
 
 Run one or more of the project's e2e suites against a freshly-reset local Kubernetes cluster. Follow these steps in order.
@@ -9,11 +9,15 @@ Run one or more of the project's e2e suites against a freshly-reset local Kubern
 
 Use `AskUserQuestion` with `multiSelect: true` and these options (omit "Other"; the harness manages it):
 
-- **ingress** — Cargo e2e suite. Harness builds the Docker image, installs via Helm, runs tests in-cluster. `cargo test -p coxswain-e2e --test ingress -- --test-threads=1`
-- **gateway_api** — Cargo e2e suite. Same shape as ingress; also covers health endpoint checks. `cargo test -p coxswain-e2e --test gateway_api -- --test-threads=1`
-- **dedicated_proxy** — Cargo e2e suite covering dedicated-mode provisioning + per-namespace RBAC. Dedicated-proxy Services use NodePort; tests connect via node IP. `cargo test -p coxswain-e2e --test dedicated_proxy -- --test-threads=1`
-- **proxy_hot_reconfig** — Cargo load-test suite: zero-drop listener add/remove; crash-loop shared-pool fallback. `cargo test -p coxswain-e2e --test proxy_hot_reconfig -- --test-threads=1`
-- **observability** — Cargo e2e suite covering readiness/status (formerly `health.rs`), the `coxswain_proxy_*` / `coxswain_controller_*` Prometheus surface, and the access-log contract (field set, path-mode behaviour, disabled mode). `cargo test -p coxswain-e2e --test observability -- --test-threads=1`
+Suites are organized by **behavior plane** (see each `tests/*.rs` header). `security.rs` carries no tests yet, so it is not offered.
+
+- **routing** — data-plane: path/host/header/method/query/weighted matching, wildcard, named-port, default-backend, cross-namespace, timeouts, endpoint-serving exclusion, parent-ref port (Ingress + Gateway API). `cargo test -p coxswain-e2e --test routing -- --test-threads=1`
+- **tls** — data-plane: SNI termination, cert rotation/fallback, cert-manager, BackendTLSPolicy, PROXY protocol, h2c, WebSocket (Ingress + Gateway API). `cargo test -p coxswain-e2e --test tls -- --test-threads=1`
+- **traffic_policy** — data-plane: per-route/backend knobs (currently the connect-retry annotation; v0.3 knobs land here). `cargo test -p coxswain-e2e --test traffic_policy -- --test-threads=1`
+- **status_conditions** — control-plane: Ingress LB status, Gateway Accepted/Programmed/observedGeneration, GatewayClass features, dedicated-mode (#211) status writer. `cargo test -p coxswain-e2e --test status_conditions -- --test-threads=1`
+- **provisioning_rbac** — control-plane: dedicated-proxy provisioning + GC, per-namespace + cluster-wide RBAC, ReferenceGrant, dedicated traffic, and the read-only-proxy SA audit. `cargo test -p coxswain-e2e --test provisioning_rbac -- --test-threads=1`
+- **resilience** — control-plane (serial): in-flight listener add/remove under load, crash-loop shared-pool fallback, controller-restart idempotency, mode migration. `cargo test -p coxswain-e2e --test resilience -- --test-threads=1`
+- **observability** — cross-cutting: readiness/status (formerly `health.rs`), the `coxswain_proxy_*` / `coxswain_controller_*` Prometheus surface, the access-log contract, the problems aggregate, and the routing admin endpoints. `cargo test -p coxswain-e2e --test observability -- --test-threads=1`
 - **conformance** — Gateway API Go conformance suite. Unlike the Cargo suites, conformance is NOT auto-bootstrapped — it needs the production multi-stage `Dockerfile` and conformance-specific Helm overrides. Use `scripts/setup-conformance.sh` to prepare the cluster, then `go test` runs against the deployed cluster. Setup is ~3–5 min on macOS (BoringSSL build); the test itself is ~2 min.
 
 Cap the question at one phrase: "Which e2e suites to run?". Header: "E2E suites".
@@ -41,7 +45,7 @@ For each reset: briefly tell the user one line ("Resetting <type> cluster with `
 
 ## 3 — Bootstrap
 
-**All Cargo suites** (ingress, gateway_api, dedicated_proxy, proxy_hot_reconfig, observability) bootstrap the cluster themselves via `coxswain-e2e`'s harness — no manual cluster setup. The bootstrap:
+**All Cargo suites** (routing, tls, traffic_policy, status_conditions, provisioning_rbac, resilience, observability) bootstrap the cluster themselves via `coxswain-e2e`'s harness — no manual cluster setup. The bootstrap:
 1. Detects cluster type (OrbStack vs kind).
 2. Builds the `coxswain:e2e` Docker image. **On Linux CI runners**: `Dockerfile.e2e` — a 2-line COPY-only image wrapping the already-compiled binary (~5 s). **On macOS (or any non-Linux host)**: the production multi-stage `Dockerfile`, because the host produces Mach-O binaries that won't run in Linux containers. First macOS build is ~5–10 min for BoringSSL; cached afterwards. The harness picks the right Dockerfile at compile time via `cfg!(target_os = "linux")`.
 3. For kind: `kind load docker-image` + starts cloud-provider-kind if not running.
@@ -57,7 +61,7 @@ The bootstrap fails fast with a clear error if `target/release/coxswain` is abse
 
 ## 4 — Run each chosen suite
 
-**ingress / gateway_api / dedicated_proxy / proxy_hot_reconfig**:
+**routing / tls / traffic_policy / status_conditions / provisioning_rbac / resilience / observability**:
 
 ```bash
 cargo test -p coxswain-e2e --test <suite> -- --test-threads=1

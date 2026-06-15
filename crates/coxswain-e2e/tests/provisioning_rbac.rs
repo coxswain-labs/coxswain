@@ -1,0 +1,1065 @@
+#![allow(missing_docs)]
+//! Provisioning & RBAC control-plane: the dedicated-proxy operator and its
+//! ServiceAccount surface.
+//!
+//! Plane: **control-plane**. Execution: **mixed** — most tests own a fresh
+//! namespace and a fresh dedicated Gateway (parallel-safe); the read-only-proxy
+//! audit reads cluster-scoped RBAC.
+//!
+//! Classification rule: a test belongs to the plane of its *primary assertion
+//! target*. "A resource is provisioned / GC'd / a binding exists" is
+//! control-plane even if it sends a probe. Covers dedicated-proxy resource
+//! provisioning (GEP-1762 labels, owner refs, SSA), garbage collection,
+//! per-namespace + cluster-wide RBAC RoleBinding lifecycle + drift recovery,
+//! `--proxy-watch-namespaces` rendering, ReferenceGrant-gated cross-namespace
+//! backends, the dedicated proxy serving traffic end-to-end, and the structural
+//! read-only-proxy ServiceAccount audit (zero write verbs).
+//!
+//! Note: `lifecycle_dedicated_proxy_routes_traffic` and
+//! `lifecycle_cross_namespace_backend` assert traffic, but are kept here with the
+//! dedicated-provisioning lifecycle they validate (and share its helper set)
+//! rather than in `routing.rs`. Controller-restart and mode-migration lifecycle
+//! tests live in `resilience.rs`; the #211 status-writer tests in
+//! `status_conditions.rs`. Shared dedicated helpers live in `common::dedicated`.
+
+use coxswain_e2e::{
+    FixtureVars, Harness, NamespaceGuard,
+    fixtures::{backends, dedicated_proxy as dedicated},
+    harness::{HttpClient, wait},
+};
+use gateway_api::apis::standard::gateways::Gateway;
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{Service, ServiceAccount};
+use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
+use std::collections::HashSet;
+use std::process::Command;
+use std::time::Duration;
+
+mod common;
+use common::dedicated::{
+    GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, binding_name, cluster_route_binding_name,
+    poll_until, wait_for_cut_over,
+};
+
+/// 1. Apply a dedicated-mode Gateway → assert all three resources are created
+///    with the GEP-1762 labels (including merged infrastructure labels), the
+///    correct owner reference back to the Gateway, and the SSA field manager
+///    set to `"coxswain-controller"`.
+#[tokio::test]
+async fn provisions_resources_for_dedicated_proxy() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-create").await?;
+
+    let (_, _, _, deploy, svc, sa) = apply_and_wait(&h, &ns).await?;
+
+    // Reserved-set + merged user labels on each resource.
+    for (kind, meta) in [
+        ("Deployment", &deploy.metadata),
+        ("Service", &svc.metadata),
+        ("ServiceAccount", &sa.metadata),
+    ] {
+        let labels = meta.labels.as_ref().unwrap_or_else(|| {
+            panic!("{kind}: labels missing");
+        });
+        assert_eq!(
+            labels
+                .get("gateway.networking.k8s.io/gateway-name")
+                .map(String::as_str),
+            Some(GATEWAY_NAME),
+            "{kind}: GEP-1762 gateway-name label missing/wrong"
+        );
+        assert_eq!(
+            labels
+                .get("app.kubernetes.io/managed-by")
+                .map(String::as_str),
+            Some("coxswain"),
+            "{kind}: managed-by label missing/wrong"
+        );
+        assert_eq!(
+            labels.get("app.kubernetes.io/name").map(String::as_str),
+            Some("coxswain"),
+            "{kind}: name label missing/wrong"
+        );
+        assert_eq!(
+            labels.get("team").map(String::as_str),
+            Some("platform"),
+            "{kind}: infrastructure.labels.team should merge"
+        );
+    }
+
+    // Annotation merged from infrastructure.annotations.
+    for (kind, meta) in [
+        ("Deployment", &deploy.metadata),
+        ("Service", &svc.metadata),
+        ("ServiceAccount", &sa.metadata),
+    ] {
+        let annotations = meta.annotations.as_ref().unwrap_or_else(|| {
+            panic!("{kind}: annotations missing");
+        });
+        assert_eq!(
+            annotations
+                .get("coxswain.example/owner")
+                .map(String::as_str),
+            Some("tenant-team"),
+            "{kind}: infrastructure.annotations.owner should merge"
+        );
+    }
+
+    // Owner reference back to the Gateway with controller=true,
+    // blockOwnerDeletion=true.
+    for (kind, meta) in [
+        ("Deployment", &deploy.metadata),
+        ("Service", &svc.metadata),
+        ("ServiceAccount", &sa.metadata),
+    ] {
+        let refs = meta.owner_references.as_ref().unwrap_or_else(|| {
+            panic!("{kind}: owner references missing");
+        });
+        assert_eq!(refs.len(), 1, "{kind}: expected exactly one owner ref");
+        let r = &refs[0];
+        assert_eq!(r.kind, "Gateway", "{kind}: owner ref kind");
+        assert_eq!(r.name, GATEWAY_NAME, "{kind}: owner ref name");
+        assert_eq!(r.controller, Some(true), "{kind}: owner ref controller");
+        assert_eq!(
+            r.block_owner_deletion,
+            Some(true),
+            "{kind}: owner ref blockOwnerDeletion"
+        );
+        assert!(
+            r.api_version.starts_with("gateway.networking.k8s.io/"),
+            "{kind}: owner ref api_version = {}",
+            r.api_version
+        );
+    }
+
+    // SSA field manager (acceptance criterion).
+    let managers = deploy
+        .metadata
+        .managed_fields
+        .as_ref()
+        .expect("Deployment managedFields missing");
+    assert!(
+        managers
+            .iter()
+            .any(|f| f.manager.as_deref() == Some("coxswain-controller")),
+        "expected a managedFields entry with manager = 'coxswain-controller'"
+    );
+
+    Ok(())
+}
+
+/// 2. Delete the Gateway → assert all three resources are garbage-collected
+///    within 30 s via the owner-ref cascade. No explicit deletion of the
+///    provisioned resources; K8s GC drives it from the owner reference.
+#[tokio::test]
+async fn gateway_deletion_garbage_collects_resources() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-gc").await?;
+
+    let (deployments, services, sas, _, _, _) = apply_and_wait(&h, &ns).await?;
+
+    // Delete the Gateway and wait for GC to cascade.
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    gateways
+        .delete(GATEWAY_NAME, &DeleteParams::default())
+        .await?;
+
+    poll_until(Duration::from_secs(30), || async {
+        let deploy_gone = deployments.get(RESOURCE_NAME).await.is_err();
+        let svc_gone = services.get(RESOURCE_NAME).await.is_err();
+        let sa_gone = sas.get(RESOURCE_NAME).await.is_err();
+        if deploy_gone && svc_gone && sa_gone {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// 4. Apply a dedicated-mode Gateway with a same-namespace HTTPRoute → assert
+///    the controller creates a `RoleBinding` `coxswain-<ns>-<gw-name>` in the
+///    Gateway's own namespace, with the discovery labels set and bound to the
+///    `coxswain-gateway-proxy-reader` ClusterRole.
+#[tokio::test]
+async fn provisions_role_binding_in_gateway_namespace() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-own").await?;
+
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &ns.name);
+    let want_name = binding_name(&ns.name);
+    let rb = poll_until(Duration::from_secs(15), || async {
+        bindings.get(&want_name).await.ok()
+    })
+    .await?;
+
+    // RoleRef points at the static permission-template ClusterRole.
+    assert_eq!(rb.role_ref.kind, "ClusterRole");
+    assert_eq!(rb.role_ref.name, "coxswain-gateway-proxy-reader");
+
+    // Subject is the rendered proxy ServiceAccount in the Gateway's own ns.
+    let subjects = rb.subjects.as_ref().expect("subjects set");
+    assert_eq!(subjects.len(), 1);
+    assert_eq!(subjects[0].kind, "ServiceAccount");
+    assert_eq!(subjects[0].name, RESOURCE_NAME);
+    assert_eq!(subjects[0].namespace.as_deref(), Some(ns.name.as_str()));
+
+    // Discovery labels — reconcile lists by these to compute drift.
+    let labels = rb
+        .metadata
+        .labels
+        .as_ref()
+        .expect("RoleBinding labels missing");
+    assert_eq!(
+        labels
+            .get("app.kubernetes.io/managed-by")
+            .map(String::as_str),
+        Some("coxswain")
+    );
+    assert_eq!(
+        labels
+            .get("gateway.networking.k8s.io/gateway-name")
+            .map(String::as_str),
+        Some(GATEWAY_NAME)
+    );
+    assert_eq!(
+        labels
+            .get("gateway.coxswain-labs.dev/gateway-namespace")
+            .map(String::as_str),
+        Some(ns.name.as_str())
+    );
+
+    // No owner references — cleanup is reconcile-driven via the labels above
+    // (cross-namespace owner refs are unsupported by K8s GC).
+    assert!(
+        rb.metadata.owner_references.is_none()
+            || rb.metadata.owner_references.as_ref().unwrap().is_empty(),
+        "RoleBinding must not carry owner references; cleanup is reconcile-driven"
+    );
+
+    Ok(())
+}
+
+/// 5. Delete the Gateway → finalizer drives synchronous cleanup of every
+///    managed `RoleBinding` for that Gateway. Verifies the binding list (by
+///    the managed-by label selector) is empty within 30 s, and the Gateway
+///    itself disappears (finalizer is removed).
+#[tokio::test]
+async fn gateway_deletion_drives_role_binding_cleanup() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-gc").await?;
+
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &ns.name);
+    let want_name = binding_name(&ns.name);
+
+    // Wait for the binding to be present before we delete the Gateway, so the
+    // subsequent "binding gone" assertion is meaningful.
+    poll_until(Duration::from_secs(15), || async {
+        bindings.get(&want_name).await.ok()
+    })
+    .await?;
+
+    // Delete the Gateway. The finalizer keeps it alive until the controller
+    // clears bindings + removes the finalizer.
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    gateways
+        .delete(GATEWAY_NAME, &DeleteParams::default())
+        .await?;
+
+    poll_until(Duration::from_secs(30), || async {
+        // The binding must be gone, and listing by the managed-by selector
+        // for this Gateway must return zero objects.
+        let binding_gone = bindings.get(&want_name).await.is_err();
+        let selector = format!(
+            "app.kubernetes.io/managed-by=coxswain,\
+             gateway.networking.k8s.io/gateway-name={GATEWAY_NAME},\
+             gateway.coxswain-labs.dev/gateway-namespace={}",
+            ns.name
+        );
+        let leftover = bindings
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map(|l| l.items.len())
+            .unwrap_or(usize::MAX);
+        let gateway_gone = gateways.get(GATEWAY_NAME).await.is_err();
+        if binding_gone && leftover == 0 && gateway_gone {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// 6. Drift detection: out-of-band delete of a managed `RoleBinding` triggers
+///    the controller to re-create it within ~5 s via the RoleBinding
+///    cross-watch (`watches(... managed-by=coxswain ...)`).
+#[tokio::test]
+async fn out_of_band_binding_deletion_is_recreated() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-drift").await?;
+
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &ns.name);
+    let want_name = binding_name(&ns.name);
+    let original = poll_until(Duration::from_secs(15), || async {
+        bindings.get(&want_name).await.ok()
+    })
+    .await?;
+    let original_rv = original
+        .metadata
+        .resource_version
+        .clone()
+        .expect("RoleBinding resourceVersion");
+
+    bindings
+        .delete(&want_name, &DeleteParams::default())
+        .await?;
+
+    // Wait for the controller to observe the deletion via the cross-watch and
+    // SSA the binding back. `resourceVersion` strictly increases on K8s
+    // writes; a new binding with the same name will have a higher one.
+    let recreated = poll_until(Duration::from_secs(15), || async {
+        bindings.get(&want_name).await.ok()
+    })
+    .await?;
+    let new_rv = recreated
+        .metadata
+        .resource_version
+        .expect("recreated RoleBinding resourceVersion");
+    assert_ne!(
+        new_rv, original_rv,
+        "drift detection should produce a new binding (resourceVersion bumped)"
+    );
+    Ok(())
+}
+
+/// 7. Container-args rendering: the Deployment the controller provisions
+///    carries `--proxy-watch-namespaces=<ns>` matching the desired-namespace
+///    set the binding reconciler computed for this Gateway.
+#[tokio::test]
+async fn deployment_container_carries_watch_namespaces_arg() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-args").await?;
+
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let deploy = poll_until(Duration::from_secs(15), || async {
+        deployments.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
+
+    let want_arg = format!("--proxy-watch-namespaces={}", ns.name);
+    let containers = deploy
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .map(|s| s.containers.as_slice())
+        .unwrap_or_default();
+    let coxswain = containers
+        .iter()
+        .find(|c| c.name == "coxswain")
+        .expect("coxswain container present");
+    let args = coxswain.args.as_ref().expect("args set");
+    assert!(
+        args.iter().any(|a| a == &want_arg),
+        "expected {want_arg} in container args; got {args:?}"
+    );
+    Ok(())
+}
+
+/// 11 — Apply a dedicated-mode Gateway → assert Deployment/Service/ServiceAccount
+/// land with the GEP-1762 labels, owner references back to the Gateway, and the
+/// SSA field manager set to `coxswain-controller`.
+#[tokio::test]
+async fn lifecycle_provisioning_creates_resources() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-prov").await?;
+
+    h.apply(dedicated::PROVISIONING, FixtureVars::new(&ns.name))
+        .await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
+
+    let deploy = poll_until(Duration::from_secs(30), || async {
+        deployments.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
+    let svc = poll_until(Duration::from_secs(30), || async {
+        services.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
+    let sa = poll_until(Duration::from_secs(30), || async {
+        sas.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
+
+    for (kind, meta) in [
+        ("Deployment", &deploy.metadata),
+        ("Service", &svc.metadata),
+        ("ServiceAccount", &sa.metadata),
+    ] {
+        let labels = meta
+            .labels
+            .as_ref()
+            .unwrap_or_else(|| panic!("{kind}: labels missing"));
+        assert_eq!(
+            labels
+                .get("gateway.networking.k8s.io/gateway-name")
+                .map(String::as_str),
+            Some(GATEWAY_NAME),
+            "{kind}: GEP-1762 gateway-name label"
+        );
+        assert_eq!(
+            labels
+                .get("app.kubernetes.io/managed-by")
+                .map(String::as_str),
+            Some("coxswain"),
+            "{kind}: managed-by label"
+        );
+
+        let refs = meta
+            .owner_references
+            .as_ref()
+            .unwrap_or_else(|| panic!("{kind}: owner references missing"));
+        assert_eq!(refs.len(), 1, "{kind}: expected one owner ref");
+        assert_eq!(refs[0].kind, "Gateway", "{kind}: owner ref kind");
+        assert_eq!(refs[0].name, GATEWAY_NAME, "{kind}: owner ref name");
+        assert_eq!(refs[0].controller, Some(true), "{kind}: controller=true");
+        assert_eq!(
+            refs[0].block_owner_deletion,
+            Some(true),
+            "{kind}: blockOwnerDeletion=true"
+        );
+    }
+
+    let managers = deploy
+        .metadata
+        .managed_fields
+        .as_ref()
+        .expect("Deployment managedFields");
+    assert!(
+        managers
+            .iter()
+            .any(|f| f.manager.as_deref() == Some("coxswain-controller")),
+        "expected managedFields entry for 'coxswain-controller'"
+    );
+
+    Ok(())
+}
+
+/// 12 — Spawn a dedicated-proxy host subprocess once the controller has flipped
+/// `DedicatedProxyReady=True`, send a GET via the Gateway listener, assert the
+/// expected backend.
+#[tokio::test]
+async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-traffic").await?;
+
+    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(dedicated::TRAFFIC, FixtureVars::new(&ns.name))
+        .await?;
+
+    // Wait for the controller to flip DedicatedProxyReady=True (cutover).
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    // The operator provisions a LoadBalancer Service for the dedicated pod;
+    // wait for it to get a real IP then verify traffic flows through it.
+    let dedicated_addr =
+        wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http = HttpClient::new(dedicated_addr)?;
+
+    let host = format!("dedicated.{}.local", ns.name);
+    let resp = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// 13 — An HTTPRoute with a backend Service in a different namespace resolves
+/// via `ReferenceGrant`. The per-tenant `RoleBinding` is provisioned for the
+/// dedicated proxy ServiceAccount, and traffic flows through the dedicated
+/// subprocess.
+#[tokio::test]
+async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "ded-life-xns-tenant").await?;
+
+    h.apply(
+        dedicated::CROSS_NAMESPACE_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
+
+    h.apply(
+        dedicated::CROSS_NAMESPACE_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &tenant.name);
+    let want_binding = binding_name(&ns.name);
+    poll_until(Duration::from_secs(30), || async {
+        bindings.get(&want_binding).await.ok()
+    })
+    .await?;
+
+    let dedicated_addr =
+        wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http = HttpClient::new(dedicated_addr)?;
+
+    let host = format!("cross-ns.{}.local", ns.name);
+    let resp = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-d");
+
+    Ok(())
+}
+
+/// 14 — Delete the `ReferenceGrant` → the cross-namespace backend is dropped
+/// from the dedicated proxy's routing table (requests 503) and the per-tenant
+/// `RoleBinding` is reconciled away.
+#[tokio::test]
+async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-revoke").await?;
+    let tenant = NamespaceGuard::create(&h.client, "ded-life-revoke-tenant").await?;
+
+    h.apply(
+        dedicated::CROSS_NAMESPACE_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
+
+    h.apply(
+        dedicated::CROSS_NAMESPACE_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    let dedicated_addr =
+        wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http = HttpClient::new(dedicated_addr)?;
+
+    let host = format!("cross-ns.{}.local", ns.name);
+    // Baseline — the route resolves while the grant is in place.
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+
+    use gateway_api::apis::standard::referencegrants::ReferenceGrant;
+    let grants: Api<ReferenceGrant> = Api::namespaced(h.client.clone(), &tenant.name);
+    let grant_name = format!("allow-httproute-from-{}", ns.name);
+    grants.delete(&grant_name, &DeleteParams::default()).await?;
+
+    // Cross-namespace backend dropped from the routing table → reflector
+    // installs an "error route" returning 500 ("No ready endpoints for rule —
+    // installing error route (500)"; see `gateway_api::reconcile`).
+    wait::wait_for_route_status(&http, &host, "/", 500, Duration::from_secs(30)).await?;
+
+    // Tenant ns is no longer in the desired-namespace set → the per-tenant
+    // RoleBinding is reconciled away.
+    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &tenant.name);
+    let want_binding = binding_name(&ns.name);
+    poll_until(Duration::from_secs(30), || async {
+        bindings.get(&want_binding).await.err().map(|_| ())
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// 16 — Gateway deletion cascades to Deployment/Service/ServiceAccount via
+/// owner-ref GC, and the Gateway itself is removed after the dedicated-cleanup
+/// finalizer runs. (Sibling of test 2 which asserts the same against
+/// `DEDICATED_GATEWAY` without the pause stub; this variant exercises the same
+/// path with a pause-image fixture for consistency with the rest of the
+/// lifecycle suite.)
+#[tokio::test]
+async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-gc").await?;
+
+    h.apply(dedicated::PROVISIONING, FixtureVars::new(&ns.name))
+        .await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
+
+    poll_until(Duration::from_secs(30), || async {
+        deployments.get(RESOURCE_NAME).await.ok()
+    })
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    gateways
+        .delete(GATEWAY_NAME, &DeleteParams::default())
+        .await?;
+
+    poll_until(Duration::from_secs(30), || async {
+        let gone = deployments.get(RESOURCE_NAME).await.is_err()
+            && services.get(RESOURCE_NAME).await.is_err()
+            && sas.get(RESOURCE_NAME).await.is_err()
+            && gateways.get(GATEWAY_NAME).await.is_err();
+        if gone { Some(()) } else { None }
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// 21. `from: All` listener → controller auto-provisions a `ClusterRoleBinding`
+///     for cluster-wide `HTTPRoute` reads and renders
+///     `--allow-cluster-wide-route-read` into the Deployment args. Flipping the
+///     listener back to `from: Same` removes the binding on the next reconcile.
+#[tokio::test]
+async fn cluster_wide_binding_created_and_removed_with_listener_mode() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-clusterwide-toggle").await?;
+
+    // Gateway fixture with from: All.
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_FROM_ALL,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let gw_name = "dedicated-gw-from-all";
+    let resource_name = "dedicated-gw-from-all-coxswain";
+    let crb_name = cluster_route_binding_name(&ns.name, gw_name);
+
+    let crbs: Api<ClusterRoleBinding> = Api::all(h.client.clone());
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // 1. ClusterRoleBinding appears within 15 s.
+    poll_until(Duration::from_secs(15), || async {
+        crbs.get(&crb_name).await.ok()
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("ClusterRoleBinding {crb_name} not created within 15s"))?;
+
+    // 2. Deployment carries --allow-cluster-wide-route-read.
+    let deploy = poll_until(Duration::from_secs(15), || async {
+        deployments.get(resource_name).await.ok()
+    })
+    .await?;
+    let containers = deploy
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .map(|s| s.containers.as_slice())
+        .unwrap_or_default();
+    let coxswain_c = containers
+        .iter()
+        .find(|c| c.name == "coxswain")
+        .expect("coxswain container");
+    let args = coxswain_c.args.as_ref().expect("args set");
+    assert!(
+        args.iter().any(|a| a == "--allow-cluster-wide-route-read"),
+        "--allow-cluster-wide-route-read not found in Deployment args: {args:?}"
+    );
+
+    // 3. Patch the listener to from: Same — the binding must disappear.
+    // SSA requires apiVersion + kind in the payload.
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let patch = serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "Gateway",
+        "metadata": { "name": gw_name, "namespace": &ns.name },
+        "spec": {
+            "gatewayClassName": "coxswain",
+            "infrastructure": {
+                "parametersRef": {
+                    "group": "gateway.coxswain-labs.dev",
+                    "kind": "CoxswainGatewayParameters",
+                    "name": "dedicated-params-from-all"
+                }
+            },
+            "listeners": [{
+                "name": "http",
+                "port": 8200,
+                "protocol": "HTTP",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            }]
+        }
+    });
+    gateways
+        .patch(
+            gw_name,
+            &PatchParams::apply("e2e-test").force(),
+            &Patch::Apply(patch),
+        )
+        .await?;
+
+    poll_until(Duration::from_secs(30), || async {
+        if crbs.get(&crb_name).await.is_err() {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "ClusterRoleBinding {crb_name} still present 30s after reverting to from: Same"
+        )
+    })?;
+
+    Ok(())
+}
+
+/// 22. Gateway deletion drives `ClusterRoleBinding` cleanup: the finalizer
+///     keeps the Gateway alive until the controller removes both per-namespace
+///     `RoleBinding`s and any cluster-wide `ClusterRoleBinding`s, then removes
+///     the finalizer.
+#[tokio::test]
+async fn cluster_wide_binding_deleted_on_gateway_deletion() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-clusterwide-gc").await?;
+
+    h.apply(
+        dedicated::DEDICATED_GATEWAY_FROM_ALL,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let gw_name = "dedicated-gw-from-all";
+    let crb_name = cluster_route_binding_name(&ns.name, gw_name);
+
+    let crbs: Api<ClusterRoleBinding> = Api::all(h.client.clone());
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // Wait for the binding to exist before deleting — makes the "binding gone"
+    // assertion below meaningful.
+    poll_until(Duration::from_secs(15), || async {
+        crbs.get(&crb_name).await.ok()
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("ClusterRoleBinding {crb_name} not created within 15s"))?;
+
+    gateways.delete(gw_name, &DeleteParams::default()).await?;
+
+    poll_until(Duration::from_secs(30), || async {
+        let crb_gone = crbs.get(&crb_name).await.is_err();
+        let gw_gone = gateways.get(gw_name).await.is_err();
+        if crb_gone && gw_gone { Some(()) } else { None }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "ClusterRoleBinding {crb_name} or Gateway {gw_name} not cleaned up within 30s"
+        )
+    })?;
+
+    Ok(())
+}
+
+// ===========================================================================
+// Read-only-proxy ServiceAccount audit (from rbac_read_only_proxy.rs).
+//
+// write verbs.
+//
+// This is the load-bearing invariant of v0.2's controller/proxy split: a
+// compromised proxy must not be able to write to Kubernetes. The chart
+// enforces it by not granting any write rules in `shared-proxy-rbac.yaml`;
+// this test enforces it by asking the API server.
+//
+// Mechanism: parse `kubectl auth can-i --list --as=<sa>` and assert that
+// every verb in the right-hand column belongs to `{get, list, watch}`. The
+// check is structural — it doesn't depend on which resources show up, only
+// on which verbs are bound. Adding a `create` / `patch` / `update` /
+// `delete` / `deletecollection` rule to the proxy ClusterRole, even on an
+// unrelated resource, regresses the invariant.
+//
+// Two baseline-grant carve-outs:
+// - `selfsubjectaccessreviews` / `selfsubjectrulesreviews` (api group
+//   `authorization.k8s.io`) — every authenticated user holds `create` on
+//   these via the cluster-default `system:basic-user` ClusterRoleBinding;
+//   that's not the proxy's RBAC, it's Kubernetes plumbing.
+// - Non-resource URLs (`/healthz`, `/version`, `/.well-known/*`) — same
+//   reason, `system:public-info-viewer` grants `get` on these to every
+//   authenticated user.
+//
+// The test skips when no cluster is reachable (kubectl unavailable, no
+// kubeconfig context) so it remains runnable locally without infrastructure.
+// In CI it runs against the same cluster the rest of the e2e suite targets.
+// ===========================================================================
+
+/// The ServiceAccount under audit. Matches the name rendered by both the
+/// raw manifests in `deploy/manifests/shared-proxy-rbac.yaml` and the Helm
+/// chart's default release-name convention (`<release>-coxswain-shared-proxy`).
+const PROXY_SA_CANDIDATES: &[&str] = &[
+    "coxswain-shared-proxy",
+    "release-name-coxswain-shared-proxy",
+];
+
+/// Verbs the proxy is allowed to hold. Anything outside this set is a
+/// regression of the read-only-proxy invariant.
+const ALLOWED_VERBS: &[&str] = &["get", "list", "watch"];
+
+/// Resource prefixes whose verbs come from baseline cluster grants
+/// (`system:basic-user`, `system:public-info-viewer`), not from the
+/// `coxswain-shared-proxy` ClusterRole. Excluded from the audit so the test
+/// fails only on real regressions.
+///
+/// Every `selfsubject*` resource (under both `authorization.k8s.io` and
+/// `authentication.k8s.io`) grants `create` to every authenticated principal
+/// via cluster-default bindings; that's K8s plumbing, not coxswain.
+const BASELINE_RESOURCE_PREFIXES: &[&str] = &["selfsubject"];
+
+#[test]
+fn shared_proxy_sa_has_only_read_verbs() {
+    let Some(output) = try_auth_can_i_list() else {
+        eprintln!(
+            "rbac_read_only_proxy: no reachable cluster — skipping. Run against a cluster \
+             with coxswain installed (helm or manifests) to enforce the invariant."
+        );
+        return;
+    };
+
+    let rows = parse_auth_can_i(&output);
+    assert!(
+        !rows.is_empty(),
+        "auth can-i --list returned no rows — is the ServiceAccount actually bound? \
+         Output was:\n{output}"
+    );
+
+    let allowed: HashSet<&str> = ALLOWED_VERBS.iter().copied().collect();
+    let mut violations: Vec<String> = Vec::new();
+
+    for row in &rows {
+        if is_baseline_grant(row) {
+            continue;
+        }
+        for verb in &row.verbs {
+            if !allowed.contains(verb.as_str()) {
+                violations.push(format!("resource={}, verb={}", row.resource, verb));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "shared-proxy ServiceAccount has write verbs — read-only invariant regressed!\n\
+         {}\n\
+         full kubectl output:\n{output}",
+        violations.join("\n")
+    );
+}
+
+/// Try each candidate SA name; return the first kubectl output that succeeded.
+/// Returns `None` when no cluster is reachable or no candidate SA exists.
+fn try_auth_can_i_list() -> Option<String> {
+    let namespace =
+        std::env::var("COXSWAIN_E2E_NAMESPACE").unwrap_or_else(|_| "coxswain-system".to_string());
+
+    for sa in PROXY_SA_CANDIDATES {
+        let principal = format!("system:serviceaccount:{namespace}:{sa}");
+        let output = Command::new("kubectl")
+            .args(["auth", "can-i", "--list", "--as", &principal])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("rbac_read_only_proxy: candidate `{sa}` failed: {stderr}");
+    }
+    None
+}
+
+/// One parsed row of `kubectl auth can-i --list` output.
+#[derive(Debug, Default)]
+struct AuthRow {
+    /// Resource cell (first column). Empty when the row is a non-resource URL.
+    resource: String,
+    /// Verbs from the rightmost bracketed segment.
+    verbs: Vec<String>,
+    /// True when the row's non-resource URL column is non-empty.
+    is_non_resource_url: bool,
+}
+
+/// Parse the kubectl table into [`AuthRow`]s. The output is column-aligned
+/// whitespace; columns are: Resources, Non-Resource URLs, Resource Names,
+/// Verbs. We split on whitespace runs, then re-assemble: the last bracketed
+/// segment is verbs; segments preceding it are the first three columns.
+fn parse_auth_can_i(output: &str) -> Vec<AuthRow> {
+    let mut rows = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("Resources") {
+            continue;
+        }
+        let Some(open) = trimmed.rfind('[') else {
+            continue;
+        };
+        let Some(close) = trimmed.rfind(']') else {
+            continue;
+        };
+        if close <= open {
+            continue;
+        }
+
+        // Verbs.
+        let mut verbs = Vec::new();
+        for verb in trimmed[open + 1..close].split(|c: char| c.is_whitespace() || c == ',') {
+            let v = verb.trim();
+            if !v.is_empty() {
+                verbs.push(v.to_string());
+            }
+        }
+
+        // Everything before the verbs bracket is the first three columns.
+        let prefix = trimmed[..open].trim_end();
+        let first_col = prefix.split_whitespace().next().unwrap_or("").to_string();
+
+        let is_non_resource_url = first_col.starts_with('[') || first_col.is_empty();
+
+        rows.push(AuthRow {
+            resource: if is_non_resource_url {
+                String::new()
+            } else {
+                first_col
+            },
+            verbs,
+            is_non_resource_url,
+        });
+    }
+    rows
+}
+
+fn is_baseline_grant(row: &AuthRow) -> bool {
+    if row.is_non_resource_url {
+        return true;
+    }
+    BASELINE_RESOURCE_PREFIXES
+        .iter()
+        .any(|p| row.resource == *p || row.resource.starts_with(p))
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::*;
+
+    const SAMPLE_READ_ONLY: &str = "\
+Resources                          Non-Resource URLs   Resource Names   Verbs
+selfsubjectaccessreviews.authorization.k8s.io   []   []   [create]
+selfsubjectrulesreviews.authorization.k8s.io    []   []   [create]
+services                                        []   []   [get list watch]
+secrets                                         []   []   [get,list,watch]
+gateways.gateway.networking.k8s.io              []   []   [get list watch]
+                                                [/.well-known/openid-configuration]   []   [get]
+                                                [/.well-known/openid/v1/jwks]         []   [get]
+";
+
+    const SAMPLE_HAS_WRITE: &str = "\
+Resources                          Non-Resource URLs   Resource Names   Verbs
+services                                        []   []   [get list watch]
+gateways/status.gateway.networking.k8s.io       []   []   [patch update]
+";
+
+    #[test]
+    fn read_only_sample_passes_audit() {
+        let rows = parse_auth_can_i(SAMPLE_READ_ONLY);
+        let allowed: HashSet<&str> = ALLOWED_VERBS.iter().copied().collect();
+        for row in &rows {
+            if is_baseline_grant(row) {
+                continue;
+            }
+            for verb in &row.verbs {
+                assert!(
+                    allowed.contains(verb.as_str()),
+                    "real read-only sample should not yield disallowed verbs; got {verb} on {}",
+                    row.resource
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_sample_yields_violation() {
+        let rows = parse_auth_can_i(SAMPLE_HAS_WRITE);
+        let allowed: HashSet<&str> = ALLOWED_VERBS.iter().copied().collect();
+        let mut violations = 0;
+        for row in &rows {
+            if is_baseline_grant(row) {
+                continue;
+            }
+            for verb in &row.verbs {
+                if !allowed.contains(verb.as_str()) {
+                    violations += 1;
+                }
+            }
+        }
+        assert!(
+            violations >= 2,
+            "write sample must produce at least two violations (patch + update); got {violations}"
+        );
+    }
+
+    #[test]
+    fn parse_ignores_header() {
+        let rows = parse_auth_can_i("Resources Non-Resource URLs Resource Names Verbs\n");
+        assert!(rows.is_empty(), "header line must not produce rows");
+    }
+
+    #[test]
+    fn parse_handles_empty_output() {
+        let rows = parse_auth_can_i("");
+        assert!(rows.is_empty());
+    }
+}
