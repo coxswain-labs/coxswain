@@ -65,6 +65,7 @@ pub struct MatchPredicates {
 
 impl MatchPredicates {
     /// Returns `true` when no predicates are set (matches any request unconditionally).
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.method.is_none() && self.headers.is_empty() && self.query.is_empty()
     }

@@ -56,6 +56,7 @@ impl ListenerTlsOutcome {
     /// Returns `true` for outcomes the controller should treat as healthy.
     /// `NotApplicable` (non-HTTPS listener) and `Resolved` are healthy; every
     /// failure variant is unhealthy.
+    #[must_use]
     pub fn is_healthy(&self) -> bool {
         matches!(self, Self::NotApplicable | Self::Resolved)
     }
