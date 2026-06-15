@@ -32,6 +32,7 @@
 
 pub mod cluster;
 pub mod crds;
+pub mod duration;
 pub mod endpoints;
 pub mod gateway_api;
 pub mod gw_types;

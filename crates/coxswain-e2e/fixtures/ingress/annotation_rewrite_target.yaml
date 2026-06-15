@@ -1,0 +1,25 @@
+# rewrite-target annotation fixture.
+# The upstream path is replaced by the annotation value regardless of the
+# original request path. TESTNS is substituted with the test namespace.
+#
+# Route: rewrite.TESTNS.local /api → echo-a, upstream path rewritten to /v2
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rewrite-ingress
+  annotations:
+    ingress.coxswain-labs.dev/rewrite-target: /v2
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: rewrite.TESTNS.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

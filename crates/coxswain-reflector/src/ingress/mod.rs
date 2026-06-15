@@ -1,5 +1,6 @@
 //! Ingress reconciler: translates `Ingress` resources into routing-table entries and TLS certs.
 
+pub mod annotations;
 mod backend;
 mod class;
 mod ports;

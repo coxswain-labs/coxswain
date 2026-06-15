@@ -1,6 +1,6 @@
 //! Per-request and per-connection context types for the Pingora proxy.
 
-use coxswain_core::routing::{BackendGroup, FilterAction, RouteTimeouts};
+use coxswain_core::routing::{BackendGroup, FilterAction, RetryOn, RouteTimeouts};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -88,13 +88,28 @@ pub struct ProxyCtx {
     pub start: Option<Instant>,
     /// Upstream endpoint address chosen in `upstream_peer` — written to the access log.
     pub upstream_addr: Option<SocketAddr>,
+    /// Number of upstream attempts already made for this request (excluding the initial).
+    ///
+    /// Incremented by `fail_to_connect` and `upstream_response_filter` before marking an
+    /// error as retryable.  Compared against `RetryPolicy::max_retries` from the matched
+    /// `BackendGroup` to enforce the per-route retry budget.
+    pub retries_used: u32,
+    /// The last retry condition that triggered a retry, for use in `error_while_proxy`.
+    ///
+    /// Set to the relevant [`RetryOn`] flag before marking an error retryable so that
+    /// `error_while_proxy` can distinguish a 5xx-response retry (which must NOT be
+    /// gated on `client_reused`) from a connection-error retry (which can check the
+    /// retry buffer).
+    pub last_retry_condition: Option<RetryOn>,
 }
 
 // Hot types — review with the team before bumping these numbers.
 // ResolvedRoute: +16 bytes for path_pattern: Arc<str> (88→104).
 // ResolvedRoute: +16 bytes for metric_route_id: Arc<str> (104→120).
-const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 120);
+// ResolvedRoute: +48 bytes because RouteTimeouts gained connect/read/send: Option<Duration> (120→168).
+const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 168);
 // ProxyCtx: +16 for start: Option<Instant>, +48 for upstream_addr: Option<SocketAddr>
 // with alignment padding (176→240).
 // ProxyCtx: +16 because Option<ResolvedRoute> inlines the struct (240→256).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 256);
+// ProxyCtx: +48 because ResolvedRoute grew with RouteTimeouts (256→304).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 312);

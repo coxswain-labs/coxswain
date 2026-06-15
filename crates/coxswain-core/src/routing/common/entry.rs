@@ -286,14 +286,103 @@ pub enum FilterAction {
     },
 }
 
-/// Per-rule timeout configuration parsed from `HTTPRouteRule.timeouts`.
-// intentionally open: field-literal constructed in crates/coxswain-reflector/src/gateway_api/timeouts.rs while translating HTTPRoute timeouts.
+/// Per-rule timeout configuration.
+///
+/// `request` / `backend_request` are parsed from `HTTPRouteRule.timeouts` (Gateway
+/// API). `connect` / `read` / `send` are parsed from the Ingress
+/// `ingress.coxswain-labs.dev/{connect,read,send}-timeout` annotations and map to the
+/// upstream TCP-connect, response-read, and request-send phases respectively.
+// intentionally open: field-literal constructed in crates/coxswain-reflector (gateway_api/timeouts.rs and ingress/annotations.rs) and merged in crates/coxswain-proxy/src/common/outcome.rs.
 #[derive(Clone, Debug, Default)]
 pub struct RouteTimeouts {
     /// Total request timeout (client → proxy → upstream → proxy → client). 504 on expiry.
     pub request: Option<Duration>,
     /// Upstream-only timeout (proxy → upstream response). 502 on expiry.
     pub backend_request: Option<Duration>,
+    /// Upstream TCP-connect timeout (`ingress.coxswain-labs.dev/connect-timeout`).
+    pub connect: Option<Duration>,
+    /// Upstream response-read timeout (`ingress.coxswain-labs.dev/read-timeout`).
+    pub read: Option<Duration>,
+    /// Upstream request-send timeout (`ingress.coxswain-labs.dev/send-timeout`).
+    pub send: Option<Duration>,
+}
+
+/// Conditions under which the proxy retries an upstream attempt, as a compact
+/// bitset parsed from the `ingress.coxswain-labs.dev/retry-on` annotation.
+///
+/// Kept `Copy` and allocation-free so a [`RetryPolicy`] adds no heap overhead to
+/// the hot [`BackendGroup`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetryOn(u8);
+
+impl RetryOn {
+    /// Retry when the upstream TCP connection cannot be established (`connect-failure`).
+    pub const CONNECT_FAILURE: Self = Self(0b001);
+    /// Retry when establishing the upstream connection times out (`timeout`).
+    pub const TIMEOUT: Self = Self(0b010);
+    /// Retry when the upstream returns a 5xx response (`5xx`).
+    pub const HTTP_5XX: Self = Self(0b100);
+
+    /// The empty set — no conditions.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// `true` when no retry conditions are set.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// `true` when every bit in `other` is also set in `self`.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Add the conditions in `other` to this set (in place).
+    pub fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+impl std::ops::BitOr for RetryOn {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Per-route upstream retry policy parsed from the Ingress `max-retries` and
+/// `retry-on` annotations.
+///
+/// Carried on [`BackendGroup`] (alongside `protocol`/`tls`) because retrying is an
+/// upstream-connection concern; the proxy reads it in `fail_to_connect` and
+/// `upstream_response_filter`. A default `RetryPolicy` (`max_retries == 0` or an
+/// empty [`RetryOn`]) disables retries entirely.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Maximum number of retries after the initial attempt.
+    pub max_retries: u32,
+    /// Conditions that trigger a retry.
+    pub on: RetryOn,
+}
+
+impl RetryPolicy {
+    /// Construct a retry policy from a max-retry count and a condition set.
+    #[must_use]
+    pub fn new(max_retries: u32, on: RetryOn) -> Self {
+        Self { max_retries, on }
+    }
+
+    /// `true` when this policy will never retry (no budget or no conditions).
+    #[must_use]
+    pub fn is_disabled(self) -> bool {
+        self.max_retries == 0 || self.on.is_empty()
+    }
 }
 
 /// Per-backend filter slot: `None` for backends without filters (the common
@@ -328,6 +417,9 @@ pub struct BackendGroup {
     /// TLS configuration from an attached `BackendTLSPolicy`.
     /// When `Some`, the proxy uses these settings instead of `protocol`-derived defaults.
     tls: Option<Arc<UpstreamTls>>,
+    /// Upstream retry policy from the Ingress `max-retries` / `retry-on` annotations.
+    /// Default (disabled) for Gateway API routes and Ingresses without the annotations.
+    retry: RetryPolicy,
     /// Per-backend request filters from `HTTPRoute.spec.rules[].backendRefs[].filters`.
     /// Index-aligned with `backends`. `None` for the common case where no backend
     /// declares per-backend filters; when `Some`, each slot is `None` for backends
@@ -354,6 +446,7 @@ impl BackendGroup {
             addrs_snapshot,
             protocol: BackendProtocol::default(),
             tls: None,
+            retry: RetryPolicy::default(),
             per_backend_filters: None,
         }
     }
@@ -401,6 +494,7 @@ impl BackendGroup {
             addrs_snapshot,
             protocol: BackendProtocol::default(),
             tls: None,
+            retry: RetryPolicy::default(),
             per_backend_filters: None,
         }
     }
@@ -414,6 +508,7 @@ impl BackendGroup {
             addrs_snapshot: Box::new([]),
             protocol: BackendProtocol::default(),
             tls: None,
+            retry: RetryPolicy::default(),
             per_backend_filters: None,
         }
     }
@@ -432,6 +527,17 @@ impl BackendGroup {
     #[must_use]
     pub fn with_tls(mut self, tls: Arc<UpstreamTls>) -> Self {
         self.tls = Some(tls);
+        self
+    }
+
+    /// Attach an upstream retry policy (builder-style).
+    ///
+    /// Parsed from the Ingress `ingress.coxswain-labs.dev/max-retries` and
+    /// `ingress.coxswain-labs.dev/retry-on` annotations. Gateway API routes and
+    /// Ingresses without the annotations leave this as the default (disabled) policy.
+    #[must_use]
+    pub fn with_retries(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -491,6 +597,15 @@ impl BackendGroup {
     /// TLS configuration from an attached `BackendTLSPolicy`, if any.
     pub fn upstream_tls(&self) -> Option<&Arc<UpstreamTls>> {
         self.tls.as_ref()
+    }
+
+    /// Upstream retry policy for this backend group.
+    ///
+    /// Returns the default (disabled) policy for Gateway API routes and
+    /// Ingresses that do not carry the `ingress.coxswain-labs.dev/max-retries` /
+    /// `retry-on` annotations.
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.retry
     }
 
     /// Flat list of all pod addresses — used by the admin `/api/v1/routes` endpoint.
@@ -755,13 +870,37 @@ impl RouteEntry {
         self.metric_route_id = id;
         self
     }
+
+    /// Set per-rule timeout overrides (builder-style).
+    ///
+    /// Used by the Ingress reconciler to attach the timeouts parsed from
+    /// `ingress.coxswain-labs.dev/{connect,read,send}-timeout` annotations
+    /// without switching to the heavier [`Self::with_filters`] constructor.
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: RouteTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    /// Append filter actions (builder-style).
+    ///
+    /// Replaces any existing filter list.  Used by the Ingress reconciler to
+    /// attach a `rewrite-target`-derived [`FilterAction::UrlRewrite`] without
+    /// switching from `path_only` to the heavier `with_filters` constructor
+    /// when no other constructor-level parameters change.
+    #[must_use]
+    pub fn with_filter_actions(mut self, filters: Vec<FilterAction>) -> Self {
+        self.filters = Arc::from(filters.into_boxed_slice());
+        self
+    }
 }
 
 // Lock the hot-path RouteEntry and BackendPool sizes to catch accidental growth.
 // Update the constant when a deliberate layout change is made.
 // Bumped 176→192 by adding path_pattern: Arc<str> (16 bytes) for access-log pattern mode.
 // Bumped 192→208 by adding metric_route_id: Arc<str> (16 bytes) for Prometheus `route` label and access-log `route_id` join key.
-static_assertions::assert_eq_size!(RouteEntry, [u8; 208]);
+// Bumped 208→256 by extending RouteTimeouts with connect/read/send: 3 × Option<Duration> (48 bytes) for Ingress annotation timeouts.
+static_assertions::assert_eq_size!(RouteEntry, [u8; 256]);
 // Hot type — review with the team before bumping this number.
 static_assertions::assert_eq_size!(BackendPool, [u8; 24]);
 
@@ -920,7 +1059,8 @@ mod tests {
         // but RouteEntry holds Arc<BackendGroup>, so RouteEntry size is unaffected.
         // Bumped 176→192: path_pattern: Arc<str> added for access-log pattern mode.
         // Bumped 192→208: metric_route_id: Arc<str> added for Prometheus `route` label.
-        static_assertions::assert_eq_size!(RouteEntry, [u8; 208]);
+        // Bumped 208→256: RouteTimeouts gained connect/read/send: 3×Option<Duration>.
+        static_assertions::assert_eq_size!(RouteEntry, [u8; 256]);
     }
 
     #[test]

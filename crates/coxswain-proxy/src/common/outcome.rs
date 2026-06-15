@@ -14,6 +14,9 @@ pub(crate) fn merge_timeouts(route: &RouteTimeouts, default: &RouteTimeouts) -> 
     RouteTimeouts {
         request: route.request.or(default.request),
         backend_request: route.backend_request.or(default.backend_request),
+        connect: route.connect.or(default.connect),
+        read: route.read.or(default.read),
+        send: route.send.or(default.send),
     }
 }
 

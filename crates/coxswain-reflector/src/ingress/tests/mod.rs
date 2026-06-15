@@ -206,6 +206,60 @@ pub(super) fn make_ingress_with_default(
     }
 }
 
+/// Build an Ingress with arbitrary `ingress.coxswain-labs.dev/*` annotations.
+///
+/// `extra_annotations` supplements (or overrides) the `kubernetes.io/ingress.class`
+/// annotation so tests can exercise the full annotation-parse → reconcile round-trip
+/// without duplicating the boilerplate `make_ingress` setup.
+pub(super) fn make_ingress_with_annotations(
+    ns: &str,
+    host: Option<&str>,
+    path: &str,
+    svc: &str,
+    extra_annotations: &[(&str, &str)],
+) -> Ingress {
+    let mut annotations: BTreeMap<String, String> = extra_annotations
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    // Always claim the "coxswain" class so reconcile does not skip it.
+    annotations
+        .entry("kubernetes.io/ingress.class".to_string())
+        .or_insert_with(|| "coxswain".to_string());
+    Ingress {
+        metadata: ObjectMeta {
+            name: Some("test-ingress".to_string()),
+            namespace: Some(ns.to_string()),
+            annotations: Some(annotations),
+            ..Default::default()
+        },
+        spec: Some(IngressSpec {
+            ingress_class_name: Some("coxswain".to_string()),
+            rules: Some(vec![IngressRule {
+                host: host.map(str::to_string),
+                http: Some(HTTPIngressRuleValue {
+                    paths: vec![HTTPIngressPath {
+                        path: Some(path.to_string()),
+                        path_type: "Prefix".to_string(),
+                        backend: IngressBackend {
+                            service: Some(IngressServiceBackend {
+                                name: svc.to_string(),
+                                port: Some(ServiceBackendPort {
+                                    number: Some(80),
+                                    ..Default::default()
+                                }),
+                            }),
+                            ..Default::default()
+                        },
+                    }],
+                }),
+            }]),
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
 pub(super) fn make_default_only_ingress(ns: &str, default_svc: &str) -> Ingress {
     Ingress {
         metadata: ObjectMeta {

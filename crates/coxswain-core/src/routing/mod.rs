@@ -14,9 +14,9 @@ mod ingress;
 mod tests;
 
 pub use common::entry::{
-    BackendGroup, BackendProtocol, FilterAction, HeaderMod, HeaderModError, PathModifier,
-    RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts, UpstreamCa, UpstreamTls,
-    parse_app_protocol,
+    BackendGroup, BackendProtocol, FilterAction, HeaderMod, HeaderModError, PathModifier, RetryOn,
+    RetryPolicy, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts, UpstreamCa,
+    UpstreamTls, parse_app_protocol,
 };
 pub use common::host_router::{HostRouter, HostRouterBuilder, WildcardKind};
 pub use common::port::PortTableBuilder;

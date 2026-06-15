@@ -64,8 +64,7 @@ spec:
 |------------|-------------|
 | `kubernetes.io/ingress.class` | Legacy class selection; takes effect when `spec.ingressClassName` is absent. Use `spec.ingressClassName` on Kubernetes 1.18+ |
 
-!!! note
-    No `gateway.coxswain-labs.dev/*` annotations are defined yet. That namespace is reserved for future per-Ingress configuration such as rewrites and redirects.
+Coxswain also supports the `ingress.coxswain-labs.dev/*` annotation namespace for per-Ingress configuration (timeouts, retries, path rewrites, backend protocol). See [Ingress annotations](ingress-annotations.md) for the full reference.
 
 ### Supported fields
 
