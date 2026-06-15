@@ -198,7 +198,7 @@ kubectl get secret example-com-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | 
 Check the routing table and logs:
 
 ```bash
-curl http://localhost:8082/routes
+curl http://localhost:8082/api/v1/routes
 curl http://localhost:8082/api/v1/health
 ```
 

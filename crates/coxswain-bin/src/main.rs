@@ -150,8 +150,8 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     });
 
     let admin_addr = SocketAddr::new(args.common.management_bind_address, args.common.admin_port);
-    // The controller does NOT wire .with_routes() — its /routes returns 404.
-    // The aggregate routing surface is /api/v1/routes/* via the aggregator.
+    // The controller does NOT wire .with_routes() — its /api/v1/routes returns
+    // 404. The aggregate routing surface is /api/v1/routing/* via the aggregator.
     server.add_service(
         AdminServer::new(health, status_writer.leader)
             .with_aggregator(aggregator)

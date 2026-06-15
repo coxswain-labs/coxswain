@@ -287,8 +287,33 @@ const SHARED_INGRESS = {
   ])),
 };
 const EMPTY_SIDE = { conflicts: [], hosts: [] };
+
+// A large synthetic slice so ProxyDetail's server-side filter + pagination (#286)
+// is exercised in dev: a *shared* proxy holds the whole cluster's table, so we
+// pad the curated rows (conflicts + dead backends, kept at the top so the
+// qualitative cases stay visible) with hundreds of generated host-groups. The
+// mock plugin windows these per block exactly as the controller's `routes_block`
+// does, so paging + Host/Path filtering behave like prod.
+// Sized to demonstrate pagination past the default 100-row page and to give the
+// host filter a meaningful list, without dumping thousands of lines of generated
+// JSON into the committed fixture: ~60 gateway hosts × 2 routes ⇒ ~120 rows.
+const idx = (i) => String(i).padStart(2, '0');
+const BULK_GATEWAY = Array.from({ length: 60 }, (_, i) =>
+  host(`svc-${idx(i)}.bulk.local`, 8080, [
+    row(`bulk-route-${i}`, 'bulk', '/', `bulk/svc-${i}`, i % 7 === 0 ? [] : EP2),
+    row(`bulk-route-${i}`, 'bulk', '/api', `bulk/svc-${i}-api`, EP1, 'exact'),
+  ]),
+);
+const BULK_INGRESS = Array.from({ length: 40 }, (_, i) =>
+  host(`shop-${idx(i)}.bulk.local`, 80, [
+    row(`bulk-ingress-${i}`, 'bulk', '/', `bulk/shop-${i}`, i % 5 === 0 ? [] : EP1),
+  ]),
+);
+const SHARED_GATEWAY_BULK = { ...SHARED_GATEWAY, hosts: [...SHARED_GATEWAY.hosts, ...BULK_GATEWAY] };
+const SHARED_INGRESS_BULK = { ...SHARED_INGRESS, hosts: [...SHARED_INGRESS.hosts, ...BULK_INGRESS] };
+
 function routesFor(p) {
-  if (p.kind === 'shared-proxy') return { gateway: SHARED_GATEWAY, ingress: SHARED_INGRESS };
+  if (p.kind === 'shared-proxy') return { gateway: SHARED_GATEWAY_BULK, ingress: SHARED_INGRESS_BULK };
   if (p.gw === 'tenant-a-gw') {
     return {
       gateway: { conflicts: [], hosts: [host('app.tenant-a.local', 8100, [row('a-web', 'tenant-a', '/', 'tenant-a/web', EP2)])] },
@@ -338,6 +363,15 @@ const GATEWAYS = [
     routes: [],
   },
 ];
+// Synthetic bulk gateways (list-only — no detail fixtures; clicking one 404s in
+// dev, like the bulk HTTPRoutes) so the Gateways tab scrolls + paginates like a
+// real cluster. All shared + healthy: they fill the list, not demo a state.
+const BULK_GATEWAYS = Array.from({ length: 70 }, (_, i) => ({
+  ns: 'bulk', name: `edge-gw-${idx(i)}`, pool: 'shared',
+  addresses: [`192.0.2.${i + 1}`], route_count: (i % 4) + 1,
+  conditions: [ACCEPTED, PROGRAMMED], listeners: [], routes: [],
+}));
+GATEWAYS.push(...BULK_GATEWAYS);
 // Gateway binding health: error when any condition is False (Accepted /
 // Programmed / DedicatedProxyReady), else ok — mirrors the controller's
 // upstream-only gateway severity (#301).
@@ -348,15 +382,18 @@ function emitGateways() {
     proxy: { pool: g.pool }, route_count: g.route_count, status: gatewayStatus(g),
   }));
   write('/api/v1/routing/gateways', { gateways, total: gateways.length, returned: gateways.length, offset: 0 });
-  GATEWAYS.forEach((g) => write(`/api/v1/routing/gateways/${g.ns}/${g.name}`, {
-    addresses: g.addresses,
-    attached_routes_list: g.routes.map(([ns, name]) => {
-      const r = HTTPROUTES.find((h) => h.ns === ns && h.name === name);
-      return { kind: 'HTTPRoute', name, namespace: ns, hostnames: r?.hostnames ?? [], rule_count: r?.rule_count ?? 0, status: r?.status ?? 'ok' };
-    }),
-    conditions: g.conditions, listeners: g.listeners, name: g.name, namespace: g.ns,
-    proxy: { pool: g.pool }, route_count: g.route_count, status: gatewayStatus(g),
-  }));
+  GATEWAYS.forEach((g) => {
+    if (g.ns === 'bulk') return; // list-only bulk: no detail fixture (404s in dev)
+    write(`/api/v1/routing/gateways/${g.ns}/${g.name}`, {
+      addresses: g.addresses,
+      attached_routes_list: g.routes.map(([ns, name]) => {
+        const r = HTTPROUTES.find((h) => h.ns === ns && h.name === name);
+        return { kind: 'HTTPRoute', name, namespace: ns, hostnames: r?.hostnames ?? [], rule_count: r?.rule_count ?? 0, status: r?.status ?? 'ok' };
+      }),
+      conditions: g.conditions, listeners: g.listeners, name: g.name, namespace: g.ns,
+      proxy: { pool: g.pool }, route_count: g.route_count, status: gatewayStatus(g),
+    });
+  });
 }
 
 // ── HTTPRoutes listing (#293) ───────────────────────────────────────────────────
@@ -577,6 +614,14 @@ const INGRESSES = [
     default_backend: { service: 'web', port: '80' },
     rules: [irule('app.tenant-b.local', [ipath('/', 'web', 80)])] },
 ];
+// Synthetic bulk ingresses (list-only — no detail fixtures; clicking one 404s in
+// dev) so the Ingresses tab scrolls + paginates. All healthy `coxswain`-class.
+const BULK_INGRESSES = Array.from({ length: 70 }, (_, i) => ({
+  ns: 'bulk', name: `shop-ing-${idx(i)}`, route_count: (i % 3) + 1,
+  ingress_class: 'coxswain', load_balancer: `192.0.2.${i + 1}`, status: 'ok',
+  rules: [irule(`shop-${idx(i)}.bulk.local`, [ipath('/', `shop-${i}`, 80)])],
+}));
+INGRESSES.push(...BULK_INGRESSES);
 function emitIngresses() {
   const ingresses = INGRESSES.map((i) => ({
     name: i.name, namespace: i.ns, route_count: i.route_count,
@@ -586,6 +631,7 @@ function emitIngresses() {
   }));
   write('/api/v1/routing/ingresses', { ingresses, total: ingresses.length, returned: ingresses.length, offset: 0 });
   INGRESSES.forEach((i) => {
+    if (i.ns === 'bulk') return; // list-only bulk: no detail fixture (404s in dev)
     write(`/api/v1/routing/routes/ingress/${i.ns}/${i.name}`, {
       name: i.name, namespace: i.ns,
       status: i.status,

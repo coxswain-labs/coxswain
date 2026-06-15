@@ -127,7 +127,7 @@ cargo run --bin coxswain -- serve proxy --dedicated \
 Verify only that Gateway's routes are loaded:
 
 ```bash
-curl -s http://localhost:8082/routes | jq .
+curl -s http://localhost:8082/api/v1/routes | jq .
 ```
 
 The output lists exactly the hosts the target Gateway's HTTPRoutes serve; Ingress routes and routes attached to other Gateways do not appear.

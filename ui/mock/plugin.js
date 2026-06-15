@@ -42,6 +42,78 @@ const LIST_KEYS = {
   '/api/v1/routing/ingresses': 'ingresses',
 };
 
+/** Matches the per-proxy compiled route table `/api/v1/fleet/proxies/{name}/routes`. */
+const ROUTES_RE = /^\/api\/v1\/fleet\/proxies\/[^/]+\/routes$/;
+/** Matches the per-proxy filter facets `/api/v1/fleet/proxies/{name}/facets`. */
+const FACETS_RE = /^\/api\/v1\/fleet\/proxies\/[^/]+\/facets$/;
+
+/** Window one block (ingress|gateway) of a proxy's compiled route table the way
+ *  the controller's `routes_block` does: filter rows by `host` (exact),
+ *  `namespace` (exact, the route's ns), `path` (substring) and `status=problem`
+ *  (dead backend), apply offset/limit, regroup into host-groups. The same
+ *  host/namespace/path scope narrows the conflict list (problems is ignored for
+ *  conflicts — a conflict is itself a problem). */
+function pageRoutesBlock(block, params) {
+  const host = (params.get('host') || '').toLowerCase();
+  const ns = (params.get('namespace') || '').toLowerCase();
+  const path = (params.get('path') || '').toLowerCase();
+  const problems = params.get('status') === 'problem';
+
+  const flat = [];
+  for (const h of block.hosts ?? []) {
+    for (const r of h.routes ?? []) {
+      if (host && (h.host || '').toLowerCase() !== host) continue;
+      if (ns && (r.namespace || '').toLowerCase() !== ns) continue;
+      if (path && !(r.path || '').toLowerCase().includes(path)) continue;
+      if (problems && (r.endpoints?.length ?? 0) !== 0) continue;
+      flat.push({ port: h.port, host: h.host, route: r });
+    }
+  }
+  const total = flat.length;
+  const limit = Math.min(1000, Number.parseInt(params.get('limit') || '200', 10) || 200);
+  const offset = Math.min(Math.max(0, Number.parseInt(params.get('offset') || '0', 10) || 0), total);
+  const windowed = flat.slice(offset, offset + limit);
+  const hosts = [];
+  for (const { port, host: h, route } of windowed) {
+    const last = hosts[hosts.length - 1];
+    if (last && last.port === port && last.host === h) last.routes.push(route);
+    else hosts.push({ port, host: h, routes: [route] });
+  }
+  const conflicts = (block.conflicts ?? []).filter(
+    (c) =>
+      (!host || (c.host || '').toLowerCase() === host) &&
+      (!ns || (c.namespace || '').toLowerCase() === ns) &&
+      (!path || (c.path || '').toLowerCase().includes(path)),
+  );
+  return { hosts, conflicts, total, returned: windowed.length, offset };
+}
+
+/** Window both blocks of a proxy's `/routes` fixture, preserving the
+ *  `{pod_name, reachable, routes}` envelope. An unreachable proxy has no
+ *  `routes` to page. */
+function pageRoutes(fixture, params) {
+  if (!fixture.routes) return fixture;
+  const routes = {};
+  for (const key of ['ingress', 'gateway']) {
+    if (fixture.routes[key]) routes[key] = pageRoutesBlock(fixture.routes[key], params);
+  }
+  return { ...fixture, routes };
+}
+
+/** Derive a proxy's filter facets (distinct hosts + route namespaces) from its
+ *  routes fixture, mirroring the controller's `/api/v1/facets`. */
+function deriveFacets(fixture) {
+  const hosts = new Set();
+  const namespaces = new Set();
+  for (const key of ['ingress', 'gateway']) {
+    for (const h of fixture.routes?.[key]?.hosts ?? []) {
+      hosts.add(h.host);
+      for (const r of h.routes ?? []) if (r.namespace) namespaces.add(r.namespace);
+    }
+  }
+  return { hosts: [...hosts].sort(), namespaces: [...namespaces].sort() };
+}
+
 /** Apply `?name=&namespace=&status=&limit=&offset=` to a list fixture, mirroring
  *  the backend's filter + window + envelope. */
 function pageList(fixture, key, params) {
@@ -135,6 +207,31 @@ export function mockApi() {
           const params = new URLSearchParams((req.url || '').split('?')[1] || '');
           const fixture = JSON.parse(readFileSync(file, 'utf8'));
           res.end(JSON.stringify(pageList(fixture, listKey, params)));
+          return;
+        }
+
+        // Per-proxy compiled route table: window each block (ingress/gateway)
+        // like the controller, so ProxyDetail's filter/pagination behaves in dev
+        // (#286). Absent params reproduce the full dump (backward-compatible).
+        if (ROUTES_RE.test(url) && existsSync(file)) {
+          const params = new URLSearchParams((req.url || '').split('?')[1] || '');
+          const fixture = JSON.parse(readFileSync(file, 'utf8'));
+          const hasParams = ['host', 'namespace', 'path', 'status', 'limit', 'offset'].some((k) => params.get(k));
+          res.end(JSON.stringify(hasParams ? pageRoutes(fixture, params) : fixture));
+          return;
+        }
+
+        // Per-proxy filter facets: derived from the proxy's routes fixture (the
+        // controller computes them from the live table), so dev's host/namespace
+        // dropdowns are populated without a separate fixture.
+        if (FACETS_RE.test(url)) {
+          const routesFile = fixtureFile(url.replace(/\/facets$/, '/routes'));
+          if (existsSync(routesFile)) {
+            const fixture = JSON.parse(readFileSync(routesFile, 'utf8'));
+            res.end(JSON.stringify(deriveFacets(fixture)));
+          } else {
+            res.end(JSON.stringify({ hosts: [], namespaces: [] }));
+          }
           return;
         }
 

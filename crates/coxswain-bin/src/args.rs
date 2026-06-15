@@ -146,7 +146,7 @@ pub(crate) struct CommonArgs {
 
     /// IP address shared by the health and admin HTTP servers.
     ///
-    /// Both `/healthz`/`/readyz` (health) and `/metrics`/`/routes`/`/status`
+    /// Both `/healthz`/`/readyz` (health) and `/metrics`/`/api/v1/routes`/`/api/v1/health`
     /// (admin) bind to this address. Set it to a management-network IP to
     /// restrict access; leave at `0.0.0.0` so kubelet probes and Prometheus
     /// scraping work out of the box. Independent from the data-plane

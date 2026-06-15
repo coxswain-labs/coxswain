@@ -319,7 +319,7 @@ pub struct BackendGroup {
     slots: Box<[u16]>,
     /// Advances monotonically; taken mod `slots.len()` on each request.
     slot_counter: AtomicUsize,
-    /// Flat snapshot of all pod addresses for the admin `/routes` endpoint.
+    /// Flat snapshot of all pod addresses for the admin `/api/v1/routes` endpoint.
     addrs_snapshot: Box<[SocketAddr]>,
     /// Wire protocol for upstream connections, derived from `appProtocol`.
     protocol: BackendProtocol,
@@ -489,7 +489,7 @@ impl BackendGroup {
         self.tls.as_ref()
     }
 
-    /// Flat list of all pod addresses — used by the admin `/routes` endpoint.
+    /// Flat list of all pod addresses — used by the admin `/api/v1/routes` endpoint.
     pub fn endpoints(&self) -> &[SocketAddr] {
         &self.addrs_snapshot
     }
@@ -678,7 +678,7 @@ impl RouteEntry {
     /// Constructs a redirect-only entry that has no upstream backend.
     ///
     /// Use for `RequestRedirect` filter rules: the proxy fires the redirect before
-    /// consulting any upstream, so no `BackendGroup` is needed. The `/routes` admin
+    /// consulting any upstream, so no `BackendGroup` is needed. The `/api/v1/routes` admin
     /// endpoint skips these entries (they have no endpoints).
     pub fn redirect_only(
         predicates: MatchPredicates,

@@ -1,0 +1,139 @@
+# Clean, all-green workload for walking the operator-UI happy path.
+#
+# Everything here is healthy: backends have ready pods, the Gateway is
+# Accepted + Programmed, every route is Accepted/ResolvedRefs/Programmed, and
+# nothing conflicts. The HTTPRoute exercises the richer effective-config view
+# (header match + a weighted canary) while staying green; the Ingress shows the
+# flat host/path → backend shape. Backends live in the `demo` namespace so the
+# routes reference them without a ReferenceGrant.
+#
+# Apply:  kubectl apply -f deploy/dev/operator-ui-happy.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+# ── backends (all with ready pods) ───────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web, namespace: demo, labels: { app: web } }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: web } }
+  template:
+    metadata: { labels: { app: web } }
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:0.2.3
+          args: ["-text=hello from web", "-listen=:5678"]
+          ports: [{ containerPort: 5678 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: demo }
+spec:
+  selector: { app: web }
+  ports: [{ port: 80, targetPort: 5678 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api, namespace: demo, labels: { app: api } }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: api } }
+  template:
+    metadata: { labels: { app: api } }
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:0.2.3
+          args: ["-text=hello from api (stable)", "-listen=:5678"]
+          ports: [{ containerPort: 5678 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api, namespace: demo }
+spec:
+  selector: { app: api }
+  ports: [{ port: 80, targetPort: 5678 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api-canary, namespace: demo, labels: { app: api-canary } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: api-canary } }
+  template:
+    metadata: { labels: { app: api-canary } }
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:0.2.3
+          args: ["-text=hello from api (canary)", "-listen=:5678"]
+          ports: [{ containerPort: 5678 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api-canary, namespace: demo }
+spec:
+  selector: { app: api-canary }
+  ports: [{ port: 80, targetPort: 5678 }]
+---
+# ── Gateway (Accepted + Programmed) ───────────────────────────────────────────
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: demo-gw, namespace: demo }
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces: { from: Same }
+---
+# ── HTTPRoute: web (single healthy rule) ──────────────────────────────────────
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web-route, namespace: demo }
+spec:
+  parentRefs: [{ name: demo-gw }]
+  hostnames: ["app.demo.local"]
+  rules:
+    - matches: [{ path: { type: PathPrefix, value: / } }]
+      backendRefs: [{ name: web, port: 80 }]
+---
+# ── HTTPRoute: api (header match + weighted canary — green) ────────────────────
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: api-route, namespace: demo }
+spec:
+  parentRefs: [{ name: demo-gw }]
+  hostnames: ["api.demo.local"]
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: /v1 }
+          method: GET
+          headers: [{ name: x-env, value: prod }]
+      backendRefs:
+        - { name: api, port: 80, weight: 90 }
+        - { name: api-canary, port: 80, weight: 10 }
+---
+# ── Ingress (flat host/path → backend, healthy) ───────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: shop-ingress, namespace: demo }
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: shop.demo.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: web, port: { number: 80 } } }
+          - path: /api
+            pathType: Prefix
+            backend: { service: { name: api, port: { number: 80 } } }

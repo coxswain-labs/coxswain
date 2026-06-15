@@ -98,9 +98,1689 @@
       },
       "route_count": 0,
       "status": "error"
+    },
+    {
+      "addresses": [
+        "192.0.2.1"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-00",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.2"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-01",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.3"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-02",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.4"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-03",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.5"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-04",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.6"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-05",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.7"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-06",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.8"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-07",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.9"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-08",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.10"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-09",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.11"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-10",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.12"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-11",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.13"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-12",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.14"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-13",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.15"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-14",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.16"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-15",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.17"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-16",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.18"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-17",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.19"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-18",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.20"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-19",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.21"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-20",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.22"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-21",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.23"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-22",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.24"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-23",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.25"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-24",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.26"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-25",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.27"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-26",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.28"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-27",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.29"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-28",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.30"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-29",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.31"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-30",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.32"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-31",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.33"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-32",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.34"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-33",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.35"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-34",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.36"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-35",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.37"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-36",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.38"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-37",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.39"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-38",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.40"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-39",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.41"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-40",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.42"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-41",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.43"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-42",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.44"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-43",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.45"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-44",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.46"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-45",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.47"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-46",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.48"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-47",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.49"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-48",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.50"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-49",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.51"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-50",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.52"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-51",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.53"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-52",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.54"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-53",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.55"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-54",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.56"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-55",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.57"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-56",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.58"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-57",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.59"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-58",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.60"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-59",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.61"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-60",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.62"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-61",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.63"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-62",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.64"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-63",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.65"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-64",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.66"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-65",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.67"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-66",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 3,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.68"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-67",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 4,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.69"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-68",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 1,
+      "status": "ok"
+    },
+    {
+      "addresses": [
+        "192.0.2.70"
+      ],
+      "conditions": [
+        {
+          "type": "Accepted",
+          "status": "True",
+          "reason": "Accepted"
+        },
+        {
+          "type": "Programmed",
+          "status": "True",
+          "reason": "Programmed"
+        }
+      ],
+      "name": "edge-gw-69",
+      "namespace": "bulk",
+      "proxy": {
+        "pool": "shared"
+      },
+      "route_count": 2,
+      "status": "ok"
     }
   ],
-  "total": 4,
-  "returned": 4,
+  "total": 74,
+  "returned": 74,
   "offset": 0
 }

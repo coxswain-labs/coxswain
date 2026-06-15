@@ -70,7 +70,7 @@ impl Harness {
     }
 
     /// Build an admin endpoint URL targeting the shared-proxy pod
-    /// (e.g. `admin_url("/routes")`).
+    /// (e.g. `admin_url("/api/v1/routes")`).
     pub fn admin_url(&self, path: &str) -> String {
         format!("http://{}{path}", self.controller.admin_addr)
     }

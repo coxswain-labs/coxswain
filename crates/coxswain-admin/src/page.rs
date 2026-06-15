@@ -35,12 +35,14 @@ pub(crate) struct ListParams {
     /// the operator UI's namespace dropdown maps here. Exact, not substring, so a
     /// page stays scoped to one namespace; lowercased at parse time.
     pub namespace: Option<String>,
-    /// Case-insensitive substring filter against each row's host (meaningful only
-    /// for the per-proxy route table; a no-op on the routing resource lists).
-    /// Lowercased at parse time.
+    /// Exact (case-insensitive) host filter for the per-proxy route table — the
+    /// operator UI's host dropdown (a pick from the proxy's known hosts) maps here.
+    /// Exact, not substring, so a selection scopes to that one host; a no-op on
+    /// the routing resource lists. Lowercased at parse time.
     pub host: Option<String>,
-    /// Case-insensitive substring filter against each row's path (meaningful only
-    /// for the per-proxy route table; a no-op on the routing resource lists).
+    /// Case-insensitive substring filter against the per-proxy route table's path —
+    /// the operator UI's path search box maps here (the within-host refinement). A
+    /// no-op on the routing resource lists. Lowercased at parse time.
     pub path: Option<String>,
     /// Page size; `None` selects [`DEFAULT_LIMIT`]. Clamped to [`MAX_LIMIT`].
     pub limit: Option<usize>,
@@ -111,17 +113,17 @@ impl ListParams {
         }
     }
 
-    /// `true` when the `host` filter is absent or a case-insensitive substring of
-    /// `haystack`.
+    /// `true` when the `host` filter is absent or an exact (case-insensitive) match
+    /// of `haystack` — a host-dropdown selection scopes the table to that host.
     pub(crate) fn host_matches(&self, haystack: &str) -> bool {
         match &self.host {
             None => true,
-            Some(needle) => haystack.to_ascii_lowercase().contains(needle),
+            Some(needle) => haystack.eq_ignore_ascii_case(needle),
         }
     }
 
     /// `true` when the `path` filter is absent or a case-insensitive substring of
-    /// `haystack`.
+    /// `haystack` — the path search narrows progressively as the operator types.
     pub(crate) fn path_matches(&self, haystack: &str) -> bool {
         match &self.path {
             None => true,
@@ -130,8 +132,8 @@ impl ListParams {
     }
 
     /// Re-encode the params as a query string (omitting defaults). Used by the
-    /// controller to relay the filter to a proxy's `/routes` endpoint, which does
-    /// the filtering at the source (#286).
+    /// controller to relay the filter to a proxy's `/api/v1/routes` endpoint,
+    /// which does the filtering at the source (#286).
     pub(crate) fn to_query(&self) -> String {
         let mut ser = form_urlencoded::Serializer::new(String::new());
         if let Some(name) = &self.name {
@@ -240,12 +242,18 @@ mod tests {
     }
 
     #[test]
-    fn substring_filters_are_case_insensitive() {
-        let p = ListParams::parse(Some("host=demo"));
-        assert!(p.host_matches("DEMO-gw"));
-        assert!(!p.host_matches("prod-gw"));
-        // path filter absent → always matches
-        assert!(p.path_matches("/anything"));
+    fn host_is_exact_path_is_substring_case_insensitive() {
+        let p = ListParams::parse(Some("host=App.Demo.local&path=%2Fv1"));
+        // host: exact (case-insensitive), not substring.
+        assert!(p.host_matches("app.demo.local"));
+        assert!(!p.host_matches("app.demo.local.extra"));
+        assert!(!p.host_matches("other.host"));
+        // path: substring (case-insensitive).
+        assert!(p.path_matches("/v1/users"));
+        assert!(!p.path_matches("/v2"));
+        // Absent → always matches.
+        assert!(ListParams::default().host_matches("anything"));
+        assert!(ListParams::default().path_matches("/anywhere"));
     }
 
     #[test]

@@ -5,9 +5,11 @@ import { fetchJson } from './client.js';
 /**
  * Build a `?…` query string from the shared list-endpoint params, omitting
  * empties so a no-arg call yields the param-less URL (the backend then returns
- * the full dump). `status: 'problem'` filters to non-ok rows.
+ * the full dump). For the per-proxy route table: `host` (exact) and `namespace`
+ * (exact) are the dropdown picks, `path` is the search substring.
+ * `status: 'problem'` filters to non-ok rows.
  *
- * @param {{host?: string, path?: string, limit?: number, offset?: number, status?: string}} [opts]
+ * @param {{name?: string, namespace?: string, host?: string, path?: string, limit?: number, offset?: number, status?: string}} [opts]
  */
 export function buildQuery(opts = {}) {
   const q = new URLSearchParams();
@@ -34,6 +36,8 @@ export const getProxies = () => fetchJson('/api/v1/fleet/proxies');
 export const getProxy = (pod) => fetchJson(`/api/v1/fleet/proxies/${encodeURIComponent(pod)}`);
 export const getProxyRoutes = (pod, opts) =>
   fetchJson(`/api/v1/fleet/proxies/${encodeURIComponent(pod)}/routes${buildQuery(opts)}`);
+export const getProxyFacets = (pod) =>
+  fetchJson(`/api/v1/fleet/proxies/${encodeURIComponent(pod)}/facets`);
 export const getProxyHealth = (pod) =>
   fetchJson(`/api/v1/fleet/proxies/${encodeURIComponent(pod)}/health`);
 

@@ -16,6 +16,26 @@ controller's named events on a loop (so the live indicator goes green), and
 (so the Logs dialog tails real-looking output). The plugin is dev-only —
 `vite build` never includes it or the fixtures.
 
+### Filter + pagination
+
+Paths that carry the shared list envelope are filtered + windowed in the plugin
+so dev matches the controller (params absent → full dump):
+
+- **Routing lists** (`routing/{gateways,httproutes,ingresses}`) honour
+  `name`/`namespace`/`status`/`limit`/`offset` and return `total`/`returned`/
+  `offset`.
+- **Per-proxy route table** (`fleet/proxies/{name}/routes`) honours
+  `host` (exact), `namespace` (exact, the route's ns), `path` (substring),
+  `status=problem` and `limit`/`offset` — windowing **each block**
+  (ingress/gateway) independently the way the controller's `routes_block` does
+  (filter, window, regroup) with `total`/`returned`/`offset` per block. The same
+  host/namespace/path scope also narrows each block's **conflict** list. The
+  shared-proxy fixtures carry a synthetic slice (~60 gateway hosts) so
+  ProxyDetail's pagination + filter dropdowns are exercised (#286).
+- **Per-proxy filter facets** (`fleet/proxies/{name}/facets`) are *derived* from
+  the proxy's routes fixture (distinct hosts + route namespaces), mirroring the
+  controller — no separate fixture to maintain.
+
 ## Two ways to (re)generate fixtures
 
 - **Synthetic, comprehensive** — `node mock/generate.mjs` writes one coherent

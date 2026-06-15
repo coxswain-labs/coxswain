@@ -29,9 +29,569 @@
       "route_count": 1,
       "load_balancer": "192.168.194.181",
       "status": "ok"
+    },
+    {
+      "name": "shop-ing-00",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.1",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-01",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.2",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-02",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.3",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-03",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.4",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-04",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.5",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-05",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.6",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-06",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.7",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-07",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.8",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-08",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.9",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-09",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.10",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-10",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.11",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-11",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.12",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-12",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.13",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-13",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.14",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-14",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.15",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-15",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.16",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-16",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.17",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-17",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.18",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-18",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.19",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-19",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.20",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-20",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.21",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-21",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.22",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-22",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.23",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-23",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.24",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-24",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.25",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-25",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.26",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-26",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.27",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-27",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.28",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-28",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.29",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-29",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.30",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-30",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.31",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-31",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.32",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-32",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.33",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-33",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.34",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-34",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.35",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-35",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.36",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-36",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.37",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-37",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.38",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-38",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.39",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-39",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.40",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-40",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.41",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-41",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.42",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-42",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.43",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-43",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.44",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-44",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.45",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-45",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.46",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-46",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.47",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-47",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.48",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-48",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.49",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-49",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.50",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-50",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.51",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-51",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.52",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-52",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.53",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-53",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.54",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-54",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.55",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-55",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.56",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-56",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.57",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-57",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.58",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-58",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.59",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-59",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.60",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-60",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.61",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-61",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.62",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-62",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.63",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-63",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.64",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-64",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.65",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-65",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.66",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-66",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.67",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-67",
+      "namespace": "bulk",
+      "route_count": 2,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.68",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-68",
+      "namespace": "bulk",
+      "route_count": 3,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.69",
+      "status": "ok"
+    },
+    {
+      "name": "shop-ing-69",
+      "namespace": "bulk",
+      "route_count": 1,
+      "ingress_class": "coxswain",
+      "load_balancer": "192.0.2.70",
+      "status": "ok"
     }
   ],
-  "total": 4,
-  "returned": 4,
+  "total": 74,
+  "returned": 74,
   "offset": 0
 }

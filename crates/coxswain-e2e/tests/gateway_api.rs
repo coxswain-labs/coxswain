@@ -1225,7 +1225,7 @@ async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
 // Verifies SupportHTTPRouteParentRefPort (#82, #98):
 // A route pinned to a listener port attaches only to that port; a route with no
 // port filter attaches to all listeners; routing-table isolation is verified via
-// the admin /routes endpoint.
+// the admin /api/v1/routes endpoint.
 #[tokio::test]
 async fn parent_ref_port_matching() -> anyhow::Result<()> {
     common::init_tracing();
@@ -1274,12 +1274,15 @@ async fn parent_ref_port_matching() -> anyhow::Result<()> {
         "route-wrong-port must not be routable on HTTP_PORT"
     );
 
-    // Verify routing-table isolation via admin /routes.
+    // Verify routing-table isolation via admin /api/v1/routes.
     // Once pinned.* and both.* are live the table is fully settled.
     //
-    // Since the IngressProxy/GatewayProxy split (#201), `/routes` reports the
-    // two tables under separate keys; this test only inspects Gateway-API routes.
-    let routes: serde_json::Value = reqwest::get(h.admin_url("/routes")).await?.json().await?;
+    // Since the IngressProxy/GatewayProxy split (#201), `/api/v1/routes` reports
+    // the two tables under separate keys; this test only inspects Gateway-API routes.
+    let routes: serde_json::Value = reqwest::get(h.admin_url("/api/v1/routes"))
+        .await?
+        .json()
+        .await?;
     let hosts = routes["gateway"]["hosts"]
         .as_array()
         .expect("gateway.hosts array");
