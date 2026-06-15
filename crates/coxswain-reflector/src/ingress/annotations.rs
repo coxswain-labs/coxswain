@@ -117,6 +117,7 @@ pub fn parse_backend_protocol(s: &str) -> Option<BackendProtocol> {
 ///
 /// Produced by [`IngressAnnotations::parse`] and applied uniformly to every route entry
 /// generated from that Ingress (both rule-path entries and the `spec.defaultBackend`).
+#[derive(Default)]
 pub(super) struct IngressAnnotations {
     /// Partial timeout overrides: the connect/read/send fields come from annotations;
     /// `request` and `backend_request` stay `None` (those come from HTTPRoute/GW API only).
@@ -245,17 +246,6 @@ impl IngressAnnotations {
             retries,
             rewrite,
             backend_protocol,
-        }
-    }
-}
-
-impl Default for IngressAnnotations {
-    fn default() -> Self {
-        Self {
-            timeouts: RouteTimeouts::default(),
-            retries: RetryPolicy::default(),
-            rewrite: None,
-            backend_protocol: None,
         }
     }
 }
