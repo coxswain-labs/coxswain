@@ -88,6 +88,7 @@ Proxy request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet
 - Routing lookup, upstream selection, metric emission, and access-log path allocate nothing beyond the capture set. Render `u16` labels (port, status) via `itoa::Buffer` — never `.to_string()`.
 - TLS connections allocate one SNI hostname `String` per outbound connection (Pingora's `HttpPeer` requires owned). Per connection, not per request; cleartext upstreams skip it.
 - Access-log `SocketAddr::to_string()` allocates exactly once per request, only when `--access-log=on`. Operators silencing the log skip it.
+- Two opt-in request filters each carry exactly one intentional allocation beyond the capture set, both owned-string sinks that can't be elided: the `Forwarded` header value when `--proxy-accept-proxy-protocol` injects the real client addr, and the rewritten `path_and_query` an `HTTPRoute` `URLRewrite` path modifier feeds to `http::Uri::builder`. Both are single-allocation by construction (no intermediate `format!`); routes without these filters allocate nothing here.
 - Use `Shared<T>` (the `ArcSwap`-backed wrapper in `coxswain-core`) for lock-free routing/TLS snapshot reads.
 - Never hold a `Mutex` or `RwLock` guard across `.await`.
 

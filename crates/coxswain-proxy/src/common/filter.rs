@@ -64,9 +64,17 @@ impl TrafficFilter {
 
         if let Some(addr) = ctx.real_client_addr {
             let proto = ctx.real_client_proto.unwrap_or("http");
-            let for_value = format_forwarded_for(&addr);
-            upstream_request
-                .insert_header("Forwarded", format!("for=\"{for_value}\";proto={proto}"))?;
+            // Build the Forwarded value in a single allocation (RFC 7239). IPv6
+            // addresses are bracketed (`[2001:db8::1]:12345`); IPv4 are not.
+            let value = match addr {
+                std::net::SocketAddr::V4(v4) => {
+                    format!("for=\"{}:{}\";proto={proto}", v4.ip(), v4.port())
+                }
+                std::net::SocketAddr::V6(v6) => {
+                    format!("for=\"[{}]:{}\";proto={proto}", v6.ip(), v6.port())
+                }
+            };
+            upstream_request.insert_header("Forwarded", value)?;
         }
 
         Ok(())
@@ -132,28 +140,20 @@ pub(crate) fn apply_header_mod<H: HeaderTarget>(
 }
 
 pub(crate) fn rewrite_path(req: &mut RequestHeader, modifier: &PathModifier, original_path: &str) {
-    let new_path = modifier.apply(original_path);
-    let path_and_query = match req.uri.query() {
-        Some(q) => format!("{new_path}?{q}"),
-        None => new_path,
-    };
+    // `apply` already owns an allocation; when a query is present, extend it in
+    // place rather than allocating a second string via `format!`.
+    let mut path_and_query = modifier.apply(original_path);
+    if let Some(q) = req.uri.query() {
+        path_and_query.reserve(1 + q.len());
+        path_and_query.push('?');
+        path_and_query.push_str(q);
+    }
     match http::Uri::builder()
         .path_and_query(path_and_query.as_str())
         .build()
     {
         Ok(uri) => req.set_uri(uri),
         Err(e) => tracing::warn!(error = %e, "URLRewrite: failed to build new URI"),
-    }
-}
-
-/// Format the `for=` component of a Forwarded header per RFC 7239.
-///
-/// IPv6 addresses are bracketed: `[2001:db8::1]:12345`.
-/// IPv4 addresses are not: `198.51.100.42:12345`.
-fn format_forwarded_for(addr: &std::net::SocketAddr) -> String {
-    match addr {
-        std::net::SocketAddr::V4(v4) => format!("{}:{}", v4.ip(), v4.port()),
-        std::net::SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
     }
 }
 
