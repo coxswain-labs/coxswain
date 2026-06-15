@@ -306,6 +306,17 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
 ///
 /// Returns an error if handover does not complete within 60 s.
 async fn wait_for_leader_ready() -> anyhow::Result<()> {
+    wait_for_leader_ready_in(COXSWAIN_NAMESPACE).await
+}
+
+/// Poll `coxswain-leader-lock` in `namespace` until the sole running
+/// controller pod holds the lease. Used by dedicated releases which install
+/// into a unique per-test namespace.
+///
+/// # Errors
+///
+/// Returns an error if handover does not complete within 60 s.
+pub(crate) async fn wait_for_leader_ready_in(namespace: &str) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let pods_out = Command::new("kubectl")
@@ -313,7 +324,7 @@ async fn wait_for_leader_ready() -> anyhow::Result<()> {
                 "get",
                 "pods",
                 "-n",
-                COXSWAIN_NAMESPACE,
+                namespace,
                 "-l",
                 "app.kubernetes.io/component=controller",
                 "-o",
@@ -333,7 +344,7 @@ async fn wait_for_leader_ready() -> anyhow::Result<()> {
                 "lease",
                 "coxswain-leader-lock",
                 "-n",
-                COXSWAIN_NAMESPACE,
+                namespace,
                 "-o",
                 "jsonpath={.spec.holderIdentity}",
                 "--ignore-not-found",
@@ -355,6 +366,118 @@ async fn wait_for_leader_ready() -> anyhow::Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+}
+
+/// Install a dedicated coxswain Helm release in an isolated namespace with
+/// unique class names. Used by tests that need a controller reconfigured with
+/// helm overrides without touching the shared release.
+///
+/// The dedicated release reuses the existing `proxy.dedicated.rbac.create=false`
+/// (the ClusterRoles exist from the shared install) and has its own leader-lock
+/// namespace to avoid collision with the shared release.
+///
+/// # Errors
+///
+/// Returns an error if `helm upgrade` exits non-zero or the leader fails to
+/// take over within 60 s.
+pub(crate) async fn helm_install_dedicated(
+    root: &Path,
+    release_name: &str,
+    namespace: &str,
+    ingress_class: &str,
+    gateway_class: &str,
+    controller_name: &str,
+    overrides: &HelmOverrides,
+) -> anyhow::Result<()> {
+    let chart = root.join("charts/coxswain");
+    let mut args: Vec<String> = vec![
+        "upgrade".into(),
+        "--install".into(),
+        release_name.into(),
+        chart.to_string_lossy().into_owned(),
+        "--namespace".into(),
+        namespace.into(),
+        "--create-namespace".into(),
+        "--set".into(),
+        "namespace.create=false".into(),
+        "--set".into(),
+        format!("image.repository={}", image_repository()),
+        "--set".into(),
+        format!("image.tag={}", image_tag()),
+        "--set".into(),
+        "image.pullPolicy=Never".into(),
+        "--set".into(),
+        "service.gateway.type=LoadBalancer".into(),
+        "--set".into(),
+        format!("controller.coxswainImage={E2E_IMAGE}"),
+        "--set".into(),
+        format!(
+            "service.gateway.additionalPorts[0].name=gw-http,service.gateway.additionalPorts[0].port={GATEWAY_HTTP_PORT},service.gateway.additionalPorts[0].targetPort={GATEWAY_HTTP_PORT},service.gateway.additionalPorts[0].protocol=TCP"
+        ),
+        "--set".into(),
+        format!(
+            "service.gateway.additionalPorts[1].name=gw-https,service.gateway.additionalPorts[1].port={GATEWAY_HTTPS_PORT},service.gateway.additionalPorts[1].targetPort={GATEWAY_HTTPS_PORT},service.gateway.additionalPorts[1].protocol=TCP"
+        ),
+        "--skip-crds".into(),
+        "--wait".into(),
+        "--timeout".into(),
+        "120s".into(),
+        // Class isolation: unique IngressClass + GatewayClass + controllerName
+        // so the dedicated controller only reconciles its own resources.
+        "--set".into(),
+        format!("ingressClass.name={ingress_class}"),
+        "--set".into(),
+        format!("gatewayClass.name={gateway_class}"),
+        "--set".into(),
+        format!("controllerName={controller_name}"),
+        // ClusterRoles for dedicated-proxy mode already exist from the shared
+        // install; creating duplicates would fail with a conflict.
+        "--set".into(),
+        "proxy.dedicated.rbac.create=false".into(),
+    ];
+
+    if let Some(addr) = &overrides.status_address {
+        args.push("--set".into());
+        args.push(format!("controller.statusAddress={addr}"));
+    }
+    if let Some(db) = &overrides.ingress_default_backend {
+        args.push("--set".into());
+        args.push(format!("proxy.shared.ingressDefaultBackend={db}"));
+    }
+    if overrides.accept_proxy_protocol {
+        args.push("--set".into());
+        args.push("proxy.shared.acceptProxyProtocol=true".into());
+    }
+    if !overrides.trusted_sources.is_empty() {
+        args.push("--set".into());
+        args.push(format!(
+            "proxy.shared.trustedSources={{{}}}",
+            overrides.trusted_sources.join("\\,")
+        ));
+    }
+    if let Some(enabled) = overrides.access_log {
+        args.push("--set".into());
+        args.push(format!("proxy.shared.accessLog={enabled}"));
+    }
+    if let Some(mode) = &overrides.access_log_path_mode {
+        args.push("--set".into());
+        args.push(format!("proxy.shared.accessLogPathMode={mode}"));
+    }
+
+    let status = Command::new("helm")
+        .args(&args)
+        .status()
+        .await
+        .context("helm upgrade (dedicated)")?;
+    anyhow::ensure!(
+        status.success(),
+        "helm upgrade --install (dedicated) failed"
+    );
+
+    wait_for_leader_ready_in(namespace)
+        .await
+        .context("dedicated controller leader handover")?;
+    Ok(())
 }
 
 /// Split `E2E_IMAGE` (`repo:tag`) into the repository part.

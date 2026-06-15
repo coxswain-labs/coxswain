@@ -24,7 +24,7 @@ kind: Ingress
 metadata:
   name: INGRESS_NAME
 spec:
-  ingressClassName: coxswain
+  ingressClassName: INGRESSCLASS
   tls:
     - secretName: SECRET_NAME
   rules:

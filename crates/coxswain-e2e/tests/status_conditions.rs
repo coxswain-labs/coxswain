@@ -12,7 +12,7 @@
 //! (#211): ClusterIP/LoadBalancer address derivation and `InvalidParameters`.
 
 use coxswain_e2e::{
-    ControllerOptions, FixtureVars, Harness, NamespaceGuard,
+    ControllerOptions, DedicatedRelease, FixtureVars, Harness, NamespaceGuard,
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress},
     harness::wait,
 };
@@ -31,19 +31,26 @@ use common::dedicated::{
 #[tokio::test]
 async fn status_load_balancer_ip() -> anyhow::Result<()> {
     common::init_tracing();
-    let h = Harness::start_with_options(ControllerOptions {
+    let ded = DedicatedRelease::install(ControllerOptions {
         status_address: Some("203.0.113.1".to_string()),
         ..Default::default()
     })
     .await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-lb-status").await?;
+    let ns = NamespaceGuard::create(&ded.client, "ing-lb-status").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::PATH_MATCHING,
+        FixtureVars {
+            ingress_class: ded.ingress_class.clone(),
+            ..FixtureVars::new(&ns.name)
+        },
+    )
+    .await?;
 
     wait::wait_for_ingress_lb_ip(
-        &h.client,
+        &ded.client,
         "echo-ingress",
         &ns.name,
         "203.0.113.1",

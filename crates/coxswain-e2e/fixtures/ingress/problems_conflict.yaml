@@ -9,7 +9,7 @@ kind: Ingress
 metadata:
   name: conflict-a
 spec:
-  ingressClassName: coxswain
+  ingressClassName: INGRESSCLASS
   rules:
     - host: conflict.TESTNS.local
       http:
@@ -27,7 +27,7 @@ kind: Ingress
 metadata:
   name: conflict-b
 spec:
-  ingressClassName: coxswain
+  ingressClassName: INGRESSCLASS
   rules:
     - host: conflict.TESTNS.local
       http:

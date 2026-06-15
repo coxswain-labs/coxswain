@@ -14,8 +14,8 @@
 # prevent a grouped test from overlapping non-grouped tests running in the
 # same binary invocation. True exclusivity requires either (a) assigning ALL
 # concurrently-running tests to the group, or (b) giving the mutator its own
-# dedicated controller release (Phase 2, #322). Within a single CI job (one
-# binary per kind cluster) this is moot — only the members themselves compete.
+# dedicated controller release. Within a single CI job (one binary per kind
+# cluster) this is moot — only the members themselves compete.
 serial = { max-threads = 1 }
 
 # dedicated_install: capped at 2 concurrent isolated Helm releases.
@@ -24,7 +24,7 @@ serial = { max-threads = 1 }
 # claims a LoadBalancer IP. A single-node OrbStack/kind cluster saturates at
 # around 2–3 concurrent dedicated installs before pod-scheduling pressure
 # causes flakes. Start at 2; tune up if the 3× race-free verification passes
-# cleanly. Populated by Phase 2 (#322) when helm-mutator tests gain isolation.
+# cleanly.
 dedicated_install = { max-threads = 2 }
 
 # ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ dedicated_install = { max-threads = 2 }
 # ---------------------------------------------------------------------------
 [profile.e2e]
 # 4 concurrent tests against the shared cluster (controller + proxy Deployments).
-# Conservative starting point for a single-node cluster; tunable once Phase 2
+# Conservative starting point for a single-node cluster; tunable once
 # dedicated-install tests confirm the cluster can sustain the load.
 test-threads = 4
 
@@ -40,23 +40,17 @@ test-threads = 4
 fail-fast = false
 
 # ---------------------------------------------------------------------------
-# Overrides: map global-state mutators to the `serial` group (Phase 1)
+# Overrides: global-state mutators
 #
-# These tests call `Harness::start_with_options` / `ControllerProcess::
-# start_with_options`, which performs a `helm upgrade --wait` on the SHARED
-# release. The upgrade affects every listener, every connection cluster-wide:
+# Tests that reconfigure or restart shared cluster infrastructure are
+# serialized with each other via test groups:
 #
-#   - `acceptProxyProtocol=true`  → strict PROXY mode; a concurrent plain
-#     request is dropped at BadPreamble (coxswain-proxy/src/accept.rs).
-#   - `controller.statusAddress`  → rewrites every Ingress LB status.
-#   - `accessLog` / `accessLogPathMode` → changes the log surface every
-#     reader sees.
-#
-# The `serial` group ensures these mutators do not race with each other.
-# They can still overlap non-grouped tests in the same binary — acceptable
-# in Phase 1 because CI runs each binary in its own kind cluster. Phase 2
-# converts them to `dedicated_install` (their own release), making them
-# unconditionally parallel-safe and removing them from `serial`.
+#   serial          — inherently un-isolatable (resilience: restarts/migrates
+#                     the shared controller; can't safely overlap anything).
+#   dedicated_install — helm-mutator tests that got their own isolated release
+#                     in Phase 2 (#322). They no longer touch the shared
+#                     proxy, so they are parallel-safe with each other up to
+#                     the cluster's pod-scheduling headroom (cap=2).
 # ---------------------------------------------------------------------------
 
 # resilience: restarts or migrates the shared controller — inherently serial.
@@ -64,25 +58,12 @@ fail-fast = false
 filter = 'binary(resilience)'
 test-group = 'serial'
 
-# tls: proxy_protocol_* enable acceptProxyProtocol=true (suite-wide PROXY mode).
+# Helm-mutator tests that use a DedicatedRelease — isolated from the shared
+# proxy and from each other's IngressClass, so they can run concurrently up
+# to the dedicated_install cap.
 [[profile.e2e.overrides]]
-filter = 'binary(tls) & (test(=proxy_protocol_http_v1_forwarded) | test(=proxy_protocol_https_v2_forwarded))'
-test-group = 'serial'
-
-# status_conditions: status_load_balancer_ip sets controller.statusAddress.
-[[profile.e2e.overrides]]
-filter = 'binary(status_conditions) & test(=status_load_balancer_ip)'
-test-group = 'serial'
-
-# observability: access_log_* mutate accessLog / accessLogPathMode.
-[[profile.e2e.overrides]]
-filter = 'binary(observability) & (test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing))'
-test-group = 'serial'
-
-# routing: default_backend mutates proxy.shared.ingressDefaultBackend;
-# default_backend_only relies on global catchall hosts (random.example /
-# other.io) that collide if a concurrent test also serves a wildcard route.
-# Phase 2 scopes default_backend_only to per-test namespace hostnames.
-[[profile.e2e.overrides]]
-filter = 'binary(routing) & (test(=default_backend) | test(=default_backend_only))'
-test-group = 'serial'
+filter = '''binary(tls) & (test(=proxy_protocol_http_v1_forwarded) | test(=proxy_protocol_https_v2_forwarded))
+  | binary(status_conditions) & test(=status_load_balancer_ip)
+  | binary(observability) & (test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing))
+  | binary(routing) & (test(=default_backend) | test(=default_backend_only))'''
+test-group = 'dedicated_install'

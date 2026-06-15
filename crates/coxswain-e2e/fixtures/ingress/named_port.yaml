@@ -24,7 +24,7 @@ metadata:
   name: named-port-ingress
   namespace: TESTNS
 spec:
-  ingressClassName: coxswain
+  ingressClassName: INGRESSCLASS
   rules:
     - host: INGRESS_HOST
       http:

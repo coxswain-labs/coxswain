@@ -9,7 +9,7 @@ kind: Ingress
 metadata:
   name: echo-ingress-wildcard
 spec:
-  ingressClassName: coxswain
+  ingressClassName: INGRESSCLASS
   rules:
     - host: "*.wildcard.TESTNS.local"
       http:

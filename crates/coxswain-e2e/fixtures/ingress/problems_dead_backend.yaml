@@ -20,7 +20,7 @@ kind: Ingress
 metadata:
   name: dead-ingress
 spec:
-  ingressClassName: coxswain
+  ingressClassName: INGRESSCLASS
   rules:
     - host: dead.TESTNS.local
       http:

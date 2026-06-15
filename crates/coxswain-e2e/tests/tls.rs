@@ -16,8 +16,7 @@
 //! lives in `routing.rs`.
 
 use coxswain_e2e::{
-    ControllerOptions, ControllerProcess, FixtureVars, GeneratedCert, Harness, NamespaceGuard,
-    bootstrap,
+    ControllerOptions, DedicatedRelease, FixtureVars, GeneratedCert, Harness, NamespaceGuard,
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::{http, wait},
 };
@@ -229,28 +228,31 @@ async fn cert_manager_ingress_provisioning() -> anyhow::Result<()> {
 }
 
 /// Verifies PROXY protocol v1 on the plain-HTTP listener:
-/// - Controller started with --proxy-accept-proxy-protocol and 127.0.0.1/32 trusted.
+/// - Controller started with --proxy-accept-proxy-protocol and 0.0.0.0/0 trusted.
 /// - Raw TCP connection sends "PROXY TCP4 198.51.100.42 ... \r\n" then HTTP/1.1 GET.
 /// - Echo response must include a `forwarded` header with `for="198.51.100.42:12345"`.
 #[tokio::test]
 async fn proxy_protocol_http_v1_forwarded() -> anyhow::Result<()> {
     common::init_tracing();
 
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "pp-http-v1").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
+    let ded = DedicatedRelease::install(ControllerOptions {
         accept_proxy_protocol: true,
         trusted_sources: vec!["0.0.0.0/0".to_string()],
         ..Default::default()
     })
     .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+    let ns = NamespaceGuard::create(&ded.client, "pp-http-v1").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::PATH_MATCHING,
+        FixtureVars {
+            ingress_class: ded.ingress_class.clone(),
+            ..FixtureVars::new(&ns.name)
+        },
+    )
+    .await?;
 
     let host = format!("ingress.{}.local", ns.name);
 
@@ -260,7 +262,7 @@ async fn proxy_protocol_http_v1_forwarded() -> anyhow::Result<()> {
 
     // Retry until the route is live (controller may still be syncing).
     let body = wait_for_proxy_v1_route(
-        controller.proxy_addr,
+        ded.proxy_addr,
         proxy_line,
         &http_req,
         Duration::from_secs(60),
@@ -292,9 +294,13 @@ async fn proxy_protocol_http_v1_forwarded() -> anyhow::Result<()> {
 async fn proxy_protocol_https_v2_forwarded() -> anyhow::Result<()> {
     common::init_tracing();
 
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "pp-https-v2").await?;
+    let ded = DedicatedRelease::install(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&ded.client, "pp-https-v2").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -304,23 +310,18 @@ async fn proxy_protocol_https_v2_forwarded() -> anyhow::Result<()> {
 
     fixtures::apply_fixture(
         ingress::TLS_TERMINATION,
-        FixtureVars::new(&ns.name)
-            .with("INGRESS_NAME", "pp-ingress")
-            .with("SECRET_NAME", "pp-cert")
-            .with("TLS_HOST", &host)
-            .with("BACKEND_NAME", "echo-a")
-            .with("TLS_CRT_B64", cert.cert_b64())
-            .with("TLS_KEY_B64", cert.key_b64()),
+        FixtureVars {
+            ingress_class: ded.ingress_class.clone(),
+            ..FixtureVars::new(&ns.name)
+        }
+        .with("INGRESS_NAME", "pp-ingress")
+        .with("SECRET_NAME", "pp-cert")
+        .with("TLS_HOST", &host)
+        .with("BACKEND_NAME", "echo-a")
+        .with("TLS_CRT_B64", cert.cert_b64())
+        .with("TLS_KEY_B64", cert.key_b64()),
     )
     .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
 
     // Build PROXY v2 binary header: src=192.0.2.7:54321, dst=10.0.0.1:443
     let mut v2_header = Vec::with_capacity(28);
@@ -336,7 +337,7 @@ async fn proxy_protocol_https_v2_forwarded() -> anyhow::Result<()> {
     let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
 
     let body = wait_for_proxy_v2_tls_route(
-        controller.tls_addr,
+        ded.tls_addr,
         &host,
         &v2_header,
         &http_req,
