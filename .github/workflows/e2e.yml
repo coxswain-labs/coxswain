@@ -146,18 +146,24 @@ jobs:
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      # Suites map 1:1 to the by-plane test binaries in crates/coxswain-e2e/tests/
+      # (#321). Each runs in its own kind cluster, so suites stay fully parallel.
+      # `security.rs` is omitted until it carries tests — running an empty binary
+      # would spin a cluster for nothing; add it here when its first test lands.
       matrix:
         include:
-          - suite: ingress
-            test: ingress
-          - suite: gateway-api
-            test: gateway_api
-          - suite: dedicated-proxy
-            test: dedicated_proxy
-          - suite: proxy-hot-reconfig
-            test: proxy_hot_reconfig
-          - suite: rbac-read-only-proxy
-            test: rbac_read_only_proxy
+          - suite: routing
+            test: routing
+          - suite: tls
+            test: tls
+          - suite: traffic-policy
+            test: traffic_policy
+          - suite: status-conditions
+            test: status_conditions
+          - suite: provisioning-rbac
+            test: provisioning_rbac
+          - suite: resilience
+            test: resilience
           - suite: observability
             test: observability
     steps:

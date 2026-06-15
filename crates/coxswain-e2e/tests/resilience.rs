@@ -1,33 +1,29 @@
 #![allow(missing_docs)]
-//! E2E tests for in-flight requests surviving a data-plane reconfig.
+//! Resilience control-plane: behavior under reconfiguration and restart.
 //!
-//! Covers two distinct reconfig events that the shared proxy must handle
-//! without dropping traffic on existing listeners:
+//! Plane: **control-plane**. Execution: **serial** — these tests reconfigure or
+//! restart shared infrastructure (mid-flight listener changes under sustained
+//! load, controller pod restart, dedicated⇄shared mode migration) and must not
+//! overlap tests that depend on the default config. P0b (#322) wires the nextest
+//! serial group that enforces this; this file is its membership.
 //!
-//! - **Listener add/remove** (#231): patching a Gateway to add or remove a
-//!   second listener must not affect the surviving listener's in-flight
-//!   requests.
-//! - **Dedicated-mode cut-over (`crash-loop`)** (#210): a Gateway promoted
-//!   into dedicated mode whose dedicated proxy can never become Ready must
-//!   continue to be served by the shared pool indefinitely. The "successful
-//!   cut-over" e2e (where the dedicated proxy does become Ready and the
-//!   shared pool drops the Gateway) requires loading the locally-built
-//!   coxswain image into the kind cluster; see the deferred follow-up for
-//!   that scenario.
-//!
-//! Each scenario:
-//! 1. Starts the `dev` role (controller + proxy in one process).
-//! 2. Applies a Gateway + HTTPRoute; waits for traffic to flow.
-//! 3. Launches N concurrent reqwest clients each sending a stream of
-//!    requests against the "survivor" address.
-//! 4. Optionally fires a mid-flight reconfig patch.
-//! 5. Asserts: **every** response was 2xx; zero connection errors.
+//! Classification rule: a test belongs to the plane of its *primary assertion
+//! target*. These assert continuity/idempotency across a disruptive event.
+//! Covers in-flight listener add/remove (#231), dedicated crash-loop fallback
+//! (#210), controller-restart SSA idempotency, and mode migration in both
+//! directions (#212). Shared dedicated helpers live in `common::dedicated`.
 //!
 //! The load harness is purely in-process Rust (`reqwest`), count-or-deadline
 //! based, so CI timing variance cannot cause flakes.
 
 use anyhow::Context as _;
+use coxswain_e2e::{
+    FixtureVars, Harness, HttpClient, NamespaceGuard,
+    fixtures::{backends, dedicated_proxy as dedicated, gateway_api as gwa},
+    harness::wait,
+};
 use gateway_api::apis::standard::gateways::Gateway;
+use k8s_openapi::api::apps::v1::Deployment;
 use kube::api::{Api, Patch, PatchParams};
 use reqwest::Method;
 use serde_json::json;
@@ -39,21 +35,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time;
 
-use coxswain_e2e::{
-    FixtureVars, Harness, NamespaceGuard,
-    fixtures::{backends, gateway_api as gwa},
-    harness::wait,
-};
-
 mod common;
+use common::dedicated::{
+    GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, restart_controller, wait_for_cut_over,
+};
 
 // ── Concurrency parameters ────────────────────────────────────────────────────
 
 /// Number of concurrent client tasks.
 const CLIENTS: usize = 10;
+
 /// Requests per client (total = CLIENTS × REQUESTS_PER_CLIENT = 2000) for
 /// fixed-count scenarios.
 const REQUESTS_PER_CLIENT: usize = 200;
+
 /// After this many requests have succeeded (globally), apply the mid-flight patch.
 const PATCH_AFTER_REQUESTS: u64 = 500;
 
@@ -467,6 +462,232 @@ async fn dedicated_crash_loop_keeps_serving_via_shared() -> anyhow::Result<()> {
         result.total,
         max_errors
     );
+
+    Ok(())
+}
+
+/// 3. Restart the controller after the resources are provisioned → assert
+///    the SSA path is idempotent: `resourceVersion` stays stable across the
+///    restart because the operator's same-content SSA produces no server-side
+///    write.
+#[tokio::test]
+async fn restart_controller_does_not_bump_resource_version() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    // Persistent namespace: the bootstrap purge runs on every
+    // `Harness::start()`, including the second one below. A regular
+    // `NamespaceGuard::create` would label this namespace `coxswain-e2e=true`
+    // and the second bootstrap would delete it before we could verify the
+    // SSA idempotency — defeating the test. The persistent variant skips
+    // the label; the `Drop` still cleans up at end-of-test.
+    let ns = NamespaceGuard::create_persistent(&h.client, "dedgw-idempotent").await?;
+
+    let (_deployments, _services, _sas, deploy, _svc, _sa) = apply_and_wait(&h, &ns).await?;
+
+    // Use `metadata.generation`, not `metadata.resourceVersion`, for the
+    // idempotency check. `resourceVersion` bumps on every write — including
+    // status updates emitted by the K8s Deployment controller while the
+    // proxy pod scales / becomes Ready — so it drifts naturally in the 15 s
+    // observation window and is not a clean signal of "the operator wrote a
+    // new spec". `generation` only bumps on spec changes, which is exactly
+    // the property SSA idempotency is supposed to preserve.
+    //
+    // We check Deployment only: it's the load-bearing resource (rollouts
+    // are triggered by spec changes here), it reliably carries
+    // `.metadata.generation`, and the proxy pod's lifecycle is what would
+    // be most visibly disrupted by a spurious SSA write. Service and
+    // ServiceAccount don't consistently populate `.generation` (Service's
+    // generation isn't set in all K8s versions; ServiceAccount has no
+    // spec), so checking them via `.generation` would itself be flaky.
+    let gen_deploy_before = deploy.metadata.generation.expect("Deployment generation");
+
+    // Restart: drop the harness (kills controller) and re-spawn. Bootstrap is
+    // idempotent so the second start only re-spawns the binary, and the
+    // 3-second lease TTL means the new pod-name re-claims leadership quickly.
+    drop(h);
+    let h2 = Harness::start().await?;
+
+    // Give the new leader's operator a few reconcile cycles to send the
+    // idempotent SSAs. SSA on identical content does not bump `.generation`;
+    // if it does, the operator emitted a spec write that should have been a
+    // no-op.
+    time::sleep(Duration::from_secs(15)).await;
+
+    let deploy_after: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
+    let d2 = deploy_after.get(RESOURCE_NAME).await?;
+
+    assert_eq!(
+        d2.metadata.generation,
+        Some(gen_deploy_before),
+        "Deployment .metadata.generation changed across restart (SSA wrote a new spec)"
+    );
+
+    Ok(())
+}
+
+/// 17 — Mode migration shared → dedicated. Final-state assertion: pre-migration
+/// the shared subprocess serves the Gateway; after patching in `parametersRef`
+/// and waiting for cutover, the shared subprocess returns 404 and the dedicated
+/// subprocess returns the backend response.
+#[tokio::test]
+async fn lifecycle_mode_migration_shared_to_dedicated() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-m-s2d").await?;
+
+    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(dedicated::MODE_MIGRATION_SHARED, FixtureVars::new(&ns.name))
+        .await?;
+
+    let host = format!("migrate.{}.local", ns.name);
+
+    // Baseline: shared subprocess serves the Gateway in shared mode.
+    let pre = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
+    pre.assert_backend("echo-a");
+
+    // Patch in the parametersRef → controller provisions a dedicated pod and
+    // flips DedicatedProxyReady=True once it's Ready.
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let patch = serde_json::json!({
+        "spec": {
+            "infrastructure": {
+                "parametersRef": {
+                    "group": "gateway.coxswain-labs.dev",
+                    "kind": "CoxswainGatewayParameters",
+                    "name": "dedicated-params",
+                },
+            },
+        },
+    });
+    gateways
+        .patch(GATEWAY_NAME, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    let dedicated_addr =
+        wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http = HttpClient::new(dedicated_addr)?;
+
+    let post = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    post.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// 18 — Mode migration dedicated → shared. Final-state assertion: pre-migration
+/// the dedicated pod serves; after patching `parametersRef` out the controller GC
+/// deletes the dedicated Deployment/Service, and the shared proxy re-adopts the
+/// Gateway and serves backend traffic again.
+#[tokio::test]
+async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ded-life-m-d2s").await?;
+
+    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(
+        dedicated::MODE_MIGRATION_DEDICATED,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    let dedicated_addr =
+        wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http = HttpClient::new(dedicated_addr)?;
+
+    let host = format!("migrate.{}.local", ns.name);
+    let pre = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    pre.assert_backend("echo-a");
+
+    // Patch out the parametersRef. Merge-patch null deletes the field.
+    // The controller GC will delete the dedicated Deployment/Service; the
+    // shared proxy re-adopts the Gateway once the controller clears the status.
+    let patch = serde_json::json!({
+        "spec": {
+            "infrastructure": {
+                "parametersRef": null,
+            },
+        },
+    });
+    gateways
+        .patch(GATEWAY_NAME, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+
+    // Shared subprocess re-adopts the Gateway once the controller clears the
+    // status. The ~1s race window between status-clear and shared re-bind
+    // (where neither subprocess serves) is absorbed by this poll.
+    let post = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(30)).await?;
+    post.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// 19 — Controller restart idempotency: the dedicated pod keeps serving
+/// across a controller pod restart (no traffic disruption), and the controller's
+/// SSA on identical content does not bump the Deployment's `.metadata.generation`.
+#[tokio::test]
+async fn lifecycle_controller_restart_is_idempotent() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    // Persistent namespace so the bootstrap purge on the second `Harness::start()`
+    // doesn't delete it.
+    let ns = NamespaceGuard::create_persistent(&h.client, "ded-life-restart").await?;
+
+    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(dedicated::TRAFFIC, FixtureVars::new(&ns.name))
+        .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    // Wait for the dedicated proxy's LB IP and verify baseline traffic.
+    // The dedicated pod keeps serving through the controller restart below.
+    let dedicated_addr =
+        wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http = HttpClient::new(dedicated_addr)?;
+
+    let host = format!("dedicated.{}.local", ns.name);
+    let pre = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    pre.assert_backend("echo-a");
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let deploy_before = deployments.get(RESOURCE_NAME).await?;
+    let gen_before = deploy_before
+        .metadata
+        .generation
+        .expect("Deployment generation");
+
+    // Restart the in-cluster controller pod to simulate a process restart.
+    // The dedicated proxy pod is independent — it keeps serving through the
+    // controller restart, so the `http` client above remains valid.
+    restart_controller().await?;
+    let h2 = Harness::start().await?;
+
+    // Let the new leader's operator emit its first few idempotent SSAs.
+    time::sleep(Duration::from_secs(15)).await;
+
+    let deployments_after: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
+    let deploy_after = deployments_after.get(RESOURCE_NAME).await?;
+    assert_eq!(
+        deploy_after.metadata.generation,
+        Some(gen_before),
+        "Deployment .metadata.generation should not bump across controller restart (SSA must be idempotent on identical content)"
+    );
+
+    // Traffic continuity — the dedicated subprocess kept serving the whole
+    // time, so the same backend assertion still holds.
+    let post = http.get(&host, "/").await?;
+    post.assert_backend("echo-a");
 
     Ok(())
 }

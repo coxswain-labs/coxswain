@@ -9,7 +9,7 @@
 # Load-bearing invariants:
 #   - Zero write verbs. A compromised dedicated proxy must not be able to
 #     write to Kubernetes. The e2e test in
-#     `crates/coxswain-e2e/tests/rbac_read_only_proxy.rs` enforces this.
+#     `crates/coxswain-e2e/tests/provisioning_rbac.rs` enforces this.
 #   - No rules on cluster-scoped resources. Rules on `gatewayclasses` would be
 #     silently ineffective when bound via a `RoleBinding`, so listing them
 #     would be a lie. The dedicated proxy drops the `GatewayClass` watch

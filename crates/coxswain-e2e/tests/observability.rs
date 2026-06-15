@@ -19,7 +19,7 @@
 
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, Harness, NamespaceGuard,
-    fixtures::{self, backends, ingress},
+    fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::wait,
 };
 use std::time::Duration;
@@ -531,5 +531,181 @@ async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
         .await?
         .status();
     assert_eq!(unknown, 404, "unknown pod name must 404");
+    Ok(())
+}
+
+/// `/api/v1/routing/gateways` list endpoint: after applying a Gateway +
+/// HTTPRoute, the controller's response must include the Gateway with
+/// `proxy.pool == "shared"`, a positive `route_count`, a `status`, and at least
+/// one condition, all within one reconcile cycle (#301; replaces the retired
+/// `/api/v1/cluster` aggregate). Also asserts `/api/v1/health` now carries the
+/// apiserver GitVersion (`kubernetes_version`, relocated from `/cluster`, #287),
+/// and `/api/v1/routing/httproutes` lists the applied route as first-class
+/// (#293), and `/api/v1/problems` is the nested cross-cutting aggregate (#301).
+#[tokio::test]
+async fn routing_endpoints() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-routing-endpoints").await?;
+
+    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(gwa::PATH_MATCHING, FixtureVars::new(&ns.name))
+        .await?;
+
+    // First wait for the route to be live so we know the reconciler has built
+    // the routing table at least once after our Gateway was applied.
+    let host = format!("echo.{}.local", ns.name);
+    wait::wait_for_route(&h.gateway_http, &host, "/a", Duration::from_secs(60)).await?;
+
+    let gateways_url = h.controller_admin_url("/api/v1/routing/gateways");
+    let client = reqwest::Client::new();
+
+    // Poll /api/v1/routing/gateways until the Gateway we just applied is visible.
+    // The reconciler rebuilds with a 500 ms trailing-edge debounce so allow a
+    // generous window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let listing = loop {
+        let resp = client.get(&gateways_url).send().await?;
+        assert_eq!(
+            resp.status(),
+            200,
+            "/api/v1/routing/gateways should be 200 on the controller"
+        );
+        let json: serde_json::Value = resp.json().await?;
+        let gateways = json["gateways"].as_array().cloned().unwrap_or_default();
+        let visible = gateways
+            .iter()
+            .any(|g| g["namespace"] == ns.name && g["name"] == "coxswain-test");
+        if visible {
+            break json;
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "Gateway coxswain-test/{} did not appear in /routing/gateways within timeout: {}",
+                ns.name,
+                json
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    // Envelope fields are present on the list response.
+    assert!(
+        listing["total"].is_u64(),
+        "list envelope must carry `total`"
+    );
+    assert!(
+        listing["returned"].is_u64(),
+        "list envelope must carry `returned`"
+    );
+
+    let gw = listing["gateways"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["namespace"] == ns.name && g["name"] == "coxswain-test")
+        .expect("Gateway entry");
+    assert_eq!(
+        gw["proxy"]["pool"], "shared",
+        "Gateway without parametersRef must be classified as shared"
+    );
+    assert!(
+        gw["status"].is_string(),
+        "gateway entry must carry a traffic-served `status` (#301), got {gw}"
+    );
+    let route_count = gw["route_count"].as_u64().unwrap_or(0);
+    assert!(
+        route_count >= 1,
+        "expected at least one attached route, got {route_count} (gw={gw})"
+    );
+    let cond_types: Vec<&str> = gw["conditions"]
+        .as_array()
+        .expect("conditions array")
+        .iter()
+        .filter_map(|c| c["type"].as_str())
+        .collect();
+    assert!(
+        cond_types.contains(&"Programmed") || cond_types.contains(&"Accepted"),
+        "expected Programmed or Accepted condition, got {cond_types:?}"
+    );
+
+    // /api/v1/health carries the apiserver GitVersion (relocated from /cluster, #287).
+    let health: serde_json::Value = client
+        .get(h.controller_admin_url("/api/v1/health"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let k8s_version = health["kubernetes_version"]
+        .as_str()
+        .expect("/api/v1/health must include kubernetes_version against a live controller");
+    // GitVersion looks like `v1.31.2`: a `v`, then a major.minor numeric prefix.
+    let looks_like_version = k8s_version
+        .strip_prefix('v')
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(major, rest)| {
+            !major.is_empty()
+                && major.bytes().all(|b| b.is_ascii_digit())
+                && rest.bytes().next().is_some_and(|b| b.is_ascii_digit())
+        });
+    assert!(
+        looks_like_version,
+        "kubernetes_version must look like a server GitVersion (got {k8s_version:?})"
+    );
+
+    // /api/v1/routing/httproutes lists the applied HTTPRoute as a first-class
+    // resource (#293), carrying parent_gateways + status + envelope fields.
+    let httproutes: serde_json::Value = client
+        .get(h.controller_admin_url("/api/v1/routing/httproutes"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(
+        httproutes["total"].is_u64(),
+        "httproutes list must carry the `total` envelope field"
+    );
+    let route = httproutes["httproutes"]
+        .as_array()
+        .expect("httproutes array")
+        .iter()
+        .find(|r| r["namespace"] == ns.name)
+        .unwrap_or_else(|| panic!("no HTTPRoute listed in {}: {httproutes}", ns.name));
+    assert!(
+        route["status"].is_string(),
+        "httproute entry must carry a `status` (#301)"
+    );
+    assert!(
+        route["parent_gateways"]
+            .as_array()
+            .is_some_and(|p| !p.is_empty()),
+        "httproute must list its parent Gateway(s), got {route}"
+    );
+
+    // /api/v1/problems is the nested cross-cutting aggregate (#301).
+    let problems: serde_json::Value = client
+        .get(h.controller_admin_url("/api/v1/problems"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(
+        problems["fleet"]["leaderless"].is_boolean(),
+        "problems.fleet.leaderless must be present"
+    );
+    for key in ["unreachable", "degraded"] {
+        assert!(
+            problems["fleet"][key].is_array(),
+            "problems.fleet.{key} must be an array"
+        );
+    }
+    for key in ["conflicts", "dead_routes"] {
+        assert!(
+            problems["routing"][key].is_array(),
+            "problems.routing.{key} must be an array"
+        );
+    }
+
     Ok(())
 }

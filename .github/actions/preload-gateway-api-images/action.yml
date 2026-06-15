@@ -12,7 +12,7 @@ inputs:
   include-busybox:
     description: >
       Set to 'true' to also pull and load busybox:1.37. Required by the
-      e2e-ingress and e2e-gateway-api suites; not needed for conformance.
+      routing/tls data-plane suites; not needed for conformance.
     required: false
     default: 'false'
 

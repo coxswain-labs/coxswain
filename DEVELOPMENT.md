@@ -225,10 +225,15 @@ All Rust e2e suites require a live cluster. The harness builds a Docker image, i
 
 ```bash
 cargo build --release --bin coxswain   # compile once; re-run only when source changes
-cargo test -p coxswain-e2e --test ingress           -- --test-threads=1
-cargo test -p coxswain-e2e --test gateway_api       -- --test-threads=1
-cargo test -p coxswain-e2e --test dedicated_proxy   -- --test-threads=1
-cargo test -p coxswain-e2e --test proxy_hot_reconfig -- --test-threads=1
+# Suites are by behavior plane (see each tests/*.rs header). data-plane:
+cargo test -p coxswain-e2e --test routing           -- --test-threads=1
+cargo test -p coxswain-e2e --test tls               -- --test-threads=1
+cargo test -p coxswain-e2e --test traffic_policy    -- --test-threads=1
+# control-plane:
+cargo test -p coxswain-e2e --test status_conditions -- --test-threads=1
+cargo test -p coxswain-e2e --test provisioning_rbac -- --test-threads=1
+cargo test -p coxswain-e2e --test resilience        -- --test-threads=1
+# cross-cutting:
 cargo test -p coxswain-e2e --test observability     -- --test-threads=1
 ```
 
