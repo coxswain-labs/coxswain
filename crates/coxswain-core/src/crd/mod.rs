@@ -6,7 +6,9 @@
 //! these types by `examples/crdgen.rs` and pinned by snapshot tests.
 
 pub mod gateway_parameters;
+pub mod ingress_parameters;
 
 pub use gateway_parameters::{
     CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType,
 };
+pub use ingress_parameters::{CoxswainIngressClassParameters, CoxswainIngressClassParametersSpec};

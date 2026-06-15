@@ -1,0 +1,55 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: coxswainingressclassparameters.ingress.coxswain-labs.dev
+spec:
+  group: ingress.coxswain-labs.dev
+  names:
+    categories: []
+    kind: CoxswainIngressClassParameters
+    plural: coxswainingressclassparameters
+    shortNames: []
+    singular: coxswainingressclassparameters
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for CoxswainIngressClassParametersSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Per-class annotation defaults for the Ingress data plane.
+
+              Referenced from `IngressClass.spec.parameters` with
+              `apiGroup: ingress.coxswain-labs.dev` and `scope: Namespace`.
+              Presence of such a reference enables class-level defaults; the fields
+              below supply the default values for every Ingress claiming that class.
+            properties:
+              defaultAnnotations:
+                additionalProperties:
+                  type: string
+                description: |-
+                  Default `ingress.coxswain-labs.dev/*` annotation values applied to
+                  every Ingress claiming this class.
+
+                  Keys must be valid `ingress.coxswain-labs.dev/*` annotation names.
+                  Values follow the same format and validation rules as the corresponding
+                  per-Ingress annotations — invalid values emit a `WARN` at reconcile
+                  time and fall back to the built-in default, exactly as they would if
+                  set directly on an Ingress.
+
+                  Per-Ingress annotations override on a per-key basis: a key present in
+                  the Ingress's own annotation map wins over the class default for that
+                  key; unmentioned keys still inherit the class default.
+                nullable: true
+                type: object
+            type: object
+        required:
+        - spec
+        title: CoxswainIngressClassParameters
+        type: object
+    served: true
+    storage: true
+    subresources: {}

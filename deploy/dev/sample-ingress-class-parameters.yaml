@@ -1,0 +1,73 @@
+# Sample CoxswainIngressClassParameters resources.
+#
+# Demonstrates two IngressClass objects owned by the same coxswain controller,
+# each referencing a distinct CoxswainIngressClassParameters CR that supplies
+# different default annotation values.
+#
+# The CRD is inert at this stage: the controller does not yet read these
+# values — applying these objects only proves the CRD installs and the schema
+# accepts a populated spec.
+#
+# Apply:
+#   kubectl apply -f deploy/manifests/crds/coxswainingressclassparameters.yaml
+#   kubectl apply -f deploy/dev/sample-ingress-class-parameters.yaml
+#
+# Inspect:
+#   kubectl get coxswainingressclassparameters -A
+#   kubectl describe coxswainingressclassparameters/public-defaults -n coxswain-system
+#   kubectl describe coxswainingressclassparameters/internal-defaults -n coxswain-system
+#
+# IngressClass wiring (for reference; not applied by this file):
+#
+#   apiVersion: networking.k8s.io/v1
+#   kind: IngressClass
+#   metadata:
+#     name: coxswain
+#   spec:
+#     controller: coxswain-labs.dev/gateway-controller
+#     parameters:
+#       apiGroup: ingress.coxswain-labs.dev
+#       kind: CoxswainIngressClassParameters
+#       name: public-defaults
+#       namespace: coxswain-system
+#       scope: Namespace
+#   ---
+#   apiVersion: networking.k8s.io/v1
+#   kind: IngressClass
+#   metadata:
+#     name: coxswain-internal
+#   spec:
+#     controller: coxswain-labs.dev/gateway-controller   # same controller — both owned
+#     parameters:
+#       apiGroup: ingress.coxswain-labs.dev
+#       kind: CoxswainIngressClassParameters
+#       name: internal-defaults
+#       namespace: coxswain-system
+#       scope: Namespace
+---
+# Public edge class — generous timeouts, retries enabled.
+apiVersion: ingress.coxswain-labs.dev/v1alpha1
+kind: CoxswainIngressClassParameters
+metadata:
+  name: public-defaults
+  namespace: coxswain-system
+spec:
+  defaultAnnotations:
+    ingress.coxswain-labs.dev/connect-timeout: "10s"
+    ingress.coxswain-labs.dev/read-timeout: "60s"
+    ingress.coxswain-labs.dev/send-timeout: "60s"
+    ingress.coxswain-labs.dev/max-retries: "2"
+    ingress.coxswain-labs.dev/retry-on: "connect-failure,5xx"
+---
+# Internal services class — tight timeouts, no retries.
+apiVersion: ingress.coxswain-labs.dev/v1alpha1
+kind: CoxswainIngressClassParameters
+metadata:
+  name: internal-defaults
+  namespace: coxswain-system
+spec:
+  defaultAnnotations:
+    ingress.coxswain-labs.dev/connect-timeout: "1s"
+    ingress.coxswain-labs.dev/read-timeout: "10s"
+    ingress.coxswain-labs.dev/send-timeout: "10s"
+    ingress.coxswain-labs.dev/backend-protocol: "HTTP"
