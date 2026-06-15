@@ -1,21 +1,37 @@
-//! Prints the `CoxswainGatewayParameters` CRD YAML to stdout.
+//! Prints a Coxswain CRD YAML to stdout.
 //!
-//! Run after touching `crates/coxswain-core/src/crd/gateway_parameters.rs` to
-//! regenerate the committed CRD manifests:
+//! Pass the CRD kind as the first argument. With no argument, defaults to
+//! `GatewayParameters` for backward compatibility.
+//!
+//! ## Regenerate manifests after touching a CRD type
 //!
 //! ```bash
+//! # CoxswainGatewayParameters
 //! cargo run -p coxswain-core --example crdgen \
 //!     > deploy/manifests/crds/coxswaingatewayparameters.yaml
 //! cp deploy/manifests/crds/coxswaingatewayparameters.yaml \
 //!     charts/coxswain/crds/coxswaingatewayparameters.yaml
+//!
+//! # CoxswainIngressClassParameters
+//! cargo run -p coxswain-core --example crdgen -- IngressClassParameters \
+//!     > deploy/manifests/crds/coxswainingressclassparameters.yaml
+//! cp deploy/manifests/crds/coxswainingressclassparameters.yaml \
+//!     charts/coxswain/crds/coxswainingressclassparameters.yaml
 //! ```
 //!
-//! The snapshot test in `coxswain-core` fails on drift between this generator
+//! The snapshot tests in `coxswain-core` fail on drift between this generator
 //! and the committed YAML.
 
-use coxswain_core::crd::CoxswainGatewayParameters;
+use coxswain_core::crd::{CoxswainGatewayParameters, CoxswainIngressClassParameters};
 use kube::CustomResourceExt;
 
 fn main() -> Result<(), serde_yaml::Error> {
-    serde_yaml::to_writer(std::io::stdout(), &CoxswainGatewayParameters::crd())
+    let kind = std::env::args().nth(1).unwrap_or_default();
+    match kind.as_str() {
+        "IngressClassParameters" => {
+            serde_yaml::to_writer(std::io::stdout(), &CoxswainIngressClassParameters::crd())
+        }
+        // No arg or "GatewayParameters" → gateway (backward-compatible default).
+        _ => serde_yaml::to_writer(std::io::stdout(), &CoxswainGatewayParameters::crd()),
+    }
 }
