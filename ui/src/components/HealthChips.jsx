@@ -93,7 +93,9 @@ function SubsystemRow({ label, snap }) {
         <span class="health-sub-name">{label}</span>
         <span class="health-sub-count">{ready}/{total}</span>
         {total > 0 && (
-          <span class={`health-sub-caret${open ? ' open' : ''}`} aria-hidden="true">▾</span>
+          <span class={`health-sub-caret${open ? ' open' : ''}`} aria-hidden="true">
+            <Icon name="chevron-down" size={14} />
+          </span>
         )}
       </button>
       {open && total > 0 && (

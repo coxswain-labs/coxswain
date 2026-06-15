@@ -5,16 +5,18 @@ import { fetchJson } from './client.js';
 /**
  * Build a `?…` query string from the shared list-endpoint params, omitting
  * empties so a no-arg call yields the param-less URL (the backend then returns
- * the full dump). `q` is the per-proxy route table's free-text search (host OR
- * path). `status: 'problem'` filters to non-ok rows.
+ * the full dump). For the per-proxy route table: `host` (exact) and `namespace`
+ * (exact) are the dropdown picks, `path` is the search substring.
+ * `status: 'problem'` filters to non-ok rows.
  *
- * @param {{name?: string, namespace?: string, q?: string, limit?: number, offset?: number, status?: string}} [opts]
+ * @param {{name?: string, namespace?: string, host?: string, path?: string, limit?: number, offset?: number, status?: string}} [opts]
  */
 export function buildQuery(opts = {}) {
   const q = new URLSearchParams();
   if (opts.name) q.set('name', opts.name);
   if (opts.namespace) q.set('namespace', opts.namespace);
-  if (opts.q) q.set('q', opts.q);
+  if (opts.host) q.set('host', opts.host);
+  if (opts.path) q.set('path', opts.path);
   if (opts.limit != null) q.set('limit', String(opts.limit));
   if (opts.offset) q.set('offset', String(opts.offset));
   if (opts.status) q.set('status', opts.status);
@@ -34,6 +36,8 @@ export const getProxies = () => fetchJson('/api/v1/fleet/proxies');
 export const getProxy = (pod) => fetchJson(`/api/v1/fleet/proxies/${encodeURIComponent(pod)}`);
 export const getProxyRoutes = (pod, opts) =>
   fetchJson(`/api/v1/fleet/proxies/${encodeURIComponent(pod)}/routes${buildQuery(opts)}`);
+export const getProxyFacets = (pod) =>
+  fetchJson(`/api/v1/fleet/proxies/${encodeURIComponent(pod)}/facets`);
 export const getProxyHealth = (pod) =>
   fetchJson(`/api/v1/fleet/proxies/${encodeURIComponent(pod)}/health`);
 

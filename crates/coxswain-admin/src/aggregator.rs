@@ -344,6 +344,27 @@ impl OperatorAggregator {
         }
     }
 
+    /// `GET /api/v1/fleet/proxies/{pod-name}/facets` — relay the proxy's distinct
+    /// hosts + route namespaces (the route table's filter-dropdown options). On an
+    /// unreachable pod the lists come back empty, so the UI's combos just offer
+    /// "All …".
+    pub(crate) async fn get_proxy_facets(&self, pod_name: &str) -> Response<Vec<u8>> {
+        let snapshot = self.fleet.load();
+        let entry = snapshot
+            .shared_proxies
+            .iter()
+            .chain(&snapshot.dedicated_proxies)
+            .find(|e| e.pod_name == pod_name);
+        let Some(entry) = entry else {
+            return not_found();
+        };
+        let url = format!("{}/api/v1/facets", pod_base_url(entry));
+        match self.fetch_json(&url).await {
+            Some(facets) => json_response(facets.to_string()),
+            None => json_response(serde_json::json!({ "hosts": [], "namespaces": [] }).to_string()),
+        }
+    }
+
     /// `GET /api/v1/proxies/{pod-name}/health` — fan-out to the pod's
     /// `/api/v1/health`.
     pub(crate) async fn get_proxy_health(&self, pod_name: &str) -> Response<Vec<u8>> {

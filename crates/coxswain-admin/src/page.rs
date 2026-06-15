@@ -35,11 +35,15 @@ pub(crate) struct ListParams {
     /// the operator UI's namespace dropdown maps here. Exact, not substring, so a
     /// page stays scoped to one namespace; lowercased at parse time.
     pub namespace: Option<String>,
-    /// Case-insensitive free-text filter for the per-proxy route table: a row is
-    /// kept when its host **or** its path contains this substring (the operator
-    /// UI's single route search box maps here). A no-op on the routing resource
-    /// lists. Lowercased at parse time.
-    pub q: Option<String>,
+    /// Exact (case-insensitive) host filter for the per-proxy route table — the
+    /// operator UI's host dropdown (a pick from the proxy's known hosts) maps here.
+    /// Exact, not substring, so a selection scopes to that one host; a no-op on
+    /// the routing resource lists. Lowercased at parse time.
+    pub host: Option<String>,
+    /// Case-insensitive substring filter against the per-proxy route table's path —
+    /// the operator UI's path search box maps here (the within-host refinement). A
+    /// no-op on the routing resource lists. Lowercased at parse time.
+    pub path: Option<String>,
     /// Page size; `None` selects [`DEFAULT_LIMIT`]. Clamped to [`MAX_LIMIT`].
     pub limit: Option<usize>,
     /// Page offset over the post-filter result set.
@@ -52,7 +56,7 @@ impl ListParams {
     /// Parse from a raw query string (`uri.query()`), tolerating junk: an
     /// unparseable `limit`/`offset` falls back to its default rather than
     /// erroring (the operator UI is the only caller; a 400 here is a worse UX
-    /// than a sane default). An empty `q` is treated as absent.
+    /// than a sane default). Empty `host`/`path` are treated as absent.
     pub(crate) fn parse(query: Option<&str>) -> Self {
         let mut p = ListParams::default();
         let Some(q) = query else { return p };
@@ -62,7 +66,8 @@ impl ListParams {
                 "namespace" if !v.is_empty() => {
                     p.namespace = Some(v.into_owned().to_ascii_lowercase());
                 }
-                "q" if !v.is_empty() => p.q = Some(v.into_owned().to_ascii_lowercase()),
+                "host" if !v.is_empty() => p.host = Some(v.into_owned().to_ascii_lowercase()),
+                "path" if !v.is_empty() => p.path = Some(v.into_owned().to_ascii_lowercase()),
                 "limit" => p.limit = v.parse::<usize>().ok(),
                 "offset" => p.offset = v.parse::<usize>().unwrap_or(0),
                 "status" => p.problems_only = matches!(v.as_ref(), "problem" | "problems"),
@@ -82,7 +87,8 @@ impl ListParams {
     pub(crate) fn is_empty(&self) -> bool {
         self.name.is_none()
             && self.namespace.is_none()
-            && self.q.is_none()
+            && self.host.is_none()
+            && self.path.is_none()
             && self.limit.is_none()
             && self.offset == 0
             && !self.problems_only
@@ -107,17 +113,21 @@ impl ListParams {
         }
     }
 
-    /// `true` when the `q` filter is absent, or is a case-insensitive substring of
-    /// **either** `host` or `path` — the per-proxy route table's single search box
-    /// matches a row by host or by path (OR, not AND), so one box narrows on
-    /// whichever the operator typed.
-    pub(crate) fn q_matches(&self, host: &str, path: &str) -> bool {
-        match &self.q {
+    /// `true` when the `host` filter is absent or an exact (case-insensitive) match
+    /// of `haystack` — a host-dropdown selection scopes the table to that host.
+    pub(crate) fn host_matches(&self, haystack: &str) -> bool {
+        match &self.host {
             None => true,
-            Some(needle) => {
-                host.to_ascii_lowercase().contains(needle)
-                    || path.to_ascii_lowercase().contains(needle)
-            }
+            Some(needle) => haystack.eq_ignore_ascii_case(needle),
+        }
+    }
+
+    /// `true` when the `path` filter is absent or a case-insensitive substring of
+    /// `haystack` — the path search narrows progressively as the operator types.
+    pub(crate) fn path_matches(&self, haystack: &str) -> bool {
+        match &self.path {
+            None => true,
+            Some(needle) => haystack.to_ascii_lowercase().contains(needle),
         }
     }
 
@@ -132,8 +142,11 @@ impl ListParams {
         if let Some(namespace) = &self.namespace {
             ser.append_pair("namespace", namespace);
         }
-        if let Some(q) = &self.q {
-            ser.append_pair("q", q);
+        if let Some(host) = &self.host {
+            ser.append_pair("host", host);
+        }
+        if let Some(path) = &self.path {
+            ser.append_pair("path", path);
         }
         if let Some(limit) = self.limit {
             ser.append_pair("limit", &limit.to_string());
@@ -203,8 +216,9 @@ mod tests {
 
     #[test]
     fn parse_reads_and_lowercases_filters() {
-        let p = ListParams::parse(Some("q=API.example.com&limit=10&offset=5"));
-        assert_eq!(p.q.as_deref(), Some("api.example.com"));
+        let p = ListParams::parse(Some("host=API.example.com&path=%2Fv1&limit=10&offset=5"));
+        assert_eq!(p.host.as_deref(), Some("api.example.com"));
+        assert_eq!(p.path.as_deref(), Some("/v1"));
         assert_eq!(p.limit, Some(10));
         assert_eq!(p.offset, 5);
         assert!(!p.is_empty());
@@ -228,16 +242,18 @@ mod tests {
     }
 
     #[test]
-    fn q_matches_host_or_path_case_insensitive() {
-        let p = ListParams::parse(Some("q=demo"));
-        // Matches on host…
-        assert!(p.q_matches("DEMO-gw", "/anything"));
-        // …or on path…
-        assert!(p.q_matches("prod-gw", "/demo/v1"));
-        // …but not when neither contains the needle.
-        assert!(!p.q_matches("prod-gw", "/api"));
-        // Absent q → always matches.
-        assert!(ListParams::default().q_matches("anything", "/anywhere"));
+    fn host_is_exact_path_is_substring_case_insensitive() {
+        let p = ListParams::parse(Some("host=App.Demo.local&path=%2Fv1"));
+        // host: exact (case-insensitive), not substring.
+        assert!(p.host_matches("app.demo.local"));
+        assert!(!p.host_matches("app.demo.local.extra"));
+        assert!(!p.host_matches("other.host"));
+        // path: substring (case-insensitive).
+        assert!(p.path_matches("/v1/users"));
+        assert!(!p.path_matches("/v2"));
+        // Absent → always matches.
+        assert!(ListParams::default().host_matches("anything"));
+        assert!(ListParams::default().path_matches("/anywhere"));
     }
 
     #[test]

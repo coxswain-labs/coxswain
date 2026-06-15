@@ -87,6 +87,10 @@ const PATHS = {
       <path d="M7 11V7a5 5 0 0 1 10 0v4" />
     </>
   ),
+  // chevron down — dropdown affordance (health chips)
+  'chevron-down': <polyline points="6 9 12 15 18 9" />,
+  // chevron up — back-to-top button
+  'chevron-up': <polyline points="18 15 12 9 6 15" />,
   // chevrons — pager nav (prev/next + first/last)
   'chevron-left': <polyline points="15 18 9 12 15 6" />,
   'chevron-right': <polyline points="9 18 15 12 9 6" />,

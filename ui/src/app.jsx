@@ -1,5 +1,6 @@
 import { useHashRoute } from './router.js';
 import { Nav } from './components/Nav.jsx';
+import { BackToTop } from './components/BackToTop.jsx';
 import { Dashboard } from './screens/Dashboard.jsx';
 import { Fleet } from './screens/Fleet.jsx';
 import { Routing } from './screens/Routing.jsx';
@@ -28,6 +29,7 @@ export function App() {
       <main class="content" id="main-content">
         <ActiveScreen screen={screen} params={params} query={query} />
       </main>
+      <BackToTop />
     </div>
   );
 }

@@ -729,6 +729,16 @@ td.table-foot {
 /* Standalone pager bar (ProxyDetail renders the pager above its host-grouped
    table rather than in a <tfoot>, so it's reachable without scrolling). */
 .pager-bar { margin-bottom: 16px; }
+
+/* Floating back-to-top button — appears once a long page is scrolled. */
+.back-to-top {
+  position: fixed; right: 20px; bottom: 20px; z-index: 90;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 40px; height: 40px; border-radius: 50%;
+  background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35); cursor: pointer;
+}
+.back-to-top:hover { border-color: var(--blue); color: var(--blue); }
 .pager-info strong { color: var(--text); font-weight: 600; }
 .pager-controls { display: flex; align-items: center; gap: 16px; }
 .pager-size { display: inline-flex; align-items: center; gap: 6px; }
@@ -810,11 +820,13 @@ td.table-foot {
   color: var(--text); font-size: 13px; text-align: left; outline: none;
 }
 .health-sub-head:hover, .health-sub-head:focus-visible { background: var(--surface2); }
-.health-sub.ok   > .health-sub-head svg { color: var(--green); }
-.health-sub.warn > .health-sub-head svg { color: var(--amber); }
+/* Colour only the leading status icon (a direct child); the caret svg is nested
+   in .health-sub-caret and stays muted, so it doesn't echo the green check. */
+.health-sub.ok   > .health-sub-head > svg { color: var(--green); }
+.health-sub.warn > .health-sub-head > svg { color: var(--amber); }
 .health-sub-name { font-weight: 600; }
 .health-sub-count { color: var(--muted); }
-.health-sub-caret { margin-left: 4px; color: var(--muted); transition: transform .12s; }
+.health-sub-caret { display: inline-flex; margin-left: 4px; color: var(--muted); transition: transform .12s; }
 .health-sub-caret.open { transform: rotate(180deg); }
 /* Checks open in a dropdown anchored under the chip (same chrome as the combo
    filter popover), overlaying content rather than growing the chip. */

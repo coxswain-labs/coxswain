@@ -43,7 +43,7 @@ use pingora_core::services::listening::Service;
 use pingora_http::ResponseHeader;
 use prometheus::{Encoder, TextEncoder};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -306,6 +306,7 @@ impl AdminServer {
             "/" => return self.ui_response(),
             "/metrics" => return metrics_response(),
             "/api/v1/routes" => return self.routes_response(&params),
+            "/api/v1/facets" => return self.facets_response(),
             "/api/v1/health" => {
                 // The apiserver version is fetched + cached by the aggregator
                 // (controller/dev roles only); proxy roles wire none, so the
@@ -338,6 +339,7 @@ impl AdminServer {
             ["fleet", "proxies"] => agg.list_proxies().await,
             ["fleet", "proxies", name] => agg.get_proxy(name).await,
             ["fleet", "proxies", name, "routes"] => agg.get_proxy_routes(name, &params).await,
+            ["fleet", "proxies", name, "facets"] => agg.get_proxy_facets(name).await,
             ["fleet", "proxies", name, "health"] => agg.get_proxy_health(name).await,
 
             // ── routing (config resources) ────────────────────────────────────
@@ -419,6 +421,56 @@ impl AdminServer {
         .to_string();
         json_response(body)
     }
+
+    /// Build the `/api/v1/facets` response: the distinct hosts and route
+    /// namespaces this proxy serves, so the operator UI can populate the route
+    /// table's host/namespace filter dropdowns without fetching the whole table.
+    /// Both lists are far smaller than the route set (many routes per host, and a
+    /// bounded namespace count), so shipping them whole is cheap. Returns 404 when
+    /// no routing tables are wired (controller role); the controller relays this
+    /// through `fleet/proxies/{name}/facets`.
+    fn facets_response(&self) -> Response<Vec<u8>> {
+        let Some((ingress, gateway)) = self.routes.as_ref() else {
+            let mut r = Response::new(Vec::new());
+            *r.status_mut() = StatusCode::NOT_FOUND;
+            return r;
+        };
+        let mut hosts: BTreeSet<String> = BTreeSet::new();
+        let mut namespaces: BTreeSet<String> = BTreeSet::new();
+        collect_facets(ingress.load().as_ref(), &mut hosts, &mut namespaces);
+        collect_facets(gateway.load().as_ref(), &mut hosts, &mut namespaces);
+        let body = serde_json::json!({
+            "hosts": hosts.into_iter().collect::<Vec<_>>(),
+            "namespaces": namespaces.into_iter().collect::<Vec<_>>(),
+        })
+        .to_string();
+        json_response(body)
+    }
+}
+
+/// Collect the distinct hosts and route namespaces from one typed table into the
+/// shared sorted sets (`BTreeSet` keeps them de-duplicated and ordered for a
+/// stable dropdown). Skips placeholder routes with no backend, matching the rows
+/// the route table actually shows.
+fn collect_facets<K>(
+    table: &RoutingTable<K>,
+    hosts: &mut BTreeSet<String>,
+    namespaces: &mut BTreeSet<String>,
+) {
+    for (_port, host, router) in table.host_routes() {
+        hosts.insert(host.clone());
+        for r in router
+            .routes()
+            .iter()
+            .filter(|r| !r.backend_group.name().is_empty())
+        {
+            if let Some((ns, _)) = r.route_id.split_once('/') {
+                if !ns.is_empty() {
+                    namespaces.insert(ns.to_string());
+                }
+            }
+        }
+    }
 }
 
 /// Build the per-spec block of the `/api/v1/routes` payload from a typed table.
@@ -427,26 +479,39 @@ impl AdminServer {
 /// Gateway-API tables; the type parameter prevents the caller from passing the
 /// wrong table to the wrong block label.
 ///
-/// `params` filter the flattened route rows by `q` (a case-insensitive substring
-/// matched against the row's host **or** path) and `status=problem` (keep only
-/// dead-backend rows — zero ready endpoints), then window them by `limit`/`offset`;
-/// when [`ListParams::is_empty`] the output is byte-identical to the legacy full
-/// dump (the conflict list is always included whole — it is bounded by
-/// definition). When any param is set the block also carries
-/// `total`/`returned`/`offset` over the post-filter rows.
+/// `params` filter the flattened route rows by `host` (exact), `path` (substring),
+/// `namespace` (exact, the route's namespace) and `status=problem` (keep only
+/// dead-backend rows — zero ready endpoints), then window them by `limit`/`offset`.
+/// The same host/path/namespace predicates also narrow the conflict list (a
+/// conflict belongs to a host/path and a rejected route's namespace), so a scoped
+/// view shows only the conflicts in scope; `problems_only` leaves conflicts whole
+/// (a conflict is itself a problem). When [`ListParams::is_empty`] the output is
+/// byte-identical to the legacy full dump. When any param is set the block also
+/// carries `total`/`returned`/`offset` over the post-filter rows.
 fn routes_block<K>(table: &RoutingTable<K>, params: &ListParams) -> serde_json::Value {
-    // Flatten to (port, host, route_json) so the `q` filter and the offset/limit
-    // window apply across the whole table, not per host-group. `q` matches on host
-    // OR path, so the filter runs per row (a host-group can't be skipped wholesale
-    // — one of its routes may match on path even when the host doesn't).
+    // Flatten to (port, host, route_json) so the offset/limit window applies across
+    // the whole table, not per host-group. The exact `host` filter skips a whole
+    // host-group; `path`/`namespace` filter per row.
     let mut matched: Vec<(u16, String, serde_json::Value)> = Vec::new();
     for (port, host, router) in table.host_routes() {
+        if !params.host_matches(&host) {
+            continue;
+        }
         for r in router
             .routes()
             .iter()
             .filter(|r| !r.backend_group.name().is_empty())
         {
-            if !params.q_matches(&host, &r.path) {
+            if !params.path_matches(&r.path) {
+                continue;
+            }
+            // `route_id` is `"{namespace}/{name}"`; split so the UI can deep-link
+            // a compiled row back to its source resource (and to filter by it).
+            let (namespace, name) = r
+                .route_id
+                .split_once('/')
+                .unwrap_or(("", r.route_id.as_str()));
+            if !params.namespace_matches(namespace) {
                 continue;
             }
             // `status=problem`: a compiled route "with a problem" is one serving
@@ -455,12 +520,6 @@ fn routes_block<K>(table: &RoutingTable<K>, params: &ListParams) -> serde_json::
             if params.problems_only && !r.backend_group.endpoints().is_empty() {
                 continue;
             }
-            // `route_id` is `"{namespace}/{name}"`; split so the UI can deep-link
-            // a compiled row back to its source resource.
-            let (namespace, name) = r
-                .route_id
-                .split_once('/')
-                .unwrap_or(("", r.route_id.as_str()));
             matched.push((
                 port,
                 host.clone(),
@@ -506,14 +565,22 @@ fn routes_block<K>(table: &RoutingTable<K>, params: &ListParams) -> serde_json::
     let conflicts: Vec<serde_json::Value> = table
         .conflicts()
         .iter()
-        .map(|c| {
+        .filter_map(|c| {
             // `rejected_route_id` is `"{namespace}/{name}"` of the shadowed route;
             // split so the UI can deep-link a conflict to that route.
             let (namespace, name) = c
                 .rejected_route_id
                 .split_once('/')
                 .unwrap_or(("", c.rejected_route_id.as_str()));
-            serde_json::json!({
+            // Narrow conflicts by the same host/path/namespace scope as the rows
+            // (problems_only is intentionally ignored — a conflict is a problem).
+            if !params.host_matches(&c.host)
+                || !params.path_matches(&c.path)
+                || !params.namespace_matches(namespace)
+            {
+                return None;
+            }
+            Some(serde_json::json!({
                 "port": c.port,
                 "host": c.host,
                 "type": c.kind.as_str(),
@@ -521,7 +588,7 @@ fn routes_block<K>(table: &RoutingTable<K>, params: &ListParams) -> serde_json::
                 "rejected_group": c.rejected_group,
                 "namespace": namespace,
                 "name": name,
-            })
+            }))
         })
         .collect();
     if params.is_empty() {

@@ -52,7 +52,9 @@ paths:
         legacy `{ingress, gateway}` full dump. With params, each spec block is
         filtered/windowed and gains `total`/`returned`/`offset` (#286).
       parameters:
-        - { $ref: '#/components/parameters/routeQuery' }
+        - { $ref: '#/components/parameters/hostQuery' }
+        - { $ref: '#/components/parameters/namespaceQuery' }
+        - { $ref: '#/components/parameters/pathQuery' }
         - { $ref: '#/components/parameters/status' }
         - { $ref: '#/components/parameters/limit' }
         - { $ref: '#/components/parameters/offset' }
@@ -66,6 +68,21 @@ paths:
                 properties:
                   ingress: { $ref: '#/components/schemas/RouteBlock' }
                   gateway: { $ref: '#/components/schemas/RouteBlock' }
+
+  /api/v1/facets:
+    get:
+      tags: [role-local]
+      summary: Distinct hosts + route namespaces this proxy serves (proxy/dev only; 404 on controller)
+      description: >-
+        Filter-dropdown options for the proxy route table — far smaller than the
+        route set, so shipped whole. The controller relays this via
+        /api/v1/fleet/proxies/{name}/facets.
+      responses:
+        '200':
+          description: Distinct hosts and namespaces
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Facets' }
 
   /api/v1/health:
     get:
@@ -155,7 +172,9 @@ paths:
       summary: A proxy's compiled routing table (filter/pagination relayed to the proxy, #286)
       parameters:
         - { $ref: '#/components/parameters/podName' }
-        - { $ref: '#/components/parameters/routeQuery' }
+        - { $ref: '#/components/parameters/hostQuery' }
+        - { $ref: '#/components/parameters/namespaceQuery' }
+        - { $ref: '#/components/parameters/pathQuery' }
         - { $ref: '#/components/parameters/status' }
         - { $ref: '#/components/parameters/limit' }
         - { $ref: '#/components/parameters/offset' }
@@ -174,6 +193,18 @@ paths:
                     properties:
                       ingress: { $ref: '#/components/schemas/RouteBlock' }
                       gateway: { $ref: '#/components/schemas/RouteBlock' }
+
+  /api/v1/fleet/proxies/{name}/facets:
+    get:
+      tags: [fleet]
+      summary: Distinct hosts + route namespaces for a proxy's route-table filters (relayed)
+      parameters: [{ $ref: '#/components/parameters/podName' }]
+      responses:
+        '200':
+          description: Distinct hosts and namespaces (empty lists when the pod is unreachable)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Facets' }
 
   /api/v1/fleet/proxies/{name}/health:
     get:
@@ -451,10 +482,15 @@ components:
       in: query
       description: Exact (case-insensitive) namespace filter for the routing lists (the operator UI's namespace dropdown).
       schema: { type: string }
-    routeQuery:
-      name: q
+    hostQuery:
+      name: host
       in: query
-      description: Case-insensitive free-text filter for the proxy route table; a row matches when its host OR its path contains the substring (the operator UI's single route search box).
+      description: Exact (case-insensitive) host filter for the proxy route table — the operator UI's host dropdown (a pick from the proxy's known hosts). Also narrows the conflict list.
+      schema: { type: string }
+    pathQuery:
+      name: path
+      in: query
+      description: Case-insensitive substring filter against the proxy route table's path — the operator UI's path search box. Also narrows the conflict list.
       schema: { type: string }
     limit:
       name: limit
@@ -612,6 +648,12 @@ components:
         reason: { type: string }
         message: { type: string }
 
+    Facets:
+      type: object
+      description: Distinct filter-dropdown values for a proxy's route table.
+      properties:
+        hosts: { type: array, items: { type: string } }
+        namespaces: { type: array, items: { type: string } }
     RouteBlock:
       type: object
       description: Per-spec compiled routes; gains envelope counts when filtered.
