@@ -42,6 +42,56 @@ const LIST_KEYS = {
   '/api/v1/routing/ingresses': 'ingresses',
 };
 
+/** Matches the per-proxy compiled route table `/api/v1/fleet/proxies/{name}/routes`. */
+const ROUTES_RE = /^\/api\/v1\/fleet\/proxies\/[^/]+\/routes$/;
+
+/** Window one block (ingress|gateway) of a proxy's compiled route table the way
+ *  the controller's `routes_block` does: flatten the host-groups, filter by the
+ *  `q` substring (matched against host OR path), apply offset/limit, then regroup
+ *  consecutive rows back into host-groups. Conflicts are always returned whole
+ *  (bounded by definition). */
+function pageRoutesBlock(block, params) {
+  const flat = [];
+  for (const h of block.hosts ?? []) {
+    for (const r of h.routes ?? []) flat.push({ port: h.port, host: h.host, route: r });
+  }
+  const q = (params.get('q') || '').toLowerCase();
+  let rows = flat;
+  if (q) {
+    rows = rows.filter(
+      (x) => (x.host || '').toLowerCase().includes(q) || (x.route.path || '').toLowerCase().includes(q),
+    );
+  }
+  // status=problem → only dead-backend rows (zero ready endpoints), mirroring the
+  // controller's `routes_block`.
+  if (params.get('status') === 'problem') {
+    rows = rows.filter((x) => (x.route.endpoints?.length ?? 0) === 0);
+  }
+  const total = rows.length;
+  const limit = Math.min(1000, Number.parseInt(params.get('limit') || '200', 10) || 200);
+  const offset = Math.min(Math.max(0, Number.parseInt(params.get('offset') || '0', 10) || 0), total);
+  const windowed = rows.slice(offset, offset + limit);
+  const hosts = [];
+  for (const { port, host: h, route } of windowed) {
+    const last = hosts[hosts.length - 1];
+    if (last && last.port === port && last.host === h) last.routes.push(route);
+    else hosts.push({ port, host: h, routes: [route] });
+  }
+  return { hosts, conflicts: block.conflicts ?? [], total, returned: windowed.length, offset };
+}
+
+/** Window both blocks of a proxy's `/routes` fixture, preserving the
+ *  `{pod_name, reachable, routes}` envelope. An unreachable proxy has no
+ *  `routes` to page. */
+function pageRoutes(fixture, params) {
+  if (!fixture.routes) return fixture;
+  const routes = {};
+  for (const key of ['ingress', 'gateway']) {
+    if (fixture.routes[key]) routes[key] = pageRoutesBlock(fixture.routes[key], params);
+  }
+  return { ...fixture, routes };
+}
+
 /** Apply `?name=&namespace=&status=&limit=&offset=` to a list fixture, mirroring
  *  the backend's filter + window + envelope. */
 function pageList(fixture, key, params) {
@@ -135,6 +185,17 @@ export function mockApi() {
           const params = new URLSearchParams((req.url || '').split('?')[1] || '');
           const fixture = JSON.parse(readFileSync(file, 'utf8'));
           res.end(JSON.stringify(pageList(fixture, listKey, params)));
+          return;
+        }
+
+        // Per-proxy compiled route table: window each block (ingress/gateway)
+        // like the controller, so ProxyDetail's filter/pagination behaves in dev
+        // (#286). Absent params reproduce the full dump (backward-compatible).
+        if (ROUTES_RE.test(url) && existsSync(file)) {
+          const params = new URLSearchParams((req.url || '').split('?')[1] || '');
+          const fixture = JSON.parse(readFileSync(file, 'utf8'));
+          const hasParams = ['q', 'status', 'limit', 'offset'].some((k) => params.get(k));
+          res.end(JSON.stringify(hasParams ? pageRoutes(fixture, params) : fixture));
           return;
         }
 

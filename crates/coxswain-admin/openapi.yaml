@@ -43,7 +43,7 @@ paths:
       responses:
         '200': { description: Prometheus text exposition, content: { text/plain: {} } }
 
-  /routes:
+  /api/v1/routes:
     get:
       tags: [role-local]
       summary: Proxy-local compiled routing table (proxy/dev only; 404 on controller)
@@ -52,8 +52,8 @@ paths:
         legacy `{ingress, gateway}` full dump. With params, each spec block is
         filtered/windowed and gains `total`/`returned`/`offset` (#286).
       parameters:
-        - { $ref: '#/components/parameters/host' }
-        - { $ref: '#/components/parameters/path' }
+        - { $ref: '#/components/parameters/routeQuery' }
+        - { $ref: '#/components/parameters/status' }
         - { $ref: '#/components/parameters/limit' }
         - { $ref: '#/components/parameters/offset' }
       responses:
@@ -155,8 +155,8 @@ paths:
       summary: A proxy's compiled routing table (filter/pagination relayed to the proxy, #286)
       parameters:
         - { $ref: '#/components/parameters/podName' }
-        - { $ref: '#/components/parameters/host' }
-        - { $ref: '#/components/parameters/path' }
+        - { $ref: '#/components/parameters/routeQuery' }
+        - { $ref: '#/components/parameters/status' }
         - { $ref: '#/components/parameters/limit' }
         - { $ref: '#/components/parameters/offset' }
       responses:
@@ -451,15 +451,10 @@ components:
       in: query
       description: Exact (case-insensitive) namespace filter for the routing lists (the operator UI's namespace dropdown).
       schema: { type: string }
-    host:
-      name: host
+    routeQuery:
+      name: q
       in: query
-      description: Case-insensitive substring filter against the route host (proxy routes only).
-      schema: { type: string }
-    path:
-      name: path
-      in: query
-      description: Case-insensitive substring filter against the route path (proxy routes only).
+      description: Case-insensitive free-text filter for the proxy route table; a row matches when its host OR its path contains the substring (the operator UI's single route search box).
       schema: { type: string }
     limit:
       name: limit

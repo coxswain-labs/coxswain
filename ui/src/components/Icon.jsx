@@ -110,6 +110,13 @@ const PATHS = {
       <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
     </>
   ),
+  // magnifier — search/filter inputs
+  search: (
+    <>
+      <circle cx="11" cy="11" r="8" />
+      <line x1="21" y1="21" x2="16.65" y2="16.65" />
+    </>
+  ),
   // info circle — version / about popover
   info: (
     <>

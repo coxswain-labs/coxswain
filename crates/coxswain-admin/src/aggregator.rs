@@ -310,7 +310,7 @@ impl OperatorAggregator {
     }
 
     /// `GET /api/v1/fleet/proxies/{pod-name}/routes` — fan-out to the pod's
-    /// `/routes`, relaying the filter/pagination `params` so the **proxy** does
+    /// `/api/v1/routes`, relaying the filter/pagination `params` so the **proxy** does
     /// the filtering at the source (the typed routing table lives there, #286).
     /// The controller is a transparent relay: it never receives non-matching rows.
     pub(crate) async fn get_proxy_routes(
@@ -329,9 +329,9 @@ impl OperatorAggregator {
         };
         let base = pod_base_url(entry);
         let url = if params.is_empty() {
-            format!("{base}/routes")
+            format!("{base}/api/v1/routes")
         } else {
-            format!("{base}/routes?{}", params.to_query())
+            format!("{base}/api/v1/routes?{}", params.to_query())
         };
         match self.fetch_json(&url).await {
             Some(routes) => json_response(
@@ -854,13 +854,13 @@ impl OperatorAggregator {
         }
     }
 
-    /// Live HTTPRoute status conditions from Kubernetes + parallel `/routes`
+    /// Live HTTPRoute status conditions from Kubernetes + parallel `/api/v1/routes`
     /// fan-out to all proxy pods.
     pub(crate) async fn get_httproute(&self, namespace: &str, name: &str) -> Response<Vec<u8>> {
         let kube = match self.kube().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "kube client unavailable for /api/v1/routes/httproute");
+                tracing::warn!(error = %e, "kube client unavailable for /api/v1/routing/routes/httproute");
                 return service_unavailable("kubernetes client not available");
             }
         };
@@ -927,13 +927,14 @@ impl OperatorAggregator {
         )
     }
 
-    /// `GET /api/v1/routes/ingress/{namespace}/{name}` — live Ingress load-balancer
-    /// status from Kubernetes + parallel `/routes` fan-out to all proxy pods.
+    /// `GET /api/v1/routing/routes/ingress/{namespace}/{name}` — live Ingress
+    /// load-balancer status from Kubernetes + parallel `/api/v1/routes` fan-out to
+    /// all proxy pods.
     pub(crate) async fn get_ingress_route(&self, namespace: &str, name: &str) -> Response<Vec<u8>> {
         let kube = match self.kube().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "kube client unavailable for /api/v1/routes/ingress");
+                tracing::warn!(error = %e, "kube client unavailable for /api/v1/routing/routes/ingress");
                 return service_unavailable("kubernetes client not available");
             }
         };
@@ -999,7 +1000,7 @@ impl OperatorAggregator {
     /// each proxy directly. It targets only the proxies that *should* serve the
     /// route — the shared pool, or the dedicated proxies of the route's parent
     /// Gateways (matched by the `gateway-name` label) — fans out to their
-    /// `/routes`, and diffs the route-tagged rows across them: a proxy missing a
+    /// `/api/v1/routes`, and diffs the route-tagged rows across them: a proxy missing a
     /// row its peers have is drift.
     ///
     /// # Errors
@@ -1153,7 +1154,7 @@ impl OperatorAggregator {
         )
     }
 
-    /// Fan out `GET /routes` to all proxy pods in parallel.
+    /// Fan out `GET /api/v1/routes` to all proxy pods in parallel.
     ///
     /// Returns one entry per pod: `{pod_name, reachable: true, routes: {...}}`
     /// when the pod responds, or `{pod_name, reachable: false}` on timeout or
@@ -1169,15 +1170,15 @@ impl OperatorAggregator {
         self.fan_out_routes_to(&entries).await
     }
 
-    /// Fan out `GET /routes` to a specific set of proxy pods in parallel — the
-    /// check path targets only the proxies that should serve a given route,
+    /// Fan out `GET /api/v1/routes` to a specific set of proxy pods in parallel —
+    /// the check path targets only the proxies that should serve a given route,
     /// not the whole fleet.
     async fn fan_out_routes_to(&self, entries: &[FleetEntry]) -> Vec<serde_json::Value> {
         let http = &self.http;
         let futures: Vec<_> = entries
             .iter()
             .map(|e| {
-                let url = format!("{}/routes", pod_base_url(e));
+                let url = format!("{}/api/v1/routes", pod_base_url(e));
                 let pod_name = e.pod_name.clone();
                 async move {
                     match http
@@ -1206,7 +1207,7 @@ impl OperatorAggregator {
 
 // ── Route check (data-plane consistency) ─────────────────────────────────────────────────────────────
 
-/// The proxy `/routes` sub-key for a route kind: Gateway-API routes live under
+/// The proxy `/api/v1/routes` sub-key for a route kind: Gateway-API routes live under
 /// `gateway`, classic Ingress under `ingress`. `None` for an unknown kind.
 fn route_kind_key(kind: &str) -> Option<&'static str> {
     match kind {
@@ -1249,7 +1250,7 @@ fn serving_proxies_for_parents(
     out
 }
 
-/// Flatten the rows in one proxy's `/routes` payload that are tagged with the
+/// Flatten the rows in one proxy's `/api/v1/routes` payload that are tagged with the
 /// given route object to `{host, path, backend_group, endpoints}`.
 fn route_rows_for(
     routes: &serde_json::Value,
@@ -1632,7 +1633,7 @@ impl OperatorAggregator {
 
 impl OperatorAggregator {
     /// `GET /api/v1/problems` — cluster-wide routing problems derived from
-    /// fan-out to all proxy `/routes` endpoints.
+    /// fan-out to all proxy `/api/v1/routes` endpoints.
     ///
     /// Cross-cutting problem aggregate, namespaced by the two API axes (#301):
     /// ```json
@@ -1643,7 +1644,7 @@ impl OperatorAggregator {
     /// ```
     ///
     /// `routing` conflicts/dead-routes come from fanning out to every proxy's
-    /// `/routes` (deduped, `kind`-tagged). `fleet` classes come from probing each
+    /// `/api/v1/routes` (deduped, `kind`-tagged). `fleet` classes come from probing each
     /// pod's `/api/v1/health`: `unreachable` pods don't answer, `degraded` pods
     /// answer with failing checks, and `leaderless` is `true` when no reachable
     /// controller reports `leader`. The operator UI renders this directly rather
@@ -1812,7 +1813,7 @@ impl OperatorAggregator {
     }
 }
 
-/// De-dupe and aggregate fanned-out proxy `/routes` results into the
+/// De-dupe and aggregate fanned-out proxy `/api/v1/routes` results into the
 /// `/api/v1/problems` payload. Split out from [`OperatorAggregator::list_problems`]
 /// so it is unit-testable without a live fan-out.
 ///
@@ -2188,7 +2189,7 @@ mod tests {
 
     #[test]
     fn routes_response_parses_proxy_routes_shape() {
-        // Simulates the body returned by a proxy pod's GET /routes.
+        // Simulates the body returned by a proxy pod's GET /api/v1/routes.
         let raw = serde_json::json!({
             "ingress": {
                 "hosts": [

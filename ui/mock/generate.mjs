@@ -287,8 +287,33 @@ const SHARED_INGRESS = {
   ])),
 };
 const EMPTY_SIDE = { conflicts: [], hosts: [] };
+
+// A large synthetic slice so ProxyDetail's server-side filter + pagination (#286)
+// is exercised in dev: a *shared* proxy holds the whole cluster's table, so we
+// pad the curated rows (conflicts + dead backends, kept at the top so the
+// qualitative cases stay visible) with hundreds of generated host-groups. The
+// mock plugin windows these per block exactly as the controller's `routes_block`
+// does, so paging + Host/Path filtering behave like prod.
+// Sized to demonstrate pagination past the default 100-row page and to give the
+// host filter a meaningful list, without dumping thousands of lines of generated
+// JSON into the committed fixture: ~60 gateway hosts × 2 routes ⇒ ~120 rows.
+const idx = (i) => String(i).padStart(2, '0');
+const BULK_GATEWAY = Array.from({ length: 60 }, (_, i) =>
+  host(`svc-${idx(i)}.bulk.local`, 8080, [
+    row(`bulk-route-${i}`, 'bulk', '/', `bulk/svc-${i}`, i % 7 === 0 ? [] : EP2),
+    row(`bulk-route-${i}`, 'bulk', '/api', `bulk/svc-${i}-api`, EP1, 'exact'),
+  ]),
+);
+const BULK_INGRESS = Array.from({ length: 40 }, (_, i) =>
+  host(`shop-${idx(i)}.bulk.local`, 80, [
+    row(`bulk-ingress-${i}`, 'bulk', '/', `bulk/shop-${i}`, i % 5 === 0 ? [] : EP1),
+  ]),
+);
+const SHARED_GATEWAY_BULK = { ...SHARED_GATEWAY, hosts: [...SHARED_GATEWAY.hosts, ...BULK_GATEWAY] };
+const SHARED_INGRESS_BULK = { ...SHARED_INGRESS, hosts: [...SHARED_INGRESS.hosts, ...BULK_INGRESS] };
+
 function routesFor(p) {
-  if (p.kind === 'shared-proxy') return { gateway: SHARED_GATEWAY, ingress: SHARED_INGRESS };
+  if (p.kind === 'shared-proxy') return { gateway: SHARED_GATEWAY_BULK, ingress: SHARED_INGRESS_BULK };
   if (p.gw === 'tenant-a-gw') {
     return {
       gateway: { conflicts: [], hosts: [host('app.tenant-a.local', 8100, [row('a-web', 'tenant-a', '/', 'tenant-a/web', EP2)])] },

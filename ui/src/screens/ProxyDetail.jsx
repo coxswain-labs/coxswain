@@ -7,10 +7,12 @@ import { Badge, poolBadge } from '../components/Badge.jsx';
 import { DetailHeader } from '../components/DetailHeader.jsx';
 import { PodInfo } from '../components/PodInfo.jsx';
 import { PodActions } from '../components/PodActions.jsx';
+import { PodHealthChips } from '../components/HealthChips.jsx';
 import { Icon } from '../components/Icon.jsx';
 import { EndpointHealth } from '../components/EndpointHealth.jsx';
-import { Tabs } from '../components/Tabs.jsx';
 import { SearchBox } from '../components/SearchBox.jsx';
+import { Table } from '../components/Table.jsx';
+import { Pager, PAGE_SIZES } from '../components/DataTable.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 import { useEffect, useState } from 'preact/hooks';
 
@@ -20,13 +22,56 @@ import { useEffect, useState } from 'preact/hooks';
  * Shows pod metadata, subsystem health, and a tabbed route table
  * (Ingress | Gateway API). Routing conflicts are called out inline.
  * Clicking a route row navigates to the route detail screen.
+ *
+ * The route table is **server-side filtered + paginated** (#286): a *shared*
+ * proxy holds the whole cluster's compiled routing table (every Ingress + every
+ * HTTPRoute, unioned), so this screen must never fetch or render it whole. The
+ * Host and Path inputs map 1:1 to the backend's two substring params (which
+ * AND); `limit`/`offset` window the post-filter rows and the footer pager shows
+ * "X–Y of N". Each tab paginates independently against the same params.
  */
 export function ProxyDetail({ pod, query }) {
   const meta        = useApi(() => getProxy(pod), [pod]);
-  const routes      = useApi(() => getProxyRoutes(pod), [pod]);
   const health      = useApi(() => getProxyHealth(pod), [pod]);
   const controllers = useApi(getControllers);
   const sse         = useSSE('/api/v1/events');
+
+  // One search box filters the route table by host OR path (the backend's `q`
+  // param). A deep-link (e.g. from a conflict) may carry the host of a specific
+  // route; pre-filling the box narrows the (otherwise cluster-wide) table to it
+  // so the operator lands on that route instead of page 1 of thousands — the row
+  // is then flashed via `row-hit`.
+  const [search, setSearch] = useState(query?.host ?? '');
+  const dSearch = useDebounced(search);
+  // Problems-only: filtered server-side via `status=problem` — for the compiled
+  // table a "problem" route is one serving zero ready endpoints (a dead backend),
+  // which the proxy can see directly (unlike Routing's cross-proxy aggregate), so
+  // the count stays honest rather than narrowing a page client-side.
+  const [problemsOnly, setProblemsOnly] = useState(false);
+  const [pageSize, setPageSize] = useState(100);
+  const [offset, setOffset]     = useState(0);
+  // Active tab id ('ingress' | 'gateway'); null defers to the data-driven default.
+  const [tab, setTab] = useState(null);
+
+  const routes = useApi(
+    () =>
+      getProxyRoutes(pod, {
+        q: dSearch,
+        status: problemsOnly ? 'problem' : undefined,
+        limit: pageSize,
+        offset,
+      }),
+    [pod, dSearch, problemsOnly, pageSize, offset],
+  );
+
+  // Reset to the first page whenever the window's shape changes — a search edit,
+  // the problems-only toggle, a page-size change, or a tab switch. Each tab
+  // paginates independently and the server clamps offset to the active block's
+  // total, so a stale offset from a larger tab would otherwise land past a
+  // smaller tab's last page.
+  useEffect(() => {
+    setOffset(0);
+  }, [dSearch, problemsOnly, pageSize, tab]);
 
   useEffect(() => {
     const off = sse.subscribe('rebuild.completed', () => routes.refetch());
@@ -92,7 +137,12 @@ export function ProxyDetail({ pod, query }) {
               : <Badge variant="fail">unreachable</Badge>}
           </>
         )}
-        actions={<PodActions namespace={p.pod_namespace} name={pod} />}
+        actions={(
+          <>
+            <PodHealthChips health={health} />
+            <PodActions namespace={p.pod_namespace} name={pod} />
+          </>
+        )}
       />
 
       <PodInfo detail={p} health={health} />
@@ -106,37 +156,149 @@ export function ProxyDetail({ pod, query }) {
         {routes.error ? (
           <ErrorState error={routes.error} />
         ) : !routes.data ? null : (
-          <RouteTabs routesData={routes.data} highlight={query} pod={pod} />
+          <RoutesPanel
+            routesData={routes.data}
+            highlight={query}
+            search={search}
+            onSearch={setSearch}
+            problemsOnly={problemsOnly}
+            onProblemsOnly={setProblemsOnly}
+            pageSize={pageSize}
+            offset={offset}
+            onPage={setOffset}
+            onPageSize={setPageSize}
+            activeTab={tab}
+            onTab={setTab}
+          />
         )}
       </section>
     </div>
   );
 }
 
-function RouteTabs({ routesData, highlight, pod }) {
+/** Debounce a rapidly-changing value (filter keystrokes) so each character
+ *  doesn't trigger a server round-trip against a large routing table. */
+function useDebounced(value, ms = 250) {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(value), ms);
+    return () => clearTimeout(t);
+  }, [value, ms]);
+  return debounced;
+}
+
+/**
+ * The Routes section: a tab per compiled table the proxy holds (Ingress |
+ * Gateway API), the shared Host/Path filters, the active tab's host-grouped
+ * table, and the footer pager. Tabs are structural (present whenever the proxy
+ * holds that table) — a filter that matches nothing leaves the tab in place with
+ * an empty body, never makes it vanish.
+ */
+function RoutesPanel({
+  routesData, highlight, search, onSearch, problemsOnly, onProblemsOnly,
+  pageSize, offset, onPage, onPageSize, activeTab, onTab,
+}) {
   const specs = [
     { id: 'ingress', kind: 'ingress',   label: 'Ingress',     spec: routesData?.routes?.ingress },
     { id: 'gateway', kind: 'httproute', label: 'Gateway API', spec: routesData?.routes?.gateway },
   ].filter((s) => s.spec);
 
-  const tabs = specs.map((s) => {
-    const issues = specHasIssues(s.spec);
-    return {
-      id: s.id,
-      label: (
-        <span class={`tab-label ${issues ? 'warn' : 'ok'}`}>
-          <Icon name={issues ? 'alert' : 'check'} size={13} />
-          {s.label} ({countRoutes(s.spec)})
-        </span>
-      ),
-      content: <RouteSection spec={s.spec} kind={s.kind} highlight={highlight} pod={pod} />,
-    };
-  });
+  if (specs.length === 0) return <EmptyState message="No routes synced yet." />;
 
-  if (tabs.length === 0) return <EmptyState message="No routes synced yet." />;
-  if (tabs.length === 1) return tabs[0].content;
+  const activeId = activeTab && specs.some((s) => s.id === activeTab)
+    ? activeTab
+    : pickDefaultTab(specs, highlight);
+  const active = specs.find((s) => s.id === activeId) ?? specs[0];
 
-  return <Tabs tabs={tabs} defaultTab={pickDefaultTab(specs, highlight)} />;
+  const filtered = Boolean(search) || problemsOnly;
+  // Show the filter controls whenever there's something to filter (any tab has
+  // rows) or a filter is active (so it stays dismissable after narrowing to 0).
+  const showFilters = filtered || specs.some((s) => blockTotal(s.spec) > 0);
+  const total = blockTotal(active.spec);
+
+  return (
+    <div>
+      {/* One search box narrows both tabs by host OR path (the backend filters
+          both blocks by the same `q`), so it sits ABOVE the tab bar — one shared
+          scope, not a per-tab control. */}
+      {showFilters && (
+        <div class="header-controls left routing-filters" style="margin-bottom:14px">
+          <div class="filter-group">
+            <button
+              type="button"
+              class={`toggle-pill${problemsOnly ? ' active' : ''}`}
+              aria-pressed={problemsOnly}
+              title="Show only routes that aren't serving traffic (no ready endpoints)"
+              onClick={() => onProblemsOnly(!problemsOnly)}
+            >
+              <Icon name="alert" size={13} />
+              Problems only
+            </button>
+          </div>
+          <SearchBox
+            value={search}
+            onInput={(e) => onSearch(e.currentTarget.value)}
+            placeholder="Filter by host or path…"
+            label="Filter routes by host or path"
+          />
+        </div>
+      )}
+
+      {specs.length > 1 && (
+        <div class="tabs" role="tablist">
+          {specs.map((s) => {
+            const issues = specHasIssues(s.spec);
+            return (
+              <button
+                key={s.id}
+                role="tab"
+                aria-selected={s.id === activeId}
+                class={`tab${s.id === activeId ? ' active' : ''}`}
+                onClick={() => onTab(s.id)}
+              >
+                <span class={`tab-label ${issues ? 'warn' : 'ok'}`}>
+                  <Icon name={issues ? 'alert' : 'check'} size={13} />
+                  {s.label} ({blockTotal(s.spec)})
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Pager ABOVE the (tall, host-grouped) table so the page controls + the
+          "X–Y of N" count are reachable without scrolling past every row. */}
+      {total > 0 && (
+        <div class="pager-bar">
+          <Pager
+            page={{
+              offset: active.spec.offset ?? offset,
+              returned: active.spec.returned ?? countRoutes(active.spec),
+              total,
+              pageSize,
+              pageSizes: PAGE_SIZES,
+              onPage,
+              onPageSize,
+            }}
+          />
+        </div>
+      )}
+
+      <RouteSection
+        spec={active.spec}
+        kind={active.kind}
+        highlight={highlight}
+        filtered={filtered}
+        scrollKey={`${activeId}-${offset}`}
+      />
+    </div>
+  );
+}
+
+/** A block's full (pre-window) route count: the server's post-filter `total`
+ *  when paginated, else the rows present (an unparameterized full dump). */
+function blockTotal(spec) {
+  return spec?.total ?? countRoutes(spec);
 }
 
 function countRoutes(spec) {
@@ -157,7 +319,10 @@ function dedupeConflicts(conflicts) {
 }
 
 /** A spec needs attention if it has a conflict or any route with 0 endpoints
- *  (accepted-but-dead backend). Drives the tab alert icon. */
+ *  (accepted-but-dead backend). Drives the tab alert icon. Conflicts are always
+ *  returned whole (bounded), so that signal is complete; the dead-backend check
+ *  sees only the current page, which is acceptable — the per-row endpoint health
+ *  still flags dead backends wherever they land. */
 function specHasIssues(spec) {
   if (!spec) return false;
   if ((spec.conflicts?.length ?? 0) > 0) return true;
@@ -184,8 +349,7 @@ function pickDefaultTab(specs, highlight) {
   return (flagged ?? specs[0])?.id;
 }
 
-function RouteSection({ spec, kind, highlight, pod }) {
-  const allHosts  = spec?.hosts ?? [];
+function RouteSection({ spec, kind, highlight, filtered, scrollKey }) {
   // A routing conflict is a property of the host+path routing key (two routes
   // claim it; one is rejected) — not of a listener port. The shared proxy serves
   // the same routes on every listener, so the compiled table reports the *same*
@@ -195,30 +359,20 @@ function RouteSection({ spec, kind, highlight, pod }) {
   const conflicts = dedupeConflicts(spec?.conflicts ?? []);
   const wantPath  = highlight?.path || '/';
 
-  // Client-side host/path filter for large tables (#286). At scale an operator
-  // looks up a specific host/path rather than eyeballing thousands of rows; the
-  // count line always states matched-of-total so nothing is silently hidden.
-  // (Server-side filtering + windowing are wired in the backend envelope and are
-  // a follow-up to push the filter to the proxy for very large tables.)
-  const [filter, setFilter] = useState('');
-  const needle = filter.trim().toLowerCase();
-  const hosts = needle
-    ? allHosts
-        .map((h) => {
-          if (h.host.toLowerCase().includes(needle)) return h;
-          const routes = (h.routes ?? []).filter((r) =>
-            (r.path || '/').toLowerCase().includes(needle),
-          );
-          return routes.length ? { ...h, routes } : null;
-        })
-        .filter(Boolean)
-    : allHosts;
+  // Flatten the host-grouped payload into one compact table. The backend orders
+  // rows grouped by (port, host), so consecutive rows share a host — we blank the
+  // repeated Host cell to keep the grouped reading without a sub-table per host
+  // (that chrome was what made this screen so tall).
+  const rows = [];
+  for (const h of spec?.hosts ?? []) {
+    for (const r of h.routes ?? []) rows.push({ ...r, host: h.host, port: h.port });
+  }
 
-  const total = countRoutes(spec);
-  const shown = hosts.reduce((sum, h) => sum + (h.routes?.length ?? 0), 0);
+  const openRoute = (r) =>
+    kind === 'httproute' ? nav.httproute(r.namespace, r.name) : nav.ingressRoute(r.namespace, r.name);
 
   return (
-    <div>
+    <>
       {conflicts.length > 0 && (
         <div class="conflict-list" aria-label="Routing conflicts">
           {conflicts.map((c, i) => (
@@ -230,70 +384,44 @@ function RouteSection({ spec, kind, highlight, pod }) {
         </div>
       )}
 
-      {total > 0 && (
-        <div class="header-controls left routing-filters" style="margin-bottom:8px">
-          <span class="table-foot" style="padding:0;align-self:center">
-            {shown === total ? `${total} routes` : `Showing ${shown} of ${total}`}
-          </span>
-          <SearchBox
-            value={filter}
-            onInput={(e) => setFilter(e.currentTarget.value)}
-            placeholder="Filter by host or path…"
-            label="Filter routes by host or path"
-          />
-        </div>
-      )}
-
-      {allHosts.length === 0 && <EmptyState message="No routes." />}
-      {allHosts.length > 0 && hosts.length === 0 && <EmptyState message="No routes match." />}
-
-      {hosts.map((h) => (
-        <div key={`${h.port}-${h.host}`} class="host-group">
-          <div class="host-label">
-            <code>{h.host}</code>
-            <span class="host-port">:{h.port}</span>
-          </div>
-          <div class="tbl-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Path</th>
-                  <th>Type</th>
-                  <th>Backend</th>
-                  <th>Endpoints</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(h.routes ?? []).map((r, i) => {
-                  const hit = highlight?.host === h.host && (r.path || '/') === wantPath;
-                  // The compiled routing table doesn't carry the source route's
-                  // namespace/name, so we can only deep-link to the Route
-                  // Inspector when identity is present. Otherwise the row is
-                  // informational — never a link that resolves to nowhere.
-                  const linkable = Boolean(r.namespace && r.name);
-                  const open = () =>
-                    kind === 'httproute'
-                      ? nav.httproute(r.namespace, r.name)
-                      : nav.ingressRoute(r.namespace, r.name);
-                  return (
-                    <tr
-                      key={i}
-                      class={`${linkable ? 'clickable' : ''}${hit ? ' row-hit' : ''}`}
-                      onClick={linkable ? open : undefined}
-                      title={linkable ? `Open ${r.backend_group}` : r.backend_group}
-                    >
-                      <td><code>{r.path || '/'}</code></td>
-                      <td><Badge variant="neutral">{r.type}</Badge></td>
-                      <td><code>{r.backend_group}</code></td>
-                      <td><EndpointHealth endpoints={r.endpoints ?? []} /></td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      ))}
-    </div>
+      <Table
+        columns={['Host', 'Port', 'Path', 'Type', 'Backend', 'Endpoints']}
+        rows={rows}
+        emptyMsg={filtered ? 'No routes match.' : 'No routes.'}
+        scrollKey={scrollKey}
+        renderRow={(r, i) => {
+          // A compiled route serving zero ready endpoints is a dead backend —
+          // amber (warn tier), the same left-edge accent the routing tables use,
+          // never red (red is reserved for "down").
+          const dead = (r.endpoints?.length ?? 0) === 0;
+          const hit = highlight?.host === r.host && (r.path || '/') === wantPath;
+          // The compiled table doesn't carry the source route's namespace/name,
+          // so we only deep-link when identity is present — otherwise the row is
+          // informational, never a link that resolves to nowhere.
+          const linkable = Boolean(r.namespace && r.name);
+          return (
+            <tr
+              key={`${r.port}-${r.host}-${r.path}-${i}`}
+              class={`${linkable ? 'clickable' : ''}${dead ? ' sev-warn' : ''}${hit ? ' row-hit' : ''}`}
+              onClick={linkable ? () => openRoute(r) : undefined}
+              title={
+                dead
+                  ? 'No ready endpoints — not serving traffic'
+                  : linkable
+                    ? `Open ${r.backend_group}`
+                    : r.backend_group
+              }
+            >
+              <td><code>{r.host}</code></td>
+              <td class="col-port">{r.port}</td>
+              <td><code>{r.path || '/'}</code></td>
+              <td><Badge variant="neutral">{r.type}</Badge></td>
+              <td><code>{r.backend_group}</code></td>
+              <td><EndpointHealth endpoints={r.endpoints ?? []} /></td>
+            </tr>
+          );
+        }}
+      />
+    </>
   );
 }

@@ -125,7 +125,7 @@ Example output:
 ## Routes endpoint
 
 ```bash
-curl -s http://localhost:8082/routes | jq .
+curl -s http://localhost:8082/api/v1/routes | jq .
 ```
 
 Returns the active routing table as JSON — all hostname entries, their rules, and resolved upstream addresses. Useful for debugging routing decisions without reading raw Kubernetes objects.

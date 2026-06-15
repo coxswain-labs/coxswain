@@ -70,6 +70,1599 @@
               "type": "prefix"
             }
           ]
+        },
+        {
+          "host": "svc-00.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-0",
+              "endpoints": [],
+              "name": "bulk-route-0",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-0-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-0",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-01.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-1",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-1",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-1-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-1",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-02.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-2",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-2",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-2-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-2",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-03.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-3",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-3",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-3-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-3",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-04.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-4",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-4",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-4-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-4",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-05.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-5",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-5",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-5-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-5",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-06.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-6",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-6",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-6-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-6",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-07.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-7",
+              "endpoints": [],
+              "name": "bulk-route-7",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-7-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-7",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-08.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-8",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-8",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-8-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-8",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-09.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-9",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-9",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-9-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-9",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-10.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-10",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-10",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-10-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-10",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-11.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-11",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-11",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-11-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-11",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-12.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-12",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-12",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-12-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-12",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-13.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-13",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-13",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-13-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-13",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-14.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-14",
+              "endpoints": [],
+              "name": "bulk-route-14",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-14-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-14",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-15.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-15",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-15",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-15-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-15",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-16.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-16",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-16",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-16-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-16",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-17.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-17",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-17",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-17-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-17",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-18.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-18",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-18",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-18-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-18",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-19.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-19",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-19",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-19-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-19",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-20.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-20",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-20",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-20-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-20",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-21.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-21",
+              "endpoints": [],
+              "name": "bulk-route-21",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-21-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-21",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-22.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-22",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-22",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-22-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-22",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-23.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-23",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-23",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-23-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-23",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-24.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-24",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-24",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-24-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-24",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-25.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-25",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-25",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-25-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-25",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-26.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-26",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-26",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-26-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-26",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-27.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-27",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-27",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-27-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-27",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-28.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-28",
+              "endpoints": [],
+              "name": "bulk-route-28",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-28-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-28",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-29.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-29",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-29",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-29-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-29",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-30.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-30",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-30",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-30-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-30",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-31.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-31",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-31",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-31-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-31",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-32.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-32",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-32",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-32-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-32",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-33.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-33",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-33",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-33-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-33",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-34.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-34",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-34",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-34-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-34",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-35.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-35",
+              "endpoints": [],
+              "name": "bulk-route-35",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-35-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-35",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-36.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-36",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-36",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-36-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-36",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-37.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-37",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-37",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-37-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-37",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-38.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-38",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-38",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-38-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-38",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-39.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-39",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-39",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-39-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-39",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-40.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-40",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-40",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-40-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-40",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-41.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-41",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-41",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-41-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-41",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-42.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-42",
+              "endpoints": [],
+              "name": "bulk-route-42",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-42-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-42",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-43.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-43",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-43",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-43-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-43",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-44.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-44",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-44",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-44-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-44",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-45.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-45",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-45",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-45-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-45",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-46.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-46",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-46",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-46-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-46",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-47.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-47",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-47",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-47-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-47",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-48.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-48",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-48",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-48-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-48",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-49.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-49",
+              "endpoints": [],
+              "name": "bulk-route-49",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-49-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-49",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-50.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-50",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-50",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-50-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-50",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-51.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-51",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-51",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-51-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-51",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-52.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-52",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-52",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-52-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-52",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-53.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-53",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-53",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-53-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-53",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-54.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-54",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-54",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-54-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-54",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-55.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-55",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-55",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-55-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-55",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-56.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-56",
+              "endpoints": [],
+              "name": "bulk-route-56",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-56-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-56",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-57.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-57",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-57",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-57-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-57",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-58.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-58",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-58",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-58-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-58",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
+        },
+        {
+          "host": "svc-59.bulk.local",
+          "port": 8080,
+          "routes": [
+            {
+              "backend_group": "bulk/svc-59",
+              "endpoints": [
+                "10.42.0.48:80",
+                "10.42.0.49:80"
+              ],
+              "name": "bulk-route-59",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            },
+            {
+              "backend_group": "bulk/svc-59-api",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-route-59",
+              "namespace": "bulk",
+              "path": "/api",
+              "type": "exact"
+            }
+          ]
         }
       ]
     },
@@ -196,6 +1789,630 @@
               "name": "staging-ingress",
               "namespace": "staging",
               "path": "/api",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-00.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-0",
+              "endpoints": [],
+              "name": "bulk-ingress-0",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-01.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-1",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-1",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-02.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-2",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-2",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-03.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-3",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-3",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-04.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-4",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-4",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-05.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-5",
+              "endpoints": [],
+              "name": "bulk-ingress-5",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-06.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-6",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-6",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-07.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-7",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-7",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-08.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-8",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-8",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-09.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-9",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-9",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-10.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-10",
+              "endpoints": [],
+              "name": "bulk-ingress-10",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-11.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-11",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-11",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-12.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-12",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-12",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-13.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-13",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-13",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-14.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-14",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-14",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-15.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-15",
+              "endpoints": [],
+              "name": "bulk-ingress-15",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-16.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-16",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-16",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-17.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-17",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-17",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-18.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-18",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-18",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-19.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-19",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-19",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-20.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-20",
+              "endpoints": [],
+              "name": "bulk-ingress-20",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-21.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-21",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-21",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-22.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-22",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-22",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-23.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-23",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-23",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-24.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-24",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-24",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-25.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-25",
+              "endpoints": [],
+              "name": "bulk-ingress-25",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-26.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-26",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-26",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-27.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-27",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-27",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-28.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-28",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-28",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-29.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-29",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-29",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-30.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-30",
+              "endpoints": [],
+              "name": "bulk-ingress-30",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-31.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-31",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-31",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-32.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-32",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-32",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-33.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-33",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-33",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-34.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-34",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-34",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-35.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-35",
+              "endpoints": [],
+              "name": "bulk-ingress-35",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-36.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-36",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-36",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-37.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-37",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-37",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-38.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-38",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-38",
+              "namespace": "bulk",
+              "path": "/",
+              "type": "prefix"
+            }
+          ]
+        },
+        {
+          "host": "shop-39.bulk.local",
+          "port": 80,
+          "routes": [
+            {
+              "backend_group": "bulk/shop-39",
+              "endpoints": [
+                "10.42.0.97:80"
+              ],
+              "name": "bulk-ingress-39",
+              "namespace": "bulk",
+              "path": "/",
               "type": "prefix"
             }
           ]

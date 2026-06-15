@@ -65,13 +65,13 @@ pub struct ControllerProcess {
     pub gateway_https_addr: SocketAddr,
     /// Local port-forwarded address for `/healthz` / `/readyz`.
     pub health_addr: SocketAddr,
-    /// Local port-forwarded address for `/metrics` / `/routes` / `/api/v1/health` on
-    /// the shared-proxy pod.
+    /// Local port-forwarded address for `/metrics` / `/api/v1/routes` /
+    /// `/api/v1/health` on the shared-proxy pod.
     pub admin_addr: SocketAddr,
     /// Local port-forwarded address for the controller pod's admin endpoint.
     /// Serves `/api/v1/health` and the aggregator surface
     /// `/api/v1/{fleet,routing}/*` plus `/api/v1/{problems,manifests/*}`.
-    /// The unprefixed `/routes` returns 404 on the controller — use the proxy
+    /// `/api/v1/routes` returns 404 on the controller — use the proxy
     /// admin (`admin_addr`) for the raw per-pod routing table.
     pub controller_admin_addr: SocketAddr,
     health_pf: Child,

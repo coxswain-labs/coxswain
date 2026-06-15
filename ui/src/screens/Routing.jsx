@@ -7,10 +7,11 @@ import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { SearchBox } from '../components/SearchBox.jsx';
 import { ComboFilter } from '../components/ComboFilter.jsx';
 import { Icon } from '../components/Icon.jsx';
+import { PAGE_SIZES } from '../components/DataTable.jsx';
 import { useEffect, useState } from 'preact/hooks';
 import { problemRouteKeys, categoryHasProblem } from '../severity.js';
 import { GatewaysSection } from './Gateways.jsx';
-import { HttpRoutesSection } from './HttpRoutes.jsx';
+import { HttpRoutesSection } from './HTTPRoutes.jsx';
 import { IngressesSection } from './Ingresses.jsx';
 
 /**
@@ -68,8 +69,7 @@ export function Routing({ query }) {
 
   // Server-side pagination: name search + namespace narrow the set server-side;
   // the window is limit/offset. Offset resets whenever the tab or a server-side
-  // filter changes.
-  const PAGE_SIZES = [25, 50, 100, 200];
+  // filter changes. `PAGE_SIZES` is shared with the per-proxy route table.
   const [pageSize, setPageSize] = useState(100);
   const [offset, setOffset] = useState(0);
   useEffect(() => {

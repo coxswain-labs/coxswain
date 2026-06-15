@@ -1,20 +1,16 @@
-import { HealthChips } from './HealthChips.jsx';
-import { Spinner, ErrorState, EmptyState } from './Spinner.jsx';
-
 /**
  * Shared "Pod" section for the pod-detail pages (controller + proxy): the pod's
- * runtime facts (node, age, restarts, phase, admin endpoint, version) plus its
- * subsystem health. Both detail screens are pods, so this keeps them identical.
+ * runtime facts (node, age, restarts, phase, admin endpoint, version). Both
+ * detail screens are pods, so this keeps them identical. Subsystem health is
+ * rendered separately as chips in the page header (see `PodHealthChips`).
  *
  * @param detail the `get_controller`/`get_proxy` object (carries node, restarts,
  *               phase, created_at, pod_ip, admin_port, reachable)
- * @param health the `useApi` result for that pod's `/health` ({data,loading,error})
+ * @param health the `useApi` result for that pod's `/health` ({data,loading,error}),
+ *               used here only for the pod's reported version
  */
 export function PodInfo({ detail, health }) {
-  const reachable = detail.reachable ?? false;
   const version = health?.data?.health?.version;
-  const subsystems = health?.data?.health?.subsystems;
-  const hasSubsystems = subsystems && Object.keys(subsystems).length > 0;
 
   const facts = [
     { label: 'Node', value: detail.node },
@@ -36,26 +32,6 @@ export function PodInfo({ detail, health }) {
           </div>
         ))}
       </dl>
-
-      <h3 class="section-title pod-health-head">Health</h3>
-      {!reachable ? (
-        <EmptyState message="Pod is unreachable — no health to show." />
-      ) : health?.loading ? (
-        <Spinner label="Loading health…" />
-      ) : health?.error ? (
-        <ErrorState error={health.error} />
-      ) : hasSubsystems ? (
-        <>
-          <p class="section-desc">
-            Each subsystem this pod runs and its readiness checks — every check
-            must pass for the subsystem to be ready. Green is all ready; amber
-            lists the checks that aren't.
-          </p>
-          <HealthChips subsystems={subsystems} />
-        </>
-      ) : (
-        <EmptyState message="No subsystem health reported." />
-      )}
     </section>
   );
 }

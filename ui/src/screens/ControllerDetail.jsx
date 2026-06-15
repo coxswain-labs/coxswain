@@ -7,6 +7,7 @@ import { Badge } from '../components/Badge.jsx';
 import { DetailHeader } from '../components/DetailHeader.jsx';
 import { PodInfo } from '../components/PodInfo.jsx';
 import { PodActions } from '../components/PodActions.jsx';
+import { PodHealthChips } from '../components/HealthChips.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 import { useEffect } from 'preact/hooks';
 
@@ -97,7 +98,12 @@ export function ControllerDetail({ pod }) {
               : <Badge variant="fail">unreachable</Badge>}
           </>
         )}
-        actions={<PodActions namespace={c.pod_namespace} name={pod} />}
+        actions={(
+          <>
+            <PodHealthChips health={health} />
+            <PodActions namespace={c.pod_namespace} name={pod} />
+          </>
+        )}
       />
 
       <PodInfo detail={c} health={health} />

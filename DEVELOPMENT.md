@@ -91,7 +91,7 @@ To run a dedicated-mode proxy (per-Gateway data plane) locally, see [docs/src/gu
 | `80`   | HTTP proxy (data plane)                          |
 | `443`  | HTTPS proxy (data plane, SNI TLS)                |
 | `8081` | Health endpoints (`/healthz`, `/readyz`)         |
-| `8082` | Admin endpoints (`/metrics`, `/routes`, `/api/v1/health`, operator UI + `/api/v1/*`) |
+| `8082` | Admin endpoints (`/metrics`, `/api/v1/routes`, `/api/v1/health`, operator UI + `/api/v1/*`) |
 
 The bind address for all listeners defaults to `0.0.0.0`. Pass `--proxy-bind-address 127.0.0.1` to restrict to localhost.
 
@@ -104,7 +104,7 @@ curl -s http://localhost:8081/readyz       # ok (after every subsystem check is 
 
 # Admin diagnostics
 curl -s http://localhost:8082/api/v1/health  # {"version":"...","kubernetes_version":"...","leader":...,"subsystems":{...}}
-curl -s http://localhost:8082/routes         # {"ingress":{"hosts":[]},"gateway":{"hosts":[]}} (proxy/dev only)
+curl -s http://localhost:8082/api/v1/routes  # {"ingress":{"hosts":[]},"gateway":{"hosts":[]}} (proxy/dev only)
 curl -s http://localhost:8082/metrics        # Prometheus text
 
 # Kubernetes
@@ -169,7 +169,7 @@ curl -H "Host: cross-ns.local" http://localhost:8000/    # 503 Service Unavailab
 ### Observe the routing table
 
 ```bash
-curl -s http://localhost:8082/routes | jq .    # lists all active hostnames
+curl -s http://localhost:8082/api/v1/routes | jq .    # lists all active hostnames
 ```
 
 ---
