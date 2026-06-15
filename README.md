@@ -2,11 +2,15 @@
 
 [![E2E & Conformance](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml/badge.svg)](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml)
 
-A Kubernetes controller that bridges classic `Ingress` and Gateway API `HTTPRoute` in a single proxy fleet, written in Rust and backed by [Pingora](https://github.com/cloudflare/pingora) — Cloudflare's battle-tested proxy library.
+> **Pre-1.0 — early adopter release.** Coxswain's core proxy is functional and passes the full Gateway API standard conformance suite. The per-Ingress annotation surface is under active development (v0.3). Production use is at your own risk; feedback and contributions are welcome.
 
-Coxswain runs as a controller pod plus a horizontally-scalable pool of read-only Pingora proxy pods. The controller is the sole Kubernetes writer (status conditions, provisioning); proxy pods build their routing table directly from Kubernetes watch events and serve traffic with no inter-replica coordination. Gateways can be opted into a dedicated proxy pool for stricter tenant isolation — see [Architecture](https://docs.coxswain-labs.dev/coxswain/latest/architecture/).
+A Kubernetes Ingress and Gateway API controller written in Rust, backed by [Pingora](https://github.com/cloudflare/pingora) — Cloudflare's battle-tested proxy library.
 
-> **Pre-1.0:** Coxswain is a work in progress — early adopters are welcome to try it out. The API surface and configuration flags may change between minor releases. Bug reports and feature requests are welcome; external contribution guidelines will follow as the project matures.
+- Bridges classic `Ingress` and Gateway API `HTTPRoute` in a single proxy fleet
+- Routing changes and TLS certificate rotations take effect without restarting the proxy
+- Controller/proxy split with a strict RBAC boundary — proxy pods hold zero write permissions
+
+See [Architecture](https://docs.coxswain-labs.dev/coxswain/latest/architecture/) for the deployment models (shared and dedicated proxy pools) and the RBAC boundary.
 
 **Documentation**: [docs.coxswain-labs.dev/coxswain](https://docs.coxswain-labs.dev/coxswain/) — installation guides, configuration reference, architecture overview, and FAQ.
 
@@ -29,6 +33,14 @@ helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --namespace coxswain-system --create-namespace
 
 # Or: kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/latest/download/install.yaml
+```
+
+Wait for the controller, then confirm the `GatewayClass` is accepted:
+
+```bash
+kubectl -n coxswain-system wait pod -l app.kubernetes.io/name=coxswain \
+  --for=condition=Ready --timeout=90s
+kubectl get gatewayclass coxswain
 ```
 
 **3. Create a Gateway and route** (swap `echo.example.com` and the backend service to match your app):
@@ -88,6 +100,15 @@ PROXY=localhost:8080
 
 ```bash
 curl -H "Host: echo.example.com" http://$PROXY/
+```
+
+**6. Open the operator console:**
+
+The controller serves a built-in web UI on its admin port — cluster health, the live routing table across Gateways and Ingresses, per-pod fleet status, and recent events:
+
+```bash
+kubectl port-forward -n coxswain-system svc/coxswain-controller 8082:8082 &
+# open http://localhost:8082
 ```
 
 For the complete walkthrough — including a test backend, TLS, and Ingress — see [Getting started](https://docs.coxswain-labs.dev/coxswain/latest/getting-started/).
