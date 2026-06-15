@@ -5,6 +5,7 @@
 use coxswain_core::fleet::{FleetEntry, FleetSnapshot};
 
 use crate::gw_types;
+use crate::routes_dto::{CheckRow, RouteKey, RoutesResponse};
 
 /// The proxy `/api/v1/routes` sub-key for a route kind: Gateway-API routes live under
 /// `gateway`, classic Ingress under `ingress`. `None` for an unknown kind.
@@ -49,45 +50,43 @@ pub(super) fn serving_proxies_for_parents(
     out
 }
 
-/// Flatten the rows in one proxy's `/api/v1/routes` payload that are tagged with the
-/// given route object to `{host, path, backend_group, endpoints}`.
+/// Flatten the rows in one proxy's routes payload that are tagged with the given
+/// route object to [`CheckRow`]s, computing `dead` (zero endpoints) per row.
 pub(super) fn route_rows_for(
-    routes: &serde_json::Value,
+    routes: &RoutesResponse,
     spec_key: &str,
     namespace: &str,
     name: &str,
-) -> Vec<serde_json::Value> {
+) -> Vec<CheckRow> {
+    let block = match spec_key {
+        "ingress" => &routes.ingress,
+        "gateway" => &routes.gateway,
+        _ => return Vec::new(),
+    };
     let mut out = Vec::new();
-    let hosts = routes
-        .get(spec_key)
-        .and_then(|s| s.get("hosts"))
-        .and_then(|h| h.as_array());
-    for host_entry in hosts.into_iter().flatten() {
-        let host = host_entry
-            .get("host")
-            .and_then(|h| h.as_str())
-            .unwrap_or("");
-        let rows = host_entry.get("routes").and_then(|r| r.as_array());
-        for r in rows.into_iter().flatten() {
-            if r.get("namespace").and_then(|v| v.as_str()) == Some(namespace)
-                && r.get("name").and_then(|v| v.as_str()) == Some(name)
-            {
-                out.push(serde_json::json!({
-                    "host": host,
-                    "path": r.get("path").cloned().unwrap_or(serde_json::Value::Null),
-                    "backend_group": r.get("backend_group").cloned().unwrap_or(serde_json::Value::Null),
-                    "endpoints": r.get("endpoints").cloned().unwrap_or_else(|| serde_json::json!([])),
-                }));
+    for host_group in &block.hosts {
+        for r in &host_group.routes {
+            if r.namespace == namespace && r.name == name {
+                out.push(CheckRow {
+                    host: host_group.host.clone(),
+                    path: r.path.clone(),
+                    backend_group: r.backend_group.clone(),
+                    dead: r.endpoints.is_empty(),
+                    endpoints: r.endpoints.clone(),
+                });
             }
         }
     }
     out
 }
 
-/// `(host, path, backend_group)` identity for a check row, for set membership.
-pub(super) fn row_key(r: &serde_json::Value) -> (String, String, String) {
-    let s = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
-    (s("host"), s("path"), s("backend_group"))
+/// `(host, path, backend_group)` identity of a check row, for set membership.
+pub(super) fn row_key(r: &CheckRow) -> RouteKey {
+    RouteKey {
+        host: r.host.clone(),
+        path: r.path.clone(),
+        backend_group: r.backend_group.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -98,27 +97,24 @@ mod tests {
 
     #[test]
     fn route_rows_for_filters_to_tagged_rows() {
-        let routes = serde_json::json!({
+        let routes: RoutesResponse = serde_json::from_value(serde_json::json!({
             "gateway": { "hosts": [
                 { "host": "api.demo.local", "port": 8080, "routes": [
-                    {"name": "api-route", "namespace": "demo", "path": "/",
+                    {"type": "prefix", "name": "api-route", "namespace": "demo", "path": "/",
                      "backend_group": "demo/api", "endpoints": []},
-                    {"name": "other", "namespace": "demo", "path": "/x",
+                    {"type": "exact", "name": "other", "namespace": "demo", "path": "/x",
                      "backend_group": "demo/other", "endpoints": ["1.2.3.4:80"]}
                 ]}
             ]}
-        });
+        }))
+        .expect("deserialise routes body");
         let rows = route_rows_for(&routes, "gateway", "demo", "api-route");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["host"], "api.demo.local");
-        assert_eq!(rows[0]["path"], "/");
-        assert_eq!(rows[0]["backend_group"], "demo/api");
-        assert!(
-            rows[0]["endpoints"]
-                .as_array()
-                .expect("endpoints array")
-                .is_empty()
-        );
+        assert_eq!(rows[0].host, "api.demo.local");
+        assert_eq!(rows[0].path, "/");
+        assert_eq!(rows[0].backend_group, "demo/api");
+        assert!(rows[0].endpoints.is_empty());
+        assert!(rows[0].dead, "zero endpoints ⇒ dead");
     }
 
     #[test]

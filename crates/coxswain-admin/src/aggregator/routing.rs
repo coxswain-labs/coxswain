@@ -15,6 +15,7 @@ use super::{
     OperatorAggregator, internal_error, json_response, not_found, pod_base_url, service_unavailable,
 };
 use crate::gw_types::{self, HttpRoute};
+use crate::routes_dto::{ProxyCheck, ProxyRoutes, RouteCheck, RouteKey, RoutesResponse};
 
 impl OperatorAggregator {
     /// `GET /api/v1/routing/routes/{kind}/{namespace}/{name}` — kind-dispatching
@@ -33,8 +34,9 @@ impl OperatorAggregator {
         }
     }
 
-    /// Live HTTPRoute status conditions from Kubernetes + parallel `/api/v1/routes`
-    /// fan-out to all proxy pods.
+    /// `GET /api/v1/routing/routes/httproute/{namespace}/{name}` — the HTTPRoute
+    /// object's effective config + live status conditions from Kubernetes. No proxy
+    /// fan-out; data-plane consistency is the on-demand `/check` sub-resource.
     pub(crate) async fn get_httproute(&self, namespace: &str, name: &str) -> Response<Vec<u8>> {
         let kube = match self.kube().await {
             Ok(c) => c,
@@ -106,9 +108,9 @@ impl OperatorAggregator {
         )
     }
 
-    /// `GET /api/v1/routing/routes/ingress/{namespace}/{name}` — live Ingress
-    /// load-balancer status from Kubernetes + parallel `/api/v1/routes` fan-out to
-    /// all proxy pods.
+    /// `GET /api/v1/routing/routes/ingress/{namespace}/{name}` — the Ingress object's
+    /// effective config + live load-balancer status from Kubernetes. No proxy fan-out;
+    /// data-plane consistency is the on-demand `/check` sub-resource.
     pub(crate) async fn get_ingress_route(&self, namespace: &str, name: &str) -> Response<Vec<u8>> {
         let kube = match self.kube().await {
             Ok(c) => c,
@@ -241,93 +243,65 @@ impl OperatorAggregator {
 
         // Pass 1: per-pod route-tagged rows + the union of (host, path, backend)
         // keys seen across all reachable serving proxies — the expected set.
-        let mut union: Vec<(String, String, String)> = Vec::new();
-        let mut union_seen: std::collections::HashSet<(String, String, String)> =
-            std::collections::HashSet::new();
-        let mut pod_rows: Vec<(String, bool, Vec<serde_json::Value>)> = Vec::new();
+        let mut union: Vec<RouteKey> = Vec::new();
+        let mut union_seen: std::collections::HashSet<RouteKey> = std::collections::HashSet::new();
+        let mut pod_rows: Vec<(String, Option<Vec<_>>)> = Vec::new();
         for pr in &pod_results {
-            let pod_name = pr
-                .get("pod_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let reachable = pr
-                .get("reachable")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !reachable {
-                pod_rows.push((pod_name, false, Vec::new()));
+            let Some(routes) = &pr.routes else {
+                pod_rows.push((pr.pod_name.clone(), None));
                 continue;
-            }
-            let routes = pr.get("routes").cloned().unwrap_or(serde_json::Value::Null);
-            let rows = route_rows_for(&routes, spec_key, namespace, name);
+            };
+            let rows = route_rows_for(routes, spec_key, namespace, name);
             for r in &rows {
                 let key = row_key(r);
                 if union_seen.insert(key.clone()) {
                     union.push(key);
                 }
             }
-            pod_rows.push((pod_name, true, rows));
+            pod_rows.push((pr.pod_name.clone(), Some(rows)));
         }
 
         // Pass 2: per-pod present rows (flagging dead backends) + the union keys
         // each pod is missing. Any unreachable pod, any missing key, or a route
         // absent from every proxy means the data plane disagrees.
         let mut consistent = !union.is_empty();
-        let mut proxies_json: Vec<serde_json::Value> = Vec::new();
-        for (pod_name, reachable, rows) in &pod_rows {
-            if !reachable {
+        let mut proxies: Vec<ProxyCheck> = Vec::new();
+        for (pod_name, rows) in pod_rows {
+            let Some(rows) = rows else {
                 consistent = false;
-                proxies_json.push(serde_json::json!({ "pod_name": pod_name, "reachable": false }));
+                proxies.push(ProxyCheck {
+                    pod_name,
+                    reachable: false,
+                    rows: None,
+                    missing: None,
+                });
                 continue;
-            }
-            let present: std::collections::HashSet<(String, String, String)> =
-                rows.iter().map(row_key).collect();
-            let missing: Vec<serde_json::Value> = union
+            };
+            let present: std::collections::HashSet<RouteKey> = rows.iter().map(row_key).collect();
+            let missing: Vec<RouteKey> = union
                 .iter()
                 .filter(|k| !present.contains(*k))
-                .map(|(host, path, backend_group)| {
-                    serde_json::json!({ "host": host, "path": path, "backend_group": backend_group })
-                })
+                .cloned()
                 .collect();
             if !missing.is_empty() {
                 consistent = false;
             }
-            let rows_json: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|r| {
-                    let dead = r
-                        .get("endpoints")
-                        .and_then(|e| e.as_array())
-                        .is_none_or(|a| a.is_empty());
-                    let mut rr = r.clone();
-                    rr["dead"] = serde_json::Value::Bool(dead);
-                    rr
-                })
-                .collect();
-            proxies_json.push(serde_json::json!({
-                "pod_name": pod_name,
-                "reachable": true,
-                "rows": rows_json,
-                "missing": missing,
-            }));
+            proxies.push(ProxyCheck {
+                pod_name,
+                reachable: true,
+                rows: Some(rows),
+                missing: Some(missing),
+            });
         }
 
-        let expected: Vec<serde_json::Value> = union
-            .iter()
-            .map(|(host, path, backend_group)| {
-                serde_json::json!({ "host": host, "path": path, "backend_group": backend_group })
-            })
-            .collect();
-
         json_response(
-            serde_json::json!({
-                "kind": kind,
-                "namespace": namespace,
-                "name": name,
-                "consistent": consistent,
-                "expected": expected,
-                "proxies": proxies_json,
+            serde_json::json!(RouteCheck {
+                kind: kind.to_owned(),
+                namespace: namespace.to_owned(),
+                name: name.to_owned(),
+                consistent,
+                expected: union,
+                proxies,
             })
             .to_string(),
         )
@@ -335,10 +309,9 @@ impl OperatorAggregator {
 
     /// Fan out `GET /api/v1/routes` to all proxy pods in parallel.
     ///
-    /// Returns one entry per pod: `{pod_name, reachable: true, routes: {...}}`
-    /// when the pod responds, or `{pod_name, reachable: false}` on timeout or
-    /// error.
-    pub(super) async fn fan_out_routes(&self) -> Vec<serde_json::Value> {
+    /// Returns one [`ProxyRoutes`] per pod: the parsed body when the pod responds,
+    /// or `routes: None` (`reachable: false`) on timeout, error, or unparseable body.
+    pub(super) async fn fan_out_routes(&self) -> Vec<ProxyRoutes> {
         let snapshot = self.fleet.load();
         let entries: Vec<FleetEntry> = snapshot
             .shared_proxies
@@ -352,7 +325,7 @@ impl OperatorAggregator {
     /// Fan out `GET /api/v1/routes` to a specific set of proxy pods in parallel —
     /// the check path targets only the proxies that should serve a given route,
     /// not the whole fleet.
-    async fn fan_out_routes_to(&self, entries: &[FleetEntry]) -> Vec<serde_json::Value> {
+    async fn fan_out_routes_to(&self, entries: &[FleetEntry]) -> Vec<ProxyRoutes> {
         let http = &self.http;
         let futures: Vec<_> = entries
             .iter()
@@ -360,22 +333,22 @@ impl OperatorAggregator {
                 let url = format!("{}/api/v1/routes", pod_base_url(e));
                 let pod_name = e.pod_name.clone();
                 async move {
-                    match http
+                    // `routes` is `Some` only when the pod responds 2xx with a body
+                    // that parses into the typed contract; anything else is unreachable.
+                    let routes = match http
                         .get(&url)
                         .send()
                         .await
                         .ok()
                         .filter(|r| r.status().is_success())
                     {
-                        Some(resp) => match resp.json::<serde_json::Value>().await.ok() {
-                            Some(routes) => serde_json::json!({
-                                "pod_name": pod_name,
-                                "reachable": true,
-                                "routes": routes,
-                            }),
-                            None => serde_json::json!({ "pod_name": pod_name, "reachable": false }),
-                        },
-                        None => serde_json::json!({ "pod_name": pod_name, "reachable": false }),
+                        Some(resp) => resp.json::<RoutesResponse>().await.ok(),
+                        None => None,
+                    };
+                    ProxyRoutes {
+                        pod_name,
+                        reachable: routes.is_some(),
+                        routes,
                     }
                 }
             })
@@ -626,6 +599,8 @@ mod tests {
                                 "type": "prefix",
                                 "path": "/",
                                 "backend_group": "default/svc:80",
+                                "namespace": "default",
+                                "name": "svc",
                                 "endpoints": ["10.0.1.1:8080"]
                             }
                         ]
@@ -636,21 +611,23 @@ mod tests {
             "gateway": { "hosts": [], "conflicts": [] }
         });
 
-        // The aggregator stores the parsed value as-is inside the per-pod entry.
-        let entry = serde_json::json!({
-            "pod_name": "proxy-0",
-            "reachable": true,
-            "routes": raw,
-        });
-        assert_eq!(
-            entry["routes"]["ingress"]["hosts"][0]["host"],
-            "example.com"
-        );
-        assert_eq!(
-            entry["routes"]["ingress"]["hosts"][0]["routes"][0]["type"],
-            "prefix"
-        );
-        assert_eq!(entry["routes"]["gateway"]["hosts"], serde_json::json!([]));
+        // The body deserialises into the typed contract...
+        let parsed: RoutesResponse = serde_json::from_value(raw).expect("parse proxy routes");
+        assert_eq!(parsed.ingress.hosts[0].host, "example.com");
+        assert_eq!(parsed.ingress.hosts[0].port, 80);
+        assert_eq!(parsed.ingress.hosts[0].routes[0].kind, "prefix");
+        assert!(parsed.gateway.hosts.is_empty());
+
+        // ...and the fan-out envelope round-trips it (reachable mirrors routes presence).
+        let envelope = ProxyRoutes {
+            pod_name: "proxy-0".to_owned(),
+            reachable: true,
+            routes: Some(parsed),
+        };
+        let v = serde_json::to_value(&envelope).expect("serialise envelope");
+        assert_eq!(v["routes"]["ingress"]["hosts"][0]["host"], "example.com");
+        assert_eq!(v["routes"]["gateway"]["hosts"], serde_json::json!([]));
+        assert_eq!(v["reachable"], true);
     }
 
     #[test]

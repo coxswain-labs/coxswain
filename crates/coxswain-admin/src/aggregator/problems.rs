@@ -8,6 +8,7 @@ use coxswain_core::fleet::FleetEntry;
 use futures::future::join_all;
 
 use super::{OperatorAggregator, json_response, non_ready_checks, pod_base_url};
+use crate::routes_dto::{Problem, ProxyRoutes, RouteRef, RoutingProblems};
 
 impl OperatorAggregator {
     /// `GET /api/v1/problems` — cluster-wide routing problems derived from
@@ -138,7 +139,7 @@ impl OperatorAggregator {
 /// — the source Ingress/HTTPRoute identity — so the operator UI can deep-link the
 /// card to that route in the Route Inspector. (For a conflict, this is the
 /// rejected/shadowed route.)
-fn aggregate_problems(raw: &[serde_json::Value]) -> serde_json::Value {
+fn aggregate_problems(raw: &[ProxyRoutes]) -> RoutingProblems {
     // (host, path, group, kind) → (route_ns, route_name, pods). BTreeMap for
     // stable output ordering.
     type ProblemMap =
@@ -147,54 +148,43 @@ fn aggregate_problems(raw: &[serde_json::Value]) -> serde_json::Value {
     let mut dead_routes: ProblemMap = std::collections::BTreeMap::new();
 
     for proxy in raw {
-        let pod_name = proxy["pod_name"].as_str().unwrap_or("").to_owned();
-        if !proxy["reachable"].as_bool().unwrap_or(false) {
+        // `routes: None` ⇒ unreachable; skip (no problems to attribute).
+        let Some(routes) = &proxy.routes else {
             continue;
-        }
-        let routes = &proxy["routes"];
+        };
+        let pod_name = &proxy.pod_name;
 
-        for spec in ["ingress", "gateway"] {
-            if let Some(conflict_arr) = routes[spec]["conflicts"].as_array() {
-                for c in conflict_arr {
-                    let key = (
-                        c["host"].as_str().unwrap_or("").to_owned(),
-                        c["path"].as_str().unwrap_or("").to_owned(),
-                        c["rejected_group"].as_str().unwrap_or("").to_owned(),
-                        spec.to_owned(),
-                    );
-                    let route_ns = c["namespace"].as_str().unwrap_or("").to_owned();
-                    let route_name = c["name"].as_str().unwrap_or("").to_owned();
-                    conflicts
-                        .entry(key)
-                        .or_insert_with(|| (route_ns, route_name, Vec::new()))
-                        .2
-                        .push(pod_name.clone());
-                }
+        for (spec, block) in [("ingress", &routes.ingress), ("gateway", &routes.gateway)] {
+            for c in &block.conflicts {
+                let key = (
+                    c.host.clone(),
+                    c.path.clone(),
+                    c.rejected_group.clone(),
+                    spec.to_owned(),
+                );
+                conflicts
+                    .entry(key)
+                    .or_insert_with(|| (c.namespace.clone(), c.name.clone(), Vec::new()))
+                    .2
+                    .push(pod_name.clone());
             }
 
-            if let Some(hosts) = routes[spec]["hosts"].as_array() {
-                for host_entry in hosts {
-                    let host = host_entry["host"].as_str().unwrap_or("").to_owned();
-                    if let Some(route_arr) = host_entry["routes"].as_array() {
-                        for route in route_arr {
-                            let is_dead =
-                                route["endpoints"].as_array().is_some_and(|e| e.is_empty());
-                            if is_dead {
-                                let key = (
-                                    host.clone(),
-                                    route["path"].as_str().unwrap_or("").to_owned(),
-                                    route["backend_group"].as_str().unwrap_or("").to_owned(),
-                                    spec.to_owned(),
-                                );
-                                let route_ns = route["namespace"].as_str().unwrap_or("").to_owned();
-                                let route_name = route["name"].as_str().unwrap_or("").to_owned();
-                                dead_routes
-                                    .entry(key)
-                                    .or_insert_with(|| (route_ns, route_name, Vec::new()))
-                                    .2
-                                    .push(pod_name.clone());
-                            }
-                        }
+            for host_group in &block.hosts {
+                for route in &host_group.routes {
+                    if route.endpoints.is_empty() {
+                        let key = (
+                            host_group.host.clone(),
+                            route.path.clone(),
+                            route.backend_group.clone(),
+                            spec.to_owned(),
+                        );
+                        dead_routes
+                            .entry(key)
+                            .or_insert_with(|| {
+                                (route.namespace.clone(), route.name.clone(), Vec::new())
+                            })
+                            .2
+                            .push(pod_name.clone());
                     }
                 }
             }
@@ -210,44 +200,60 @@ fn aggregate_problems(raw: &[serde_json::Value]) -> serde_json::Value {
         }
     };
 
-    let conflicts_json: Vec<serde_json::Value> = conflicts
+    let conflicts = conflicts
         .into_iter()
         .map(
             |((host, path, rejected_group, kind), (namespace, name, pods))| {
-                serde_json::json!({
-                    "host": host,
-                    "path": path,
-                    "rejected_group": rejected_group,
-                    "kind": kind,
-                    "pods": pods,
-                    "route": { "kind": route_kind(&kind), "namespace": namespace, "name": name },
-                })
+                let route = RouteRef {
+                    kind: route_kind(&kind).to_owned(),
+                    namespace,
+                    name,
+                };
+                Problem {
+                    host,
+                    path,
+                    kind,
+                    rejected_group: Some(rejected_group),
+                    backend_group: None,
+                    pods,
+                    route,
+                }
             },
         )
         .collect();
 
-    let dead_json: Vec<serde_json::Value> = dead_routes
+    let dead_routes = dead_routes
         .into_iter()
         .map(
             |((host, path, backend_group, kind), (namespace, name, pods))| {
-                serde_json::json!({
-                    "host": host,
-                    "path": path,
-                    "backend_group": backend_group,
-                    "kind": kind,
-                    "pods": pods,
-                    "route": { "kind": route_kind(&kind), "namespace": namespace, "name": name },
-                })
+                let route = RouteRef {
+                    kind: route_kind(&kind).to_owned(),
+                    namespace,
+                    name,
+                };
+                Problem {
+                    host,
+                    path,
+                    kind,
+                    rejected_group: None,
+                    backend_group: Some(backend_group),
+                    pods,
+                    route,
+                }
             },
         )
         .collect();
 
-    serde_json::json!({ "conflicts": conflicts_json, "dead_routes": dead_json })
+    RoutingProblems {
+        conflicts,
+        dead_routes,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes_dto::ProxyRoutes;
 
     /// Build a fake proxy-routes fan-out result for list_problems testing.
     fn fake_routes_result(
@@ -274,7 +280,9 @@ mod tests {
         // Two pods report the same conflict + dead route (shared table). Each
         // carries the source route's namespace/name for deep-linking.
         let conflict = serde_json::json!({
+            "port": 80,
             "host": "api.example.com",
+            "type": "exact",
             "path": "/v1",
             "rejected_group": "default/shadowed-svc:80",
             "namespace": "default",
@@ -292,7 +300,7 @@ mod tests {
                 "endpoints": [],
             }]
         });
-        let raw = vec![
+        let raw: Vec<ProxyRoutes> = vec![
             fake_routes_result(
                 "proxy-0",
                 true,
@@ -306,9 +314,15 @@ mod tests {
                 vec![dead_host.clone()],
             ),
             fake_routes_result("proxy-2", false, vec![], vec![]),
-        ];
+        ]
+        .into_iter()
+        .map(|v| serde_json::from_value(v).expect("fixture deserialises into ProxyRoutes"))
+        .collect();
 
-        let out = aggregate_problems(&raw);
+        // Serialise the typed aggregate back to a Value so the structural
+        // assertions below exercise the full round-trip.
+        let out =
+            serde_json::to_value(aggregate_problems(&raw)).expect("problems serialise to Value");
 
         // One unique conflict (de-duped from two pods), tagged with kind + route.
         let conflicts = out["conflicts"].as_array().unwrap();
