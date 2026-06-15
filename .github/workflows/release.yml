@@ -39,15 +39,15 @@ concurrency:
 # https://docs.docker.com/build/ci/github-actions/multi-platform/#distribute-build-across-multiple-runners
 #
 # Job graph (main: through publish-image + publish-docs; tag: full pipeline):
-#   cargo-deny ──► build ──► trivy-scan ──► conformance ──► publish-image ──┬──► publish-kustomize ──┐
-#                                                                            └──► publish-chart    ──┴──► publish-docs
-#   (cargo-deny gates the build; trivy-scan scans the freshly-built amd64 image
-#    by digest and fails fast on HIGH/CRITICAL CVEs *before* the expensive
-#    conformance suite, so we never run conformance on an artifact we'd discard;
-#    conformance then runs the Gateway API suite against those exact bytes; both
-#    gate image publish. publish-docs is the last step and is skipped if any
-#    prior release job fails, so a broken release never promotes the docs site
-#    to a tag that lacks signed artifacts.)
+#   cargo-deny ──► build ──┬──► trivy-scan ──┐
+#                          └──► conformance ──┴──► publish-image ──┬──► publish-kustomize ──┐
+#                                                                  └──► publish-chart    ──┴──► publish-docs
+#   (cargo-deny gates the build; trivy-scan and conformance run in parallel
+#    against the same amd64 digest — trivy scans for HIGH/CRITICAL CVEs,
+#    conformance runs the full Gateway API suite and produces the report attached
+#    to the GitHub Release; both must pass before publish-image. publish-docs is
+#    the last step and is skipped if any prior release job fails, so a broken
+#    release never promotes the docs site to a tag that lacks signed artifacts.)
 jobs:
   cargo-deny:
     name: cargo-deny
@@ -190,12 +190,11 @@ jobs:
 
   conformance:
     name: conformance
-    # Gate image publish on the Gateway API suite passing against the *exact*
-    # image the build job pushed — not a separately-compiled binary. Runs after
-    # trivy-scan so a CVE failure fails fast without burning a full conformance
-    # run on an artifact we'd discard (trivy-scan needs build, so build → the
-    # digest this job pulls is available transitively).
-    needs: [build, trivy-scan]
+    # Runs the Gateway API conformance suite against the exact amd64 image the
+    # build job pushed — not a separately-compiled binary — and uploads the
+    # report artifact attached to the GitHub Release. Runs in parallel with
+    # trivy-scan (both depend only on build); publish-image requires both to pass.
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -246,7 +245,7 @@ jobs:
 
   publish-image:
     name: publish-image
-    needs: [build, conformance]
+    needs: [build, trivy-scan, conformance]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
