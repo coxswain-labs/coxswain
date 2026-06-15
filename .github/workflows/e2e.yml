@@ -63,32 +63,23 @@ jobs:
         with:
           cache-key-prefix: e2e-build
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       # Build coxswain and the e2e test binaries in debug profile so they share
       # the same dependency graph — one cargo cache, two sets of artifacts.
       # Debug is fine for tests; we're not measuring proxy throughput here.
       - name: Build coxswain binary
         run: cargo build --bin coxswain
 
-      # cargo test --no-run compiles every #[test] binary in coxswain-e2e/tests/
-      # without running them. --message-format=json emits one JSON per artifact;
-      # we extract (target.name, executable) pairs and copy each into test-bins/
-      # under its short name so matrix jobs can address them by suite.
-      - name: Build e2e test binaries
-        run: |
-          set -euo pipefail
-          mkdir -p test-bins
-          cargo test --no-run -p coxswain-e2e --tests --message-format=json \
-            | tee /tmp/cargo-test.json \
-            | jq -r '
-                select(.reason == "compiler-artifact") |
-                select(.target.kind[]? == "test") |
-                select(.executable != null) |
-                "\(.target.name)\t\(.executable)"
-              ' \
-            | while IFS=$'\t' read -r name exe; do
-                cp "$exe" "test-bins/$name"
-              done
-          ls -lh test-bins/
+      # cargo nextest archive compiles every integration test binary in
+      # coxswain-e2e/tests/ and bundles them with nextest metadata into a
+      # single .tar.zst archive. Matrix jobs download the archive and run
+      # `cargo-nextest run --archive-file` — no Rust toolchain required on
+      # the test runner, just the nextest binary from taiki-e/install-action.
+      - name: Build e2e test archive
+        run: cargo nextest archive --archive-file e2e-archive.tar.zst -p coxswain-e2e
 
       - name: Build e2e Docker image
         run: docker build -f Dockerfile.ci -t coxswain:e2e .
@@ -103,11 +94,11 @@ jobs:
           path: e2e-image.tar.gz
           retention-days: 1
 
-      - name: Upload e2e test binaries
+      - name: Upload e2e test archive
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-test-bins
-          path: test-bins/
+          name: e2e-archive
+          path: e2e-archive.tar.zst
           retention-days: 1
 
       # Build cloud-provider-kind once here so the e2e and conformance jobs
@@ -141,7 +132,8 @@ jobs:
     name: e2e-${{ matrix.suite }}
     needs: [changes, build]
     if: needs.changes.outputs.code == 'true'
-    # Matrix jobs only run pre-compiled binaries — no Rust toolchain, no cargo.
+    # Matrix jobs run pre-compiled binaries via `cargo-nextest run --archive-file`.
+    # No Rust toolchain needed — only the nextest binary (taiki-e/install-action).
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -204,16 +196,22 @@ jobs:
       - name: Load Docker image into daemon
         run: docker load < e2e-image.tar.gz
 
-      - name: Download e2e test binaries
+      - name: Download e2e test archive
         uses: actions/download-artifact@v8
         with:
-          name: e2e-test-bins
-          path: test-bins/
+          name: e2e-archive
+
+      # Install the nextest binary standalone — no Rust toolchain needed to
+      # run from a pre-built archive. The archive carries the test binaries;
+      # cargo-nextest extracts and executes them directly.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
 
       - name: Run e2e tests (${{ matrix.suite }})
         run: |
-          chmod +x test-bins/${{ matrix.test }}
-          ./test-bins/${{ matrix.test }} --test-threads=1
+          cargo-nextest run --profile e2e --archive-file e2e-archive.tar.zst \
+            -E 'binary(${{ matrix.test }})'
         env:
           COXSWAIN_E2E_SKIP_BUILD: "1"
           RUST_LOG: coxswain_e2e=debug,warn
