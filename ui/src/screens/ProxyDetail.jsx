@@ -15,7 +15,7 @@ import { ComboFilter } from '../components/ComboFilter.jsx';
 import { Table } from '../components/Table.jsx';
 import { Pager, PAGE_SIZES } from '../components/DataTable.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 
 /**
  * Proxy detail screen.
@@ -184,6 +184,25 @@ export function ProxyDetail({ pod, query }) {
   );
 }
 
+/** Track an element's height into a CSS variable so the table header can dock
+ *  directly below the pinned controls bar. The bar's height isn't fixed — it
+ *  grows when the filters wrap and shrinks when the tab bar or pager are absent —
+ *  so a measured value beats a hard-coded offset. Returns [ref, heightPx]. */
+function useElementHeight() {
+  const ref = useRef(null);
+  const [height, setHeight] = useState(0);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return undefined;
+    const update = () => setHeight(el.offsetHeight);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, height];
+}
+
 /** Debounce a rapidly-changing value (search keystrokes) so each character
  *  doesn't trigger a server round-trip against a large routing table. */
 function useDebounced(value, ms = 250) {
@@ -207,6 +226,9 @@ function RoutesPanel({
   onHost, onNamespace, onPath, problemsOnly, onProblemsOnly,
   pageSize, offset, onPage, onPageSize, activeTab, onTab,
 }) {
+  // Measured height of the pinned controls bar → the column header docks just
+  // below it instead of sliding up behind it as the rows scroll the window.
+  const [chromeRef, chromeH] = useElementHeight();
   const routeSpecs = [
     { id: 'ingress', kind: 'ingress',   label: 'Ingress',     spec: routesData?.routes?.ingress },
     { id: 'gateway', kind: 'httproute', label: 'Gateway API', spec: routesData?.routes?.gateway },
@@ -243,85 +265,91 @@ function RoutesPanel({
   ];
 
   return (
-    <div>
-      {/* Filters narrow every tab (the backend applies them to both route blocks
-          and the conflicts), so they sit ABOVE the tab bar — one shared scope.
-          Namespace + host are dropdown picks (left); path is the free-text search
-          (right), the conventional toolbar split. */}
-      <div class="header-controls left routing-filters" style="margin-bottom:14px">
-        <div class="filter-group">
-          <ComboFilter
-            label="Filter by namespace"
-            value={namespace}
-            options={nsOptions}
-            onChange={onNamespace}
+    <div class="routes-screen" style={`--routes-chrome-h:${chromeH}px`}>
+      {/* The filter + tab + pager chrome is pinned to the top of the viewport
+          (see .routes-controls) so it stays reachable while the row list scrolls
+          the window underneath — Routing's "controls stay put" benefit without a
+          fixed-height inner-scroll container on this composite screen. */}
+      <div class="routes-controls" ref={chromeRef}>
+        {/* Filters narrow every tab (the backend applies them to both route
+            blocks and the conflicts), so they sit ABOVE the tab bar — one shared
+            scope. Namespace + host are dropdown picks (left); path is the
+            free-text search (right), the conventional toolbar split. */}
+        <div class="header-controls left routing-filters">
+          <div class="filter-group">
+            <ComboFilter
+              label="Filter by namespace"
+              value={namespace}
+              options={nsOptions}
+              onChange={onNamespace}
+            />
+            <ComboFilter
+              label="Filter by host"
+              value={host}
+              options={hostOptions}
+              onChange={onHost}
+            />
+            <button
+              type="button"
+              class={`toggle-pill${problemsOnly ? ' active' : ''}`}
+              aria-pressed={problemsOnly}
+              title="Show only routes that aren't serving traffic (no ready endpoints)"
+              onClick={() => onProblemsOnly(!problemsOnly)}
+            >
+              <Icon name="alert" size={13} />
+              Problems only
+            </button>
+          </div>
+          <SearchBox
+            value={pathSearch}
+            onInput={(e) => onPath(e.currentTarget.value)}
+            placeholder="Filter by path…"
+            label="Filter routes by path"
           />
-          <ComboFilter
-            label="Filter by host"
-            value={host}
-            options={hostOptions}
-            onChange={onHost}
-          />
-          <button
-            type="button"
-            class={`toggle-pill${problemsOnly ? ' active' : ''}`}
-            aria-pressed={problemsOnly}
-            title="Show only routes that aren't serving traffic (no ready endpoints)"
-            onClick={() => onProblemsOnly(!problemsOnly)}
-          >
-            <Icon name="alert" size={13} />
-            Problems only
-          </button>
         </div>
-        <SearchBox
-          value={pathSearch}
-          onInput={(e) => onPath(e.currentTarget.value)}
-          placeholder="Filter by path…"
-          label="Filter routes by path"
-        />
+
+        {tabs.length > 1 && (
+          <div class="tabs" role="tablist">
+            {tabs.map((t) => {
+              const warn = t.id === 'conflicts' || specHasDeadRoute(t.spec);
+              const count = t.id === 'conflicts' ? conflicts.length : blockTotal(t.spec);
+              return (
+                <button
+                  key={t.id}
+                  role="tab"
+                  aria-selected={t.id === activeId}
+                  class={`tab${t.id === activeId ? ' active' : ''}`}
+                  onClick={() => onTab(t.id)}
+                >
+                  <span class={`tab-label ${warn ? 'warn' : 'ok'}`}>
+                    <Icon name={warn ? 'alert' : 'check'} size={13} />
+                    {t.label} ({count})
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Pager ABOVE the (potentially long) table so the page controls + the
+            "X–Y of N" count are reachable without scrolling past every row. The
+            Conflicts tab is bounded, so it gets no pager. */}
+        {!isConflicts && total > 0 && (
+          <div class="pager-bar">
+            <Pager
+              page={{
+                offset: active.spec.offset ?? offset,
+                returned: active.spec.returned ?? countRoutes(active.spec),
+                total,
+                pageSize,
+                pageSizes: PAGE_SIZES,
+                onPage,
+                onPageSize,
+              }}
+            />
+          </div>
+        )}
       </div>
-
-      {tabs.length > 1 && (
-        <div class="tabs" role="tablist">
-          {tabs.map((t) => {
-            const warn = t.id === 'conflicts' || specHasDeadRoute(t.spec);
-            const count = t.id === 'conflicts' ? conflicts.length : blockTotal(t.spec);
-            return (
-              <button
-                key={t.id}
-                role="tab"
-                aria-selected={t.id === activeId}
-                class={`tab${t.id === activeId ? ' active' : ''}`}
-                onClick={() => onTab(t.id)}
-              >
-                <span class={`tab-label ${warn ? 'warn' : 'ok'}`}>
-                  <Icon name={warn ? 'alert' : 'check'} size={13} />
-                  {t.label} ({count})
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      {/* Pager ABOVE the (potentially long) table so the page controls + the
-          "X–Y of N" count are reachable without scrolling past every row. The
-          Conflicts tab is bounded, so it gets no pager. */}
-      {!isConflicts && total > 0 && (
-        <div class="pager-bar">
-          <Pager
-            page={{
-              offset: active.spec.offset ?? offset,
-              returned: active.spec.returned ?? countRoutes(active.spec),
-              total,
-              pageSize,
-              pageSizes: PAGE_SIZES,
-              onPage,
-              onPageSize,
-            }}
-          />
-        </div>
-      )}
 
       {isConflicts ? (
         <ConflictsTable conflicts={conflicts} filtered={filtered} />

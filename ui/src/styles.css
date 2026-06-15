@@ -730,6 +730,31 @@ td.table-foot {
    table rather than in a <tfoot>, so it's reachable without scrolling). */
 .pager-bar { margin-bottom: 16px; }
 
+/* ProxyDetail pins its filter + tab + pager chrome to the top of the viewport
+   (just below the fixed nav) so the controls stay reachable while the row list
+   scrolls the window underneath — Routing's "controls stay put" benefit without
+   a fixed-height inner-scroll container on this composite screen. Sticky within
+   the Routes <section>, so it releases once that section scrolls fully past. The
+   --bg fill + bottom hairline let the rows pass cleanly behind it. */
+.routes-controls {
+  position: sticky; top: var(--nav-h); z-index: 50;
+  background: var(--bg);
+  padding-top: 12px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 16px;
+}
+.routes-controls .routing-filters { margin-bottom: 14px; }
+.routes-controls .tabs { margin-bottom: 14px; }
+/* The pager is the bar's last child; the container's own bottom edge provides
+   the gap to the table, so trim the standalone bar's margin (no double gap). */
+.routes-controls .pager-bar { margin-bottom: 12px; }
+/* The route table scrolls with the window here (not an inner box), so drop the
+   wrapper's scroll container — that lets the sticky <th> escape it and stick to
+   the viewport, docked just below the pinned controls bar (height tracked in
+   --routes-chrome-h). Below the bar's z-index so they abut cleanly on scroll. */
+.routes-screen .tbl-wrap { overflow: visible; }
+.routes-screen th { top: calc(var(--nav-h) + var(--routes-chrome-h, 0px)); z-index: 40; }
+
 /* Floating back-to-top button — appears once a long page is scrolled. */
 .back-to-top {
   position: fixed; right: 20px; bottom: 20px; z-index: 90;
