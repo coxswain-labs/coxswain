@@ -464,10 +464,8 @@ fn collect_facets<K>(
             .iter()
             .filter(|r| !r.backend_group.name().is_empty())
         {
-            if let Some((ns, _)) = r.route_id.split_once('/') {
-                if !ns.is_empty() {
-                    namespaces.insert(ns.to_string());
-                }
+            if let Some((ns, _)) = r.route_id.split_once('/').filter(|(ns, _)| !ns.is_empty()) {
+                namespaces.insert(ns.to_string());
             }
         }
     }
