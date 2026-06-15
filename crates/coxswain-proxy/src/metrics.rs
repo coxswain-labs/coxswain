@@ -192,6 +192,32 @@ pub(crate) fn upstream_errors_total() -> &'static IntCounterVec {
     })
 }
 
+/// Counter: upstream retry attempts fired by the proxy, classified by retry condition.
+///
+/// Incremented once per retry attempt (not per request) immediately when the retry
+/// decision is made — in `fail_to_connect` for `connect-failure`/`timeout` conditions
+/// and in `upstream_response_filter` for the `5xx` condition. The final (non-retried)
+/// attempt is NOT counted here; it is captured by [`upstream_errors_total`] instead.
+///
+/// Labels: `condition ∈ {"connect-failure", "timeout", "5xx"}`.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
+pub(crate) fn upstream_retries_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_proxy_upstream_retries_total",
+                "Upstream retry attempts fired by the proxy, by retry condition",
+            ),
+            &["listener", "route", "upstream", "condition"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
 // `active_upstreams`, `tls_certs_loaded`, and `tls_cert_expiry_seconds` are
 // registered by `coxswain_reflector::metrics` — the proxy crate doesn't
 // duplicate them here because both modules would try to register the same

@@ -30,11 +30,11 @@ use super::redirect::extract_host;
 use crate::config::AccessLogPathMode;
 use crate::upstream_ca::UpstreamCaCache;
 use bytes::Bytes;
-use coxswain_core::routing::{RequestContext, RouteTimeouts, UpstreamCa};
+use coxswain_core::routing::{RequestContext, RetryOn, RouteTimeouts, UpstreamCa};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{
-    ConnectTimedout, ConnectionClosed, ErrorSource, HTTPStatus, ReadError, ReadTimedout, Result,
-    WriteError, WriteTimedout,
+    ConnectTimedout, ConnectionClosed, Error, ErrorSource, HTTPStatus, ReadError, ReadTimedout,
+    Result, WriteError, WriteTimedout,
 };
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, Session};
@@ -57,6 +57,8 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             selected_backend_filters: None,
             start: None,
             upstream_addr: None,
+            retries_used: 0,
+            last_retry_condition: None,
         })
         .unwrap_or_default()
 }
@@ -227,35 +229,68 @@ pub(crate) async fn upstream_peer(
     // Pingora's HttpPeer hash includes sni and group_key; pool isolation is automatic.
 
     // Apply per-route timeout settings.
-    // backendRequest controls the upstream read (and connect) phase → 502 on expiry.
-    // request controls the total budget; we use the remaining time as read_timeout so
-    // that an expiry can be detected in fail_to_proxy and mapped to 504.
+    //
+    // Priority order (highest wins):
+    //   1. ingress connect/read/send timeouts (from ingress.coxswain-labs.dev/* annotations)
+    //   2. backend_request timeout (from HTTPRoute.timeouts.backendRequest / merge_timeouts)
+    //   3. request total-budget (remaining wall-clock from timeouts.request)
+    //
+    // connect: controls the TCP-connect phase → 502 on ConnectTimedout.
+    // read:    controls the upstream response-read phase.
+    // send:    controls the upstream request-send phase.
+    // backend_request: used when explicit connect/read are absent (legacy behaviour).
     let remaining_request = ctx
         .request_deadline
         .and_then(|d| d.checked_duration_since(Instant::now()));
     let backend_timeout = resolved.timeouts.backend_request;
 
-    let read_timeout = match (backend_timeout, remaining_request) {
-        (Some(bt), Some(rem)) => {
-            ctx.request_timeout_is_controlling = rem <= bt;
-            Some(bt.min(rem))
+    // Ingress-annotation-derived timeouts (may be None for GW-API routes).
+    let explicit_connect = resolved.timeouts.connect;
+    let explicit_read = resolved.timeouts.read;
+    let explicit_send = resolved.timeouts.send;
+
+    // Connection timeout: annotation-specific connect wins; else backend_request legacy.
+    let conn_timeout = explicit_connect.or(backend_timeout);
+    if let Some(t) = conn_timeout {
+        peer.options.connection_timeout = Some(t);
+        ctx.backend_request_timeout_active = true;
+    }
+
+    // Write (send) timeout: annotation-specific send.
+    if let Some(t) = explicit_send {
+        peer.options.write_timeout = Some(t);
+    }
+
+    // Read timeout: annotation read wins; else min(backend_request, remaining request budget).
+    let read_timeout = if let Some(read) = explicit_read {
+        // Annotation-explicit read: clamp by remaining request budget if set.
+        match remaining_request {
+            Some(rem) => {
+                ctx.request_timeout_is_controlling = rem <= read;
+                Some(read.min(rem))
+            }
+            None => Some(read),
         }
-        (Some(bt), None) => {
-            ctx.request_timeout_is_controlling = false;
-            Some(bt)
+    } else {
+        // Legacy: min(backend_request, remaining request budget) — unchanged behaviour.
+        match (backend_timeout, remaining_request) {
+            (Some(bt), Some(rem)) => {
+                ctx.request_timeout_is_controlling = rem <= bt;
+                Some(bt.min(rem))
+            }
+            (Some(bt), None) => {
+                ctx.request_timeout_is_controlling = false;
+                Some(bt)
+            }
+            (None, Some(rem)) => {
+                ctx.request_timeout_is_controlling = true;
+                Some(rem)
+            }
+            (None, None) => None,
         }
-        (None, Some(rem)) => {
-            ctx.request_timeout_is_controlling = true;
-            Some(rem)
-        }
-        (None, None) => None,
     };
     if let Some(t) = read_timeout {
         peer.options.read_timeout = Some(t);
-    }
-    if let Some(t) = backend_timeout {
-        peer.options.connection_timeout = Some(t);
-        ctx.backend_request_timeout_active = true;
     }
 
     Ok(Box::new(peer))
@@ -299,23 +334,135 @@ pub(crate) async fn upstream_request_filter(
     Ok(())
 }
 
-/// Pingora `upstream_response_filter` body: apply rule-level response filters.
+/// Pingora `upstream_response_filter` body: apply rule-level response filters and
+/// trigger a retry when the upstream returns a 5xx status and the route allows it.
+///
+/// ## 5xx-response retries
+///
+/// When `retry-on` includes `5xx` and `max-retries` budget remains, this function
+/// returns a retryable `Err` so Pingora re-enters the retry loop and calls
+/// `upstream_peer` again.  On the **final** attempt (budget exhausted) the 5xx
+/// passes through to the client unmodified.
+///
+/// **Replay guard**: retries are suppressed when `session.retry_buffer_truncated()`
+/// is true — large or streaming request bodies cannot be replayed safely.
 ///
 /// # Errors
-/// None today; signature is `Result` for forward-compatibility with future
-/// response-side validation.
+/// Propagates header-mutation errors from [`TrafficFilter::apply_response_filters`]
+/// and returns a retryable upstream error when a 5xx retry is triggered.
 pub(crate) async fn upstream_response_filter(
-    _session: &mut Session,
+    session: &mut Session,
     upstream_response: &mut ResponseHeader,
     ctx: &mut ProxyCtx,
 ) -> Result<()> {
     if let Some(resolved) = &ctx.resolved {
         TrafficFilter::apply_response_filters(upstream_response, &resolved.filters);
     }
-    if upstream_response.status.as_u16() >= 500 {
+    let status = upstream_response.status.as_u16();
+    if status >= 500 {
         inc_upstream_error(ctx, "5xx");
+
+        // 5xx-response retry: check policy, budget, and replay safety.
+        let retry_allowed = ctx.resolved.as_ref().is_some_and(|r| {
+            r.backend_group
+                .retry_policy()
+                .on
+                .contains(RetryOn::HTTP_5XX)
+        });
+        let budget_ok = ctx
+            .resolved
+            .as_ref()
+            .is_some_and(|r| ctx.retries_used < r.backend_group.retry_policy().max_retries);
+        if retry_allowed && budget_ok && !session.as_ref().retry_buffer_truncated() {
+            ctx.retries_used += 1;
+            ctx.last_retry_condition = Some(RetryOn::HTTP_5XX);
+            inc_upstream_retry(ctx, "5xx");
+            let mut e = Error::explain(
+                HTTPStatus(status),
+                format!(
+                    "upstream returned {status}; retrying (attempt {})",
+                    ctx.retries_used
+                ),
+            );
+            e.retry = true.into();
+            e.as_up();
+            return Err(e);
+        }
     }
     Ok(())
+}
+
+/// Pingora `fail_to_connect` body: retry upstream connection failures when the
+/// route's `RetryPolicy` permits.
+///
+/// Called when establishing the TCP/TLS connection to the upstream fails **before**
+/// any request bytes are sent, so replaying the request is always safe.
+/// Marks the error retryable when:
+/// - `retry-on` includes `connect-failure` (for `ErrorSource::Upstream` non-timeout
+///   errors) or `timeout` (for `ConnectTimedout`); and
+/// - the `max-retries` budget is not exhausted.
+pub(crate) fn fail_to_connect(
+    _session: &mut Session,
+    _peer: &HttpPeer,
+    ctx: &mut ProxyCtx,
+    mut e: Box<pingora_core::Error>,
+) -> Box<pingora_core::Error> {
+    let Some(resolved) = ctx.resolved.as_ref() else {
+        return e;
+    };
+    let policy = resolved.backend_group.retry_policy();
+    if policy.is_disabled() || ctx.retries_used >= policy.max_retries {
+        return e;
+    }
+    let is_timeout = matches!(e.etype(), ConnectTimedout);
+    let condition = if is_timeout {
+        RetryOn::TIMEOUT
+    } else {
+        RetryOn::CONNECT_FAILURE
+    };
+    if policy.on.contains(condition) {
+        ctx.retries_used += 1;
+        ctx.last_retry_condition = Some(condition);
+        e.retry = true.into();
+        let condition_label = if is_timeout {
+            "timeout"
+        } else {
+            "connect-failure"
+        };
+        inc_upstream_retry(ctx, condition_label);
+    }
+    e
+}
+
+/// Pingora `error_while_proxy` body: preserve retry decisions made by
+/// `upstream_response_filter`, and allow connect-level retries on fresh connections.
+///
+/// Pingora's default implementation gates retries on `client_reused &&
+/// !retry_buffer_truncated()`.  We override it to:
+/// - Keep the `retry = true` set by `fail_to_connect` (connect-failure path) or
+///   `upstream_response_filter` (5xx-response path) unconditionally when those
+///   hooks already bumped `retries_used`.
+/// - Fall back to Pingora's default reuse-check for errors not triggered by our
+///   own retry logic (e.g. mid-response I/O errors).
+pub(crate) fn error_while_proxy(
+    peer: &HttpPeer,
+    session: &mut Session,
+    mut e: Box<pingora_core::Error>,
+    ctx: &mut ProxyCtx,
+    client_reused: bool,
+) -> Box<pingora_core::Error> {
+    if ctx.last_retry_condition == Some(RetryOn::HTTP_5XX) {
+        // 5xx-response retry was already set in upstream_response_filter; preserve it.
+        // (Do NOT gate on client_reused — the connection held the response, not a reuse.)
+        e.retry = true.into();
+        return e;
+    }
+    // For connection-error retries (fail_to_connect already set retry=true) or
+    // unrelated errors, apply Pingora's default reuse check.
+    let mut e = e.more_context(format!("Peer: {peer}"));
+    e.retry
+        .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+    e
 }
 
 /// Pingora `fail_to_proxy` body: map upstream/downstream errors to HTTP
@@ -377,6 +524,22 @@ fn classify_upstream_error(e: &pingora_core::Error) -> &'static str {
             _ => "other",
         },
     }
+}
+
+/// Increment `coxswain_proxy_upstream_retries_total{listener, route, upstream,
+/// condition}` from a per-request `ProxyCtx`. Called once per retry attempt,
+/// not per request. Best-effort: falls back to `"none"` labels when routing
+/// has not yet resolved (should not occur in practice since retries require a
+/// resolved route).
+fn inc_upstream_retry(ctx: &ProxyCtx, condition: &'static str) {
+    let mut port_buf = itoa::Buffer::new();
+    let listener = port_buf.format(ctx.local_port.unwrap_or(0));
+    let (route, upstream) = ctx.resolved.as_ref().map_or(("none", "none"), |r| {
+        (r.metric_route_id.as_ref(), r.backend_group.name())
+    });
+    crate::metrics::upstream_retries_total()
+        .with_label_values(&[listener, route, upstream, condition])
+        .inc();
 }
 
 /// Increment `coxswain_proxy_upstream_errors_total{listener, route, upstream,

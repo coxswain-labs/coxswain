@@ -81,6 +81,7 @@ nav:
   - Guides:
     - Ingress:
       - Overview: guides/ingress.md
+      - Annotations: guides/ingress-annotations.md
     - Gateway API:
       - Overview: guides/gateway-api.md
       - Dedicated proxy pools: guides/dedicated-mode.md

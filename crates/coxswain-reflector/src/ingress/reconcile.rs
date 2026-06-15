@@ -1,12 +1,15 @@
 //! Core Ingress reconciliation: maps rules to routing-table entries.
 
 use super::IngressReconciler;
+use super::annotations::IngressAnnotations;
 use super::backend::resolve_backend_port;
 use super::class::claimed_ingress_class;
 use super::ports::IngressPorts;
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
-use coxswain_core::routing::{BackendGroup, IngressRoutingTableBuilder, RouteEntry, WildcardKind};
+use coxswain_core::routing::{
+    BackendGroup, FilterAction, IngressRoutingTableBuilder, RouteEntry, WildcardKind,
+};
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
@@ -64,6 +67,22 @@ impl IngressReconciler {
         let spec = ingress.spec.as_ref();
         let rules = spec.and_then(|s| s.rules.as_deref()).unwrap_or(&[]);
 
+        // Parse ingress.coxswain-labs.dev/* annotations once per Ingress.
+        // Invalid values WARN + use default; the Ingress is never dropped.
+        let ann = IngressAnnotations::parse(ingress.metadata.annotations.as_ref(), &route_id);
+
+        // Build rewrite filter list once (shared across all entries for this Ingress).
+        let rewrite_filters: Vec<FilterAction> = ann
+            .rewrite
+            .as_ref()
+            .map(|pm| {
+                vec![FilterAction::UrlRewrite {
+                    hostname: None,
+                    path: Some(pm.clone()),
+                }]
+            })
+            .unwrap_or_default();
+
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
         for (rule_index, rule) in rules.iter().enumerate() {
@@ -113,10 +132,12 @@ impl IngressReconciler {
                         "No ready endpoints — installing dead route (503)"
                     );
                 }
-                let protocol = resolved.app_protocol;
+                // Annotation backend-protocol overrides appProtocol-derived default.
+                let protocol = ann.backend_protocol.unwrap_or(resolved.app_protocol);
                 let group = Arc::new(
                     BackendGroup::new(format!("{ns}/{}", svc.name), resolved.addrs)
-                        .with_protocol(protocol),
+                        .with_protocol(protocol)
+                        .with_retries(ann.retries),
                 );
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
@@ -135,7 +156,9 @@ impl IngressReconciler {
                 ));
                 let mut entry = RouteEntry::path_only(group, route_id.clone(), created_at)
                     .with_path_pattern(Arc::from(path))
-                    .with_metric_route_id(metric_route_id);
+                    .with_metric_route_id(metric_route_id)
+                    .with_timeouts(ann.timeouts.clone())
+                    .with_filter_actions(rewrite_filters.clone());
                 if dead {
                     entry.error_status = Some(503);
                 }
@@ -178,10 +201,12 @@ impl IngressReconciler {
                             "No ready endpoints for defaultBackend — skipping"
                         );
                     } else {
-                        let protocol = resolved.app_protocol;
+                        // Annotation backend-protocol overrides appProtocol-derived default.
+                        let protocol = ann.backend_protocol.unwrap_or(resolved.app_protocol);
                         let group = Arc::new(
                             BackendGroup::new(format!("{ns}/{}", default_svc.name), resolved.addrs)
-                                .with_protocol(protocol),
+                                .with_protocol(protocol)
+                                .with_retries(ann.retries),
                         );
                         let default_metric_route_id: Arc<str> =
                             Arc::from(format!("ingress/{ns}/{ingress_name}:default"));
@@ -193,7 +218,9 @@ impl IngressReconciler {
                                     created_at,
                                 )
                                 .with_path_pattern(Arc::from("/"))
-                                .with_metric_route_id(Arc::clone(&default_metric_route_id)),
+                                .with_metric_route_id(Arc::clone(&default_metric_route_id))
+                                .with_timeouts(ann.timeouts.clone())
+                                .with_filter_actions(rewrite_filters.clone()),
                             )
                         };
                         for &listener_port in &ports {
@@ -1358,5 +1385,194 @@ mod tests {
             logs_contain("api/v1"),
             "warning should include the malformed path"
         );
+    }
+
+    // ── Annotation round-trip tests ───────────────────────────────────────────
+
+    fn find_timeouts(
+        table: &coxswain_core::routing::IngressRoutingTable,
+        host: &str,
+        path: &str,
+    ) -> coxswain_core::routing::RouteTimeouts {
+        use coxswain_core::routing::RouteOutcome;
+        let ctx = RequestContext::default();
+        match table.find(80, host, path, &ctx) {
+            RouteOutcome::Found(_, _, t, _, _) => t,
+            _other => panic!("expected Found"),
+        }
+    }
+
+    #[test]
+    fn annotation_timeouts_stored_on_route_entry() {
+        use crate::ingress::annotations::{CONNECT_TIMEOUT, READ_TIMEOUT, SEND_TIMEOUT};
+        use std::time::Duration;
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[
+                (CONNECT_TIMEOUT, "5s"),
+                (READ_TIMEOUT, "30s"),
+                (SEND_TIMEOUT, "10s"),
+            ],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let t = find_timeouts(&table, "example.com", "/");
+        assert_eq!(t.connect, Some(Duration::from_secs(5)));
+        assert_eq!(t.read, Some(Duration::from_secs(30)));
+        assert_eq!(t.send, Some(Duration::from_secs(10)));
+        assert!(t.request.is_none(), "request timeout is gateway-api only");
+        assert!(
+            t.backend_request.is_none(),
+            "backend_request is gateway-api only"
+        );
+    }
+
+    #[test]
+    fn annotation_backend_protocol_https_sets_upstream_tls() {
+        use crate::ingress::annotations::BACKEND_PROTOCOL;
+        use coxswain_core::routing::BackendProtocol;
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[(BACKEND_PROTOCOL, "HTTPS")],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        let group = table
+            .route(80, "example.com", "/", &ctx)
+            .expect("route not found");
+        assert_eq!(group.protocol(), BackendProtocol::Https);
+    }
+
+    #[test]
+    fn annotation_backend_protocol_grpc_sets_h2c() {
+        use crate::ingress::annotations::BACKEND_PROTOCOL;
+        use coxswain_core::routing::BackendProtocol;
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[(BACKEND_PROTOCOL, "GRPC")],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        let group = table
+            .route(80, "example.com", "/", &ctx)
+            .expect("route not found");
+        assert_eq!(group.protocol(), BackendProtocol::H2c);
+    }
+
+    #[test]
+    fn annotation_retries_stored_on_backend_group() {
+        use crate::ingress::annotations::{MAX_RETRIES, RETRY_ON};
+        use coxswain_core::routing::RetryOn;
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[
+                (MAX_RETRIES, "3"),
+                (RETRY_ON, "connect-failure,timeout,5xx"),
+            ],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        let group = table
+            .route(80, "example.com", "/", &ctx)
+            .expect("route not found");
+        let policy = group.retry_policy();
+        assert_eq!(policy.max_retries, 3);
+        assert!(policy.on.contains(RetryOn::CONNECT_FAILURE));
+        assert!(policy.on.contains(RetryOn::TIMEOUT));
+        assert!(policy.on.contains(RetryOn::HTTP_5XX));
+    }
+
+    #[test]
+    fn annotation_rewrite_target_stored_as_url_rewrite_filter() {
+        use crate::ingress::annotations::REWRITE_TARGET;
+        use coxswain_core::routing::{FilterAction, PathModifier, RouteOutcome};
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/old",
+            "svc",
+            &[(REWRITE_TARGET, "/new")],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        match table.find(80, "example.com", "/old", &ctx) {
+            RouteOutcome::Found(_, filters, _, _, _) => {
+                let rewrite = filters.iter().find(|f| {
+                    matches!(
+                        f,
+                        FilterAction::UrlRewrite {
+                            hostname: None,
+                            path: Some(PathModifier::ReplaceFullPath(_)),
+                        }
+                    )
+                });
+                assert!(
+                    rewrite.is_some(),
+                    "expected UrlRewrite filter with ReplaceFullPath"
+                );
+                if let Some(FilterAction::UrlRewrite {
+                    path: Some(PathModifier::ReplaceFullPath(target)),
+                    ..
+                }) = rewrite
+                {
+                    assert_eq!(target, "/new");
+                }
+            }
+            _ => panic!("expected Found"),
+        }
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn invalid_annotation_warns_but_route_still_installed() {
+        use crate::ingress::annotations::CONNECT_TIMEOUT;
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[(CONNECT_TIMEOUT, "not-a-duration")],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        // Route is installed despite invalid annotation.
+        assert!(table.route(80, "example.com", "/", &ctx).is_some());
+        // A warning was emitted.
+        assert!(logs_contain("invalid duration — using default"));
     }
 }

@@ -23,6 +23,7 @@ Route id formats:
 | `coxswain_proxy_requests_total` | Counter | `listener`, `route`, `method`, `status_code` |
 | `coxswain_proxy_request_duration_seconds` | Histogram | `listener`, `route` |
 | `coxswain_proxy_upstream_errors_total` | Counter | `listener`, `route`, `upstream`, `error_type` (`connect`/`timeout`/`refused`/`tls`/`5xx`/`other`) |
+| `coxswain_proxy_upstream_retries_total` | Counter | `listener`, `route`, `upstream`, `condition` (`connect-failure`/`timeout`/`5xx`) |
 | `coxswain_proxy_active_upstreams` | Gauge | `upstream` |
 | `coxswain_proxy_routing_table_hosts` | Gauge | — |
 | `coxswain_proxy_routing_table_routes` | Gauge | `kind` (`ingress`/`gateway`) |

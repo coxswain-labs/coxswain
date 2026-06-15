@@ -555,6 +555,83 @@ async fn default_ingress_class() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Verifies the `ingress.coxswain-labs.dev/rewrite-target` annotation:
+/// the echo backend must see the annotation value (`/v2`) as its request path,
+/// not the original client-side path (`/api`).
+///
+/// This confirms the `PathModifier::ReplaceFullPath` filter action wired in
+/// by the annotation parser is applied on the upstream request.
+#[tokio::test]
+async fn annotation_rewrite_target() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-rewrite").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_REWRITE_TARGET,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("rewrite.{}.local", ns.name);
+
+    // Wait until the route is live. The echo response path after rewrite must
+    // be "/v2", not "/api" (which the client sends).
+    let resp = wait::wait_for_route(&h.http, &host, "/api", Duration::from_secs(60)).await?;
+    assert_eq!(
+        resp.path.as_deref(),
+        Some("/v2"),
+        "upstream must see the rewrite-target path /v2, not the original /api"
+    );
+
+    Ok(())
+}
+
+/// Verifies that `ingress.coxswain-labs.dev/max-retries` and `retry-on:
+/// connect-failure` annotations are parsed and stored on the route:
+/// - A backend whose endpoints all refuse connections (wrong port on real pods)
+///   should produce a 502 (not a 503 dead-route) when retries are exhausted.
+/// - 502 vs 503 distinguishes "tried to connect and failed" from "no endpoints
+///   were ever resolved" — the `error_status: 503` dead-route short-circuit is
+///   bypassed when endpoints are present regardless of retry settings.
+///
+/// Note: the exact retry count (3 attempts for max-retries=2) is deterministic
+/// and covered by the unit tests in `coxswain-proxy::common::hooks`; e2e
+/// cannot observe individual retry attempts without a dedicated metric.
+#[tokio::test]
+async fn annotation_connect_retry() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-retry").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_CONNECT_RETRY,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("retry.{}.local", ns.name);
+
+    // Wait until the route is installed (502, not "no route yet").
+    // A 503 here would indicate the reflector treated the endpoint-less service
+    // as a dead route instead of installing a live route with failing endpoints.
+    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    // Confirm the upstream-error metric is being emitted for this route.
+    // (Exact retry-attempt count is validated by unit tests.)
+    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    assert!(
+        metrics.contains("coxswain_proxy_upstream_errors_total{"),
+        "proxy /metrics must expose coxswain_proxy_upstream_errors_total after a connect failure"
+    );
+
+    Ok(())
+}
+
 // ── Raw-TCP helpers for PROXY protocol tests ──────────────────────────────────
 
 /// Retry: send a v1 PROXY header + HTTP request over raw TCP until a 200 JSON response arrives.

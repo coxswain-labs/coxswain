@@ -104,6 +104,27 @@ impl ProxyHttp for IngressProxy {
         hooks::upstream_response_filter(session, upstream_response, ctx).await
     }
 
+    fn fail_to_connect(
+        &self,
+        session: &mut Session,
+        peer: &HttpPeer,
+        ctx: &mut ProxyCtx,
+        e: Box<pingora_core::Error>,
+    ) -> Box<pingora_core::Error> {
+        hooks::fail_to_connect(session, peer, ctx, e)
+    }
+
+    fn error_while_proxy(
+        &self,
+        peer: &HttpPeer,
+        session: &mut Session,
+        e: Box<pingora_core::Error>,
+        ctx: &mut ProxyCtx,
+        client_reused: bool,
+    ) -> Box<pingora_core::Error> {
+        hooks::error_while_proxy(peer, session, e, ctx, client_reused)
+    }
+
     async fn fail_to_proxy(
         &self,
         session: &mut Session,

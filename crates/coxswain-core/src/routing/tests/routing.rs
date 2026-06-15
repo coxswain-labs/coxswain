@@ -211,6 +211,9 @@ fn find_returns_timeouts_from_route_entry() {
     let timeouts = RouteTimeouts {
         request: Some(std::time::Duration::from_secs(10)),
         backend_request: Some(std::time::Duration::from_secs(2)),
+        connect: None,
+        read: None,
+        send: None,
     };
     let e = Arc::new(RouteEntry::with_filters(
         up,

@@ -395,6 +395,9 @@ fn wire_gateway_only_proxy_services(
     let default_timeouts = RouteTimeouts {
         request: proxy.proxy_default_request_timeout,
         backend_request: proxy.proxy_default_backend_request_timeout,
+        connect: None,
+        read: None,
+        send: None,
     };
     let ca_cache = Arc::new(UpstreamCaCache::new());
 
@@ -496,6 +499,9 @@ fn wire_proxy_services(
     let default_timeouts = RouteTimeouts {
         request: proxy.proxy_default_request_timeout,
         backend_request: proxy.proxy_default_backend_request_timeout,
+        connect: None,
+        read: None,
+        send: None,
     };
     let ca_cache = Arc::new(UpstreamCaCache::new());
 

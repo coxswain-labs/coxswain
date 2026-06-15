@@ -30,3 +30,10 @@ pub const PROBLEMS_DEAD_BACKEND: &str = fixture!("problems_dead_backend.yaml");
 /// Ingress whose `/shadow/` rule is shadowed by its `/shadow` rule (routing
 /// conflict), for the `/api/v1/problems` conflict route-identity test.
 pub const PROBLEMS_CONFLICT: &str = fixture!("problems_conflict.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/rewrite-target` annotation.
+/// Used to verify that the upstream request path is replaced by the annotation value.
+pub const ANNOTATION_REWRITE_TARGET: &str = fixture!("annotation_rewrite_target.yaml");
+/// Ingress with `max-retries: 2` and `retry-on: connect-failure` annotations,
+/// backed by a Service whose endpoints refuse connections (wrong port on real pods).
+/// Used to verify that connect-failure retries fire and the route returns 502.
+pub const ANNOTATION_CONNECT_RETRY: &str = fixture!("annotation_connect_retry.yaml");
