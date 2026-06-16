@@ -21,6 +21,25 @@ pub(super) type RouteMatch = (
     Option<u16>,
 );
 
+/// Compile a path pattern as a regular expression, the safe-compile guard for
+/// regex routes.
+///
+/// This is the single entry point callers use to validate an
+/// `ImplementationSpecific`/`RegularExpression` path *before* inserting it, so an
+/// uncompilable pattern can be skipped with a WARN rather than failing the whole
+/// routing-table [`build`](HostRouterBuilder::build) (which would drop every route).
+/// The returned [`regex::Regex`] is also what capture-group rewrites
+/// ([`PathModifier::RegexReplace`](super::entry::PathModifier::RegexReplace)) match
+/// against. The matcher itself compiles the same pattern into a
+/// [`RegexSet`] at build time; both use the default `regex` parser, so a pattern that
+/// compiles here is guaranteed to compile there.
+///
+/// # Errors
+/// Returns [`regex::Error`] if `pattern` is not a valid regular expression.
+pub fn compile_path_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::Regex::new(pattern)
+}
+
 /// Compiled path router for a single hostname, supporting exact, prefix, and regex patterns.
 #[non_exhaustive]
 pub struct HostRouter {

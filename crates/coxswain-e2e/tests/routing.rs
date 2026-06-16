@@ -308,6 +308,164 @@ async fn annotation_rewrite_target_rewrites_upstream_path() -> anyhow::Result<()
     Ok(())
 }
 
+/// `use-regex` (#265): a `pathType: ImplementationSpecific` path is matched as a
+/// regular expression. `/digits/[0-9]+` serves echo-a for a digit tail and 404s for a
+/// non-digit tail — proving the value is a regex, not a literal prefix.
+#[tokio::test]
+async fn ingress_use_regex_matches_implementation_specific_path() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-regex-match").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::USE_REGEX, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("regex-match.{}.local", ns.name);
+
+    // Happy: a digit tail matches the regex and reaches echo-a.
+    let resp = wait::wait_for_backend(
+        &h.http,
+        &host,
+        "/digits/42",
+        "echo-a",
+        Duration::from_secs(60),
+    )
+    .await?;
+    resp.assert_backend("echo-a");
+
+    // Sad: a non-digit tail does not match the regex (and no other route claims it).
+    wait::wait_for_route_status(&h.http, &host, "/digits/abc", 404, Duration::from_secs(30))
+        .await?;
+
+    Ok(())
+}
+
+/// `use-regex` is armed per-path by `pathType`, not host-wide (unlike nginx): a sibling
+/// `pathType: Prefix` path on the same `use-regex` Ingress still matches as a prefix.
+#[tokio::test]
+async fn ingress_use_regex_leaves_sibling_prefix_path_unaffected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-regex-mixed").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::USE_REGEX, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("regex-match.{}.local", ns.name);
+
+    // The /plain Prefix path is untouched by use-regex and still routes to echo-b,
+    // including sub-paths (prefix semantics).
+    let resp =
+        wait::wait_for_backend(&h.http, &host, "/plain", "echo-b", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-b");
+    let resp = wait::wait_for_backend(
+        &h.http,
+        &host,
+        "/plain/sub",
+        "echo-b",
+        Duration::from_secs(15),
+    )
+    .await?;
+    resp.assert_backend("echo-b");
+
+    Ok(())
+}
+
+/// `use-regex` + `rewrite-target` (#265): capture groups from the regex path are
+/// substituted into the rewritten upstream path. `^/svc/(.*)` + `/$1` rewrites
+/// `/svc/users/42` to `/users/42` as seen by the backend.
+#[tokio::test]
+async fn ingress_use_regex_rewrite_target_substitutes_capture_group() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-regex-rewrite").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::USE_REGEX, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("regex-rewrite.{}.local", ns.name);
+
+    let resp = wait::wait_for_backend(
+        &h.http,
+        &host,
+        "/svc/users/42",
+        "echo-a",
+        Duration::from_secs(60),
+    )
+    .await?;
+    resp.assert_backend("echo-a");
+    assert_eq!(
+        resp.path.as_deref(),
+        Some("/users/42"),
+        "capture group $1 must be substituted into the upstream path"
+    );
+
+    Ok(())
+}
+
+/// `use-regex` invalid pattern (#265): an uncompilable regex path is skipped with a
+/// WARN, but a sibling valid regex path on the same Ingress still serves — the bad
+/// pattern never fails the whole Ingress (or the routing table).
+#[tokio::test]
+async fn ingress_use_regex_invalid_pattern_skips_only_that_path() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-regex-invalid").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::USE_REGEX, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("regex-invalid.{}.local", ns.name);
+
+    // The valid sibling path serves despite the invalid one being present.
+    let resp = wait::wait_for_backend(&h.http, &host, "/ok/foo", "echo-a", Duration::from_secs(60))
+        .await?;
+    resp.assert_backend("echo-a");
+
+    // The invalid path installed no route, so it 404s.
+    wait::wait_for_route_status(
+        &h.http,
+        &host,
+        "/bad/anything",
+        404,
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// `use-regex` opt-in off (#265): without the annotation, an `ImplementationSpecific`
+/// path stays a literal Prefix — regex metacharacters are not interpreted, so
+/// `/lit/[0-9]+` does not match the request `/lit/42`.
+#[tokio::test]
+async fn ingress_without_use_regex_treats_implementation_specific_literally() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-regex-off").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::USE_REGEX, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("regex-off.{}.local", ns.name);
+
+    // Establish that the data plane has the fixture's routes live, then assert the
+    // negative: the literal-prefix path `/lit/[0-9]+` does not match `/lit/42`.
+    let match_host = format!("regex-match.{}.local", ns.name);
+    wait::wait_for_backend(
+        &h.http,
+        &match_host,
+        "/digits/1",
+        "echo-a",
+        Duration::from_secs(60),
+    )
+    .await?;
+    wait::wait_for_route_status(&h.http, &host, "/lit/42", 404, Duration::from_secs(30)).await?;
+
+    Ok(())
+}
+
 /// Verifies per-class annotation defaults resolved from `IngressClass.spec.parameters`
 /// (#190): a `CoxswainIngressClassParameters` CR sets a default `rewrite-target`,
 /// and an Ingress claiming that class inherits it while a second Ingress overrides

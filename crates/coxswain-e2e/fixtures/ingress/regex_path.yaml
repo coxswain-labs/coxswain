@@ -1,0 +1,101 @@
+# use-regex path matching fixture (#265). Four independent Ingresses, distinct hosts,
+# all backed by the shared echo-a / echo-b Deployments. TESTNS is substituted with the
+# test namespace at runtime.
+#
+#   regex-match.TESTNS.local   use-regex: regex /digits/[0-9]+ -> echo-a; prefix /plain -> echo-b
+#   regex-rewrite.TESTNS.local use-regex + rewrite-target /$1: ^/svc/(.*) -> echo-a (capture rewrite)
+#   regex-invalid.TESTNS.local use-regex: valid /ok/.* -> echo-a; invalid /bad/( -> echo-b (skipped)
+#   regex-off.TESTNS.local     no use-regex: /lit/[0-9]+ ImplementationSpecific stays literal Prefix
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: regex-match-ingress
+  annotations:
+    ingress.coxswain-labs.dev/use-regex: "true"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: regex-match.${TESTNS}.local
+      http:
+        paths:
+          - path: "/digits/[0-9]+"
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
+          - path: /plain
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-b
+                port:
+                  number: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: regex-rewrite-ingress
+  annotations:
+    ingress.coxswain-labs.dev/use-regex: "true"
+    ingress.coxswain-labs.dev/rewrite-target: /$1
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: regex-rewrite.${TESTNS}.local
+      http:
+        paths:
+          - path: "^/svc/(.*)"
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: regex-invalid-ingress
+  annotations:
+    ingress.coxswain-labs.dev/use-regex: "true"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: regex-invalid.${TESTNS}.local
+      http:
+        paths:
+          - path: "/ok/.*"
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
+          - path: "/bad/("
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: echo-b
+                port:
+                  number: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: regex-off-ingress
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: regex-off.${TESTNS}.local
+      http:
+        paths:
+          - path: "/lit/[0-9]+"
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

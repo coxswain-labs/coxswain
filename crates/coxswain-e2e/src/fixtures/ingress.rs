@@ -33,6 +33,11 @@ pub const PROBLEMS_CONFLICT: &str = fixture!("problems_conflict.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/rewrite-target` annotation.
 /// Used to verify that the upstream request path is replaced by the annotation value.
 pub const ANNOTATION_REWRITE_TARGET: &str = fixture!("annotation_rewrite_target.yaml");
+/// `ingress.coxswain-labs.dev/use-regex` (#265): four Ingresses on distinct hosts —
+/// regex matching with a sibling prefix path, capture-group `rewrite-target`, an
+/// invalid pattern that skips only its own path, and an Ingress without the opt-in
+/// whose `ImplementationSpecific` path stays a literal Prefix.
+pub const USE_REGEX: &str = fixture!("regex_path.yaml");
 /// Ingress with `max-retries: 2` and `retry-on: connect-failure` annotations,
 /// backed by a Service whose endpoints refuse connections (wrong port on real pods).
 /// Used to verify that connect-failure retries fire and the route returns 502.
