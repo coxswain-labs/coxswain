@@ -5,7 +5,8 @@ use gateway_api::apis::standard::backendtlspolicies::BackendTLSPolicy;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::Api;
@@ -491,37 +492,48 @@ pub async fn wait_for_route_status(
     .await
 }
 
-/// Poll until a TCP connect to `addr` fails — connection refused, reset, or
-/// SYN black-holed — i.e. nothing is listening there anymore.
+/// Poll until the route returns an upstream-rejection status — `400` or any `5xx`.
 ///
-/// Used to assert an endpoint has gone dark after teardown, where a clean HTTP
-/// status (e.g. 404) can't express it because the listening socket itself is
-/// gone: the dedicated-proxy Service/NodePort is *deleted* on GC, so the
-/// post-condition is a connection failure, not a routed response. Routed through
-/// the canonical [`poll_until`] so it never sleeps blindly.
+/// For negative backend-protocol assertions where the proxy cannot speak the
+/// upstream's wire protocol (e.g. HTTP/1.1 to an h2c-only port), the rejection
+/// surfaces as a `502` (the proxy got no valid upstream response) or a `400` (the
+/// upstream replied with a protocol error) depending on how the handshake fails —
+/// both prove the request did not succeed. A `404` (route not yet programmed) or any
+/// `2xx`/`3xx` keeps polling, so this never passes on a transient not-ready state or
+/// a success. Returns the observed rejection status.
 ///
 /// # Errors
 ///
-/// Returns an error if `addr` is still accepting TCP connections when `timeout`
-/// elapses.
-pub async fn wait_for_endpoint_unreachable(
-    addr: SocketAddr,
+/// Returns an error if no rejection status is observed before `timeout` elapses.
+pub async fn wait_for_route_rejected(
+    http: &crate::harness::HttpClient,
+    host: &str,
+    path: &str,
     timeout: Duration,
-) -> anyhow::Result<()> {
-    // Per-attempt connect budget: long enough to rule out a slow accept, short
-    // enough to keep the poll responsive when the SYN is black-holed.
-    const CONNECT_BUDGET: Duration = Duration::from_secs(2);
+) -> anyhow::Result<u16> {
+    let is_rejection = |s: u16| s == 400 || (500..=599).contains(&s);
     poll_until(
         timeout,
         POLL,
-        || async move { format!("{addr} to stop accepting TCP connections (still reachable)") },
-        || async move {
-            match time::timeout(CONNECT_BUDGET, tokio::net::TcpStream::connect(addr)).await {
-                // Still accepting connections → endpoint is live; keep polling.
-                Ok(Ok(_stream)) => None,
-                // Connect refused/reset, or the connect attempt itself timed out
-                // (black-holed SYN) → the endpoint is gone.
-                Ok(Err(_)) | Err(_) => Some(()),
+        || async {
+            match http.get_status(host, path).await {
+                Ok(status) => {
+                    format!("{host}{path} to be rejected (400 or 5xx); last status {status}")
+                }
+                Err(e) => format!("{host}{path} to be rejected (400 or 5xx); request error: {e}"),
+            }
+        },
+        move || async move {
+            match http.get_status(host, path).await {
+                Ok(status) if is_rejection(status) => Some(status),
+                Ok(status) => {
+                    tracing::debug!(host, path, status, "not a rejection yet");
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(host, path, error = %e, "request failed");
+                    None
+                }
             }
         },
     )
@@ -580,6 +592,52 @@ pub async fn wait_for_dedicated_proxy_endpoint(
     )
     .await?;
     Ok(std::net::SocketAddr::new(node_ip, node_port))
+}
+
+/// Poll until the controller has deleted the dedicated-proxy `Service` and
+/// `Deployment` for a Gateway that migrated out of dedicated mode.
+///
+/// This is the spec-driven, controller-owned observable for a dedicated→shared
+/// migration teardown. Owner-ref GC cannot reclaim these resources — the owning
+/// Gateway survives a migration, so the cluster garbage collector never fires —
+/// so the controller deletes them explicitly once the shared pool is serving the
+/// migrated routes. Asserting their *API deletion* is deterministic and
+/// cluster-independent; probing the NodePort instead would assert kube-proxy/CNI
+/// teardown timing, which differs across clusters and is not the controller's
+/// contract.
+///
+/// The dedicated resources are named `<gateway-name>-coxswain` (GEP-1762
+/// `<NAME>-<GATEWAY CLASS>`, with `coxswain` the class used across the suite).
+///
+/// # Errors
+///
+/// Returns an error if either resource still exists when `timeout` elapses.
+pub async fn wait_for_dedicated_proxy_deleted(
+    client: &kube::Client,
+    namespace: &str,
+    gateway_name: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let name = format!("{gateway_name}-coxswain");
+    let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    poll_until(
+        timeout,
+        POLL,
+        || async {
+            format!(
+                "dedicated-proxy Service+Deployment {namespace}/{name} to be deleted by the \
+                 controller; {}",
+                svc_nodeport_state(namespace, &name).await
+            )
+        },
+        || async {
+            let svc_gone = matches!(services.get_opt(&name).await, Ok(None));
+            let deploy_gone = matches!(deployments.get_opt(&name).await, Ok(None));
+            (svc_gone && deploy_gone).then_some(())
+        },
+    )
+    .await
 }
 
 /// Return the address of the first Kubernetes node.

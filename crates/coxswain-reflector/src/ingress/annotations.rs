@@ -31,10 +31,17 @@ pub const SEND_TIMEOUT: &str = "ingress.coxswain-labs.dev/send-timeout";
 pub const MAX_RETRIES: &str = "ingress.coxswain-labs.dev/max-retries";
 /// Comma-separated retry conditions: `connect-failure`, `timeout`, `5xx`.
 pub const RETRY_ON: &str = "ingress.coxswain-labs.dev/retry-on";
-/// Rewrite the upstream request path — literal replacement string (regex capture groups added by #C4).
+/// Rewrite the upstream request path. On a regex path (see [`USE_REGEX`]) the value
+/// may reference capture groups (`$1`…`$n`); on prefix/exact paths it is a literal
+/// full-path replacement.
 pub const REWRITE_TARGET: &str = "ingress.coxswain-labs.dev/rewrite-target";
 /// Override upstream wire protocol: `HTTP` (default), `HTTPS`, or `GRPC`.
 pub const BACKEND_PROTOCOL: &str = "ingress.coxswain-labs.dev/backend-protocol";
+/// Opt in to regex path matching for this Ingress's `pathType: ImplementationSpecific`
+/// rules — boolean `"true"`/`"false"`. Inert on its own: the per-path selector is the
+/// standard `pathType` field, so `Prefix`/`Exact` paths in the same Ingress are
+/// unaffected (no nginx-style host-wide contagion).
+pub const USE_REGEX: &str = "ingress.coxswain-labs.dev/use-regex";
 
 // ── Shared lookup helper ──────────────────────────────────────────────────────
 
@@ -88,6 +95,25 @@ pub fn parse_retry_on(s: &str) -> RetryOn {
     set
 }
 
+/// Parse a boolean annotation value: `"true"`/`"false"` (ASCII-case-insensitive).
+///
+/// Emits a structured `WARN` on any other value and returns `None` so the caller
+/// falls back to the default (annotation treated as absent).
+#[must_use]
+pub fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim() {
+        v if v.eq_ignore_ascii_case("true") => Some(true),
+        v if v.eq_ignore_ascii_case("false") => Some(false),
+        _ => {
+            tracing::warn!(
+                value = s,
+                "invalid boolean annotation value (expected true/false)"
+            );
+            None
+        }
+    }
+}
+
 /// Parse the `backend-protocol` annotation value.
 ///
 /// Valid values: `HTTP` (default), `HTTPS`, `GRPC`.
@@ -125,9 +151,14 @@ pub(super) struct IngressAnnotations {
     /// Retry policy from `max-retries` + `retry-on`.
     pub retries: RetryPolicy,
     /// Path rewrite from `rewrite-target` — emitted as a `FilterAction::UrlRewrite`.
+    /// Holds the literal [`PathModifier::ReplaceFullPath`]; on a regex path the
+    /// reconciler rebuilds it as [`PathModifier::RegexReplace`] against that path's
+    /// own compiled pattern so capture groups (`$1`…`$n`) resolve per-path.
     pub rewrite: Option<PathModifier>,
     /// Explicit backend-protocol override, or `None` to keep the `appProtocol`-derived default.
     pub backend_protocol: Option<BackendProtocol>,
+    /// `use-regex` opt-in: interpret `pathType: ImplementationSpecific` paths as regex.
+    pub use_regex: bool,
 }
 
 impl IngressAnnotations {
@@ -221,6 +252,22 @@ impl IngressAnnotations {
         let rewrite =
             get(ann, REWRITE_TARGET).map(|v| PathModifier::ReplaceFullPath(v.to_string()));
 
+        // ── Regex path matching opt-in ──────────────────────────────────────────
+        let use_regex = get(ann, USE_REGEX)
+            .and_then(|v| {
+                let b = parse_bool(v);
+                if b.is_none() {
+                    tracing::warn!(
+                        ingress = %route_id,
+                        annotation = USE_REGEX,
+                        value = v,
+                        "invalid boolean — treating use-regex as false"
+                    );
+                }
+                b
+            })
+            .unwrap_or(false);
+
         // ── Backend protocol ──────────────────────────────────────────────────
         let backend_protocol = get(ann, BACKEND_PROTOCOL).and_then(|v| {
             let p = parse_backend_protocol(v);
@@ -246,6 +293,7 @@ impl IngressAnnotations {
             retries,
             rewrite,
             backend_protocol,
+            use_regex,
         }
     }
 }
@@ -405,6 +453,55 @@ mod tests {
         let a = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.retries.is_disabled());
         assert!(logs_contain("max-retries is absent"));
+    }
+
+    // ── parse_bool() ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_bool_valid() {
+        assert_eq!(parse_bool("true"), Some(true));
+        assert_eq!(parse_bool("false"), Some(false));
+        // ASCII-case-insensitive + surrounding whitespace tolerated.
+        assert_eq!(parse_bool("TRUE"), Some(true));
+        assert_eq!(parse_bool("  False  "), Some(false));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_bool_invalid_warns() {
+        assert_eq!(parse_bool("yes"), None);
+        assert!(logs_contain("invalid boolean annotation value"));
+    }
+
+    // ── use-regex ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_use_regex_true() {
+        let m = ann(&[(USE_REGEX, "true")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(a.use_regex);
+    }
+
+    #[test]
+    fn parse_use_regex_false() {
+        let m = ann(&[(USE_REGEX, "false")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(!a.use_regex);
+    }
+
+    #[test]
+    fn parse_use_regex_absent_defaults_false() {
+        let a = IngressAnnotations::parse(None, "default/test");
+        assert!(!a.use_regex);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_use_regex_invalid_warns_and_defaults_false() {
+        let m = ann(&[(USE_REGEX, "1")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(!a.use_regex);
+        assert!(logs_contain("treating use-regex as false"));
     }
 
     #[test]

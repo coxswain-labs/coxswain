@@ -15,7 +15,7 @@ use futures::StreamExt;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::{
     Client,
-    api::Api,
+    api::{Api, ListParams},
     runtime::{WatchStreamExt, watcher},
 };
 use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
@@ -24,6 +24,7 @@ use pingora_core::services::background::BackgroundService;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 mod backend_tls_events;
 mod conditions;
@@ -46,6 +47,25 @@ use ingress_status::ingress_lb_already_matches;
 use coxswain_reflector::k8s_utils::scoped_api;
 
 const LEASE_NAME: &str = "coxswain-leader-lock";
+
+/// Cadence of the Gateway status resync backstop.
+///
+/// The cold-start GatewayClass-ordering race is eliminated at the source by
+/// priming the ownership sets before the watch loop (see
+/// [`Controller::list_owned_gateway_classes`]), and leadership/class-ownership
+/// transitions trigger immediate event-driven re-drives. This tick covers the
+/// one precondition transition that is *not* cleanly observable as an event:
+/// the `controller` subsystem becoming ready. The reflector wakes this writer
+/// (`tls_health` change) from *inside* its rebuild, but flips
+/// `routing_table_built` ready only *after* the rebuild returns — so a writer
+/// woken by that notify can still read `ready=false`, and on a quiet cluster no
+/// further notify follows. The periodic re-drive closes that window. The scan
+/// is in-memory and only patches when a Gateway's status is actually stale
+/// ([`gateway_needs_status_patch`]), so a steady-state tick is read-only.
+///
+/// Interim: the v0.3 migration to a `Controller` work-queue makes this
+/// unnecessary — "not ready yet" becomes a native requeue.
+const STATUS_RESYNC_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Kubernetes watch loop for leader election and writing status conditions
 /// back to `HTTPRoute`, `Gateway`, `GatewayClass`, and `BackendTLSPolicy` resources.
@@ -145,22 +165,29 @@ impl Controller {
         tokio::pin!(ingress_watcher);
         tokio::pin!(policy_watcher);
 
-        // Names of GatewayClass resources whose controllerName matches ours.
-        let mut owned_gateway_classes: HashSet<String> = HashSet::new();
+        // Class-ownership sets, primed by an explicit LIST before the watch loop
+        // processes any dependent resource. The Gateway/Ingress handlers gate on
+        // these sets; the class watchers are *independent* streams, so without
+        // priming a Gateway's `InitApply` can be processed before its
+        // GatewayClass's on a cold start, dropping the Gateway until the next
+        // relist. Priming makes "the owning class is known" a precondition that
+        // holds before the first dependent event — eliminating that ordering
+        // race at the source. Watch events keep the sets current thereafter; a
+        // list error is non-fatal (the watcher backfill + resync still converge).
+        //
+        // `owned_gateway_classes`: GatewayClasses whose controllerName is ours.
+        // `owned_dedicated_gateway_classes`: the subset whose `spec.parametersRef`
+        //   targets `CoxswainGatewayParameters` — every Gateway in such a class
+        //   is dedicated-mode, its status written by the operator in
+        //   `crate::operator::status`, not this writer (tracked, not re-derived
+        //   per event, so the Gateway dispatch needn't re-snapshot the class).
+        let (mut owned_gateway_classes, mut owned_dedicated_gateway_classes) =
+            self.list_owned_gateway_classes(&client).await;
 
-        // Subset of `owned_gateway_classes` whose `spec.parametersRef`
-        // targets the `CoxswainGatewayParameters` CRD — i.e. every Gateway
-        // in such a class is dedicated-mode and its status is written by the
-        // operator in `crate::operator::status`, not by this writer. Tracked
-        // here (not derived on demand) so the Gateway-watcher dispatch
-        // doesn't have to re-snapshot the class each event.
-        let mut owned_dedicated_gateway_classes: HashSet<String> = HashSet::new();
-
-        // Names of IngressClass resources whose spec.controller matches ours.
-        let mut owned_ingress_classes: HashSet<String> = HashSet::new();
-
-        // Subset of owned IngressClasses annotated `is-default-class: "true"`.
-        let mut owned_default_ingress_classes: HashSet<String> = HashSet::new();
+        // `owned_ingress_classes`: IngressClasses whose spec.controller is ours.
+        // `owned_default_ingress_classes`: the subset annotated the default class.
+        let (mut owned_ingress_classes, mut owned_default_ingress_classes) =
+            self.list_owned_ingress_classes(&client).await;
 
         // Local cache of known Gateway objects.
         let mut known_gateways: HashMap<ObjectKey, Gateway> = HashMap::new();
@@ -175,6 +202,14 @@ impl Controller {
         let mut renewal_interval = tokio::time::interval_at(
             tokio::time::Instant::now() + self.config.lease.renew_interval,
             self.config.lease.renew_interval,
+        );
+
+        // Backstop resync of cached Gateways. Catches the cold-start case where a
+        // Gateway's watch event was consumed before its preconditions were met
+        // (see `STATUS_RESYNC_INTERVAL`); a no-op in steady state.
+        let mut resync_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + STATUS_RESYNC_INTERVAL,
+            STATUS_RESYNC_INTERVAL,
         );
 
         // Subscribe to the three health channels. Each `watch::Receiver` tracks its
@@ -202,6 +237,30 @@ impl Controller {
                         self.leader.store(is_leader, Ordering::Release);
                         crate::metrics::leader().set(i64::from(is_leader));
                         crate::metrics::leader_transitions_total().inc();
+                        if is_leader {
+                            // Gateways observed during the pre-leadership window had
+                            // their watch event consumed while status writes were
+                            // gated off. Re-drive now so they don't wait for a relist.
+                            self.resync_gateways(
+                                &client,
+                                &known_gateways,
+                                &owned_gateway_classes,
+                                &owned_dedicated_gateway_classes,
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                _ = resync_interval.tick() => {
+                    if is_leader {
+                        self.resync_gateways(
+                            &client,
+                            &known_gateways,
+                            &owned_gateway_classes,
+                            &owned_dedicated_gateway_classes,
+                        )
+                        .await;
                     }
                 }
 
@@ -254,6 +313,19 @@ impl Controller {
                                 } else {
                                     owned_dedicated_gateway_classes.remove(&name);
                                 }
+                                if is_leader {
+                                    // This class is now owned; re-drive any cached
+                                    // Gateway whose InitApply was processed and
+                                    // skipped before the class was known (cold-start
+                                    // ordering race between the two watch streams).
+                                    self.resync_gateways(
+                                        &client,
+                                        &known_gateways,
+                                        &owned_gateway_classes,
+                                        &owned_dedicated_gateway_classes,
+                                    )
+                                    .await;
+                                }
                                 if is_leader && gateway_class_needs_status_patch(&gc) {
                                     let Some(generation) = gc.metadata.generation else {
                                         tracing::warn!(name, "Skipping GatewayClass status patch: metadata.generation is unset");
@@ -284,18 +356,26 @@ impl Controller {
                 Some(event) = gateway_watcher.next() => {
                     match event {
                         Ok(watcher::Event::Apply(gw) | watcher::Event::InitApply(gw)) => {
+                            // Cache unconditionally, before any ownership gate. The
+                            // GatewayClass watcher is an independent stream, so on a
+                            // cold start this Gateway's InitApply can arrive before
+                            // its class is known; caching here (not after the gate)
+                            // lets a later resync reconcile it once the class is
+                            // owned, instead of stranding it until the next relist.
+                            let ns = gw.metadata.namespace.clone().unwrap_or_default();
+                            let name = gw.metadata.name.clone().unwrap_or_default();
+                            known_gateways
+                                .insert(ObjectKey::new(ns, name), gw.clone());
+
                             let class_name = gw.spec.gateway_class_name.as_str();
                             if !owned_gateway_classes.contains(class_name) {
                                 tracing::debug!(
                                     name = gw.metadata.name.as_deref().unwrap_or(""),
                                     class_name,
-                                    "Ignoring Gateway — GatewayClass not managed by us"
+                                    "Ignoring Gateway status — GatewayClass not managed by us (cached for resync)"
                                 );
                                 continue;
                             }
-                            let ns = gw.metadata.namespace.clone().unwrap_or_default();
-                            let name = gw.metadata.name.clone().unwrap_or_default();
-                            known_gateways.insert(ObjectKey::new(ns, name), gw.clone());
 
                             // Skip dedicated-mode Gateways — the operator in
                             // `crate::operator::status` is their sole status
@@ -345,26 +425,14 @@ impl Controller {
                 }
 
                 _ = tls_health_rx.changed() => {
-                    if !is_leader || !self.health.is_subsystem_ready("controller") {
-                        continue;
-                    }
-                    let health_map = self.tls_health.load();
-                    for (key, gw) in &known_gateways {
-                        if !owned_gateway_classes.contains(&gw.spec.gateway_class_name) {
-                            continue;
-                        }
-                        // Same dispatch rule as the gateway_watcher arm —
-                        // dedicated-mode Gateways are owned by the operator.
-                        if is_dedicated_mode(gw, &owned_dedicated_gateway_classes) {
-                            continue;
-                        }
-                        let health = health_map
-                            .get(key)
-                            .cloned()
-                            .unwrap_or_default();
-                        if gateway_needs_status_patch(gw, &health) {
-                            gateway_events::patch_gateway_status(&client, gw, &health, self.config.status_address.as_ref(), self.config.ingress_ports).await;
-                        }
+                    if is_leader {
+                        self.resync_gateways(
+                            &client,
+                            &known_gateways,
+                            &owned_gateway_classes,
+                            &owned_dedicated_gateway_classes,
+                        )
+                        .await;
                     }
                 }
 
@@ -485,6 +553,131 @@ impl Controller {
                     }
                     break;
                 }
+            }
+        }
+    }
+
+    /// List GatewayClasses once and return `(owned, owned_dedicated)` ownership
+    /// sets, mirroring the classification the gateway_class watcher applies per
+    /// event.
+    ///
+    /// Called once before the watch loop so the Gateway handler never observes a
+    /// Gateway before its owning class is known (the cold-start ordering race
+    /// between the two independent watch streams). A list error is non-fatal:
+    /// the GatewayClass watcher's `InitApply` backfill re-populates the sets and
+    /// the resync backstop re-drives any Gateway that was skipped meanwhile, so
+    /// startup degrades to the pre-priming behaviour rather than failing.
+    async fn list_owned_gateway_classes(
+        &self,
+        client: &Client,
+    ) -> (HashSet<String>, HashSet<String>) {
+        let mut owned = HashSet::new();
+        let mut dedicated = HashSet::new();
+        match Api::<GatewayClass>::all(client.clone())
+            .list(&ListParams::default())
+            .await
+        {
+            Ok(list) => {
+                for gc in list {
+                    if gc.spec.controller_name != self.config.controller_name {
+                        continue;
+                    }
+                    let name = gc.metadata.name.clone().unwrap_or_default();
+                    if class_has_coxswain_params_ref(&gc) {
+                        dedicated.insert(name.clone());
+                    }
+                    owned.insert(name);
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "Failed to prime GatewayClass ownership; relying on watch backfill + resync"
+            ),
+        }
+        (owned, dedicated)
+    }
+
+    /// List IngressClasses once and return `(owned, owned_default)` ownership
+    /// sets, mirroring the classification the ingress_class watcher applies per
+    /// event. See [`Self::list_owned_gateway_classes`] for why this is primed
+    /// before the watch loop and why a list error is non-fatal.
+    async fn list_owned_ingress_classes(
+        &self,
+        client: &Client,
+    ) -> (HashSet<String>, HashSet<String>) {
+        use k8s_openapi::api::networking::v1::IngressClass;
+        let mut owned = HashSet::new();
+        let mut default = HashSet::new();
+        match Api::<IngressClass>::all(client.clone())
+            .list(&ListParams::default())
+            .await
+        {
+            Ok(list) => {
+                for ic in list {
+                    let is_owned = ic.spec.as_ref().and_then(|s| s.controller.as_deref())
+                        == Some(self.config.controller_name.as_str());
+                    if !is_owned {
+                        continue;
+                    }
+                    let name = ic.metadata.name.clone().unwrap_or_default();
+                    if coxswain_reflector::ingress::is_default_ingress_class(&ic) {
+                        default.insert(name.clone());
+                    }
+                    owned.insert(name);
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "Failed to prime IngressClass ownership; relying on watch backfill + resync"
+            ),
+        }
+        (owned, default)
+    }
+
+    /// Re-reconcile every cached Gateway whose `GatewayClass` we own, patching
+    /// status where it is stale.
+    ///
+    /// A Gateway's watch event can be consumed before its status can be written —
+    /// the owning `GatewayClass` may not yet be observed (the two watch streams
+    /// race on a cold start), or the `controller` subsystem may not yet be ready.
+    /// The event is not redelivered until the next watcher relist (minutes), so
+    /// the Gateway would otherwise carry stale status for that whole window. This
+    /// re-drives the in-memory cache when a precondition transitions true
+    /// (leadership acquired, class becomes owned, listener health changes) and on
+    /// a periodic backstop tick, bounding recovery to event/tick latency.
+    ///
+    /// The caller is responsible for the leadership gate; this is a no-op until
+    /// the `controller` subsystem is ready, because a `Programmed` condition
+    /// requires a synced data plane. Dedicated-mode Gateways are skipped — the
+    /// operator in [`crate::operator::status`] is their sole status writer (#211).
+    async fn resync_gateways(
+        &self,
+        client: &Client,
+        known_gateways: &HashMap<ObjectKey, Gateway>,
+        owned_gateway_classes: &HashSet<String>,
+        owned_dedicated_gateway_classes: &HashSet<String>,
+    ) {
+        if !self.health.is_subsystem_ready("controller") {
+            return;
+        }
+        let health_map = self.tls_health.load();
+        for (key, gw) in known_gateways {
+            if !owned_gateway_classes.contains(&gw.spec.gateway_class_name) {
+                continue;
+            }
+            if is_dedicated_mode(gw, owned_dedicated_gateway_classes) {
+                continue;
+            }
+            let health = health_map.get(key).cloned().unwrap_or_default();
+            if gateway_needs_status_patch(gw, &health) {
+                gateway_events::patch_gateway_status(
+                    client,
+                    gw,
+                    &health,
+                    self.config.status_address.as_ref(),
+                    self.config.ingress_ports,
+                )
+                .await;
             }
         }
     }

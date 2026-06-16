@@ -130,6 +130,20 @@ pub enum PathModifier {
         /// The string to prepend in place of the stripped prefix.
         replacement: String,
     },
+    /// Expand regex capture groups into a replacement template.
+    ///
+    /// Backs the Ingress `use-regex` + `rewrite-target` pairing: the request path is
+    /// matched against this route's own `ImplementationSpecific` pattern and `$1`…`$n`
+    /// references in the template are substituted from the captures. Because the
+    /// pattern is the route's own, capture substitution is intrinsically per-path even
+    /// though the `rewrite-target` template is Ingress-scoped.
+    RegexReplace {
+        /// The route's compiled path regex, compiled once at reconcile and shared
+        /// (`Arc`) — never recompiled per request.
+        regex: Arc<regex::Regex>,
+        /// The replacement template, e.g. `/$2`. Missing groups expand to empty.
+        replacement: Box<str>,
+    },
 }
 
 impl PathModifier {
@@ -161,6 +175,19 @@ impl PathModifier {
                     }
                 } else {
                     path.to_string()
+                }
+            }
+            PathModifier::RegexReplace { regex, replacement } => {
+                // The route was already selected by an `is_match` against the same
+                // pattern, so `captures` normally succeeds; fall back to the
+                // unchanged path defensively rather than panicking if it does not.
+                match regex.captures(path) {
+                    Some(caps) => {
+                        let mut out = String::new();
+                        caps.expand(replacement, &mut out);
+                        out
+                    }
+                    None => path.to_string(),
                 }
             }
         }
@@ -908,6 +935,38 @@ static_assertions::assert_eq_size!(BackendPool, [u8; 24]);
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    // ── PathModifier::RegexReplace ────────────────────────────────────────────────
+
+    fn regex_replace(pattern: &str, template: &str) -> PathModifier {
+        PathModifier::RegexReplace {
+            regex: Arc::new(regex::Regex::new(pattern).expect("test pattern compiles")),
+            replacement: template.into(),
+        }
+    }
+
+    #[test]
+    fn regex_replace_expands_capture_groups() {
+        // The canonical nginx pattern: capture the tail and rewrite the upstream path.
+        let pm = regex_replace(r"^/something(/|$)(.*)", "/$2");
+        assert_eq!(pm.apply("/something/foo/bar"), "/foo/bar");
+        assert_eq!(pm.apply("/something/"), "/");
+    }
+
+    #[test]
+    fn regex_replace_missing_group_expands_empty() {
+        // `$3` has no corresponding group → expands to empty, matching the regex crate.
+        let pm = regex_replace(r"^/api/(.*)", "/v2/$1$3");
+        assert_eq!(pm.apply("/api/users"), "/v2/users");
+    }
+
+    #[test]
+    fn regex_replace_no_match_falls_back_to_path() {
+        // Defensive: `apply` is only reached after `is_match` selected the route, but a
+        // non-matching path must not panic — it returns unchanged.
+        let pm = regex_replace(r"^/api/(\d+)$", "/n/$1");
+        assert_eq!(pm.apply("/api/abc"), "/api/abc");
+    }
 
     // ── BackendGroup round-robin tests ────────────────────────────────────────────
 

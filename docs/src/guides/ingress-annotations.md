@@ -1,6 +1,6 @@
 # Ingress annotations
 
-Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per-Ingress configuration. All annotations are optional and apply uniformly to every rule and path in the Ingress. Invalid values emit a controller warning and are treated as absent — the Ingress is never rejected.
+Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per-Ingress configuration. All annotations are optional and are set once per Ingress; most apply uniformly to every rule and path (`use-regex` additionally keys off each rule's `pathType`). Invalid values emit a controller warning and are treated as absent — the Ingress is never rejected.
 
 ## Quick reference
 
@@ -13,6 +13,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/retry-on` | csv | _none_ | `"connect-failure,5xx"` |
 | `ingress.coxswain-labs.dev/rewrite-target` | string | _none_ | `"/v2"` |
 | `ingress.coxswain-labs.dev/backend-protocol` | string | `HTTP` | `"GRPC"` |
+| `ingress.coxswain-labs.dev/use-regex` | boolean | `false` | `"true"` |
 
 ```yaml
 metadata:
@@ -86,7 +87,63 @@ spec:
                   number: 80
 ```
 
-Regex capture-group substitutions (e.g. `/v2$1`) are not yet supported and are tracked separately.
+### Capture-group substitution
+
+On a **regex path** (`pathType: ImplementationSpecific` with [`use-regex: "true"`](#use-regex)), `rewrite-target` may reference capture groups from the path pattern with `$1`…`$n`. The groups are expanded against the matched request path:
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/use-regex: "true"
+    ingress.coxswain-labs.dev/rewrite-target: /$1        # GET /svc/users/42 → upstream GET /users/42
+spec:
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /svc/(.*)            # paths must start with "/" (no leading ^)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+```
+
+A `$n` with no corresponding group expands to the empty string. On a non-regex path (`Prefix`/`Exact`) `rewrite-target` is always a literal replacement — `$1` is treated as the literal text `$1`, not a capture reference.
+
+!!! note
+    `rewrite-target` is a single per-Ingress value shared by every path in the Ingress. Two paths in one Ingress cannot have different rewrite templates — split them across Ingresses, or use a Gateway API `HTTPRoute` (which has per-rule filters), if you need that.
+
+## `use-regex`
+
+Opt in to **regular-expression path matching** for this Ingress's `pathType: ImplementationSpecific` rules. With `use-regex: "true"`, the `path` of each such rule is compiled and matched as a regular expression (the same engine as Gateway API `HTTPRoute` `RegularExpression` matches); without it (the default), `ImplementationSpecific` paths collapse to `Prefix` matching, so existing manifests are unchanged.
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/use-regex: "true"
+spec:
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /item/[0-9]+        # regex: matches /item/42, not /item/abc
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: items
+                port:
+                  number: 80
+```
+
+**Per-path, not per-host.** `use-regex` is an Ingress-wide *enable*; the per-path lever is the standard `pathType` field. Only `ImplementationSpecific` rules become regex — `Prefix` and `Exact` rules in the same Ingress are unaffected. This differs from nginx-ingress, where `use-regex` (or `rewrite-target`) on any path forces regex matching across **all** paths of the host; Coxswain never does this.
+
+**Matching semantics.** The pattern is matched unanchored and is evaluated **after** exact and prefix routes on the same host — a literal `Prefix`/`Exact` rule that also matches wins over a regex rule. The Kubernetes API server requires every Ingress path to start with `/`, so a regex path is always rooted there (`/svc/(.*)`, not `^/svc/(.*)`); use `$` to anchor the end.
+
+**Invalid patterns.** A path whose value is not a valid regular expression is skipped with a controller `WARN`; the rest of the Ingress (and the routing table) is unaffected.
+
+**Migrating from nginx-ingress.** The canonical nginx pairing — `nginx.ingress.kubernetes.io/use-regex` + `nginx.ingress.kubernetes.io/rewrite-target: /$2` with `pathType: ImplementationSpecific` — maps directly onto the Coxswain annotations of the same names. See [capture-group substitution](#capture-group-substitution).
 
 ## `backend-protocol`
 

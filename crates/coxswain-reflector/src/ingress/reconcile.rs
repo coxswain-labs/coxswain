@@ -8,7 +8,8 @@ use super::ports::IngressPorts;
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
 use coxswain_core::routing::{
-    BackendGroup, FilterAction, IngressRoutingTableBuilder, RouteEntry, WildcardKind,
+    BackendGroup, FilterAction, IngressRoutingTableBuilder, PathModifier, RouteEntry, WildcardKind,
+    compile_path_regex,
 };
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -195,6 +196,10 @@ impl IngressReconciler {
                 );
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
+                // Every Ingress path must be absolute — the Kubernetes API server
+                // enforces this for all pathTypes, including `ImplementationSpecific`
+                // regex paths. A regex pattern is therefore always rooted at '/'
+                // (e.g. `/svc/(.*)`), never anchored with a leading `^`.
                 if !path.starts_with('/') {
                     tracing::warn!(
                         ingress = %route_id,
@@ -205,6 +210,48 @@ impl IngressReconciler {
                     continue;
                 }
 
+                // Regex mode is per-path: the Ingress-wide `use-regex` annotation only
+                // arms `pathType: ImplementationSpecific` rules.
+                let is_regex_path =
+                    ann.use_regex && path_rule.path_type.as_str() == "ImplementationSpecific";
+
+                // Compile the regex here (the safe-compile guard) so an uncompilable
+                // pattern skips just this path instead of reaching `build()` and dropping
+                // the whole table.
+                let path_regex = if is_regex_path {
+                    match compile_path_regex(path) {
+                        Ok(re) => Some(Arc::new(re)),
+                        Err(e) => {
+                            tracing::warn!(
+                                ingress = %route_id,
+                                host = ?rule.host,
+                                path = %path,
+                                error = %e,
+                                "use-regex path is not a valid regular expression — skipping path"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Per-path rewrite filters: on a regex path the `rewrite-target` template
+                // is rebuilt as a capture-group substitution against this path's own
+                // pattern; every other path keeps the shared literal full-path replace.
+                let path_filters = match (&path_regex, &ann.rewrite) {
+                    (Some(re), Some(PathModifier::ReplaceFullPath(target))) => {
+                        vec![FilterAction::UrlRewrite {
+                            hostname: None,
+                            path: Some(PathModifier::RegexReplace {
+                                regex: Arc::clone(re),
+                                replacement: target.as_str().into(),
+                            }),
+                        }]
+                    }
+                    _ => rewrite_filters.clone(),
+                };
+
                 let metric_route_id: Arc<str> = Arc::from(format!(
                     "ingress/{ns}/{ingress_name}:{rule_index}.{path_index}"
                 ));
@@ -212,22 +259,27 @@ impl IngressReconciler {
                     .with_path_pattern(Arc::from(path))
                     .with_metric_route_id(metric_route_id)
                     .with_timeouts(ann.timeouts.clone())
-                    .with_filter_actions(rewrite_filters.clone());
+                    .with_filter_actions(path_filters);
                 if dead {
                     entry.error_status = Some(503);
                 }
                 let e = Arc::new(entry);
-                // "Prefix" and "ImplementationSpecific" both map to prefix matching.
+                // Regex paths route to the regex matcher; otherwise "Exact" is exact and
+                // "Prefix"/"ImplementationSpecific" both map to prefix matching.
                 for &listener_port in &ports {
                     let host_builder = builder
                         .for_port(listener_port)
                         .host_for(rule.host.as_deref(), WildcardKind::SingleLabel);
-                    match path_rule.path_type.as_str() {
-                        "Exact" => {
-                            host_builder.add_exact_route(path, Arc::clone(&e));
-                        }
-                        _ => {
-                            host_builder.add_prefix_route(path, Arc::clone(&e));
+                    if path_regex.is_some() {
+                        host_builder.add_regex_route(path, Arc::clone(&e));
+                    } else {
+                        match path_rule.path_type.as_str() {
+                            "Exact" => {
+                                host_builder.add_exact_route(path, Arc::clone(&e));
+                            }
+                            _ => {
+                                host_builder.add_prefix_route(path, Arc::clone(&e));
+                            }
                         }
                     }
                 }
@@ -923,6 +975,191 @@ mod tests {
 
         assert!(table.route(80, "example.com", "/api", &ctx).is_some());
         assert!(table.route(80, "example.com", "/api/v2", &ctx).is_some());
+    }
+
+    // ── use-regex (#265) ──────────────────────────────────────────────────────
+
+    /// Build an Ingress on `default` with one rule, arbitrary `(path, pathType)`
+    /// pairs, and arbitrary `ingress.coxswain-labs.dev/*` annotations.
+    fn make_regex_ingress(
+        host: Option<&str>,
+        paths: &[(&str, &str)],
+        svc: &str,
+        annotations: &[(&str, &str)],
+    ) -> Ingress {
+        let mut ann_map: BTreeMap<String, String> = annotations
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        ann_map
+            .entry("kubernetes.io/ingress.class".to_string())
+            .or_insert_with(|| "coxswain".to_string());
+        Ingress {
+            metadata: ObjectMeta {
+                name: Some("regex-ingress".to_string()),
+                namespace: Some("default".to_string()),
+                annotations: Some(ann_map),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                ingress_class_name: Some("coxswain".to_string()),
+                rules: Some(vec![IngressRule {
+                    host: host.map(str::to_string),
+                    http: Some(HTTPIngressRuleValue {
+                        paths: paths
+                            .iter()
+                            .map(|(p, pt)| HTTPIngressPath {
+                                path: Some((*p).to_string()),
+                                path_type: (*pt).to_string(),
+                                backend: IngressBackend {
+                                    service: Some(IngressServiceBackend {
+                                        name: svc.to_string(),
+                                        port: Some(ServiceBackendPort {
+                                            number: Some(80),
+                                            ..Default::default()
+                                        }),
+                                    }),
+                                    ..Default::default()
+                                },
+                            })
+                            .collect(),
+                    }),
+                }]),
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_use_regex_matches_implementation_specific_as_regex() {
+        use crate::ingress::annotations::USE_REGEX;
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_regex_ingress(
+            Some("example.com"),
+            &[(r"/item/[0-9]+", "ImplementationSpecific")],
+            "svc",
+            &[(USE_REGEX, "true")],
+        );
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        // Digits match; non-digits do not — pattern is a regex, not a prefix.
+        assert!(table.route(80, "example.com", "/item/42", &ctx).is_some());
+        assert!(table.route(80, "example.com", "/item/abc", &ctx).is_none());
+    }
+
+    #[test]
+    fn reconcile_use_regex_off_does_not_treat_path_as_regex() {
+        use crate::ingress::annotations::USE_REGEX;
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_regex_ingress(
+            Some("example.com"),
+            &[(r"/item/[0-9]+", "ImplementationSpecific")],
+            "svc",
+            &[(USE_REGEX, "false")],
+        );
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        // With the opt-in off, the path is a literal Prefix: `/item/42` does not
+        // start with the literal `/item/[0-9]+`, so it does not match (it would if
+        // the metacharacters were interpreted as a regex).
+        assert!(table.route(80, "example.com", "/item/42", &ctx).is_none());
+    }
+
+    #[test]
+    fn reconcile_use_regex_rewrite_target_substitutes_captures() {
+        use crate::ingress::annotations::{REWRITE_TARGET, USE_REGEX};
+        use coxswain_core::routing::{FilterAction, PathModifier, RouteOutcome};
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ingress = make_regex_ingress(
+            Some("example.com"),
+            &[(r"/svc/(.*)", "ImplementationSpecific")],
+            "svc",
+            &[(USE_REGEX, "true"), (REWRITE_TARGET, "/$1")],
+        );
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        match table.find(80, "example.com", "/svc/users/42", &ctx) {
+            RouteOutcome::Found(_, filters, _, _, _) => {
+                let pm = filters
+                    .iter()
+                    .find_map(|f| match f {
+                        FilterAction::UrlRewrite {
+                            path: Some(pm @ PathModifier::RegexReplace { .. }),
+                            ..
+                        } => Some(pm),
+                        _ => None,
+                    })
+                    .expect("expected a RegexReplace UrlRewrite filter");
+                // The capture group is expanded against this path's own pattern.
+                assert_eq!(pm.apply("/svc/users/42"), "/users/42");
+            }
+            _ => panic!("expected Found"),
+        }
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn reconcile_invalid_regex_skips_only_that_path() {
+        use crate::ingress::annotations::USE_REGEX;
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        // One valid and one uncompilable regex path on the same Ingress.
+        let ingress = make_regex_ingress(
+            Some("example.com"),
+            &[
+                (r"/good/[0-9]+$", "ImplementationSpecific"),
+                (r"/bad/(", "ImplementationSpecific"),
+            ],
+            "svc",
+            &[(USE_REGEX, "true")],
+        );
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        // The whole table still builds — the bad path was skipped, not fatal.
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        assert!(table.route(80, "example.com", "/good/42", &ctx).is_some());
+        // The bad path installed no route, so nothing serves it.
+        assert!(
+            table
+                .route(80, "example.com", "/bad/anything", &ctx)
+                .is_none()
+        );
+        assert!(logs_contain("not a valid regular expression"));
     }
 
     #[test]
