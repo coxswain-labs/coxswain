@@ -14,7 +14,7 @@
 //! `retry-on`). Routing-shape behavior lives in `routing.rs`; TLS in `tls.rs`.
 
 use coxswain_e2e::{
-    FixtureVars, Harness, NamespaceGuard,
+    FixtureVars, Harness, IngressClassGuard, NamespaceGuard,
     fixtures::{self, backends, ingress},
     harness::wait,
 };
@@ -114,6 +114,36 @@ async fn annotation_read_timeout_returns_502() -> anyhow::Result<()> {
 
     // 502 doubles as the readiness signal: once the route is installed every
     // request times out on the upstream read and returns 502 within 500ms.
+    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
+/// Verifies a class-level `connect-timeout` default sourced from
+/// `IngressClass.spec.parameters` (#190) reaches the data plane — proving the
+/// class-defaults merge is annotation-agnostic, not specific to `rewrite-target`.
+///
+/// The Ingress sets no `connect-timeout` of its own; the class default (500ms)
+/// bounds the connect to a black-holed backend (192.0.2.1, RFC 5737) and yields a
+/// prompt 502. Without the class default the connect would hang past the client's
+/// 5s budget, so the prompt 502 is the proof the class default applied.
+#[tokio::test]
+async fn class_default_connect_timeout_returns_502() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-cls-timeout").await?;
+
+    // Cluster-scoped IngressClass — guard deletes it on drop. Name matches the
+    // fixture's `coxswain-clstimeout-${TESTNS}`.
+    let ic_name = format!("coxswain-clstimeout-{}", ns.name);
+    let _ic_guard = IngressClassGuard::new(&h.client, &ic_name);
+
+    fixtures::apply_fixture(ingress::CLASS_DEFAULT_TIMEOUT, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("clstimeout.{}.local", ns.name);
+
+    // 502 doubles as the readiness signal: once the route is installed every
+    // request black-holes on connect and returns 502 within the 500ms deadline
+    // supplied by the class default.
     wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
 
     Ok(())

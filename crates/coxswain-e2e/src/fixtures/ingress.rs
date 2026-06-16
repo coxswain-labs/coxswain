@@ -49,3 +49,18 @@ pub const ANNOTATION_READ_TIMEOUT: &str = fixture!("annotation_read_timeout.yaml
 /// one with `backend-protocol: GRPC` (proxy speaks h2c → serves), one with no
 /// annotation (proxy speaks HTTP/1.1 → rejected). Reuses the h2c-echo Deployment.
 pub const ANNOTATION_BACKEND_PROTOCOL: &str = fixture!("annotation_backend_protocol.yaml");
+/// Per-class annotation defaults via `IngressClass.spec.parameters` (#190): a
+/// `CoxswainIngressClassParameters` CR sets a default `rewrite-target`, one
+/// Ingress inherits it and a second overrides it per-key. The IngressClass is
+/// cluster-scoped and uniquely named — wrap it in an `IngressClassGuard`.
+pub const CLASS_DEFAULT_REWRITE: &str = fixture!("class_default_rewrite.yaml");
+/// Class-default `connect-timeout` (#190) via a `CoxswainIngressClassParameters`
+/// CR, pointed at a black-holed backend. Proves the class-defaults merge applies
+/// to traffic-policy annotations, not just `rewrite-target`. Cluster-scoped
+/// IngressClass — wrap it in an `IngressClassGuard`.
+pub const CLASS_DEFAULT_TIMEOUT: &str = fixture!("class_default_timeout.yaml");
+/// Unhappy-path (#190): an IngressClass whose `spec.parameters` points at a
+/// non-existent `CoxswainIngressClassParameters`. The route must still serve with
+/// built-in defaults (graceful degrade). Cluster-scoped IngressClass — wrap it in
+/// an `IngressClassGuard`.
+pub const CLASS_DEFAULT_DANGLING: &str = fixture!("class_default_dangling.yaml");

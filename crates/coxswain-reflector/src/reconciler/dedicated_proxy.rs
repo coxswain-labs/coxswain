@@ -292,6 +292,8 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
         reflector::store::<k8s_openapi::api::networking::v1::Ingress>();
     let (ingress_class_reader, _ingress_class_writer) =
         reflector::store::<k8s_openapi::api::networking::v1::IngressClass>();
+    let (ingress_class_params_reader, _ingress_class_params_writer) =
+        reflector::store::<coxswain_core::crd::CoxswainIngressClassParameters>();
 
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
@@ -372,11 +374,13 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
         ReflectorEffects::new(&notify, controller_health, "config_map", metrics),
         "ConfigMap",
     );
-    // The dedicated reconciler skips Ingress / IngressClass — but those
-    // subsystem checks were registered for the shared-proxy case. Flip them
-    // ready immediately so `/readyz` doesn't stay 503 forever.
+    // The dedicated reconciler skips Ingress / IngressClass / the Ingress-class
+    // params CR — but those subsystem checks were registered for the
+    // shared-proxy case. Flip them ready immediately so `/readyz` doesn't stay
+    // 503 forever.
     controller_health.ready("ingress");
     controller_health.ready("ingress_class");
+    controller_health.ready("ingress_class_parameters");
 
     let controller_name = rec.config.controller_name.clone();
     let target = rec.config.target();
@@ -403,6 +407,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
                 routes: &route_reader,
                 ingresses: &ingress_reader,
                 ingress_classes: &ingress_class_reader,
+                ingress_class_parameters: &ingress_class_params_reader,
                 gateways: &gateway_reader,
                 gateway_classes: &gateway_class_reader,
                 slices: &slice_reader,
@@ -742,12 +747,15 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
     let (ingress_reader, _) = reflector::store::<k8s_openapi::api::networking::v1::Ingress>();
     let (ingress_class_reader, _) =
         reflector::store::<k8s_openapi::api::networking::v1::IngressClass>();
+    let (ingress_class_params_reader, _) =
+        reflector::store::<coxswain_core::crd::CoxswainIngressClassParameters>();
     let (gateway_class_reader, _) = reflector::store::<GatewayClass>();
 
-    // Flip the three "we don't watch this" subsystem checks Ready
-    // immediately so `/readyz` doesn't get stuck on them.
+    // Flip the "we don't watch this" subsystem checks Ready immediately so
+    // `/readyz` doesn't get stuck on them.
     controller_health.ready("ingress");
     controller_health.ready("ingress_class");
+    controller_health.ready("ingress_class_parameters");
     controller_health.ready("gateway_class");
 
     let controller_name = rec.config.controller_name.clone();
@@ -788,6 +796,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
                 routes: &routes_aggr,
                 ingresses: &ingress_reader,
                 ingress_classes: &ingress_class_reader,
+                ingress_class_parameters: &ingress_class_params_reader,
                 gateways: &gateways_aggr,
                 gateway_classes: &gateway_class_reader,
                 slices: &slices_aggr,

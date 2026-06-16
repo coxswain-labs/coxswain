@@ -14,8 +14,39 @@ use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::runtime::reflector;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+
+/// The IngressClass-ownership context threaded into [`IngressReconciler::reconcile`].
+///
+/// Groups the three class-derived inputs a reconcile pass needs — the owned
+/// class names, the owned default class (if any), and per-class annotation
+/// defaults resolved from `IngressClass.spec.parameters` (#190) — so the
+/// reconcile entry point stays under the workspace argument-count limit and so
+/// callers thread one borrow instead of three.
+#[non_exhaustive]
+pub struct IngressClassContext<'a> {
+    owned: &'a HashSet<String>,
+    default: Option<&'a str>,
+    defaults: &'a HashMap<String, BTreeMap<String, String>>,
+}
+
+impl<'a> IngressClassContext<'a> {
+    /// Bundle the owned class names, owned default class, and per-class
+    /// annotation defaults for a single reconcile pass.
+    #[must_use]
+    pub fn new(
+        owned: &'a HashSet<String>,
+        default: Option<&'a str>,
+        defaults: &'a HashMap<String, BTreeMap<String, String>>,
+    ) -> Self {
+        Self {
+            owned,
+            default,
+            defaults,
+        }
+    }
+}
 
 impl IngressReconciler {
     /// Skips the Ingress when it does not reference an owned IngressClass.
@@ -29,27 +60,29 @@ impl IngressReconciler {
         ingress: &Ingress,
         slices: &reflector::Store<EndpointSlice>,
         services: &reflector::Store<Service>,
-        owned_classes: &HashSet<String>,
-        owned_default_class: Option<&str>,
+        classes: &IngressClassContext<'_>,
         ports: IngressPorts,
         builder: &mut IngressRoutingTableBuilder,
     ) {
         let claimed_class = claimed_ingress_class(ingress);
 
-        match claimed_class {
-            None => match owned_default_class {
-                Some(_) => {}
+        // The class this Ingress is served under: its explicit class, or the
+        // owned default class when unclassified. Drives both the ownership gate
+        // and the per-class annotation-defaults lookup below.
+        let effective_class = match claimed_class {
+            None => match classes.default {
+                Some(default) => default,
                 None => {
                     tracing::debug!(name = ?ingress.metadata.name, "Skipping Ingress — no ingressClassName or annotation");
                     return;
                 }
             },
-            Some(class) if !owned_classes.contains(class) => {
+            Some(class) if !classes.owned.contains(class) => {
                 tracing::debug!(name = ?ingress.metadata.name, %class, "Skipping Ingress — class not owned by this controller");
                 return;
             }
-            Some(_) => {}
-        }
+            Some(class) => class,
+        };
 
         let ports: Vec<u16> = [ports.http, ports.https].into_iter().flatten().collect();
         if ports.is_empty() {
@@ -67,9 +100,30 @@ impl IngressReconciler {
         let spec = ingress.spec.as_ref();
         let rules = spec.and_then(|s| s.rules.as_deref()).unwrap_or(&[]);
 
+        // Layer class-level defaults (#190) under the Ingress's own
+        // annotations: a key set on the Ingress wins per-key; unset keys inherit
+        // the class default. No (or empty) class default → keep the existing
+        // zero-allocation path on the Ingress's own annotation map.
+        let merged_annotations = classes
+            .defaults
+            .get(effective_class)
+            .filter(|defaults| !defaults.is_empty())
+            .map(|defaults| {
+                let mut effective = defaults.clone();
+                if let Some(own) = ingress.metadata.annotations.as_ref() {
+                    effective.extend(own.clone());
+                }
+                effective
+            });
+
         // Parse ingress.coxswain-labs.dev/* annotations once per Ingress.
         // Invalid values WARN + use default; the Ingress is never dropped.
-        let ann = IngressAnnotations::parse(ingress.metadata.annotations.as_ref(), &route_id);
+        let ann = IngressAnnotations::parse(
+            merged_annotations
+                .as_ref()
+                .or(ingress.metadata.annotations.as_ref()),
+            &route_id,
+        );
 
         // Build rewrite filter list once (shared across all entries for this Ingress).
         let rewrite_filters: Vec<FilterAction> = ann
@@ -1147,12 +1201,12 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
+        let no_class_defaults = HashMap::new();
         IngressReconciler::reconcile(
             &ingress,
             &store,
             &empty_svc_store(),
-            &owned(&["coxswain"]),
-            Some("coxswain"),
+            &IngressClassContext::new(&owned(&["coxswain"]), Some("coxswain"), &no_class_defaults),
             IngressPorts::new(Some(80), None),
             &mut builder,
         );
@@ -1178,12 +1232,12 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
+        let no_class_defaults = HashMap::new();
         IngressReconciler::reconcile(
             &ingress,
             &store,
             &empty_svc_store(),
-            &owned(&["coxswain"]),
-            None,
+            &IngressClassContext::new(&owned(&["coxswain"]), None, &no_class_defaults),
             IngressPorts::new(Some(80), None),
             &mut builder,
         );
@@ -1573,6 +1627,155 @@ mod tests {
         // Route is installed despite invalid annotation.
         assert!(table.route(80, "example.com", "/", &ctx).is_some());
         // A warning was emitted.
+        assert!(logs_contain("invalid duration — using default"));
+    }
+
+    // ── Class-level annotation defaults (#190) ────────────────────────────────
+
+    /// `defaults` keyed by IngressClass name, with one annotation each.
+    fn class_defaults(
+        class: &str,
+        anns: &[(&str, &str)],
+    ) -> HashMap<String, BTreeMap<String, String>> {
+        let mut map = BTreeMap::new();
+        for (k, v) in anns {
+            map.insert((*k).to_string(), (*v).to_string());
+        }
+        let mut out = HashMap::new();
+        out.insert(class.to_string(), map);
+        out
+    }
+
+    #[test]
+    fn class_default_annotation_applies_when_ingress_unset() {
+        use crate::ingress::annotations::CONNECT_TIMEOUT;
+        use std::time::Duration;
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        // Ingress claims "coxswain" but sets no annotations of its own.
+        let ing = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
+        let defaults = class_defaults("coxswain", &[(CONNECT_TIMEOUT, "7s")]);
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_with_class_defaults(
+            &ing,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &defaults,
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        assert_eq!(
+            find_timeouts(&table, "example.com", "/").connect,
+            Some(Duration::from_secs(7)),
+            "Ingress must inherit the class default connect-timeout"
+        );
+    }
+
+    #[test]
+    fn ingress_annotation_overrides_class_default() {
+        use crate::ingress::annotations::CONNECT_TIMEOUT;
+        use std::time::Duration;
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        // Ingress sets connect-timeout=2s; class default is 7s → Ingress wins.
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[(CONNECT_TIMEOUT, "2s")],
+        );
+        let defaults = class_defaults("coxswain", &[(CONNECT_TIMEOUT, "7s")]);
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_with_class_defaults(
+            &ing,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &defaults,
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        assert_eq!(
+            find_timeouts(&table, "example.com", "/").connect,
+            Some(Duration::from_secs(2)),
+            "per-Ingress annotation must override the class default per-key"
+        );
+    }
+
+    #[test]
+    fn unknown_class_default_key_is_inert() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
+        // A key outside the coxswain annotation namespace is carried but ignored
+        // by the parser — the route installs and carries no parsed knobs.
+        let defaults = class_defaults("coxswain", &[("nginx.ingress.kubernetes.io/whatever", "x")]);
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_with_class_defaults(
+            &ing,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &defaults,
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        assert!(table.route(80, "example.com", "/", &ctx).is_some());
+        assert!(find_timeouts(&table, "example.com", "/").connect.is_none());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn empty_string_class_default_warns_and_falls_back() {
+        use crate::ingress::annotations::CONNECT_TIMEOUT;
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
+        // An empty string is not an "unset" sentinel: it is parsed, WARNs, and
+        // falls back to the built-in default — same as a per-Ingress empty value.
+        let defaults = class_defaults("coxswain", &[(CONNECT_TIMEOUT, "")]);
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_with_class_defaults(
+            &ing,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &defaults,
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        assert!(
+            table
+                .route(80, "example.com", "/", &RequestContext::default())
+                .is_some()
+        );
+        assert!(
+            find_timeouts(&table, "example.com", "/").connect.is_none(),
+            "empty class default must fall back to the built-in default"
+        );
         assert!(logs_contain("invalid duration — using default"));
     }
 }

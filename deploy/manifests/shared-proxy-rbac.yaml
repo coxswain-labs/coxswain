@@ -33,6 +33,12 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses", "ingressclasses"]
     verbs: ["get", "list", "watch"]
+  # Read CoxswainIngressClassParameters so IngressClass.spec.parameters can be
+  # resolved into per-class annotation defaults (#190). Read-only — the proxy SA
+  # holds no write verb on any resource.
+  - apiGroups: ["ingress.coxswain-labs.dev"]
+    resources: ["coxswainingressclassparameters"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       ["gatewayclasses", "gateways", "httproutes", "referencegrants", "backendtlspolicies"]

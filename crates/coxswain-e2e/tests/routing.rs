@@ -308,6 +308,84 @@ async fn annotation_rewrite_target_rewrites_upstream_path() -> anyhow::Result<()
     Ok(())
 }
 
+/// Verifies per-class annotation defaults resolved from `IngressClass.spec.parameters`
+/// (#190): a `CoxswainIngressClassParameters` CR sets a default `rewrite-target`,
+/// and an Ingress claiming that class inherits it while a second Ingress overrides
+/// it per-key. The echo backend's reflected upstream path is the deterministic
+/// proof of which value won — exercising the full resolve → merge → reflector →
+/// RBAC path on live traffic. (Per-key precedence is also unit-covered in
+/// `coxswain-reflector::ingress::reconcile`.)
+#[tokio::test]
+async fn ingress_class_parameters_default_annotation_applies_and_is_overridable()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-class-params").await?;
+
+    // The IngressClass is cluster-scoped and uniquely named; the guard deletes it
+    // on drop so the resource doesn't leak. The name matches the fixture's
+    // `coxswain-clsdefault-${TESTNS}`.
+    let ic_name = format!("coxswain-clsdefault-{}", ns.name);
+    let _ic_guard = IngressClassGuard::new(&h.client, &ic_name);
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::CLASS_DEFAULT_REWRITE, FixtureVars::new(&ns.name)).await?;
+
+    // Inherited: the Ingress sets no rewrite of its own, so the class default
+    // (/from-class) must reach the upstream.
+    let inherit_host = format!("clsdefault-inherit.{}.local", ns.name);
+    let resp =
+        wait::wait_for_route(&h.http, &inherit_host, "/api", Duration::from_secs(60)).await?;
+    assert_eq!(
+        resp.path.as_deref(),
+        Some("/from-class"),
+        "an Ingress with no own rewrite-target must inherit the class default"
+    );
+
+    // Overridden: the Ingress's own rewrite-target wins per-key.
+    let override_host = format!("clsdefault-override.{}.local", ns.name);
+    let resp =
+        wait::wait_for_route(&h.http, &override_host, "/api", Duration::from_secs(60)).await?;
+    assert_eq!(
+        resp.path.as_deref(),
+        Some("/from-ingress"),
+        "a per-Ingress rewrite-target must override the class default"
+    );
+
+    Ok(())
+}
+
+/// Unhappy-path companion to the class-defaults test (#190): an IngressClass whose
+/// `spec.parameters` points at a missing `CoxswainIngressClassParameters`. The
+/// reference dangles, so coxswain WARNs and degrades gracefully — the Ingress is
+/// never rejected, still routes to its backend, and no class default is applied,
+/// so the upstream sees the original request path.
+#[tokio::test]
+async fn ingress_class_parameters_dangling_ref_degrades_gracefully() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-class-dangling").await?;
+
+    let ic_name = format!("coxswain-clsdangling-{}", ns.name);
+    let _ic_guard = IngressClassGuard::new(&h.client, &ic_name);
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::CLASS_DEFAULT_DANGLING, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("dangling.{}.local", ns.name);
+    // The route still serves despite the broken ref, and — because no class
+    // default was applied — the upstream sees the original path, not a rewrite.
+    let resp = wait::wait_for_route(&h.http, &host, "/api", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+    assert_eq!(
+        resp.path.as_deref(),
+        Some("/api"),
+        "a dangling parametersRef must not apply any class default — original path preserved"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn gateway_path_match_routes_to_backend() -> anyhow::Result<()> {
     let h = Harness::start().await?;

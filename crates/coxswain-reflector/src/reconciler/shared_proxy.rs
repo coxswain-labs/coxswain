@@ -33,10 +33,13 @@ use crate::tls::{
 };
 use crate::{
     endpoints,
-    ingress::{IngressPorts, IngressReconciler},
+    ingress::{
+        IngressClassContext, IngressPorts, IngressReconciler, resolve_class_default_annotations,
+    },
 };
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
+use coxswain_core::crd::CoxswainIngressClassParameters;
 use coxswain_core::fleet::{self, SharedFleet};
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
@@ -315,6 +318,9 @@ pub(super) struct ReflectorStores<'a> {
     pub(super) routes: &'a reflector::Store<HttpRoute>,
     pub(super) ingresses: &'a reflector::Store<Ingress>,
     pub(super) ingress_classes: &'a reflector::Store<IngressClass>,
+    /// `CoxswainIngressClassParameters` CRs in scope — the per-class annotation
+    /// default sources resolved from `IngressClass.spec.parameters` (#190).
+    pub(super) ingress_class_parameters: &'a reflector::Store<CoxswainIngressClassParameters>,
     pub(super) gateways: &'a reflector::Store<Gateway>,
     pub(super) gateway_classes: &'a reflector::Store<GatewayClass>,
     pub(super) slices: &'a reflector::Store<EndpointSlice>,
@@ -535,6 +541,8 @@ async fn spawn_tasks(
     let (route_reader, route_writer) = reflector::store::<HttpRoute>();
     let (ingress_reader, ingress_writer) = reflector::store::<Ingress>();
     let (class_reader, class_writer) = reflector::store::<IngressClass>();
+    let (class_params_reader, class_params_writer) =
+        reflector::store::<CoxswainIngressClassParameters>();
     let (gateway_reader, gateway_writer) = reflector::store::<Gateway>();
     let (gateway_class_reader, gateway_class_writer) = reflector::store::<GatewayClass>();
     let (slice_reader, slice_writer) = reflector::store::<EndpointSlice>();
@@ -570,6 +578,23 @@ async fn spawn_tasks(
         watcher::Config::default(),
         ReflectorEffects::new(&notify, &controller_health, "ingress_class", metrics),
         "IngressClass",
+    );
+    // Watched cluster-wide (like IngressClass): an IngressClass is cluster-scoped
+    // and its `spec.parameters.namespace` is unconstrained, so a `--watch-namespace`
+    // scope would miss a params CR stored in another namespace. RBAC is a ClusterRole
+    // read; the proxy SA holds no write verb on this resource.
+    spawn_reflector(
+        &mut set,
+        class_params_writer,
+        Api::<CoxswainIngressClassParameters>::all(client.clone()),
+        watcher::Config::default(),
+        ReflectorEffects::new(
+            &notify,
+            &controller_health,
+            "ingress_class_parameters",
+            metrics,
+        ),
+        "CoxswainIngressClassParameters",
     );
     spawn_reflector(
         &mut set,
@@ -689,6 +714,7 @@ async fn spawn_tasks(
                 routes: &route_reader,
                 ingresses: &ingress_reader,
                 ingress_classes: &class_reader,
+                ingress_class_parameters: &class_params_reader,
                 gateways: &gateway_reader,
                 gateway_classes: &gateway_class_reader,
                 slices: &slice_reader,
@@ -1073,14 +1099,28 @@ fn build_ingress_routes(
     ingress_ports: IngressPorts,
     shared: &SharedIngressRoutingTable,
 ) -> bool {
+    // Resolve per-class annotation defaults once for this rebuild (#190):
+    // each owned IngressClass's spec.parameters → CoxswainIngressClassParameters
+    // → defaultAnnotations. Reconcile layers these under each Ingress's own
+    // annotations (per-Ingress keys win).
+    let class_defaults = resolve_class_default_annotations(
+        stores.ingress_classes,
+        ownership.ingress_classes,
+        stores.ingress_class_parameters,
+    );
+    let class_ctx = IngressClassContext::new(
+        ownership.ingress_classes,
+        ownership.default_ingress_class,
+        &class_defaults,
+    );
+
     let mut builder = IngressRoutingTableBuilder::new();
     for ingress in ingresses {
         IngressReconciler::reconcile(
             ingress,
             stores.slices,
             stores.services,
-            ownership.ingress_classes,
-            ownership.default_ingress_class,
+            &class_ctx,
             ingress_ports,
             &mut builder,
         );

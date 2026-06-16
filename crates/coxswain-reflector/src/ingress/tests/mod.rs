@@ -9,7 +9,7 @@ pub(super) use k8s_openapi::api::networking::v1::{
 };
 pub(super) use kube::api::ObjectMeta;
 pub(super) use kube::runtime::reflector;
-pub(super) use std::collections::{BTreeMap, HashSet};
+pub(super) use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub(super) use crate::tests::fixtures::{empty_svc_store, make_slice, make_svc_store, slice_store};
 
@@ -24,12 +24,32 @@ pub(super) fn reconcile_no_default(
     owned: &HashSet<String>,
     b: &mut IngressRoutingTableBuilder,
 ) {
+    let no_class_defaults = HashMap::new();
     IngressReconciler::reconcile(
         ing,
         slices,
         svcs,
-        owned,
-        None,
+        &IngressClassContext::new(owned, None, &no_class_defaults),
+        IngressPorts::new(Some(80), None),
+        b,
+    );
+}
+
+/// Like [`reconcile_no_default`] but with per-class annotation defaults keyed by
+/// IngressClass name — used to exercise the #190 class-defaults merge.
+pub(super) fn reconcile_with_class_defaults(
+    ing: &Ingress,
+    slices: &reflector::Store<EndpointSlice>,
+    svcs: &reflector::Store<Service>,
+    owned: &HashSet<String>,
+    defaults: &HashMap<String, BTreeMap<String, String>>,
+    b: &mut IngressRoutingTableBuilder,
+) {
+    IngressReconciler::reconcile(
+        ing,
+        slices,
+        svcs,
+        &IngressClassContext::new(owned, None, defaults),
         IngressPorts::new(Some(80), None),
         b,
     );

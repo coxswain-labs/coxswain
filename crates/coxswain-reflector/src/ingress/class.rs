@@ -1,6 +1,17 @@
-//! IngressClass ownership checks and `is-default-class` annotation helper.
+//! IngressClass ownership checks, the `is-default-class` annotation helper, and
+//! resolution of per-class annotation defaults from `IngressClass.spec.parameters`.
 
+use coxswain_core::crd::CoxswainIngressClassParameters;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
+use kube::runtime::reflector;
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// API group an `IngressClass.spec.parameters` must name to be treated as a
+/// Coxswain per-class parameters reference.
+pub(crate) const CLASS_PARAMETERS_API_GROUP: &str = "ingress.coxswain-labs.dev";
+/// Kind an `IngressClass.spec.parameters` must name to be treated as a Coxswain
+/// per-class parameters reference.
+pub(crate) const CLASS_PARAMETERS_KIND: &str = "CoxswainIngressClassParameters";
 
 /// Annotation that marks an `IngressClass` as the cluster-default; Ingresses
 /// without an explicit class are claimed by the owner of a default class.
@@ -32,6 +43,77 @@ pub fn claimed_ingress_class(ingress: &Ingress) -> Option<&str> {
                 .as_ref()
                 .and_then(|a| a.get("kubernetes.io/ingress.class").map(String::as_str))
         })
+}
+
+/// Resolve per-class default annotation maps for every owned `IngressClass`
+/// that references a `CoxswainIngressClassParameters` CR via `spec.parameters`.
+///
+/// The returned map is keyed by IngressClass name; the value is that class's
+/// `spec.defaultAnnotations`. A class is absent from the map (degrade
+/// gracefully — its Ingresses still route with built-in defaults) when it has
+/// no `spec.parameters`, the ref names a non-Coxswain apiGroup/kind, the ref
+/// omits its namespace (the CR is namespaced), the target CR is missing from
+/// the store, or the CR carries no `defaultAnnotations`. Every broken-reference
+/// case logs a `WARN` — mirroring how an invalid per-Ingress annotation value
+/// WARNs and falls back rather than dropping the Ingress.
+///
+/// Reads only from the supplied stores; never queries the API server.
+pub(crate) fn resolve_class_default_annotations(
+    class_store: &reflector::Store<IngressClass>,
+    owned: &HashSet<String>,
+    params_store: &reflector::Store<CoxswainIngressClassParameters>,
+) -> HashMap<String, BTreeMap<String, String>> {
+    let mut out = HashMap::new();
+    for ic in class_store.state() {
+        let Some(name) = ic.metadata.name.as_deref() else {
+            continue;
+        };
+        if !owned.contains(name) {
+            continue;
+        }
+        let Some(params) = ic.spec.as_ref().and_then(|s| s.parameters.as_ref()) else {
+            continue; // No parametersRef — nothing to resolve for this class.
+        };
+        // A class may legitimately point `parameters` at another
+        // implementation's object; only act on Coxswain's parameters CRD.
+        if params.api_group.as_deref() != Some(CLASS_PARAMETERS_API_GROUP)
+            || params.kind != CLASS_PARAMETERS_KIND
+        {
+            tracing::warn!(
+                class = name,
+                api_group = ?params.api_group,
+                kind = %params.kind,
+                "IngressClass.spec.parameters does not reference a CoxswainIngressClassParameters — ignoring class defaults"
+            );
+            continue;
+        }
+        let Some(ns) = params.namespace.as_deref() else {
+            tracing::warn!(
+                class = name,
+                ref_name = %params.name,
+                "IngressClass.spec.parameters omits namespace (CoxswainIngressClassParameters is namespaced) — ignoring class defaults"
+            );
+            continue;
+        };
+        let key =
+            reflector::ObjectRef::<CoxswainIngressClassParameters>::new(&params.name).within(ns);
+        let Some(cr) = params_store.get(&key) else {
+            tracing::warn!(
+                class = name,
+                params = %format!("{ns}/{}", params.name),
+                "IngressClass.spec.parameters target CoxswainIngressClassParameters not found — ignoring class defaults"
+            );
+            continue;
+        };
+        // An empty or absent map contributes nothing; keep it out so the merge
+        // step can take its zero-allocation fast path.
+        if let Some(defaults) = cr.spec.default_annotations.as_ref()
+            && !defaults.is_empty()
+        {
+            out.insert(name.to_string(), defaults.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -155,5 +237,211 @@ mod tests {
     #[test]
     fn claimed_returns_none_when_neither_set() {
         assert_eq!(claimed_ingress_class(&ingress_with_neither()), None);
+    }
+
+    // ── resolve_class_default_annotations ─────────────────────────────────────────
+
+    use coxswain_core::crd::CoxswainIngressClassParametersSpec;
+    use k8s_openapi::api::networking::v1::IngressClassParametersReference;
+    use kube::runtime::watcher;
+
+    fn params_ref(
+        api_group: Option<&str>,
+        kind: &str,
+        name: &str,
+        namespace: Option<&str>,
+    ) -> IngressClassParametersReference {
+        IngressClassParametersReference {
+            api_group: api_group.map(str::to_string),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            namespace: namespace.map(str::to_string),
+            scope: namespace.map(|_| "Namespace".to_string()),
+        }
+    }
+
+    /// A Coxswain-owned IngressClass with the given `spec.parameters`.
+    fn ic_with_params(name: &str, params: Option<IngressClassParametersReference>) -> IngressClass {
+        IngressClass {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressClassSpec {
+                controller: Some("coxswain".to_string()),
+                parameters: params,
+            }),
+        }
+    }
+
+    fn class_store(classes: Vec<IngressClass>) -> reflector::Store<IngressClass> {
+        let mut writer = reflector::store::Writer::<IngressClass>::default();
+        for ic in classes {
+            writer.apply_watcher_event(&watcher::Event::Apply(ic));
+        }
+        writer.as_reader()
+    }
+
+    fn make_params_cr(
+        ns: &str,
+        name: &str,
+        anns: &[(&str, &str)],
+    ) -> CoxswainIngressClassParameters {
+        let mut map = BTreeMap::new();
+        for (k, v) in anns {
+            map.insert((*k).to_string(), (*v).to_string());
+        }
+        let mut spec = CoxswainIngressClassParametersSpec::default();
+        spec.default_annotations = Some(map);
+        let mut cr = CoxswainIngressClassParameters::new(name, spec);
+        cr.metadata.namespace = Some(ns.to_string());
+        cr
+    }
+
+    fn params_store(
+        crs: Vec<CoxswainIngressClassParameters>,
+    ) -> reflector::Store<CoxswainIngressClassParameters> {
+        let mut writer = reflector::store::Writer::<CoxswainIngressClassParameters>::default();
+        for cr in crs {
+            writer.apply_watcher_event(&watcher::Event::Apply(cr));
+        }
+        writer.as_reader()
+    }
+
+    const GROUP: &str = "ingress.coxswain-labs.dev";
+    const KIND: &str = "CoxswainIngressClassParameters";
+    const CONNECT: &str = "ingress.coxswain-labs.dev/connect-timeout";
+
+    #[test]
+    fn resolves_defaults_for_valid_ref() {
+        let classes = class_store(vec![ic_with_params(
+            "coxswain",
+            Some(params_ref(Some(GROUP), KIND, "p", Some("ns"))),
+        )]);
+        let params = params_store(vec![make_params_cr("ns", "p", &[(CONNECT, "5s")])]);
+        let got = resolve_class_default_annotations(&classes, &owned(&["coxswain"]), &params);
+        assert_eq!(
+            got.get("coxswain")
+                .and_then(|m| m.get(CONNECT))
+                .map(String::as_str),
+            Some("5s")
+        );
+    }
+
+    #[test]
+    fn skips_unowned_class() {
+        let classes = class_store(vec![ic_with_params(
+            "other",
+            Some(params_ref(Some(GROUP), KIND, "p", Some("ns"))),
+        )]);
+        let params = params_store(vec![make_params_cr("ns", "p", &[(CONNECT, "5s")])]);
+        assert!(
+            resolve_class_default_annotations(&classes, &owned(&["coxswain"]), &params).is_empty()
+        );
+    }
+
+    #[test]
+    fn absent_when_no_parameters() {
+        let classes = class_store(vec![ic_with_params("coxswain", None)]);
+        assert!(
+            resolve_class_default_annotations(
+                &classes,
+                &owned(&["coxswain"]),
+                &params_store(vec![])
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn absent_and_warns_when_wrong_api_group() {
+        let classes = class_store(vec![ic_with_params(
+            "coxswain",
+            Some(params_ref(Some("other.example.com"), KIND, "p", Some("ns"))),
+        )]);
+        let params = params_store(vec![make_params_cr("ns", "p", &[(CONNECT, "5s")])]);
+        assert!(
+            resolve_class_default_annotations(&classes, &owned(&["coxswain"]), &params).is_empty()
+        );
+        assert!(logs_contain(
+            "does not reference a CoxswainIngressClassParameters"
+        ));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn absent_and_warns_when_namespace_missing() {
+        let classes = class_store(vec![ic_with_params(
+            "coxswain",
+            Some(params_ref(Some(GROUP), KIND, "p", None)),
+        )]);
+        let params = params_store(vec![make_params_cr("ns", "p", &[(CONNECT, "5s")])]);
+        assert!(
+            resolve_class_default_annotations(&classes, &owned(&["coxswain"]), &params).is_empty()
+        );
+        assert!(logs_contain("omits namespace"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn absent_and_warns_when_target_cr_missing() {
+        let classes = class_store(vec![ic_with_params(
+            "coxswain",
+            Some(params_ref(Some(GROUP), KIND, "missing", Some("ns"))),
+        )]);
+        assert!(
+            resolve_class_default_annotations(
+                &classes,
+                &owned(&["coxswain"]),
+                &params_store(vec![])
+            )
+            .is_empty()
+        );
+        assert!(logs_contain("not found"));
+    }
+
+    #[test]
+    fn absent_when_default_annotations_empty() {
+        let classes = class_store(vec![ic_with_params(
+            "coxswain",
+            Some(params_ref(Some(GROUP), KIND, "p", Some("ns"))),
+        )]);
+        let params = params_store(vec![make_params_cr("ns", "p", &[])]);
+        assert!(
+            resolve_class_default_annotations(&classes, &owned(&["coxswain"]), &params).is_empty()
+        );
+    }
+
+    #[test]
+    fn resolves_distinct_defaults_per_class() {
+        let classes = class_store(vec![
+            ic_with_params(
+                "public",
+                Some(params_ref(Some(GROUP), KIND, "public-p", Some("ns"))),
+            ),
+            ic_with_params(
+                "internal",
+                Some(params_ref(Some(GROUP), KIND, "internal-p", Some("ns"))),
+            ),
+        ]);
+        let params = params_store(vec![
+            make_params_cr("ns", "public-p", &[(CONNECT, "10s")]),
+            make_params_cr("ns", "internal-p", &[(CONNECT, "1s")]),
+        ]);
+        let got =
+            resolve_class_default_annotations(&classes, &owned(&["public", "internal"]), &params);
+        assert_eq!(
+            got.get("public")
+                .and_then(|m| m.get(CONNECT))
+                .map(String::as_str),
+            Some("10s")
+        );
+        assert_eq!(
+            got.get("internal")
+                .and_then(|m| m.get(CONNECT))
+                .map(String::as_str),
+            Some("1s")
+        );
     }
 }
