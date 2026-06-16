@@ -1,0 +1,27 @@
+# Invalid header annotation sad path fixture.
+# TESTNS is substituted with the test namespace.
+#
+# request-header-set has an invalid HTTP header name (space in name);
+# the RequestHeaderModifier is dropped but the route must still serve.
+# response-header-set is valid and must be applied independently.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: invalid-header-ingress
+  annotations:
+    ingress.coxswain-labs.dev/request-header-set: "X Invalid Name: value"
+    ingress.coxswain-labs.dev/response-header-set: "X-Survived: yes"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: invalid-header.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

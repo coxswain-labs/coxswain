@@ -12,8 +12,21 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/max-retries` | integer | `0` | `"3"` |
 | `ingress.coxswain-labs.dev/retry-on` | csv | _none_ | `"connect-failure,5xx"` |
 | `ingress.coxswain-labs.dev/rewrite-target` | string | _none_ | `"/v2"` |
-| `ingress.coxswain-labs.dev/backend-protocol` | string | `HTTP` | `"GRPC"` |
 | `ingress.coxswain-labs.dev/use-regex` | boolean | `false` | `"true"` |
+| `ingress.coxswain-labs.dev/request-header-set` | newline-list | _none_ | `"X-Via: coxswain"` |
+| `ingress.coxswain-labs.dev/request-header-add` | newline-list | _none_ | `"X-Tag: v2"` |
+| `ingress.coxswain-labs.dev/request-header-remove` | csv | _none_ | `"X-Forwarded-For"` |
+| `ingress.coxswain-labs.dev/response-header-set` | newline-list | _none_ | `"Cache-Control: no-store"` |
+| `ingress.coxswain-labs.dev/response-header-add` | newline-list | _none_ | `"X-Frame-Options: DENY"` |
+| `ingress.coxswain-labs.dev/response-header-remove` | csv | _none_ | `"Server"` |
+| `ingress.coxswain-labs.dev/redirect-scheme` | string | _none_ | `"https"` |
+| `ingress.coxswain-labs.dev/redirect-hostname` | string | _none_ | `"www.example.com"` |
+| `ingress.coxswain-labs.dev/redirect-port` | integer | _none_ | `"443"` |
+| `ingress.coxswain-labs.dev/redirect-path` | string | _none_ | `"/v2"` |
+| `ingress.coxswain-labs.dev/redirect-status-code` | integer | `302` | `"301"` |
+| `ingress.coxswain-labs.dev/ssl-redirect` | boolean | `false` | `"true"` |
+| `ingress.coxswain-labs.dev/ssl-redirect-code` | integer | `308` | `"301"` |
+| `ingress.coxswain-labs.dev/backend-protocol` | string | `HTTP` | `"GRPC"` |
 
 ```yaml
 metadata:
@@ -144,6 +157,112 @@ spec:
 **Invalid patterns.** A path whose value is not a valid regular expression is skipped with a controller `WARN`; the rest of the Ingress (and the routing table) is unaffected.
 
 **Migrating from nginx-ingress.** The canonical nginx pairing — `nginx.ingress.kubernetes.io/use-regex` + `nginx.ingress.kubernetes.io/rewrite-target: /$2` with `pathType: ImplementationSpecific` — maps directly onto the Coxswain annotations of the same names. See [capture-group substitution](#capture-group-substitution).
+
+## Request header modification
+
+Three annotations control the request headers forwarded to the upstream pod. All three are applied together in a single pass — order within a pass is: set, add, then remove.
+
+### `request-header-set`
+
+Overwrites the named header(s) on the upstream request, regardless of what the client sent. The annotation value is a **newline-separated** list of `Name: Value` pairs (one per line). This format preserves comma-bearing values such as `Cache-Control: no-cache, no-store`.
+
+```yaml
+ingress.coxswain-labs.dev/request-header-set: |
+  X-Via: coxswain
+  X-Forwarded-Proto: https
+```
+
+### `request-header-add`
+
+Appends the named header(s) on the upstream request without removing any existing value. Same newline-separated `Name: Value` format as `request-header-set`.
+
+```yaml
+ingress.coxswain-labs.dev/request-header-add: "X-Tag: v2"
+```
+
+### `request-header-remove`
+
+Removes the named header(s) from the upstream request before forwarding. The annotation value is a **comma-separated** list of header names (names never contain commas).
+
+```yaml
+ingress.coxswain-labs.dev/request-header-remove: "X-Real-IP, X-Forwarded-For"
+```
+
+!!! note
+    An invalid header name or value in `request-header-set` / `request-header-add` causes the entire `RequestHeaderModifier` (all three keys combined) to be silently dropped with a controller warning; the Ingress itself is not rejected and still routes normally.
+
+## Response header modification
+
+Mirror of the request header annotations, applied to the downstream response before delivery to the client. Apply order is the same: set, add, remove.
+
+### `response-header-set`
+
+Overwrites the named header(s) on the downstream response. Newline-separated `Name: Value` pairs.
+
+```yaml
+ingress.coxswain-labs.dev/response-header-set: |
+  Cache-Control: no-store
+  X-Content-Type-Options: nosniff
+```
+
+### `response-header-add`
+
+Appends the named header(s) to the downstream response.
+
+```yaml
+ingress.coxswain-labs.dev/response-header-add: "X-Frame-Options: DENY"
+```
+
+### `response-header-remove`
+
+Removes the named header(s) from the downstream response. Comma-separated header names.
+
+```yaml
+ingress.coxswain-labs.dev/response-header-remove: "Server, X-Powered-By"
+```
+
+## Request redirect
+
+Six annotations configure an HTTP redirect response. Any combination of the fields below may be omitted; omitted fields are inherited from the original request (hostname is preserved, path is preserved, etc.). The redirect fires at the proxy layer — the upstream backend is never reached.
+
+| Annotation | Value | Notes |
+|------------|-------|-------|
+| `redirect-scheme` | `http` or `https` | |
+| `redirect-hostname` | hostname string | replaces the Host header |
+| `redirect-port` | port integer | explicit port in the Location |
+| `redirect-path` | absolute path | full path replacement |
+| `redirect-status-code` | `301`, `302`, `307`, `308` | defaults to `302` |
+
+```yaml
+ingress.coxswain-labs.dev/redirect-scheme: "https"
+ingress.coxswain-labs.dev/redirect-hostname: "www.example.com"
+ingress.coxswain-labs.dev/redirect-status-code: "301"
+```
+
+!!! note
+    `redirect-*` annotations and `ssl-redirect` are mutually exclusive. If any `redirect-*` key is present, `ssl-redirect` is ignored. This avoids emitting two `RequestRedirect` filters on the same route.
+
+## Force-HTTPS redirect (`ssl-redirect`)
+
+### `ssl-redirect`
+
+When set to `"true"`, every request on the **HTTP listener** for this Ingress receives a redirect to the same URL rewritten to `https://`. The HTTPS listener entry is unaffected — requests already over TLS are served normally.
+
+```yaml
+ingress.coxswain-labs.dev/ssl-redirect: "true"
+```
+
+### `ssl-redirect-code`
+
+Overrides the redirect status code issued by `ssl-redirect`. Accepted values: `301`, `302`, `307`, `308`. Defaults to `308` (Permanent Redirect, preserves the request method).
+
+```yaml
+ingress.coxswain-labs.dev/ssl-redirect: "true"
+ingress.coxswain-labs.dev/ssl-redirect-code: "301"
+```
+
+!!! note
+    `ssl-redirect` is a shortcut for a scheme-only `RequestRedirect` filter scoped to the HTTP listener port. It is equivalent to setting `redirect-scheme: https` with `redirect-status-code: 308`, but only fires on port 80 (or whichever HTTP port the controller is configured with). Requests already arriving on the TLS listener are not redirected, regardless of the annotation.
 
 ## `backend-protocol`
 

@@ -2,12 +2,16 @@
 # Enforce e2e rubric #11 (knob coverage): every `ingress.coxswain-labs.dev/*`
 # annotation constant must carry BOTH
 #   (a) a parsing unit test — the const is referenced in the `#[cfg(test)]`
-#       region of its defining file, AND
+#       region of ANY file under the annotations module (flat or split), AND
 #   (b) a named e2e effect test — the annotation key string appears in the e2e
 #       suite (`crates/coxswain-e2e/{fixtures,tests}/`), proving the knob's
 #       runtime effect is exercised on live traffic.
 # Modeled on check-supported-features.sh: extract a set from source, assert a
 # property over it.
+#
+# Supports two layouts:
+#   Flat:  crates/coxswain-reflector/src/ingress/annotations.rs
+#   Split: crates/coxswain-reflector/src/ingress/annotations/*.rs
 #
 # Quarantine-with-ticket (rubric #10): annotations whose e2e effect test is not
 # yet written are listed in E2E_ALLOWLIST below, each tied to a tracking issue.
@@ -19,7 +23,8 @@
 
 set -euo pipefail
 
-ANNOTATIONS_RS="crates/coxswain-reflector/src/ingress/annotations.rs"
+ANNOTATIONS_FILE="crates/coxswain-reflector/src/ingress/annotations.rs"
+ANNOTATIONS_DIR="crates/coxswain-reflector/src/ingress/annotations"
 E2E_DIR="crates/coxswain-e2e"
 
 # Annotation keys whose e2e effect test is tracked, not yet landed.
@@ -40,24 +45,53 @@ is_allowlisted() {
   return 1
 }
 
-# Line where the `#[cfg(test)]` test module starts — the parse-test region.
-test_start=$(grep -nE '^[[:space:]]*#\[cfg\(test\)\]' "$ANNOTATIONS_RS" | head -1 | cut -d: -f1 || true)
-if [ -z "$test_start" ]; then
-  echo "ERROR: no '#[cfg(test)]' module found in $ANNOTATIONS_RS — check the layout." >&2
+# Determine the source files to search (flat file or split directory).
+if [ -d "$ANNOTATIONS_DIR" ]; then
+  # Split layout: collect all .rs files in the directory.
+  src_files=()
+  while IFS= read -r f; do
+    src_files+=("$f")
+  done < <(find "$ANNOTATIONS_DIR" -name "*.rs" | sort)
+  src_label="$ANNOTATIONS_DIR/*.rs"
+elif [ -f "$ANNOTATIONS_FILE" ]; then
+  src_files=("$ANNOTATIONS_FILE")
+  src_label="$ANNOTATIONS_FILE"
+else
+  echo "ERROR: annotations module not found at $ANNOTATIONS_FILE or $ANNOTATIONS_DIR — check the layout." >&2
   exit 1
 fi
-test_region=$(tail -n "+$test_start" "$ANNOTATIONS_RS")
 
-# Extract (const-name, annotation-key) pairs. Skip PREFIX (value ends in '/',
-# i.e. it has no per-annotation key). `mapfile` is avoided for bash-3.2 (macOS)
-# portability — the rest of scripts/ uses while-read loops too.
+if [ "${#src_files[@]}" -eq 0 ]; then
+  echo "ERROR: no .rs files found under $ANNOTATIONS_DIR — check the layout." >&2
+  exit 1
+fi
+
+# Build a combined test region by extracting content after the first
+# `#[cfg(test)]` line in each source file, then concatenating.
+combined_test_region=""
+for f in "${src_files[@]}"; do
+  test_start=$(grep -nE '^[[:space:]]*#\[cfg\(test\)\]' "$f" | head -1 | cut -d: -f1 || true)
+  if [ -n "$test_start" ]; then
+    combined_test_region+="$(tail -n "+$test_start" "$f")"$'\n'
+  fi
+done
+
+# Extract (const-name, annotation-key) pairs from all source files.
+# Skip PREFIX (value ends in '/', i.e. it has no per-annotation key).
 consts=()
-while IFS= read -r line; do
-  consts+=("$line")
-done < <(grep -E 'const [A-Z_]+: &str = "ingress\.coxswain-labs\.dev/[^"]+"' "$ANNOTATIONS_RS" || true)
+for f in "${src_files[@]}"; do
+  while IFS= read -r line; do
+    consts+=("$line")
+  done < <(grep -E 'const [A-Z_]+: &str = "ingress\.coxswain-labs\.dev/[^"]+"' "$f" || true)
+done
 
 if [ "${#consts[@]}" -eq 0 ]; then
-  echo "ERROR: extracted zero annotation constants from $ANNOTATIONS_RS — check the grep pattern." >&2
+  echo "ERROR: extracted zero annotation constants from $src_label — check the grep pattern." >&2
+  exit 1
+fi
+
+if [ -z "$combined_test_region" ]; then
+  echo "ERROR: no '#[cfg(test)]' module found in $src_label — check the layout." >&2
   exit 1
 fi
 
@@ -72,8 +106,8 @@ for line in "${consts[@]}"; do
   case "$key" in */) continue ;; esac
   checked=$((checked + 1))
 
-  # (a) parse-test: const name referenced (whole-word) in the test region.
-  if ! printf '%s\n' "$test_region" | grep -qw "$name"; then
+  # (a) parse-test: const name referenced (whole-word) in ANY test region.
+  if ! printf '%s\n' "$combined_test_region" | grep -qw "$name"; then
     missing_parse+=("$name ($key)")
   fi
 
@@ -87,7 +121,7 @@ done
 
 fail=0
 if [ "${#missing_parse[@]}" -gt 0 ]; then
-  echo "FAIL: ${#missing_parse[@]} annotation(s) missing a parsing unit test in $ANNOTATIONS_RS:" >&2
+  echo "FAIL: ${#missing_parse[@]} annotation(s) missing a parsing unit test in $src_label:" >&2
   printf '  %s\n' "${missing_parse[@]}" >&2
   fail=1
 fi

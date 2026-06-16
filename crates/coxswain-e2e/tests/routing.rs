@@ -1261,3 +1261,196 @@ async fn parent_ref_port_match_binds_only_pinned_listener() -> anyhow::Result<()
 
     Ok(())
 }
+
+/// Verifies that `ingress.coxswain-labs.dev/request-header-{set,add,remove}` annotations
+/// are applied on the upstream request before the backend receives it:
+/// - The SET header is overwritten to the annotation value.
+/// - The ADD header is appended.
+/// - The REMOVE header sent by the client is stripped before forwarding.
+#[tokio::test]
+async fn ingress_request_header_modifier_sets_adds_and_removes() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-req-hdr").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_REQUEST_HEADERS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("req-headers.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    // Send a request with X-Remove-Me present; the proxy must strip it before forwarding.
+    let (_, body) = h
+        .http
+        .request(
+            Method::GET,
+            &host,
+            "/",
+            &[("X-Remove-Me", "should-be-stripped")],
+        )
+        .await?;
+    let resp = body.expect("expected 200 echo body from echo-a");
+    resp.assert_backend("echo-a");
+
+    // SET: echo body must reflect the annotation value for X-Custom-Set.
+    let set_val = resp
+        .headers
+        .get("X-Custom-Set")
+        .and_then(|v| v[0].as_str())
+        .unwrap_or("");
+    assert_eq!(
+        set_val, "coxswain",
+        "request-header-set: expected X-Custom-Set=coxswain, got {set_val:?}"
+    );
+
+    // ADD: echo body must contain X-Custom-Add (added by the proxy).
+    let add_val = resp
+        .headers
+        .get("X-Custom-Add")
+        .and_then(|v| v[0].as_str())
+        .unwrap_or("");
+    assert_eq!(
+        add_val, "appended",
+        "request-header-add: expected X-Custom-Add=appended, got {add_val:?}"
+    );
+
+    // REMOVE: X-Remove-Me must not be present in the upstream request.
+    assert!(
+        resp.headers.get("X-Remove-Me").is_none(),
+        "request-header-remove: X-Remove-Me must be absent from upstream request, \
+         but was still present in echo body"
+    );
+
+    Ok(())
+}
+
+/// Verifies that `ingress.coxswain-labs.dev/response-header-{set,add,remove}` annotations
+/// are applied on the downstream response before the client receives it:
+/// - The SET header is present in the response with the annotation value.
+/// - The ADD header is appended to the response.
+/// - A header that was SET and then also REMOVEd is absent from the final response.
+#[tokio::test]
+async fn ingress_response_header_modifier_sets_adds_and_removes() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-resp-hdr").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_RESPONSE_HEADERS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("resp-headers.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let (status, resp_headers, _) = h.http.get_full(&host, "/").await?;
+    assert_eq!(status, 200, "response-header modifier: expected 200");
+
+    // SET: X-Response-Tag must be present with the annotation value.
+    let tag_val = resp_headers
+        .get("x-response-tag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        tag_val, "coxswain",
+        "response-header-set: expected X-Response-Tag=coxswain, got {tag_val:?}"
+    );
+
+    // ADD: X-Response-Extra must be present (added by the proxy).
+    let extra_val = resp_headers
+        .get("x-response-extra")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        extra_val, "added",
+        "response-header-add: expected X-Response-Extra=added, got {extra_val:?}"
+    );
+
+    // REMOVE: X-Will-Be-Gone was SET then REMOVED in the same modifier; apply order is
+    // set → add → remove, so it must be absent from the final response.
+    assert!(
+        resp_headers.get("x-will-be-gone").is_none(),
+        "response-header-remove: X-Will-Be-Gone must be absent (set then removed), \
+         but was present in the response"
+    );
+
+    Ok(())
+}
+
+/// Verifies that `ingress.coxswain-labs.dev/redirect-{scheme,hostname,port,path,status-code}`
+/// annotations cause the proxy to issue a redirect with the configured status and Location.
+/// No backend is hit — the redirect fires at the proxy layer.
+#[tokio::test]
+async fn ingress_request_redirect_returns_configured_status_and_location() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-redirect").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_REDIRECT, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("redirect.{}.local", ns.name);
+    let redirect_host = format!("new.{}.local", ns.name);
+
+    // Wait until the 301 redirect is live (the route returns 301, not 2xx).
+    let location =
+        wait::wait_for_route_redirect(h.http.proxy_addr, &host, "/", 301, Duration::from_secs(60))
+            .await?;
+
+    // Location must point to https://new.TESTNS.local:8443/v2 (all five redirect-* fields).
+    assert_eq!(
+        location,
+        format!("https://{redirect_host}:8443/v2"),
+        "redirect-* annotations: expected Location https://{redirect_host}:8443/v2, \
+         got {location:?}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that an invalid `request-header-set` annotation (space in header name) is
+/// silently dropped: the route still serves 200 from the expected backend, and the
+/// independent `response-header-set` sibling modifier is still applied.
+#[tokio::test]
+async fn ingress_invalid_filter_annotation_is_skipped_and_route_still_serves() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-bad-hdr").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_INVALID_HEADER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("invalid-header.{}.local", ns.name);
+
+    // Route must still serve despite the bad annotation; wait for it to become live.
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    // The valid response-header-set sibling must still be applied.
+    let (status, resp_headers, _) = h.http.get_full(&host, "/").await?;
+    assert_eq!(
+        status, 200,
+        "bad annotation: expected route to still serve 200"
+    );
+    let survived = resp_headers
+        .get("x-survived")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        survived, "yes",
+        "bad annotation: expected valid sibling X-Survived=yes in response, got {survived:?}"
+    );
+
+    Ok(())
+}

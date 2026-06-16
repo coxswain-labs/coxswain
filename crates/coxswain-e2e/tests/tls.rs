@@ -1376,3 +1376,117 @@ async fn backend_tls_policy_hostname_mismatch_fails_handshake() -> anyhow::Resul
 
     Ok(())
 }
+
+/// Verifies that `ingress.coxswain-labs.dev/ssl-redirect: "true"` (with default code 308)
+/// causes the HTTP listener to issue a 308 redirect whose Location starts with `https://`
+/// and preserves the original host and path.
+#[tokio::test]
+async fn ingress_ssl_redirect_upgrades_http_to_https_308() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-ssl-redir").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SSL_REDIRECT,
+        FixtureVars::new(&ns.name).with("SSL_REDIRECT_CODE", "308"),
+    )
+    .await?;
+
+    let host = format!("ssl-redirect.{}.local", ns.name);
+
+    let location = wait::wait_for_route_redirect(
+        h.http.proxy_addr,
+        &host,
+        "/probe",
+        308,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    assert!(
+        location.starts_with("https://"),
+        "ssl-redirect: Location must start with https://, got {location:?}"
+    );
+    assert!(
+        location.contains(&host),
+        "ssl-redirect: Location must preserve the original host {host:?}, got {location:?}"
+    );
+    assert!(
+        location.ends_with("/probe"),
+        "ssl-redirect: Location must preserve the original path /probe, got {location:?}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that `ingress.coxswain-labs.dev/ssl-redirect-code: "301"` overrides the
+/// default 308 status code for the HTTP→HTTPS redirect.
+#[tokio::test]
+async fn ingress_ssl_redirect_honors_custom_status_code() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-ssl-301").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SSL_REDIRECT,
+        FixtureVars::new(&ns.name).with("SSL_REDIRECT_CODE", "301"),
+    )
+    .await?;
+
+    let host = format!("ssl-redirect.{}.local", ns.name);
+
+    let location =
+        wait::wait_for_route_redirect(h.http.proxy_addr, &host, "/", 301, Duration::from_secs(60))
+            .await?;
+
+    assert!(
+        location.starts_with("https://"),
+        "ssl-redirect-code=301: Location must start with https://, got {location:?}"
+    );
+
+    Ok(())
+}
+
+/// Verifies that `ingress.coxswain-labs.dev/ssl-redirect` only applies to the HTTP listener:
+/// - HTTP requests receive a 308 redirect to https://.
+/// - HTTPS requests are served normally (200 from echo-a, no redirect).
+///
+/// This is the HTTP-port-scoping invariant: the `RequestRedirect` filter is prepended
+/// only on the HTTP listener's route entry, leaving the TLS listener entry unmodified.
+#[tokio::test]
+async fn ingress_ssl_redirect_noop_on_https_listener() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-ssl-noop").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("ssl-redirect-tls.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&host);
+
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SSL_REDIRECT_TLS,
+        FixtureVars::new(&ns.name)
+            .with("SECRET_NAME", "ssl-redirect-cert")
+            .with("TLS_CRT_B64", cert.cert_b64())
+            .with("TLS_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+
+    // HTTP listener must redirect to HTTPS.
+    let location =
+        wait::wait_for_route_redirect(h.http.proxy_addr, &host, "/", 308, Duration::from_secs(60))
+            .await?;
+    assert!(
+        location.starts_with("https://"),
+        "ssl-redirect noop: HTTP redirect Location must start with https://, got {location:?}"
+    );
+
+    // HTTPS listener must NOT redirect — must serve 200 from echo-a.
+    let resp = wait::wait_for_https_route(h.tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    Ok(())
+}

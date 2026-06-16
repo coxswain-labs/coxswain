@@ -1,0 +1,31 @@
+# response-header-{set,add,remove} annotation fixture.
+# TESTNS is substituted with the test namespace.
+#
+# Route: resp-headers.TESTNS.local / -> echo-a
+#   response-header-set:    X-Response-Tag: coxswain  (+ X-Will-Be-Gone: yes, removed below)
+#   response-header-add:    X-Response-Extra: added
+#   response-header-remove: X-Will-Be-Gone (SET above then REMOVE proves the remove path)
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: resp-headers-ingress
+  annotations:
+    ingress.coxswain-labs.dev/response-header-set: |
+      X-Response-Tag: coxswain
+      X-Will-Be-Gone: yes
+    ingress.coxswain-labs.dev/response-header-add: "X-Response-Extra: added"
+    ingress.coxswain-labs.dev/response-header-remove: "X-Will-Be-Gone"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: resp-headers.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
