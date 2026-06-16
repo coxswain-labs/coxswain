@@ -1,0 +1,57 @@
+# connect-timeout annotation fixture.
+# A Service with NO selector, backed by a hand-written EndpointSlice whose single
+# address is 192.0.2.1 (RFC 5737 TEST-NET-1 — guaranteed never routable). A TCP
+# connect to it black-holes: the SYN is dropped, so connect() hangs until a timeout
+# fires (never ECONNREFUSED, which would be instant and bypass the connect phase).
+#
+# With connect-timeout: 500ms the proxy gives up the TCP-connect after 500ms and
+# returns 502 (ConnectTimedout, backend_request_timeout_active). Without the
+# annotation the connect would hang until the test client's own 5s timeout, so the
+# route would never return a clean 502 and the test would fail — i.e. the 502 IS the
+# proof the annotation shortened the connect deadline.
+#
+# Route: connect-timeout.TESTNS.local / → blackhole:80 (192.0.2.1, SYN black-holed)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blackhole
+spec:
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: blackhole-manual
+  labels:
+    kubernetes.io/service-name: blackhole
+addressType: IPv4
+ports:
+  - port: 80
+endpoints:
+  - addresses:
+      - 192.0.2.1
+    conditions:
+      ready: true
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: connect-timeout-ingress
+  annotations:
+    ingress.coxswain-labs.dev/connect-timeout: "500ms"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: connect-timeout.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: blackhole
+                port:
+                  number: 80

@@ -37,3 +37,15 @@ pub const ANNOTATION_REWRITE_TARGET: &str = fixture!("annotation_rewrite_target.
 /// backed by a Service whose endpoints refuse connections (wrong port on real pods).
 /// Used to verify that connect-failure retries fire and the route returns 502.
 pub const ANNOTATION_CONNECT_RETRY: &str = fixture!("annotation_connect_retry.yaml");
+/// Ingress with `connect-timeout: 500ms`, backed by a Service whose single
+/// EndpointSlice address (`192.0.2.1`, RFC 5737) black-holes the TCP connect.
+/// Used to verify the annotation shortens the connect deadline (prompt 502).
+pub const ANNOTATION_CONNECT_TIMEOUT: &str = fixture!("annotation_connect_timeout.yaml");
+/// Ingress with `read-timeout: 500ms` pointed at the slow-echo backend (accepts
+/// TCP, never responds). Used to verify the annotation shortens the upstream-read
+/// deadline (prompt 502).
+pub const ANNOTATION_READ_TIMEOUT: &str = fixture!("annotation_read_timeout.yaml");
+/// Two Ingresses sharing an appProtocol-less Service on the h2c-only port 3001:
+/// one with `backend-protocol: GRPC` (proxy speaks h2c → serves), one with no
+/// annotation (proxy speaks HTTP/1.1 → rejected). Reuses the h2c-echo Deployment.
+pub const ANNOTATION_BACKEND_PROTOCOL: &str = fixture!("annotation_backend_protocol.yaml");

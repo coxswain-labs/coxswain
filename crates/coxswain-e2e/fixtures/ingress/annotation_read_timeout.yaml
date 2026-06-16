@@ -1,0 +1,32 @@
+# read-timeout annotation fixture.
+# Depends on the slow-echo backend (busybox `nc -e /bin/sleep 30`): it accepts the
+# TCP connection but never writes any HTTP response, holding the socket ~30s.
+#
+# With read-timeout: 500ms the proxy gives up waiting for the upstream response
+# after 500ms and returns 502 (ReadTimedout, esource=Upstream — a pure Ingress
+# read-timeout carries no request budget, so it maps to 502, not the Gateway-API
+# 504). Without the annotation the proxy would block on the read until the test
+# client's own 5s timeout, so the route would never return a clean 502 within the
+# poll window — i.e. the prompt 502 IS the proof the annotation fired.
+#
+# Route: read-timeout.TESTNS.local / → slow-echo:3000 (accepts, never responds)
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: read-timeout-ingress
+  annotations:
+    ingress.coxswain-labs.dev/read-timeout: "500ms"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: read-timeout.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: slow-echo
+                port:
+                  number: 3000

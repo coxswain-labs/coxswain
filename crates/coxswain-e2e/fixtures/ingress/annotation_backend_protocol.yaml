@@ -1,0 +1,64 @@
+# backend-protocol annotation fixture.
+# Reuses the h2c-echo Deployment (apply backends::H2C_ECHO first): container port
+# 3001 speaks HTTP/2 cleartext (h2c, prior knowledge) and rejects HTTP/1.1.
+#
+# This fixture adds a SECOND Service, `h2c-echo-plain`, that targets the same
+# pods on 3001 but declares NO appProtocol — so the proxy's wire protocol is
+# governed solely by the Ingress annotation, not by Service appProtocol:
+#
+#   * backend-protocol-grpc.TESTNS.local  → annotation GRPC → BackendProtocol::H2c
+#       → proxy speaks h2c → 3001 serves (2xx echo).
+#   * backend-protocol-http1.TESTNS.local → no annotation  → BackendProtocol::Http1
+#       → proxy speaks HTTP/1.1 → 3001 rejects (non-2xx) — the negative.
+#
+# The contrast proves the annotation flips the upstream wire protocol; without it
+# the default (HTTP/1.1) cannot serve the h2c-only port.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: h2c-echo-plain
+spec:
+  selector:
+    app: h2c-echo
+  ports:
+    - port: 3001
+      targetPort: 3001
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backend-protocol-grpc-ingress
+  annotations:
+    ingress.coxswain-labs.dev/backend-protocol: GRPC
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: backend-protocol-grpc.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: h2c-echo-plain
+                port:
+                  number: 3001
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backend-protocol-http1-ingress
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: backend-protocol-http1.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: h2c-echo-plain
+                port:
+                  number: 3001
