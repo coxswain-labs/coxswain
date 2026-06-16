@@ -13,7 +13,7 @@ metadata:
 spec:
   ingressClassName: coxswain
   rules:
-    - host: rewrite.TESTNS.local
+    - host: rewrite.${TESTNS}.local
       http:
         paths:
           - path: /api

@@ -11,7 +11,7 @@ metadata:
 spec:
   ingressClassName: coxswain
   rules:
-    - host: conflict.TESTNS.local
+    - host: conflict.${TESTNS}.local
       http:
         paths:
           - path: /
@@ -29,7 +29,7 @@ metadata:
 spec:
   ingressClassName: coxswain
   rules:
-    - host: conflict.TESTNS.local
+    - host: conflict.${TESTNS}.local
       http:
         paths:
           - path: /

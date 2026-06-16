@@ -19,7 +19,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
 ---
 apiVersion: gateway.networking.k8s.io/v1
@@ -30,7 +30,7 @@ spec:
   parentRefs:
     - name: backend-tls-gw
   hostnames:
-    - backend-tls.TESTNS.local
+    - backend-tls.${TESTNS}.local
   rules:
     - backendRefs:
         - name: echo-tls
@@ -46,7 +46,7 @@ spec:
       kind: Service
       name: echo-tls
   validation:
-    hostname: echo-tls.TESTNS.local
+    hostname: echo-tls.${TESTNS}.local
     caCertificateRefs:
       - group: ""
         kind: ConfigMap

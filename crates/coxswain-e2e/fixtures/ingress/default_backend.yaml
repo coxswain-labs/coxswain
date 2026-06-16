@@ -19,7 +19,7 @@ spec:
       port:
         number: 3000
   rules:
-    - host: app.TESTNS.local
+    - host: app.${TESTNS}.local
       http:
         paths:
           - path: /api

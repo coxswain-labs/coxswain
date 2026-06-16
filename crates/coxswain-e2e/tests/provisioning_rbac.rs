@@ -24,7 +24,7 @@
 
 use coxswain_e2e::{
     FixtureVars, Harness, NamespaceGuard,
-    fixtures::{backends, dedicated_proxy as dedicated},
+    fixtures::{self, backends, dedicated_proxy as dedicated},
     harness::{HttpClient, wait},
 };
 use gateway_api::apis::standard::gateways::Gateway;
@@ -38,8 +38,8 @@ use std::time::Duration;
 
 mod common;
 use common::dedicated::{
-    GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, binding_name, cluster_route_binding_name,
-    wait_for_cut_over,
+    GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, assert_provisioning_contract, binding_name,
+    cluster_route_binding_name, wait_for_cut_over,
 };
 
 /// 1. Apply a dedicated-mode Gateway → assert all three resources are created
@@ -48,13 +48,16 @@ use common::dedicated::{
 ///    set to `"coxswain-controller"`.
 #[tokio::test]
 async fn provisions_resources_for_dedicated_proxy() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-create").await?;
 
     let (_, _, _, deploy, svc, sa) = apply_and_wait(&h, &ns).await?;
 
-    // Reserved-set + merged user labels on each resource.
+    // GEP-1762 labels + owner reference + SSA field manager (shared contract).
+    assert_provisioning_contract(&deploy, &svc, &sa);
+
+    // Fixture-specific: this fixture sets `infrastructure.labels`/`annotations`,
+    // which must merge onto every provisioned resource.
     for (kind, meta) in [
         ("Deployment", &deploy.metadata),
         ("Service", &svc.metadata),
@@ -64,37 +67,10 @@ async fn provisions_resources_for_dedicated_proxy() -> anyhow::Result<()> {
             panic!("{kind}: labels missing");
         });
         assert_eq!(
-            labels
-                .get("gateway.networking.k8s.io/gateway-name")
-                .map(String::as_str),
-            Some(GATEWAY_NAME),
-            "{kind}: GEP-1762 gateway-name label missing/wrong"
-        );
-        assert_eq!(
-            labels
-                .get("app.kubernetes.io/managed-by")
-                .map(String::as_str),
-            Some("coxswain"),
-            "{kind}: managed-by label missing/wrong"
-        );
-        assert_eq!(
-            labels.get("app.kubernetes.io/name").map(String::as_str),
-            Some("coxswain"),
-            "{kind}: name label missing/wrong"
-        );
-        assert_eq!(
             labels.get("team").map(String::as_str),
             Some("platform"),
             "{kind}: infrastructure.labels.team should merge"
         );
-    }
-
-    // Annotation merged from infrastructure.annotations.
-    for (kind, meta) in [
-        ("Deployment", &deploy.metadata),
-        ("Service", &svc.metadata),
-        ("ServiceAccount", &sa.metadata),
-    ] {
         let annotations = meta.annotations.as_ref().unwrap_or_else(|| {
             panic!("{kind}: annotations missing");
         });
@@ -107,46 +83,6 @@ async fn provisions_resources_for_dedicated_proxy() -> anyhow::Result<()> {
         );
     }
 
-    // Owner reference back to the Gateway with controller=true,
-    // blockOwnerDeletion=true.
-    for (kind, meta) in [
-        ("Deployment", &deploy.metadata),
-        ("Service", &svc.metadata),
-        ("ServiceAccount", &sa.metadata),
-    ] {
-        let refs = meta.owner_references.as_ref().unwrap_or_else(|| {
-            panic!("{kind}: owner references missing");
-        });
-        assert_eq!(refs.len(), 1, "{kind}: expected exactly one owner ref");
-        let r = &refs[0];
-        assert_eq!(r.kind, "Gateway", "{kind}: owner ref kind");
-        assert_eq!(r.name, GATEWAY_NAME, "{kind}: owner ref name");
-        assert_eq!(r.controller, Some(true), "{kind}: owner ref controller");
-        assert_eq!(
-            r.block_owner_deletion,
-            Some(true),
-            "{kind}: owner ref blockOwnerDeletion"
-        );
-        assert!(
-            r.api_version.starts_with("gateway.networking.k8s.io/"),
-            "{kind}: owner ref api_version = {}",
-            r.api_version
-        );
-    }
-
-    // SSA field manager (acceptance criterion).
-    let managers = deploy
-        .metadata
-        .managed_fields
-        .as_ref()
-        .expect("Deployment managedFields missing");
-    assert!(
-        managers
-            .iter()
-            .any(|f| f.manager.as_deref() == Some("coxswain-controller")),
-        "expected a managedFields entry with manager = 'coxswain-controller'"
-    );
-
     Ok(())
 }
 
@@ -155,7 +91,6 @@ async fn provisions_resources_for_dedicated_proxy() -> anyhow::Result<()> {
 ///    provisioned resources; K8s GC drives it from the owner reference.
 #[tokio::test]
 async fn gateway_deletion_garbage_collects_resources() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-gc").await?;
 
@@ -191,11 +126,10 @@ async fn gateway_deletion_garbage_collects_resources() -> anyhow::Result<()> {
 ///    `coxswain-gateway-proxy-reader` ClusterRole.
 #[tokio::test]
 async fn provisions_role_binding_in_gateway_namespace() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-own").await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
         FixtureVars::new(&ns.name),
     )
@@ -258,11 +192,10 @@ async fn provisions_role_binding_in_gateway_namespace() -> anyhow::Result<()> {
 ///    itself disappears (finalizer is removed).
 #[tokio::test]
 async fn gateway_deletion_drives_role_binding_cleanup() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-gc").await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
         FixtureVars::new(&ns.name),
     )
@@ -319,11 +252,10 @@ async fn gateway_deletion_drives_role_binding_cleanup() -> anyhow::Result<()> {
 ///    cross-watch (`watches(... managed-by=coxswain ...)`).
 #[tokio::test]
 async fn out_of_band_binding_deletion_is_recreated() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-drift").await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
         FixtureVars::new(&ns.name),
     )
@@ -362,11 +294,10 @@ async fn out_of_band_binding_deletion_is_recreated() -> anyhow::Result<()> {
 ///    set the binding reconciler computed for this Gateway.
 #[tokio::test]
 async fn deployment_container_carries_watch_namespaces_arg() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-args").await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
         FixtureVars::new(&ns.name),
     )
@@ -400,12 +331,10 @@ async fn deployment_container_carries_watch_namespaces_arg() -> anyhow::Result<(
 /// SSA field manager set to `coxswain-controller`.
 #[tokio::test]
 async fn lifecycle_provisioning_creates_resources() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ded-life-prov").await?;
 
-    h.apply(dedicated::PROVISIONING, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(dedicated::PROVISIONING, FixtureVars::new(&ns.name)).await?;
 
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
@@ -416,56 +345,8 @@ async fn lifecycle_provisioning_creates_resources() -> anyhow::Result<()> {
     let svc = wait::wait_for_resource(&services, RESOURCE_NAME, Duration::from_secs(30)).await?;
     let sa = wait::wait_for_resource(&sas, RESOURCE_NAME, Duration::from_secs(30)).await?;
 
-    for (kind, meta) in [
-        ("Deployment", &deploy.metadata),
-        ("Service", &svc.metadata),
-        ("ServiceAccount", &sa.metadata),
-    ] {
-        let labels = meta
-            .labels
-            .as_ref()
-            .unwrap_or_else(|| panic!("{kind}: labels missing"));
-        assert_eq!(
-            labels
-                .get("gateway.networking.k8s.io/gateway-name")
-                .map(String::as_str),
-            Some(GATEWAY_NAME),
-            "{kind}: GEP-1762 gateway-name label"
-        );
-        assert_eq!(
-            labels
-                .get("app.kubernetes.io/managed-by")
-                .map(String::as_str),
-            Some("coxswain"),
-            "{kind}: managed-by label"
-        );
-
-        let refs = meta
-            .owner_references
-            .as_ref()
-            .unwrap_or_else(|| panic!("{kind}: owner references missing"));
-        assert_eq!(refs.len(), 1, "{kind}: expected one owner ref");
-        assert_eq!(refs[0].kind, "Gateway", "{kind}: owner ref kind");
-        assert_eq!(refs[0].name, GATEWAY_NAME, "{kind}: owner ref name");
-        assert_eq!(refs[0].controller, Some(true), "{kind}: controller=true");
-        assert_eq!(
-            refs[0].block_owner_deletion,
-            Some(true),
-            "{kind}: blockOwnerDeletion=true"
-        );
-    }
-
-    let managers = deploy
-        .metadata
-        .managed_fields
-        .as_ref()
-        .expect("Deployment managedFields");
-    assert!(
-        managers
-            .iter()
-            .any(|f| f.manager.as_deref() == Some("coxswain-controller")),
-        "expected managedFields entry for 'coxswain-controller'"
-    );
+    // GEP-1762 labels + owner reference + SSA field manager (shared contract).
+    assert_provisioning_contract(&deploy, &svc, &sa);
 
     Ok(())
 }
@@ -475,14 +356,12 @@ async fn lifecycle_provisioning_creates_resources() -> anyhow::Result<()> {
 /// expected backend.
 #[tokio::test]
 async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ded-life-traffic").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    h.apply(dedicated::TRAFFIC, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(dedicated::TRAFFIC, FixtureVars::new(&ns.name)).await?;
 
     // Wait for the controller to flip DedicatedProxyReady=True (cutover).
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
@@ -500,10 +379,49 @@ async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
     resp.assert_backend("echo-a");
 
     // Negative (#210 cut-over): once DedicatedProxyReady=True the shared pool must
-    // relinquish the Gateway, so the shared listener returns 404 for the host the
-    // dedicated pod now owns. Without this the dedicated pod could serve while the
-    // shared pool still double-serves the same Gateway.
-    wait::wait_for_route_status(&h.gateway_http, &host, "/", 404, Duration::from_secs(30)).await?;
+    // relinquish the Gateway — without this the shared pool could double-serve the
+    // same Gateway the dedicated pod now owns.
+    //
+    // Assert this against the shared proxy's OWN routing table, not by probing its
+    // listener for a 404: Gateway listener ports are bound dynamically and the
+    // socket is released once no shared Gateway uses the port (see
+    // docs/src/guides/running-in-production.md — "removed ports … socket is
+    // released"). With this the only Gateway, the shared proxy unbinds the gateway
+    // port entirely, so a data-plane probe is TCP-refused, never a 404. The
+    // relinquish is faithfully observed as the host leaving `/api/v1/routes`.
+    let routes_url = h.admin_url("/api/v1/routes");
+    let client = reqwest::Client::new();
+    let still_serving = |json: &serde_json::Value, host: &str| -> bool {
+        json["gateway"]["hosts"]
+            .as_array()
+            .is_some_and(|hosts| hosts.iter().any(|e| e["host"].as_str() == Some(host)))
+    };
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            let state = match client.get(&routes_url).send().await {
+                Ok(r) => match r.json::<serde_json::Value>().await {
+                    Ok(j) => format!("still serving = {}", still_serving(&j, &host)),
+                    Err(e) => format!("routes body parse error: {e}"),
+                },
+                Err(e) => format!("routes request error: {e}"),
+            };
+            format!("shared proxy to drop '{host}' from its gateway routing table; {state}")
+        },
+        || async {
+            let json = client
+                .get(&routes_url)
+                .send()
+                .await
+                .ok()?
+                .json::<serde_json::Value>()
+                .await
+                .ok()?;
+            (!still_serving(&json, &host)).then_some(())
+        },
+    )
+    .await?;
 
     Ok(())
 }
@@ -514,19 +432,18 @@ async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
 /// subprocess.
 #[tokio::test]
 async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ded-life-xns").await?;
     let tenant = NamespaceGuard::create(&h.client, "ded-life-xns-tenant").await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::CROSS_NAMESPACE_TENANT,
         FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
     )
     .await?;
     wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::CROSS_NAMESPACE_ROUTE,
         FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
     )
@@ -556,19 +473,18 @@ async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
 /// `RoleBinding` is reconciled away.
 #[tokio::test]
 async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ded-life-revoke").await?;
     let tenant = NamespaceGuard::create(&h.client, "ded-life-revoke-tenant").await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::CROSS_NAMESPACE_TENANT,
         FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
     )
     .await?;
     wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::CROSS_NAMESPACE_ROUTE,
         FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
     )
@@ -619,12 +535,10 @@ async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<
 /// lifecycle suite.)
 #[tokio::test]
 async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ded-life-gc").await?;
 
-    h.apply(dedicated::PROVISIONING, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(dedicated::PROVISIONING, FixtureVars::new(&ns.name)).await?;
 
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
@@ -664,12 +578,11 @@ async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
 ///     listener back to `from: Same` removes the binding on the next reconcile.
 #[tokio::test]
 async fn cluster_wide_binding_created_and_removed_with_listener_mode() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-clusterwide-toggle").await?;
 
     // Gateway fixture with from: All.
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_FROM_ALL,
         FixtureVars::new(&ns.name),
     )
@@ -755,11 +668,10 @@ async fn cluster_wide_binding_created_and_removed_with_listener_mode() -> anyhow
 ///     the finalizer.
 #[tokio::test]
 async fn cluster_wide_binding_deleted_on_gateway_deletion() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-clusterwide-gc").await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_FROM_ALL,
         FixtureVars::new(&ns.name),
     )

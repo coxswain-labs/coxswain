@@ -13,7 +13,7 @@ metadata:
 spec:
   ingressClassName: coxswain
   rules:
-    - host: ingress.TESTNS.local
+    - host: ingress.${TESTNS}.local
       http:
         paths:
           - path: /a

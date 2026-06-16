@@ -15,7 +15,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
       allowedRoutes:
         namespaces:
@@ -29,7 +29,7 @@ spec:
   parentRefs:
     - name: coxswain-test
   hostnames:
-    - "weighted.TESTNS.local"
+    - "weighted.${TESTNS}.local"
   rules:
     - matches:
         - path:

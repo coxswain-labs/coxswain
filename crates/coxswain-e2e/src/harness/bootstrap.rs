@@ -82,7 +82,17 @@ impl ClusterKind {
 ///
 /// Returns an error if bootstrap fails.
 pub async fn bootstrap() -> anyhow::Result<()> {
+    // Process-global, idempotent test-process setup. `bootstrap` is the one
+    // entry every test reaches — directly or via `Harness::start` — so the
+    // crypto provider and the tracing subscriber are installed here once per
+    // process rather than re-stated in each test. Both `try`/`let _ =` forms
+    // no-op if already installed (e.g. under `cargo test`, where the suite
+    // shares one process). Placed before the early-return so CI test processes
+    // (which set `COXSWAIN_E2E_BOOTSTRAPPED`) still get logging.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coxswain_e2e=debug,warn")
+        .try_init();
     if std::env::var("COXSWAIN_E2E_BOOTSTRAPPED").is_ok() {
         return Ok(());
     }
@@ -550,6 +560,12 @@ async fn install_cloud_provider_kind_if_missing() -> anyhow::Result<()> {
 /// Install cert-manager v1.18.0 if not already present, then ensure the
 /// `coxswain-e2e-selfsigned` ClusterIssuer exists. Both steps are idempotent
 /// via `kubectl apply`.
+///
+/// Version source: the `v1.18.0` release tag in the install URL below. This is a
+/// multi-document manifest applied by URL (not a single image), so it is pinned by
+/// release tag rather than `@sha256:` — bump the tag here to upgrade. The
+/// Gateway-API CRDs are likewise tag-pinned via `.gateway-api-version`
+/// ([`GATEWAY_API_VERSION`]).
 async fn install_cert_manager_if_missing() -> anyhow::Result<()> {
     if !cert_manager_installed().await {
         tracing::info!("cert-manager not found, installing v1.18.0");

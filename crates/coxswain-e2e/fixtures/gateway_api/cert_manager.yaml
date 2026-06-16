@@ -13,12 +13,12 @@ kind: Certificate
 metadata:
   name: cert-manager-tls-cert
 spec:
-  secretName: SECRET_NAME
+  secretName: ${SECRET_NAME}
   issuerRef:
     name: coxswain-e2e-selfsigned
     kind: ClusterIssuer
   dnsNames:
-    - LISTENER_HOSTNAME
+    - ${LISTENER_HOSTNAME}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -28,14 +28,14 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: https
-      port: GATEWAY_HTTPS_PORT
+      port: ${GATEWAY_HTTPS_PORT}
       protocol: HTTPS
-      hostname: "LISTENER_HOSTNAME"
+      hostname: "${LISTENER_HOSTNAME}"
       tls:
         mode: Terminate
         certificateRefs:
           - kind: Secret
-            name: SECRET_NAME
+            name: ${SECRET_NAME}
       allowedRoutes:
         namespaces:
           from: Same
@@ -48,7 +48,7 @@ spec:
   parentRefs:
     - name: coxswain-cert-manager-test
   hostnames:
-    - "LISTENER_HOSTNAME"
+    - "${LISTENER_HOSTNAME}"
   rules:
     - backendRefs:
         - name: echo-a

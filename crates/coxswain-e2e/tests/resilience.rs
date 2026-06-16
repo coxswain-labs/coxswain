@@ -20,7 +20,7 @@
 use anyhow::Context as _;
 use coxswain_e2e::{
     FixtureVars, Harness, HttpClient, NamespaceGuard,
-    fixtures::{backends, dedicated_proxy as dedicated, gateway_api as gwa},
+    fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa},
     harness::wait,
 };
 use gateway_api::apis::standard::gateways::Gateway;
@@ -230,15 +230,13 @@ where
 /// Assert: every request on port A returned 2xx; zero connection errors.
 #[tokio::test]
 async fn listener_add_does_not_drop_requests_on_survivor() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "drain-add").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
-    h.apply(gwa::LISTENER_DRAIN, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(gwa::LISTENER_DRAIN, FixtureVars::new(&ns.name)).await?;
 
     let addr_a = h.controller.gateway_http_addr;
     let port_b = h.controller.gateway_https_addr.port();
@@ -316,11 +314,10 @@ async fn listener_add_does_not_drop_requests_on_survivor() -> anyhow::Result<()>
 /// Assert: port A traffic is completely unaffected.
 #[tokio::test]
 async fn listener_remove_does_not_drop_requests_on_survivor() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "drain-rem").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let addr_a = h.controller.gateway_http_addr;
@@ -355,8 +352,7 @@ async fn listener_remove_does_not_drop_requests_on_survivor() -> anyhow::Result<
 
     // Apply the HTTPRoute (reuse the LISTENER_DRAIN fixture for the route; the
     // Gateway already exists, so kubectl apply is idempotent for the Gateway part).
-    h.apply(gwa::LISTENER_DRAIN, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(gwa::LISTENER_DRAIN, FixtureVars::new(&ns.name)).await?;
 
     wait_for_listener(addr_a, &host, Duration::from_secs(30)).await?;
 
@@ -428,15 +424,13 @@ async fn listener_remove_does_not_drop_requests_on_survivor() -> anyhow::Result<
 /// errors on the shared LB throughout.
 #[tokio::test]
 async fn dedicated_crash_loop_keeps_serving_via_shared() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "drain-crash").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
-    h.apply(gwa::CUTOVER_CRASH_LOOP, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(gwa::CUTOVER_CRASH_LOOP, FixtureVars::new(&ns.name)).await?;
 
     let addr = h.controller.gateway_http_addr;
     let host = format!("crash.{}.local", ns.name);
@@ -482,12 +476,12 @@ async fn dedicated_crash_loop_keeps_serving_via_shared() -> anyhow::Result<()> {
 }
 
 /// 3. Restart the controller after the resources are provisioned → assert
-///    the SSA path is idempotent: `resourceVersion` stays stable across the
-///    restart because the operator's same-content SSA produces no server-side
-///    write.
+///    the SSA path is idempotent: the Deployment's `metadata.generation` stays
+///    stable across the restart because the operator's same-content SSA produces
+///    no spec write. (`generation`, not `resourceVersion`: the latter bumps on
+///    unrelated status writes — see the in-body comment.)
 #[tokio::test]
-async fn restart_controller_does_not_bump_resource_version() -> anyhow::Result<()> {
-    common::init_tracing();
+async fn restart_controller_does_not_bump_generation() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     // Persistent namespace: the bootstrap purge runs on every
     // `Harness::start()`, including the second one below. A regular
@@ -552,14 +546,12 @@ async fn restart_controller_does_not_bump_resource_version() -> anyhow::Result<(
 /// subprocess returns the backend response.
 #[tokio::test]
 async fn lifecycle_mode_migration_shared_to_dedicated() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ded-life-m-s2d").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    h.apply(dedicated::MODE_MIGRATION_SHARED, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(dedicated::MODE_MIGRATION_SHARED, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("migrate.{}.local", ns.name);
 
@@ -609,13 +601,12 @@ async fn lifecycle_mode_migration_shared_to_dedicated() -> anyhow::Result<()> {
 /// Gateway and serves backend traffic again.
 #[tokio::test]
 async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ded-life-m-d2s").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::MODE_MIGRATION_DEDICATED,
         FixtureVars::new(&ns.name),
     )
@@ -661,16 +652,14 @@ async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
 /// SSA on identical content does not bump the Deployment's `.metadata.generation`.
 #[tokio::test]
 async fn lifecycle_controller_restart_is_idempotent() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     // Persistent namespace so the bootstrap purge on the second `Harness::start()`
     // doesn't delete it.
     let ns = NamespaceGuard::create_persistent(&h.client, "ded-life-restart").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    h.apply(dedicated::TRAFFIC, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(dedicated::TRAFFIC, FixtureVars::new(&ns.name)).await?;
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;

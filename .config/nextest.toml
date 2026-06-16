@@ -60,9 +60,9 @@ slow-timeout = { period = "900s", terminate-after = 1 }
 # Everything except the mutators and the (always-serial) resilience suite.
 default-filter = '''
   not (
-    test(=default_backend) | test(=default_backend_only)
+    test(=default_backend_serves_unmatched_requests) | test(=default_backend_alone_serves_all_hosts)
     | test(=proxy_protocol_http_v1_forwarded) | test(=proxy_protocol_https_v2_forwarded)
-    | test(=status_load_balancer_ip)
+    | test(=status_reports_load_balancer_ip)
     | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
   )
   and not binary(resilience)
@@ -86,9 +86,9 @@ setup = ['e2e-setup']
 # Only the global-config mutators and the resilience suite (restarts/migrates
 # the shared controller). One at a time, so each owns the shared control plane.
 default-filter = '''
-  test(=default_backend) | test(=default_backend_only)
+  test(=default_backend_serves_unmatched_requests) | test(=default_backend_alone_serves_all_hosts)
   | test(=proxy_protocol_http_v1_forwarded) | test(=proxy_protocol_https_v2_forwarded)
-  | test(=status_load_balancer_ip)
+  | test(=status_reports_load_balancer_ip)
   | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
   | binary(resilience)
 '''

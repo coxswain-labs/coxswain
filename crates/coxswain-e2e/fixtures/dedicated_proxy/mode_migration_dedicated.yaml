@@ -28,7 +28,7 @@ spec:
       name: dedicated-params
   listeners:
     - name: http
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
       allowedRoutes:
         namespaces:
@@ -42,7 +42,7 @@ spec:
   parentRefs:
     - name: dedicated-gw
   hostnames:
-    - "migrate.TESTNS.local"
+    - "migrate.${TESTNS}.local"
   rules:
     - matches:
         - path:

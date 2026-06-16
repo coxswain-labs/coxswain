@@ -18,13 +18,13 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
       allowedRoutes:
         namespaces:
           from: Same
     - name: alt
-      port: WRONG_PORT
+      port: ${WRONG_PORT}
       protocol: HTTP
       allowedRoutes:
         namespaces:
@@ -38,9 +38,9 @@ metadata:
 spec:
   parentRefs:
     - name: port-gw
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
   hostnames:
-    - "pinned.TESTNS.local"
+    - "pinned.${TESTNS}.local"
   rules:
     - backendRefs:
         - name: echo-a
@@ -61,9 +61,9 @@ metadata:
 spec:
   parentRefs:
     - name: port-gw
-      port: WRONG_PORT
+      port: ${WRONG_PORT}
   hostnames:
-    - "wrong.TESTNS.local"
+    - "wrong.${TESTNS}.local"
   rules:
     - backendRefs:
         - name: echo-b
@@ -78,7 +78,7 @@ spec:
   parentRefs:
     - name: port-gw
   hostnames:
-    - "both.TESTNS.local"
+    - "both.${TESTNS}.local"
   rules:
     - backendRefs:
         - name: echo-a

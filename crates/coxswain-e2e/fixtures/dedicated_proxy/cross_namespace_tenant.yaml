@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: echo
-          image: gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
+          image: ${ECHO_IMAGE}
           ports:
             - containerPort: 3000
           env:
@@ -47,12 +47,12 @@ spec:
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: ReferenceGrant
 metadata:
-  name: allow-httproute-from-TESTNS
+  name: allow-httproute-from-${TESTNS}
 spec:
   from:
     - group: gateway.networking.k8s.io
       kind: HTTPRoute
-      namespace: TESTNS
+      namespace: ${TESTNS}
   to:
     - group: ""
       kind: Service

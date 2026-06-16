@@ -16,7 +16,7 @@ metadata:
 spec:
   replicas: 1
   serviceType: ClusterIP
-  image: registry.k8s.io/pause:3.10
+  image: ${PAUSE_IMAGE}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -31,7 +31,7 @@ spec:
       name: dedicated-params
   listeners:
     - name: http
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
       allowedRoutes:
         namespaces:

@@ -27,8 +27,7 @@ mod common;
 use common::dedicated::{GATEWAY_NAME, RESOURCE_NAME, gateway_addresses, gateway_condition};
 
 #[tokio::test]
-async fn status_load_balancer_ip() -> anyhow::Result<()> {
-    common::init_tracing();
+async fn status_reports_load_balancer_ip() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
         status_address: Some("203.0.113.1".to_string()),
         ..Default::default()
@@ -52,16 +51,17 @@ async fn status_load_balancer_ip() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A valid Gateway with an attached HTTPRoute reaches both `Accepted=True` and
+/// `Programmed=True`: the controller admits the Gateway, then programs the data
+/// plane for it.
 #[tokio::test]
-async fn gateway_status() -> anyhow::Result<()> {
-    common::init_tracing();
+async fn gateway_becomes_accepted_and_programmed() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-status").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    h.apply(gwa::PATH_MATCHING, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     wait::wait_for_gateway_programmed(
         &h.client,
@@ -70,6 +70,17 @@ async fn gateway_status() -> anyhow::Result<()> {
         Duration::from_secs(30),
     )
     .await?;
+
+    // Programmed implies the controller first Accepted the Gateway; assert it
+    // explicitly so the test name's "accepted_and" half is enforced.
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let gw = gw_api.get("coxswain-test").await?;
+    let (accepted, _) = gateway_condition(&gw, "Accepted")
+        .unwrap_or_else(|| panic!("Gateway missing Accepted condition"));
+    assert_eq!(
+        accepted, "True",
+        "Gateway should be Accepted=True once Programmed"
+    );
 
     Ok(())
 }
@@ -80,14 +91,12 @@ async fn gateway_status() -> anyhow::Result<()> {
 /// `metadata.generation` even when the programmed-ness of the Gateway is unchanged.
 #[tokio::test]
 async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-gen-tracking").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    h.apply(gwa::PATH_MATCHING, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     wait::wait_for_gateway_programmed(
         &h.client,
@@ -191,7 +200,6 @@ async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn gatewayclass_supported_features() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
 
     let feats = wait::wait_for_gatewayclass_supported_features(
@@ -230,11 +238,10 @@ async fn gatewayclass_supported_features() -> anyhow::Result<()> {
 /// against the operator-rendered args, so it never reports Ready.
 #[tokio::test]
 async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-status-clusterip").await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_CLUSTERIP,
         FixtureVars::new(&ns.name),
     )
@@ -317,11 +324,10 @@ async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow
 /// a single reconcile loop.
 #[tokio::test]
 async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-status-lb").await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_LOADBALANCER,
         FixtureVars::new(&ns.name),
     )
@@ -447,11 +453,10 @@ async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> any
 /// `AcceptedOverrides` channel.
 #[tokio::test]
 async fn invalid_parameters_yields_accepted_false_invalid_parameters() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "dedgw-status-invalid").await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_INVALID_PARAMS,
         FixtureVars::new(&ns.name),
     )
@@ -512,12 +517,10 @@ async fn invalid_parameters_yields_accepted_false_invalid_parameters() -> anyhow
 /// gates only on conditions/addresses without the cutover-and-traffic plumbing.)
 #[tokio::test]
 async fn lifecycle_gateway_status_conditions_and_addresses() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ded-life-status").await?;
 
-    h.apply(dedicated::PROVISIONING, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(dedicated::PROVISIONING, FixtureVars::new(&ns.name)).await?;
 
     wait::wait_for_gateway_programmed(&h.client, GATEWAY_NAME, &ns.name, Duration::from_secs(60))
         .await?;
@@ -536,17 +539,7 @@ async fn lifecycle_gateway_status_conditions_and_addresses() -> anyhow::Result<(
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     let gw = gateways.get(GATEWAY_NAME).await?;
-    let addresses: Vec<(String, String)> = gw
-        .status
-        .as_ref()
-        .and_then(|s| s.addresses.as_ref())
-        .map(|addrs| {
-            addrs
-                .iter()
-                .map(|a| (a.r#type.clone().unwrap_or_default(), a.value.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let addresses = gateway_addresses(&gw);
     assert!(
         addresses
             .iter()

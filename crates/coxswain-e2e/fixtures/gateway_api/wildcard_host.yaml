@@ -13,7 +13,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
       allowedRoutes:
         namespaces:
@@ -27,7 +27,7 @@ spec:
   parentRefs:
     - name: coxswain-test
   hostnames:
-    - "*.wildcard.TESTNS.local"
+    - "*.wildcard.${TESTNS}.local"
   rules:
     - backendRefs:
         - name: echo-c

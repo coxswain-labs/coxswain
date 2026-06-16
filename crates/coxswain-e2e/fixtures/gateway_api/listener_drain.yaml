@@ -15,7 +15,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http-a
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
       allowedRoutes:
         namespaces:
@@ -29,7 +29,7 @@ spec:
   parentRefs:
     - name: drain-gw
   hostnames:
-    - "drain.TESTNS.local"
+    - "drain.${TESTNS}.local"
   rules:
     - backendRefs:
         - name: echo-a

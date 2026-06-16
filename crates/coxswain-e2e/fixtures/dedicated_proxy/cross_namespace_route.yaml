@@ -27,7 +27,7 @@ spec:
       name: dedicated-params
   listeners:
     - name: http
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
       allowedRoutes:
         namespaces:
@@ -41,7 +41,7 @@ spec:
   parentRefs:
     - name: dedicated-gw
   hostnames:
-    - "cross-ns.TESTNS.local"
+    - "cross-ns.${TESTNS}.local"
   rules:
     - matches:
         - path:
@@ -49,5 +49,5 @@ spec:
             value: /
       backendRefs:
         - name: echo-d
-          namespace: TENANTNS
+          namespace: ${TENANTNS}
           port: 3000

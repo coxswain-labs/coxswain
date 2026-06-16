@@ -80,21 +80,4 @@ impl Harness {
     pub fn controller_admin_url(&self, path: &str) -> String {
         format!("http://{}{path}", self.controller.controller_admin_addr)
     }
-
-    /// Apply a fixture YAML. Substitutes the four standard port placeholders
-    /// with their fixed in-cluster values; use `vars.with(key, val)` for extras.
-    pub async fn apply(
-        &self,
-        path: impl AsRef<std::path::Path>,
-        vars: crate::fixtures::FixtureVars,
-    ) -> anyhow::Result<()> {
-        let vars = crate::fixtures::FixtureVars {
-            http_port: INGRESS_HTTP_PORT,
-            https_port: INGRESS_HTTPS_PORT,
-            gateway_http_port: GATEWAY_HTTP_PORT,
-            gateway_https_port: GATEWAY_HTTPS_PORT,
-            ..vars
-        };
-        crate::fixtures::apply_fixture(path, vars).await
-    }
 }

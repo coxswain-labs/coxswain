@@ -10,11 +10,11 @@
 apiVersion: v1
 kind: Secret
 metadata:
-  name: SECRET_NAME
+  name: ${SECRET_NAME}
 type: kubernetes.io/tls
 data:
-  tls.crt: TLS_CRT_B64
-  tls.key: TLS_KEY_B64
+  tls.crt: ${TLS_CRT_B64}
+  tls.key: ${TLS_KEY_B64}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -24,14 +24,14 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: https
-      port: GATEWAY_HTTPS_PORT
+      port: ${GATEWAY_HTTPS_PORT}
       protocol: HTTPS
-      hostname: "LISTENER_HOST"
+      hostname: "${LISTENER_HOST}"
       tls:
         mode: Terminate
         certificateRefs:
           - kind: Secret
-            name: SECRET_NAME
+            name: ${SECRET_NAME}
       allowedRoutes:
         namespaces:
           from: Same
@@ -44,7 +44,7 @@ spec:
   parentRefs:
     - name: coxswain-tls-redirect
   hostnames:
-    - "LISTENER_HOST"
+    - "${LISTENER_HOST}"
   rules:
     # Redirect rule — returns 302 with a new path; no backend needed.
     - matches:

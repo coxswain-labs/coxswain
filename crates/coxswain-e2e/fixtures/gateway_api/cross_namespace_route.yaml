@@ -13,7 +13,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
       allowedRoutes:
         namespaces:
@@ -27,9 +27,9 @@ spec:
   parentRefs:
     - name: coxswain-test
   hostnames:
-    - "cross-ns.TESTNS.local"
+    - "cross-ns.${TESTNS}.local"
   rules:
     - backendRefs:
         - name: echo-d
-          namespace: TENANTNS
+          namespace: ${TENANTNS}
           port: 3000
