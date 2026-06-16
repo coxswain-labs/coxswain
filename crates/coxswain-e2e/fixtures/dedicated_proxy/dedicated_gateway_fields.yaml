@@ -1,0 +1,55 @@
+# Per-field CoxswainGatewayParameters fixture (#333).
+# Exercises every spec knob at once so a single provision cycle can assert each
+# one lands on the rendered Deployment/Service:
+#   replicas    → Deployment.spec.replicas
+#   image       → coxswain container image
+#   resources   → coxswain container resources
+#   serviceType → Service.spec.type
+#   podTemplate → merged onto the rendered pod template (labels + nodeSelector)
+#
+# The image is a deliberately non-pullable `registry.invalid/` literal: the test
+# reads the rendered Deployment spec and never waits on Pod readiness, so
+# ImagePullBackOff is irrelevant (and the image-pinning gate allowlists the
+# prefix). TESTNS is substituted at runtime.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: dedicated-params
+spec:
+  replicas: 3
+  image: registry.invalid/custom-proxy:v9
+  serviceType: NodePort
+  resources:
+    requests:
+      cpu: 125m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+  podTemplate:
+    metadata:
+      labels:
+        tier: edge
+    spec:
+      nodeSelector:
+        coxswain-labs.dev/pool: edge
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: dedicated-gw
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    parametersRef:
+      group: gateway.coxswain-labs.dev
+      kind: CoxswainGatewayParameters
+      name: dedicated-params
+  listeners:
+    - name: http
+      port: 8100
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

@@ -241,3 +241,75 @@ pub async fn restart_controller() -> anyhow::Result<()> {
     anyhow::ensure!(status.success(), "controller restart timed out");
     Ok(())
 }
+
+/// Scale the in-cluster controller Deployment to `replicas` and wait for the
+/// change to take effect. Scaling to `0` then back to `1` gives a deterministic
+/// controller-downtime window: this helper does not return for `replicas == 0`
+/// until the controller pods are actually gone, so a mutation applied next is
+/// guaranteed to land while nothing is watching.
+///
+/// # Errors
+///
+/// Returns an error if the `kubectl scale` invocation fails, or if the
+/// controller does not reach the requested replica count within 60s.
+pub async fn scale_controller(replicas: u32) -> anyhow::Result<()> {
+    let status = Command::new("kubectl")
+        .args([
+            "scale",
+            "deployment/coxswain-controller",
+            "-n",
+            "coxswain-system",
+            &format!("--replicas={replicas}"),
+        ])
+        .status()
+        .await?;
+    anyhow::ensure!(
+        status.success(),
+        "kubectl scale controller to {replicas} failed"
+    );
+
+    if replicas == 0 {
+        // Wait until no replicas remain — `kubectl scale` returns once the spec
+        // is updated, not once the pod has terminated. Poll the real state so a
+        // catch-up test's mutation lands with the controller genuinely down.
+        wait::poll_until(
+            Duration::from_secs(60),
+            wait::POLL,
+            || async { "controller Deployment to report 0 running replicas".to_string() },
+            || async {
+                let out = Command::new("kubectl")
+                    .args([
+                        "get",
+                        "deployment",
+                        "coxswain-controller",
+                        "-n",
+                        "coxswain-system",
+                        "-o",
+                        "jsonpath={.status.replicas}",
+                    ])
+                    .output()
+                    .await
+                    .ok()?;
+                let raw = String::from_utf8_lossy(&out.stdout);
+                let raw = raw.trim();
+                // `.status.replicas` is omitted (empty) or "0" once all pods are gone.
+                (raw.is_empty() || raw == "0").then_some(())
+            },
+        )
+        .await?;
+    } else {
+        let status = Command::new("kubectl")
+            .args([
+                "rollout",
+                "status",
+                "deployment/coxswain-controller",
+                "-n",
+                "coxswain-system",
+                "--timeout=60s",
+            ])
+            .status()
+            .await?;
+        anyhow::ensure!(status.success(), "controller scale-up rollout timed out");
+    }
+    Ok(())
+}

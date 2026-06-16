@@ -921,6 +921,47 @@ async fn backend_protocol_h2c() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Verifies the Ingress `ingress.coxswain-labs.dev/backend-protocol` annotation
+/// (distinct from the Gateway-API `appProtocol` path in [`backend_protocol_h2c`]).
+///
+/// Both Ingresses point at the same appProtocol-less Service on the h2c-only port
+/// 3001, so the upstream wire protocol is governed solely by the annotation:
+/// - `GRPC` → `BackendProtocol::H2c` → the proxy speaks h2c → the port serves (2xx).
+/// - no annotation → `BackendProtocol::Http1` → the proxy speaks HTTP/1.1 → the
+///   h2c-only port rejects it (non-2xx). This is the negative that proves the
+///   annotation — not the Service — flipped the protocol.
+///
+/// The HTTPS value isn't exercised here: an Ingress `backend-protocol: HTTPS` makes
+/// the proxy verify the upstream cert against the system trust store with no CA
+/// injection path (Ingress has no `BackendTLSPolicy` equivalent), so a self-signed
+/// e2e upstream can never complete the handshake. h2c needs no upstream cert.
+#[tokio::test]
+async fn annotation_backend_protocol_grpc_selects_h2c() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-backend-protocol").await?;
+
+    fixtures::apply_fixture(backends::H2C_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["h2c-echo"]).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_BACKEND_PROTOCOL,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    // Positive: GRPC annotation → h2c → the h2c-only port serves.
+    let grpc_host = format!("backend-protocol-grpc.{}.local", ns.name);
+    let resp = wait::wait_for_route(&h.http, &grpc_host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("h2c-echo");
+
+    // Negative: no annotation → HTTP/1.1 → the h2c-only port rejects the request,
+    // so the proxy returns an upstream error (502). The route is programmed (the
+    // positive proved the fixture reconciled); only the wire protocol differs.
+    let http1_host = format!("backend-protocol-http1.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &http1_host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
 /// An HTTPS listener with a RequestRedirect filter must produce a `Location` header
 /// that uses the `https://` scheme, not the hardcoded `http://` that existed before
 /// the redirect-scheme fix.

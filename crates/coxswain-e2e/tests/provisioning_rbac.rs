@@ -326,6 +326,156 @@ async fn deployment_container_carries_watch_namespaces_arg() -> anyhow::Result<(
     Ok(())
 }
 
+// ── Per-field CoxswainGatewayParameters coverage (#333) ──────────────────────
+//
+// The happy-path provisioning tests assert only the GEP-1762 contract (labels,
+// owner refs, SSA manager), never the individual tunables. Each parameter field
+// is an independent mapping with its own failure mode, so it gets one atomic
+// test (charter #2) — a failure names the exact field that stopped rendering.
+// All five share the `DEDICATED_GATEWAY_FIELDS` fixture (every knob set) and
+// assert their own field against the rendered objects.
+
+/// Provision the all-fields dedicated Gateway in `ns` and return the rendered
+/// Deployment + Service for the per-field assertions below.
+async fn provision_field_gateway(
+    h: &Harness,
+    ns: &NamespaceGuard,
+) -> anyhow::Result<(Deployment, Service)> {
+    fixtures::apply_fixture(
+        dedicated::DEDICATED_GATEWAY_FIELDS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let deploy =
+        wait::wait_for_resource(&deployments, RESOURCE_NAME, Duration::from_secs(15)).await?;
+    let svc = wait::wait_for_resource(&services, RESOURCE_NAME, Duration::from_secs(15)).await?;
+    Ok((deploy, svc))
+}
+
+/// The `coxswain` container of the rendered dedicated-proxy Deployment.
+fn coxswain_container(deploy: &Deployment) -> &k8s_openapi::api::core::v1::Container {
+    deploy
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .map(|s| s.containers.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find(|c| c.name == "coxswain")
+        .unwrap_or_else(|| panic!("coxswain container present"))
+}
+
+/// #333 — `replicas` renders to `Deployment.spec.replicas`.
+#[tokio::test]
+async fn params_replicas_sets_deployment_replicas() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-replicas").await?;
+    let (deploy, _) = provision_field_gateway(&h, &ns).await?;
+    assert_eq!(
+        deploy.spec.as_ref().and_then(|s| s.replicas),
+        Some(3),
+        "replicas should render to Deployment.spec.replicas"
+    );
+    Ok(())
+}
+
+/// #333 — `image` renders to the `coxswain` container image.
+#[tokio::test]
+async fn params_image_sets_container_image() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-image").await?;
+    let (deploy, _) = provision_field_gateway(&h, &ns).await?;
+    assert_eq!(
+        coxswain_container(&deploy).image.as_deref(),
+        Some("registry.invalid/custom-proxy:v9"),
+        "image override should render to the coxswain container image"
+    );
+    Ok(())
+}
+
+/// #333 — `resources` render to the `coxswain` container requests/limits.
+#[tokio::test]
+async fn params_resources_set_container_resources() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-resources").await?;
+    let (deploy, _) = provision_field_gateway(&h, &ns).await?;
+    let resources = coxswain_container(&deploy)
+        .resources
+        .as_ref()
+        .expect("container resources");
+    let requests = resources.requests.as_ref().expect("resource requests");
+    assert_eq!(
+        requests.get("cpu").map(|q| q.0.as_str()),
+        Some("125m"),
+        "cpu request should render"
+    );
+    assert_eq!(
+        requests.get("memory").map(|q| q.0.as_str()),
+        Some("64Mi"),
+        "memory request should render"
+    );
+    let limits = resources.limits.as_ref().expect("resource limits");
+    assert_eq!(
+        limits.get("cpu").map(|q| q.0.as_str()),
+        Some("250m"),
+        "cpu limit should render"
+    );
+    assert_eq!(
+        limits.get("memory").map(|q| q.0.as_str()),
+        Some("128Mi"),
+        "memory limit should render"
+    );
+    Ok(())
+}
+
+/// #333 — `podTemplate` merges onto the rendered pod template (label + nodeSelector).
+#[tokio::test]
+async fn params_pod_template_merges_onto_template() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-podtemplate").await?;
+    let (deploy, _) = provision_field_gateway(&h, &ns).await?;
+    let tmpl = &deploy.spec.as_ref().expect("Deployment spec").template;
+    let labels = tmpl
+        .metadata
+        .as_ref()
+        .and_then(|m| m.labels.as_ref())
+        .expect("pod template labels");
+    assert_eq!(
+        labels.get("tier").map(String::as_str),
+        Some("edge"),
+        "podTemplate label should merge onto the rendered pod template"
+    );
+    let node_selector = tmpl
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_selector.as_ref())
+        .expect("podTemplate nodeSelector");
+    assert_eq!(
+        node_selector
+            .get("coxswain-labs.dev/pool")
+            .map(String::as_str),
+        Some("edge"),
+        "podTemplate nodeSelector should merge onto the rendered pod template"
+    );
+    Ok(())
+}
+
+/// #333 — `serviceType: NodePort` renders to `Service.spec.type`.
+#[tokio::test]
+async fn params_service_type_sets_service_type() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "dedgw-svctype").await?;
+    let (_, svc) = provision_field_gateway(&h, &ns).await?;
+    assert_eq!(
+        svc.spec.as_ref().and_then(|s| s.type_.as_deref()),
+        Some("NodePort"),
+        "serviceType should render to Service.spec.type"
+    );
+    Ok(())
+}
+
 /// 11 — Apply a dedicated-mode Gateway → assert Deployment/Service/ServiceAccount
 /// land with the GEP-1762 labels, owner references back to the Gateway, and the
 /// SSA field manager set to `coxswain-controller`.

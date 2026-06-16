@@ -63,3 +63,58 @@ async fn annotation_connect_retry_retries_failed_connect() -> anyhow::Result<()>
 
     Ok(())
 }
+
+/// Verifies that `ingress.coxswain-labs.dev/connect-timeout` bounds the upstream
+/// TCP-connect phase. The backend's only EndpointSlice address is `192.0.2.1`
+/// (RFC 5737 TEST-NET-1), so the SYN is black-holed and `connect()` hangs.
+///
+/// With `connect-timeout: 500ms` the proxy abandons the connect after 500ms and
+/// returns 502 (`ConnectTimedout`). The proof is that the 502 arrives within the
+/// test client's 5s budget: without the annotation the connect would hang past it
+/// and the route would never return a clean 502.
+#[tokio::test]
+async fn annotation_connect_timeout_returns_502() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-connect-timeout").await?;
+
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_CONNECT_TIMEOUT,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("connect-timeout.{}.local", ns.name);
+
+    // 502 doubles as the readiness signal: once the route is installed every
+    // request black-holes on connect and returns 502 within the 500ms deadline.
+    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
+/// Verifies that `ingress.coxswain-labs.dev/read-timeout` bounds the upstream
+/// response-read phase. The slow-echo backend accepts the connection but never
+/// writes a response, holding the socket ~30s.
+///
+/// With `read-timeout: 500ms` the proxy abandons the read after 500ms and returns
+/// 502 (`ReadTimedout`, `esource=Upstream` — a pure Ingress read-timeout carries
+/// no request budget, so it maps to 502 rather than the Gateway-API 504). The
+/// proof is the prompt 502: without the annotation the read would block past the
+/// test client's 5s budget and the route would never return a clean 502.
+#[tokio::test]
+async fn annotation_read_timeout_returns_502() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-read-timeout").await?;
+
+    fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_READ_TIMEOUT, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("read-timeout.{}.local", ns.name);
+
+    // 502 doubles as the readiness signal: once the route is installed every
+    // request times out on the upstream read and returns 502 within 500ms.
+    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
