@@ -101,7 +101,7 @@ spec:
     - host: app.example.com
       http:
         paths:
-          - path: ^/svc/(.*)
+          - path: /svc/(.*)            # paths must start with "/" (no leading ^)
             pathType: ImplementationSpecific
             backend:
               service:
@@ -139,7 +139,7 @@ spec:
 
 **Per-path, not per-host.** `use-regex` is an Ingress-wide *enable*; the per-path lever is the standard `pathType` field. Only `ImplementationSpecific` rules become regex — `Prefix` and `Exact` rules in the same Ingress are unaffected. This differs from nginx-ingress, where `use-regex` (or `rewrite-target`) on any path forces regex matching across **all** paths of the host; Coxswain never does this.
 
-**Matching semantics.** The pattern is matched unanchored (use `^`/`$` to anchor) and is evaluated **after** exact and prefix routes on the same host — a literal `Prefix`/`Exact` rule that also matches wins over a regex rule.
+**Matching semantics.** The pattern is matched unanchored and is evaluated **after** exact and prefix routes on the same host — a literal `Prefix`/`Exact` rule that also matches wins over a regex rule. The Kubernetes API server requires every Ingress path to start with `/`, so a regex path is always rooted there (`/svc/(.*)`, not `^/svc/(.*)`); use `$` to anchor the end.
 
 **Invalid patterns.** A path whose value is not a valid regular expression is skipped with a controller `WARN`; the rest of the Ingress (and the routing table) is unaffected.
 

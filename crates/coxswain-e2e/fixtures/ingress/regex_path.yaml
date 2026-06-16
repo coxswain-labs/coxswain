@@ -3,7 +3,7 @@
 # test namespace at runtime.
 #
 #   regex-match.TESTNS.local   use-regex: regex /digits/[0-9]+ -> echo-a; prefix /plain -> echo-b
-#   regex-rewrite.TESTNS.local use-regex + rewrite-target /$1: ^/svc/(.*) -> echo-a (capture rewrite)
+#   regex-rewrite.TESTNS.local use-regex + rewrite-target /$1: /svc/(.*) -> echo-a (capture rewrite)
 #   regex-invalid.TESTNS.local use-regex: valid /ok/.* -> echo-a; invalid /bad/( -> echo-b (skipped)
 #   regex-off.TESTNS.local     no use-regex: /lit/[0-9]+ ImplementationSpecific stays literal Prefix
 ---
@@ -47,7 +47,7 @@ spec:
     - host: regex-rewrite.${TESTNS}.local
       http:
         paths:
-          - path: "^/svc/(.*)"
+          - path: "/svc/(.*)"
             pathType: ImplementationSpecific
             backend:
               service:

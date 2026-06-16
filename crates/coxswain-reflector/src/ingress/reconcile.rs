@@ -196,15 +196,11 @@ impl IngressReconciler {
                 );
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
-                // Regex mode is per-path: the Ingress-wide `use-regex` annotation only
-                // arms `pathType: ImplementationSpecific` rules.
-                let is_regex_path =
-                    ann.use_regex && path_rule.path_type.as_str() == "ImplementationSpecific";
-
-                // Literal Prefix/Exact paths must be rooted at '/'; a regex pattern may
-                // legitimately start with an anchor (`^`) or group, so this guard applies
-                // only to non-regex paths.
-                if !is_regex_path && !path.starts_with('/') {
+                // Every Ingress path must be absolute — the Kubernetes API server
+                // enforces this for all pathTypes, including `ImplementationSpecific`
+                // regex paths. A regex pattern is therefore always rooted at '/'
+                // (e.g. `/svc/(.*)`), never anchored with a leading `^`.
+                if !path.starts_with('/') {
                     tracing::warn!(
                         ingress = %route_id,
                         host = ?rule.host,
@@ -213,6 +209,11 @@ impl IngressReconciler {
                     );
                     continue;
                 }
+
+                // Regex mode is per-path: the Ingress-wide `use-regex` annotation only
+                // arms `pathType: ImplementationSpecific` rules.
+                let is_regex_path =
+                    ann.use_regex && path_rule.path_type.as_str() == "ImplementationSpecific";
 
                 // Compile the regex here (the safe-compile guard) so an uncompilable
                 // pattern skips just this path instead of reaching `build()` and dropping
@@ -1090,7 +1091,7 @@ mod tests {
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_regex_ingress(
             Some("example.com"),
-            &[(r"^/svc/(.*)", "ImplementationSpecific")],
+            &[(r"/svc/(.*)", "ImplementationSpecific")],
             "svc",
             &[(USE_REGEX, "true"), (REWRITE_TARGET, "/$1")],
         );
@@ -1133,8 +1134,8 @@ mod tests {
         let ingress = make_regex_ingress(
             Some("example.com"),
             &[
-                (r"^/good/[0-9]+$", "ImplementationSpecific"),
-                (r"^/bad/(", "ImplementationSpecific"),
+                (r"/good/[0-9]+$", "ImplementationSpecific"),
+                (r"/bad/(", "ImplementationSpecific"),
             ],
             "svc",
             &[(USE_REGEX, "true")],
