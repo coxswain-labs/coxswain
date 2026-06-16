@@ -499,6 +499,12 @@ async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
     let resp = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
+    // Negative (#210 cut-over): once DedicatedProxyReady=True the shared pool must
+    // relinquish the Gateway, so the shared listener returns 404 for the host the
+    // dedicated pod now owns. Without this the dedicated pod could serve while the
+    // shared pool still double-serves the same Gateway.
+    wait::wait_for_route_status(&h.gateway_http, &host, "/", 404, Duration::from_secs(30)).await?;
+
     Ok(())
 }
 
