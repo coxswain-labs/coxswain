@@ -764,17 +764,19 @@ async fn catch_up_reconciles_gateway_created_during_controller_downtime() -> any
     )
     .await?;
 
-    // Relist catch-up: the Gateway created during downtime reaches Programmed=True,
+    // Catch-up: the Gateway created during downtime reaches Programmed=True,
     // which only happens if the controller reconciled an object it never received
-    // a watch event for.
-    // 120s, not 60s: after a cold controller restart the informer cache must resync
-    // and drain the relisted backlog before this specific Gateway is reconciled —
-    // that overruns 60s on slow CI runners (locally it lands in ~16s).
+    // a watch event for. On a cold restart that Gateway's InitApply is consumed
+    // before its preconditions are met (the GatewayClass watch stream is an
+    // independent race; leadership/readiness lag the first events), so the per-event
+    // path alone can drop it until the next relist (minutes). The controller's
+    // status-resync backstop re-drives the cached Gateway once the preconditions
+    // hold, bounding recovery to the resync interval — comfortably inside 60s.
     wait::wait_for_gateway_programmed(
         &h2.client,
         "coxswain-test",
         &ns.name,
-        Duration::from_secs(120),
+        Duration::from_secs(60),
     )
     .await?;
 
