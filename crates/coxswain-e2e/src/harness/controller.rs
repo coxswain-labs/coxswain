@@ -93,12 +93,11 @@ impl ControllerProcess {
     /// Returns an error if the Helm upgrade, LB-IP lookup, or port-forward
     /// setup fails.
     pub async fn start_with_options(opts: ControllerOptions) -> anyhow::Result<Self> {
-        // Always reconcile the Helm release with the requested overrides so the
-        // chart never carries leftover state from a previous test in the same
-        // binary (e.g. test N flipping `accessLog=false` would leak into test
-        // N+1 if N+1 passed `ControllerOptions::default()` and we skipped the
-        // upgrade). When the values match the live release Helm short-circuits
-        // — the cost is one helm-upgrade decision plus `wait_for_leader_ready`.
+        // Only upgrade the shared Helm release when the caller requests non-default
+        // overrides. Bootstrap already installed the release with default settings,
+        // so the many tests that call start_with_options(default) never touch Helm
+        // and never race on its lock; only the global-config mutator tests (which
+        // pass non-default overrides and run in the serial pass) reconfigure it.
         let overrides = HelmOverrides {
             status_address: opts.status_address,
             ingress_default_backend: opts.ingress_default_backend,
@@ -107,22 +106,43 @@ impl ControllerProcess {
             access_log: opts.access_log,
             access_log_path_mode: opts.access_log_path_mode,
         };
-        let root = workspace_root().context("workspace root")?;
-        helm_install(&root, &overrides)
-            .await
-            .context("helm upgrade with overrides")?;
+        if overrides != HelmOverrides::default() {
+            let root = workspace_root().context("workspace root")?;
+            helm_install(&root, &overrides)
+                .await
+                .context("helm upgrade with overrides")?;
+        }
 
-        let lb_ip = wait_for_lb_ip().await.context("shared-proxy LB IP")?;
+        let lb_ip = wait_for_lb_ip(SHARED_PROXY_SVC, COXSWAIN_NAMESPACE)
+            .await
+            .context("shared-proxy LB IP")?;
 
         let health_port = free_port()?;
         let admin_port = free_port()?;
 
         let controller_admin_port = free_port()?;
 
-        let health_pf = start_port_forward(SHARED_PROXY_INTERNAL_SVC, health_port, 8081).await?;
-        let admin_pf = start_port_forward(SHARED_PROXY_INTERNAL_SVC, admin_port, 8082).await?;
-        let controller_admin_pf =
-            start_port_forward(CONTROLLER_SVC, controller_admin_port, 8082).await?;
+        let health_pf = start_port_forward(
+            SHARED_PROXY_INTERNAL_SVC,
+            health_port,
+            8081,
+            COXSWAIN_NAMESPACE,
+        )
+        .await?;
+        let admin_pf = start_port_forward(
+            SHARED_PROXY_INTERNAL_SVC,
+            admin_port,
+            8082,
+            COXSWAIN_NAMESPACE,
+        )
+        .await?;
+        let controller_admin_pf = start_port_forward(
+            CONTROLLER_SVC,
+            controller_admin_port,
+            8082,
+            COXSWAIN_NAMESPACE,
+        )
+        .await?;
 
         let health_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), health_port);
         let admin_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), admin_port);
@@ -136,7 +156,7 @@ impl ControllerProcess {
         // by Harness::start_with_options) returns immediately since the proxy
         // wasn't necessarily restarted — but the controller may still be
         // running its initial informer sync and hasn't written any status yet.
-        wait_for_controller_ready()
+        wait_for_controller_ready(CONTROLLER_SVC, COXSWAIN_NAMESPACE)
             .await
             .context("controller readyz")?;
 
@@ -211,24 +231,24 @@ impl Drop for ControllerProcess {
     }
 }
 
-/// Poll `Service.status.loadBalancer.ingress[0].ip` for the shared-proxy external
-/// Service until an IP is assigned or the timeout expires.
+/// Poll `Service.status.loadBalancer.ingress[0].ip` for `svc_name` in `namespace`
+/// until an IP is assigned or 60 s elapses.
 ///
 /// OrbStack assigns IPs within ~150 ms; cloud-provider-kind on kind takes ~5-10 s.
 ///
 /// # Errors
 ///
 /// Returns an error if no IP is assigned within 60 s.
-async fn wait_for_lb_ip() -> anyhow::Result<IpAddr> {
+async fn wait_for_lb_ip(svc_name: &str, namespace: &str) -> anyhow::Result<IpAddr> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let out = Command::new("kubectl")
             .args([
                 "get",
                 "svc",
-                SHARED_PROXY_SVC,
+                svc_name,
                 "-n",
-                COXSWAIN_NAMESPACE,
+                namespace,
                 "-o",
                 "jsonpath={.status.loadBalancer.ingress[0].ip}",
             ])
@@ -242,14 +262,14 @@ async fn wait_for_lb_ip() -> anyhow::Result<IpAddr> {
                 .with_context(|| format!("parse LB IP: {ip_str}"));
         }
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("shared-proxy Service has no LoadBalancer IP after 60s");
+            anyhow::bail!("{svc_name} Service has no LoadBalancer IP after 60s");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
 /// Spawn a `kubectl port-forward` tunnel from `127.0.0.1:<local_port>` to
-/// `<svc_name>:<remote_port>` in the coxswain namespace.
+/// `<svc_name>:<remote_port>` in `namespace`.
 ///
 /// The returned [`Child`] must be kept alive for the lifetime of the tunnel;
 /// dropping it kills the forward.
@@ -261,12 +281,13 @@ async fn start_port_forward(
     svc_name: &str,
     local_port: u16,
     remote_port: u16,
+    namespace: &str,
 ) -> anyhow::Result<Child> {
     let child = Command::new("kubectl")
         .args([
             "port-forward",
             "-n",
-            COXSWAIN_NAMESPACE,
+            namespace,
             &format!("svc/{svc_name}"),
             &format!("{local_port}:{remote_port}"),
         ])
@@ -324,9 +345,9 @@ const CONTROLLER_SVC: &str = "coxswain-controller";
 ///
 /// Returns an error if the port-forward cannot be started or readyz doesn't
 /// return 200 within 60 s.
-async fn wait_for_controller_ready() -> anyhow::Result<()> {
+async fn wait_for_controller_ready(controller_svc: &str, namespace: &str) -> anyhow::Result<()> {
     let port = free_port()?;
-    let mut pf = start_port_forward(CONTROLLER_SVC, port, 8081).await?;
+    let mut pf = start_port_forward(controller_svc, port, 8081, namespace).await?;
     let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
     let result = crate::harness::wait::wait_for_ready(addr, Duration::from_secs(60))
         .await

@@ -19,6 +19,7 @@ For the release procedure, see `RELEASE.md`. For contributing conventions (docs 
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) stable toolchain.
+- [cargo-nextest](https://nextest.rs/installation): `cargo install cargo-nextest` (or `cargo binstall cargo-nextest`). Required for e2e runs.
 - A local Kubernetes cluster with `kubectl` configured (`~/.kube/config`). Any of OrbStack, Docker Desktop, minikube, kind, or k3d works.
 
 ---
@@ -223,21 +224,22 @@ kubectl -n coxswain-system rollout restart deploy/coxswain-controller deploy/cox
 
 All Rust e2e suites require a live cluster. The harness builds a Docker image, installs the Helm chart, and runs tests against the deployed pods. Reset the cluster before each run.
 
+Each suite runs as **two passes** — a parallel pass (`e2e`), then a serial pass (`e2e-serial`) — both filtered by `binary(<suite>)`. Run them in that order:
+
 ```bash
-cargo build --release --bin coxswain   # compile once; re-run only when source changes
-# Suites are by behavior plane (see each tests/*.rs header). data-plane:
-cargo test -p coxswain-e2e --test routing           -- --test-threads=1
-cargo test -p coxswain-e2e --test tls               -- --test-threads=1
-cargo test -p coxswain-e2e --test traffic_policy    -- --test-threads=1
-# control-plane:
-cargo test -p coxswain-e2e --test status_conditions -- --test-threads=1
-cargo test -p coxswain-e2e --test provisioning_rbac -- --test-threads=1
-cargo test -p coxswain-e2e --test resilience        -- --test-threads=1
-# cross-cutting:
-cargo test -p coxswain-e2e --test observability     -- --test-threads=1
+# Suites are by behavior plane (see each tests/*.rs header). For each suite:
+cargo nextest run --profile e2e        -p coxswain-e2e -E 'binary(routing)' --no-tests=pass
+cargo nextest run --profile e2e-serial -p coxswain-e2e -E 'binary(routing)' --no-tests=pass
+# …and likewise for: tls, traffic_policy, status_conditions, provisioning_rbac,
+# resilience, observability.
 ```
 
-The bootstrap fails fast with a clear message if `target/release/coxswain` is missing.
+`.config/nextest.toml` defines two profiles whose `default-filter`s split the work, so the command is identical per suite — only the profile changes:
+
+- **`e2e`** — up to 4 tests concurrently against the one shared proxy; everything *except* the global-config mutators and the resilience suite.
+- **`e2e-serial`** — one at a time. The global-config mutators (`default_backend`, `proxy_protocol_*`, `access_log_*`, `status_load_balancer_ip`) each reconfigure the shared proxy/controller via `helm upgrade`, which rolls the Deployment and is proxy-wide — so they must own the shared control plane while they run (a cap-1 group is *not* enough, since it doesn't stop overlap with ungrouped tests). The resilience suite (restarts/migrates the controller) runs here too.
+
+`--no-tests=pass` makes the empty side of the split a no-op (e.g. `traffic_policy` has no mutators; `resilience` runs entirely in the serial pass). Bootstrap runs once per `cargo nextest` invocation via the `e2e-setup` setup script (idempotent — a fast no-op on the second pass).
 
 > **On macOS the harness uses the production multi-stage `Dockerfile`.** macOS produces Mach-O binaries that won't run in Linux containers, so the COPY-only `Dockerfile.ci` (the fast Linux-CI path) is bypassed. First build is ~5–10 min for BoringSSL; cached afterwards. CI Linux runners keep the fast `Dockerfile.ci` path.
 
@@ -263,7 +265,7 @@ Examples for other clusters:
 
 ### Tips
 
-- Verbose output: `RUST_LOG=coxswain_e2e=debug,warn` + `--nocapture`.
+- Verbose output: `RUST_LOG=coxswain_e2e=debug,warn` (nextest captures output per test; add `--no-capture` to stream live).
 - Cleanup after an interrupted run: `kubectl delete ns -l coxswain-e2e=true && helm uninstall coxswain -n coxswain-system`.
 - `cargo test` alone does not run e2e — the crate is excluded from `default-members`.
 - Set `COXSWAIN_E2E_SKIP_BUILD=1` to skip the `docker build` step when the `coxswain:e2e` image is already current.

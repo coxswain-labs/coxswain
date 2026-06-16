@@ -1,0 +1,101 @@
+# Nextest configuration for coxswain e2e suites.
+# Reference: https://nextest.rs/configuration/
+#
+# Two in-cluster profiles, run as two passes per suite:
+#   e2e        — parallel pass: every test EXCEPT the global-config mutators.
+#   e2e-serial — serial pass (test-threads=1): the global-config mutators and
+#                the resilience suite, which need exclusive use of the shared
+#                control plane.
+# The `default` profile (used by `cargo test` for unit tests) is untouched.
+
+# ---------------------------------------------------------------------------
+# Experimental features
+# ---------------------------------------------------------------------------
+# setup-scripts: run a command once before any tests start within a profile.
+# Required until setup-scripts graduates from experimental in nextest.
+[experimental]
+setup-scripts = true
+
+# ---------------------------------------------------------------------------
+# Setup script
+# ---------------------------------------------------------------------------
+# e2e-setup runs bootstrap_cluster() once before any test starts: it builds the
+# Docker image, installs Gateway API CRDs, cert-manager, coxswain CRDs, and the
+# shared Helm release, then exports COXSWAIN_E2E_BOOTSTRAPPED=1 so test
+# processes skip the heavy setup. Running bootstrap outside the per-test
+# process avoids the Helm/CRD races that happen when nextest's
+# concurrently-started per-test processes all attempt installs at once. It is
+# idempotent, so it is a fast no-op on the second (serial) pass.
+#
+# If COXSWAIN_E2E_BOOTSTRAPPED is already set the script no-ops: CI's
+# toolchain-free archive runners have no `cargo`, so they bootstrap once with
+# the prebuilt `e2e_setup` binary and export the variable themselves (see
+# .github/workflows/e2e.yml). Locally the variable is unset, so this builds and
+# runs the binary via cargo.
+[scripts.setup.e2e-setup]
+command = ["bash", "-c", 'test -n "${COXSWAIN_E2E_BOOTSTRAPPED:-}" || cargo run --quiet -p coxswain-e2e --bin e2e_setup']
+slow-timeout = { period = "900s", terminate-after = 1 }
+
+# ---------------------------------------------------------------------------
+# Global-config mutators
+# ---------------------------------------------------------------------------
+# These tests reconfigure the ONE shared proxy/controller via `helm upgrade`
+# (or install a global catchall route). The upgrade rolls the shared
+# Deployment and the new config is proxy-wide, so a mutator running
+# concurrently with ANY other test against that proxy corrupts it — a cap-1
+# test-group is insufficient (it serializes members with each other but not
+# with ungrouped tests). They therefore run alone, in the serial pass.
+#
+# When per-scope control lands these move back to the parallel pass:
+#   proxy_protocol_*  -> #327 (per-listener PROXY protocol)
+#   access_log_*      -> #279 (per-Ingress access-log)
+#
+# The two profiles below split on exactly this set via `default-filter`, so the
+# run command stays uniform (`-E 'binary(<suite>)'`) for both passes.
+
+# ---------------------------------------------------------------------------
+# e2e — parallel pass
+# ---------------------------------------------------------------------------
+[profile.e2e]
+# Everything except the mutators and the (always-serial) resilience suite.
+default-filter = '''
+  not (
+    test(=default_backend) | test(=default_backend_only)
+    | test(=proxy_protocol_http_v1_forwarded) | test(=proxy_protocol_https_v2_forwarded)
+    | test(=status_load_balancer_ip)
+    | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
+  )
+  and not binary(resilience)
+'''
+
+# 4 concurrent tests against the shared cluster. Conservative for a single-node
+# cluster; tunable as the parallel set proves it can sustain more.
+test-threads = 4
+
+# Collect all failures per suite — don't stop on the first failing test.
+fail-fast = false
+
+[[profile.e2e.scripts]]
+filter = 'all()'
+setup = ['e2e-setup']
+
+# ---------------------------------------------------------------------------
+# e2e-serial — serial pass
+# ---------------------------------------------------------------------------
+[profile.e2e-serial]
+# Only the global-config mutators and the resilience suite (restarts/migrates
+# the shared controller). One at a time, so each owns the shared control plane.
+default-filter = '''
+  test(=default_backend) | test(=default_backend_only)
+  | test(=proxy_protocol_http_v1_forwarded) | test(=proxy_protocol_https_v2_forwarded)
+  | test(=status_load_balancer_ip)
+  | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
+  | binary(resilience)
+'''
+
+test-threads = 1
+fail-fast = false
+
+[[profile.e2e-serial.scripts]]
+filter = 'all()'
+setup = ['e2e-setup']

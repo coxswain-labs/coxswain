@@ -3,12 +3,14 @@
 
 use anyhow::Context as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 
-/// Guards the heavy one-time cluster setup (image build, Helm install, CRDs,
-/// cert-manager) so it only runs once per test-binary process, not per test.
-static CLUSTER_SETUP_DONE: AtomicBool = AtomicBool::new(false);
+/// Guards the heavy one-time cluster setup within a single process (fallback
+/// for non-nextest execution). Under nextest with the `e2e-setup` setup
+/// script, `COXSWAIN_E2E_BOOTSTRAPPED=1` is injected and tests short-circuit
+/// without touching this cell.
+static CLUSTER_SETUP: OnceCell<()> = OnceCell::const_new();
 
 /// Single source of truth for the Gateway API CRD version installed in tests.
 /// To bump: change `.gateway-api-version` at the repo root and update
@@ -70,10 +72,29 @@ impl ClusterKind {
 
 /// Ensure the cluster is ready for e2e tests.
 ///
-/// The heavyweight steps (image build, Helm install, CRDs, cert-manager) run
-/// only **once per test-binary process** — subsequent calls skip them via
-/// [`CLUSTER_SETUP_DONE`]. The namespace purge always runs so each test starts
-/// with a clean slate.
+/// Under `cargo nextest run --profile e2e` the `e2e-setup` setup script runs
+/// [`bootstrap_cluster`] once before any test starts and injects
+/// `COXSWAIN_E2E_BOOTSTRAPPED=1`; this function returns immediately in that
+/// case. Without the setup script (direct `cargo test` or other paths) it
+/// falls back to calling [`bootstrap_cluster`] inline.
+///
+/// # Errors
+///
+/// Returns an error if bootstrap fails.
+pub async fn bootstrap() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    if std::env::var("COXSWAIN_E2E_BOOTSTRAPPED").is_ok() {
+        return Ok(());
+    }
+    bootstrap_cluster().await
+}
+
+/// Run the full one-time cluster setup: build image, install CRDs,
+/// cert-manager, and the coxswain Helm release.
+///
+/// Called directly by the `e2e-setup` nextest setup-script binary so the
+/// heavy work happens once, serially, before any test process starts. Also
+/// used as the inline fallback by [`bootstrap`] when the env var is absent.
 ///
 /// Cold path (fresh cluster, no Docker cache): ~10 min for the BoringSSL build.
 /// Warm path (image cached, Helm release deployed): < 1 s.
@@ -82,94 +103,79 @@ impl ClusterKind {
 ///
 /// Returns an error if any setup step fails or a required component does not
 /// become available within its timeout.
-pub async fn bootstrap() -> anyhow::Result<()> {
-    // reqwest 0.13 uses `rustls-no-provider`; install ring explicitly so the
-    // process has exactly one crypto provider regardless of transitive deps.
+pub async fn bootstrap_cluster() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    CLUSTER_SETUP
+        .get_or_try_init(|| async {
+            // Purge leftover e2e namespaces from a previous interrupted run.
+            let _ = Command::new("kubectl")
+                .args([
+                    "delete",
+                    "ns",
+                    "-l",
+                    "coxswain-e2e=true",
+                    "--ignore-not-found",
+                    "--wait=false",
+                ])
+                .status()
+                .await;
 
-    // Purge any namespaces left over from a previous run AND from
-    // already-completed tests inside the current run. This runs on EVERY
-    // `Harness::start()` call. Without it, a terminating namespace from a
-    // previous test can keep its `Ingress` resources in the proxy's routing
-    // table briefly — long enough that the next test's HTTP requests hit
-    // (and assert against) the wrong backend, especially when the lingering
-    // Ingress is the `*`-host catchall used by `default_backend_only`.
-    let _ = Command::new("kubectl")
-        .args([
-            "delete",
-            "ns",
-            "-l",
-            "coxswain-e2e=true",
-            "--ignore-not-found",
-            "--wait=false",
-        ])
-        .status()
-        .await;
+            let root = workspace_root().context("workspace root")?;
+            let cluster = ClusterKind::detect().await.context("detect cluster kind")?;
 
-    // Everything below is expensive and idempotent — skip on the second+
-    // call within the same process (i.e. between tests in the same suite).
-    if CLUSTER_SETUP_DONE
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Ok(());
-    }
+            build_image(&root).await.context("docker build")?;
 
-    let root = workspace_root().context("workspace root")?;
-    let cluster = ClusterKind::detect().await.context("detect cluster kind")?;
+            match &cluster {
+                ClusterKind::Kind { name } => {
+                    kind_load_image(name).await.context("kind load")?;
+                    install_cloud_provider_kind_if_missing()
+                        .await
+                        .context("cloud-provider-kind")?;
+                }
+                ClusterKind::Orbstack => {}
+            }
 
-    build_image(&root).await.context("docker build")?;
-
-    match &cluster {
-        ClusterKind::Kind { name } => {
-            kind_load_image(name).await.context("kind load")?;
-            install_cloud_provider_kind_if_missing()
+            if !gateway_v1_crds_installed().await {
+                tracing::info!(
+                    "Gateway API CRDs absent or pre-v1, installing {GATEWAY_API_VERSION}"
+                );
+                kubectl_apply_url(&format!(
+                    "https://github.com/kubernetes-sigs/gateway-api/releases/download/{GATEWAY_API_VERSION}/standard-install.yaml"
+                ))
                 .await
-                .context("cloud-provider-kind")?;
-        }
-        ClusterKind::Orbstack => {
-            // OrbStack's containerd shares the local Docker daemon; no explicit
-            // image load needed.
-        }
-    }
+                .context("install Gateway API CRDs")?;
+                wait_for_crds_established()
+                    .await
+                    .context("Gateway API CRDs not established")?;
+            }
 
-    if !gateway_v1_crds_installed().await {
-        tracing::info!("Gateway API CRDs absent or pre-v1, installing {GATEWAY_API_VERSION}");
-        kubectl_apply_url(
-            &format!("https://github.com/kubernetes-sigs/gateway-api/releases/download/{GATEWAY_API_VERSION}/standard-install.yaml"),
-        )
-        .await
-        .context("install Gateway API CRDs")?;
-        wait_for_crds_established()
-            .await
-            .context("Gateway API CRDs not established")?;
-    }
+            install_cert_manager_if_missing()
+                .await
+                .context("install cert-manager")?;
 
-    install_cert_manager_if_missing()
-        .await
-        .context("install cert-manager")?;
+            // Pre-apply coxswain CRDs with SSA before helm so the field manager
+            // is consistent across fresh and pre-existing clusters.
+            let crd_dir = root.join("charts/coxswain/crds");
+            let status = Command::new("kubectl")
+                .args([
+                    "apply",
+                    "--server-side",
+                    "--force-conflicts",
+                    "-f",
+                    crd_dir.to_string_lossy().as_ref(),
+                ])
+                .status()
+                .await
+                .context("kubectl apply crds")?;
+            anyhow::ensure!(status.success(), "kubectl apply --server-side crds failed");
 
-    // Pre-apply coxswain CRDs with server-side apply before helm install so
-    // the CRD field manager is consistent across fresh and pre-existing clusters.
-    // Helm's `crds/` directory uses client-side apply which conflicts with a
-    // prior CSA-managed install; `--server-side --force-conflicts` avoids that.
-    let crd_dir = root.join("charts/coxswain/crds");
-    let status = Command::new("kubectl")
-        .args([
-            "apply",
-            "--server-side",
-            "--force-conflicts",
-            "-f",
-            crd_dir.to_string_lossy().as_ref(),
-        ])
-        .status()
-        .await
-        .context("kubectl apply crds")?;
-    anyhow::ensure!(status.success(), "kubectl apply --server-side crds failed");
+            helm_install(&root, &HelmOverrides::default())
+                .await
+                .context("helm install")?;
 
-    helm_install(&root, &HelmOverrides::default())
-        .await
-        .context("helm install")?;
+            Ok(())
+        })
+        .await?;
 
     Ok(())
 }
@@ -177,7 +183,7 @@ pub async fn bootstrap() -> anyhow::Result<()> {
 /// Additional Helm `--set` overrides for tests that need non-default proxy config.
 ///
 /// All fields default to the chart's own defaults (empty / false).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct HelmOverrides {
     /// Passed as `controller.statusAddress`. Used by the conformance suite so
     /// `Gateway.status.addresses` is populated with a reachable LB IP.
@@ -306,6 +312,16 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
 ///
 /// Returns an error if handover does not complete within 60 s.
 async fn wait_for_leader_ready() -> anyhow::Result<()> {
+    wait_for_leader_ready_in(COXSWAIN_NAMESPACE).await
+}
+
+/// Poll `coxswain-leader-lock` in `namespace` until the sole running
+/// controller pod holds the lease.
+///
+/// # Errors
+///
+/// Returns an error if handover does not complete within 60 s.
+async fn wait_for_leader_ready_in(namespace: &str) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let pods_out = Command::new("kubectl")
@@ -313,7 +329,7 @@ async fn wait_for_leader_ready() -> anyhow::Result<()> {
                 "get",
                 "pods",
                 "-n",
-                COXSWAIN_NAMESPACE,
+                namespace,
                 "-l",
                 "app.kubernetes.io/component=controller",
                 "-o",
@@ -333,7 +349,7 @@ async fn wait_for_leader_ready() -> anyhow::Result<()> {
                 "lease",
                 "coxswain-leader-lock",
                 "-n",
-                COXSWAIN_NAMESPACE,
+                namespace,
                 "-o",
                 "jsonpath={.spec.holderIdentity}",
                 "--ignore-not-found",

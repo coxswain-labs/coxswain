@@ -4,8 +4,9 @@
 //! Plane: **control-plane**. Execution: **serial** — these tests reconfigure or
 //! restart shared infrastructure (mid-flight listener changes under sustained
 //! load, controller pod restart, dedicated⇄shared mode migration) and must not
-//! overlap tests that depend on the default config. P0b (#322) wires the nextest
-//! serial group that enforces this; this file is its membership.
+//! overlap tests that depend on the default config. The nextest `serial` group
+//! in `.config/nextest.toml` enforces this; the entire `resilience` binary is
+//! its primary member.
 //!
 //! Classification rule: a test belongs to the plane of its *primary assertion
 //! target*. These assert continuity/idempotency across a disruptive event.

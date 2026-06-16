@@ -3,7 +3,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "coxswain.sharedProxy.fullname" . }}
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ include "coxswain.namespace" . }}
   labels:
     {{- include "coxswain.labels" . | nindent 4 }}
     app.kubernetes.io/component: shared-proxy
