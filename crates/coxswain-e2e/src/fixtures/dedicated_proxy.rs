@@ -37,6 +37,12 @@ pub const DEDICATED_GATEWAY_LOADBALANCER: &str = fixture!("dedicated_gateway_loa
 pub const DEDICATED_GATEWAY_INVALID_PARAMS: &str =
     fixture!("dedicated_gateway_invalid_params.yaml");
 
+/// Dedicated-mode `Gateway` whose `CoxswainGatewayParameters` sets every spec
+/// knob at once (`replicas`, `image`, `resources`, `serviceType: NodePort`,
+/// `podTemplate`). Used by the #333 per-field coverage test to assert each one
+/// lands on the rendered Deployment/Service.
+pub const DEDICATED_GATEWAY_FIELDS: &str = fixture!("dedicated_gateway_fields.yaml");
+
 /// Dedicated-mode `Gateway` with `allowedRoutes.namespaces.from: All` on its
 /// listener (#229). Used to verify that the controller auto-provisions a
 /// `ClusterRoleBinding` for the proxy SA and renders
