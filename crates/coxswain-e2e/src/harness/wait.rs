@@ -491,6 +491,54 @@ pub async fn wait_for_route_status(
     .await
 }
 
+/// Poll until the route returns an upstream-rejection status — `400` or any `5xx`.
+///
+/// For negative backend-protocol assertions where the proxy cannot speak the
+/// upstream's wire protocol (e.g. HTTP/1.1 to an h2c-only port), the rejection
+/// surfaces as a `502` (the proxy got no valid upstream response) or a `400` (the
+/// upstream replied with a protocol error) depending on how the handshake fails —
+/// both prove the request did not succeed. A `404` (route not yet programmed) or any
+/// `2xx`/`3xx` keeps polling, so this never passes on a transient not-ready state or
+/// a success. Returns the observed rejection status.
+///
+/// # Errors
+///
+/// Returns an error if no rejection status is observed before `timeout` elapses.
+pub async fn wait_for_route_rejected(
+    http: &crate::harness::HttpClient,
+    host: &str,
+    path: &str,
+    timeout: Duration,
+) -> anyhow::Result<u16> {
+    let is_rejection = |s: u16| s == 400 || (500..=599).contains(&s);
+    poll_until(
+        timeout,
+        POLL,
+        || async {
+            match http.get_status(host, path).await {
+                Ok(status) => {
+                    format!("{host}{path} to be rejected (400 or 5xx); last status {status}")
+                }
+                Err(e) => format!("{host}{path} to be rejected (400 or 5xx); request error: {e}"),
+            }
+        },
+        move || async move {
+            match http.get_status(host, path).await {
+                Ok(status) if is_rejection(status) => Some(status),
+                Ok(status) => {
+                    tracing::debug!(host, path, status, "not a rejection yet");
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(host, path, error = %e, "request failed");
+                    None
+                }
+            }
+        },
+    )
+    .await
+}
+
 /// Poll until a TCP connect to `addr` fails — connection refused, reset, or
 /// SYN black-holed — i.e. nothing is listening there anymore.
 ///

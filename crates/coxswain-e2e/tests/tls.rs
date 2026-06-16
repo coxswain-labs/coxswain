@@ -953,11 +953,13 @@ async fn annotation_backend_protocol_grpc_selects_h2c() -> anyhow::Result<()> {
     let resp = wait::wait_for_route(&h.http, &grpc_host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("h2c-echo");
 
-    // Negative: no annotation → HTTP/1.1 → the h2c-only port rejects the request,
-    // so the proxy returns an upstream error (502). The route is programmed (the
-    // positive proved the fixture reconciled); only the wire protocol differs.
+    // Negative: no annotation → HTTP/1.1 → the h2c-only port rejects the request.
+    // The route is programmed (the positive proved the fixture reconciled); only the
+    // wire protocol differs. The rejection surfaces as 400 or 502 depending on how the
+    // h2c/HTTP-1.1 mismatch fails (upstream protocol error vs. no valid upstream
+    // response), so assert the rejection class rather than a single hardcoded code.
     let http1_host = format!("backend-protocol-http1.{}.local", ns.name);
-    wait::wait_for_route_status(&h.http, &http1_host, "/", 502, Duration::from_secs(60)).await?;
+    wait::wait_for_route_rejected(&h.http, &http1_host, "/", Duration::from_secs(60)).await?;
 
     Ok(())
 }

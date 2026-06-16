@@ -649,7 +649,10 @@ async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
     // migration, so its endpoint must go dark. This is a connection failure, not a
     // 404 — the listening socket is gone — so it can't be expressed as a route
     // status; `wait_for_endpoint_unreachable` polls a real TCP connect instead.
-    wait::wait_for_endpoint_unreachable(dedicated_addr, Duration::from_secs(60)).await?;
+    // 120s, not 60s: controller GC of the Deployment/Service plus kube-proxy
+    // withdrawing the NodePort is the slowest step here and overruns 60s on slow CI
+    // runners (it passes well under this locally).
+    wait::wait_for_endpoint_unreachable(dedicated_addr, Duration::from_secs(120)).await?;
 
     Ok(())
 }
@@ -756,11 +759,14 @@ async fn catch_up_reconciles_gateway_created_during_controller_downtime() -> any
     // Relist catch-up: the Gateway created during downtime reaches Programmed=True,
     // which only happens if the controller reconciled an object it never received
     // a watch event for.
+    // 120s, not 60s: after a cold controller restart the informer cache must resync
+    // and drain the relisted backlog before this specific Gateway is reconciled —
+    // that overruns 60s on slow CI runners (locally it lands in ~16s).
     wait::wait_for_gateway_programmed(
         &h2.client,
         "coxswain-test",
         &ns.name,
-        Duration::from_secs(60),
+        Duration::from_secs(120),
     )
     .await?;
 
