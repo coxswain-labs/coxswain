@@ -34,7 +34,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::time;
 
 mod common;
 use common::dedicated::{
@@ -57,22 +56,37 @@ const PATCH_AFTER_REQUESTS: u64 = 500;
 
 /// Wait up to `timeout` for a 2xx GET on `addr/` with the given `Host` header.
 async fn wait_for_listener(addr: SocketAddr, host: &str, timeout: Duration) -> anyhow::Result<()> {
-    let deadline = time::Instant::now() + timeout;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .context("build reqwest client")?;
-    loop {
-        let url = format!("http://{addr}/");
-        match client.get(&url).header("Host", host).send().await {
-            Ok(r) if r.status().is_success() => return Ok(()),
-            _ => {}
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!("listener at {addr} did not become ready within {timeout:?}");
-        }
-        time::sleep(Duration::from_millis(200)).await;
-    }
+    let url = format!("http://{addr}/");
+    wait::poll_until(
+        timeout,
+        wait::POLL_FAST,
+        || async {
+            match client.get(&url).header("Host", host).send().await {
+                Ok(r) => format!(
+                    "listener at {addr} (Host: {host}) to return 2xx; last status {}",
+                    r.status()
+                ),
+                Err(e) => {
+                    format!("listener at {addr} (Host: {host}) to become ready; request error: {e}")
+                }
+            }
+        },
+        || async {
+            client
+                .get(&url)
+                .header("Host", host)
+                .send()
+                .await
+                .ok()
+                .filter(|r| r.status().is_success())
+                .map(|_| ())
+        },
+    )
+    .await
 }
 
 // ── Sustained load harness ────────────────────────────────────────────────────
@@ -508,11 +522,17 @@ async fn restart_controller_does_not_bump_resource_version() -> anyhow::Result<(
     drop(h);
     let h2 = Harness::start().await?;
 
-    // Give the new leader's operator a few reconcile cycles to send the
-    // idempotent SSAs. SSA on identical content does not bump `.generation`;
-    // if it does, the operator emitted a spec write that should have been a
-    // no-op.
-    time::sleep(Duration::from_secs(15)).await;
+    // Poll a real post-condition rather than blind-sleeping: wait until the new
+    // pod reports it holds the leader lease (`coxswain_controller_leader=1`) and
+    // has completed at least one successful reconcile on the fresh process. SSA
+    // on identical content is deterministic — it never bumps `.generation` — so
+    // one confirmed post-restart reconcile is sufficient to then assert
+    // generation stability.
+    wait::wait_for_controller_reconciled(
+        &h2.controller_admin_url("/metrics"),
+        Duration::from_secs(60),
+    )
+    .await?;
 
     let deploy_after: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
     let d2 = deploy_after.get(RESOURCE_NAME).await?;
@@ -574,6 +594,11 @@ async fn lifecycle_mode_migration_shared_to_dedicated() -> anyhow::Result<()> {
 
     let post = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
     post.assert_backend("echo-a");
+
+    // Negative: cut-over (DedicatedProxyReady=True) means the shared pool dropped
+    // the Gateway from its routing table, so the shared proxy must now return 404
+    // for the migrated host — the claim the docstring makes is asserted here.
+    wait::wait_for_route_status(&h.gateway_http, &host, "/", 404, Duration::from_secs(30)).await?;
 
     Ok(())
 }
@@ -674,8 +699,13 @@ async fn lifecycle_controller_restart_is_idempotent() -> anyhow::Result<()> {
     restart_controller().await?;
     let h2 = Harness::start().await?;
 
-    // Let the new leader's operator emit its first few idempotent SSAs.
-    time::sleep(Duration::from_secs(15)).await;
+    // Wait for the real post-condition — new leader elected + at least one
+    // successful reconcile on the fresh process — instead of blind-sleeping.
+    wait::wait_for_controller_reconciled(
+        &h2.controller_admin_url("/metrics"),
+        Duration::from_secs(60),
+    )
+    .await?;
 
     let deployments_after: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
     let deploy_after = deployments_after.get(RESOURCE_NAME).await?;

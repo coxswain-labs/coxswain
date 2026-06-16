@@ -12,19 +12,39 @@ use kube::Api;
 use std::{net::SocketAddr, time::Duration};
 use tokio::time;
 
-const POLL: Duration = Duration::from_millis(500);
-const POLL_FAST: Duration = Duration::from_millis(200);
+/// Default poll interval — tight enough to keep total wall-clock low, loose
+/// enough not to hammer the API server.
+pub const POLL: Duration = Duration::from_millis(500);
+/// Faster poll interval for cheap local probes (e.g. `/readyz`).
+pub const POLL_FAST: Duration = Duration::from_millis(200);
 
-/// Poll `check` every `interval` until it returns `Some(T)` or `timeout` elapses.
-async fn poll_until<T, F, Fut>(
+/// Poll `check` every `interval` until it returns `Some(T)`, or fail when
+/// `timeout` elapses.
+///
+/// This is the single canonical poller for the e2e suite. Tests and harness
+/// waiters route every blind wait through it rather than sleeping, so the
+/// "poll the real post-condition, never sleep" rubric is enforced by reuse.
+///
+/// On timeout the `on_timeout` closure is awaited and its string is embedded in
+/// the error. That closure is expected to *fetch and render the last-observed
+/// world state* (conditions, pod identity, HTTP status), so a timeout is
+/// diagnosable from the log alone — without re-running under `RUST_LOG`.
+///
+/// # Errors
+///
+/// Returns an error if `check` does not yield `Some` before `timeout` elapses;
+/// the message carries the `on_timeout` state dump.
+pub async fn poll_until<T, F, Fut, D, DFut>(
     timeout: Duration,
     interval: Duration,
-    timeout_msg: impl Fn() -> String,
+    on_timeout: D,
     mut check: F,
 ) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
+    D: Fn() -> DFut,
+    DFut: std::future::Future<Output = String>,
 {
     let deadline = time::Instant::now() + timeout;
     loop {
@@ -32,7 +52,10 @@ where
             return Ok(val);
         }
         if time::Instant::now() >= deadline {
-            anyhow::bail!("{}", timeout_msg());
+            anyhow::bail!(
+                "timed out after {timeout:?} waiting for {}",
+                on_timeout().await
+            );
         }
         time::sleep(interval).await;
     }
@@ -48,7 +71,16 @@ pub async fn wait_for_tls_cert_rotation(
     poll_until(
         timeout,
         POLL,
-        || format!("TLS cert rotation on {host}"),
+        || async {
+            match crate::harness::http::https_peer_leaf_der(host, "/", tls_addr).await {
+                Ok(der) => format!(
+                    "TLS leaf on {host} to rotate (was {} bytes); current leaf is {} bytes",
+                    old_der.len(),
+                    der.len()
+                ),
+                Err(e) => format!("TLS leaf on {host} to rotate; current handshake fails: {e}"),
+            }
+        },
         || async {
             match crate::harness::http::https_peer_leaf_der(host, "/", tls_addr).await {
                 Ok(new_der) if new_der != old_der => Some(new_der),
@@ -76,7 +108,14 @@ pub async fn wait_for_https_route(
     poll_until(
         timeout,
         POLL,
-        || format!("HTTPS route {host}{path} to become live"),
+        || async {
+            match crate::harness::http::https_get(host, path, tls_addr).await {
+                Ok((status, _)) => {
+                    format!("HTTPS route {host}{path} to return 2xx; last status {status}")
+                }
+                Err(e) => format!("HTTPS route {host}{path} to become live; handshake error: {e}"),
+            }
+        },
         || async {
             match crate::harness::http::https_get(host, path, tls_addr).await {
                 Ok((_, Some(body))) => Some(body),
@@ -104,7 +143,15 @@ pub async fn wait_for_ready(addr: SocketAddr, timeout: Duration) -> anyhow::Resu
     poll_until(
         timeout,
         POLL_FAST,
-        || format!("readyz at {addr}"),
+        || async {
+            match client.get(&url).send().await {
+                Ok(r) => format!(
+                    "/readyz at {addr} to return 200; last status {}",
+                    r.status()
+                ),
+                Err(e) => format!("/readyz at {addr} to return 200; request error: {e}"),
+            }
+        },
         || async {
             client
                 .get(&url)
@@ -128,7 +175,12 @@ pub async fn wait_for_gatewayclass_supported_features(
     poll_until(
         timeout,
         POLL,
-        || format!("GatewayClass {name} to have status.supportedFeatures"),
+        || async {
+            format!(
+                "GatewayClass {name} to publish status.supportedFeatures; {}",
+                gatewayclass_state(&api, name).await
+            )
+        },
         || async {
             api.get(name).await.ok().and_then(|gc| {
                 let feats: Vec<String> = gc
@@ -155,7 +207,12 @@ pub async fn wait_for_httproute_programmed(
     poll_until(
         timeout,
         POLL,
-        || format!("HTTPRoute {namespace}/{name} to be Programmed"),
+        || async {
+            format!(
+                "HTTPRoute {namespace}/{name} to be Programmed; observed {}",
+                route_state(&api, name).await
+            )
+        },
         || async {
             api.get(name)
                 .await
@@ -178,7 +235,12 @@ pub async fn wait_for_gateway_programmed(
     poll_until(
         timeout,
         POLL,
-        || format!("Gateway {namespace}/{name} to be Accepted and Programmed"),
+        || async {
+            format!(
+                "Gateway {namespace}/{name} to be Accepted and Programmed; observed {}",
+                gateway_state(&api, name).await
+            )
+        },
         || async {
             api.get(name)
                 .await
@@ -203,7 +265,12 @@ pub async fn wait_for_tls_secret(
     poll_until(
         timeout,
         POLL,
-        || format!("kubernetes.io/tls Secret {namespace}/{name} to be populated"),
+        || async {
+            format!(
+                "kubernetes.io/tls Secret {namespace}/{name} to be populated; observed {}",
+                secret_state(&api, name).await
+            )
+        },
         || async {
             api.get(name)
                 .await
@@ -243,6 +310,31 @@ pub async fn wait_for_deployments(namespace: &str, names: &[&str]) -> anyhow::Re
     Ok(())
 }
 
+/// Poll until the named namespaced resource exists, returning it.
+///
+/// The single most common shape in the provisioning/status suites — "wait for
+/// the controller to create object `name`, then assert on it". Routes through
+/// the canonical [`poll_until`] (no ad-hoc loop) and dumps the resource kind +
+/// name on timeout.
+///
+/// # Errors
+///
+/// Returns an error if the resource does not exist before `timeout` elapses.
+pub async fn wait_for_resource<K>(api: &Api<K>, name: &str, timeout: Duration) -> anyhow::Result<K>
+where
+    K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+    K::DynamicType: Default,
+{
+    let kind = K::kind(&K::DynamicType::default()).to_string();
+    poll_until(
+        timeout,
+        POLL,
+        || async { format!("{kind} '{name}' to be created") },
+        || async { api.get(name).await.ok() },
+    )
+    .await
+}
+
 /// Retry WebSocket handshakes against the proxy until one succeeds or `timeout` expires.
 pub async fn wait_for_ws_route(
     proxy_addr: SocketAddr,
@@ -254,7 +346,9 @@ pub async fn wait_for_ws_route(
     poll_until(
         timeout,
         POLL,
-        || format!("WebSocket route on {host}"),
+        || async {
+            format!("WebSocket route on {host} via {proxy_addr} to complete its upgrade handshake")
+        },
         || async {
             let req = tungstenite::http::Request::builder()
                 .uri(&uri)
@@ -293,7 +387,12 @@ pub async fn wait_for_route(
     poll_until(
         timeout,
         POLL,
-        || format!("route {host}{path} to become live"),
+        || async {
+            format!(
+                "route {host}{path} to become live; {}",
+                http_probe_state(http, host, path).await
+            )
+        },
         || async {
             match http.get(host, path).await {
                 Ok(resp) => Some(resp),
@@ -318,7 +417,17 @@ pub async fn wait_for_backend(
     poll_until(
         timeout,
         POLL,
-        || format!("backend '{expected_backend}' at {host}{path}"),
+        || async {
+            match http.get(host, path).await {
+                Ok(resp) => format!(
+                    "backend '{expected_backend}' at {host}{path}; last response from pod {:?}",
+                    resp.pod
+                ),
+                Err(e) => {
+                    format!("backend '{expected_backend}' at {host}{path}; request error: {e}")
+                }
+            }
+        },
         || async {
             match http.get(host, path).await {
                 Ok(resp) => {
@@ -357,7 +466,14 @@ pub async fn wait_for_route_status(
     poll_until(
         timeout,
         POLL,
-        || format!("{host}{path} to return {expected_status}"),
+        || async {
+            match http.get_status(host, path).await {
+                Ok(status) => {
+                    format!("{host}{path} to return {expected_status}; last status {status}")
+                }
+                Err(e) => format!("{host}{path} to return {expected_status}; request error: {e}"),
+            }
+        },
         || async {
             match http.get_status(host, path).await {
                 Ok(status) if status == expected_status => Some(()),
@@ -398,7 +514,12 @@ pub async fn wait_for_dedicated_proxy_endpoint(
     let node_port = poll_until(
         timeout,
         POLL,
-        || format!("dedicated-proxy Service {namespace}/{svc_name} to have a NodePort"),
+        || async {
+            format!(
+                "dedicated-proxy Service {namespace}/{svc_name} to have a NodePort; {}",
+                svc_nodeport_state(namespace, &svc_name).await
+            )
+        },
         || async {
             let out = tokio::process::Command::new("kubectl")
                 .args([
@@ -454,6 +575,97 @@ async fn get_node_ip() -> anyhow::Result<std::net::IpAddr> {
         .with_context(|| format!("no parseable IP in node address output: {raw}"))
 }
 
+/// Poll the controller admin `/metrics` endpoint until the replica reports it
+/// holds the leader lease *and* has completed at least one successful reconcile
+/// on the current process.
+///
+/// This is the real post-condition that replaces blind "wait for the operator to
+/// settle" sleeps after a controller restart: `coxswain_controller_leader` flips
+/// to `1` on leader-election, and `coxswain_controller_reconcile_total{...,
+/// result="success"}` starts at `0` in a fresh process, so a value `>= 1` proves
+/// the new leader has run a full reconcile pass. Because server-side apply is
+/// deterministic (identical rendered spec never bumps `.metadata.generation`),
+/// one confirmed post-restart reconcile is sufficient to then assert generation
+/// stability.
+///
+/// # Errors
+///
+/// Returns an error if the endpoint does not report `leader=1` with a successful
+/// reconcile before `timeout`.
+pub async fn wait_for_controller_reconciled(
+    metrics_url: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("build reqwest client")?;
+    poll_until(
+        timeout,
+        POLL,
+        || async {
+            match fetch_metrics(&client, metrics_url).await {
+                Ok(body) => format!(
+                    "controller {metrics_url} to report leader=1 with a successful reconcile; \
+                     last leader={:?}, reconcile_success={:?}",
+                    metric_value(&body, "coxswain_controller_leader"),
+                    reconcile_success_total(&body),
+                ),
+                Err(e) => {
+                    format!(
+                        "controller {metrics_url} to report leader + reconcile; fetch error: {e}"
+                    )
+                }
+            }
+        },
+        || async {
+            let body = fetch_metrics(&client, metrics_url).await.ok()?;
+            let is_leader = metric_value(&body, "coxswain_controller_leader") == Some(1.0);
+            let reconciled = reconcile_success_total(&body).is_some_and(|v| v >= 1.0);
+            (is_leader && reconciled).then_some(())
+        },
+    )
+    .await
+}
+
+async fn fetch_metrics(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
+    Ok(client.get(url).send().await?.text().await?)
+}
+
+/// Parse the value of a no-label Prometheus gauge/counter line
+/// (`<name> <value>`). Returns `None` if the series is absent.
+fn metric_value(body: &str, name: &str) -> Option<f64> {
+    body.lines().filter(|l| !l.starts_with('#')).find_map(|l| {
+        let rest = l.strip_prefix(name)?;
+        // Match the bare series only — `name <value>`, not `name_other` or
+        // `name{labels}`.
+        rest.strip_prefix(' ')?.trim().parse::<f64>().ok()
+    })
+}
+
+/// Sum `coxswain_controller_reconcile_total{...,result="success"}` across all
+/// `controller` labels. Returns `None` if no success series is present.
+fn reconcile_success_total(body: &str) -> Option<f64> {
+    let mut total = 0.0;
+    let mut seen = false;
+    for line in body.lines().filter(|l| !l.starts_with('#')) {
+        let Some(rest) = line.strip_prefix("coxswain_controller_reconcile_total{") else {
+            continue;
+        };
+        let Some((labels, value)) = rest.split_once('}') else {
+            continue;
+        };
+        if !labels.contains("result=\"success\"") {
+            continue;
+        }
+        if let Ok(v) = value.trim().parse::<f64>() {
+            total += v;
+            seen = true;
+        }
+    }
+    seen.then_some(total)
+}
+
 /// Poll until `Ingress.status.loadBalancer.ingress[0].ip` equals `expected_ip`.
 pub async fn wait_for_ingress_lb_ip(
     client: &kube::Client,
@@ -466,7 +678,12 @@ pub async fn wait_for_ingress_lb_ip(
     poll_until(
         timeout,
         POLL,
-        || format!("Ingress {namespace}/{name} to have loadBalancer ip={expected_ip}"),
+        || async {
+            format!(
+                "Ingress {namespace}/{name} to have loadBalancer ip={expected_ip}; observed {}",
+                ingress_lb_state(&api, name).await
+            )
+        },
         || async {
             api.get(name)
                 .await
@@ -499,7 +716,12 @@ pub async fn wait_for_gateway_condition(
     poll_until(
         timeout,
         POLL,
-        || format!("Gateway {namespace}/{name} to have condition {type_}={status}"),
+        || async {
+            format!(
+                "Gateway {namespace}/{name} to have condition {type_}={status}; observed {}",
+                gateway_state(&api, name).await
+            )
+        },
         || async {
             api.get(name)
                 .await
@@ -530,9 +752,10 @@ pub async fn wait_for_gateway_listener_condition(
     poll_until(
         timeout,
         POLL,
-        || {
+        || async {
             format!(
-                "Gateway {namespace}/{gw_name} listener '{listener_name}' to have condition {type_}={status}"
+                "Gateway {namespace}/{gw_name} listener '{listener_name}' to have condition {type_}={status}; observed {}",
+                gateway_listener_state(&api, gw_name, listener_name).await
             )
         },
         || async {
@@ -573,6 +796,154 @@ fn condition_matches(conditions: &[Condition], type_: &str, status: &str) -> boo
         .any(|c| c.type_ == type_ && c.status == status)
 }
 
+/// Render a condition list as `[type=status(reason), ...]` for timeout dumps.
+fn summarize_conditions(conditions: &[Condition]) -> String {
+    if conditions.is_empty() {
+        return "[]".to_string();
+    }
+    let rendered: Vec<String> = conditions
+        .iter()
+        .map(|c| format!("{}={}({})", c.type_, c.status, c.reason))
+        .collect();
+    format!("[{}]", rendered.join(", "))
+}
+
+/// Fetch and summarize a Gateway's top-level conditions for a timeout dump.
+async fn gateway_state(api: &Api<Gateway>, name: &str) -> String {
+    match api.get(name).await {
+        Ok(gw) => {
+            let conds = gw
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_deref())
+                .unwrap_or(&[]);
+            format!("conditions={}", summarize_conditions(conds))
+        }
+        Err(e) => format!("<could not fetch Gateway {name}: {e}>"),
+    }
+}
+
+/// Fetch and summarize a single Gateway listener's conditions for a timeout dump.
+async fn gateway_listener_state(api: &Api<Gateway>, gw_name: &str, listener_name: &str) -> String {
+    match api.get(gw_name).await {
+        Ok(gw) => {
+            let conds = gw
+                .status
+                .as_ref()
+                .and_then(|s| s.listeners.as_deref())
+                .and_then(|ls| ls.iter().find(|l| l.name == listener_name))
+                .map_or_else(
+                    || "<listener absent>".to_string(),
+                    |l| summarize_conditions(l.conditions.as_slice()),
+                );
+            format!("listener conditions={conds}")
+        }
+        Err(e) => format!("<could not fetch Gateway {gw_name}: {e}>"),
+    }
+}
+
+/// Fetch and summarize an HTTPRoute's per-parent conditions for a timeout dump.
+async fn route_state(api: &Api<HTTPRoute>, name: &str) -> String {
+    match api.get(name).await {
+        Ok(route) => match route.status.as_ref() {
+            Some(s) => {
+                let parents: Vec<String> = s
+                    .parents
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}:{}",
+                            p.controller_name,
+                            summarize_conditions(p.conditions.as_slice())
+                        )
+                    })
+                    .collect();
+                format!("parents=[{}]", parents.join(", "))
+            }
+            None => "<no status yet>".to_string(),
+        },
+        Err(e) => format!("<could not fetch HTTPRoute {name}: {e}>"),
+    }
+}
+
+/// Fetch and summarize a Secret's type and `tls.crt` presence for a timeout dump.
+async fn secret_state(api: &Api<Secret>, name: &str) -> String {
+    match api.get(name).await {
+        Ok(s) => {
+            let has_crt = s
+                .data
+                .as_ref()
+                .and_then(|d| d.get("tls.crt"))
+                .is_some_and(|b| !b.0.is_empty());
+            format!("type={:?}, tls.crt present={has_crt}", s.type_)
+        }
+        Err(e) => format!("<could not fetch Secret {name}: {e}>"),
+    }
+}
+
+/// Fetch and summarize a GatewayClass's `supportedFeatures` count for a timeout dump.
+async fn gatewayclass_state(api: &Api<GatewayClass>, name: &str) -> String {
+    match api.get(name).await {
+        Ok(gc) => {
+            let count = gc
+                .status
+                .as_ref()
+                .and_then(|s| s.supported_features.as_ref())
+                .map_or(0, Vec::len);
+            format!("supportedFeatures count={count}")
+        }
+        Err(e) => format!("<could not fetch GatewayClass {name}: {e}>"),
+    }
+}
+
+/// Fetch and summarize an Ingress's load-balancer IPs for a timeout dump.
+async fn ingress_lb_state(api: &Api<Ingress>, name: &str) -> String {
+    match api.get(name).await {
+        Ok(ing) => {
+            let ips: Vec<String> = ing
+                .status
+                .as_ref()
+                .and_then(|s| s.load_balancer.as_ref())
+                .and_then(|lb| lb.ingress.as_deref())
+                .map(|entries| entries.iter().filter_map(|e| e.ip.clone()).collect())
+                .unwrap_or_default();
+            format!("loadBalancer ips={ips:?}")
+        }
+        Err(e) => format!("<could not fetch Ingress {name}: {e}>"),
+    }
+}
+
+/// Re-probe an HTTP route and report the current status/error for a timeout dump.
+async fn http_probe_state(http: &crate::harness::HttpClient, host: &str, path: &str) -> String {
+    match http.get_status(host, path).await {
+        Ok(status) => format!("last status {status}"),
+        Err(e) => format!("request error: {e}"),
+    }
+}
+
+/// Report the current `type`/`nodePort` of a Service for a timeout dump.
+async fn svc_nodeport_state(namespace: &str, svc_name: &str) -> String {
+    match tokio::process::Command::new("kubectl")
+        .args([
+            "get",
+            "svc",
+            svc_name,
+            "-n",
+            namespace,
+            "-o",
+            "jsonpath={.spec.type}/{.spec.ports[0].nodePort}",
+        ])
+        .output()
+        .await
+    {
+        Ok(out) => format!(
+            "kubectl reports type/nodePort='{}'",
+            String::from_utf8_lossy(&out.stdout).trim()
+        ),
+        Err(e) => format!("<could not run kubectl get svc {svc_name}: {e}>"),
+    }
+}
+
 /// Poll until a `BackendTLSPolicy`'s `status.ancestors[]` contains a condition
 /// with the given type and status from our controller.
 pub async fn wait_for_backend_tls_policy_condition(
@@ -588,9 +959,10 @@ pub async fn wait_for_backend_tls_policy_condition(
     poll_until(
         timeout,
         POLL,
-        || {
+        || async {
             format!(
-                "BackendTLSPolicy {namespace}/{name} to have ancestor condition {type_}={status}"
+                "BackendTLSPolicy {namespace}/{name} to have ancestor condition {type_}={status}; observed {}",
+                backend_tls_policy_state(&api, name).await
             )
         },
         || async {
@@ -648,9 +1020,10 @@ pub async fn wait_for_backend_tls_policy_condition_with_reason(
     poll_until(
         timeout,
         POLL,
-        || {
+        || async {
             format!(
-                "BackendTLSPolicy {namespace}/{name} to have ancestor condition {type_}={status} reason={reason}"
+                "BackendTLSPolicy {namespace}/{name} to have ancestor condition {type_}={status} reason={reason}; observed {}",
+                backend_tls_policy_state(&api, name).await
             )
         },
         || async {
@@ -674,4 +1047,28 @@ pub async fn wait_for_backend_tls_policy_condition_with_reason(
         },
     )
     .await
+}
+
+/// Fetch and summarize a `BackendTLSPolicy`'s ancestor conditions for a timeout dump.
+async fn backend_tls_policy_state(api: &Api<BackendTLSPolicy>, name: &str) -> String {
+    match api.get(name).await {
+        Ok(p) => {
+            let ancestors: Vec<String> = p
+                .status
+                .as_ref()
+                .map(|s| s.ancestors.as_slice())
+                .unwrap_or(&[])
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{}:{}",
+                        a.controller_name,
+                        summarize_conditions(&a.conditions)
+                    )
+                })
+                .collect();
+            format!("ancestors=[{}]", ancestors.join(", "))
+        }
+        Err(e) => format!("<could not fetch BackendTLSPolicy {name}: {e}>"),
+    }
 }

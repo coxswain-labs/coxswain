@@ -398,20 +398,31 @@ async fn wait_for_problem(
 ) -> anyhow::Result<serde_json::Value> {
     let url = h.controller_admin_url("/api/v1/problems");
     let client = reqwest::Client::new();
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let json: serde_json::Value = client.get(&url).send().await?.json().await?;
-        if let Some(row) = json["routing"][bucket]
-            .as_array()
-            .and_then(|a| a.iter().find(|r| pick(r)))
-        {
-            return Ok(row.clone());
-        }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!("no matching `routing.{bucket}` problem within timeout: {json}");
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    wait::poll_until(
+        timeout,
+        wait::POLL,
+        || async {
+            match client.get(&url).send().await {
+                Ok(r) => match r.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        format!("a matching `routing.{bucket}` problem; last body={json}")
+                    }
+                    Err(e) => {
+                        format!("a matching `routing.{bucket}` problem; body decode error: {e}")
+                    }
+                },
+                Err(e) => format!("a matching `routing.{bucket}` problem; request error: {e}"),
+            }
+        },
+        || async {
+            let json: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+            json["routing"][bucket]
+                .as_array()
+                .and_then(|a| a.iter().find(|r| pick(r)))
+                .cloned()
+        },
+    )
+    .await
 }
 
 /// A dead backend (Service with zero ready endpoints) must appear in
@@ -564,31 +575,39 @@ async fn routing_endpoints() -> anyhow::Result<()> {
     // Poll /api/v1/routing/gateways until the Gateway we just applied is visible.
     // The reconciler rebuilds with a 500 ms trailing-edge debounce so allow a
     // generous window.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let listing = loop {
-        let resp = client.get(&gateways_url).send().await?;
-        assert_eq!(
-            resp.status(),
-            200,
-            "/api/v1/routing/gateways should be 200 on the controller"
-        );
-        let json: serde_json::Value = resp.json().await?;
-        let gateways = json["gateways"].as_array().cloned().unwrap_or_default();
-        let visible = gateways
-            .iter()
-            .any(|g| g["namespace"] == ns.name && g["name"] == "coxswain-test");
-        if visible {
-            break json;
-        }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "Gateway coxswain-test/{} did not appear in /routing/gateways within timeout: {}",
-                ns.name,
-                json
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    };
+    let listing = wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            match client.get(&gateways_url).send().await {
+                Ok(r) => {
+                    let status = r.status();
+                    let body = r.json::<serde_json::Value>().await.unwrap_or_default();
+                    format!(
+                        "Gateway coxswain-test/{} to appear in /routing/gateways; last status={status}, body={body}",
+                        ns.name
+                    )
+                }
+                Err(e) => format!(
+                    "Gateway coxswain-test/{} to appear in /routing/gateways; request error: {e}",
+                    ns.name
+                ),
+            }
+        },
+        || async {
+            let resp = client.get(&gateways_url).send().await.ok()?;
+            if resp.status() != 200 {
+                return None;
+            }
+            let json: serde_json::Value = resp.json().await.ok()?;
+            let gateways = json["gateways"].as_array().cloned().unwrap_or_default();
+            let visible = gateways
+                .iter()
+                .any(|g| g["namespace"] == ns.name && g["name"] == "coxswain-test");
+            visible.then_some(json)
+        },
+    )
+    .await?;
 
     // Envelope fields are present on the list response.
     assert!(

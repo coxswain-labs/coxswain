@@ -22,10 +22,12 @@ use coxswain_e2e::{
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::{http, wait},
 };
+use gateway_api::apis::standard::httproutes::HTTPRoute;
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
+use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Api;
-use kube::api::PostParams;
+use kube::api::{DeleteParams, PostParams};
 use reqwest::Method;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -122,6 +124,73 @@ async fn ingress_path_matching() -> anyhow::Result<()> {
     // wait_for_route rather than a bare get() to tolerate transient timeouts.
     let resp = wait::wait_for_route(&h.http, &host, "/b", Duration::from_secs(15)).await?;
     resp.assert_backend("echo-b");
+
+    Ok(())
+}
+
+/// Deleting the Ingress object stops the data plane serving its route: apply →
+/// serves echo-a → delete the Ingress → the path 404s. Asserts the teardown
+/// negative (rubric #5) that the Ingress API otherwise lacks — withdrawal of a
+/// route object, not just a backend, must take the route out of the table.
+#[tokio::test]
+async fn ingress_deleted_route_stops_serving() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-delete-stops").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("ingress.{}.local", ns.name);
+    // Baseline: the route serves echo-a while the Ingress exists.
+    wait::wait_for_backend(&h.http, &host, "/a", "echo-a", Duration::from_secs(60)).await?;
+
+    // Delete the Ingress object.
+    let ingresses: Api<Ingress> = Api::namespaced(h.client.clone(), &ns.name);
+    ingresses
+        .delete("echo-ingress", &DeleteParams::default())
+        .await?;
+
+    // The route is withdrawn from the routing table → the path 404s.
+    wait::wait_for_route_status(&h.http, &host, "/a", 404, Duration::from_secs(30)).await?;
+
+    Ok(())
+}
+
+/// Gateway-API counterpart to [`ingress_deleted_route_stops_serving`]: deleting
+/// the HTTPRoute (leaving the Gateway in place) stops the listener serving its
+/// route → the path 404s.
+#[tokio::test]
+async fn gateway_deleted_route_stops_serving() -> anyhow::Result<()> {
+    common::init_tracing();
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-delete-stops").await?;
+
+    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    h.apply(gwa::PATH_MATCHING, FixtureVars::new(&ns.name))
+        .await?;
+
+    let host = format!("echo.{}.local", ns.name);
+    // Baseline: the route serves echo-a while the HTTPRoute exists.
+    wait::wait_for_backend(
+        &h.gateway_http,
+        &host,
+        "/a",
+        "echo-a",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Delete the HTTPRoute object — leave the Gateway in place.
+    let routes: Api<HTTPRoute> = Api::namespaced(h.client.clone(), &ns.name);
+    routes
+        .delete("echo-route", &DeleteParams::default())
+        .await?;
+
+    // With no attached route the Gateway listener 404s for the host.
+    wait::wait_for_route_status(&h.gateway_http, &host, "/a", 404, Duration::from_secs(30)).await?;
 
     Ok(())
 }
@@ -451,9 +520,9 @@ async fn header_matching() -> anyhow::Result<()> {
         .gateway_http
         .request(Method::GET, &host, "/hdr", &[])
         .await?;
-    assert_ne!(
-        status, 200,
-        "expected non-200 when header predicate not satisfied"
+    assert_eq!(
+        status, 404,
+        "expected 404 (no matching route) when header predicate not satisfied"
     );
 
     Ok(())
@@ -527,9 +596,9 @@ async fn query_param_matching() -> anyhow::Result<()> {
         .gateway_http
         .request(Method::GET, &host, "/query", &[])
         .await?;
-    assert_ne!(
-        status, 200,
-        "expected non-200 when query predicate not satisfied"
+    assert_eq!(
+        status, 404,
+        "expected 404 (no matching route) when query predicate not satisfied"
     );
 
     Ok(())
@@ -570,9 +639,9 @@ async fn combined_matching() -> anyhow::Result<()> {
         .gateway_http
         .request(Method::GET, &host, "/combined", &[("X-Env", "dev")])
         .await?;
-    assert_ne!(
-        status, 200,
-        "expected non-200 when AND predicates not fully satisfied"
+    assert_eq!(
+        status, 404,
+        "expected 404 (no matching route) when AND predicates not fully satisfied"
     );
 
     Ok(())
@@ -885,9 +954,9 @@ async fn parent_ref_port_matching() -> anyhow::Result<()> {
     // the route is scoped to the alt listener, which coxswain doesn't bind.
     let wrong_host = format!("wrong.{}.local", ns.name);
     let status = h.gateway_http.get_status(&wrong_host, "/").await?;
-    assert_ne!(
-        status, 200,
-        "route-wrong-port must not be routable on HTTP_PORT"
+    assert_eq!(
+        status, 404,
+        "route-wrong-port must not be routable on HTTP_PORT (no attached route → 404)"
     );
 
     // Verify routing-table isolation via admin /api/v1/routes.

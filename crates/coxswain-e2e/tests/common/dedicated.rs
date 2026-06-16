@@ -10,6 +10,7 @@
 use coxswain_e2e::{
     Harness, NamespaceGuard,
     fixtures::{FixtureVars, dedicated_proxy as dedicated},
+    harness::wait,
 };
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
@@ -17,7 +18,6 @@ use k8s_openapi::api::core::v1::{Service, ServiceAccount};
 use kube::api::Api;
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::time;
 
 /// Gateway `metadata.name` declared in the fixture — chosen to keep the
 /// rendered resource name (`<gw>-<class>`) stable across test runs without
@@ -65,38 +65,12 @@ pub async fn apply_and_wait(
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
     let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
 
-    let deploy = poll_until(Duration::from_secs(15), || async {
-        deployments.get(RESOURCE_NAME).await.ok()
-    })
-    .await?;
-    let svc = poll_until(Duration::from_secs(15), || async {
-        services.get(RESOURCE_NAME).await.ok()
-    })
-    .await?;
-    let sa = poll_until(Duration::from_secs(15), || async {
-        sas.get(RESOURCE_NAME).await.ok()
-    })
-    .await?;
+    let deploy =
+        wait::wait_for_resource(&deployments, RESOURCE_NAME, Duration::from_secs(15)).await?;
+    let svc = wait::wait_for_resource(&services, RESOURCE_NAME, Duration::from_secs(15)).await?;
+    let sa = wait::wait_for_resource(&sas, RESOURCE_NAME, Duration::from_secs(15)).await?;
 
     Ok((deployments, services, sas, deploy, svc, sa))
-}
-
-/// Poll `check` every 500 ms until it returns `Some(T)` or `timeout` elapses.
-pub async fn poll_until<T, F, Fut>(timeout: Duration, mut check: F) -> anyhow::Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Option<T>>,
-{
-    let deadline = time::Instant::now() + timeout;
-    loop {
-        if let Some(val) = check().await {
-            return Ok(val);
-        }
-        if time::Instant::now() >= deadline {
-            anyhow::bail!("poll_until timed out after {timeout:?}");
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
 }
 
 /// Returns the Gateway's `status.conditions[type=...]` `(status, reason)`
@@ -137,15 +111,33 @@ pub async fn wait_for_cut_over(
     name: &str,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    poll_until(timeout, || async {
-        let gw = gateways.get(name).await.ok()?;
-        let conds = gw.status.as_ref()?.conditions.as_ref()?;
-        conds
-            .iter()
-            .find(|c| c.type_ == CUT_OVER_CONDITION)
-            .filter(|c| c.status == "True")
-            .map(|_| ())
-    })
+    wait::poll_until(
+        timeout,
+        wait::POLL,
+        || async {
+            let conds = gateways
+                .get(name)
+                .await
+                .ok()
+                .and_then(|gw| gw.status.and_then(|s| s.conditions))
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| format!("{}={}", c.type_, c.status))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            format!("Gateway '{name}' to flip {CUT_OVER_CONDITION}=True; conditions={conds:?}")
+        },
+        || async {
+            let gw = gateways.get(name).await.ok()?;
+            let conds = gw.status.as_ref()?.conditions.as_ref()?;
+            conds
+                .iter()
+                .find(|c| c.type_ == CUT_OVER_CONDITION)
+                .filter(|c| c.status == "True")
+                .map(|_| ())
+        },
+    )
     .await
 }
 

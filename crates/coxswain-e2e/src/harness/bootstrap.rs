@@ -523,8 +523,25 @@ async fn install_cloud_provider_kind_if_missing() -> anyhow::Result<()> {
         .spawn()
         .context("spawn cloud-provider-kind")?;
 
-    // Give it a moment to register with the cluster.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Poll until the spawned process is actually running rather than blind-
+    // sleeping: `pgrep` only matches once the child is up, so this both confirms
+    // registration and surfaces an immediate startup crash as a timeout. (We
+    // returned early above if one was already running, so any match here is ours.)
+    crate::harness::wait::poll_until(
+        std::time::Duration::from_secs(10),
+        crate::harness::wait::POLL_FAST,
+        || async { "cloud-provider-kind process to start".to_string() },
+        || async {
+            Command::new("pgrep")
+                .args(["-x", "cloud-provider-kind"])
+                .status()
+                .await
+                .ok()
+                .filter(|s| s.success())
+                .map(|_| ())
+        },
+    )
+    .await?;
     Ok(())
 }
 
