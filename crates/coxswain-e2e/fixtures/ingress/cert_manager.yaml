@@ -11,23 +11,23 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: INGRESS_NAME
+  name: ${INGRESS_NAME}
   annotations:
     cert-manager.io/cluster-issuer: coxswain-e2e-selfsigned
 spec:
   ingressClassName: coxswain
   tls:
     - hosts:
-        - TLS_HOST
-      secretName: SECRET_NAME
+        - ${TLS_HOST}
+      secretName: ${SECRET_NAME}
   rules:
-    - host: TLS_HOST
+    - host: ${TLS_HOST}
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: BACKEND_NAME
+                name: ${BACKEND_NAME}
                 port:
                   number: 3000

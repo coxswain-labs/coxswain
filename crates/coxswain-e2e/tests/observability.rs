@@ -58,7 +58,6 @@ const CONTROLLER_CHECKS: &[&str] = &[
 
 #[tokio::test]
 async fn status_exposes_per_subsystem_checks() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
 
     let health: serde_json::Value = reqwest::get(h.admin_url("/api/v1/health"))
@@ -99,7 +98,6 @@ async fn status_exposes_per_subsystem_checks() -> anyhow::Result<()> {
 /// prefix absent on the proxy-pod scrape target.
 #[tokio::test]
 async fn proxy_pod_emits_proxy_prefix_metrics() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "obs-proxy").await?;
 
@@ -149,7 +147,6 @@ async fn proxy_pod_emits_proxy_prefix_metrics() -> anyhow::Result<()> {
 /// `coxswain_proxy_*` request counters.
 #[tokio::test]
 async fn controller_pod_emits_controller_prefix_metrics() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
 
     let metrics = reqwest::get(h.controller_admin_url("/metrics"))
@@ -181,7 +178,6 @@ async fn controller_pod_emits_controller_prefix_metrics() -> anyhow::Result<()> 
 /// from the #20 design refinement.
 #[tokio::test]
 async fn access_log_emits_required_fields_on_success() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "obs-access-fields").await?;
 
@@ -223,7 +219,6 @@ async fn access_log_emits_required_fields_on_success() -> anyhow::Result<()> {
 /// redacted `path` field.
 #[tokio::test]
 async fn access_log_path_mode_pattern_uses_rule_pattern() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start_with_options(ControllerOptions {
         access_log_path_mode: Some("pattern".to_string()),
         ..Default::default()
@@ -265,7 +260,6 @@ async fn access_log_path_mode_pattern_uses_rule_pattern() -> anyhow::Result<()> 
 /// keeping every other documented field.
 #[tokio::test]
 async fn access_log_path_mode_none_omits_path() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start_with_options(ControllerOptions {
         access_log_path_mode: Some("none".to_string()),
         ..Default::default()
@@ -307,7 +301,6 @@ async fn access_log_path_mode_none_omits_path() -> anyhow::Result<()> {
 /// `status=404` and an `error` field describing why no route matched.
 #[tokio::test]
 async fn access_log_error_path_carries_error_field() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
 
     // No route is ever installed for this host: the proxy responds 404 from
@@ -345,7 +338,6 @@ async fn access_log_error_path_carries_error_field() -> anyhow::Result<()> {
 /// silencing is log-only.
 #[tokio::test]
 async fn access_log_disabled_emits_nothing() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start_with_options(ControllerOptions {
         access_log: Some(false),
         ..Default::default()
@@ -430,7 +422,6 @@ async fn wait_for_problem(
 /// Dashboard card can deep-link to the Route Inspector.
 #[tokio::test]
 async fn problems_dead_backend_carries_route_identity() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "obs-dead").await?;
 
@@ -460,7 +451,6 @@ async fn problems_dead_backend_carries_route_identity() -> anyhow::Result<()> {
 /// route's identity — proving the routing core captures it end-to-end.
 #[tokio::test]
 async fn problems_conflict_carries_rejected_route_identity() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "obs-conflict").await?;
 
@@ -500,7 +490,6 @@ async fn problems_conflict_carries_rejected_route_identity() -> anyhow::Result<(
 /// (the name is resolved against the fleet, never the URL).
 #[tokio::test]
 async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let client = reqwest::Client::new();
 
@@ -554,15 +543,13 @@ async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
 /// and `/api/v1/routing/httproutes` lists the applied route as first-class
 /// (#293), and `/api/v1/problems` is the nested cross-cutting aggregate (#301).
 #[tokio::test]
-async fn routing_endpoints() -> anyhow::Result<()> {
-    common::init_tracing();
+async fn routing_api_surfaces_gateways_routes_and_problems() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-routing-endpoints").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    h.apply(gwa::PATH_MATCHING, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     // First wait for the route to be live so we know the reconciler has built
     // the routing table at least once after our Gateway was applied.

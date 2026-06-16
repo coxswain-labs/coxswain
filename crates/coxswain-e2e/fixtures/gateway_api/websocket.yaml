@@ -7,7 +7,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
 ---
 apiVersion: gateway.networking.k8s.io/v1
@@ -18,7 +18,7 @@ spec:
   parentRefs:
     - name: ws-gateway
   hostnames:
-    - ws.TESTNS.local
+    - ws.${TESTNS}.local
   rules:
     - backendRefs:
         - name: ws-echo

@@ -9,7 +9,7 @@
 
 use coxswain_e2e::{
     Harness, NamespaceGuard,
-    fixtures::{FixtureVars, dedicated_proxy as dedicated},
+    fixtures::{self, FixtureVars, dedicated_proxy as dedicated},
     harness::wait,
 };
 use gateway_api::apis::standard::gateways::Gateway;
@@ -58,8 +58,7 @@ pub async fn apply_and_wait(
     Service,
     ServiceAccount,
 )> {
-    h.apply(dedicated::DEDICATED_GATEWAY, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(dedicated::DEDICATED_GATEWAY, FixtureVars::new(&ns.name)).await?;
 
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
@@ -71,6 +70,77 @@ pub async fn apply_and_wait(
     let sa = wait::wait_for_resource(&sas, RESOURCE_NAME, Duration::from_secs(15)).await?;
 
     Ok((deployments, services, sas, deploy, svc, sa))
+}
+
+/// Assert the GEP-1762 provisioning contract every dedicated-proxy resource
+/// shares: each of the Deployment, Service, and ServiceAccount carries the
+/// `gateway-name`, `managed-by`, and `name` labels, exactly one owner reference
+/// back to the Gateway (`controller=true`, `blockOwnerDeletion=true`,
+/// `gateway.networking.k8s.io/*` apiVersion), and the Deployment's SSA field
+/// manager is `coxswain-controller`. Fixture-specific extras (e.g. merged
+/// `infrastructure.labels`/`annotations`) are asserted by the caller.
+pub fn assert_provisioning_contract(deploy: &Deployment, svc: &Service, sa: &ServiceAccount) {
+    for (kind, meta) in [
+        ("Deployment", &deploy.metadata),
+        ("Service", &svc.metadata),
+        ("ServiceAccount", &sa.metadata),
+    ] {
+        let labels = meta
+            .labels
+            .as_ref()
+            .unwrap_or_else(|| panic!("{kind}: labels missing"));
+        assert_eq!(
+            labels
+                .get("gateway.networking.k8s.io/gateway-name")
+                .map(String::as_str),
+            Some(GATEWAY_NAME),
+            "{kind}: GEP-1762 gateway-name label missing/wrong"
+        );
+        assert_eq!(
+            labels
+                .get("app.kubernetes.io/managed-by")
+                .map(String::as_str),
+            Some("coxswain"),
+            "{kind}: managed-by label missing/wrong"
+        );
+        assert_eq!(
+            labels.get("app.kubernetes.io/name").map(String::as_str),
+            Some("coxswain"),
+            "{kind}: name label missing/wrong"
+        );
+
+        let refs = meta
+            .owner_references
+            .as_ref()
+            .unwrap_or_else(|| panic!("{kind}: owner references missing"));
+        assert_eq!(refs.len(), 1, "{kind}: expected exactly one owner ref");
+        let r = &refs[0];
+        assert_eq!(r.kind, "Gateway", "{kind}: owner ref kind");
+        assert_eq!(r.name, GATEWAY_NAME, "{kind}: owner ref name");
+        assert_eq!(r.controller, Some(true), "{kind}: owner ref controller");
+        assert_eq!(
+            r.block_owner_deletion,
+            Some(true),
+            "{kind}: owner ref blockOwnerDeletion"
+        );
+        assert!(
+            r.api_version.starts_with("gateway.networking.k8s.io/"),
+            "{kind}: owner ref api_version = {}",
+            r.api_version
+        );
+    }
+
+    let managers = deploy
+        .metadata
+        .managed_fields
+        .as_ref()
+        .unwrap_or_else(|| panic!("Deployment managedFields missing"));
+    assert!(
+        managers
+            .iter()
+            .any(|f| f.manager.as_deref() == Some("coxswain-controller")),
+        "expected a managedFields entry with manager = 'coxswain-controller'"
+    );
 }
 
 /// Returns the Gateway's `status.conditions[type=...]` `(status, reason)`

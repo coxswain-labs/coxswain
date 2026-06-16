@@ -22,7 +22,7 @@ metadata:
 spec:
   ingressClassName: coxswain
   rules:
-    - host: dead.TESTNS.local
+    - host: dead.${TESTNS}.local
       http:
         paths:
           - path: /

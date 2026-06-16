@@ -16,8 +16,8 @@ metadata:
   name: echo-tls-creds
 type: Opaque
 data:
-  tls.crt: TLS_SERVER_CERT_B64
-  tls.key: TLS_SERVER_KEY_B64
+  tls.crt: ${TLS_SERVER_CERT_B64}
+  tls.key: ${TLS_SERVER_KEY_B64}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -35,7 +35,7 @@ spec:
     spec:
       containers:
         - name: echo
-          image: gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1
+          image: ${ECHO_IMAGE}
           ports:
             - containerPort: 3000
               name: http

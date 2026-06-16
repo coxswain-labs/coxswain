@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: ws-echo
-          image: jmalloc/echo-server:latest
+          image: ${WEBSOCKET_ECHO_IMAGE}
           ports:
             - containerPort: 8080
 ---

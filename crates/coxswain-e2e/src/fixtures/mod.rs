@@ -3,92 +3,106 @@
 pub mod backends;
 pub mod dedicated_proxy;
 pub mod gateway_api;
+pub mod images;
 pub mod ingress;
 
+use crate::harness::{
+    GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, INGRESS_HTTP_PORT, INGRESS_HTTPS_PORT,
+};
 use anyhow::Context as _;
 use std::path::Path;
 use tokio::io::AsyncWriteExt as _;
 
 /// Template variables for [`apply_fixture`].
 ///
-/// `TESTNS` is always replaced with `namespace`. The four port fields
-/// substitute the placeholders below when non-zero:
+/// Placeholders are sentinel-delimited (`${NAME}`) so substitution can never
+/// corrupt the document via substring collision: `${GATEWAY_HTTP_PORT}` is not a
+/// superstring of `${HTTP_PORT}`, so order is irrelevant, and a bare prose mention
+/// of a token name in a YAML comment is left untouched.
 ///
-/// - `http_port` → `HTTP_PORT` (Ingress HTTP listener)
-/// - `https_port` → `HTTPS_PORT` (Ingress HTTPS listener)
-/// - `gateway_http_port` → `GATEWAY_HTTP_PORT` (Gateway HTTP listener)
-/// - `gateway_https_port` → `GATEWAY_HTTPS_PORT` (Gateway HTTPS listener)
+/// A fixed set of placeholders is always substituted by [`apply_fixture`],
+/// regardless of fixture, so any test (with or without a [`Harness`]) gets the
+/// same result: `${TESTNS}` (the namespace), the four in-cluster listener ports
+/// (`${HTTP_PORT}`, `${HTTPS_PORT}`, `${GATEWAY_HTTP_PORT}`, `${GATEWAY_HTTPS_PORT}`),
+/// and the pinned external images (`${ECHO_IMAGE}` etc., from the [`images`] module).
+/// Placeholders absent from a given fixture are harmless no-ops.
 ///
-/// Use [`FixtureVars::with`] to add extra substitutions.
+/// Use [`FixtureVars::with`] for fixture-specific substitutions (hostnames, cert
+/// bundles, resource names).
+///
+/// [`Harness`]: crate::harness::Harness
 pub struct FixtureVars {
-    /// Substituted for `TESTNS` in the YAML template.
+    /// Substituted for `${TESTNS}` in the YAML template.
     pub namespace: String,
-    /// Substituted for `HTTP_PORT` in the YAML template. `0` means skip.
-    pub http_port: u16,
-    /// Substituted for `HTTPS_PORT` in the YAML template. `0` means skip.
-    pub https_port: u16,
-    /// Substituted for `GATEWAY_HTTP_PORT` in the YAML template. `0` means skip.
-    pub gateway_http_port: u16,
-    /// Substituted for `GATEWAY_HTTPS_PORT` in the YAML template. `0` means skip.
-    pub gateway_https_port: u16,
-    /// Additional `(placeholder, replacement)` pairs applied before the standard substitutions.
+    /// Additional `(placeholder, replacement)` pairs; `placeholder` is the bare
+    /// token name (e.g. `"TLS_HOSTNAME"`), matched as `${TLS_HOSTNAME}` in the YAML.
     pub extra: Vec<(String, String)>,
 }
 
 impl FixtureVars {
-    /// Construct a minimal vars set with only a namespace (all ports default to 0 = skip).
+    /// Construct a vars set scoped to `namespace`; the standard ports and images
+    /// are injected by [`apply_fixture`] regardless.
     pub fn new(namespace: impl Into<String>) -> Self {
         Self {
             namespace: namespace.into(),
-            http_port: 0,
-            https_port: 0,
-            gateway_http_port: 0,
-            gateway_https_port: 0,
             extra: Vec::new(),
         }
     }
 
     /// Add an extra template substitution, returning `self` for chaining.
+    #[must_use]
     pub fn with(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
         self.extra.push((key.into(), val.into()));
         self
     }
 }
 
-/// Apply a fixture YAML file to `namespace` using `vars` for template substitution.
+/// Apply a fixture YAML file to `vars.namespace`, substituting template
+/// placeholders, via `kubectl apply`.
+///
+/// This is the single fixture-apply path for the whole suite: it always injects
+/// `${TESTNS}`, the in-cluster listener ports, and the pinned images, so it
+/// behaves identically whether or not the caller holds a [`Harness`]. Tests that
+/// manage their own [`ControllerProcess`] (to apply fixtures *before* the
+/// controller starts) call it exactly like harness-based tests do.
+///
+/// [`Harness`]: crate::harness::Harness
+/// [`ControllerProcess`]: crate::harness::ControllerProcess
+///
+/// # Errors
+/// Returns an error if the fixture file can't be read or `kubectl apply` fails.
 pub async fn apply_fixture(path: impl AsRef<Path>, vars: FixtureVars) -> anyhow::Result<()> {
     let path = path.as_ref();
     let mut content =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
 
-    // Apply extra vars first so callers can override the standard substitutions.
+    // Sentinel-delimited (`${KEY}`) tokens make substitution order irrelevant —
+    // `${GATEWAY_HTTP_PORT}` can no longer collide with `${HTTP_PORT}`.
+
+    // Pinned external images: single source of truth in `images`.
+    content = substitute(&content, "ECHO_IMAGE", images::ECHO);
+    content = substitute(&content, "BUSYBOX_IMAGE", images::BUSYBOX);
+    content = substitute(&content, "WEBSOCKET_ECHO_IMAGE", images::WEBSOCKET_ECHO);
+    content = substitute(&content, "PAUSE_IMAGE", images::PAUSE);
+
+    // Extra vars (caller-supplied, e.g. `${TLS_HOSTNAME}`, `${CA_PEM}`).
     for (key, val) in &vars.extra {
         content = substitute(&content, key, val);
     }
-    // Substitute Gateway placeholders before Ingress ones; `GATEWAY_HTTP_PORT`
-    // is a superstring of `HTTP_PORT` and a literal-replace pass over `HTTP_PORT`
-    // first would corrupt the Gateway placeholder.
-    if vars.gateway_http_port != 0 {
-        content = substitute(
-            &content,
-            "GATEWAY_HTTP_PORT",
-            &vars.gateway_http_port.to_string(),
-        );
-    }
-    if vars.gateway_https_port != 0 {
-        content = substitute(
-            &content,
-            "GATEWAY_HTTPS_PORT",
-            &vars.gateway_https_port.to_string(),
-        );
-    }
-    if vars.http_port != 0 {
-        let p = vars.http_port.to_string();
-        content = substitute(&content, "HTTP_PORT", &p);
-    }
-    if vars.https_port != 0 {
-        content = substitute(&content, "HTTPS_PORT", &vars.https_port.to_string());
-    }
+
+    // Fixed in-cluster listener ports — the harness port-forwards these.
+    content = substitute(
+        &content,
+        "GATEWAY_HTTP_PORT",
+        &GATEWAY_HTTP_PORT.to_string(),
+    );
+    content = substitute(
+        &content,
+        "GATEWAY_HTTPS_PORT",
+        &GATEWAY_HTTPS_PORT.to_string(),
+    );
+    content = substitute(&content, "HTTP_PORT", &INGRESS_HTTP_PORT.to_string());
+    content = substitute(&content, "HTTPS_PORT", &INGRESS_HTTPS_PORT.to_string());
     content = substitute(&content, "TESTNS", &vars.namespace);
 
     let mut child = tokio::process::Command::new("kubectl")
@@ -114,9 +128,13 @@ pub async fn apply_fixture(path: impl AsRef<Path>, vars: FixtureVars) -> anyhow:
     Ok(())
 }
 
-/// Replace every occurrence of `key` in `content` with `val`, preserving the
-/// indentation prefix of the line containing each occurrence on continuation
-/// lines of `val`.
+/// Replace every occurrence of the sentinel token `${key}` in `content` with
+/// `val`, preserving the indentation prefix of the line containing each
+/// occurrence on continuation lines of `val`.
+///
+/// `key` is the bare token name (e.g. `"TESTNS"`); the matched form is `${TESTNS}`.
+/// Sentinel delimiting means a bare prose mention of the name in a comment is left
+/// untouched, and tokens cannot collide by substring.
 ///
 /// The "indentation prefix" is the leading whitespace of the placeholder's line,
 /// optionally extended with a leading `#` (and the whitespace immediately after it)
@@ -127,18 +145,19 @@ pub async fn apply_fixture(path: impl AsRef<Path>, vars: FixtureVars) -> anyhow:
 /// the substitution Just Work whether the placeholder is in a YAML block scalar,
 /// a regular indented field, or a `#`-prefixed comment.
 fn substitute(content: &str, key: &str, val: &str) -> String {
+    let token = format!("${{{key}}}");
     if val.contains('\n') {
-        substitute_indent_aware(content, key, val)
+        substitute_indent_aware(content, &token, val)
     } else {
         // Single-line value: plain replace, identical to the historical behaviour.
-        content.replace(key, val)
+        content.replace(&token, val)
     }
 }
 
-fn substitute_indent_aware(content: &str, key: &str, val: &str) -> String {
+fn substitute_indent_aware(content: &str, token: &str, val: &str) -> String {
     let mut out = String::with_capacity(content.len() + val.len());
     let mut cursor = 0;
-    while let Some(rel) = content[cursor..].find(key) {
+    while let Some(rel) = content[cursor..].find(token) {
         let idx = cursor + rel;
         // Append the chunk before the match.
         out.push_str(&content[cursor..idx]);
@@ -162,7 +181,7 @@ fn substitute_indent_aware(content: &str, key: &str, val: &str) -> String {
             }
         }
 
-        cursor = idx + key.len();
+        cursor = idx + token.len();
     }
     out.push_str(&content[cursor..]);
     out
@@ -203,13 +222,13 @@ mod tests {
 
     #[test]
     fn single_line_value_round_trips() {
-        let out = substitute("hostname: TLS_HOSTNAME", "TLS_HOSTNAME", "example.com");
+        let out = substitute("hostname: ${TLS_HOSTNAME}", "TLS_HOSTNAME", "example.com");
         assert_eq!(out, "hostname: example.com");
     }
 
     #[test]
     fn multi_line_value_in_yaml_block_scalar_keeps_indent() {
-        let template = "data:\n  ca.crt: |\n    CA_PEM\n";
+        let template = "data:\n  ca.crt: |\n    ${CA_PEM}\n";
         let pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----";
         let out = substitute(template, "CA_PEM", pem);
         assert_eq!(
@@ -220,7 +239,7 @@ mod tests {
 
     #[test]
     fn multi_line_value_inside_comment_stays_commented() {
-        let template = "# Note: CA_PEM is the bundle\n---\n";
+        let template = "# Note: ${CA_PEM} is the bundle\n---\n";
         let pem = "first\nsecond";
         let out = substitute(template, "CA_PEM", pem);
         assert_eq!(out, "# Note: first\n# second is the bundle\n---\n");
@@ -228,9 +247,26 @@ mod tests {
 
     #[test]
     fn multiple_occurrences_all_substituted() {
-        let template = "  A: CA_PEM\n  B: CA_PEM\n";
+        let template = "  A: ${CA_PEM}\n  B: ${CA_PEM}\n";
         let pem = "one\ntwo";
         let out = substitute(template, "CA_PEM", pem);
         assert_eq!(out, "  A: one\n  two\n  B: one\n  two\n");
+    }
+
+    #[test]
+    fn bare_token_name_without_sentinel_is_left_untouched() {
+        // A prose mention of the token name (no `${}`) must not be substituted —
+        // this is what keeps `# TESTNS is substituted at runtime` comments safe.
+        let out = substitute("# TESTNS is substituted at runtime", "TESTNS", "ns-1");
+        assert_eq!(out, "# TESTNS is substituted at runtime");
+    }
+
+    #[test]
+    fn superstring_token_is_not_corrupted_by_substring_token() {
+        // Order-independence: substituting `${HTTP_PORT}` must not touch
+        // `${GATEWAY_HTTP_PORT}`.
+        let template = "a: ${HTTP_PORT}\nb: ${GATEWAY_HTTP_PORT}\n";
+        let out = substitute(template, "HTTP_PORT", "80");
+        assert_eq!(out, "a: 80\nb: ${GATEWAY_HTTP_PORT}\n");
     }
 }

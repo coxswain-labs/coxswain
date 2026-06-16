@@ -7,7 +7,7 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: http
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
 ---
 apiVersion: gateway.networking.k8s.io/v1
@@ -18,7 +18,7 @@ spec:
   parentRefs:
     - name: h2c-gateway
   hostnames:
-    - h2c.TESTNS.local
+    - h2c.${TESTNS}.local
   rules:
     - backendRefs:
         - name: h2c-echo

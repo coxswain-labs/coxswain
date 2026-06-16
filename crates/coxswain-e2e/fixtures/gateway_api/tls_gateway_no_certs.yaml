@@ -13,14 +13,14 @@ spec:
   gatewayClassName: coxswain
   listeners:
     - name: https
-      port: GATEWAY_HTTPS_PORT
+      port: ${GATEWAY_HTTPS_PORT}
       protocol: HTTPS
-      hostname: "LISTENER_HOSTNAME"
+      hostname: "${LISTENER_HOSTNAME}"
       tls:
         mode: Terminate
         certificateRefs:
           - kind: Secret
-            name: SECRET_NAME
+            name: ${SECRET_NAME}
       allowedRoutes:
         namespaces:
           from: Same

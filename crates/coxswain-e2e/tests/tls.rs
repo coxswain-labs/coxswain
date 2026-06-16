@@ -39,7 +39,6 @@ mod common;
 /// - Unknown SNI causes a TLS handshake error (no cert installed).
 #[tokio::test]
 async fn ingress_tls_termination_with_sni() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-tls").await?;
 
@@ -100,7 +99,6 @@ async fn ingress_tls_termination_with_sni() -> anyhow::Result<()> {
 /// rule hosts and the cert is still served correctly via SNI.
 #[tokio::test]
 async fn tls_fallback_when_hosts_omitted() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-tls-nohosts").await?;
 
@@ -136,7 +134,6 @@ async fn tls_fallback_when_hosts_omitted() -> anyhow::Result<()> {
 /// 4. Assert that routing still works on the new certificate.
 #[tokio::test]
 async fn ingress_tls_certificate_hot_rotation() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-tls-rotate").await?;
 
@@ -198,7 +195,6 @@ async fn ingress_tls_certificate_hot_rotation() -> anyhow::Result<()> {
 /// 4. HTTPS request succeeds and routes to the expected backend.
 #[tokio::test]
 async fn cert_manager_ingress_provisioning() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-cert-mgr").await?;
 
@@ -234,8 +230,6 @@ async fn cert_manager_ingress_provisioning() -> anyhow::Result<()> {
 /// - Echo response must include a `forwarded` header with `for="198.51.100.42:12345"`.
 #[tokio::test]
 async fn proxy_protocol_http_v1_forwarded() -> anyhow::Result<()> {
-    common::init_tracing();
-
     bootstrap().await?;
     let client = kube::Client::try_default().await?;
     let ns = NamespaceGuard::create(&client, "pp-http-v1").await?;
@@ -290,8 +284,6 @@ async fn proxy_protocol_http_v1_forwarded() -> anyhow::Result<()> {
 /// - Echo response must include `forwarded: for="192.0.2.7:54321";proto=https`.
 #[tokio::test]
 async fn proxy_protocol_https_v2_forwarded() -> anyhow::Result<()> {
-    common::init_tracing();
-
     bootstrap().await?;
     let client = kube::Client::try_default().await?;
     let ns = NamespaceGuard::create(&client, "pp-https-v2").await?;
@@ -545,11 +537,10 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// - Unknown SNI fails the TLS handshake.
 #[tokio::test]
 async fn gateway_tls_termination_with_sni() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-sni").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host_a = format!("tls-a.{}.local", ns.name);
@@ -557,7 +548,7 @@ async fn gateway_tls_termination_with_sni() -> anyhow::Result<()> {
     let cert_a = GeneratedCert::for_host(&host_a);
     let cert_b = GeneratedCert::for_host(&host_b);
 
-    h.apply(
+    fixtures::apply_fixture(
         gwa::TLS_TERMINATION,
         FixtureVars::new(&ns.name)
             .with("LISTENER_A_HOSTNAME", &host_a)
@@ -600,7 +591,6 @@ async fn gateway_tls_termination_with_sni() -> anyhow::Result<()> {
 /// individual listener health).
 #[tokio::test]
 async fn tls_missing_secret_marks_gateway_not_programmed() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-missing").await?;
 
@@ -608,7 +598,7 @@ async fn tls_missing_secret_marks_gateway_not_programmed() -> anyhow::Result<()>
     let secret_name = "cert-missing";
 
     // Apply a Gateway with an HTTPS listener whose Secret does not exist yet.
-    h.apply(
+    fixtures::apply_fixture(
         gwa::TLS_GATEWAY_NO_CERTS,
         FixtureVars::new(&ns.name)
             .with("LISTENER_HOSTNAME", &host)
@@ -687,14 +677,13 @@ async fn tls_missing_secret_marks_gateway_not_programmed() -> anyhow::Result<()>
 /// Gateway in one namespace references a Secret in a separate namespace,
 /// permitted by a ReferenceGrant. HTTPS must work end-to-end.
 #[tokio::test]
-async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
-    common::init_tracing();
+async fn tls_cross_namespace_grant_serves_https() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-xns").await?;
     let certs_ns = NamespaceGuard::create(&h.client, "gw-tls-xns-certs").await?;
 
     // Deploy backend in the primary namespace.
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host = format!("tls-xns.{}.local", ns.name);
@@ -702,7 +691,7 @@ async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
     let secret_name = "xns-cert";
 
     // Deploy Secret + ReferenceGrant into the certs namespace.
-    h.apply(
+    fixtures::apply_fixture(
         gwa::TLS_CROSS_NAMESPACE_CERTS,
         FixtureVars::new(&certs_ns.name)
             .with("TESTNS", &ns.name)
@@ -713,7 +702,7 @@ async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
     .await?;
 
     // Deploy Gateway + HTTPRoute into the primary namespace.
-    h.apply(
+    fixtures::apply_fixture(
         gwa::TLS_CROSS_NAMESPACE_GW,
         FixtureVars::new(&ns.name)
             .with("CERTS_NS", &certs_ns.name)
@@ -737,11 +726,10 @@ async fn tls_cross_namespace_with_grant() -> anyhow::Result<()> {
 /// 4. Assert routing still works on both listeners after the swap.
 #[tokio::test]
 async fn gateway_tls_certificate_hot_rotation() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-rotate").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host_a = format!("tls-rot-a.{}.local", ns.name);
@@ -751,7 +739,7 @@ async fn gateway_tls_certificate_hot_rotation() -> anyhow::Result<()> {
     let cert_b = GeneratedCert::for_host(&host_b);
 
     // Deploy with original certs.
-    h.apply(
+    fixtures::apply_fixture(
         gwa::TLS_TERMINATION,
         FixtureVars::new(&ns.name)
             .with("LISTENER_A_HOSTNAME", &host_a)
@@ -772,7 +760,7 @@ async fn gateway_tls_certificate_hot_rotation() -> anyhow::Result<()> {
     let old_der_b = http::https_peer_leaf_der(&host_b, "/", h.gateway_tls_addr).await?;
 
     // Rotate only Secret A; Secret B data is unchanged.
-    h.apply(
+    fixtures::apply_fixture(
         gwa::TLS_TERMINATION,
         FixtureVars::new(&ns.name)
             .with("LISTENER_A_HOSTNAME", &host_a)
@@ -825,17 +813,16 @@ async fn gateway_tls_certificate_hot_rotation() -> anyhow::Result<()> {
 /// 4. HTTPS request succeeds and routes to the expected backend.
 #[tokio::test]
 async fn cert_manager_gateway_provisioning() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-cert-mgr").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host = format!("tls-cm.{}.local", ns.name);
     let secret_name = "cert-manager-tls";
 
-    h.apply(
+    fixtures::apply_fixture(
         gwa::CERT_MANAGER,
         FixtureVars::new(&ns.name)
             .with("LISTENER_HOSTNAME", &host)
@@ -861,14 +848,12 @@ async fn cert_manager_gateway_provisioning() -> anyhow::Result<()> {
 /// 4. Send a text frame and assert the same frame echoes back.
 #[tokio::test]
 async fn websocket_passthrough() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-ws").await?;
 
-    h.apply(backends::WEBSOCKET_ECHO, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(backends::WEBSOCKET_ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["ws-echo"]).await?;
-    h.apply(gwa::WEBSOCKET, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::WEBSOCKET, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("ws.{}.local", ns.name);
 
@@ -914,24 +899,20 @@ async fn websocket_passthrough() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Verifies that a Service with `appProtocol: kubernetes.io/h2c` is correctly
-/// routed by Coxswain (GEP-1911). The test confirms that the `appProtocol`
-/// annotation is propagated through the data pipeline (endpoint resolution →
-/// BackendGroup → proxy) and that the route is successfully programmed and
-/// returns responses. Actual h2c wire-protocol verification (that the proxy
-/// speaks HTTP/2 cleartext on the upstream leg) is covered by the conformance
-/// suite, which requires a backend that natively accepts h2c connections.
+/// Does NOT verify the h2c wire: it does not assert the proxy speaks HTTP/2
+/// cleartext on the upstream leg (that is covered by the conformance suite, which
+/// needs a backend that natively accepts h2c). What it verifies (GEP-1911) is
+/// that a Service's `appProtocol: kubernetes.io/h2c` propagates through the data
+/// pipeline (endpoint resolution → BackendGroup → proxy) and the route is
+/// programmed and serves responses.
 #[tokio::test]
 async fn backend_protocol_h2c() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-h2c").await?;
 
-    h.apply(backends::H2C_ECHO, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(backends::H2C_ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["h2c-echo"]).await?;
-    h.apply(gwa::BACKEND_PROTOCOL_H2C, FixtureVars::new(&ns.name))
-        .await?;
+    fixtures::apply_fixture(gwa::BACKEND_PROTOCOL_H2C, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("h2c.{}.local", ns.name);
 
@@ -945,18 +926,17 @@ async fn backend_protocol_h2c() -> anyhow::Result<()> {
 /// the redirect-scheme fix.
 #[tokio::test]
 async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-tls-redirect").await?;
 
-    h.apply(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
     let host = format!("tls-redirect.{}.local", ns.name);
     let cert = GeneratedCert::for_host(&host);
     let secret_name = "cert-tls-redirect";
 
-    h.apply(
+    fixtures::apply_fixture(
         gwa::TLS_REDIRECT,
         FixtureVars::new(&ns.name)
             .with("LISTENER_HOST", &host)
@@ -1016,8 +996,7 @@ async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
 /// 3. Wait for the route to return a 2xx echo response (proves TLS was established).
 /// 4. Poll `BackendTLSPolicy.status.ancestors[].conditions` for `Accepted=True` / `ResolvedRefs=True`.
 #[tokio::test]
-async fn backend_tls_policy_configmap() -> anyhow::Result<()> {
-    common::init_tracing();
+async fn backend_tls_policy_configmap_ca_verifies_upstream() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-backend-tls").await?;
 
@@ -1026,7 +1005,7 @@ async fn backend_tls_policy_configmap() -> anyhow::Result<()> {
     let cert = GeneratedCert::for_host(&tls_hostname);
 
     // Deploy the TLS echo backend.
-    h.apply(
+    fixtures::apply_fixture(
         backends::ECHO_TLS,
         FixtureVars::new(&ns.name)
             .with("TLS_SERVER_CERT_B64", cert.cert_b64())
@@ -1038,7 +1017,7 @@ async fn backend_tls_policy_configmap() -> anyhow::Result<()> {
     let host = format!("backend-tls.{}.local", ns.name);
 
     // Apply Gateway + HTTPRoute + ConfigMap CA + BackendTLSPolicy.
-    h.apply(
+    fixtures::apply_fixture(
         gwa::BACKEND_TLS_POLICY,
         FixtureVars::new(&ns.name)
             .with("TLS_HOSTNAME", &tls_hostname)
@@ -1081,14 +1060,13 @@ async fn backend_tls_policy_configmap() -> anyhow::Result<()> {
 /// - Traffic to the targeted backend returns 5xx (GEP-1897: invalid policy must NOT
 ///   silently fall back to plain HTTP).
 #[tokio::test]
-async fn backend_tls_policy_invalid_ca() -> anyhow::Result<()> {
-    common::init_tracing();
+async fn backend_tls_policy_invalid_ca_rejects_with_502() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-backend-tls-invalid").await?;
 
     // Backend cert can be anything — the policy is invalid before we get to TLS.
     let cert = GeneratedCert::for_host(&format!("echo-tls.{}.local", ns.name));
-    h.apply(
+    fixtures::apply_fixture(
         backends::ECHO_TLS,
         FixtureVars::new(&ns.name)
             .with("TLS_SERVER_CERT_B64", cert.cert_b64())
@@ -1097,7 +1075,7 @@ async fn backend_tls_policy_invalid_ca() -> anyhow::Result<()> {
     .await?;
     wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         gwa::BACKEND_TLS_POLICY_INVALID_CA,
         FixtureVars::new(&ns.name),
     )
@@ -1146,8 +1124,7 @@ async fn backend_tls_policy_invalid_ca() -> anyhow::Result<()> {
 ///   traffic to port 8443 (path `/port-8443`) must use the no-section-name policy's SNI.
 /// - Both must succeed because the backend cert covers both SANs.
 #[tokio::test]
-async fn backend_tls_policy_section_name_routing() -> anyhow::Result<()> {
-    common::init_tracing();
+async fn backend_tls_policy_section_name_selects_per_port_sni() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-backend-tls-section").await?;
 
@@ -1156,7 +1133,7 @@ async fn backend_tls_policy_section_name_routing() -> anyhow::Result<()> {
     let cert = GeneratedCert::for_hosts(&[&sni_primary, &sni_secondary]);
 
     // Apply the dual-port TLS echo backend.
-    h.apply(
+    fixtures::apply_fixture(
         backends::ECHO_TLS_DUAL_PORT,
         FixtureVars::new(&ns.name)
             .with("TLS_SERVER_CERT_B64", cert.cert_b64())
@@ -1165,7 +1142,7 @@ async fn backend_tls_policy_section_name_routing() -> anyhow::Result<()> {
     .await?;
     wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         gwa::BACKEND_TLS_POLICY_SECTION_NAME,
         FixtureVars::new(&ns.name)
             .with("SNI_PRIMARY", &sni_primary)
@@ -1204,15 +1181,14 @@ async fn backend_tls_policy_section_name_routing() -> anyhow::Result<()> {
 /// - Expected status: winner `Accepted=True`, loser `Accepted=False/Conflicted`,
 ///   both with the test Gateway in `status.ancestors[]`.
 #[tokio::test]
-async fn backend_tls_policy_conflict_resolution() -> anyhow::Result<()> {
-    common::init_tracing();
+async fn backend_tls_policy_conflict_resolves_by_name() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-backend-tls-conflict").await?;
 
     let tls_hostname = format!("echo-tls.{}.local", ns.name);
     let cert = GeneratedCert::for_host(&tls_hostname);
 
-    h.apply(
+    fixtures::apply_fixture(
         backends::ECHO_TLS,
         FixtureVars::new(&ns.name)
             .with("TLS_SERVER_CERT_B64", cert.cert_b64())
@@ -1221,7 +1197,7 @@ async fn backend_tls_policy_conflict_resolution() -> anyhow::Result<()> {
     .await?;
     wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         gwa::BACKEND_TLS_POLICY_CONFLICT,
         FixtureVars::new(&ns.name)
             .with("TLS_HOSTNAME", &tls_hostname)
@@ -1265,18 +1241,17 @@ async fn backend_tls_policy_conflict_resolution() -> anyhow::Result<()> {
 /// - Backend cert no longer verifies → traffic must transition to 5xx, proving the
 ///   controller reacted to the ConfigMap watch.
 #[tokio::test]
-async fn backend_tls_policy_configmap_mutation() -> anyhow::Result<()> {
+async fn backend_tls_policy_configmap_mutation_reloads_ca() -> anyhow::Result<()> {
     use k8s_openapi::api::core::v1::ConfigMap;
     use kube::api::{Patch, PatchParams};
 
-    common::init_tracing();
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-backend-tls-cm-mutation").await?;
 
     let tls_hostname = format!("echo-tls.{}.local", ns.name);
     let cert = GeneratedCert::for_host(&tls_hostname);
 
-    h.apply(
+    fixtures::apply_fixture(
         backends::ECHO_TLS,
         FixtureVars::new(&ns.name)
             .with("TLS_SERVER_CERT_B64", cert.cert_b64())
@@ -1285,7 +1260,7 @@ async fn backend_tls_policy_configmap_mutation() -> anyhow::Result<()> {
     .await?;
     wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
 
-    h.apply(
+    fixtures::apply_fixture(
         gwa::BACKEND_TLS_POLICY,
         FixtureVars::new(&ns.name)
             .with("TLS_HOSTNAME", &tls_hostname)
@@ -1322,8 +1297,7 @@ async fn backend_tls_policy_configmap_mutation() -> anyhow::Result<()> {
 /// `BackendTLSPolicy` hostname-mismatch: the policy's `validation.hostname` does not
 /// match the SAN in the backend's certificate → TLS handshake fails → proxy returns 5xx.
 #[tokio::test]
-async fn backend_tls_policy_hostname_mismatch() -> anyhow::Result<()> {
-    common::init_tracing();
+async fn backend_tls_policy_hostname_mismatch_fails_handshake() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-backend-tls-mismatch").await?;
 
@@ -1331,7 +1305,7 @@ async fn backend_tls_policy_hostname_mismatch() -> anyhow::Result<()> {
     let real_hostname = format!("echo-tls.{}.local", ns.name);
     let cert = GeneratedCert::for_host(&real_hostname);
 
-    h.apply(
+    fixtures::apply_fixture(
         backends::ECHO_TLS,
         FixtureVars::new(&ns.name)
             .with("TLS_SERVER_CERT_B64", cert.cert_b64())
@@ -1343,7 +1317,7 @@ async fn backend_tls_policy_hostname_mismatch() -> anyhow::Result<()> {
     // Policy specifies a hostname that does NOT match the cert's SAN.
     let wrong_hostname = format!("wrong-hostname.{}.local", ns.name);
 
-    h.apply(
+    fixtures::apply_fixture(
         gwa::BACKEND_TLS_POLICY,
         FixtureVars::new(&ns.name)
             .with("TLS_HOSTNAME", &wrong_hostname) // mismatch

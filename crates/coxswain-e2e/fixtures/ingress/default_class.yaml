@@ -9,7 +9,7 @@
 apiVersion: networking.k8s.io/v1
 kind: IngressClass
 metadata:
-  name: coxswain-default-TESTNS
+  name: coxswain-default-${TESTNS}
   annotations:
     ingressclass.kubernetes.io/is-default-class: "true"
 spec:
@@ -21,7 +21,7 @@ metadata:
   name: echo-ingress
 spec:
   rules:
-    - host: default-ingress.TESTNS.local
+    - host: default-ingress.${TESTNS}.local
       http:
         paths:
           - path: /

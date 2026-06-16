@@ -34,8 +34,7 @@ mod common;
 /// and covered by the unit tests in `coxswain-proxy::common::hooks`; e2e
 /// cannot observe individual retry attempts without a dedicated metric.
 #[tokio::test]
-async fn annotation_connect_retry() -> anyhow::Result<()> {
-    common::init_tracing();
+async fn annotation_connect_retry_retries_failed_connect() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "ing-retry").await?;
 

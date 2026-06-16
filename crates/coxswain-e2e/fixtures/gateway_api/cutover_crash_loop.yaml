@@ -32,7 +32,7 @@ spec:
       name: crash-loop-params
   listeners:
     - name: http
-      port: GATEWAY_HTTP_PORT
+      port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
       allowedRoutes:
         namespaces:
@@ -46,7 +46,7 @@ spec:
   parentRefs:
     - name: crash-gw
   hostnames:
-    - "crash.TESTNS.local"
+    - "crash.${TESTNS}.local"
   rules:
     - backendRefs:
         - name: echo-a
