@@ -1,0 +1,74 @@
+# Per-class annotation defaults via IngressClass.spec.parameters (#190).
+#
+# A CoxswainIngressClassParameters CR supplies a default rewrite-target. One
+# Ingress claiming the class inherits it; a second overrides it per-key with its
+# own rewrite-target. The echo backend reflects the upstream path, so the
+# observed path proves which value won (no timing involved).
+#
+# The IngressClass is cluster-scoped and uniquely named per test run — the test
+# wraps it in an IngressClassGuard so it does not leak. The namespace
+# placeholder is substituted with the test namespace at apply time.
+#
+# Routes (both /api -> echo-a):
+#   clsdefault-inherit  -> upstream path /from-class   (inherited from the class)
+#   clsdefault-override -> upstream path /from-ingress (Ingress overrides per-key)
+---
+apiVersion: ingress.coxswain-labs.dev/v1alpha1
+kind: CoxswainIngressClassParameters
+metadata:
+  name: class-defaults
+  namespace: ${TESTNS}
+spec:
+  defaultAnnotations:
+    ingress.coxswain-labs.dev/rewrite-target: /from-class
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: coxswain-clsdefault-${TESTNS}
+spec:
+  controller: coxswain-labs.dev/gateway-controller
+  parameters:
+    apiGroup: ingress.coxswain-labs.dev
+    kind: CoxswainIngressClassParameters
+    name: class-defaults
+    namespace: ${TESTNS}
+    scope: Namespace
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: inherit-ingress
+spec:
+  ingressClassName: coxswain-clsdefault-${TESTNS}
+  rules:
+    - host: clsdefault-inherit.${TESTNS}.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: override-ingress
+  annotations:
+    ingress.coxswain-labs.dev/rewrite-target: /from-ingress
+spec:
+  ingressClassName: coxswain-clsdefault-${TESTNS}
+  rules:
+    - host: clsdefault-override.${TESTNS}.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

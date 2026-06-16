@@ -1,10 +1,9 @@
 //! `CoxswainIngressClassParameters` CRD — per-class annotation defaults for the
 //! Ingress data plane, referenced from `IngressClass.spec.parameters`.
 //!
-//! The CRD is inert at this stage: the type compiles and the YAML installs,
-//! but no controller code reads it yet. The reflector will resolve
-//! `IngressClass.spec.parameters` and merge `spec.defaultAnnotations` under
-//! each Ingress's own annotation map in a later step (#190).
+//! The reflector resolves `IngressClass.spec.parameters` and merges
+//! `spec.defaultAnnotations` under each Ingress's own annotation map (#190): a
+//! per-Ingress annotation overrides the class default for that key.
 //!
 //! ## Design rationale
 //!

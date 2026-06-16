@@ -1,0 +1,43 @@
+# Unhappy-path: IngressClass.spec.parameters points at a CoxswainIngressClassParameters
+# CR that does not exist (#190).
+#
+# Coxswain must WARN and degrade gracefully — the Ingress still routes with
+# built-in defaults (no class default applied) and is never rejected. No CR is
+# created here on purpose; the reference dangles. The upstream therefore sees the
+# ORIGINAL request path (no class-supplied rewrite is applied).
+#
+# The IngressClass is cluster-scoped and uniquely named; the test wraps it in an
+# IngressClassGuard. The namespace placeholder is substituted at apply time.
+#
+# Route: dangling.TESTNS.local /api -> echo-a, upstream path unchanged (/api)
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: coxswain-clsdangling-${TESTNS}
+spec:
+  controller: coxswain-labs.dev/gateway-controller
+  parameters:
+    apiGroup: ingress.coxswain-labs.dev
+    kind: CoxswainIngressClassParameters
+    name: does-not-exist
+    namespace: ${TESTNS}
+    scope: Namespace
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dangling-ingress
+spec:
+  ingressClassName: coxswain-clsdangling-${TESTNS}
+  rules:
+    - host: dangling.${TESTNS}.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

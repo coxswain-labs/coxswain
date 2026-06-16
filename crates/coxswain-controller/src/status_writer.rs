@@ -121,6 +121,7 @@ pub fn spawn_status_writer(
             "httproute",
             "ingress",
             "ingress_class",
+            "ingress_class_parameters",
             "gateway",
             "gateway_class",
             "endpoint_slice",

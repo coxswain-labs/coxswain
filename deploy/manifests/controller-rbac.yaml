@@ -42,6 +42,12 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses/status"]
     verbs: ["patch", "update"]
+  # Read CoxswainIngressClassParameters so IngressClass.spec.parameters can be
+  # resolved into per-class annotation defaults (#190). No write verbs:
+  # operators author these objects; coxswain only reads them.
+  - apiGroups: ["ingress.coxswain-labs.dev"]
+    resources: ["coxswainingressclassparameters"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       ["gatewayclasses", "httproutes", "referencegrants", "backendtlspolicies"]

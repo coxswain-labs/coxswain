@@ -34,6 +34,7 @@ const CONTROLLER_CHECKS: &[&str] = &[
     "httproute",
     "ingress",
     "ingress_class",
+    "ingress_class_parameters",
     "gateway",
     "gateway_class",
     "endpoint_slice",

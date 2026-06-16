@@ -100,3 +100,44 @@ Overrides the upstream wire protocol derived from the Service `appProtocol` fiel
 
 !!! note
     `GRPC` maps to cleartext HTTP/2 (`h2c`). For gRPC over TLS, use `backend-protocol: HTTPS` — gRPC-over-TLS support via a single annotation value is tracked separately.
+
+## Class-level defaults
+
+Any of the annotations above can be defaulted for **every Ingress claiming an IngressClass** by pointing the class at a `CoxswainIngressClassParameters` resource via `IngressClass.spec.parameters`. This is the GitOps-friendly way to set a baseline policy (timeouts, retries, upstream protocol) once per class instead of repeating it on each Ingress.
+
+```yaml
+apiVersion: ingress.coxswain-labs.dev/v1alpha1
+kind: CoxswainIngressClassParameters
+metadata:
+  name: public-defaults
+  namespace: coxswain-system
+spec:
+  defaultAnnotations:
+    ingress.coxswain-labs.dev/connect-timeout: "10s"
+    ingress.coxswain-labs.dev/retry-on: "connect-failure,5xx"
+    ingress.coxswain-labs.dev/max-retries: "2"
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: coxswain
+spec:
+  controller: coxswain-labs.dev/gateway-controller
+  parameters:
+    apiGroup: ingress.coxswain-labs.dev
+    kind: CoxswainIngressClassParameters
+    name: public-defaults
+    namespace: coxswain-system
+    scope: Namespace
+```
+
+**Precedence** (highest wins, per key):
+
+1. The annotation set on the Ingress itself.
+2. The class default from `spec.defaultAnnotations`.
+3. The built-in Coxswain default.
+
+The merge is per-key: an Ingress that sets only `connect-timeout` still inherits the class's `retry-on` and `max-retries`. The keys and value formats in `defaultAnnotations` are exactly the per-Ingress ones; an invalid value emits a warning and falls back to the built-in default, the same as if it were set directly on an Ingress (an empty string `""` is **not** an "unset" override — it parses, warns, and falls back).
+
+!!! note
+    `CoxswainIngressClassParameters` is namespaced, so `spec.parameters` must set `scope: Namespace` and a `namespace`. A reference that is missing, names a different kind, or omits its namespace is logged as a warning and ignored — affected Ingresses still route with built-in defaults rather than being rejected. Because `IngressClass` has no status subresource, this condition is surfaced in the controller log, not on the object.

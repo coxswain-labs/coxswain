@@ -4,9 +4,9 @@
 # each referencing a distinct CoxswainIngressClassParameters CR that supplies
 # different default annotation values.
 #
-# The CRD is inert at this stage: the controller does not yet read these
-# values — applying these objects only proves the CRD installs and the schema
-# accepts a populated spec.
+# Coxswain resolves IngressClass.spec.parameters and applies these
+# defaultAnnotations to every Ingress claiming the class; a per-Ingress
+# annotation overrides the class default for that key (#190).
 #
 # Apply:
 #   kubectl apply -f deploy/manifests/crds/coxswainingressclassparameters.yaml
