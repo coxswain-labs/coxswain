@@ -51,11 +51,12 @@ use coxswain_reflector::tls::{
     GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
 };
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Node, Pod, Service};
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{Node, Pod, Service, ServiceAccount};
 use k8s_openapi::api::rbac::v1::RoleBinding;
 use kube::{
     Api, Client, Resource as _,
-    api::{Patch, PatchParams},
+    api::{DeleteParams, Patch, PatchParams},
     runtime::{
         WatchStreamExt,
         controller::{Action, Controller},
@@ -83,6 +84,14 @@ const NON_LEADER_REQUEUE: Duration = Duration::from_secs(20);
 /// errors here are transient (apiserver hiccup, missing object that's about
 /// to be created).
 const ERROR_REQUEUE: Duration = Duration::from_secs(15);
+
+/// Re-queue interval while a dedicated→shared hand-off is in flight: we have
+/// cleared our dedicated-mode status and are waiting for the shared pool to
+/// re-adopt and program the Gateway before tearing the dedicated proxy down.
+/// Short enough to make the teardown prompt once the shared pool is serving
+/// (rebind lands in ~1 s), long enough not to hot-spin the apiserver. The
+/// dedicated proxy keeps bridging traffic across every one of these ticks.
+const MIGRATION_HANDOFF_REQUEUE: Duration = Duration::from_secs(1);
 
 /// Errors that can be returned from [`reconcile`]. They are observed only by
 /// the controller framework's error policy (which converts them into a
@@ -722,26 +731,70 @@ async fn reconcile_inner(
     }) {
         Ok(Some(e)) => e,
         Ok(None) => {
-            // Not dedicated mode. If we previously placed our finalizer on
-            // this Gateway (it was dedicated, now isn't), clean up bindings
-            // and the finalizer AND clear every condition this writer owned
-            // so the shared-pool status writer can re-establish
-            // `Accepted`/`Programmed` on its next Gateway reconcile.
+            // The Gateway is no longer in dedicated mode. If we never placed our
+            // finalizer there is nothing to undo — it was always shared-pool.
             //
-            // The finalizer is what tells us we ever owned this Gateway's
-            // status — without it the clear path would delete conditions
-            // written by the shared-pool writer on every reconcile of every
-            // non-dedicated Gateway, producing an unbounded patch loop.
+            // The finalizer is what tells us we ever owned this Gateway: it is
+            // the DURABLE record that a dedicated→shared hand-off is still
+            // pending. It lives on the Gateway object, not in controller memory,
+            // so a controller that loses leadership (or crashes) mid-hand-off
+            // leaves it in place, and whichever pod next holds leadership
+            // re-enters this branch and resumes from the current cluster state.
+            // Every step below is driven off observable state (conditions,
+            // resource existence), never in-memory bookkeeping, so the resume is
+            // exact. Without the finalizer the clear path would also delete
+            // conditions written by the shared-pool writer on every reconcile of
+            // every non-dedicated Gateway, producing an unbounded patch loop.
             if has_our_finalizer(&gw) {
-                tracing::info!(
-                    gateway = %gateway_id(&gw),
-                    "operator: Gateway transitioned out of dedicated mode; cleaning bindings"
-                );
+                // Cross-namespace RBAC is safe to reconcile every pass — the
+                // deletes are NotFound-tolerant (idempotent).
                 rbac::delete_all_for_gateway(&ctx.client, gw_namespace, gw_name).await?;
                 rbac::delete_all_cluster_bindings_for_gateway(&ctx.client, gw_namespace, gw_name)
                     .await?;
+
+                // Step 1 — hand status ownership back to the shared pool, ONCE.
+                // We are the sole writer of `DedicatedProxyReady`; its presence
+                // means we have not yet handed off. Clearing our dedicated-mode
+                // conditions (plus the generation bump from the spec edit) is
+                // what un-gates the shared pool's re-adoption. We must clear only
+                // while we still own that condition — once it is gone the
+                // shared-pool writer owns `Accepted`/`Programmed` and re-clearing
+                // would stomp them in an unbounded fight.
+                if has_dedicated_proxy_ready_condition(&gw) {
+                    tracing::info!(
+                        gateway = %gateway_id(&gw),
+                        "operator: Gateway left dedicated mode; clearing status and handing back to shared pool"
+                    );
+                    status::clear_dedicated_gateway_status(&ctx.client, &gw).await?;
+                    return Ok(Action::requeue(MIGRATION_HANDOFF_REQUEUE));
+                }
+
+                // Step 2 — wait for the shared pool to actually be serving the
+                // migrated routes before we tear the dedicated proxy down. The
+                // dedicated Deployment/Service keep bridging traffic across this
+                // window; deleting them earlier would blackhole the host during
+                // the shared pool's ~1 s listener rebind. This is the symmetric
+                // counterpart to shared→dedicated cut-over, which waits for the
+                // dedicated Pod to be Ready before flipping the signal.
+                if !shared_pool_is_serving(&gw) {
+                    return Ok(Action::requeue(MIGRATION_HANDOFF_REQUEUE));
+                }
+
+                // Step 3 — shared pool is serving: tear down the dedicated proxy.
+                // Owner-ref GC cannot reclaim these on a migration (the owning
+                // Gateway survives), so we delete them explicitly. We delete the
+                // resources STRICTLY BEFORE removing the finalizer: a crash
+                // between the two leaves the finalizer in place, so the next
+                // leader re-runs the idempotent delete and only then drops it —
+                // never re-leaking the proxy.
+                let resource_name = render::resource_name(&gw, class_name);
+                tracing::info!(
+                    gateway = %gateway_id(&gw),
+                    resource = %resource_name,
+                    "operator: shared pool serving migrated Gateway; deleting dedicated proxy resources"
+                );
+                delete_dedicated_resources(&ctx.client, gw_namespace, &resource_name).await?;
                 remove_finalizer(&ctx.client, &gw).await?;
-                status::clear_dedicated_gateway_status(&ctx.client, &gw).await?;
                 ctx.last_hashes
                     .lock()
                     .unwrap_or_else(|e| panic!("invariant: hash-tracking mutex poisoned: {e}"))
@@ -960,6 +1013,85 @@ async fn remove_finalizer(client: &Client, gw: &Gateway) -> Result<(), kube::Err
     Ok(())
 }
 
+/// True while the Gateway still carries a `DedicatedProxyReady` condition.
+///
+/// The operator is the sole writer of that condition (the shared-pool status
+/// writer never touches it), so its presence is a durable signal that we have
+/// not yet handed this Gateway back to the shared pool. The migration path uses
+/// it to clear our dedicated-mode status exactly once — re-clearing after the
+/// shared-pool writer has taken over `Accepted`/`Programmed` would stomp those
+/// conditions in an unbounded patch fight.
+fn has_dedicated_proxy_ready_condition(gw: &Gateway) -> bool {
+    gw.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|cs| {
+            cs.iter()
+                .any(|c| c.type_ == status::DEDICATED_PROXY_READY_CONDITION_TYPE)
+        })
+}
+
+/// True once the shared pool is demonstrably serving the Gateway at its current
+/// generation: a `Programmed=True` condition whose `observedGeneration` is at
+/// least the Gateway's `metadata.generation`.
+///
+/// The shared-pool status writer is the only writer of `Programmed` for a
+/// non-dedicated Gateway (the operator clears its own copy on hand-off), and it
+/// writes `Programmed=True` at the current generation only once the Gateway is
+/// adopted and its listeners are programmed. So this is the deterministic
+/// "routes have migrated to the shared proxy" signal — the safe point to tear
+/// the dedicated proxy down. The generation check (mirroring the shared pool's
+/// own `gateway_is_cut_over` gate) rejects a stale `Programmed` left over from
+/// before the spec edit that triggered the migration.
+fn shared_pool_is_serving(gw: &Gateway) -> bool {
+    let expected_gen = gw.metadata.generation.unwrap_or(0);
+    gw.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|cs| cs.iter().find(|c| c.type_ == "Programmed"))
+        .is_some_and(|c| c.status == "True" && c.observed_generation.unwrap_or(0) >= expected_gen)
+}
+
+/// Delete the provisioned dedicated-proxy `Deployment`, `Service`, and
+/// `ServiceAccount` for a Gateway that has migrated out of dedicated mode.
+///
+/// Owner-ref GC cannot reclaim these on a *migration* — the owning Gateway
+/// survives, so the cluster garbage collector never fires — so they are deleted
+/// explicitly. Idempotent: a `NotFound` (already deleted, partially deleted, or
+/// never provisioned) is treated as success, so the cleanup converges across
+/// re-queues and across a controller that resumes the hand-off after a crash or
+/// a change of leadership.
+///
+/// # Errors
+///
+/// Returns the underlying [`kube::Error`] for any delete that fails for a reason
+/// other than `NotFound`.
+async fn delete_dedicated_resources(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+) -> Result<(), kube::Error> {
+    let dp = DeleteParams::default();
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+    let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    ignore_not_found(deployments.delete(name, &dp).await)?;
+    ignore_not_found(services.delete(name, &dp).await)?;
+    ignore_not_found(service_accounts.delete(name, &dp).await)?;
+    Ok(())
+}
+
+/// Collapse a `404 NotFound` delete result to success; propagate every other
+/// error. Lets [`delete_dedicated_resources`] be safely re-run on every
+/// hand-off re-queue.
+fn ignore_not_found<T>(result: Result<T, kube::Error>) -> Result<(), kube::Error> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Returns true iff any HTTPRoute attached to the given Gateway has a
 /// `backendRef` whose target namespace equals `target_ns`. Used by the
 /// ReferenceGrant cross-watch mapper to filter affected Gateways precisely.
@@ -1103,6 +1235,120 @@ mod tests {
         let k = gateway_key(&gw);
         assert_eq!(k.ns, "tenant-a");
         assert_eq!(k.name, "my-gw");
+    }
+
+    fn condition(
+        type_: &str,
+        status_: &str,
+        observed_gen: i64,
+    ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
+            type_: type_.to_string(),
+            status: status_.to_string(),
+            reason: type_.to_string(),
+            message: String::new(),
+            observed_generation: Some(observed_gen),
+            last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
+            ),
+        }
+    }
+
+    fn gateway_with(
+        generation: i64,
+        conditions: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition>,
+    ) -> Gateway {
+        use coxswain_reflector::gw_types::v::gateways::GatewayStatus;
+        Gateway {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some("default".into()),
+                name: Some("gw".into()),
+                generation: Some(generation),
+                ..Default::default()
+            },
+            spec: Default::default(),
+            status: Some(GatewayStatus {
+                conditions: Some(conditions),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn dedicated_proxy_ready_condition_detected_regardless_of_status() {
+        // Presence is the signal — True or False both mean we still own it and
+        // have not yet handed off.
+        let gw_true = gateway_with(
+            2,
+            vec![condition(
+                status::DEDICATED_PROXY_READY_CONDITION_TYPE,
+                "True",
+                2,
+            )],
+        );
+        assert!(has_dedicated_proxy_ready_condition(&gw_true));
+        let gw_false = gateway_with(
+            2,
+            vec![condition(
+                status::DEDICATED_PROXY_READY_CONDITION_TYPE,
+                "False",
+                2,
+            )],
+        );
+        assert!(has_dedicated_proxy_ready_condition(&gw_false));
+    }
+
+    #[test]
+    fn no_dedicated_proxy_ready_condition_means_handed_off() {
+        // Cleared status (only shared-pool conditions remain) → handed off.
+        let gw = gateway_with(2, vec![condition("Programmed", "True", 2)]);
+        assert!(!has_dedicated_proxy_ready_condition(&gw));
+        // No status at all → nothing owned.
+        let bare = Gateway {
+            metadata: kube::api::ObjectMeta {
+                name: Some("gw".into()),
+                ..Default::default()
+            },
+            spec: Default::default(),
+            status: None,
+        };
+        assert!(!has_dedicated_proxy_ready_condition(&bare));
+    }
+
+    #[test]
+    fn shared_pool_serving_requires_programmed_true_at_current_generation() {
+        // Programmed=True at the current generation → shared pool is serving.
+        let serving = gateway_with(3, vec![condition("Programmed", "True", 3)]);
+        assert!(shared_pool_is_serving(&serving));
+        // A newer observedGeneration also counts (>=).
+        let ahead = gateway_with(3, vec![condition("Programmed", "True", 4)]);
+        assert!(shared_pool_is_serving(&ahead));
+    }
+
+    #[test]
+    fn shared_pool_not_serving_on_stale_or_false_or_missing_programmed() {
+        // Stale Programmed left over from before the migration's generation bump.
+        let stale = gateway_with(3, vec![condition("Programmed", "True", 2)]);
+        assert!(!shared_pool_is_serving(&stale));
+        // Programmed=False (e.g. shared pool adopted but not yet programmed).
+        let not_ready = gateway_with(3, vec![condition("Programmed", "False", 3)]);
+        assert!(!shared_pool_is_serving(&not_ready));
+        // Accepted present but no Programmed yet → not serving.
+        let accepted_only = gateway_with(3, vec![condition("Accepted", "True", 3)]);
+        assert!(!shared_pool_is_serving(&accepted_only));
+    }
+
+    #[test]
+    fn ignore_not_found_collapses_404_only() {
+        fn api_err(code: u16) -> kube::Error {
+            kube::Error::Api(Box::new(kube::core::Status {
+                code,
+                ..Default::default()
+            }))
+        }
+        assert!(ignore_not_found::<()>(Ok(())).is_ok());
+        assert!(ignore_not_found::<()>(Err(api_err(404))).is_ok());
+        assert!(ignore_not_found::<()>(Err(api_err(409))).is_err());
     }
 
     #[test]

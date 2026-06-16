@@ -645,14 +645,22 @@ async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
     let post = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(30)).await?;
     post.assert_backend("echo-a");
 
-    // Assert the negative for teardown: the dedicated Service/NodePort is GC'd on
-    // migration, so its endpoint must go dark. This is a connection failure, not a
-    // 404 — the listening socket is gone — so it can't be expressed as a route
-    // status; `wait_for_endpoint_unreachable` polls a real TCP connect instead.
-    // 120s, not 60s: controller GC of the Deployment/Service plus kube-proxy
-    // withdrawing the NodePort is the slowest step here and overruns 60s on slow CI
-    // runners (it passes well under this locally).
-    wait::wait_for_endpoint_unreachable(dedicated_addr, Duration::from_secs(120)).await?;
+    // Assert the negative for teardown: the dedicated proxy is torn down on
+    // migration. Owner-ref GC cannot reclaim it — the owning Gateway survives the
+    // migration — so the controller deletes the dedicated Deployment/Service
+    // explicitly, but only AFTER the shared pool is serving the migrated routes
+    // (which the `post` assertion above just confirmed). We assert that
+    // controller-owned, spec-driven observable directly via the K8s API: the
+    // Service and Deployment are gone. This is deterministic and identical on
+    // every cluster, unlike a NodePort TCP probe whose teardown timing is
+    // kube-proxy/CNI-dependent and is not the controller's contract.
+    wait::wait_for_dedicated_proxy_deleted(
+        &h.client,
+        &ns.name,
+        GATEWAY_NAME,
+        Duration::from_secs(60),
+    )
+    .await?;
 
     Ok(())
 }

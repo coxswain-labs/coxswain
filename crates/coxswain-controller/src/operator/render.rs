@@ -185,7 +185,10 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
 }
 
 /// GEP-1762 names the generated resources `<NAME>-<GATEWAY CLASS>`.
-fn resource_name(gateway: &Gateway, class_name: &str) -> String {
+///
+/// Shared with the reconciler's migration-cleanup path so the name it deletes
+/// is derived from the same single source of truth that provisioning rendered.
+pub(super) fn resource_name(gateway: &Gateway, class_name: &str) -> String {
     let gw_name =
         gateway.metadata.name.as_deref().unwrap_or_else(|| {
             panic!("invariant: Gateway has no name; the API server requires it")
