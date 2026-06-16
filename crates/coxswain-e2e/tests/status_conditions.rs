@@ -24,9 +24,7 @@ use kube::api::{Patch, PatchParams};
 use std::time::Duration;
 
 mod common;
-use common::dedicated::{
-    GATEWAY_NAME, RESOURCE_NAME, gateway_addresses, gateway_condition, poll_until,
-};
+use common::dedicated::{GATEWAY_NAME, RESOURCE_NAME, gateway_addresses, gateway_condition};
 
 #[tokio::test]
 async fn status_load_balancer_ip() -> anyhow::Result<()> {
@@ -135,43 +133,60 @@ async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
         )
         .await?;
 
-    // Wait for the controller to detect the stale observedGeneration and re-patch.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Ok(gw) = gw_api.get("coxswain-test").await {
-            let new_gen = gw.metadata.generation.unwrap_or(0);
-            if new_gen > gen_before {
-                let top = gw
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.conditions.as_deref())
-                    .unwrap_or(&[]);
-                let listeners = gw
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.listeners.as_deref())
-                    .unwrap_or(&[]);
-                let top_fresh = top
-                    .iter()
-                    .all(|c| c.observed_generation.unwrap_or(0) >= new_gen);
-                let listeners_fresh = listeners.iter().all(|sl| {
-                    sl.conditions
+    // Wait for the controller to detect the stale observedGeneration and re-patch
+    // every condition (top-level + per-listener) up to the new generation.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            let observed = gw_api.get("coxswain-test").await.ok().map_or_else(
+                || "<could not fetch Gateway>".to_string(),
+                |gw| {
+                    let current_gen = gw.metadata.generation.unwrap_or(0);
+                    let top: Vec<i64> = gw
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.conditions.as_deref())
+                        .unwrap_or(&[])
                         .iter()
-                        .all(|c| c.observed_generation.unwrap_or(0) >= new_gen)
-                });
-                if top_fresh && listeners_fresh {
-                    return Ok(());
-                }
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out: Gateway coxswain-test conditions did not advance observedGeneration \
-                 to the new generation after a spec bump"
+                        .map(|c| c.observed_generation.unwrap_or(0))
+                        .collect();
+                    format!("generation={current_gen}, top observedGenerations={top:?}")
+                },
             );
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+            format!(
+                "Gateway coxswain-test conditions to advance observedGeneration past {gen_before} \
+                 after a spec bump; {observed}"
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let new_gen = gw.metadata.generation.unwrap_or(0);
+            if new_gen <= gen_before {
+                return None;
+            }
+            let top = gw
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_deref())
+                .unwrap_or(&[]);
+            let listeners = gw
+                .status
+                .as_ref()
+                .and_then(|s| s.listeners.as_deref())
+                .unwrap_or(&[]);
+            let top_fresh = top
+                .iter()
+                .all(|c| c.observed_generation.unwrap_or(0) >= new_gen);
+            let listeners_fresh = listeners.iter().all(|sl| {
+                sl.conditions
+                    .iter()
+                    .all(|c| c.observed_generation.unwrap_or(0) >= new_gen)
+            });
+            (top_fresh && listeners_fresh).then_some(())
+        },
+    )
+    .await
 }
 
 #[tokio::test]
@@ -226,10 +241,7 @@ async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow
     .await?;
 
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
-    let svc = poll_until(Duration::from_secs(15), || async {
-        services.get(RESOURCE_NAME).await.ok()
-    })
-    .await?;
+    let svc = wait::wait_for_resource(&services, RESOURCE_NAME, Duration::from_secs(15)).await?;
     let cluster_ip = svc
         .spec
         .as_ref()
@@ -244,22 +256,39 @@ async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow
     // Programmed=True takes a moment: we wait for both pod readiness and
     // the operator's reconcile to propagate. 60s window accommodates image
     // pull and pod startup on a cold local cluster.
-    let gw = poll_until(Duration::from_secs(60), || async {
-        let gw = gateways.get(GATEWAY_NAME).await.ok()?;
-        let accepted = gateway_condition(&gw, "Accepted")?;
-        let programmed = gateway_condition(&gw, "Programmed")?;
-        let cut_over = gateway_condition(&gw, "gateway.coxswain-labs.dev/DedicatedProxyReady")?;
-        let addresses = gateway_addresses(&gw);
-        if accepted == ("True".to_string(), "Accepted".to_string())
-            && programmed == ("True".to_string(), "Programmed".to_string())
-            && cut_over == ("True".to_string(), "Ready".to_string())
-            && !addresses.is_empty()
-        {
-            Some(gw)
-        } else {
-            None
-        }
-    })
+    let gw = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let observed = gateways.get(GATEWAY_NAME).await.ok().map_or_else(
+                || "<could not fetch Gateway>".to_string(),
+                |gw| {
+                    format!(
+                        "Accepted={:?}, Programmed={:?}, DedicatedProxyReady={:?}, addresses={:?}",
+                        gateway_condition(&gw, "Accepted"),
+                        gateway_condition(&gw, "Programmed"),
+                        gateway_condition(&gw, "gateway.coxswain-labs.dev/DedicatedProxyReady"),
+                        gateway_addresses(&gw),
+                    )
+                },
+            );
+            format!(
+                "Gateway {GATEWAY_NAME} to be Accepted+Programmed+DedicatedProxyReady with an address; observed {observed}"
+            )
+        },
+        || async {
+            let gw = gateways.get(GATEWAY_NAME).await.ok()?;
+            let accepted = gateway_condition(&gw, "Accepted")?;
+            let programmed = gateway_condition(&gw, "Programmed")?;
+            let cut_over = gateway_condition(&gw, "gateway.coxswain-labs.dev/DedicatedProxyReady")?;
+            let addresses = gateway_addresses(&gw);
+            (accepted == ("True".to_string(), "Accepted".to_string())
+                && programmed == ("True".to_string(), "Programmed".to_string())
+                && cut_over == ("True".to_string(), "Ready".to_string())
+                && !addresses.is_empty())
+            .then_some(gw)
+        },
+    )
     .await?;
 
     // Address came from the Service's clusterIP, type=IPAddress.
@@ -299,10 +328,7 @@ async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> any
     .await?;
 
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
-    poll_until(Duration::from_secs(15), || async {
-        services.get(RESOURCE_NAME).await.ok()
-    })
-    .await?;
+    wait::wait_for_resource(&services, RESOURCE_NAME, Duration::from_secs(15)).await?;
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
 
@@ -310,17 +336,26 @@ async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> any
     // Programmed=False with one of two reasons:
     //   * Pending — pod not yet Ready (precedence: pod-ready > address)
     //   * AddressNotAssigned — pod is Ready but no LB IP yet
-    poll_until(Duration::from_secs(45), || async {
-        let gw = gateways.get(GATEWAY_NAME).await.ok()?;
-        let programmed = gateway_condition(&gw, "Programmed")?;
-        if programmed.0 == "False"
-            && (programmed.1 == "AddressNotAssigned" || programmed.1 == "Pending")
-        {
-            Some(())
-        } else {
-            None
-        }
-    })
+    wait::poll_until(
+        Duration::from_secs(45),
+        wait::POLL,
+        || async {
+            let observed = gateways.get(GATEWAY_NAME).await.ok().map_or_else(
+                || "<could not fetch Gateway>".to_string(),
+                |gw| format!("Programmed={:?}", gateway_condition(&gw, "Programmed")),
+            );
+            format!(
+                "Gateway {GATEWAY_NAME} to surface Programmed=False (AddressNotAssigned|Pending); observed {observed}"
+            )
+        },
+        || async {
+            let gw = gateways.get(GATEWAY_NAME).await.ok()?;
+            let programmed = gateway_condition(&gw, "Programmed")?;
+            (programmed.0 == "False"
+                && (programmed.1 == "AddressNotAssigned" || programmed.1 == "Pending"))
+            .then_some(())
+        },
+    )
     .await?;
 
     // Give an in-cluster LB controller a short window to assign an IP. If
@@ -328,18 +363,23 @@ async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> any
     // so the test still exercises address propagation on bare clusters.
     // Plain `.patch()` would target the spec subresource — `/status` writes
     // MUST go through `.patch_status()`.
-    let in_cluster_assigned = poll_until(Duration::from_secs(10), || async {
-        let svc = services.get_status(RESOURCE_NAME).await.ok()?;
-        let ip = svc
-            .status
-            .as_ref()
-            .and_then(|s| s.load_balancer.as_ref())
-            .and_then(|lb| lb.ingress.as_ref())
-            .and_then(|i| i.first())
-            .and_then(|e| e.ip.clone())
-            .filter(|s| !s.is_empty());
-        ip.map(|ip| ip.to_string())
-    })
+    let in_cluster_assigned = wait::poll_until(
+        Duration::from_secs(10),
+        wait::POLL,
+        || async { format!("Service {RESOURCE_NAME} to receive an in-cluster LB ingress IP") },
+        || async {
+            let svc = services.get_status(RESOURCE_NAME).await.ok()?;
+            let ip = svc
+                .status
+                .as_ref()
+                .and_then(|s| s.load_balancer.as_ref())
+                .and_then(|lb| lb.ingress.as_ref())
+                .and_then(|i| i.first())
+                .and_then(|e| e.ip.clone())
+                .filter(|s| !s.is_empty());
+            ip.map(|ip| ip.to_string())
+        },
+    )
     .await
     .ok();
     let expected_ip: String = if let Some(ip) = in_cluster_assigned {
@@ -366,20 +406,35 @@ async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> any
     // The operator's Service cross-watch picks up the LB-ingress change and
     // re-reconciles the owning Gateway. Wait for Programmed=True and the
     // assigned IP in status.addresses.
-    let gw = poll_until(Duration::from_secs(60), || async {
-        let gw = gateways.get(GATEWAY_NAME).await.ok()?;
-        let programmed = gateway_condition(&gw, "Programmed")?;
-        let addresses = gateway_addresses(&gw);
-        if programmed == ("True".to_string(), "Programmed".to_string())
-            && addresses
-                .iter()
-                .any(|(t, v)| t == "IPAddress" && v == &expected_ip)
-        {
-            Some(gw)
-        } else {
-            None
-        }
-    })
+    let gw = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let observed = gateways.get(GATEWAY_NAME).await.ok().map_or_else(
+                || "<could not fetch Gateway>".to_string(),
+                |gw| {
+                    format!(
+                        "Programmed={:?}, addresses={:?}",
+                        gateway_condition(&gw, "Programmed"),
+                        gateway_addresses(&gw),
+                    )
+                },
+            );
+            format!(
+                "Gateway {GATEWAY_NAME} to be Programmed=True with address {expected_ip}; observed {observed}"
+            )
+        },
+        || async {
+            let gw = gateways.get(GATEWAY_NAME).await.ok()?;
+            let programmed = gateway_condition(&gw, "Programmed")?;
+            let addresses = gateway_addresses(&gw);
+            (programmed == ("True".to_string(), "Programmed".to_string())
+                && addresses
+                    .iter()
+                    .any(|(t, v)| t == "IPAddress" && v == &expected_ip))
+            .then_some(gw)
+        },
+    )
     .await?;
     let _ = gw;
     Ok(())
@@ -403,18 +458,33 @@ async fn invalid_parameters_yields_accepted_false_invalid_parameters() -> anyhow
     .await?;
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
-    poll_until(Duration::from_secs(30), || async {
-        let gw = gateways.get(GATEWAY_NAME).await.ok()?;
-        let accepted = gateway_condition(&gw, "Accepted")?;
-        let programmed = gateway_condition(&gw, "Programmed")?;
-        if accepted == ("False".to_string(), "InvalidParameters".to_string())
-            && programmed == ("False".to_string(), "Invalid".to_string())
-        {
-            Some(())
-        } else {
-            None
-        }
-    })
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            let observed = gateways.get(GATEWAY_NAME).await.ok().map_or_else(
+                || "<could not fetch Gateway>".to_string(),
+                |gw| {
+                    format!(
+                        "Accepted={:?}, Programmed={:?}",
+                        gateway_condition(&gw, "Accepted"),
+                        gateway_condition(&gw, "Programmed"),
+                    )
+                },
+            );
+            format!(
+                "Gateway {GATEWAY_NAME} to be Accepted=False(InvalidParameters)+Programmed=False(Invalid); observed {observed}"
+            )
+        },
+        || async {
+            let gw = gateways.get(GATEWAY_NAME).await.ok()?;
+            let accepted = gateway_condition(&gw, "Accepted")?;
+            let programmed = gateway_condition(&gw, "Programmed")?;
+            (accepted == ("False".to_string(), "InvalidParameters".to_string())
+                && programmed == ("False".to_string(), "Invalid".to_string()))
+            .then_some(())
+        },
+    )
     .await?;
 
     // No Deployment/Service/SA should have been provisioned — the

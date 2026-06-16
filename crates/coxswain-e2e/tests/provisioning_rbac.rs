@@ -39,7 +39,7 @@ use std::time::Duration;
 mod common;
 use common::dedicated::{
     GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, binding_name, cluster_route_binding_name,
-    poll_until, wait_for_cut_over,
+    wait_for_cut_over,
 };
 
 /// 1. Apply a dedicated-mode Gateway → assert all three resources are created
@@ -167,16 +167,19 @@ async fn gateway_deletion_garbage_collects_resources() -> anyhow::Result<()> {
         .delete(GATEWAY_NAME, &DeleteParams::default())
         .await?;
 
-    poll_until(Duration::from_secs(30), || async {
-        let deploy_gone = deployments.get(RESOURCE_NAME).await.is_err();
-        let svc_gone = services.get(RESOURCE_NAME).await.is_err();
-        let sa_gone = sas.get(RESOURCE_NAME).await.is_err();
-        if deploy_gone && svc_gone && sa_gone {
-            Some(())
-        } else {
-            None
-        }
-    })
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            format!("Deployment/Service/ServiceAccount '{RESOURCE_NAME}' to be garbage-collected")
+        },
+        || async {
+            let deploy_gone = deployments.get(RESOURCE_NAME).await.is_err();
+            let svc_gone = services.get(RESOURCE_NAME).await.is_err();
+            let sa_gone = sas.get(RESOURCE_NAME).await.is_err();
+            (deploy_gone && svc_gone && sa_gone).then_some(())
+        },
+    )
     .await?;
 
     Ok(())
@@ -200,10 +203,7 @@ async fn provisions_role_binding_in_gateway_namespace() -> anyhow::Result<()> {
 
     let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &ns.name);
     let want_name = binding_name(&ns.name);
-    let rb = poll_until(Duration::from_secs(15), || async {
-        bindings.get(&want_name).await.ok()
-    })
-    .await?;
+    let rb = wait::wait_for_resource(&bindings, &want_name, Duration::from_secs(15)).await?;
 
     // RoleRef points at the static permission-template ClusterRole.
     assert_eq!(rb.role_ref.kind, "ClusterRole");
@@ -273,10 +273,7 @@ async fn gateway_deletion_drives_role_binding_cleanup() -> anyhow::Result<()> {
 
     // Wait for the binding to be present before we delete the Gateway, so the
     // subsequent "binding gone" assertion is meaningful.
-    poll_until(Duration::from_secs(15), || async {
-        bindings.get(&want_name).await.ok()
-    })
-    .await?;
+    wait::wait_for_resource(&bindings, &want_name, Duration::from_secs(15)).await?;
 
     // Delete the Gateway. The finalizer keeps it alive until the controller
     // clears bindings + removes the finalizer.
@@ -285,28 +282,33 @@ async fn gateway_deletion_drives_role_binding_cleanup() -> anyhow::Result<()> {
         .delete(GATEWAY_NAME, &DeleteParams::default())
         .await?;
 
-    poll_until(Duration::from_secs(30), || async {
-        // The binding must be gone, and listing by the managed-by selector
-        // for this Gateway must return zero objects.
-        let binding_gone = bindings.get(&want_name).await.is_err();
-        let selector = format!(
-            "app.kubernetes.io/managed-by=coxswain,\
-             gateway.networking.k8s.io/gateway-name={GATEWAY_NAME},\
-             gateway.coxswain-labs.dev/gateway-namespace={}",
-            ns.name
-        );
-        let leftover = bindings
-            .list(&ListParams::default().labels(&selector))
-            .await
-            .map(|l| l.items.len())
-            .unwrap_or(usize::MAX);
-        let gateway_gone = gateways.get(GATEWAY_NAME).await.is_err();
-        if binding_gone && leftover == 0 && gateway_gone {
-            Some(())
-        } else {
-            None
-        }
-    })
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            format!(
+                "RoleBinding {want_name} + all managed bindings + Gateway {GATEWAY_NAME} to be cleaned up"
+            )
+        },
+        || async {
+            // The binding must be gone, and listing by the managed-by selector
+            // for this Gateway must return zero objects.
+            let binding_gone = bindings.get(&want_name).await.is_err();
+            let selector = format!(
+                "app.kubernetes.io/managed-by=coxswain,\
+                 gateway.networking.k8s.io/gateway-name={GATEWAY_NAME},\
+                 gateway.coxswain-labs.dev/gateway-namespace={}",
+                ns.name
+            );
+            let leftover = bindings
+                .list(&ListParams::default().labels(&selector))
+                .await
+                .map(|l| l.items.len())
+                .unwrap_or(usize::MAX);
+            let gateway_gone = gateways.get(GATEWAY_NAME).await.is_err();
+            (binding_gone && leftover == 0 && gateway_gone).then_some(())
+        },
+    )
     .await?;
 
     Ok(())
@@ -329,10 +331,7 @@ async fn out_of_band_binding_deletion_is_recreated() -> anyhow::Result<()> {
 
     let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &ns.name);
     let want_name = binding_name(&ns.name);
-    let original = poll_until(Duration::from_secs(15), || async {
-        bindings.get(&want_name).await.ok()
-    })
-    .await?;
+    let original = wait::wait_for_resource(&bindings, &want_name, Duration::from_secs(15)).await?;
     let original_rv = original
         .metadata
         .resource_version
@@ -346,10 +345,7 @@ async fn out_of_band_binding_deletion_is_recreated() -> anyhow::Result<()> {
     // Wait for the controller to observe the deletion via the cross-watch and
     // SSA the binding back. `resourceVersion` strictly increases on K8s
     // writes; a new binding with the same name will have a higher one.
-    let recreated = poll_until(Duration::from_secs(15), || async {
-        bindings.get(&want_name).await.ok()
-    })
-    .await?;
+    let recreated = wait::wait_for_resource(&bindings, &want_name, Duration::from_secs(15)).await?;
     let new_rv = recreated
         .metadata
         .resource_version
@@ -377,10 +373,8 @@ async fn deployment_container_carries_watch_namespaces_arg() -> anyhow::Result<(
     .await?;
 
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    let deploy = poll_until(Duration::from_secs(15), || async {
-        deployments.get(RESOURCE_NAME).await.ok()
-    })
-    .await?;
+    let deploy =
+        wait::wait_for_resource(&deployments, RESOURCE_NAME, Duration::from_secs(15)).await?;
 
     let want_arg = format!("--proxy-watch-namespaces={}", ns.name);
     let containers = deploy
@@ -417,18 +411,10 @@ async fn lifecycle_provisioning_creates_resources() -> anyhow::Result<()> {
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
     let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
 
-    let deploy = poll_until(Duration::from_secs(30), || async {
-        deployments.get(RESOURCE_NAME).await.ok()
-    })
-    .await?;
-    let svc = poll_until(Duration::from_secs(30), || async {
-        services.get(RESOURCE_NAME).await.ok()
-    })
-    .await?;
-    let sa = poll_until(Duration::from_secs(30), || async {
-        sas.get(RESOURCE_NAME).await.ok()
-    })
-    .await?;
+    let deploy =
+        wait::wait_for_resource(&deployments, RESOURCE_NAME, Duration::from_secs(30)).await?;
+    let svc = wait::wait_for_resource(&services, RESOURCE_NAME, Duration::from_secs(30)).await?;
+    let sa = wait::wait_for_resource(&sas, RESOURCE_NAME, Duration::from_secs(30)).await?;
 
     for (kind, meta) in [
         ("Deployment", &deploy.metadata),
@@ -513,6 +499,12 @@ async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
     let resp = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
+    // Negative (#210 cut-over): once DedicatedProxyReady=True the shared pool must
+    // relinquish the Gateway, so the shared listener returns 404 for the host the
+    // dedicated pod now owns. Without this the dedicated pod could serve while the
+    // shared pool still double-serves the same Gateway.
+    wait::wait_for_route_status(&h.gateway_http, &host, "/", 404, Duration::from_secs(30)).await?;
+
     Ok(())
 }
 
@@ -545,10 +537,7 @@ async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
 
     let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &tenant.name);
     let want_binding = binding_name(&ns.name);
-    poll_until(Duration::from_secs(30), || async {
-        bindings.get(&want_binding).await.ok()
-    })
-    .await?;
+    wait::wait_for_resource(&bindings, &want_binding, Duration::from_secs(30)).await?;
 
     let dedicated_addr =
         wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
@@ -611,9 +600,12 @@ async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<
     // RoleBinding is reconciled away.
     let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &tenant.name);
     let want_binding = binding_name(&ns.name);
-    poll_until(Duration::from_secs(30), || async {
-        bindings.get(&want_binding).await.err().map(|_| ())
-    })
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async { format!("per-tenant RoleBinding {want_binding} to be reconciled away") },
+        || async { bindings.get(&want_binding).await.err().map(|_| ()) },
+    )
     .await?;
 
     Ok(())
@@ -638,23 +630,29 @@ async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
     let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
 
-    poll_until(Duration::from_secs(30), || async {
-        deployments.get(RESOURCE_NAME).await.ok()
-    })
-    .await?;
+    wait::wait_for_resource(&deployments, RESOURCE_NAME, Duration::from_secs(30)).await?;
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     gateways
         .delete(GATEWAY_NAME, &DeleteParams::default())
         .await?;
 
-    poll_until(Duration::from_secs(30), || async {
-        let gone = deployments.get(RESOURCE_NAME).await.is_err()
-            && services.get(RESOURCE_NAME).await.is_err()
-            && sas.get(RESOURCE_NAME).await.is_err()
-            && gateways.get(GATEWAY_NAME).await.is_err();
-        if gone { Some(()) } else { None }
-    })
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            format!(
+                "Deployment/Service/ServiceAccount '{RESOURCE_NAME}' and Gateway {GATEWAY_NAME} to be garbage-collected"
+            )
+        },
+        || async {
+            let gone = deployments.get(RESOURCE_NAME).await.is_err()
+                && services.get(RESOURCE_NAME).await.is_err()
+                && sas.get(RESOURCE_NAME).await.is_err()
+                && gateways.get(GATEWAY_NAME).await.is_err();
+            gone.then_some(())
+        },
+    )
     .await?;
 
     Ok(())
@@ -685,17 +683,11 @@ async fn cluster_wide_binding_created_and_removed_with_listener_mode() -> anyhow
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
 
     // 1. ClusterRoleBinding appears within 15 s.
-    poll_until(Duration::from_secs(15), || async {
-        crbs.get(&crb_name).await.ok()
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("ClusterRoleBinding {crb_name} not created within 15s"))?;
+    wait::wait_for_resource(&crbs, &crb_name, Duration::from_secs(15)).await?;
 
     // 2. Deployment carries --allow-cluster-wide-route-read.
-    let deploy = poll_until(Duration::from_secs(15), || async {
-        deployments.get(resource_name).await.ok()
-    })
-    .await?;
+    let deploy =
+        wait::wait_for_resource(&deployments, resource_name, Duration::from_secs(15)).await?;
     let containers = deploy
         .spec
         .as_ref()
@@ -744,19 +736,15 @@ async fn cluster_wide_binding_created_and_removed_with_listener_mode() -> anyhow
         )
         .await?;
 
-    poll_until(Duration::from_secs(30), || async {
-        if crbs.get(&crb_name).await.is_err() {
-            Some(())
-        } else {
-            None
-        }
-    })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "ClusterRoleBinding {crb_name} still present 30s after reverting to from: Same"
-        )
-    })?;
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            format!("ClusterRoleBinding {crb_name} to be removed after reverting the listener to from: Same")
+        },
+        || async { crbs.get(&crb_name).await.is_err().then_some(()) },
+    )
+    .await?;
 
     Ok(())
 }
@@ -785,25 +773,23 @@ async fn cluster_wide_binding_deleted_on_gateway_deletion() -> anyhow::Result<()
 
     // Wait for the binding to exist before deleting — makes the "binding gone"
     // assertion below meaningful.
-    poll_until(Duration::from_secs(15), || async {
-        crbs.get(&crb_name).await.ok()
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("ClusterRoleBinding {crb_name} not created within 15s"))?;
+    wait::wait_for_resource(&crbs, &crb_name, Duration::from_secs(15)).await?;
 
     gateways.delete(gw_name, &DeleteParams::default()).await?;
 
-    poll_until(Duration::from_secs(30), || async {
-        let crb_gone = crbs.get(&crb_name).await.is_err();
-        let gw_gone = gateways.get(gw_name).await.is_err();
-        if crb_gone && gw_gone { Some(()) } else { None }
-    })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "ClusterRoleBinding {crb_name} or Gateway {gw_name} not cleaned up within 30s"
-        )
-    })?;
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            format!("ClusterRoleBinding {crb_name} and Gateway {gw_name} to be cleaned up after deletion")
+        },
+        || async {
+            let crb_gone = crbs.get(&crb_name).await.is_err();
+            let gw_gone = gateways.get(gw_name).await.is_err();
+            (crb_gone && gw_gone).then_some(())
+        },
+    )
+    .await?;
 
     Ok(())
 }

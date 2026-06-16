@@ -375,18 +375,22 @@ async fn wait_for_proxy_v1_route(
     http_req: &str,
     timeout: Duration,
 ) -> anyhow::Result<String> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match try_raw_http(proxy_addr, proxy_line.as_bytes(), http_req).await {
-            Ok(body) => return Ok(body),
-            Err(_) => {
-                if tokio::time::Instant::now() >= deadline {
-                    anyhow::bail!("timed out waiting for PROXY v1 route");
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+    wait::poll_until(
+        timeout,
+        wait::POLL,
+        || async {
+            match try_raw_http(proxy_addr, proxy_line.as_bytes(), http_req).await {
+                Ok(_) => "PROXY v1 route to return a 200 body".to_string(),
+                Err(e) => format!("PROXY v1 route to return 200; last attempt failed: {e}"),
             }
-        }
-    }
+        },
+        || async {
+            try_raw_http(proxy_addr, proxy_line.as_bytes(), http_req)
+                .await
+                .ok()
+        },
+    )
+    .await
 }
 
 /// Make one raw TCP request: write `preamble` bytes, then the HTTP request, read the response body.
@@ -428,18 +432,22 @@ async fn wait_for_proxy_v2_tls_route(
     http_req: &str,
     timeout: Duration,
 ) -> anyhow::Result<String> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match try_tls_after_proxy_v2(tls_addr, host, v2_header, http_req).await {
-            Ok(body) => return Ok(body),
-            Err(_) => {
-                if tokio::time::Instant::now() >= deadline {
-                    anyhow::bail!("timed out waiting for PROXY v2 TLS route");
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+    wait::poll_until(
+        timeout,
+        wait::POLL,
+        || async {
+            match try_tls_after_proxy_v2(tls_addr, host, v2_header, http_req).await {
+                Ok(_) => "PROXY v2 + TLS route to return a 200 body".to_string(),
+                Err(e) => format!("PROXY v2 + TLS route to return 200; last attempt failed: {e}"),
             }
-        }
-    }
+        },
+        || async {
+            try_tls_after_proxy_v2(tls_addr, host, v2_header, http_req)
+                .await
+                .ok()
+        },
+    )
+    .await
 }
 
 /// Write v2 PROXY header bytes to a raw TCP stream, then perform TLS handshake,
