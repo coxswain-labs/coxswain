@@ -582,8 +582,8 @@ async fn get_node_ip() -> anyhow::Result<std::net::IpAddr> {
 /// This is the real post-condition that replaces blind "wait for the operator to
 /// settle" sleeps after a controller restart: `coxswain_controller_leader` flips
 /// to `1` on leader-election, and `coxswain_controller_reconcile_total{...,
-/// result="success"}` starts at `0` in a fresh process, so a value `>= 1` proves
-/// the new leader has run a full reconcile pass. Because server-side apply is
+/// result="ok"}` starts unregistered (effectively `0`) in a fresh process, so a
+/// value `>= 1` proves the new leader has run a full reconcile pass. Because SSA is
 /// deterministic (identical rendered spec never bumps `.metadata.generation`),
 /// one confirmed post-restart reconcile is sufficient to then assert generation
 /// stability.
@@ -607,9 +607,9 @@ pub async fn wait_for_controller_reconciled(
             match fetch_metrics(&client, metrics_url).await {
                 Ok(body) => format!(
                     "controller {metrics_url} to report leader=1 with a successful reconcile; \
-                     last leader={:?}, reconcile_success={:?}",
+                     last leader={:?}, reconcile_ok={:?}",
                     metric_value(&body, "coxswain_controller_leader"),
-                    reconcile_success_total(&body),
+                    reconcile_ok_total(&body),
                 ),
                 Err(e) => {
                     format!(
@@ -621,7 +621,7 @@ pub async fn wait_for_controller_reconciled(
         || async {
             let body = fetch_metrics(&client, metrics_url).await.ok()?;
             let is_leader = metric_value(&body, "coxswain_controller_leader") == Some(1.0);
-            let reconciled = reconcile_success_total(&body).is_some_and(|v| v >= 1.0);
+            let reconciled = reconcile_ok_total(&body).is_some_and(|v| v >= 1.0);
             (is_leader && reconciled).then_some(())
         },
     )
@@ -643,9 +643,10 @@ fn metric_value(body: &str, name: &str) -> Option<f64> {
     })
 }
 
-/// Sum `coxswain_controller_reconcile_total{...,result="success"}` across all
-/// `controller` labels. Returns `None` if no success series is present.
-fn reconcile_success_total(body: &str) -> Option<f64> {
+/// Sum `coxswain_controller_reconcile_total{...,result="ok"}` across all
+/// `controller` labels. Returns `None` if no `result="ok"` series is present
+/// (the metric `observe_reconcile` labels a successful reconcile `result="ok"`).
+fn reconcile_ok_total(body: &str) -> Option<f64> {
     let mut total = 0.0;
     let mut seen = false;
     for line in body.lines().filter(|l| !l.starts_with('#')) {
@@ -655,7 +656,7 @@ fn reconcile_success_total(body: &str) -> Option<f64> {
         let Some((labels, value)) = rest.split_once('}') else {
             continue;
         };
-        if !labels.contains("result=\"success\"") {
+        if !labels.contains("result=\"ok\"") {
             continue;
         }
         if let Ok(v) = value.trim().parse::<f64>() {
