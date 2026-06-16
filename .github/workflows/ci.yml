@@ -54,6 +54,11 @@ jobs:
               - 'scripts/check-workspace-lints-decl.sh'
               - 'scripts/check-no-per-site-allow.sh'
               - 'scripts/check-must-use-builders.sh'
+              - 'scripts/check-no-e2e-sleeps.sh'
+              - 'scripts/check-e2e-single-poller.sh'
+              - 'scripts/check-annotation-coverage.sh'
+              - 'scripts/check-e2e-plane-layout.sh'
+              - 'scripts/check-e2e-images-pinned.sh'
               - '.github/workflows/ci.yml'
 
   fmt:
@@ -177,3 +182,13 @@ jobs:
         run: bash scripts/check-no-per-site-allow.sh
       - name: Builders / predicates carry #[must_use]
         run: bash scripts/check-must-use-builders.sh
+      - name: No bare sleeps in e2e test bodies (poll a post-condition)
+        run: bash scripts/check-no-e2e-sleeps.sh
+      - name: Exactly one canonical e2e poll_until (no shadow pollers)
+        run: bash scripts/check-e2e-single-poller.sh
+      - name: Every Ingress annotation has a parse test + e2e effect test
+        run: bash scripts/check-annotation-coverage.sh
+      - name: e2e test files belong to an approved behaviour plane
+        run: bash scripts/check-e2e-plane-layout.sh
+      - name: e2e fixture images are @sha256:-pinned
+        run: bash scripts/check-e2e-images-pinned.sh

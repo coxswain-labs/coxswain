@@ -64,6 +64,11 @@ coxswain-bin
 | No per-site `#[allow]` / `#[expect]` in non-test source | `scripts/check-no-per-site-allow.sh` |
 | Builder `with_*` methods + `is_/has_/can_` predicates carry `#[must_use]` | `scripts/check-must-use-builders.sh` |
 | Gateway API SupportedFeatures Rust↔Go parity | `scripts/check-supported-features.sh` |
+| No bare sleeps in e2e test bodies; waits poll a real post-condition | `scripts/check-no-e2e-sleeps.sh` |
+| Exactly one canonical e2e `poll_until`; no shadow pollers | `scripts/check-e2e-single-poller.sh` |
+| Every `ingress.coxswain-labs.dev/*` annotation has a parse test + e2e effect test | `scripts/check-annotation-coverage.sh` |
+| `coxswain-e2e/tests/*.rs` files belong to an approved behaviour plane | `scripts/check-e2e-plane-layout.sh` |
+| Every e2e fixture image is `@sha256:`-pinned | `scripts/check-e2e-images-pinned.sh` |
 
 `[workspace.lints]` in `Cargo.toml` is the source of truth for lint configuration. Workspace-wide opt-outs in `[workspace.lints]` are acceptable when an entire lint *group* is too broad for the project (current: `clippy::pedantic = "allow"`). For upstream-imposed names that trip a lint (e.g. `HTTPRoute` from codegen tripping `upper_case_acronyms`): re-export with a project-canonical alias at the crate boundary (`gw_types.rs`) and use the alias everywhere internally — a one-time fix; per-site annotations lock the inconsistency in forever.
 
@@ -79,7 +84,7 @@ coxswain-bin
 
 - **Error types.** Every crate-defined error type uses `#[derive(thiserror::Error)]` with `#[error("…")]` on each variant, and `#[non_exhaustive]`. Library crates emit typed errors via `thiserror`; only `coxswain-bin` may use `anyhow` at the binary boundary.
 
-- **Test layout.** Per-source-file unit tests live INLINE as `#[cfg(test)] mod tests { use super::*; ... }` at the bottom of the source file (rust-skills `test-cfg-test-module`). Cross-cutting tests (those that span multiple source files + shared helpers) live under `crates/<crate>/src/[<submodule>/]tests/`. Inline test blocks reach shared helpers via `use crate::<path>::tests::*;`; helpers are declared `pub(super)` so wildcard imports work. Integration tests against the binary live in `crates/coxswain-e2e/tests/`.
+- **Test layout.** Per-source-file unit tests live INLINE as `#[cfg(test)] mod tests { use super::*; ... }` at the bottom of the source file (rust-skills `test-cfg-test-module`). Cross-cutting tests (those that span multiple source files + shared helpers) live under `crates/<crate>/src/[<submodule>/]tests/`. Inline test blocks reach shared helpers via `use crate::<path>::tests::*;`; helpers are declared `pub(super)` so wildcard imports work. Integration tests against the binary live in `crates/coxswain-e2e/tests/`; the behavioural rules for writing them (black-box, atomic-on-shared-fixture, mutate-only-what-you-own, assert backend identity + the negative, zero flakes, self-diagnosing failures, behaviour+outcome naming) are the **e2e crate charter** in `crates/coxswain-e2e/src/lib.rs`.
 
 ### Hot path
 
