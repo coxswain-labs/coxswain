@@ -333,17 +333,44 @@ jobs:
           fi
           PR_HEAD_SHORT="${PR_HEAD_SHA:0:7}"
           MERGE_SHORT="${MERGE_SHA:0:7}"
-          # Body built with printf for the header (so env vars interpolate)
-          # and a literal `cat` of the report content (so its markdown
-          # backticks / `$` chars cannot trip word-splitting or command
-          # substitution). Written to a temp file because PR-comment bodies
+          # Hidden marker (renders invisibly) keys the single sticky comment we
+          # maintain per PR — it lets us find and update the prior report in
+          # place instead of accumulating one comment per run.
+          MARKER='<!-- coxswain-conformance-report -->'
+          # Body built with printf for the header (so env vars interpolate) and a
+          # literal `cat` of the report content (so its markdown backticks / `$`
+          # chars cannot trip word-splitting or command substitution). The report
+          # is wrapped in a <details> block so the long YAML collapses by default;
+          # the blank line after </summary> is required for GitHub to render the
+          # fenced block inside. Written to a temp file because PR-comment bodies
           # can exceed shell argv length limits.
           {
+            printf '%s\n' "$MARKER"
             printf '## Gateway API conformance report\n\n'
             printf 'Run [#%s](%s) for PR head `%s` (tested merge into main as `%s`).\n\n' \
               "$RUN_NUMBER" "$RUN_URL" "$PR_HEAD_SHORT" "$MERGE_SHORT"
+            printf '<details>\n<summary>Full conformance report</summary>\n\n'
             printf '```yaml\n'
             cat "$REPORT_FILE"
             printf '```\n'
+            printf '\n</details>\n'
           } > /tmp/conformance-comment.md
-          gh pr comment "$PR_NUMBER" --body-file /tmp/conformance-comment.md
+          # Upsert: find our prior sticky comment by the hidden marker and PATCH
+          # it; create a fresh one only when none exists yet. Keyed on the marker
+          # (not "the bot's last comment") so unrelated github-actions comments
+          # are never clobbered. With --paginate, --jq runs per page, so the
+          # filter emits one id per matching comment across all pages; `tail -n1`
+          # takes the newest (the API returns comments oldest-first), defensive in
+          # case an older run left more than one.
+          existing_id=$(
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate \
+              --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | tail -n1
+          )
+          if [ -n "$existing_id" ]; then
+            echo "Updating existing conformance comment $existing_id in place."
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing_id}" \
+              -F body=@/tmp/conformance-comment.md
+          else
+            echo "No prior conformance comment; creating one."
+            gh pr comment "$PR_NUMBER" --body-file /tmp/conformance-comment.md
+          fi
