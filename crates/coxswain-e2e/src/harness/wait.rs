@@ -491,6 +491,43 @@ pub async fn wait_for_route_status(
     .await
 }
 
+/// Poll until a TCP connect to `addr` fails — connection refused, reset, or
+/// SYN black-holed — i.e. nothing is listening there anymore.
+///
+/// Used to assert an endpoint has gone dark after teardown, where a clean HTTP
+/// status (e.g. 404) can't express it because the listening socket itself is
+/// gone: the dedicated-proxy Service/NodePort is *deleted* on GC, so the
+/// post-condition is a connection failure, not a routed response. Routed through
+/// the canonical [`poll_until`] so it never sleeps blindly.
+///
+/// # Errors
+///
+/// Returns an error if `addr` is still accepting TCP connections when `timeout`
+/// elapses.
+pub async fn wait_for_endpoint_unreachable(
+    addr: SocketAddr,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    // Per-attempt connect budget: long enough to rule out a slow accept, short
+    // enough to keep the poll responsive when the SYN is black-holed.
+    const CONNECT_BUDGET: Duration = Duration::from_secs(2);
+    poll_until(
+        timeout,
+        POLL,
+        || async move { format!("{addr} to stop accepting TCP connections (still reachable)") },
+        || async move {
+            match time::timeout(CONNECT_BUDGET, tokio::net::TcpStream::connect(addr)).await {
+                // Still accepting connections → endpoint is live; keep polling.
+                Ok(Ok(_stream)) => None,
+                // Connect refused/reset, or the connect attempt itself timed out
+                // (black-holed SYN) → the endpoint is gone.
+                Ok(Err(_)) | Err(_) => Some(()),
+            }
+        },
+    )
+    .await
+}
+
 /// Return a `SocketAddr` for the dedicated-proxy Service using its NodePort.
 ///
 /// The dedicated-proxy Service is rendered with `type: NodePort` (avoids klipper-lb

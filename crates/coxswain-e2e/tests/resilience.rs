@@ -37,7 +37,8 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::dedicated::{
-    GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, restart_controller, wait_for_cut_over,
+    GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, restart_controller, scale_controller,
+    wait_for_cut_over,
 };
 
 // ── Concurrency parameters ────────────────────────────────────────────────────
@@ -644,6 +645,12 @@ async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
     let post = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(30)).await?;
     post.assert_backend("echo-a");
 
+    // Assert the negative for teardown: the dedicated Service/NodePort is GC'd on
+    // migration, so its endpoint must go dark. This is a connection failure, not a
+    // 404 — the listening socket is gone — so it can't be expressed as a route
+    // status; `wait_for_endpoint_unreachable` polls a real TCP connect instead.
+    wait::wait_for_endpoint_unreachable(dedicated_addr, Duration::from_secs(60)).await?;
+
     Ok(())
 }
 
@@ -708,6 +715,54 @@ async fn lifecycle_controller_restart_is_idempotent() -> anyhow::Result<()> {
     // time, so the same backend assertion still holds.
     let post = http.get(&host, "/").await?;
     post.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// 20 — Controller catch-up after a watch-stream downtime window. With the
+/// controller scaled to zero, a Gateway is created that the controller never
+/// receives a create event for; on restart it must relist and reconcile the
+/// missed object.
+///
+/// The catch-up signal is controller-written status (`Programmed`), not served
+/// traffic: in the split architecture the shared proxy runs its own reflector
+/// and would route the Gateway regardless of the controller, so only the
+/// Gateway's status proves the *controller* relisted and caught up.
+#[tokio::test]
+async fn catch_up_reconciles_gateway_created_during_controller_downtime() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    // Persistent namespace so the bootstrap purge on the second `Harness::start()`
+    // below doesn't delete the Gateway we create during the downtime window.
+    let ns = NamespaceGuard::create_persistent(&h.client, "ctrl-catchup").await?;
+
+    // Take the controller fully down — `scale_controller(0)` waits for the pod to
+    // be gone — so the mutation below lands while nothing is watching.
+    scale_controller(0).await?;
+
+    // Mutation during downtime: a Gateway (named `coxswain-test`) the controller
+    // never sees a create event for.
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    // Bring the controller back and wait for the real post-condition — new leader
+    // elected + at least one successful reconcile on the fresh process.
+    scale_controller(1).await?;
+    let h2 = Harness::start().await?;
+    wait::wait_for_controller_reconciled(
+        &h2.controller_admin_url("/metrics"),
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Relist catch-up: the Gateway created during downtime reaches Programmed=True,
+    // which only happens if the controller reconciled an object it never received
+    // a watch event for.
+    wait::wait_for_gateway_programmed(
+        &h2.client,
+        "coxswain-test",
+        &ns.name,
+        Duration::from_secs(60),
+    )
+    .await?;
 
     Ok(())
 }
