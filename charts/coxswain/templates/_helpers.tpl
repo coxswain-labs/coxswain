@@ -6,6 +6,18 @@ Expand the name of the chart.
 {{- end }}
 
 {{/*
+Namespace every resource is deployed into.
+Defaults to the release namespace (the `helm --namespace` value), with an
+optional `namespaceOverride` escape hatch — the idiomatic pattern shared by
+ingress-nginx, cert-manager, Traefik, and Envoy Gateway. Never hardcode a
+namespace in a template; always render this helper so `helm --namespace` is
+honoured and every resource resolves to one consistent namespace.
+*/}}
+{{- define "coxswain.namespace" -}}
+{{- default .Release.Namespace .Values.namespaceOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Create a default fully qualified app name.
 Truncated at 63 characters — Kubernetes DNS label limit.
 When the release name already contains the chart name it is used as-is.

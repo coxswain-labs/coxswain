@@ -25,11 +25,16 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets: []
 
+# -- Override the namespace all resources deploy into. Empty means the release
+# namespace (the value passed to `helm --namespace`), matching the convention
+# used by ingress-nginx, cert-manager, Traefik, and Envoy Gateway.
+namespaceOverride: ""
+
 # -- Namespace to deploy into.
 namespace:
-  # Create the namespace as part of this release.
+  # Create the namespace as part of this release. Set false when it already
+  # exists or you rely on `helm --create-namespace`.
   create: true
-  name: coxswain-system
 
 # -- GatewayClass controllerName this install claims.
 controllerName: coxswain-labs.dev/gateway-controller

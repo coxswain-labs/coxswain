@@ -4,7 +4,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ include "coxswain.sharedProxy.serviceAccountName" . }}
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ include "coxswain.namespace" . }}
   labels:
     {{- include "coxswain.sharedProxy.selectorLabels" . | nindent 4 }}
   {{- with .Values.proxy.shared.serviceAccount.annotations }}
@@ -52,7 +52,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: {{ include "coxswain.sharedProxy.serviceAccountName" . }}
-    namespace: {{ .Values.namespace.name }}
+    namespace: {{ include "coxswain.namespace" . }}
 roleRef:
   kind: ClusterRole
   name: {{ include "coxswain.sharedProxy.fullname" . }}

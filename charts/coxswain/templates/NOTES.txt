@@ -1,23 +1,23 @@
 Coxswain has been deployed!
 
-Default topology: two Deployments in {{ .Values.namespace.name }} —
+Default topology: two Deployments in {{ include "coxswain.namespace" . }} —
   - {{ include "coxswain.controller.fullname" . }} (leader-elected status writer)
   - {{ include "coxswain.sharedProxy.fullname" . }} (read-only data plane)
 
 Verify both pods are ready:
 
-  kubectl -n {{ .Values.namespace.name }} get pods -l app.kubernetes.io/name={{ include "coxswain.name" . }}
+  kubectl -n {{ include "coxswain.namespace" . }} get pods -l app.kubernetes.io/name={{ include "coxswain.name" . }}
   kubectl get gatewayclass {{ .Values.gatewayClass.name }}
 
 Check controller readiness:
 
-  kubectl -n {{ .Values.namespace.name }} port-forward svc/{{ include "coxswain.controller.fullname" . }} {{ .Values.health.port }}:{{ .Values.health.port }} {{ .Values.admin.port }}:{{ .Values.admin.port }}
+  kubectl -n {{ include "coxswain.namespace" . }} port-forward svc/{{ include "coxswain.controller.fullname" . }} {{ .Values.health.port }}:{{ .Values.health.port }} {{ .Values.admin.port }}:{{ .Values.admin.port }}
   curl http://localhost:{{ .Values.health.port }}/readyz
   curl http://localhost:{{ .Values.admin.port }}/status
 
 Check shared-proxy readiness:
 
-  kubectl -n {{ .Values.namespace.name }} port-forward svc/{{ include "coxswain.sharedProxy.fullname" . }}-internal {{ .Values.health.port }}:{{ .Values.health.port }} {{ .Values.admin.port }}:{{ .Values.admin.port }}
+  kubectl -n {{ include "coxswain.namespace" . }} port-forward svc/{{ include "coxswain.sharedProxy.fullname" . }}-internal {{ .Values.health.port }}:{{ .Values.health.port }} {{ .Values.admin.port }}:{{ .Values.admin.port }}
   curl http://localhost:{{ .Values.health.port }}/readyz
   curl http://localhost:{{ .Values.admin.port }}/routes
 
@@ -25,7 +25,7 @@ Check shared-proxy readiness:
 
 Get the external IP for the data-plane:
 
-  kubectl -n {{ .Values.namespace.name }} get svc {{ include "coxswain.sharedProxy.fullname" . }}
+  kubectl -n {{ include "coxswain.namespace" . }} get svc {{ include "coxswain.sharedProxy.fullname" . }}
 {{- end }}
 
 {{- if .Values.security.rootless }}
@@ -36,7 +36,7 @@ gateway Service maps 80/443 → 8080/8443. CAP_NET_BIND_SERVICE is not required.
 
 The shared-proxy ServiceAccount has zero K8s write permissions; verify with:
 
-  kubectl auth can-i --list --as=system:serviceaccount:{{ .Values.namespace.name }}:{{ include "coxswain.sharedProxy.serviceAccountName" . }} | grep -E "create|patch|update|delete"
+  kubectl auth can-i --list --as=system:serviceaccount:{{ include "coxswain.namespace" . }}:{{ include "coxswain.sharedProxy.serviceAccountName" . }} | grep -E "create|patch|update|delete"
 
 The grep should return nothing — every verb the proxy SA holds is in
 {get, list, watch}. If you see a write verb, file a bug.

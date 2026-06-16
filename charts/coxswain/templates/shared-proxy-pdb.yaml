@@ -3,7 +3,7 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: {{ include "coxswain.sharedProxy.fullname" . }}
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ include "coxswain.namespace" . }}
   labels:
     {{- include "coxswain.sharedProxy.selectorLabels" . | nindent 4 }}
 spec:

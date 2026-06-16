@@ -13,7 +13,7 @@ apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
   name: {{ include "coxswain.fullname" . }}
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "coxswain.namespace" . }}
   labels:
     {{- include "coxswain.labels" . | nindent 4 }}
     {{- with .Values.podMonitor.labels }}
