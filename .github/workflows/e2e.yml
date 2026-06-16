@@ -39,6 +39,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.gateway-api-version'
+              - '.config/nextest.toml'
               - '.github/workflows/e2e.yml'
 
   build:
@@ -72,6 +73,20 @@ jobs:
       # Debug is fine for tests; we're not measuring proxy throughput here.
       - name: Build coxswain binary
         run: cargo build --bin coxswain
+
+      # The toolchain-free matrix runners can't `cargo run` the e2e-setup
+      # script, so build the bootstrap binary here and ship it as an artifact.
+      # The matrix job runs it once to install CRDs/cert-manager/Helm, then
+      # exports COXSWAIN_E2E_BOOTSTRAPPED=1 so the nextest setup script no-ops.
+      - name: Build e2e bootstrap binary
+        run: cargo build -p coxswain-e2e --bin e2e_setup
+
+      - name: Upload e2e bootstrap binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-setup-bin
+          path: target/debug/e2e_setup
+          retention-days: 1
 
       # cargo nextest archive compiles every integration test binary in
       # coxswain-e2e/tests/ and bundles them with nextest metadata into a
@@ -201,6 +216,12 @@ jobs:
         with:
           name: e2e-archive
 
+      - name: Download e2e bootstrap binary
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-setup-bin
+          path: /tmp/e2e-setup
+
       # Install the nextest binary standalone — no Rust toolchain needed to
       # run from a pre-built archive. The archive carries the test binaries;
       # cargo-nextest extracts and executes them directly.
@@ -208,10 +229,29 @@ jobs:
         with:
           tool: nextest
 
+      # Bootstrap once with the prebuilt binary (no `cargo` on this runner),
+      # then export COXSWAIN_E2E_BOOTSTRAPPED so both nextest passes' setup
+      # scripts no-op and every test process skips the heavy setup. Image build
+      # is skipped (COXSWAIN_E2E_SKIP_BUILD) — the image was loaded above.
+      - name: Bootstrap cluster (CRDs, cert-manager, Helm)
+        run: |
+          chmod +x /tmp/e2e-setup/e2e_setup
+          /tmp/e2e-setup/e2e_setup
+          echo "COXSWAIN_E2E_BOOTSTRAPPED=1" >> "$GITHUB_ENV"
+        env:
+          COXSWAIN_E2E_SKIP_BUILD: "1"
+          RUST_LOG: coxswain_e2e=debug,warn
+
+      # Two passes (see .config/nextest.toml): the parallel `e2e` profile, then
+      # the serial `e2e-serial` profile (global-config mutators + resilience).
+      # `--no-tests=pass` makes the empty side a no-op for suites that have
+      # tests in only one pass (e.g. traffic_policy, resilience).
       - name: Run e2e tests (${{ matrix.suite }})
         run: |
-          cargo-nextest run --profile e2e --archive-file e2e-archive.tar.zst \
-            -E 'binary(${{ matrix.test }})'
+          cargo-nextest nextest run --profile e2e        --archive-file e2e-archive.tar.zst \
+            -E 'binary(${{ matrix.test }})' --no-tests=pass
+          cargo-nextest nextest run --profile e2e-serial --archive-file e2e-archive.tar.zst \
+            -E 'binary(${{ matrix.test }})' --no-tests=pass
         env:
           COXSWAIN_E2E_SKIP_BUILD: "1"
           RUST_LOG: coxswain_e2e=debug,warn

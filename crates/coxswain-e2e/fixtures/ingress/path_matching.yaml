@@ -11,7 +11,7 @@ kind: Ingress
 metadata:
   name: echo-ingress
 spec:
-  ingressClassName: INGRESSCLASS
+  ingressClassName: coxswain
   rules:
     - host: ingress.TESTNS.local
       http:

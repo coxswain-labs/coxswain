@@ -18,7 +18,7 @@
 //!   relay (#285): controller serves it, proxy 404s, unknown pod 404s.
 
 use coxswain_e2e::{
-    ControllerOptions, DedicatedRelease, FixtureVars, Harness, NamespaceGuard,
+    ControllerOptions, FixtureVars, Harness, NamespaceGuard,
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::wait,
 };
@@ -224,30 +224,22 @@ async fn access_log_emits_required_fields_on_success() -> anyhow::Result<()> {
 #[tokio::test]
 async fn access_log_path_mode_pattern_uses_rule_pattern() -> anyhow::Result<()> {
     common::init_tracing();
-    let ded = DedicatedRelease::install(ControllerOptions {
+    let h = Harness::start_with_options(ControllerOptions {
         access_log_path_mode: Some("pattern".to_string()),
         ..Default::default()
     })
     .await?;
-    let ns = NamespaceGuard::create(&ded.client, "obs-access-pattern").await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-access-pattern").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::PATH_MATCHING,
-        FixtureVars {
-            ingress_class: ded.ingress_class.clone(),
-            ..FixtureVars::new(&ns.name)
-        },
-    )
-    .await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
-    let http = coxswain_e2e::HttpClient::new(ded.proxy_addr)?;
     let host = format!("ingress.{}.local", ns.name);
-    wait::wait_for_route(&http, &host, "/a", Duration::from_secs(60)).await?;
-    http.get(&host, "/a/deep/path").await?;
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+    h.http.get(&host, "/a/deep/path").await?;
 
-    let logs = ded.shared_proxy_access_logs().await?;
+    let logs = h.controller.shared_proxy_access_logs().await?;
     let row = logs
         .iter()
         .rev()
@@ -274,30 +266,22 @@ async fn access_log_path_mode_pattern_uses_rule_pattern() -> anyhow::Result<()> 
 #[tokio::test]
 async fn access_log_path_mode_none_omits_path() -> anyhow::Result<()> {
     common::init_tracing();
-    let ded = DedicatedRelease::install(ControllerOptions {
+    let h = Harness::start_with_options(ControllerOptions {
         access_log_path_mode: Some("none".to_string()),
         ..Default::default()
     })
     .await?;
-    let ns = NamespaceGuard::create(&ded.client, "obs-access-none").await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-access-none").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::PATH_MATCHING,
-        FixtureVars {
-            ingress_class: ded.ingress_class.clone(),
-            ..FixtureVars::new(&ns.name)
-        },
-    )
-    .await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
-    let http = coxswain_e2e::HttpClient::new(ded.proxy_addr)?;
     let host = format!("ingress.{}.local", ns.name);
-    wait::wait_for_route(&http, &host, "/a", Duration::from_secs(60)).await?;
-    http.get(&host, "/a").await?;
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+    h.http.get(&host, "/a").await?;
 
-    let logs = ded.shared_proxy_access_logs().await?;
+    let logs = h.controller.shared_proxy_access_logs().await?;
     let row = logs
         .iter()
         .rev()
@@ -362,32 +346,24 @@ async fn access_log_error_path_carries_error_field() -> anyhow::Result<()> {
 #[tokio::test]
 async fn access_log_disabled_emits_nothing() -> anyhow::Result<()> {
     common::init_tracing();
-    let ded = DedicatedRelease::install(ControllerOptions {
+    let h = Harness::start_with_options(ControllerOptions {
         access_log: Some(false),
         ..Default::default()
     })
     .await?;
-    let ns = NamespaceGuard::create(&ded.client, "obs-access-off").await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-access-off").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::PATH_MATCHING,
-        FixtureVars {
-            ingress_class: ded.ingress_class.clone(),
-            ..FixtureVars::new(&ns.name)
-        },
-    )
-    .await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
-    let http = coxswain_e2e::HttpClient::new(ded.proxy_addr)?;
     let host = format!("ingress.{}.local", ns.name);
-    wait::wait_for_route(&http, &host, "/a", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
     for _ in 0..5 {
-        http.get(&host, "/a").await?;
+        h.http.get(&host, "/a").await?;
     }
 
-    let logs = ded.shared_proxy_access_logs().await?;
+    let logs = h.controller.shared_proxy_access_logs().await?;
     let recent: Vec<_> = logs
         .iter()
         .filter(|line| line.get("host").and_then(|h| h.as_str()) == Some(host.as_str()))
@@ -399,10 +375,7 @@ async fn access_log_disabled_emits_nothing() -> anyhow::Result<()> {
     );
 
     // Metrics must still be observed even when access logging is off.
-    let metrics = reqwest::get(ded.admin_url("/metrics"))
-        .await?
-        .text()
-        .await?;
+    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
     assert!(
         metrics.contains("coxswain_proxy_requests_total{"),
         "metrics must still emit even with access logging disabled"

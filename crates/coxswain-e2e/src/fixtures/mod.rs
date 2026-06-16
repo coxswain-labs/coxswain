@@ -19,10 +19,6 @@ use tokio::io::AsyncWriteExt as _;
 /// - `gateway_http_port` → `GATEWAY_HTTP_PORT` (Gateway HTTP listener)
 /// - `gateway_https_port` → `GATEWAY_HTTPS_PORT` (Gateway HTTPS listener)
 ///
-/// `ingress_class` and `gateway_class` are always substituted for
-/// `INGRESSCLASS` and `GATEWAYCLASS`, defaulting to `"coxswain"`.
-/// Dedicated-release tests override these to their isolated class names.
-///
 /// Use [`FixtureVars::with`] to add extra substitutions.
 pub struct FixtureVars {
     /// Substituted for `TESTNS` in the YAML template.
@@ -35,10 +31,6 @@ pub struct FixtureVars {
     pub gateway_http_port: u16,
     /// Substituted for `GATEWAY_HTTPS_PORT` in the YAML template. `0` means skip.
     pub gateway_https_port: u16,
-    /// Substituted for `INGRESSCLASS`. Defaults to `"coxswain"`.
-    pub ingress_class: String,
-    /// Substituted for `GATEWAYCLASS`. Defaults to `"coxswain"`.
-    pub gateway_class: String,
     /// Additional `(placeholder, replacement)` pairs applied before the standard substitutions.
     pub extra: Vec<(String, String)>,
 }
@@ -52,8 +44,6 @@ impl FixtureVars {
             https_port: 0,
             gateway_http_port: 0,
             gateway_https_port: 0,
-            ingress_class: "coxswain".into(),
-            gateway_class: "coxswain".into(),
             extra: Vec::new(),
         }
     }
@@ -75,11 +65,6 @@ pub async fn apply_fixture(path: impl AsRef<Path>, vars: FixtureVars) -> anyhow:
     for (key, val) in &vars.extra {
         content = substitute(&content, key, val);
     }
-    // Class tokens: always substituted (default "coxswain"; dedicated tests override).
-    // `GATEWAYCLASS` before `INGRESSCLASS` is arbitrary — neither is a substring
-    // of the other. Both are applied before port tokens.
-    content = substitute(&content, "GATEWAYCLASS", &vars.gateway_class);
-    content = substitute(&content, "INGRESSCLASS", &vars.ingress_class);
     // Substitute Gateway placeholders before Ingress ones; `GATEWAY_HTTP_PORT`
     // is a superstring of `HTTP_PORT` and a literal-replace pass over `HTTP_PORT`
     // first would corrupt the Gateway placeholder.

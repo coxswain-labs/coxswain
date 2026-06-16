@@ -3,15 +3,12 @@
 
 use anyhow::Context as _;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
-static DEDICATED_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 use crate::harness::bootstrap::{
-    COXSWAIN_NAMESPACE, E2E_IMAGE, GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, HelmOverrides, bootstrap,
-    helm_install, helm_install_dedicated, workspace_root,
+    COXSWAIN_NAMESPACE, E2E_IMAGE, GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, HelmOverrides,
+    helm_install, workspace_root,
 };
 
 /// Fixed port the Helm chart sets for HTTP ingress (`proxy.http.port`).
@@ -96,12 +93,11 @@ impl ControllerProcess {
     /// Returns an error if the Helm upgrade, LB-IP lookup, or port-forward
     /// setup fails.
     pub async fn start_with_options(opts: ControllerOptions) -> anyhow::Result<Self> {
-        // Always reconcile the Helm release with the requested overrides so the
-        // chart never carries leftover state from a previous test in the same
-        // binary (e.g. test N flipping `accessLog=false` would leak into test
-        // N+1 if N+1 passed `ControllerOptions::default()` and we skipped the
-        // upgrade). When the values match the live release Helm short-circuits
-        // — the cost is one helm-upgrade decision plus `wait_for_leader_ready`.
+        // Only upgrade the shared Helm release when the caller requests non-default
+        // overrides. Bootstrap already installed the release with default settings,
+        // so the many tests that call start_with_options(default) never touch Helm
+        // and never race on its lock; only the global-config mutator tests (which
+        // pass non-default overrides and run in the serial pass) reconfigure it.
         let overrides = HelmOverrides {
             status_address: opts.status_address,
             ingress_default_backend: opts.ingress_default_backend,
@@ -110,10 +106,12 @@ impl ControllerProcess {
             access_log: opts.access_log,
             access_log_path_mode: opts.access_log_path_mode,
         };
-        let root = workspace_root().context("workspace root")?;
-        helm_install(&root, &overrides)
-            .await
-            .context("helm upgrade with overrides")?;
+        if overrides != HelmOverrides::default() {
+            let root = workspace_root().context("workspace root")?;
+            helm_install(&root, &overrides)
+                .await
+                .context("helm upgrade with overrides")?;
+        }
 
         let lb_ip = wait_for_lb_ip(SHARED_PROXY_SVC, COXSWAIN_NAMESPACE)
             .await
@@ -364,244 +362,4 @@ async fn wait_for_controller_ready(controller_svc: &str, namespace: &str) -> any
 /// this value.
 pub fn dedicated_proxy_image() -> &'static str {
     E2E_IMAGE
-}
-
-/// RAII handle for an isolated coxswain Helm release installed solely for one
-/// test. Exposes the same address surface as [`ControllerProcess`] plus the
-/// unique class names of the release. On drop, it uninstalls the Helm release
-/// and deletes the namespace.
-///
-/// Dedicated releases share the cluster with the shared release but are
-/// completely isolated by class names and namespace, so they can run
-/// concurrently with parallel-partition tests and with each other.
-pub struct DedicatedRelease {
-    /// LoadBalancer IP of this release's shared-proxy Service.
-    pub lb_ip: IpAddr,
-    /// Ingress HTTP proxy address (`<lb_ip>:80`).
-    pub proxy_addr: SocketAddr,
-    /// Ingress HTTPS/TLS proxy address (`<lb_ip>:443`).
-    pub tls_addr: SocketAddr,
-    /// Gateway HTTP proxy address (`<lb_ip>:GATEWAY_HTTP_PORT`).
-    pub gateway_http_addr: SocketAddr,
-    /// Gateway HTTPS proxy address (`<lb_ip>:GATEWAY_HTTPS_PORT`).
-    pub gateway_https_addr: SocketAddr,
-    /// Port-forwarded health endpoint of this release's shared-proxy pod.
-    pub health_addr: SocketAddr,
-    /// Port-forwarded admin endpoint of this release's shared-proxy pod.
-    pub admin_addr: SocketAddr,
-    /// Port-forwarded admin endpoint of this release's controller pod.
-    pub controller_admin_addr: SocketAddr,
-    /// Kubernetes client (same kubeconfig as the shared release).
-    pub client: kube::Client,
-    /// IngressClass name unique to this release.
-    pub ingress_class: String,
-    /// GatewayClass name unique to this release.
-    pub gateway_class: String,
-    release_name: String,
-    namespace: String,
-    health_pf: Child,
-    admin_pf: Child,
-    controller_admin_pf: Child,
-}
-
-impl DedicatedRelease {
-    /// Install an isolated coxswain release with its own namespace and class
-    /// names, wait for it to be ready, and return a handle to it.
-    ///
-    /// The bootstrap (image build, shared release, CRDs) runs first via
-    /// [`bootstrap`] so the shared ClusterRoles exist before the dedicated
-    /// install sets `proxy.dedicated.rbac.create=false`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if bootstrap, helm upgrade, LB-IP lookup, or
-    /// port-forward setup fails.
-    pub async fn install(opts: ControllerOptions) -> anyhow::Result<Self> {
-        bootstrap()
-            .await
-            .context("bootstrap for dedicated release")?;
-
-        let id = DEDICATED_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let release_name = format!("coxswain-ded-{pid}-{id}");
-        let namespace = release_name.clone();
-        // Class names fit within 253-char DNS label limits and are unique per
-        // parallel test slot. They contain "ded" so they don't collide with
-        // the shared "coxswain" class even if the counter wraps.
-        let ingress_class = format!("ded-{pid}-{id}");
-        let gateway_class = ingress_class.clone();
-        let controller_name = format!("coxswain-labs.dev/ded-{pid}-{id}");
-
-        // Derive service names from the Helm fullname helper:
-        // if release name contains "coxswain" → fullname = release name.
-        // "coxswain-ded-<pid>-<id>" contains "coxswain", so:
-        //   shared-proxy svc  = "<release_name>-shared-proxy"
-        //   shared-proxy-int  = "<release_name>-shared-proxy-internal"
-        //   controller svc    = "<release_name>-controller"
-        let shared_proxy_svc = format!("{release_name}-shared-proxy");
-        let shared_proxy_internal_svc = format!("{release_name}-shared-proxy-internal");
-        let controller_svc = format!("{release_name}-controller");
-
-        let overrides = HelmOverrides {
-            status_address: opts.status_address,
-            ingress_default_backend: opts.ingress_default_backend,
-            accept_proxy_protocol: opts.accept_proxy_protocol,
-            trusted_sources: opts.trusted_sources,
-            access_log: opts.access_log,
-            access_log_path_mode: opts.access_log_path_mode,
-        };
-        let root = workspace_root().context("workspace root")?;
-        helm_install_dedicated(
-            &root,
-            &release_name,
-            &namespace,
-            &ingress_class,
-            &gateway_class,
-            &controller_name,
-            &overrides,
-        )
-        .await
-        .context("dedicated helm install")?;
-
-        let lb_ip = wait_for_lb_ip(&shared_proxy_svc, &namespace)
-            .await
-            .context("dedicated shared-proxy LB IP")?;
-
-        let health_port = free_port()?;
-        let admin_port = free_port()?;
-        let controller_admin_port = free_port()?;
-
-        let health_pf =
-            start_port_forward(&shared_proxy_internal_svc, health_port, 8081, &namespace).await?;
-        let admin_pf =
-            start_port_forward(&shared_proxy_internal_svc, admin_port, 8082, &namespace).await?;
-        let controller_admin_pf =
-            start_port_forward(&controller_svc, controller_admin_port, 8082, &namespace).await?;
-
-        let health_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), health_port);
-        let admin_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), admin_port);
-        let controller_admin_addr = SocketAddr::new(
-            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            controller_admin_port,
-        );
-
-        wait_for_controller_ready(&controller_svc, &namespace)
-            .await
-            .context("dedicated controller readyz")?;
-        crate::harness::wait::wait_for_ready(health_addr, Duration::from_secs(60))
-            .await
-            .context("dedicated proxy readyz")?;
-
-        let client = kube::Client::try_default()
-            .await
-            .context("kube client for dedicated release")?;
-
-        Ok(Self {
-            lb_ip,
-            proxy_addr: SocketAddr::new(lb_ip, INGRESS_HTTP_PORT),
-            tls_addr: SocketAddr::new(lb_ip, INGRESS_HTTPS_PORT),
-            gateway_http_addr: SocketAddr::new(lb_ip, GATEWAY_HTTP_PORT),
-            gateway_https_addr: SocketAddr::new(lb_ip, GATEWAY_HTTPS_PORT),
-            health_addr,
-            admin_addr,
-            controller_admin_addr,
-            client,
-            ingress_class,
-            gateway_class,
-            release_name,
-            namespace,
-            health_pf,
-            admin_pf,
-            controller_admin_pf,
-        })
-    }
-
-    /// Read every shared-proxy pod's stdout in this release's namespace and
-    /// return only the JSON access-log lines.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if listing pods or reading their logs fails.
-    pub async fn shared_proxy_access_logs(&self) -> anyhow::Result<Vec<serde_json::Value>> {
-        let out = Command::new("kubectl")
-            .args([
-                "logs",
-                "-n",
-                &self.namespace,
-                "-l",
-                "app.kubernetes.io/name=coxswain,app.kubernetes.io/component=shared-proxy",
-                "--tail=-1",
-            ])
-            .output()
-            .await
-            .context("kubectl logs shared-proxy (dedicated)")?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "kubectl logs shared-proxy exit {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let stdout = String::from_utf8(out.stdout).context("decode kubectl logs stdout")?;
-        let mut access = Vec::new();
-        for line in stdout.lines() {
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            if json.get("target").and_then(|v| v.as_str()) == Some("coxswain_proxy::access") {
-                access.push(json);
-            }
-        }
-        Ok(access)
-    }
-
-    /// Build an admin endpoint URL targeting the shared-proxy pod of this release.
-    pub fn admin_url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.admin_addr)
-    }
-
-    /// Build an admin endpoint URL targeting the controller pod of this release.
-    pub fn controller_admin_url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.controller_admin_addr)
-    }
-}
-
-impl Drop for DedicatedRelease {
-    fn drop(&mut self) {
-        let _ = self.health_pf.start_kill();
-        let _ = self.admin_pf.start_kill();
-        let _ = self.controller_admin_pf.start_kill();
-
-        // Fire-and-forget cleanup: uninstall the Helm release and delete the
-        // namespace. Failures here are logged but don't panic — the cluster
-        // resets between suite runs anyway.
-        let release_name = self.release_name.clone();
-        let namespace = self.namespace.clone();
-        tokio::spawn(async move {
-            let uninstall = tokio::process::Command::new("helm")
-                .args(["uninstall", &release_name, "-n", &namespace])
-                .status()
-                .await;
-            match uninstall {
-                Ok(s) if s.success() => {
-                    tracing::debug!(release = %release_name, "dedicated release uninstalled")
-                }
-                Ok(s) => tracing::warn!(
-                    release = %release_name,
-                    "helm uninstall exited {s}"
-                ),
-                Err(e) => tracing::warn!(
-                    release = %release_name,
-                    "helm uninstall failed: {e}"
-                ),
-            }
-            let del = tokio::process::Command::new("kubectl")
-                .args(["delete", "ns", &namespace, "--ignore-not-found"])
-                .status()
-                .await;
-            if let Err(e) = del {
-                tracing::warn!(namespace = %namespace, "kubectl delete ns failed: {e}");
-            }
-        });
-    }
 }

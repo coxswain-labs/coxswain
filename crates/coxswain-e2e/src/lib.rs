@@ -10,6 +10,6 @@ pub mod harness;
 
 pub use fixtures::FixtureVars;
 pub use harness::{
-    ControllerOptions, ControllerProcess, DedicatedRelease, GeneratedCert, Harness, HttpClient,
-    IngressClassGuard, NamespaceGuard, bootstrap,
+    ControllerOptions, ControllerProcess, GeneratedCert, Harness, HttpClient, IngressClassGuard,
+    NamespaceGuard, bootstrap, bootstrap_cluster,
 };

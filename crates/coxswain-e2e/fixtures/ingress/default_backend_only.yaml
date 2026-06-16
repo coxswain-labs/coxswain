@@ -9,7 +9,7 @@ kind: Ingress
 metadata:
   name: default-only-ingress
 spec:
-  ingressClassName: INGRESSCLASS
+  ingressClassName: coxswain
   defaultBackend:
     service:
       name: echo-b

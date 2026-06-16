@@ -12,7 +12,7 @@ kind: Ingress
 metadata:
   name: echo-ingress
 spec:
-  ingressClassName: INGRESSCLASS
+  ingressClassName: coxswain
   defaultBackend:
     service:
       name: echo-b

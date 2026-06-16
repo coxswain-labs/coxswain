@@ -224,18 +224,22 @@ kubectl -n coxswain-system rollout restart deploy/coxswain-controller deploy/cox
 
 All Rust e2e suites require a live cluster. The harness builds a Docker image, installs the Helm chart, and runs tests against the deployed pods. Reset the cluster before each run.
 
+Each suite runs as **two passes** — a parallel pass (`e2e`), then a serial pass (`e2e-serial`) — both filtered by `binary(<suite>)`. Run them in that order:
+
 ```bash
-# Suites are by behavior plane (see each tests/*.rs header). Run one suite:
-cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(routing)'
-cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(tls)'
-cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(traffic_policy)'
-cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(status_conditions)'
-cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(provisioning_rbac)'
-cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(resilience)'
-cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(observability)'
+# Suites are by behavior plane (see each tests/*.rs header). For each suite:
+cargo nextest run --profile e2e        -p coxswain-e2e -E 'binary(routing)' --no-tests=pass
+cargo nextest run --profile e2e-serial -p coxswain-e2e -E 'binary(routing)' --no-tests=pass
+# …and likewise for: tls, traffic_policy, status_conditions, provisioning_rbac,
+# resilience, observability.
 ```
 
-The `e2e` profile (`.config/nextest.toml`) runs up to 4 tests concurrently and places global-state mutators in a `serial` group so they don't race each other. Suites that reconfigure or restart shared cluster infrastructure (resilience, PROXY-protocol tests, access-log tests, LB-status tests) are serialized with each other automatically.
+`.config/nextest.toml` defines two profiles whose `default-filter`s split the work, so the command is identical per suite — only the profile changes:
+
+- **`e2e`** — up to 4 tests concurrently against the one shared proxy; everything *except* the global-config mutators and the resilience suite.
+- **`e2e-serial`** — one at a time. The global-config mutators (`default_backend`, `proxy_protocol_*`, `access_log_*`, `status_load_balancer_ip`) each reconfigure the shared proxy/controller via `helm upgrade`, which rolls the Deployment and is proxy-wide — so they must own the shared control plane while they run (a cap-1 group is *not* enough, since it doesn't stop overlap with ungrouped tests). The resilience suite (restarts/migrates the controller) runs here too.
+
+`--no-tests=pass` makes the empty side of the split a no-op (e.g. `traffic_policy` has no mutators; `resilience` runs entirely in the serial pass). Bootstrap runs once per `cargo nextest` invocation via the `e2e-setup` setup script (idempotent — a fast no-op on the second pass).
 
 > **On macOS the harness uses the production multi-stage `Dockerfile`.** macOS produces Mach-O binaries that won't run in Linux containers, so the COPY-only `Dockerfile.ci` (the fast Linux-CI path) is bypassed. First build is ~5–10 min for BoringSSL; cached afterwards. CI Linux runners keep the fast `Dockerfile.ci` path.
 

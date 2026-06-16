@@ -17,7 +17,7 @@
 //! annotation. TLS lives in `tls.rs`; traffic-policy knobs in `traffic_policy.rs`.
 
 use coxswain_e2e::{
-    ControllerOptions, DedicatedRelease, FixtureVars, Harness, HttpClient, IngressClassGuard,
+    ControllerOptions, ControllerProcess, FixtureVars, Harness, HttpClient, IngressClassGuard,
     NamespaceGuard, bootstrap,
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::{http, wait},
@@ -39,8 +39,8 @@ mod common;
 async fn default_backend() -> anyhow::Result<()> {
     common::init_tracing();
 
-    // Bootstrap and create the namespace before the dedicated install so the
-    // default-backend endpoints are ready on the controller's first sync.
+    // Bootstrap cluster connection and create the namespace before starting the
+    // controller, so the default-backend endpoints are ready on first sync.
     bootstrap().await?;
     let client = kube::Client::try_default().await?;
     let ns = NamespaceGuard::create(&client, "ing-default").await?;
@@ -48,24 +48,17 @@ async fn default_backend() -> anyhow::Result<()> {
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
-    // Isolated release: helm overrides apply only here, not to the shared proxy.
-    let ded = DedicatedRelease::install(ControllerOptions {
+    // Start the controller with the controller-wide default pointing at echo-c.
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
         ingress_default_backend: Some(format!("{}/echo-c:3000", ns.name)),
         ..Default::default()
     })
     .await?;
-    let http = HttpClient::new(ded.proxy_addr)?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+    let http = HttpClient::new(controller.proxy_addr)?;
 
-    // Apply the fixture with the dedicated class name so only this release
-    // reconciles the Ingress.
-    fixtures::apply_fixture(
-        ingress::DEFAULT_BACKEND,
-        FixtureVars {
-            ingress_class: ded.ingress_class.clone(),
-            ..FixtureVars::new(&ns.name)
-        },
-    )
-    .await?;
+    // Apply the fixture: rule /api → echo-a, spec.defaultBackend → echo-b.
+    fixtures::apply_fixture(ingress::DEFAULT_BACKEND, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("app.{}.local", ns.name);
     let unknown_host = format!("unknown.{}.local", ns.name);
@@ -88,34 +81,23 @@ async fn default_backend() -> anyhow::Result<()> {
 
 /// Tests a rules-less Ingress (only spec.defaultBackend, no spec.rules).
 /// The defaultBackend should serve all traffic regardless of host or path.
-///
-/// Uses a dedicated release so the catchall `ingressClassName` is unique to
-/// this test — the shared proxy is unaffected by the wildcard-host Ingress.
 #[tokio::test]
 async fn default_backend_only() -> anyhow::Result<()> {
     common::init_tracing();
-    let ded = DedicatedRelease::install(ControllerOptions::default()).await?;
-    let ns = NamespaceGuard::create(&ded.client, "ing-default-only").await?;
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-default-only").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::DEFAULT_BACKEND_ONLY,
-        FixtureVars {
-            ingress_class: ded.ingress_class.clone(),
-            ..FixtureVars::new(&ns.name)
-        },
-    )
-    .await?;
-
-    let http = HttpClient::new(ded.proxy_addr)?;
+    fixtures::apply_fixture(ingress::DEFAULT_BACKEND_ONLY, FixtureVars::new(&ns.name)).await?;
 
     // Wait for the defaultBackend to be live, probing an arbitrary host+path.
-    let resp = wait::wait_for_route(&http, "random.example", "/", Duration::from_secs(60)).await?;
+    let resp =
+        wait::wait_for_route(&h.http, "random.example", "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-b");
 
     // Any host and any path should hit echo-b.
-    let resp = http.get("other.io", "/api/v1").await?;
+    let resp = h.http.get("other.io", "/api/v1").await?;
     resp.assert_backend("echo-b");
 
     Ok(())

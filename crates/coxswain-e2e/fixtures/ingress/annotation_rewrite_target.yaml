@@ -11,7 +11,7 @@ metadata:
   annotations:
     ingress.coxswain-labs.dev/rewrite-target: /v2
 spec:
-  ingressClassName: INGRESSCLASS
+  ingressClassName: coxswain
   rules:
     - host: rewrite.TESTNS.local
       http:

@@ -25,7 +25,7 @@ metadata:
     ingress.coxswain-labs.dev/max-retries: "2"
     ingress.coxswain-labs.dev/retry-on: connect-failure
 spec:
-  ingressClassName: INGRESSCLASS
+  ingressClassName: coxswain
   rules:
     - host: retry.TESTNS.local
       http:

@@ -15,7 +15,7 @@ metadata:
   annotations:
     cert-manager.io/cluster-issuer: coxswain-e2e-selfsigned
 spec:
-  ingressClassName: INGRESSCLASS
+  ingressClassName: coxswain
   tls:
     - hosts:
         - TLS_HOST

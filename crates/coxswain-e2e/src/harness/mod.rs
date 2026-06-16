@@ -9,10 +9,8 @@ pub mod tls;
 pub mod wait;
 
 use anyhow::Context as _;
-pub use bootstrap::{GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, bootstrap};
-pub use controller::{
-    ControllerOptions, ControllerProcess, DedicatedRelease, INGRESS_HTTP_PORT, INGRESS_HTTPS_PORT,
-};
+pub use bootstrap::{GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, bootstrap, bootstrap_cluster};
+pub use controller::{ControllerOptions, ControllerProcess, INGRESS_HTTP_PORT, INGRESS_HTTPS_PORT};
 pub use http::HttpClient;
 pub use namespace::{IngressClassGuard, NamespaceGuard};
 pub use tls::GeneratedCert;

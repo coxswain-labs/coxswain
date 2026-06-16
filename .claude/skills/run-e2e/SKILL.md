@@ -11,13 +11,13 @@ Use `AskUserQuestion` with `multiSelect: true` and these options (omit "Other"; 
 
 Suites are organized by **behavior plane** (see each `tests/*.rs` header). `security.rs` carries no tests yet, so it is not offered.
 
-- **routing** — data-plane: path/host/header/method/query/weighted matching, wildcard, named-port, default-backend, cross-namespace, timeouts, endpoint-serving exclusion, parent-ref port (Ingress + Gateway API). `cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(routing)'`
-- **tls** — data-plane: SNI termination, cert rotation/fallback, cert-manager, BackendTLSPolicy, PROXY protocol, h2c, WebSocket (Ingress + Gateway API). `cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(tls)'`
-- **traffic_policy** — data-plane: per-route/backend knobs (currently the connect-retry annotation; v0.3 knobs land here). `cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(traffic_policy)'`
-- **status_conditions** — control-plane: Ingress LB status, Gateway Accepted/Programmed/observedGeneration, GatewayClass features, dedicated-mode (#211) status writer. `cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(status_conditions)'`
-- **provisioning_rbac** — control-plane: dedicated-proxy provisioning + GC, per-namespace + cluster-wide RBAC, ReferenceGrant, dedicated traffic, and the read-only-proxy SA audit. `cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(provisioning_rbac)'`
-- **resilience** — control-plane (serial): in-flight listener add/remove under load, crash-loop shared-pool fallback, controller-restart idempotency, mode migration. `cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(resilience)'`
-- **observability** — cross-cutting: readiness/status (formerly `health.rs`), the `coxswain_proxy_*` / `coxswain_controller_*` Prometheus surface, the access-log contract, the problems aggregate, and the routing admin endpoints. `cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(observability)'`
+- **routing** — data-plane: path/host/header/method/query/weighted matching, wildcard, named-port, default-backend, cross-namespace, timeouts, endpoint-serving exclusion, parent-ref port (Ingress + Gateway API). `two-pass run (see step 4) on `binary(routing)``
+- **tls** — data-plane: SNI termination, cert rotation/fallback, cert-manager, BackendTLSPolicy, PROXY protocol, h2c, WebSocket (Ingress + Gateway API). `two-pass run (see step 4) on `binary(tls)``
+- **traffic_policy** — data-plane: per-route/backend knobs (currently the connect-retry annotation; v0.3 knobs land here). `two-pass run (see step 4) on `binary(traffic_policy)``
+- **status_conditions** — control-plane: Ingress LB status, Gateway Accepted/Programmed/observedGeneration, GatewayClass features, dedicated-mode (#211) status writer. `two-pass run (see step 4) on `binary(status_conditions)``
+- **provisioning_rbac** — control-plane: dedicated-proxy provisioning + GC, per-namespace + cluster-wide RBAC, ReferenceGrant, dedicated traffic, and the read-only-proxy SA audit. `two-pass run (see step 4) on `binary(provisioning_rbac)``
+- **resilience** — control-plane (serial): in-flight listener add/remove under load, crash-loop shared-pool fallback, controller-restart idempotency, mode migration. `two-pass run (see step 4) on `binary(resilience)``
+- **observability** — cross-cutting: readiness/status (formerly `health.rs`), the `coxswain_proxy_*` / `coxswain_controller_*` Prometheus surface, the access-log contract, the problems aggregate, and the routing admin endpoints. `two-pass run (see step 4) on `binary(observability)``
 - **conformance** — Gateway API Go conformance suite. Unlike the Cargo suites, conformance is NOT auto-bootstrapped — it needs the production multi-stage `Dockerfile` and conformance-specific Helm overrides. Use `scripts/setup-conformance.sh` to prepare the cluster, then `go test` runs against the deployed cluster. Setup is ~3–5 min on macOS (BoringSSL build); the test itself is ~2 min.
 
 Cap the question at one phrase: "Which e2e suites to run?". Header: "E2E suites".
@@ -59,11 +59,16 @@ The bootstrap builds the Docker image automatically (using the production multi-
 
 **routing / tls / traffic_policy / status_conditions / provisioning_rbac / resilience / observability**:
 
+Each suite runs as **two passes** — a parallel pass, then a serial pass — both filtered by `binary(<suite>)`:
+
 ```bash
-cargo nextest run --profile e2e -p coxswain-e2e -E 'binary(<suite>)'
+# Pass 1 — parallel: every test except the global-config mutators.
+cargo nextest run --profile e2e        -p coxswain-e2e -E 'binary(<suite>)' --no-tests=pass
+# Pass 2 — serial: the global-config mutators (and the resilience suite).
+cargo nextest run --profile e2e-serial -p coxswain-e2e -E 'binary(<suite>)' --no-tests=pass
 ```
 
-The `e2e` profile (`.config/nextest.toml`) runs up to 4 tests concurrently and serializes global-state mutators (PROXY-protocol, access-log, LB-status, default-backend, resilience) so they don't race each other. No `cargo build` prerequisite. Set `COXSWAIN_E2E_SKIP_BUILD=1` only if you know the `coxswain:e2e` image is already up to date in the local Docker daemon and you want to skip the build step.
+Run the passes in that order; the serial pass must not overlap the parallel one. The two `default-filter`s in `.config/nextest.toml` decide which tests land in each pass, so the command stays identical per suite — `--no-tests=pass` makes the empty side a no-op (e.g. `traffic_policy` has no mutators; `resilience` runs entirely in the serial pass). `e2e` runs up to 4 tests concurrently against the one shared proxy; `e2e-serial` runs one at a time so each global-config mutator (PROXY-protocol, access-log, LB-status, default-backend) owns the shared control plane while it reconfigures it via `helm upgrade`. No `cargo build` prerequisite. Set `COXSWAIN_E2E_SKIP_BUILD=1` only if the `coxswain:e2e` image is already current in the local Docker daemon.
 
 Capture stdout+stderr to a tmpfile so a failure can be inspected without re-running. Set the Bash timeout to 600000 ms (10 min) — Cargo suites typically run in 2–7 min each on a fresh cluster, so 10 min is generous headroom.
 
