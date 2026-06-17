@@ -115,7 +115,7 @@ For the complete walkthrough — including a test backend, TLS, and Ingress — 
 
 ## Authors
 
-Created and maintained by Matteo Giaccone, under the Coxswain Labs banner.
+Created and maintained by Matteo Giaccone.
 
 ## License
 
