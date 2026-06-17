@@ -8,8 +8,12 @@
 //! target*. "The controller writes condition/address X" is control-plane even if
 //! it sends a probe. Covers Ingress `loadBalancer` status, Gateway
 //! `Accepted`/`Programmed`, `observedGeneration` tracking (GEP-1364),
-//! `GatewayClass.status.supportedFeatures`, and the dedicated-mode status writer
-//! (#211): ClusterIP/LoadBalancer address derivation and `InvalidParameters`.
+//! `GatewayClass.status.supportedFeatures`, the dedicated-mode status writer
+//! (#211): ClusterIP/LoadBalancer address derivation and `InvalidParameters`,
+//! the per-parent `HTTPRoute` `ResolvedRefs`/`Programmed` conditions, the
+//! ownership negative (an unowned IngressClass is never patched), and the
+//! status-writer idempotency invariant — no-op reconciles must not re-stamp
+//! `lastTransitionTime` or bump `observedGeneration` (#347).
 
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, Harness, NamespaceGuard,
@@ -17,8 +21,11 @@ use coxswain_e2e::{
     harness::wait,
 };
 use gateway_api::apis::standard::gateways::Gateway;
+use gateway_api::apis::standard::httproutes::HTTPRoute;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
+use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::Api;
 use kube::api::{Patch, PatchParams};
 use std::time::Duration;
@@ -548,4 +555,281 @@ async fn lifecycle_gateway_status_conditions_and_addresses() -> anyhow::Result<(
     );
 
     Ok(())
+}
+
+/// The status writer writes per-parent `HTTPRoute` conditions that reflect
+/// backend resolution: a route whose backend Service exists resolves
+/// (`ResolvedRefs=True`), while a sibling route attached to the same Gateway but
+/// pointing at a missing Service stays `Accepted=True` yet flips
+/// `ResolvedRefs=False/BackendNotFound`. Closes the route-status happy+sad gap
+/// the #347 work-queue migration relies on `mark_http_route_programmed` to cover.
+#[tokio::test]
+async fn route_status_reports_resolved_refs_per_backend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "route-status-refs").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::ROUTE_STATUS_BACKENDS, FixtureVars::new(&ns.name)).await?;
+
+    // The resolvable route programming proves the writer is live for this ns —
+    // so the ghost route below has had equal opportunity to be evaluated.
+    wait::wait_for_httproute_programmed(&h.client, "good-route", &ns.name, Duration::from_secs(30))
+        .await?;
+
+    let routes: Api<HTTPRoute> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // Happy: good-route attaches and resolves.
+    let good = routes.get("good-route").await?;
+    assert_eq!(
+        route_parent_condition(&good, "Accepted").map(|(s, _)| s),
+        Some("True".to_string()),
+        "good-route must be Accepted=True"
+    );
+    assert_eq!(
+        route_parent_condition(&good, "Programmed").map(|(s, _)| s),
+        Some("True".to_string()),
+        "good-route must be Programmed=True"
+    );
+    assert_eq!(
+        route_parent_condition(&good, "ResolvedRefs"),
+        Some(("True".to_string(), "ResolvedRefs".to_string())),
+        "good-route's existing backend must yield ResolvedRefs=True"
+    );
+
+    // Sad: ghost-route attaches (Accepted=True) but its backend Service is
+    // missing — ResolvedRefs must be False/BackendNotFound. Poll: the ghost
+    // route may settle a beat after the good one.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            let observed = routes.get("ghost-route").await.ok().map_or_else(
+                || "<could not fetch ghost-route>".to_string(),
+                |r| {
+                    format!(
+                        "Accepted={:?}, ResolvedRefs={:?}",
+                        route_parent_condition(&r, "Accepted"),
+                        route_parent_condition(&r, "ResolvedRefs"),
+                    )
+                },
+            );
+            format!(
+                "ghost-route to be Accepted=True + ResolvedRefs=False(BackendNotFound); observed {observed}"
+            )
+        },
+        || async {
+            let r = routes.get("ghost-route").await.ok()?;
+            (route_parent_condition(&r, "Accepted").map(|(s, _)| s) == Some("True".to_string())
+                && route_parent_condition(&r, "ResolvedRefs")
+                    == Some(("False".to_string(), "BackendNotFound".to_string())))
+            .then_some(())
+        },
+    )
+    .await
+}
+
+/// Ownership negative: the status writer patches `loadBalancer` status only onto
+/// Ingresses whose class we own. An Ingress claiming a foreign IngressClass must
+/// be left untouched, even while an owned sibling in the same namespace is
+/// patched. Guards the `reconcile_ingress` ownership branch (#347).
+#[tokio::test]
+async fn ingress_status_skips_unowned_ingress_class() -> anyhow::Result<()> {
+    let status_ip = "203.0.113.9";
+    let h = Harness::start_with_options(ControllerOptions {
+        status_address: Some(status_ip.to_string()),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-foreign-class").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::FOREIGN_CLASS, FixtureVars::new(&ns.name)).await?;
+
+    // Positive control: the owned Ingress receives the configured status IP.
+    // Reaching this proves the writer processed this namespace's Ingresses, so
+    // the foreign one below had equal opportunity to (wrongly) be patched.
+    wait::wait_for_ingress_lb_ip(
+        &h.client,
+        "owned-ingress",
+        &ns.name,
+        status_ip,
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    // Negative: the foreign-class Ingress must carry no loadBalancer ingress.
+    let ingresses: Api<Ingress> = Api::namespaced(h.client.clone(), &ns.name);
+    let foreign = ingresses.get("foreign-ingress").await?;
+    let lb_ingress = foreign
+        .status
+        .as_ref()
+        .and_then(|s| s.load_balancer.as_ref())
+        .and_then(|lb| lb.ingress.as_deref())
+        .unwrap_or(&[]);
+    assert!(
+        lb_ingress.is_empty(),
+        "foreign-class Ingress must not receive a loadBalancer status patch, got {lb_ingress:?}"
+    );
+
+    Ok(())
+}
+
+/// Idempotency invariant (#347): once a Gateway and HTTPRoute are programmed,
+/// reconciles that change no spec must not re-stamp `lastTransitionTime` or bump
+/// `observedGeneration`. The work-queue migration deleted the `STATUS_RESYNC_INTERVAL`
+/// backstop and now funnels resync + health + spec events through one reconcile,
+/// so this churn-free property — unit-tested via `route_status_unchanged` /
+/// `gateway_needs_status_patch` — needs a live guard too. We force reconciles
+/// with metadata-only annotation pokes (which bump `resourceVersion` and fire a
+/// watch event, but not `metadata.generation`) and assert the condition stamps
+/// never move.
+#[tokio::test]
+async fn status_writes_are_idempotent_no_condition_churn() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "status-idempotent").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    wait::wait_for_gateway_programmed(
+        &h.client,
+        "coxswain-test",
+        &ns.name,
+        Duration::from_secs(30),
+    )
+    .await?;
+    wait::wait_for_httproute_programmed(&h.client, "echo-route", &ns.name, Duration::from_secs(30))
+        .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let routes: Api<HTTPRoute> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // Snapshot the (type → lastTransitionTime, observedGeneration) fingerprint of
+    // every condition the writer owns. A churning writer re-stamps
+    // lastTransitionTime on each no-op reconcile; an idempotent one leaves it.
+    let gw_before = gateway_condition_stamps(&gateways.get("coxswain-test").await?);
+    let route_before = route_condition_stamps(&routes.get("echo-route").await?);
+    assert!(
+        !gw_before.is_empty(),
+        "expected Gateway conditions to be present before poking"
+    );
+    assert!(
+        !route_before.is_empty(),
+        "expected HTTPRoute conditions to be present before poking"
+    );
+
+    const POKE_ANNOTATION: &str = "e2e.coxswain-labs.dev/poke";
+    for round in 0..3 {
+        let want = round.to_string();
+        let poke = serde_json::json!({ "metadata": { "annotations": { POKE_ANNOTATION: want } } });
+        gateways
+            .patch(
+                "coxswain-test",
+                &PatchParams::default(),
+                &Patch::Merge(&poke),
+            )
+            .await?;
+        routes
+            .patch("echo-route", &PatchParams::default(), &Patch::Merge(&poke))
+            .await?;
+
+        // Wait until both pokes are observable again through the API — informers
+        // have therefore delivered them and the work-queues have processed the
+        // update (a real post-condition, not a blind sleep). This is the window
+        // in which a broken idempotency gate would re-patch status.
+        wait::poll_until(
+            Duration::from_secs(15),
+            wait::POLL,
+            || async { format!("poke round {round} to land on both Gateway and HTTPRoute") },
+            || async {
+                let gw_ann = gateways
+                    .get("coxswain-test")
+                    .await
+                    .ok()
+                    .and_then(|g| g.metadata.annotations?.get(POKE_ANNOTATION).cloned());
+                let rt_ann = routes
+                    .get("echo-route")
+                    .await
+                    .ok()
+                    .and_then(|r| r.metadata.annotations?.get(POKE_ANNOTATION).cloned());
+                (gw_ann.as_deref() == Some(want.as_str())
+                    && rt_ann.as_deref() == Some(want.as_str()))
+                .then_some(())
+            },
+        )
+        .await?;
+
+        let gw_after = gateway_condition_stamps(&gateways.get("coxswain-test").await?);
+        let route_after = route_condition_stamps(&routes.get("echo-route").await?);
+        assert_eq!(
+            gw_after, gw_before,
+            "Gateway condition stamps churned on round {round} — the status writer re-patched on a no-op reconcile"
+        );
+        assert_eq!(
+            route_after, route_before,
+            "HTTPRoute condition stamps churned on round {round} — the status writer re-patched on a no-op reconcile"
+        );
+    }
+
+    Ok(())
+}
+
+/// `(type, lastTransitionTime, observedGeneration)` for every top-level Gateway
+/// condition, sorted by type — a stable fingerprint of what the writer stamped.
+fn gateway_condition_stamps(gw: &Gateway) -> Vec<(String, Time, Option<i64>)> {
+    let mut out: Vec<(String, Time, Option<i64>)> = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .map(|cs| {
+            cs.iter()
+                .map(|c| {
+                    (
+                        c.type_.clone(),
+                        c.last_transition_time.clone(),
+                        c.observed_generation,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Same fingerprint across every parent's conditions of an HTTPRoute.
+fn route_condition_stamps(route: &HTTPRoute) -> Vec<(String, Time, Option<i64>)> {
+    let mut out: Vec<(String, Time, Option<i64>)> = route
+        .status
+        .as_ref()
+        .map(|s| {
+            s.parents
+                .iter()
+                .flat_map(|p| {
+                    p.conditions.iter().map(|c| {
+                        (
+                            c.type_.clone(),
+                            c.last_transition_time.clone(),
+                            c.observed_generation,
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `(status, reason)` of the first parent condition of `type_`, or `None`.
+fn route_parent_condition(route: &HTTPRoute, type_: &str) -> Option<(String, String)> {
+    route.status.as_ref()?.parents.iter().find_map(|p| {
+        p.conditions
+            .iter()
+            .find(|c| c.type_ == type_)
+            .map(|c| (c.status.clone(), c.reason.clone()))
+    })
 }

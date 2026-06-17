@@ -8,6 +8,10 @@ macro_rules! fixture {
 
 /// HTTPRoute path-based routing rules.
 pub const PATH_MATCHING: &str = fixture!("path_matching.yaml");
+/// One Gateway with two HTTPRoutes — a resolvable backend and a missing one —
+/// for asserting per-parent `ResolvedRefs` (`True` vs `False/BackendNotFound`)
+/// while both stay `Accepted=True`.
+pub const ROUTE_STATUS_BACKENDS: &str = fixture!("route_status_backends.yaml");
 /// HTTPRoute with multiple backends pooled into a single upstream.
 pub const HOST_POOL: &str = fixture!("host_pool.yaml");
 /// HTTPRoute with a wildcard hostname listener.

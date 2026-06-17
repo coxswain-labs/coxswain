@@ -1,0 +1,51 @@
+# Route-status backend-resolution fixture.
+#
+# One Gateway, two HTTPRoutes that attach to it:
+#   good-route  → echo-a (exists)        → ResolvedRefs=True
+#   ghost-route → ghost-svc (no Service) → ResolvedRefs=False/BackendNotFound
+#
+# Both routes attach to the listener (Accepted=True); they differ only in
+# whether their backendRef resolves, isolating the ResolvedRefs assertion.
+# TESTNS is substituted with the test namespace at runtime.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: good-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "good.${TESTNS}.local"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ghost-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "ghost.${TESTNS}.local"
+  rules:
+    - backendRefs:
+        - name: ghost-svc
+          port: 3000
