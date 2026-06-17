@@ -44,6 +44,11 @@ rules:
   - apiGroups: ["ingress.coxswain-labs.dev"]
     resources: ["coxswainingressclassparameters"]
     verbs: ["get", "list", "watch"]
+  # Read RateLimit CRs so HTTPRouteRule ExtensionRef filters can be resolved
+  # into per-route rate-limiting config (#25). Read-only.
+  - apiGroups: ["coxswain-labs.dev"]
+    resources: ["ratelimits"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
       ["gatewayclasses", "gateways", "httproutes", "referencegrants", "backendtlspolicies"]

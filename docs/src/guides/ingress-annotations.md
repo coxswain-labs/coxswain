@@ -547,7 +547,7 @@ spec:
 Requests without credentials receive **401** with a `WWW-Authenticate: Basic realm="coxswain"` header. Invalid credentials also receive **401**.
 
 !!! tip "Hardening"
-    Credential hashes are zeroed from memory when the credential list is replaced at reconcile time (`zeroize`). For defense-in-depth: run the proxy pod with swap disabled (`/proc/sys/vm/swappiness=0`) and core dumps off (`ulimit -c 0` / `RLIMIT_CORE=0`), so hashes can't be recovered from a swap file or crash dump.
+    Credential hashes are zeroed from memory when the credential list is replaced at reconcile time (`zeroize`). The Helm chart already ships `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`, and `capabilities.drop: ALL` by default. For the remaining defense-in-depth, configure nodes with `vm.swappiness=0` so hashes can't be paged to disk — this is a node-level kernel parameter that Kubernetes cannot enforce per-pod.
 
 ## Class-level defaults
 
