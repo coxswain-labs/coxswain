@@ -28,6 +28,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/ssl-redirect-code` | integer | `308` | `"301"` |
 | `ingress.coxswain-labs.dev/backend-protocol` | string | `HTTP` | `"GRPC"` |
 | `ingress.coxswain-labs.dev/max-body-size` | size | _none_ | `"8m"` |
+| `ingress.coxswain-labs.dev/allow-source-range` | cidr-list | _none_ | `"10.0.0.0/8,192.168.1.0/24"` |
 
 ```yaml
 metadata:
@@ -305,6 +306,28 @@ Enforcement is two-layered and never buffers the whole body:
 - For chunked or streaming uploads (no `Content-Length`), the proxy counts bytes as they arrive and aborts with 413 the moment the running total crosses the limit.
 
 Omitting the annotation imposes no limit. An unparseable value (e.g. `"8mb"`, `"lots"`) emits a controller warning and is treated as absent — the route serves with no body cap rather than being rejected (**fail-open**).
+
+## `allow-source-range`
+
+Restricts the Ingress to a set of client source IPs. A request whose client IP falls outside **every** listed range is rejected with **403 Forbidden** before any upstream connection is opened — the equivalent of nginx-ingress's `whitelist-source-range`.
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/allow-source-range: "10.0.0.0/8,192.168.1.0/24"
+```
+
+The value is a comma-separated list of IPv4/IPv6 CIDR blocks. A bare address without a prefix (`10.0.0.1`, `2001:db8::1`) is accepted as a host route (`/32` / `/128`). Whitespace around entries is trimmed.
+
+**Which IP is matched.** When the proxy sits behind a load balancer speaking the [PROXY protocol](../reference/configuration.md) (`--proxy-accept-proxy-protocol`), the match uses the **real client IP** carried in the PROXY header. Otherwise it uses the L4 peer address of the connection. Deploy behind a PROXY-protocol-aware load balancer (or set `externalTrafficPolicy: Local`) so the proxy observes real client IPs rather than the LB's address.
+
+**Matching is strict.** CIDR membership is exact per address family — an IPv4-mapped IPv6 client (`::ffff:10.0.0.1`) does **not** match an IPv4 CIDR. List both families if your clients can arrive over either.
+
+**Failure handling:**
+
+- An invalid CIDR token emits a controller warning and is **skipped**; the remaining valid ranges still apply.
+- If **every** token is invalid (or the annotation is absent/empty), the allow-list is treated as absent — **all** source IPs are admitted (**fail-open** at parse time, so a typo never locks out all traffic).
+- Once an allow-list is in effect, a request whose source IP cannot be determined is **denied** (**fail-closed** at request time) — an un-attributable client must not pass a security control.
 
 ## Class-level defaults
 

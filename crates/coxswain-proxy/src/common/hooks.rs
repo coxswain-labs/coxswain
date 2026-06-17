@@ -120,24 +120,38 @@ pub(crate) async fn request_filter<K>(
         engine.find(port, &host, &path, &route_ctx)
     }; // route_ctx (and req borrow) drops here
 
-    let Some((
-        backend_group,
-        filters,
-        route_timeouts,
-        path_pattern,
-        metric_route_id,
-        max_body_size,
-    )) = resolve_outcome(session, &host, &path, outcome).await?
-    else {
+    let Some(m) = resolve_outcome(session, &host, &path, outcome).await? else {
         return Ok(true);
     };
 
-    let timeouts = merge_timeouts(&route_timeouts, default_timeouts);
+    // Per-route source-IP allow-list (ingress.coxswain-labs.dev/allow-source-range).
+    // Access control runs first — ahead of redirect and body handling — so an
+    // out-of-range client gets 403 and never receives a redirect (which would leak
+    // the canonical host/URL) nor has its body read. Match the *real* client IP:
+    // the PROXY-protocol peer when present, else the L4 downstream peer. Both are
+    // `Copy`; the CIDR scan borrows the `Arc`'d set — no per-request allocation.
+    if let Some(nets) = m.allow_source_range.as_deref() {
+        let client_ip = ctx.real_client_addr.map(|a| a.ip()).or_else(|| {
+            session
+                .as_downstream()
+                .client_addr()
+                .and_then(|a| a.as_inet())
+                .map(|a| a.ip())
+        });
+        if !ip_allowed(client_ip, nets) {
+            return Err(pingora_core::Error::explain(
+                HTTPStatus(403),
+                "client IP not in allow-list",
+            ));
+        }
+    }
+
+    let timeouts = merge_timeouts(&m.timeouts, default_timeouts);
     ctx.request_deadline = timeouts.request.map(|d| Instant::now() + d);
 
     if try_redirect(
         session,
-        &filters,
+        &m.filters,
         proto,
         &host,
         port,
@@ -154,8 +168,8 @@ pub(crate) async fn request_filter<K>(
     // 413 before opening any upstream connection. Streaming/chunked bodies that omit
     // `Content-Length` are capped mid-stream in `request_body_filter`. The limit is
     // stashed on the context for that later hook.
-    ctx.max_body_size = max_body_size;
-    if let Some(limit) = max_body_size
+    ctx.max_body_size = m.max_body_size;
+    if let Some(limit) = m.max_body_size
         && content_length(session).is_some_and(|len| len > limit)
     {
         return Err(pingora_core::Error::explain(
@@ -165,15 +179,26 @@ pub(crate) async fn request_filter<K>(
     }
 
     ctx.resolved = Some(ResolvedRoute {
-        backend_group,
-        filters,
+        backend_group: m.backend_group,
+        filters: m.filters,
         timeouts,
         original_host: host,
         original_path: path,
-        path_pattern,
-        metric_route_id,
+        path_pattern: m.path_pattern,
+        metric_route_id: m.metric_route_id,
     });
     Ok(false)
+}
+
+/// Returns `true` if `client_ip` is admitted by the CIDR allow-list `nets`.
+///
+/// Fail-closed: a `None` client IP (the peer could not be determined) is
+/// rejected — an un-attributable request must not pass a security allow-list.
+/// Matching is strict (no IPv4-mapped-IPv6 normalization), matching `ipnet`'s
+/// default and the `TrustedSources` PROXY-protocol check.
+#[must_use]
+pub(crate) fn ip_allowed(client_ip: Option<std::net::IpAddr>, nets: &[ipnet::IpNet]) -> bool {
+    client_ip.is_some_and(|ip| nets.iter().any(|n| n.contains(&ip)))
 }
 
 /// Read and parse the `Content-Length` request header, if present and valid.
@@ -716,4 +741,67 @@ pub(crate) async fn logging(
         error = err_msg.as_deref(),
         "access",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ip_allowed;
+    use std::net::IpAddr;
+
+    fn nets(cidrs: &[&str]) -> Vec<ipnet::IpNet> {
+        cidrs
+            .iter()
+            .map(|c| c.parse().expect("valid CIDR"))
+            .collect()
+    }
+
+    fn ip(s: &str) -> Option<IpAddr> {
+        Some(s.parse().expect("valid IP"))
+    }
+
+    #[test]
+    fn in_range_v4_allowed() {
+        assert!(ip_allowed(ip("10.1.2.3"), &nets(&["10.0.0.0/8"])));
+    }
+
+    #[test]
+    fn out_of_range_v4_rejected() {
+        assert!(!ip_allowed(ip("192.168.0.1"), &nets(&["10.0.0.0/8"])));
+    }
+
+    #[test]
+    fn in_range_v6_allowed() {
+        assert!(ip_allowed(ip("2001:db8::1"), &nets(&["2001:db8::/32"])));
+    }
+
+    #[test]
+    fn out_of_range_v6_rejected() {
+        assert!(!ip_allowed(ip("2001:dead::1"), &nets(&["2001:db8::/32"])));
+    }
+
+    #[test]
+    fn matches_second_cidr_in_list() {
+        assert!(ip_allowed(
+            ip("192.168.1.5"),
+            &nets(&["10.0.0.0/8", "192.168.1.0/24"])
+        ));
+    }
+
+    #[test]
+    fn missing_client_ip_is_rejected_fail_closed() {
+        // A peer we cannot attribute must never pass a security allow-list.
+        assert!(!ip_allowed(None, &nets(&["10.0.0.0/8"])));
+    }
+
+    #[test]
+    fn empty_allow_list_rejects_everything() {
+        assert!(!ip_allowed(ip("10.0.0.1"), &[]));
+    }
+
+    #[test]
+    fn v4_mapped_v6_does_not_match_v4_cidr() {
+        // Strict matching: an IPv4-mapped IPv6 client does NOT satisfy an IPv4 CIDR.
+        // Locks the documented behavior so leniency would be a deliberate change.
+        assert!(!ip_allowed(ip("::ffff:10.0.0.1"), &nets(&["10.0.0.0/8"])));
+    }
 }

@@ -21,6 +21,7 @@ coxswain-core = { workspace = true }
 futures = { workspace = true }
 gateway-api = { workspace = true }
 http = { workspace = true }
+ipnet = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 pingora-core = { workspace = true }

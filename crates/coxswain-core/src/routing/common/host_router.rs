@@ -10,17 +10,52 @@ use std::cmp::Reverse;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-/// Return type of `HostRouter::route`: backend group + filters + timeouts +
-/// path pattern + metric route id + optional max body size + optional error status.
-pub(super) type RouteMatch = (
-    Arc<BackendGroup>,
-    Arc<[FilterAction]>,
-    RouteTimeouts,
-    Arc<str>,
-    Arc<str>,
-    Option<u64>,
-    Option<u16>,
-);
+/// Resolved per-rule match payload returned by [`HostRouter::route`] and carried
+/// by [`RouteOutcome::Found`](super::table::RouteOutcome::Found).
+///
+/// Every field is either `Copy`, an `Arc` (clone = refcount bump), or a small
+/// `RouteTimeouts`, so building one on the hot path allocates nothing.
+/// `error_status` is `Some` only when the matched rule has an invalid/missing
+/// backend ref; [`PortRoutingTable::find`](super::port::PortRoutingTable) peels
+/// it off into [`RouteOutcome::Error`](super::table::RouteOutcome::Error), so it
+/// is always `None` once a `RouteMatch` is wrapped in `Found`.
+#[non_exhaustive]
+pub struct RouteMatch {
+    /// Backend group to forward matching requests to.
+    pub backend_group: Arc<BackendGroup>,
+    /// Filter actions applied to the request/response for this rule.
+    pub filters: Arc<[FilterAction]>,
+    /// Per-rule timeout overrides.
+    pub timeouts: RouteTimeouts,
+    /// Registered path pattern of the matched rule (for the access-log `pattern` mode).
+    pub path_pattern: Arc<str>,
+    /// Canonical metric/log identifier for the matched rule.
+    pub metric_route_id: Arc<str>,
+    /// Per-route request body size limit in bytes (`None` = unlimited).
+    pub max_body_size: Option<u64>,
+    /// Per-route source-IP allow-list (`None` = admit all source IPs).
+    pub allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    /// When `Some`, the proxy returns this status immediately without contacting
+    /// upstream (invalid/missing/forbidden backend ref). See the struct docs.
+    pub error_status: Option<u16>,
+}
+
+impl RouteMatch {
+    /// Build a `RouteMatch` from the matched entry, cloning the shared (`Arc`) and
+    /// `Copy` fields — a refcount bump per `Arc`, no heap allocation.
+    fn from_entry(entry: &RouteEntry) -> Self {
+        Self {
+            backend_group: Arc::clone(&entry.backend_group),
+            filters: Arc::clone(&entry.filters),
+            timeouts: entry.timeouts.clone(),
+            path_pattern: Arc::clone(&entry.path_pattern),
+            metric_route_id: Arc::clone(&entry.metric_route_id),
+            max_body_size: entry.max_body_size,
+            allow_source_range: entry.allow_source_range.clone(),
+            error_status: entry.error_status,
+        }
+    }
+}
 
 /// Compile a path pattern as a regular expression, the safe-compile guard for
 /// regex routes.
@@ -65,15 +100,7 @@ impl HostRouter {
         if let Ok(m) = self.router.at(path) {
             for entry in m.value.iter() {
                 if entry.predicates.matches(ctx) {
-                    return Some((
-                        Arc::clone(&entry.backend_group),
-                        Arc::clone(&entry.filters),
-                        entry.timeouts.clone(),
-                        Arc::clone(&entry.path_pattern),
-                        Arc::clone(&entry.metric_route_id),
-                        entry.max_body_size,
-                        entry.error_status,
-                    ));
+                    return Some(RouteMatch::from_entry(entry));
                 }
             }
         }
@@ -83,15 +110,7 @@ impl HostRouter {
             if set.is_match(path) {
                 for entry in entries.iter() {
                     if entry.predicates.matches(ctx) {
-                        return Some((
-                            Arc::clone(&entry.backend_group),
-                            Arc::clone(&entry.filters),
-                            entry.timeouts.clone(),
-                            Arc::clone(&entry.path_pattern),
-                            Arc::clone(&entry.metric_route_id),
-                            entry.max_body_size,
-                            entry.error_status,
-                        ));
+                        return Some(RouteMatch::from_entry(entry));
                     }
                 }
             }

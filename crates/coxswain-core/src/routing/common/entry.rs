@@ -787,6 +787,15 @@ pub struct RouteEntry {
     /// chunked bodies. `None` (the default, and the value for all Gateway-API routes)
     /// imposes no limit.
     pub max_body_size: Option<u64>,
+    /// IP allow-list (CIDR ranges) from the
+    /// `ingress.coxswain-labs.dev/allow-source-range` annotation.
+    ///
+    /// `Some(nets)` restricts the rule to requests whose real client IP matches at
+    /// least one CIDR; clients outside every range are rejected with 403 Forbidden.
+    /// `None` (the default, and the value for all Gateway-API routes) admits all
+    /// source IPs. Shared as an `Arc` so cloning into the lookup result is a
+    /// refcount bump, not a heap copy, on the hot path.
+    pub allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
 }
 
 impl RouteEntry {
@@ -807,6 +816,7 @@ impl RouteEntry {
             error_status: None,
             path_pattern: Arc::from(""),
             max_body_size: None,
+            allow_source_range: None,
         }
     }
 
@@ -828,6 +838,7 @@ impl RouteEntry {
             error_status: None,
             path_pattern: Arc::from(""),
             max_body_size: None,
+            allow_source_range: None,
         }
     }
 
@@ -854,6 +865,7 @@ impl RouteEntry {
             error_status: None,
             path_pattern: Arc::from(""),
             max_body_size: None,
+            allow_source_range: None,
         }
     }
 
@@ -883,6 +895,7 @@ impl RouteEntry {
             error_status: None,
             path_pattern: Arc::from(""),
             max_body_size: None,
+            allow_source_range: None,
         }
     }
 
@@ -943,6 +956,21 @@ impl RouteEntry {
         self.max_body_size = max_body_size;
         self
     }
+
+    /// Set the source-IP allow-list for this route (builder-style).
+    ///
+    /// Used by the Ingress reconciler to attach the CIDR set parsed from the
+    /// `ingress.coxswain-labs.dev/allow-source-range` annotation. `None` admits
+    /// all source IPs (the default). The reconciler shares one `Arc` across every
+    /// path of an Ingress, so cloning it onto each entry is a refcount bump.
+    #[must_use]
+    pub fn with_allow_source_range(
+        mut self,
+        allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    ) -> Self {
+        self.allow_source_range = allow_source_range;
+        self
+    }
 }
 
 // Lock the hot-path RouteEntry and BackendPool sizes to catch accidental growth.
@@ -951,7 +979,8 @@ impl RouteEntry {
 // Bumped 192→208 by adding metric_route_id: Arc<str> (16 bytes) for Prometheus `route` label and access-log `route_id` join key.
 // Bumped 208→256 by extending RouteTimeouts with connect/read/send: 3 × Option<Duration> (48 bytes) for Ingress annotation timeouts.
 // Bumped 256→272 by adding max_body_size: Option<u64> (16 bytes) for the ingress.coxswain-labs.dev/max-body-size request-body limit.
-static_assertions::assert_eq_size!(RouteEntry, [u8; 272]);
+// Bumped 272→280 by adding allow_source_range: Option<Arc<Vec<IpNet>>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/allow-source-range IP allow-list.
+static_assertions::assert_eq_size!(RouteEntry, [u8; 280]);
 // Hot type — review with the team before bumping this number.
 static_assertions::assert_eq_size!(BackendPool, [u8; 24]);
 
@@ -1144,7 +1173,8 @@ mod tests {
         // Bumped 192→208: metric_route_id: Arc<str> added for Prometheus `route` label.
         // Bumped 208→256: RouteTimeouts gained connect/read/send: 3×Option<Duration>.
         // Bumped 256→272: max_body_size: Option<u64> added for the max-body-size limit.
-        static_assertions::assert_eq_size!(RouteEntry, [u8; 272]);
+        // Bumped 272→280: allow_source_range: Option<Arc<Vec<IpNet>>> added for the allow-source-range IP allow-list.
+        static_assertions::assert_eq_size!(RouteEntry, [u8; 280]);
     }
 
     #[test]
@@ -1157,6 +1187,18 @@ mod tests {
     fn upstream_default_protocol_is_http1() {
         let u = BackendGroup::new("ns/svc".to_string(), vec![]);
         assert_eq!(u.protocol(), BackendProtocol::Http1);
+    }
+
+    #[test]
+    fn with_allow_source_range_round_trips() {
+        let group = Arc::new(BackendGroup::new("ns/svc".to_string(), vec![]));
+        let bare = RouteEntry::path_only(Arc::clone(&group), "ns/r".to_string(), None);
+        assert!(bare.allow_source_range.is_none());
+
+        let nets = Arc::new(vec!["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]);
+        let entry = RouteEntry::path_only(group, "ns/r".to_string(), None)
+            .with_allow_source_range(Some(Arc::clone(&nets)));
+        assert_eq!(entry.allow_source_range.as_deref(), Some(&*nets));
     }
 
     #[test]

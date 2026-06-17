@@ -7,8 +7,8 @@
 //! [`crate::routing::gateway`][crate::routing::gateway] sub-modules instantiate
 //! this generic via type aliases and supply the marker types.
 
-use super::entry::{BackendGroup, FilterAction, RouteConflict, RouteTimeouts};
-use super::host_router::HostRouter;
+use super::entry::{BackendGroup, RouteConflict};
+use super::host_router::{HostRouter, RouteMatch};
 use super::port::{PortRoutingTable, PortTableBuilder};
 use super::predicate::RequestContext;
 use std::collections::HashMap;
@@ -30,22 +30,11 @@ pub enum RouterError {
 /// Result of a two-level host+path routing lookup.
 #[non_exhaustive]
 pub enum RouteOutcome {
-    /// Route matched; tuple is `(backend_group, filters, timeouts, path_pattern,
-    /// metric_route_id, max_body_size)`.
-    ///
-    /// `path_pattern` is the matched rule's registered pattern (for the
-    /// access-log `pattern` mode) and `metric_route_id` is the canonical
-    /// rule identifier emitted as the `route` Prometheus label and the
-    /// `route_id` access-log field. `max_body_size` is the per-route request
-    /// body limit in bytes (`None` = unlimited), enforced by the proxy.
-    Found(
-        Arc<BackendGroup>,
-        Arc<[FilterAction]>,
-        RouteTimeouts,
-        Arc<str>,
-        Arc<str>,
-        Option<u64>,
-    ),
+    /// Route matched; the [`RouteMatch`] carries the backend group, filters,
+    /// timeouts, path pattern, metric route id, max body size, and source-IP
+    /// allow-list for the matched rule. Its `error_status` is always `None`
+    /// here — an invalid/missing backend ref becomes [`RouteOutcome::Error`].
+    Found(RouteMatch),
     /// Route matched but backend is invalid/missing/forbidden — return this status immediately.
     Error(u16),
     /// No entry for this hostname (host is not registered at this proxy).

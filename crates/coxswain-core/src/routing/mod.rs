@@ -18,7 +18,9 @@ pub use common::entry::{
     RetryPolicy, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts, UpstreamCa,
     UpstreamTls, parse_app_protocol,
 };
-pub use common::host_router::{HostRouter, HostRouterBuilder, WildcardKind, compile_path_regex};
+pub use common::host_router::{
+    HostRouter, HostRouterBuilder, RouteMatch, WildcardKind, compile_path_regex,
+};
 pub use common::port::PortTableBuilder;
 pub use common::predicate::{
     HeaderPredicate, MatchPredicates, QueryPredicate, RequestContext, ValueMatch,

@@ -1,10 +1,11 @@
 //! Annotation key constants and parser for the `ingress.coxswain-labs.dev/*` namespace.
 //!
-//! The module is split into three domain submodules re-exported here:
+//! The module is split into domain submodules re-exported here:
 //!
 //! - [`traffic_policy`] — timeout, retry, and backend-protocol annotations.
 //! - [`routing`] — path rewrite and regex opt-in annotations.
 //! - [`filters`] — request/response header modifiers, redirect, and ssl-redirect annotations.
+//! - [`security`] — edge access control (source-IP allow-list).
 //!
 //! The top-level [`IngressAnnotations::parse`] function is called once per Ingress in
 //! [`super::reconcile`] and threads the results into every rule/path entry.
@@ -17,10 +18,12 @@
 
 mod filters;
 mod routing;
+mod security;
 mod traffic_policy;
 
 pub use filters::*;
 pub use routing::*;
+pub use security::*;
 pub use traffic_policy::*;
 
 use coxswain_core::routing::{
@@ -103,6 +106,9 @@ pub(super) struct IngressAnnotations {
     /// Per-route request body size limit in bytes from `max-body-size` (#263).
     /// `None` (the default, or an unparseable value) imposes no limit.
     pub max_body_size: Option<u64>,
+    /// Source-IP allow-list (CIDR set) from `allow-source-range` (#264).
+    /// `None` (the default, or an all-invalid/absent value) admits all source IPs.
+    pub allow_source_range: Option<Vec<ipnet::IpNet>>,
 }
 
 impl IngressAnnotations {
@@ -351,6 +357,9 @@ impl IngressAnnotations {
             n
         });
 
+        // ── Allow-source-range (#264) ─────────────────────────────────────────
+        let allow_source_range = get(ann, ALLOW_SOURCE_RANGE).and_then(parse_allow_source_range);
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -369,6 +378,7 @@ impl IngressAnnotations {
             ssl_redirect,
             ssl_redirect_code,
             max_body_size,
+            allow_source_range,
         }
     }
 }
