@@ -55,7 +55,7 @@ pub use metrics::{MetricsPrefix, ReflectorMetrics};
 pub use reconciler::{
     ControllerReconciler, DedicatedConfig, DedicatedOutputs, DedicatedProxyReconciler,
     IngressDefaultBackend, IngressDefaultBackendParseError, ReconcilerHealth, ReconcilerOptions,
-    ReconcilerOutputs, SharedProxyReconciler,
+    ReconcilerOutputs, SharedProxyReconciler, StatusSubscriptions,
 };
 pub use tls::{
     GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, SharedBackendTlsPolicyHealth,

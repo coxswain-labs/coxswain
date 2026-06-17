@@ -8,7 +8,7 @@
 use coxswain_core::ownership::{self, ObjectKey};
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
-use coxswain_reflector::gw_types::v::httproutes::{HTTPRoute, HttpRouteParentRefs};
+use coxswain_reflector::gw_types::v::httproutes::HttpRouteParentRefs;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use std::collections::HashSet;
 
@@ -52,40 +52,6 @@ pub(super) fn gateway_programmed(gw: &Gateway) -> bool {
     )
 }
 
-pub(super) fn http_route_programmed(
-    route: &HTTPRoute,
-    controller_name: &str,
-    owned_gateways: &HashSet<ObjectKey>,
-) -> bool {
-    let default_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-    let expected_gen = route.metadata.generation.unwrap_or(0);
-    route
-        .status
-        .as_ref()
-        .map(|s| {
-            s.parents.iter().any(|p| {
-                p.controller_name == controller_name
-                    && p.conditions.iter().any(|c| {
-                        c.type_ == "Programmed"
-                            && c.observed_generation.unwrap_or(0) >= expected_gen
-                    })
-                    && p.conditions.iter().any(|c| {
-                        c.type_ == "ResolvedRefs"
-                            && c.observed_generation.unwrap_or(0) >= expected_gen
-                    })
-                    && ownership::parent_ref_owned(
-                        p.parent_ref.group.as_deref(),
-                        p.parent_ref.kind.as_deref(),
-                        p.parent_ref.namespace.as_deref(),
-                        &p.parent_ref.name,
-                        default_ns,
-                        owned_gateways,
-                    )
-            })
-        })
-        .unwrap_or(false)
-}
-
 /// Returns the subset of `parent_refs` that point to a Coxswain-managed Gateway.
 pub(super) fn filter_owned_parent_refs(
     parent_refs: &[HttpRouteParentRefs],
@@ -112,16 +78,12 @@ pub(super) fn filter_owned_parent_refs(
 mod tests {
     use super::{
         filter_owned_parent_refs, gateway_accepted, gateway_class_accepted, gateway_programmed,
-        has_condition, http_route_programmed, make_condition,
+        has_condition, make_condition,
     };
     use coxswain_core::ownership::ObjectKey;
-    use coxswain_reflector::gw_types::HttpRoute;
     use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassStatus};
     use gateway_api::apis::standard::gateways::{Gateway, GatewayStatus};
-    use gateway_api::apis::standard::httproutes::{
-        HttpRouteParentRefs, HttpRouteStatus, HttpRouteStatusParents,
-        HttpRouteStatusParentsParentRef,
-    };
+    use gateway_api::apis::standard::httproutes::HttpRouteParentRefs;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use kube::api::ObjectMeta;
     use std::collections::HashSet;
@@ -216,51 +178,6 @@ mod tests {
     }
 
     #[test]
-    fn http_route_not_programmed_when_resolved_refs_missing() {
-        // has Programmed=True but no ResolvedRefs — must not be considered programmed
-        let route = gateway_api::apis::standard::httproutes::HTTPRoute {
-            metadata: ObjectMeta {
-                namespace: Some("default".to_string()),
-                ..Default::default()
-            },
-            status: Some(HttpRouteStatus {
-                parents: vec![HttpRouteStatusParents {
-                    controller_name: "my-ctrl".to_string(),
-                    conditions: vec![make_condition("Programmed", "True", "ok", "", 0, now())],
-                    parent_ref: HttpRouteStatusParentsParentRef {
-                        name: "gw".to_string(),
-                        namespace: Some("default".to_string()),
-                        ..Default::default()
-                    },
-                }],
-            }),
-            ..Default::default()
-        };
-        assert!(!http_route_programmed(
-            &route,
-            "my-ctrl",
-            &owned("default", "gw")
-        ));
-    }
-
-    #[test]
-    fn http_route_not_programmed_when_no_status() {
-        let route = gateway_api::apis::standard::httproutes::HTTPRoute {
-            metadata: ObjectMeta {
-                namespace: Some("default".to_string()),
-                ..Default::default()
-            },
-            status: None,
-            ..Default::default()
-        };
-        assert!(!http_route_programmed(
-            &route,
-            "my-ctrl",
-            &owned("default", "gw")
-        ));
-    }
-
-    #[test]
     fn filter_owned_empty_input_returns_empty() {
         let set = owned("default", "gw");
         assert!(filter_owned_parent_refs(&[], "default", &set).is_empty());
@@ -324,81 +241,6 @@ mod tests {
             ..Default::default()
         };
         assert!(!gateway_class_accepted(&gc));
-    }
-
-    #[test]
-    fn http_route_programmed_for_matching_controller_and_owned_parent() {
-        let set = owned_pairs(&[("default", "gw")]);
-        let route = HttpRoute {
-            metadata: kube::api::ObjectMeta {
-                namespace: Some("default".to_string()),
-                ..Default::default()
-            },
-            status: Some(HttpRouteStatus {
-                parents: vec![HttpRouteStatusParents {
-                    controller_name: "my-controller".to_string(),
-                    conditions: vec![
-                        stub_condition("Programmed", "True"),
-                        stub_condition("ResolvedRefs", "True"),
-                    ],
-                    parent_ref: HttpRouteStatusParentsParentRef {
-                        name: "gw".to_string(),
-                        namespace: Some("default".to_string()),
-                        ..Default::default()
-                    },
-                }],
-            }),
-            ..Default::default()
-        };
-        assert!(http_route_programmed(&route, "my-controller", &set));
-    }
-
-    #[test]
-    fn http_route_not_programmed_for_different_controller() {
-        let set = owned_pairs(&[("default", "gw")]);
-        let route = HttpRoute {
-            metadata: kube::api::ObjectMeta {
-                namespace: Some("default".to_string()),
-                ..Default::default()
-            },
-            status: Some(HttpRouteStatus {
-                parents: vec![HttpRouteStatusParents {
-                    controller_name: "other-controller".to_string(),
-                    conditions: vec![stub_condition("Programmed", "True")],
-                    parent_ref: HttpRouteStatusParentsParentRef {
-                        name: "gw".to_string(),
-                        namespace: Some("default".to_string()),
-                        ..Default::default()
-                    },
-                }],
-            }),
-            ..Default::default()
-        };
-        assert!(!http_route_programmed(&route, "my-controller", &set));
-    }
-
-    #[test]
-    fn http_route_not_programmed_when_parent_not_owned() {
-        let set = owned_pairs(&[("default", "gw")]);
-        let route = HttpRoute {
-            metadata: kube::api::ObjectMeta {
-                namespace: Some("default".to_string()),
-                ..Default::default()
-            },
-            status: Some(HttpRouteStatus {
-                parents: vec![HttpRouteStatusParents {
-                    controller_name: "my-controller".to_string(),
-                    conditions: vec![stub_condition("Programmed", "True")],
-                    parent_ref: HttpRouteStatusParentsParentRef {
-                        name: "envoy-gateway".to_string(),
-                        namespace: Some("default".to_string()),
-                        ..Default::default()
-                    },
-                }],
-            }),
-            ..Default::default()
-        };
-        assert!(!http_route_programmed(&route, "my-controller", &set));
     }
 
     #[test]

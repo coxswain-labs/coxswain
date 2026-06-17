@@ -14,7 +14,7 @@
 //! per-role arg validation — defense in depth for the read-only-proxy
 //! invariant.
 
-use crate::{Controller, ControllerConfig};
+use crate::{Controller, ControllerConfig, StatusHealthChannels};
 use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::OwnedGateways;
@@ -163,6 +163,10 @@ pub fn spawn_status_writer(
             opts.ingress_ports = ingress_ports;
             opts.metrics_prefix = coxswain_reflector::MetricsPrefix::Controller;
             opts.watch_fleet = true;
+            // Back the status-relevant stores with shared informers so the
+            // status-writer's work-queues reuse them instead of duplicating
+            // watches (#347).
+            opts.status_subscriptions = true;
             opts
         },
     );
@@ -170,13 +174,22 @@ pub fn spawn_status_writer(
     let route_health: SharedHttpRouteHealth = reconciler.route_health();
     let policy_health: SharedBackendTlsPolicyHealth = reconciler.policy_health();
 
+    // Take the shared-informer subscriptions the reconciler created (it must
+    // hand them over since we set `status_subscriptions = true` above).
+    let subscriptions = reconciler.status_subscriptions().unwrap_or_else(|| {
+        panic!("invariant: reconciler built with status_subscriptions must yield subscriptions")
+    });
+
     let controller_svc = Controller::new(
         health,
         leader.clone(),
         owned_gateways,
-        gateway_tls_health,
-        route_health,
-        policy_health,
+        StatusHealthChannels {
+            tls: gateway_tls_health,
+            route: route_health,
+            policy: policy_health,
+        },
+        subscriptions,
         controller,
     );
 

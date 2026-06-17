@@ -59,7 +59,13 @@ itoa               = { version = "1" }
 # stable CRDs. This feature is for contributor/CI/preview builds ONLY —
 # release images are always built without it. See docs/guides/gateway-api.md.
 k8s-openapi        = { version = "0.27", features = ["latest", "schemars"] }
-kube               = { version = "3.1", features = ["runtime", "derive", "client"] }
+# `unstable-runtime` exposes the shared-store API (`store_shared`,
+# `Writer::subscribe`, `Controller::for_shared_stream`) the controller's
+# status-writer uses to drive its reconcile work-queues off the reflector's
+# informers without duplicating watches (#347). It is an unstable kube surface
+# pinned to the 3.1 line (kube 4 is currently blocked by gateway-api lacking a
+# kube-4 release).
+kube               = { version = "3.1", features = ["runtime", "derive", "client", "unstable-runtime"] }
 kube-leader-election = { version = "0.43" }
 matchit            = { version = "0.9" }
 nix                = { version = "0.31", features = ["signal", "process"] }

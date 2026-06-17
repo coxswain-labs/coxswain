@@ -17,6 +17,7 @@ mod status_writer;
 
 pub use controller::{
     Controller, ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress,
+    StatusHealthChannels,
 };
 pub use operator::{Operator, OperatorConfig};
 pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writer};
