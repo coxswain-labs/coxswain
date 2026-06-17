@@ -11,7 +11,7 @@ use thiserror::Error;
 /// Parsed from `--status-address` at startup: if the value is a valid
 /// `IpAddr` it becomes `Ip`, otherwise it is treated as a DNS hostname.
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum StatusAddress {
     /// A bare IP address written to `.ip` in the status block.
     Ip(IpAddr),

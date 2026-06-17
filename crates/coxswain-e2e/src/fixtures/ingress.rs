@@ -8,6 +8,10 @@ macro_rules! fixture {
 
 /// Ingress with path-based routing rules.
 pub const PATH_MATCHING: &str = fixture!("path_matching.yaml");
+/// Two Ingresses: one claiming our `coxswain` class (owned) and one claiming a
+/// foreign class (unowned). Exercises the status-writer ownership negative —
+/// the foreign Ingress must never receive a `loadBalancer` status patch.
+pub const FOREIGN_CLASS: &str = fixture!("foreign_class.yaml");
 /// Ingress with a `spec.defaultBackend` alongside normal rules.
 pub const DEFAULT_BACKEND: &str = fixture!("default_backend.yaml");
 /// Ingress with only `spec.defaultBackend` and no rules.

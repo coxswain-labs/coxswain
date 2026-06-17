@@ -56,7 +56,7 @@ use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::{
     Client,
     api::Api,
-    runtime::{WatchStreamExt, reflector, watcher},
+    runtime::{WatchStreamExt, reflector, reflector::ReflectHandle, watcher},
 };
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
@@ -143,6 +143,13 @@ pub struct ReconcilerOptions {
     /// on every change. Must only be set to `true` for the controller role — the
     /// shared-proxy ServiceAccount does not hold pod-read RBAC.
     pub watch_fleet: bool,
+    /// When `true`, back the status-relevant stores (`Gateway`, `GatewayClass`,
+    /// `HTTPRoute`, `Ingress`, `IngressClass`, `BackendTLSPolicy`) with shared
+    /// informers and expose [`StatusSubscriptions`] so the controller's
+    /// status-writer can drive its reconcile work-queues off the reflector's
+    /// stores without duplicating watches (#347). Controller role only — the
+    /// proxy role never writes status and leaves this `false`.
+    pub status_subscriptions: bool,
 }
 
 impl Default for ReconcilerOptions {
@@ -153,9 +160,18 @@ impl Default for ReconcilerOptions {
             ingress_ports: IngressPorts::default(),
             metrics_prefix: crate::MetricsPrefix::Proxy,
             watch_fleet: false,
+            status_subscriptions: false,
         }
     }
 }
+
+/// Broadcast buffer depth for the status-writer's shared-store subscriptions.
+///
+/// A shared-store applied event clears the dispatcher buffer only once **every**
+/// subscriber has consumed it, so a lagging status reconcile back-pressures the
+/// root reflector (and thus `rebuild`). Sized generously to absorb bursts (e.g.
+/// a rolling deploy touching many Gateways) without stalling the reflector.
+const STATUS_SUBSCRIBE_BUFFER: usize = 256;
 
 /// Health-registry handles consumed by the [`SharedProxyReconciler`].
 ///
@@ -203,6 +219,13 @@ pub struct SharedProxyReconciler {
     health: ReconcilerHealth,
     controller_name: String,
     opts: ReconcilerOptions,
+    /// Shared-store writers (status-relevant types) pre-created in `new` when
+    /// `opts.status_subscriptions` is set; taken by `start` and moved into
+    /// `spawn_tasks`. `None` when status subscriptions are disabled.
+    status_store_writers: std::sync::Mutex<Option<StatusStoreWriters>>,
+    /// The subscriptions matching `status_store_writers`, taken once by
+    /// [`SharedProxyReconciler::status_subscriptions`].
+    status_subscriptions: std::sync::Mutex<Option<StatusSubscriptions>>,
 }
 
 /// The `Shared<T>` outputs the [`SharedProxyReconciler`] writes into on each rebuild.
@@ -245,6 +268,46 @@ impl ReconcilerOutputs {
     }
 }
 
+/// Shared-store subscriptions the controller's status-writer consumes to drive
+/// its reconcile work-queues off the reflector's informers (#347).
+///
+/// Each [`ReflectHandle`] is simultaneously a `Stream<Item = Arc<K>>` of applied
+/// objects (the work-queue trigger) and a handle to the synced store via
+/// [`ReflectHandle::reader`]. The handles are independent broadcast subscribers:
+/// `clone()` one to feed a second consumer (e.g. a primary trigger plus a
+/// secondary `watches_shared_stream` on another Controller). Obtained once from
+/// [`SharedProxyReconciler::status_subscriptions`].
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct StatusSubscriptions {
+    /// Applied-`Gateway` stream + reader.
+    pub gateways: ReflectHandle<Gateway>,
+    /// Applied-`GatewayClass` stream + reader.
+    pub gateway_classes: ReflectHandle<GatewayClass>,
+    /// Applied-`HTTPRoute` stream + reader.
+    pub routes: ReflectHandle<HttpRoute>,
+    /// Applied-`Ingress` stream + reader.
+    pub ingresses: ReflectHandle<Ingress>,
+    /// Applied-`IngressClass` stream + reader.
+    pub ingress_classes: ReflectHandle<IngressClass>,
+    /// Applied-`BackendTLSPolicy` stream + reader.
+    pub policies: ReflectHandle<BackendTlsPolicy>,
+}
+
+/// Pre-created shared-store writers for the status-relevant types.
+///
+/// Built in [`SharedProxyReconciler::new`] (so the matching
+/// [`StatusSubscriptions`] exist at wiring time, before `start`), stashed behind
+/// a `Mutex`, and moved into [`spawn_tasks`] on `start` to drive the reflectors.
+struct StatusStoreWriters {
+    gateways: reflector::store::Writer<Gateway>,
+    gateway_classes: reflector::store::Writer<GatewayClass>,
+    routes: reflector::store::Writer<HttpRoute>,
+    ingresses: reflector::store::Writer<Ingress>,
+    ingress_classes: reflector::store::Writer<IngressClass>,
+    policies: reflector::store::Writer<BackendTlsPolicy>,
+}
+
 impl SharedProxyReconciler {
     /// Construct a new reconciler (does not start the watch loop).
     ///
@@ -267,6 +330,56 @@ impl SharedProxyReconciler {
             tls_health,
             cluster_summary,
         } = outputs;
+        // When the controller role asks for status subscriptions, back the
+        // status-relevant stores with shared informers now (sync) so the
+        // matching subscriptions exist before `start` runs and can be handed to
+        // the status-writer at wiring time. `subscribe()` is infallible here:
+        // the writer comes from `store_shared`, which always carries a
+        // dispatcher.
+        let (status_store_writers, status_subscriptions) = if opts.status_subscriptions {
+            let (_, gateways) = reflector::store_shared::<Gateway>(STATUS_SUBSCRIBE_BUFFER);
+            let (_, gateway_classes) =
+                reflector::store_shared::<GatewayClass>(STATUS_SUBSCRIBE_BUFFER);
+            let (_, routes) = reflector::store_shared::<HttpRoute>(STATUS_SUBSCRIBE_BUFFER);
+            let (_, ingresses) = reflector::store_shared::<Ingress>(STATUS_SUBSCRIBE_BUFFER);
+            let (_, ingress_classes) =
+                reflector::store_shared::<IngressClass>(STATUS_SUBSCRIBE_BUFFER);
+            let (_, policies) =
+                reflector::store_shared::<BackendTlsPolicy>(STATUS_SUBSCRIBE_BUFFER);
+            let subs = StatusSubscriptions {
+                gateways: gateways.subscribe().unwrap_or_else(|| {
+                    panic!("invariant: store_shared writer must yield a Gateway subscriber")
+                }),
+                gateway_classes: gateway_classes.subscribe().unwrap_or_else(|| {
+                    panic!("invariant: store_shared writer must yield a GatewayClass subscriber")
+                }),
+                routes: routes.subscribe().unwrap_or_else(|| {
+                    panic!("invariant: store_shared writer must yield an HTTPRoute subscriber")
+                }),
+                ingresses: ingresses.subscribe().unwrap_or_else(|| {
+                    panic!("invariant: store_shared writer must yield an Ingress subscriber")
+                }),
+                ingress_classes: ingress_classes.subscribe().unwrap_or_else(|| {
+                    panic!("invariant: store_shared writer must yield an IngressClass subscriber")
+                }),
+                policies: policies.subscribe().unwrap_or_else(|| {
+                    panic!(
+                        "invariant: store_shared writer must yield a BackendTLSPolicy subscriber"
+                    )
+                }),
+            };
+            let writers = StatusStoreWriters {
+                gateways,
+                gateway_classes,
+                routes,
+                ingresses,
+                ingress_classes,
+                policies,
+            };
+            (Some(writers), Some(subs))
+        } else {
+            (None, None)
+        };
         Self {
             ingress_routes,
             gateway_routes,
@@ -281,7 +394,21 @@ impl SharedProxyReconciler {
             health,
             controller_name,
             opts,
+            status_store_writers: std::sync::Mutex::new(status_store_writers),
+            status_subscriptions: std::sync::Mutex::new(status_subscriptions),
         }
+    }
+
+    /// Take the status-writer subscriptions, if this reconciler was built with
+    /// [`ReconcilerOptions::status_subscriptions`]. Returns `Some` exactly once
+    /// (the handles are independent broadcast subscribers and must not be left
+    /// undrained on the reconciler, which would back-pressure the stores); a
+    /// second call — or any call on a proxy-role reconciler — returns `None`.
+    pub fn status_subscriptions(&self) -> Option<StatusSubscriptions> {
+        self.status_subscriptions
+            .lock()
+            .unwrap_or_else(|e| panic!("invariant: status_subscriptions mutex poisoned: {e}"))
+            .take()
     }
 
     /// Returns the shared route health handle so other services (e.g. the Controller)
@@ -475,7 +602,15 @@ impl BackgroundService for SharedProxyReconciler {
             controller_health: self.health.controller.clone(),
             proxy_health: self.health.proxy.clone(),
         };
-        let mut set = spawn_tasks(client, handles, config).await;
+        // Hand the pre-created shared-store writers (if any) to the watch
+        // tasks. Taken here so `spawn_tasks` drives the same stores the
+        // status-writer subscribed to in `new`.
+        let status_writers = self
+            .status_store_writers
+            .lock()
+            .unwrap_or_else(|e| panic!("invariant: status_store_writers mutex poisoned: {e}"))
+            .take();
+        let mut set = spawn_tasks(client, handles, config, status_writers).await;
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
@@ -511,10 +646,28 @@ struct SharedHandles {
     proxy_health: SubsystemHandle,
 }
 
+/// Resolve a `(reader, writer)` pair for a reflector store: reuse a shared
+/// writer pre-created in [`SharedProxyReconciler::new`] (its reader is the same
+/// synced store the status-writer subscribed to), or create a fresh
+/// non-shared store when status subscriptions are disabled.
+fn reader_writer<K>(
+    pre: Option<reflector::store::Writer<K>>,
+) -> (reflector::Store<K>, reflector::store::Writer<K>)
+where
+    K: kube::Resource + Clone + 'static,
+    K::DynamicType: Eq + std::hash::Hash + Clone + Default,
+{
+    match pre {
+        Some(writer) => (writer.as_reader(), writer),
+        None => reflector::store::<K>(),
+    }
+}
+
 async fn spawn_tasks(
     client: Client,
     handles: SharedHandles,
     config: ReconcilerConfig,
+    status_writers: Option<StatusStoreWriters>,
 ) -> JoinSet<()> {
     let SharedHandles {
         ingress_routes,
@@ -538,18 +691,40 @@ async fn spawn_tasks(
         metrics,
         watch_fleet,
     } = config;
-    let (route_reader, route_writer) = reflector::store::<HttpRoute>();
-    let (ingress_reader, ingress_writer) = reflector::store::<Ingress>();
-    let (class_reader, class_writer) = reflector::store::<IngressClass>();
+    // Status-relevant stores reuse the shared writers pre-created in `new` (so
+    // the status-writer's subscriptions observe the same synced stores); the
+    // rest are always fresh non-shared stores.
+    let (
+        pre_routes,
+        pre_ingresses,
+        pre_ingress_classes,
+        pre_gateways,
+        pre_gateway_classes,
+        pre_policies,
+    ) = match status_writers {
+        Some(w) => (
+            Some(w.routes),
+            Some(w.ingresses),
+            Some(w.ingress_classes),
+            Some(w.gateways),
+            Some(w.gateway_classes),
+            Some(w.policies),
+        ),
+        None => (None, None, None, None, None, None),
+    };
+    let (route_reader, route_writer) = reader_writer::<HttpRoute>(pre_routes);
+    let (ingress_reader, ingress_writer) = reader_writer::<Ingress>(pre_ingresses);
+    let (class_reader, class_writer) = reader_writer::<IngressClass>(pre_ingress_classes);
     let (class_params_reader, class_params_writer) =
         reflector::store::<CoxswainIngressClassParameters>();
-    let (gateway_reader, gateway_writer) = reflector::store::<Gateway>();
-    let (gateway_class_reader, gateway_class_writer) = reflector::store::<GatewayClass>();
+    let (gateway_reader, gateway_writer) = reader_writer::<Gateway>(pre_gateways);
+    let (gateway_class_reader, gateway_class_writer) =
+        reader_writer::<GatewayClass>(pre_gateway_classes);
     let (slice_reader, slice_writer) = reflector::store::<EndpointSlice>();
     let (grant_reader, grant_writer) = reflector::store::<ReferenceGrant>();
     let (secret_reader, secret_writer) = reflector::store::<Secret>();
     let (service_reader, service_writer) = reflector::store::<Service>();
-    let (policy_reader, policy_writer) = reflector::store::<BackendTlsPolicy>();
+    let (policy_reader, policy_writer) = reader_writer::<BackendTlsPolicy>(pre_policies);
     let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();

@@ -1,0 +1,48 @@
+# Foreign-IngressClass ownership negative fixture.
+#
+# Two Ingresses in the same namespace:
+#   owned-ingress   → ingressClassName: coxswain         (we own it → LB status patched)
+#   foreign-ingress → ingressClassName: not-coxswain     (unowned   → never patched)
+#
+# `not-coxswain` need not exist as an IngressClass object: ownership is decided
+# by whether the claimed class name appears among the IngressClasses whose
+# spec.controller is ours. The owned Ingress is the positive control proving the
+# status writer is live and patching this namespace; the foreign one proves it
+# leaves unowned Ingresses untouched.
+# TESTNS is substituted with the test namespace at runtime.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: owned-ingress
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: owned.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: foreign-ingress
+spec:
+  ingressClassName: not-coxswain
+  rules:
+    - host: foreign.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
