@@ -14,7 +14,6 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct NamespaceGuard {
     /// Name of the created namespace.
     pub name: String,
-    client: Client,
 }
 
 impl NamespaceGuard {
@@ -63,35 +62,35 @@ impl NamespaceGuard {
         let api: Api<Namespace> = Api::all(client.clone());
         api.create(&PostParams::default(), &ns).await?;
         tracing::debug!(namespace = %name, "created test namespace");
-        Ok(Self {
-            name,
-            client: client.clone(),
-        })
+        Ok(Self { name })
     }
 }
 
 impl Drop for NamespaceGuard {
     fn drop(&mut self) {
-        // Delete the namespace synchronously on its own thread+runtime.
-        //
-        // `#[tokio::test]` builds a current-thread runtime that is torn down the
-        // instant the test function returns. A `tokio::spawn`ed deletion is
-        // therefore dropped before it ever issues the DELETE, so namespaces (and
-        // their pods) accumulate across the entire parallel pass and exhaust the
-        // node — the last-scheduled tests then fail to schedule their backends.
-        // Running the delete to completion on an independent runtime guarantees
-        // every test reaps its namespace. Use
-        // `kubectl delete ns -l coxswain-e2e=true` to clean up after an interrupt.
-        delete_resource::<Namespace>(self.client.clone(), self.name.clone(), "namespace");
+        // Use `kubectl delete ns -l coxswain-e2e=true` to clean up after an interrupt.
+        delete_resource::<Namespace>(self.name.clone(), "namespace");
     }
 }
 
 /// Issue a blocking `DELETE` for a cluster-scoped resource on a dedicated
-/// thread+runtime, so cleanup completes regardless of the calling test's
-/// runtime teardown state (see [`NamespaceGuard`]'s `Drop`). Errors are ignored:
-/// a failed delete is backstopped by the bootstrap's label-purge, and a guard's
-/// `Drop` must not panic.
-fn delete_resource<K>(client: Client, name: String, kind: &'static str)
+/// thread that owns a fresh runtime *and* a fresh kube `Client`.
+///
+/// Two footguns this navigates, both rooted in `#[tokio::test]` building a
+/// current-thread runtime that is torn down the instant the test fn returns:
+///
+/// 1. A `tokio::spawn`ed deletion in `Drop` is dropped before it ever issues the
+///    DELETE — cleanup silently never runs, so namespaces (and their pods)
+///    accumulate across the whole parallel pass and exhaust the node.
+/// 2. A kube `Client`'s hyper connection pool is bound to the runtime it was
+///    built on. Driving the test's client from another runtime leaves its IO
+///    registered on a reactor nobody polls, so the request hangs forever. Hence
+///    a brand-new client is constructed *inside* this runtime.
+///
+/// The thread is `join`ed so the DELETE completes before the (process-per-test)
+/// test process exits. Errors are logged, not propagated: a failed delete is
+/// backstopped by the bootstrap's label-purge, and a guard's `Drop` must not panic.
+fn delete_resource<K>(name: String, kind: &'static str)
 where
     K: kube::Resource<Scope = k8s_openapi::ClusterResourceScope>
         + Clone
@@ -111,6 +110,14 @@ where
             }
         };
         rt.block_on(async move {
+            // Fresh client bound to THIS runtime — see footgun #2 above.
+            let client = match Client::try_default().await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, kind, %name, "could not build cleanup client");
+                    return;
+                }
+            };
             let api: Api<K> = Api::all(client);
             match api.delete(&name, &DeleteParams::default()).await {
                 Ok(_) => tracing::debug!(kind, %name, "deleted test resource"),
@@ -123,28 +130,22 @@ where
 
 /// RAII guard for a cluster-scoped `IngressClass`. Deletes the IngressClass on
 /// drop so test-only classes don't leak between runs.
-/// RAII guard for a cluster-scoped `IngressClass`. Deletes the IngressClass on
-/// drop so test-only classes don't leak between runs.
 pub struct IngressClassGuard {
     /// Name of the created IngressClass.
     pub name: String,
-    client: Client,
 }
 
 impl IngressClassGuard {
     /// Wrap an existing `IngressClass` name in a drop guard (does not create it).
-    pub fn new(client: &Client, name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            client: client.clone(),
-        }
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
     }
 }
 
 impl Drop for IngressClassGuard {
     fn drop(&mut self) {
-        // Synchronous cleanup on an independent runtime — see [`NamespaceGuard`]'s
-        // `Drop` for why a `tokio::spawn` here would silently never run.
-        delete_resource::<IngressClass>(self.client.clone(), self.name.clone(), "ingressclass");
+        // Synchronous cleanup on an independent runtime — see [`delete_resource`]
+        // for why a `tokio::spawn` here would silently never run.
+        delete_resource::<IngressClass>(self.name.clone(), "ingressclass");
     }
 }

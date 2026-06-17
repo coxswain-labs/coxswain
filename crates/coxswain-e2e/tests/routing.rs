@@ -261,7 +261,7 @@ async fn default_ingress_class_claims_unannotated_ingress() -> anyhow::Result<()
     // Create a uniquely-named default IngressClass scoped to this test run.
     // The guard deletes it on drop so the cluster-scoped resource doesn't leak.
     let ic_name = format!("coxswain-default-{}", ns.name);
-    let _ic_guard = IngressClassGuard::new(&h.client, &ic_name);
+    let _ic_guard = IngressClassGuard::new(&ic_name);
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -483,7 +483,7 @@ async fn ingress_class_parameters_default_annotation_applies_and_is_overridable(
     // on drop so the resource doesn't leak. The name matches the fixture's
     // `coxswain-clsdefault-${TESTNS}`.
     let ic_name = format!("coxswain-clsdefault-{}", ns.name);
-    let _ic_guard = IngressClassGuard::new(&h.client, &ic_name);
+    let _ic_guard = IngressClassGuard::new(&ic_name);
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -524,7 +524,7 @@ async fn ingress_class_parameters_dangling_ref_degrades_gracefully() -> anyhow::
     let ns = NamespaceGuard::create(&h.client, "ing-class-dangling").await?;
 
     let ic_name = format!("coxswain-clsdangling-{}", ns.name);
-    let _ic_guard = IngressClassGuard::new(&h.client, &ic_name);
+    let _ic_guard = IngressClassGuard::new(&ic_name);
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
