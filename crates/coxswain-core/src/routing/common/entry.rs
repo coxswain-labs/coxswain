@@ -1,5 +1,6 @@
 //! Route entry types: backend groups, filter actions, route timeouts, and path-rule metadata.
 
+use super::auth::IngressAuthConfig;
 use super::predicate::MatchPredicates;
 use super::rate_limit::RateLimitConfig;
 use http::{HeaderName, HeaderValue};
@@ -1034,6 +1035,15 @@ pub struct RouteEntry {
     /// the route. Shared as an `Arc` so cloning into the lookup result is a
     /// refcount bump, not a heap copy, on the hot path.
     pub rate_limit: Option<Arc<RateLimitConfig>>,
+    /// Authentication configuration resolved from the
+    /// `ingress.coxswain-labs.dev/auth-*` annotations.
+    ///
+    /// `None` (the default, and the value for all Gateway-API routes until the
+    /// `SecurityPolicy` binding in #23) disables authentication — requests
+    /// pass through to the upstream without a check.  `Some(cfg)` makes the
+    /// proxy enforce auth before touching the upstream.  Shared as an `Arc` so
+    /// the per-request cost is a refcount bump.
+    pub auth: Option<Arc<IngressAuthConfig>>,
 }
 
 impl RouteEntry {
@@ -1057,6 +1067,7 @@ impl RouteEntry {
             allow_source_range: None,
             cache_enabled: false,
             rate_limit: None,
+            auth: None,
         }
     }
 
@@ -1081,6 +1092,7 @@ impl RouteEntry {
             allow_source_range: None,
             cache_enabled: false,
             rate_limit: None,
+            auth: None,
         }
     }
 
@@ -1110,6 +1122,7 @@ impl RouteEntry {
             allow_source_range: None,
             cache_enabled: false,
             rate_limit: None,
+            auth: None,
         }
     }
 
@@ -1142,6 +1155,7 @@ impl RouteEntry {
             allow_source_range: None,
             cache_enabled: false,
             rate_limit: None,
+            auth: None,
         }
     }
 
@@ -1243,6 +1257,19 @@ impl RouteEntry {
         self.rate_limit = rate_limit;
         self
     }
+
+    /// Set the authentication config for this route (builder-style).
+    ///
+    /// Used by the Ingress reconciler to attach the config resolved from the
+    /// `ingress.coxswain-labs.dev/auth-*` annotations.  `None` (the default,
+    /// and the value for all Gateway-API routes) disables authentication.  The
+    /// reconciler shares one `Arc` across every path of an Ingress so cloning
+    /// onto each entry is a refcount bump.
+    #[must_use]
+    pub fn with_auth(mut self, auth: Option<Arc<IngressAuthConfig>>) -> Self {
+        self.auth = auth;
+        self
+    }
 }
 
 // Lock the hot-path RouteEntry and BackendPool sizes to catch accidental growth.
@@ -1254,7 +1281,8 @@ impl RouteEntry {
 // Bumped 272→280 by adding allow_source_range: Option<Arc<Vec<IpNet>>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/allow-source-range IP allow-list.
 // cache_enabled: bool (#40) added without a bump — it occupies existing struct padding.
 // Bumped 280→288 by adding rate_limit: Option<Arc<RateLimitConfig>> (8 bytes, niche pointer) for per-route rate limiting (#25).
-static_assertions::assert_eq_size!(RouteEntry, [u8; 288]);
+// Bumped 288→296 by adding auth: Option<Arc<IngressAuthConfig>> (8 bytes, niche pointer) for ingress.coxswain-labs.dev/auth-* (#24).
+static_assertions::assert_eq_size!(RouteEntry, [u8; 296]);
 // Hot type — review with the team before bumping this number.
 static_assertions::assert_eq_size!(BackendPool, [u8; 24]);
 
@@ -1449,7 +1477,8 @@ mod tests {
         // Bumped 256→272: max_body_size: Option<u64> added for the max-body-size limit.
         // Bumped 272→280: allow_source_range: Option<Arc<Vec<IpNet>>> added for the allow-source-range IP allow-list.
         // Bumped 280→288: rate_limit: Option<Arc<RateLimitConfig>> added for per-route rate limiting (#25).
-        static_assertions::assert_eq_size!(RouteEntry, [u8; 288]);
+        // Bumped 288→296: auth: Option<Arc<IngressAuthConfig>> added for auth-* annotations (#24).
+        static_assertions::assert_eq_size!(RouteEntry, [u8; 296]);
     }
 
     #[test]

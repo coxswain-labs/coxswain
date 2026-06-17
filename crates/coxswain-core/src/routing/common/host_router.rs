@@ -1,5 +1,6 @@
 //! Per-host path router: exact, prefix, and regex path matching with predicate filtering.
 
+use super::auth::IngressAuthConfig;
 use super::entry::{
     BackendGroup, FilterAction, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts,
 };
@@ -40,6 +41,12 @@ pub struct RouteMatch {
     pub cache_enabled: bool,
     /// Per-route rate-limiting configuration (`None` = no rate limiting).
     pub rate_limit: Option<Arc<RateLimitConfig>>,
+    /// Authentication configuration for this route (`None` = no auth required).
+    ///
+    /// Populated from `RouteEntry::auth`; `Some` only for Ingress routes that
+    /// carry one of the `ingress.coxswain-labs.dev/auth-*` annotations.  The
+    /// proxy enforces it in `request_filter` before forwarding to upstream.
+    pub auth: Option<Arc<IngressAuthConfig>>,
     /// When `Some`, the proxy returns this status immediately without contacting
     /// upstream (invalid/missing/forbidden backend ref). See the struct docs.
     pub error_status: Option<u16>,
@@ -59,6 +66,7 @@ impl RouteMatch {
             allow_source_range: entry.allow_source_range.clone(),
             cache_enabled: entry.cache_enabled,
             rate_limit: entry.rate_limit.clone(),
+            auth: entry.auth.clone(),
             error_status: entry.error_status,
         }
     }
