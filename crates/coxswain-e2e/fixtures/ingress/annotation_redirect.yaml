@@ -1,0 +1,28 @@
+# redirect-{scheme,hostname,port,path,status-code} annotation fixture.
+# TESTNS is substituted with the test namespace.
+#
+# Route: redirect.TESTNS.local / -> 301 to https://new.TESTNS.local:8443/v2
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: redirect-ingress
+  annotations:
+    ingress.coxswain-labs.dev/redirect-scheme: "https"
+    ingress.coxswain-labs.dev/redirect-hostname: "new.${TESTNS}.local"
+    ingress.coxswain-labs.dev/redirect-port: "8443"
+    ingress.coxswain-labs.dev/redirect-path: "/v2"
+    ingress.coxswain-labs.dev/redirect-status-code: "301"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: redirect.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

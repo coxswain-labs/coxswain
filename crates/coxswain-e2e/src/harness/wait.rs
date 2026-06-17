@@ -540,6 +540,73 @@ pub async fn wait_for_route_rejected(
     .await
 }
 
+/// Poll `host`+`path` until the route returns the expected redirect status without
+/// following the redirect. Returns the `Location` header value on success.
+///
+/// Useful for waiting until an `ssl-redirect` or `redirect-*` annotated Ingress is
+/// programmed: `404` (not yet installed) keeps the poller waiting, a non-redirect
+/// status also keeps it waiting, and only the exact `expected_status` with a
+/// `Location` header satisfies the condition. Uses a separate no-redirect
+/// `reqwest::Client` so the 3xx is observed rather than automatically followed.
+///
+/// # Errors
+///
+/// Returns an error if the redirect is not observed before `timeout` elapses.
+pub async fn wait_for_route_redirect(
+    proxy_addr: std::net::SocketAddr,
+    host: &str,
+    path: &str,
+    expected_status: u16,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build no-redirect reqwest client")?;
+    let url = format!("http://{proxy_addr}{path}");
+    poll_until(
+        timeout,
+        POLL,
+        || async {
+            match client.get(&url).header("Host", host).send().await {
+                Ok(resp) => format!(
+                    "{host}{path} to return {expected_status} redirect; last status {}",
+                    resp.status().as_u16()
+                ),
+                Err(e) => {
+                    format!("{host}{path} to return {expected_status} redirect; error: {e}")
+                }
+            }
+        },
+        || async {
+            match client.get(&url).header("Host", host).send().await {
+                Ok(resp) if resp.status().as_u16() == expected_status => Some(
+                    resp.headers()
+                        .get("location")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                Ok(resp) => {
+                    tracing::debug!(
+                        host,
+                        path,
+                        status = resp.status().as_u16(),
+                        "not the expected redirect yet"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(host, path, error = %e, "request failed");
+                    None
+                }
+            }
+        },
+    )
+    .await
+}
+
 /// Return a `SocketAddr` for the dedicated-proxy Service using its NodePort.
 ///
 /// The dedicated-proxy Service is rendered with `type: NodePort` (avoids klipper-lb

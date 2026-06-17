@@ -135,7 +135,7 @@ async fn class_default_connect_timeout_returns_502() -> anyhow::Result<()> {
     // Cluster-scoped IngressClass — guard deletes it on drop. Name matches the
     // fixture's `coxswain-clstimeout-${TESTNS}`.
     let ic_name = format!("coxswain-clstimeout-{}", ns.name);
-    let _ic_guard = IngressClassGuard::new(&h.client, &ic_name);
+    let _ic_guard = IngressClassGuard::new(&ic_name);
 
     fixtures::apply_fixture(ingress::CLASS_DEFAULT_TIMEOUT, FixtureVars::new(&ns.name)).await?;
 

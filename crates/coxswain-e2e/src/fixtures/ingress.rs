@@ -54,6 +54,27 @@ pub const ANNOTATION_READ_TIMEOUT: &str = fixture!("annotation_read_timeout.yaml
 /// one with `backend-protocol: GRPC` (proxy speaks h2c → serves), one with no
 /// annotation (proxy speaks HTTP/1.1 → rejected). Reuses the h2c-echo Deployment.
 pub const ANNOTATION_BACKEND_PROTOCOL: &str = fixture!("annotation_backend_protocol.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/request-header-{set,add,remove}` annotations.
+/// Used to verify that request headers are set, added, and removed before forwarding.
+pub const ANNOTATION_REQUEST_HEADERS: &str = fixture!("annotation_request_headers.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/response-header-{set,add,remove}` annotations.
+/// Used to verify that response headers are set, added, and removed before delivering to client.
+pub const ANNOTATION_RESPONSE_HEADERS: &str = fixture!("annotation_response_headers.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/redirect-{scheme,hostname,port,path,status-code}`.
+/// Used to verify that the proxy issues a redirect with all fields populated.
+pub const ANNOTATION_REDIRECT: &str = fixture!("annotation_redirect.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/ssl-redirect` and `ssl-redirect-code`.
+/// HTTP-only (no TLS termination). Used to verify HTTP-to-HTTPS redirect status codes.
+/// Requires `SSL_REDIRECT_CODE` fixture var.
+pub const ANNOTATION_SSL_REDIRECT: &str = fixture!("annotation_ssl_redirect.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/ssl-redirect` **and** `spec.tls[]`.
+/// Used to verify that the ssl-redirect filter fires only on the HTTP listener, not the TLS one.
+/// Requires `SECRET_NAME`, `TLS_CRT_B64`, `TLS_KEY_B64` fixture vars.
+pub const ANNOTATION_SSL_REDIRECT_TLS: &str = fixture!("annotation_ssl_redirect_tls.yaml");
+/// Ingress with an invalid `request-header-set` annotation value (space in header name)
+/// alongside a valid `response-header-set`. Used to verify the bad modifier is dropped but
+/// the route still serves and the valid sibling modifier is applied.
+pub const ANNOTATION_INVALID_HEADER: &str = fixture!("annotation_invalid_header.yaml");
 /// Per-class annotation defaults via `IngressClass.spec.parameters` (#190): a
 /// `CoxswainIngressClassParameters` CR sets a default `rewrite-target`, one
 /// Ingress inherits it and a second overrides it per-key. The IngressClass is

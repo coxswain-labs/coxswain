@@ -68,9 +68,11 @@ default-filter = '''
   and not binary(resilience)
 '''
 
-# 4 concurrent tests against the shared cluster. Conservative for a single-node
-# cluster; tunable as the parallel set proves it can sustain more.
-test-threads = 4
+# 3 concurrent tests against the shared cluster. With per-test namespace cleanup
+# now running synchronously (NamespaceGuard::Drop), peak pod count is bounded by
+# the live set — 3 tests × up to 3 backends = 9 echo pods — which fits the 4-vCPU
+# CI runner. Raise only after confirming headroom with a larger suite.
+test-threads = 3
 
 # Collect all failures per suite — don't stop on the first failing test.
 fail-fast = false

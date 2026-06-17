@@ -1,0 +1,26 @@
+# ssl-redirect + ssl-redirect-code annotation fixture (HTTP listener only).
+# TESTNS is substituted with the test namespace.
+# SSL_REDIRECT_CODE is substituted with the desired redirect status code.
+#
+# HTTP: ssl-redirect.TESTNS.local / -> SSL_REDIRECT_CODE redirect to https://
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ssl-redirect-ingress
+  annotations:
+    ingress.coxswain-labs.dev/ssl-redirect: "true"
+    ingress.coxswain-labs.dev/ssl-redirect-code: "${SSL_REDIRECT_CODE}"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: ssl-redirect.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

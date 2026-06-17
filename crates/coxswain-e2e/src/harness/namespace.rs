@@ -14,7 +14,6 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct NamespaceGuard {
     /// Name of the created namespace.
     pub name: String,
-    client: Client,
 }
 
 impl NamespaceGuard {
@@ -63,56 +62,90 @@ impl NamespaceGuard {
         let api: Api<Namespace> = Api::all(client.clone());
         api.create(&PostParams::default(), &ns).await?;
         tracing::debug!(namespace = %name, "created test namespace");
-        Ok(Self {
-            name,
-            client: client.clone(),
-        })
+        Ok(Self { name })
     }
 }
 
 impl Drop for NamespaceGuard {
     fn drop(&mut self) {
-        let client = self.client.clone();
-        let name = self.name.clone();
-        // Fire-and-forget deletion. Unique names mean a slow deletion never
-        // affects the next test. Use `kubectl delete ns -l coxswain-e2e=true`
-        // to clean up if tests were interrupted.
-        tokio::spawn(async move {
-            let api: Api<Namespace> = Api::all(client);
-            let _ = api.delete(&name, &DeleteParams::default()).await;
-            tracing::debug!(namespace = %name, "deleted test namespace");
-        });
+        // Use `kubectl delete ns -l coxswain-e2e=true` to clean up after an interrupt.
+        delete_resource::<Namespace>(self.name.clone(), "namespace");
     }
 }
 
-/// RAII guard for a cluster-scoped `IngressClass`. Deletes the IngressClass on
-/// drop so test-only classes don't leak between runs.
+/// Issue a blocking `DELETE` for a cluster-scoped resource on a dedicated
+/// thread that owns a fresh runtime *and* a fresh kube `Client`.
+///
+/// Two footguns this navigates, both rooted in `#[tokio::test]` building a
+/// current-thread runtime that is torn down the instant the test fn returns:
+///
+/// 1. A `tokio::spawn`ed deletion in `Drop` is dropped before it ever issues the
+///    DELETE — cleanup silently never runs, so namespaces (and their pods)
+///    accumulate across the whole parallel pass and exhaust the node.
+/// 2. A kube `Client`'s hyper connection pool is bound to the runtime it was
+///    built on. Driving the test's client from another runtime leaves its IO
+///    registered on a reactor nobody polls, so the request hangs forever. Hence
+///    a brand-new client is constructed *inside* this runtime.
+///
+/// The thread is `join`ed so the DELETE completes before the (process-per-test)
+/// test process exits. Errors are logged, not propagated: a failed delete is
+/// backstopped by the bootstrap's label-purge, and a guard's `Drop` must not panic.
+fn delete_resource<K>(name: String, kind: &'static str)
+where
+    K: kube::Resource<Scope = k8s_openapi::ClusterResourceScope>
+        + Clone
+        + std::fmt::Debug
+        + serde::de::DeserializeOwned,
+    K::DynamicType: Default,
+{
+    let handle = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::warn!(error = %e, kind, %name, "could not build cleanup runtime");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            // Fresh client bound to THIS runtime — see footgun #2 above.
+            let client = match Client::try_default().await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, kind, %name, "could not build cleanup client");
+                    return;
+                }
+            };
+            let api: Api<K> = Api::all(client);
+            match api.delete(&name, &DeleteParams::default()).await {
+                Ok(_) => tracing::debug!(kind, %name, "deleted test resource"),
+                Err(e) => tracing::warn!(error = %e, kind, %name, "failed to delete test resource"),
+            }
+        });
+    });
+    let _ = handle.join();
+}
+
 /// RAII guard for a cluster-scoped `IngressClass`. Deletes the IngressClass on
 /// drop so test-only classes don't leak between runs.
 pub struct IngressClassGuard {
     /// Name of the created IngressClass.
     pub name: String,
-    client: Client,
 }
 
 impl IngressClassGuard {
     /// Wrap an existing `IngressClass` name in a drop guard (does not create it).
-    pub fn new(client: &Client, name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            client: client.clone(),
-        }
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
     }
 }
 
 impl Drop for IngressClassGuard {
     fn drop(&mut self) {
-        let client = self.client.clone();
-        let name = self.name.clone();
-        tokio::spawn(async move {
-            let api: Api<IngressClass> = Api::all(client);
-            let _ = api.delete(&name, &DeleteParams::default()).await;
-            tracing::debug!(ingress_class = %name, "deleted test IngressClass");
-        });
+        // Synchronous cleanup on an independent runtime — see [`delete_resource`]
+        // for why a `tokio::spawn` here would silently never run.
+        delete_resource::<IngressClass>(self.name.clone(), "ingressclass");
     }
 }

@@ -85,6 +85,9 @@ impl IngressReconciler {
             Some(class) => class,
         };
 
+        // Capture the HTTP listener port before shadowing `ports` as a Vec.
+        // Used by ssl-redirect to scope the redirect filter to the HTTP port only.
+        let http_port = ports.http;
         let ports: Vec<u16> = [ports.http, ports.https].into_iter().flatten().collect();
         if ports.is_empty() {
             tracing::warn!(
@@ -126,17 +129,23 @@ impl IngressReconciler {
             &route_id,
         );
 
-        // Build rewrite filter list once (shared across all entries for this Ingress).
-        let rewrite_filters: Vec<FilterAction> = ann
-            .rewrite
-            .as_ref()
-            .map(|pm| {
-                vec![FilterAction::UrlRewrite {
-                    hostname: None,
-                    path: Some(pm.clone()),
-                }]
-            })
-            .unwrap_or_default();
+        // Build the Ingress-wide base filter list once.  Header modifiers and the generic
+        // redirect are port-independent and go here; the rewrite filter is appended
+        // per-path below because regex paths rebuild it against their own compiled pattern.
+        let mut base_filters: Vec<FilterAction> = Vec::new();
+        if let Some(hm) = ann.request_headers.clone() {
+            base_filters.push(FilterAction::RequestHeaderModifier(hm));
+        }
+        if let Some(hm) = ann.response_headers.clone() {
+            base_filters.push(FilterAction::ResponseHeaderModifier(hm));
+        }
+        if let Some(redirect) = ann.redirect.clone() {
+            base_filters.push(redirect);
+        }
+
+        // ssl-redirect fires only on the HTTP listener; it is suppressed when an explicit
+        // redirect-* annotation is already present (redirect-* takes precedence).
+        let needs_ssl_redirect = ann.ssl_redirect && ann.redirect.is_none();
 
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
@@ -236,49 +245,93 @@ impl IngressReconciler {
                     None
                 };
 
-                // Per-path rewrite filters: on a regex path the `rewrite-target` template
-                // is rebuilt as a capture-group substitution against this path's own
-                // pattern; every other path keeps the shared literal full-path replace.
-                let path_filters = match (&path_regex, &ann.rewrite) {
-                    (Some(re), Some(PathModifier::ReplaceFullPath(target))) => {
-                        vec![FilterAction::UrlRewrite {
-                            hostname: None,
-                            path: Some(PathModifier::RegexReplace {
-                                regex: Arc::clone(re),
-                                replacement: target.as_str().into(),
-                            }),
-                        }]
+                // Per-path filter vec: start from the shared base (header mods + generic
+                // redirect), then append the rewrite filter.  On a regex path the
+                // rewrite-target template is rebuilt as a capture-group substitution
+                // against this path's own compiled pattern.
+                let path_filters = {
+                    let mut f = base_filters.clone();
+                    match (&path_regex, &ann.rewrite) {
+                        (Some(re), Some(PathModifier::ReplaceFullPath(target))) => {
+                            f.push(FilterAction::UrlRewrite {
+                                hostname: None,
+                                path: Some(PathModifier::RegexReplace {
+                                    regex: Arc::clone(re),
+                                    replacement: target.as_str().into(),
+                                }),
+                            });
+                        }
+                        _ => {
+                            if let Some(pm) = &ann.rewrite {
+                                f.push(FilterAction::UrlRewrite {
+                                    hostname: None,
+                                    path: Some(pm.clone()),
+                                });
+                            }
+                        }
                     }
-                    _ => rewrite_filters.clone(),
+                    f
                 };
 
                 let metric_route_id: Arc<str> = Arc::from(format!(
                     "ingress/{ns}/{ingress_name}:{rule_index}.{path_index}"
                 ));
-                let mut entry = RouteEntry::path_only(group, route_id.clone(), created_at)
-                    .with_path_pattern(Arc::from(path))
-                    .with_metric_route_id(metric_route_id)
-                    .with_timeouts(ann.timeouts.clone())
-                    .with_filter_actions(path_filters);
+                let mut base_entry =
+                    RouteEntry::path_only(Arc::clone(&group), route_id.clone(), created_at)
+                        .with_path_pattern(Arc::from(path))
+                        .with_metric_route_id(Arc::clone(&metric_route_id))
+                        .with_timeouts(ann.timeouts.clone())
+                        .with_filter_actions(path_filters.clone());
                 if dead {
-                    entry.error_status = Some(503);
+                    base_entry.error_status = Some(503);
                 }
-                let e = Arc::new(entry);
+                // When ssl-redirect is active the HTTP-port entry carries an extra leading
+                // RequestRedirect filter; the HTTPS-port entry does not (the request is
+                // already over TLS).  When ssl-redirect is inactive both ports share the
+                // same Arc<RouteEntry>.
+                let e = Arc::new(base_entry);
+                let e_ssl = needs_ssl_redirect.then(|| {
+                    let ssl_status = ann.ssl_redirect_code.unwrap_or(308);
+                    let mut ssl_filters = Vec::with_capacity(path_filters.len() + 1);
+                    ssl_filters.push(FilterAction::RequestRedirect {
+                        scheme: Some("https".to_string()),
+                        hostname: None,
+                        port: None,
+                        status_code: ssl_status,
+                        path: None,
+                    });
+                    ssl_filters.extend_from_slice(&path_filters);
+                    let mut entry =
+                        RouteEntry::path_only(Arc::clone(&group), route_id.clone(), created_at)
+                            .with_path_pattern(Arc::from(path))
+                            .with_metric_route_id(Arc::clone(&metric_route_id))
+                            .with_timeouts(ann.timeouts.clone())
+                            .with_filter_actions(ssl_filters);
+                    if dead {
+                        entry.error_status = Some(503);
+                    }
+                    Arc::new(entry)
+                });
+
                 // Regex paths route to the regex matcher; otherwise "Exact" is exact and
                 // "Prefix"/"ImplementationSpecific" both map to prefix matching.
                 for &listener_port in &ports {
+                    let route_entry = match &e_ssl {
+                        Some(ssl_e) if Some(listener_port) == http_port => Arc::clone(ssl_e),
+                        _ => Arc::clone(&e),
+                    };
                     let host_builder = builder
                         .for_port(listener_port)
                         .host_for(rule.host.as_deref(), WildcardKind::SingleLabel);
                     if path_regex.is_some() {
-                        host_builder.add_regex_route(path, Arc::clone(&e));
+                        host_builder.add_regex_route(path, route_entry);
                     } else {
                         match path_rule.path_type.as_str() {
                             "Exact" => {
-                                host_builder.add_exact_route(path, Arc::clone(&e));
+                                host_builder.add_exact_route(path, route_entry);
                             }
                             _ => {
-                                host_builder.add_prefix_route(path, Arc::clone(&e));
+                                host_builder.add_prefix_route(path, route_entry);
                             }
                         }
                     }
@@ -316,7 +369,17 @@ impl IngressReconciler {
                         );
                         let default_metric_route_id: Arc<str> =
                             Arc::from(format!("ingress/{ns}/{ingress_name}:default"));
-                        let make_entry = || {
+                        // Build the defaultBackend filter vec (same base as rule-path
+                        // entries; rewrite applied as a literal full-path replace since
+                        // defaultBackend always matches prefix "/", never a regex).
+                        let mut default_filters = base_filters.clone();
+                        if let Some(pm) = &ann.rewrite {
+                            default_filters.push(FilterAction::UrlRewrite {
+                                hostname: None,
+                                path: Some(pm.clone()),
+                            });
+                        }
+                        let make_entry = |filters: Vec<FilterAction>| {
                             Arc::new(
                                 RouteEntry::path_only(
                                     Arc::clone(&group),
@@ -326,20 +389,36 @@ impl IngressReconciler {
                                 .with_path_pattern(Arc::from("/"))
                                 .with_metric_route_id(Arc::clone(&default_metric_route_id))
                                 .with_timeouts(ann.timeouts.clone())
-                                .with_filter_actions(rewrite_filters.clone()),
+                                .with_filter_actions(filters),
                             )
                         };
                         for &listener_port in &ports {
+                            let effective =
+                                if needs_ssl_redirect && Some(listener_port) == http_port {
+                                    let ssl_status = ann.ssl_redirect_code.unwrap_or(308);
+                                    let mut f = Vec::with_capacity(default_filters.len() + 1);
+                                    f.push(FilterAction::RequestRedirect {
+                                        scheme: Some("https".to_string()),
+                                        hostname: None,
+                                        port: None,
+                                        status_code: ssl_status,
+                                        path: None,
+                                    });
+                                    f.extend_from_slice(&default_filters);
+                                    f
+                                } else {
+                                    default_filters.clone()
+                                };
                             for rule in rules {
                                 builder
                                     .for_port(listener_port)
                                     .host_for(rule.host.as_deref(), WildcardKind::SingleLabel)
-                                    .add_prefix_route("/", make_entry());
+                                    .add_prefix_route("/", make_entry(effective.clone()));
                             }
                             builder
                                 .for_port(listener_port)
                                 .host_for(None, WildcardKind::SingleLabel)
-                                .add_prefix_route("/", make_entry());
+                                .add_prefix_route("/", make_entry(effective));
                         }
                     }
                 }
@@ -1865,6 +1944,295 @@ mod tests {
         assert!(table.route(80, "example.com", "/", &ctx).is_some());
         // A warning was emitted.
         assert!(logs_contain("invalid duration — using default"));
+    }
+
+    // ── Header modifier + redirect filter reconcile tests (#79, #262) ────────
+
+    #[test]
+    fn annotation_request_header_modifier_stored_as_filter() {
+        use crate::ingress::annotations::{REQUEST_HEADER_REMOVE, REQUEST_HEADER_SET};
+        use coxswain_core::routing::{FilterAction, RouteOutcome};
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[
+                (REQUEST_HEADER_SET, "X-Env: prod"),
+                (REQUEST_HEADER_REMOVE, "X-Debug"),
+            ],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        match table.find(80, "example.com", "/", &ctx) {
+            RouteOutcome::Found(_, filters, _, _, _) => {
+                let has_req_mod = filters
+                    .iter()
+                    .any(|f| matches!(f, FilterAction::RequestHeaderModifier(_)));
+                assert!(has_req_mod, "expected RequestHeaderModifier filter");
+            }
+            _ => panic!("expected Found"),
+        }
+    }
+
+    #[test]
+    fn annotation_response_header_modifier_stored_as_filter() {
+        use crate::ingress::annotations::{RESPONSE_HEADER_ADD, RESPONSE_HEADER_REMOVE};
+        use coxswain_core::routing::{FilterAction, RouteOutcome};
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[
+                (RESPONSE_HEADER_ADD, "X-Powered-By: coxswain"),
+                (RESPONSE_HEADER_REMOVE, "X-Internal"),
+            ],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        match table.find(80, "example.com", "/", &ctx) {
+            RouteOutcome::Found(_, filters, _, _, _) => {
+                let has_resp_mod = filters
+                    .iter()
+                    .any(|f| matches!(f, FilterAction::ResponseHeaderModifier(_)));
+                assert!(has_resp_mod, "expected ResponseHeaderModifier filter");
+            }
+            _ => panic!("expected Found"),
+        }
+    }
+
+    #[test]
+    fn annotation_redirect_stored_as_filter() {
+        use crate::ingress::annotations::{REDIRECT_HOSTNAME, REDIRECT_STATUS_CODE};
+        use coxswain_core::routing::{FilterAction, RouteOutcome};
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[
+                (REDIRECT_HOSTNAME, "new.example.com"),
+                (REDIRECT_STATUS_CODE, "301"),
+            ],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        match table.find(80, "example.com", "/", &ctx) {
+            RouteOutcome::Found(_, filters, _, _, _) => {
+                let redirect = filters.iter().find(|f| {
+                    matches!(
+                        f,
+                        FilterAction::RequestRedirect {
+                            hostname: Some(_),
+                            status_code: 301,
+                            ..
+                        }
+                    )
+                });
+                assert!(redirect.is_some(), "expected RequestRedirect with 301");
+            }
+            _ => panic!("expected Found"),
+        }
+    }
+
+    #[test]
+    fn annotation_header_modifier_and_rewrite_coexist_on_same_route() {
+        use crate::ingress::annotations::{REQUEST_HEADER_SET, REWRITE_TARGET};
+        use coxswain_core::routing::{FilterAction, RouteOutcome};
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/old",
+            "svc",
+            &[
+                (REQUEST_HEADER_SET, "X-Version: 2"),
+                (REWRITE_TARGET, "/new"),
+            ],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        match table.find(80, "example.com", "/old", &ctx) {
+            RouteOutcome::Found(_, filters, _, _, _) => {
+                let has_req_mod = filters
+                    .iter()
+                    .any(|f| matches!(f, FilterAction::RequestHeaderModifier(_)));
+                let has_rewrite = filters
+                    .iter()
+                    .any(|f| matches!(f, FilterAction::UrlRewrite { path: Some(_), .. }));
+                assert!(has_req_mod, "expected RequestHeaderModifier filter");
+                assert!(has_rewrite, "expected UrlRewrite filter");
+            }
+            _ => panic!("expected Found"),
+        }
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn annotation_invalid_header_value_drops_modifier_but_route_still_serves() {
+        use crate::ingress::annotations::REQUEST_HEADER_SET;
+        use coxswain_core::routing::{FilterAction, RouteOutcome};
+        // Header values cannot contain control characters.
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[(REQUEST_HEADER_SET, "X-Bad: value\x01with-ctrl")],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        // Route is still installed.
+        match table.find(80, "example.com", "/", &ctx) {
+            RouteOutcome::Found(_, filters, _, _, _) => {
+                let has_req_mod = filters
+                    .iter()
+                    .any(|f| matches!(f, FilterAction::RequestHeaderModifier(_)));
+                assert!(
+                    !has_req_mod,
+                    "expected no RequestHeaderModifier (modifier was invalid)"
+                );
+            }
+            _ => panic!("expected Found"),
+        }
+        assert!(logs_contain("invalid header annotation"));
+    }
+
+    #[test]
+    fn annotation_ssl_redirect_on_http_port_only() {
+        use crate::ingress::annotations::SSL_REDIRECT;
+        use coxswain_core::routing::{FilterAction, RouteOutcome};
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[(SSL_REDIRECT, "true")],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        // Reconcile with BOTH HTTP (80) and HTTPS (443) ports active.
+        let no_class_defaults = HashMap::new();
+        IngressReconciler::reconcile(
+            &ing,
+            &store,
+            &svcs,
+            &IngressClassContext::new(&owned(&["coxswain"]), None, &no_class_defaults),
+            IngressPorts::new(Some(80), Some(443)),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        // HTTP port: entry carries the ssl-redirect.
+        match table.find(80, "example.com", "/", &ctx) {
+            RouteOutcome::Found(_, filters, _, _, _) => {
+                let ssl_redir = filters.iter().find(|f| {
+                    matches!(
+                        f,
+                        FilterAction::RequestRedirect {
+                            scheme: Some(_),
+                            ..
+                        }
+                    )
+                });
+                assert!(
+                    ssl_redir.is_some(),
+                    "expected ssl-redirect RequestRedirect on HTTP port"
+                );
+                if let Some(FilterAction::RequestRedirect {
+                    scheme,
+                    status_code,
+                    ..
+                }) = ssl_redir
+                {
+                    assert_eq!(scheme.as_deref(), Some("https"));
+                    assert_eq!(*status_code, 308);
+                }
+            }
+            _ => panic!("expected Found on port 80"),
+        }
+
+        // HTTPS port: entry must NOT carry the ssl-redirect.
+        match table.find(443, "example.com", "/", &ctx) {
+            RouteOutcome::Found(_, filters, _, _, _) => {
+                let ssl_redir = filters.iter().find(|f| {
+                    matches!(
+                        f,
+                        FilterAction::RequestRedirect {
+                            scheme: Some(_),
+                            ..
+                        }
+                    )
+                });
+                assert!(
+                    ssl_redir.is_none(),
+                    "ssl-redirect must not appear on the HTTPS port entry"
+                );
+            }
+            _ => panic!("expected Found on port 443"),
+        }
+    }
+
+    #[test]
+    fn annotation_explicit_redirect_takes_precedence_over_ssl_redirect() {
+        use crate::ingress::annotations::{REDIRECT_HOSTNAME, SSL_REDIRECT};
+        use coxswain_core::routing::{FilterAction, RouteOutcome};
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let ing = make_ingress_with_annotations(
+            "default",
+            Some("example.com"),
+            "/",
+            "svc",
+            &[
+                (REDIRECT_HOSTNAME, "new.example.com"),
+                (SSL_REDIRECT, "true"),
+            ],
+        );
+        let svcs = empty_svc_store();
+        let mut builder = IngressRoutingTableBuilder::new();
+        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+        match table.find(80, "example.com", "/", &ctx) {
+            RouteOutcome::Found(_, filters, _, _, _) => {
+                // Exactly one RequestRedirect — the explicit redirect-*.
+                let redirect_count = filters
+                    .iter()
+                    .filter(|f| matches!(f, FilterAction::RequestRedirect { .. }))
+                    .count();
+                assert_eq!(redirect_count, 1, "expected exactly one RequestRedirect");
+                // The single redirect uses the explicit hostname, not https scheme.
+                if let Some(FilterAction::RequestRedirect { hostname, .. }) = filters
+                    .iter()
+                    .find(|f| matches!(f, FilterAction::RequestRedirect { .. }))
+                {
+                    assert_eq!(hostname.as_deref(), Some("new.example.com"));
+                }
+            }
+            _ => panic!("expected Found"),
+        }
     }
 
     // ── Class-level annotation defaults (#190) ────────────────────────────────
