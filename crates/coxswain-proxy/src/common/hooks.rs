@@ -33,7 +33,7 @@ use bytes::Bytes;
 use coxswain_cache::ResponseCache;
 use coxswain_core::routing::{RequestContext, RetryOn, RouteTimeouts, UpstreamCa};
 use pingora_cache::key::{CacheKey, HashBinary};
-use pingora_cache::{CacheMeta, RespCacheable, VarianceBuilder};
+use pingora_cache::{CacheMeta, NoCacheReason, RespCacheable, VarianceBuilder};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{
     ConnectTimedout, ConnectionClosed, Error, ErrorSource, HTTPStatus, ReadError, ReadTimedout,
@@ -292,7 +292,17 @@ pub(crate) fn cache_key_callback(session: &Session, ctx: &ProxyCtx) -> CacheKey 
 /// (`no-store`/`no-cache`/`private`/`max-age`) and `Expires`. With
 /// [`CACHE_DEFAULTS`] supplying no implicit TTL, only explicitly-fresh responses
 /// are admitted.
+///
+/// A response carrying `Set-Cookie` is refused outright: `resp_cacheable` would
+/// otherwise store and replay the cookie verbatim to every client (it only
+/// strips it when the origin uses the qualified `Cache-Control: no-cache=
+/// "set-cookie"` form), which is session leakage / cache poisoning on a shared
+/// cache. RFC 7234 §3 permits caching `Set-Cookie` responses only with explicit
+/// authorization; we take the conservative stance and never do.
 pub(crate) fn response_cache_filter(resp: &ResponseHeader) -> RespCacheable {
+    if resp.headers.contains_key(http::header::SET_COOKIE) {
+        return RespCacheable::Uncacheable(NoCacheReason::OriginNotCache);
+    }
     let cc = pingora_cache::cache_control::CacheControl::from_resp_headers(resp);
     pingora_cache::filters::resp_cacheable(cc.as_ref(), resp.clone(), false, &CACHE_DEFAULTS)
 }
@@ -929,5 +939,39 @@ mod tests {
         // Strict matching: an IPv4-mapped IPv6 client does NOT satisfy an IPv4 CIDR.
         // Locks the documented behavior so leniency would be a deliberate change.
         assert!(!ip_allowed(ip("::ffff:10.0.0.1"), &nets(&["10.0.0.0/8"])));
+    }
+
+    #[test]
+    fn cacheable_response_without_set_cookie_is_admitted() {
+        use super::response_cache_filter;
+        use pingora_cache::RespCacheable;
+        use pingora_http::ResponseHeader;
+
+        let mut resp = ResponseHeader::build(200, None).expect("build response");
+        resp.insert_header("Cache-Control", "max-age=300")
+            .expect("insert cache-control");
+        assert!(
+            matches!(response_cache_filter(&resp), RespCacheable::Cacheable(_)),
+            "an explicitly-fresh response with no Set-Cookie must be cacheable"
+        );
+    }
+
+    #[test]
+    fn response_with_set_cookie_is_never_cached() {
+        use super::response_cache_filter;
+        use pingora_cache::RespCacheable;
+        use pingora_http::ResponseHeader;
+
+        // A Set-Cookie response that is otherwise fresh must be refused: caching it
+        // would replay one client's cookie to every other client (session leakage).
+        let mut resp = ResponseHeader::build(200, None).expect("build response");
+        resp.insert_header("Cache-Control", "max-age=300")
+            .expect("insert cache-control");
+        resp.insert_header("Set-Cookie", "session=secret")
+            .expect("insert set-cookie");
+        assert!(
+            matches!(response_cache_filter(&resp), RespCacheable::Uncacheable(_)),
+            "a Set-Cookie response must never be admitted to the shared cache"
+        );
     }
 }
