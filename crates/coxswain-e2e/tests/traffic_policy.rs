@@ -148,3 +148,107 @@ async fn class_default_connect_timeout_returns_502() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Verifies that `ingress.coxswain-labs.dev/max-body-size: "1k"` (#263) caps the
+/// request body. One route, the full happy/sad matrix:
+/// - under-limit POST (200 B, Content-Length) → 200, served by `echo-a`;
+/// - over-limit POST (4 KiB, Content-Length) → 413, rejected up front before the
+///   upstream is contacted (no echo body);
+/// - over-limit chunked POST (8×512 B, no Content-Length) → 413, proving the
+///   mid-stream `request_body_filter` cap fires without buffering the whole body.
+///
+/// A bodyless GET carries nothing to cap, so its 200 is the route-ready signal.
+#[tokio::test]
+async fn max_body_size_enforces_limit() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-maxbody").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_MAX_BODY_SIZE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("maxbody.{}.local", ns.name);
+
+    // Readiness: a bodyless GET is always under the limit, so a 200 proves the route
+    // is installed before we exercise the body-size cases.
+    wait::wait_for_route_status(&h.http, &host, "/", 200, Duration::from_secs(60)).await?;
+
+    // Happy path: 200 B < 1 KiB → served, and specifically by echo-a (backend identity).
+    let (status, body) = h
+        .http
+        .request_with_body(reqwest::Method::POST, &host, "/", vec![b'x'; 200])
+        .await?;
+    assert_eq!(status, 200, "under-limit POST must be served");
+    body.expect("under-limit POST must return an echo body")
+        .assert_backend("echo-a");
+
+    // Sad path (up-front): 4 KiB with Content-Length > 1 KiB → 413 before any upstream.
+    let (status, body) = h
+        .http
+        .request_with_body(reqwest::Method::POST, &host, "/", vec![b'x'; 4096])
+        .await?;
+    assert_eq!(
+        status, 413,
+        "over-limit POST (Content-Length) must be rejected with 413"
+    );
+    assert!(
+        body.is_none(),
+        "rejected POST must not reach the echo backend"
+    );
+
+    // Sad path (mid-stream): chunked body (no Content-Length) totalling 4 KiB across
+    // 8×512 B chunks crosses the 1 KiB cap → 413 from request_body_filter.
+    let chunks = vec![vec![b'x'; 512]; 8];
+    let (status, body) = h
+        .http
+        .request_with_streamed_body(reqwest::Method::POST, &host, "/", chunks)
+        .await?;
+    assert_eq!(
+        status, 413,
+        "over-limit chunked POST must be rejected with 413"
+    );
+    assert!(
+        body.is_none(),
+        "rejected chunked POST must not reach the echo backend"
+    );
+
+    Ok(())
+}
+
+/// Verifies that an unparseable `max-body-size` value fails open (#263): the limit is
+/// ignored and an oversized 4 KiB POST still reaches the backend (200). Proves an
+/// invalid size can never block traffic — the inverse of the enforced case above.
+#[tokio::test]
+async fn max_body_size_invalid_value_fails_open() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-maxbody-bad").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_MAX_BODY_SIZE_INVALID,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("maxbodybad.{}.local", ns.name);
+
+    wait::wait_for_route_status(&h.http, &host, "/", 200, Duration::from_secs(60)).await?;
+
+    let (status, body) = h
+        .http
+        .request_with_body(reqwest::Method::POST, &host, "/", vec![b'x'; 4096])
+        .await?;
+    assert_eq!(
+        status, 200,
+        "fail-open: oversized POST must still be served when the limit is invalid"
+    );
+    body.expect("served POST must return an echo body")
+        .assert_backend("echo-a");
+
+    Ok(())
+}

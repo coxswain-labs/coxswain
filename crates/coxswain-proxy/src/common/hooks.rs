@@ -59,6 +59,8 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             upstream_addr: None,
             retries_used: 0,
             last_retry_condition: None,
+            max_body_size: None,
+            body_bytes_seen: 0,
         })
         .unwrap_or_default()
 }
@@ -118,8 +120,14 @@ pub(crate) async fn request_filter<K>(
         engine.find(port, &host, &path, &route_ctx)
     }; // route_ctx (and req borrow) drops here
 
-    let Some((backend_group, filters, route_timeouts, path_pattern, metric_route_id)) =
-        resolve_outcome(session, &host, &path, outcome).await?
+    let Some((
+        backend_group,
+        filters,
+        route_timeouts,
+        path_pattern,
+        metric_route_id,
+        max_body_size,
+    )) = resolve_outcome(session, &host, &path, outcome).await?
     else {
         return Ok(true);
     };
@@ -141,6 +149,21 @@ pub(crate) async fn request_filter<K>(
         return Ok(true);
     }
 
+    // Per-route request-body limit (ingress.coxswain-labs.dev/max-body-size).
+    // Up-front check: when `Content-Length` already exceeds the limit, reject with
+    // 413 before opening any upstream connection. Streaming/chunked bodies that omit
+    // `Content-Length` are capped mid-stream in `request_body_filter`. The limit is
+    // stashed on the context for that later hook.
+    ctx.max_body_size = max_body_size;
+    if let Some(limit) = max_body_size
+        && content_length(session).is_some_and(|len| len > limit)
+    {
+        return Err(pingora_core::Error::explain(
+            HTTPStatus(413),
+            "request body exceeds max-body-size",
+        ));
+    }
+
     ctx.resolved = Some(ResolvedRoute {
         backend_group,
         filters,
@@ -151,6 +174,49 @@ pub(crate) async fn request_filter<K>(
         metric_route_id,
     });
     Ok(false)
+}
+
+/// Read and parse the `Content-Length` request header, if present and valid.
+///
+/// Returns `None` when the header is absent, non-ASCII, or not a valid unsigned
+/// integer — chunked/streaming uploads (no `Content-Length`) fall through to the
+/// mid-stream cap in [`request_body_filter`].
+fn content_length(session: &Session) -> Option<u64> {
+    session
+        .req_header()
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Pingora `request_body_filter` body: enforce the per-route request-body size limit
+/// on streaming/chunked uploads.
+///
+/// Called for every chunk of the request body. Accumulates the running byte count on
+/// the [`ProxyCtx`] and, once it exceeds the route's `max-body-size`, returns
+/// `Err(Error::explain(413, …))`. Pingora propagates that through `fail_to_proxy`,
+/// which writes a clean `413 Payload Too Large` to the client. The body is never
+/// buffered — the `u64` counter is the only state — so this stays within the hot-path
+/// allocation budget. No-ops when the route carries no limit (every Gateway-API route,
+/// and Ingress routes without the annotation).
+///
+/// # Errors
+/// Returns `Error::explain(413, …)` once the cumulative body size exceeds the limit.
+pub(crate) fn request_body_filter(body: Option<&Bytes>, ctx: &mut ProxyCtx) -> Result<()> {
+    let Some(limit) = ctx.max_body_size else {
+        return Ok(());
+    };
+    ctx.body_bytes_seen = ctx
+        .body_bytes_seen
+        .saturating_add(body.map_or(0, Bytes::len) as u64);
+    if ctx.body_bytes_seen > limit {
+        return Err(pingora_core::Error::explain(
+            HTTPStatus(413),
+            "request body exceeds max-body-size",
+        ));
+    }
+    Ok(())
 }
 
 /// Pingora `upstream_peer` body: choose the backend address from the resolved

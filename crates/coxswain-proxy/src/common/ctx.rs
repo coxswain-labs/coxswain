@@ -101,6 +101,15 @@ pub struct ProxyCtx {
     /// gated on `client_reused`) from a connection-error retry (which can check the
     /// retry buffer).
     pub last_retry_condition: Option<RetryOn>,
+    /// Per-route request body size limit in bytes, from the matched route's
+    /// `ingress.coxswain-labs.dev/max-body-size` annotation. `None` = unlimited.
+    /// Set in `request_filter`; read by the up-front `Content-Length` check and the
+    /// streaming `request_body_filter` cap.
+    pub max_body_size: Option<u64>,
+    /// Running count of request-body bytes seen so far in `request_body_filter`.
+    /// Compared against [`Self::max_body_size`] to abort over-limit streaming/chunked
+    /// uploads with 413 without buffering the whole body.
+    pub body_bytes_seen: u64,
 }
 
 // Hot types — review with the team before bumping these numbers.
@@ -112,4 +121,6 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 168);
 // with alignment padding (176→240).
 // ProxyCtx: +16 because Option<ResolvedRoute> inlines the struct (240→256).
 // ProxyCtx: +48 because ResolvedRoute grew with RouteTimeouts (256→304).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 312);
+// ProxyCtx: +24 for max_body_size: Option<u64> (16 — no niche) + body_bytes_seen: u64
+// (8) — the max-body-size request-body limit and its running counter (312→336).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 336);

@@ -100,6 +100,9 @@ pub(super) struct IngressAnnotations {
     pub ssl_redirect: bool,
     /// Status code for the ssl-redirect (`None` → default `308`).
     pub ssl_redirect_code: Option<u16>,
+    /// Per-route request body size limit in bytes from `max-body-size` (#263).
+    /// `None` (the default, or an unparseable value) imposes no limit.
+    pub max_body_size: Option<u64>,
 }
 
 impl IngressAnnotations {
@@ -334,6 +337,20 @@ impl IngressAnnotations {
             c
         });
 
+        // ── Max body size (#263) ──────────────────────────────────────────────
+        let max_body_size = get(ann, MAX_BODY_SIZE).and_then(|v| {
+            let n = parse_byte_size(v);
+            if n.is_none() {
+                tracing::warn!(
+                    ingress = %route_id,
+                    annotation = MAX_BODY_SIZE,
+                    value = v,
+                    "invalid max-body-size — no limit applied"
+                );
+            }
+            n
+        });
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -351,6 +368,7 @@ impl IngressAnnotations {
             redirect,
             ssl_redirect,
             ssl_redirect_code,
+            max_body_size,
         }
     }
 }
@@ -800,5 +818,27 @@ mod tests {
         let a = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.ssl_redirect_code.is_none());
         assert!(logs_contain("invalid ssl-redirect-code"));
+    }
+
+    #[test]
+    fn parse_max_body_size_valid() {
+        let m = ann(&[(MAX_BODY_SIZE, "8m")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert_eq!(a.max_body_size, Some(8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_max_body_size_absent_is_none() {
+        let a = IngressAnnotations::parse(None, "default/test");
+        assert!(a.max_body_size.is_none());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_max_body_size_invalid_warns_and_fails_open() {
+        let m = ann(&[(MAX_BODY_SIZE, "garbage")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(a.max_body_size.is_none());
+        assert!(logs_contain("invalid max-body-size"));
     }
 }

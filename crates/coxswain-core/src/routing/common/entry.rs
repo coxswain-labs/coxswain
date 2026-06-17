@@ -779,6 +779,14 @@ pub struct RouteEntry {
     /// Shared as an `Arc<str>` so the access-log `pattern` mode can emit the rule
     /// pattern instead of the concrete request path without a per-request allocation.
     pub path_pattern: Arc<str>,
+    /// Per-route request body size limit in bytes, from the
+    /// `ingress.coxswain-labs.dev/max-body-size` annotation.
+    ///
+    /// `Some(n)` rejects requests whose body exceeds `n` bytes with 413 Payload Too
+    /// Large — checked up front from `Content-Length` and enforced mid-stream for
+    /// chunked bodies. `None` (the default, and the value for all Gateway-API routes)
+    /// imposes no limit.
+    pub max_body_size: Option<u64>,
 }
 
 impl RouteEntry {
@@ -798,6 +806,7 @@ impl RouteEntry {
             created_at,
             error_status: None,
             path_pattern: Arc::from(""),
+            max_body_size: None,
         }
     }
 
@@ -818,6 +827,7 @@ impl RouteEntry {
             created_at,
             error_status: None,
             path_pattern: Arc::from(""),
+            max_body_size: None,
         }
     }
 
@@ -843,6 +853,7 @@ impl RouteEntry {
             created_at,
             error_status: None,
             path_pattern: Arc::from(""),
+            max_body_size: None,
         }
     }
 
@@ -871,6 +882,7 @@ impl RouteEntry {
             created_at,
             error_status: None,
             path_pattern: Arc::from(""),
+            max_body_size: None,
         }
     }
 
@@ -920,6 +932,17 @@ impl RouteEntry {
         self.filters = Arc::from(filters.into_boxed_slice());
         self
     }
+
+    /// Set the per-route request body size limit in bytes (builder-style).
+    ///
+    /// Used by the Ingress reconciler to attach the limit parsed from the
+    /// `ingress.coxswain-labs.dev/max-body-size` annotation. `None` leaves the
+    /// route unlimited (the default).
+    #[must_use]
+    pub fn with_max_body_size(mut self, max_body_size: Option<u64>) -> Self {
+        self.max_body_size = max_body_size;
+        self
+    }
 }
 
 // Lock the hot-path RouteEntry and BackendPool sizes to catch accidental growth.
@@ -927,7 +950,8 @@ impl RouteEntry {
 // Bumped 176→192 by adding path_pattern: Arc<str> (16 bytes) for access-log pattern mode.
 // Bumped 192→208 by adding metric_route_id: Arc<str> (16 bytes) for Prometheus `route` label and access-log `route_id` join key.
 // Bumped 208→256 by extending RouteTimeouts with connect/read/send: 3 × Option<Duration> (48 bytes) for Ingress annotation timeouts.
-static_assertions::assert_eq_size!(RouteEntry, [u8; 256]);
+// Bumped 256→272 by adding max_body_size: Option<u64> (16 bytes) for the ingress.coxswain-labs.dev/max-body-size request-body limit.
+static_assertions::assert_eq_size!(RouteEntry, [u8; 272]);
 // Hot type — review with the team before bumping this number.
 static_assertions::assert_eq_size!(BackendPool, [u8; 24]);
 
@@ -1119,7 +1143,8 @@ mod tests {
         // Bumped 176→192: path_pattern: Arc<str> added for access-log pattern mode.
         // Bumped 192→208: metric_route_id: Arc<str> added for Prometheus `route` label.
         // Bumped 208→256: RouteTimeouts gained connect/read/send: 3×Option<Duration>.
-        static_assertions::assert_eq_size!(RouteEntry, [u8; 256]);
+        // Bumped 256→272: max_body_size: Option<u64> added for the max-body-size limit.
+        static_assertions::assert_eq_size!(RouteEntry, [u8; 272]);
     }
 
     #[test]

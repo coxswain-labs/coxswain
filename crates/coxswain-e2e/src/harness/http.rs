@@ -84,6 +84,72 @@ impl HttpClient {
         }
     }
 
+    /// Send `method` to `host``path` with a fixed in-memory body. `reqwest` derives a
+    /// `Content-Length` header from the body length, so this exercises the proxy's
+    /// up-front body-size check. Returns `(status, Some(body))` on a 2xx JSON response,
+    /// `(status, None)` otherwise (e.g. a 413 rejection).
+    pub async fn request_with_body(
+        &self,
+        method: Method,
+        host: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> anyhow::Result<(u16, Option<EchoResponse>)> {
+        let url = format!("http://{}{path}", self.proxy_addr);
+        let resp = self
+            .inner
+            .request(method, &url)
+            .header("Host", host)
+            .body(body)
+            .send()
+            .await
+            .context("send request with body")?;
+        let status = resp.status().as_u16();
+        if resp.status().is_success() {
+            let body = resp
+                .json::<EchoResponse>()
+                .await
+                .context("parse echo response")?;
+            Ok((status, Some(body)))
+        } else {
+            Ok((status, None))
+        }
+    }
+
+    /// Send `method` with an unknown-length streaming body. `reqwest` omits
+    /// `Content-Length` and uses `Transfer-Encoding: chunked`, so this exercises the
+    /// proxy's mid-stream body-size cap (the up-front Content-Length check cannot fire).
+    /// `chunks` are streamed in order. Returns `(status, Some(body))` on a 2xx JSON
+    /// response, `(status, None)` otherwise (e.g. a 413 rejection).
+    pub async fn request_with_streamed_body(
+        &self,
+        method: Method,
+        host: &str,
+        path: &str,
+        chunks: Vec<Vec<u8>>,
+    ) -> anyhow::Result<(u16, Option<EchoResponse>)> {
+        let url = format!("http://{}{path}", self.proxy_addr);
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+        let resp = self
+            .inner
+            .request(method, &url)
+            .header("Host", host)
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .context("send request with streamed body")?;
+        let status = resp.status().as_u16();
+        if resp.status().is_success() {
+            let body = resp
+                .json::<EchoResponse>()
+                .await
+                .context("parse echo response")?;
+            Ok((status, Some(body)))
+        } else {
+            Ok((status, None))
+        }
+    }
+
     /// GET `path` with `Host: host`. Returns the parsed echo body on 2xx, or an error.
     pub async fn get(&self, host: &str, path: &str) -> anyhow::Result<EchoResponse> {
         let (status, body) = self.request(Method::GET, host, path, &[]).await?;

@@ -75,6 +75,19 @@ impl ProxyHttp for IngressProxy {
         hooks::request_filter(&self.engine, &self.default_timeouts, session, ctx).await
     }
 
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut ProxyCtx,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        hooks::request_body_filter(body.as_ref(), ctx)
+    }
+
     async fn upstream_peer(
         &self,
         _session: &mut Session,
