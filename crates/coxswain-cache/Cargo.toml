@@ -1,0 +1,19 @@
+[package]
+name = "coxswain-cache"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+coxswain-core = { workspace = true }
+itoa          = { workspace = true }
+pingora-cache = { workspace = true, features = ["boringssl"] }
+prometheus    = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

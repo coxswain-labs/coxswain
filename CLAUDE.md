@@ -20,7 +20,7 @@ The hidden `serve dev` runs both pipelines in one process for local development.
 
 ## Architecture
 
-Eight crates with a strict dependency order:
+Nine crates with a strict dependency order:
 
 ```
 coxswain-bin
@@ -29,12 +29,16 @@ coxswain-bin
   │     └── coxswain-reflector
   ├── coxswain-proxy
   │     ├── coxswain-core
-  │     └── coxswain-reflector
+  │     ├── coxswain-reflector
+  │     └── coxswain-cache
   ├── coxswain-reflector
+  │     └── coxswain-core
+  ├── coxswain-cache
   │     └── coxswain-core
   ├── coxswain-health
   ├── coxswain-admin
-  │     └── coxswain-core
+  │     ├── coxswain-core
+  │     └── coxswain-cache
   └── (coxswain-e2e — black-box tests, not a runtime dep)
 ```
 
