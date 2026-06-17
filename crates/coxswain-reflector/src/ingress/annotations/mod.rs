@@ -6,6 +6,7 @@
 //! - [`routing`] — path rewrite and regex opt-in annotations.
 //! - [`filters`] — request/response header modifiers, redirect, and ssl-redirect annotations.
 //! - [`security`] — edge access control (source-IP allow-list).
+//! - [`caching`] — RFC 7234 response-cache opt-in.
 //!
 //! The top-level [`IngressAnnotations::parse`] function is called once per Ingress in
 //! [`super::reconcile`] and threads the results into every rule/path entry.
@@ -16,11 +17,13 @@
 //! returns `None` so the annotation is treated as absent — the whole Ingress keeps
 //! its routes; only that annotation's effect is suppressed.
 
+mod caching;
 mod filters;
 mod routing;
 mod security;
 mod traffic_policy;
 
+pub use caching::*;
 pub use filters::*;
 pub use routing::*;
 pub use security::*;
@@ -109,6 +112,9 @@ pub(super) struct IngressAnnotations {
     /// Source-IP allow-list (CIDR set) from `allow-source-range` (#264).
     /// `None` (the default, or an all-invalid/absent value) admits all source IPs.
     pub allow_source_range: Option<Vec<ipnet::IpNet>>,
+    /// RFC 7234 response-cache opt-in from `cache-enabled` (#40).
+    /// `false` (the default, or an invalid value) leaves caching off.
+    pub cache_enabled: bool,
 }
 
 impl IngressAnnotations {
@@ -360,6 +366,11 @@ impl IngressAnnotations {
         // ── Allow-source-range (#264) ─────────────────────────────────────────
         let allow_source_range = get(ann, ALLOW_SOURCE_RANGE).and_then(parse_allow_source_range);
 
+        // ── Response caching (#40) ────────────────────────────────────────────
+        let cache_enabled = get(ann, CACHE_ENABLED)
+            .and_then(parse_cache_enabled)
+            .unwrap_or(false);
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -379,6 +390,7 @@ impl IngressAnnotations {
             ssl_redirect_code,
             max_body_size,
             allow_source_range,
+            cache_enabled,
         }
     }
 }
@@ -850,5 +862,28 @@ mod tests {
         let a = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.max_body_size.is_none());
         assert!(logs_contain("invalid max-body-size"));
+    }
+
+    #[test]
+    fn parse_cache_enabled_true() {
+        let m = ann(&[(CACHE_ENABLED, "true")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(a.cache_enabled);
+    }
+
+    #[test]
+    fn parse_cache_enabled_false_and_absent_default_off() {
+        let m = ann(&[(CACHE_ENABLED, "false")]);
+        assert!(!IngressAnnotations::parse(Some(&m), "default/test").cache_enabled);
+        assert!(!IngressAnnotations::parse(None, "default/test").cache_enabled);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_cache_enabled_invalid_warns_and_defaults_off() {
+        let m = ann(&[(CACHE_ENABLED, "1")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(!a.cache_enabled);
+        assert!(logs_contain("treating cache-enabled as false"));
     }
 }

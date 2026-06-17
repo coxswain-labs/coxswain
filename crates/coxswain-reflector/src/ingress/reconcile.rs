@@ -287,7 +287,8 @@ impl IngressReconciler {
                         .with_timeouts(ann.timeouts.clone())
                         .with_filter_actions(path_filters.clone())
                         .with_max_body_size(ann.max_body_size)
-                        .with_allow_source_range(allow_source_range.clone());
+                        .with_allow_source_range(allow_source_range.clone())
+                        .with_cache_enabled(ann.cache_enabled);
                 if dead {
                     base_entry.error_status = Some(503);
                 }
@@ -314,7 +315,8 @@ impl IngressReconciler {
                             .with_timeouts(ann.timeouts.clone())
                             .with_filter_actions(ssl_filters)
                             .with_max_body_size(ann.max_body_size)
-                            .with_allow_source_range(allow_source_range.clone());
+                            .with_allow_source_range(allow_source_range.clone())
+                            .with_cache_enabled(ann.cache_enabled);
                     if dead {
                         entry.error_status = Some(503);
                     }
