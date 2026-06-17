@@ -184,6 +184,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -221,6 +222,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -256,6 +258,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -291,6 +294,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -359,6 +363,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -380,6 +385,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );

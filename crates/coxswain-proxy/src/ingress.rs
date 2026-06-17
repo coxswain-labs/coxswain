@@ -13,6 +13,7 @@ use crate::common::ctx::ProxyCtx;
 use crate::common::engine::RoutingEngine;
 use crate::common::hooks;
 use crate::config::AccessLogPathMode;
+use crate::rate_limit::RateLimiterRegistry;
 use crate::upstream_ca::UpstreamCaCache;
 use async_trait::async_trait;
 use coxswain_cache::ResponseCache;
@@ -45,6 +46,10 @@ pub struct IngressProxy {
     /// (`--cache-max-size=0`). Enabled per request only for routes carrying the
     /// `ingress.coxswain-labs.dev/cache-enabled` opt-in.
     pub cache: Option<ResponseCache>,
+    /// Shared per-process rate-limiter registry. Holds one governor keyed limiter
+    /// per route that has `ingress.coxswain-labs.dev/rate-limit-*` annotations or
+    /// a `RateLimit` CRD `ExtensionRef` filter. Survives routing-table reconciles.
+    pub rate_limiter: RateLimiterRegistry,
 }
 
 impl IngressProxy {
@@ -57,6 +62,7 @@ impl IngressProxy {
         access_log_enabled: bool,
         access_log_path_mode: AccessLogPathMode,
         cache: Option<ResponseCache>,
+        rate_limiter: RateLimiterRegistry,
     ) -> Self {
         Self {
             engine,
@@ -65,6 +71,7 @@ impl IngressProxy {
             access_log_enabled,
             access_log_path_mode,
             cache,
+            rate_limiter,
         }
     }
 }
@@ -81,7 +88,14 @@ impl ProxyHttp for IngressProxy {
     where
         Self::CTX: Send + Sync,
     {
-        hooks::request_filter(&self.engine, &self.default_timeouts, session, ctx).await
+        hooks::request_filter(
+            &self.engine,
+            &self.default_timeouts,
+            &self.rate_limiter,
+            session,
+            ctx,
+        )
+        .await
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut ProxyCtx) -> Result<()> {

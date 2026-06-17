@@ -112,6 +112,22 @@ pub const ANNOTATION_SESSION_AFFINITY_HEADER: &str =
 /// Baseline for #15: the same 3-pod `echo-aff` Service with NO session-affinity
 /// annotation — proves the default path stays plain round-robin.
 pub const SESSION_AFFINITY_NONE: &str = fixture!("session_affinity_none.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/rate-limit-rps: "1"` (#25).
+/// Used to verify the proxy admits a single request within quota (200) and rejects
+/// subsequent rapid-fire requests with 429 + `Retry-After`.
+pub const ANNOTATION_RATE_LIMIT_RPS: &str = fixture!("annotation_rate_limit_rps.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/rate-limit-rps: "1"` and `rate-limit-burst: "5"` (#25).
+/// Used to verify the proxy absorbs an initial spike up to the burst cap then starts
+/// returning 429 + `Retry-After`.
+pub const ANNOTATION_RATE_LIMIT_BURST: &str = fixture!("annotation_rate_limit_burst.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/rate-limit-by: "header:X-Rate-Key"` (#25).
+/// Used to verify fail-open when the keying header is absent — all requests pass even
+/// at high rates.
+pub const ANNOTATION_RATE_LIMIT_BY_HEADER: &str = fixture!("annotation_rate_limit_by_header.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/rate-limit-rps: "notanumber"` (#25).
+/// Used to verify that an invalid annotation value is ignored (warn + fail-open) and
+/// traffic flows unthrottled.
+pub const ANNOTATION_RATE_LIMIT_INVALID: &str = fixture!("annotation_rate_limit_invalid.yaml");
 /// Per-class annotation defaults via `IngressClass.spec.parameters` (#190): a
 /// `CoxswainIngressClassParameters` CR sets a default `rewrite-target`, one
 /// Ingress inherits it and a second overrides it per-key. The IngressClass is

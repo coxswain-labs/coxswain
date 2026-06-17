@@ -39,7 +39,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
-use coxswain_core::crd::CoxswainIngressClassParameters;
+use coxswain_core::crd::{CoxswainIngressClassParameters, RateLimit};
 use coxswain_core::fleet::{self, SharedFleet};
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
@@ -461,6 +461,9 @@ pub(super) struct ReflectorStores<'a> {
     /// have no equivalent filter; all CMs in scope are watched. A follow-up will
     /// switch to per-policy informers to bound memory use in large clusters.
     pub(super) configmaps: &'a reflector::Store<ConfigMap>,
+    /// `RateLimit` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
+    /// filters during Gateway API reconciliation.
+    pub(super) rate_limits: &'a reflector::Store<RateLimit>,
 }
 
 struct SharedOutputs<'a> {
@@ -726,6 +729,7 @@ async fn spawn_tasks(
     let (service_reader, service_writer) = reflector::store::<Service>();
     let (policy_reader, policy_writer) = reader_writer::<BackendTlsPolicy>(pre_policies);
     let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
+    let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
     let ns = watch_namespace.as_deref();
@@ -840,6 +844,14 @@ async fn spawn_tasks(
         ReflectorEffects::new(&notify, &controller_health, "config_map", metrics),
         "ConfigMap",
     );
+    spawn_reflector(
+        &mut set,
+        rate_limit_writer,
+        scoped_api::<RateLimit>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(&notify, &controller_health, "rate_limit", metrics),
+        "RateLimit",
+    );
 
     // --- Fleet pod watch (controller role only) ---
     //
@@ -898,6 +910,7 @@ async fn spawn_tasks(
                 secrets: &secret_reader,
                 policies: &policy_reader,
                 configmaps: &configmap_reader,
+                rate_limits: &rate_limit_reader,
             };
             let outputs = SharedOutputs {
                 ingress_routes: &ingress_routes,
@@ -1249,6 +1262,7 @@ pub(super) fn build_gateway_routes(
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: ownership.policy_index,
+                rate_limits: stores.rate_limits,
             },
             &mut builder,
         );

@@ -16,8 +16,9 @@ use coxswain_core::routing::{RouteTimeouts, SharedGatewayRoutingTable, SharedIng
 use coxswain_proxy::{
     DedicatedProxyReflector, DedicatedProxyReflectorConfig, GatewayProxy, IngressProxy,
     KubernetesSource, ListenerProtocol, ListenerSpec, ProxyAcceptor, ProxyReflector,
-    ProxyReflectorConfig, RoutingEngine, RoutingSource, SniCertSelector, TrustedSources,
-    UpstreamCaCache, spawn_dedicated_routing_table_builder, spawn_routing_table_builder,
+    ProxyReflectorConfig, RateLimiterRegistry, RoutingEngine, RoutingSource, SniCertSelector,
+    TrustedSources, UpstreamCaCache, spawn_dedicated_routing_table_builder,
+    spawn_routing_table_builder,
 };
 use coxswain_reflector::{GatewayListenerHealth, ListenerTlsOutcome, ReconcilerHealth};
 use pingora_core::server::Server;
@@ -422,6 +423,7 @@ fn wire_gateway_only_proxy_services(
         send: None,
     };
     let ca_cache = Arc::new(UpstreamCaCache::new());
+    let rate_limiter = RateLimiterRegistry::new();
 
     let gateway_proxy = Arc::new(pingora_proxy::http_proxy(
         &server.configuration,
@@ -432,6 +434,7 @@ fn wire_gateway_only_proxy_services(
             proxy.access_log,
             access_log_path_mode(proxy),
             cache,
+            rate_limiter.clone(),
         ),
     ));
 
@@ -491,6 +494,13 @@ fn wire_gateway_only_proxy_services(
         },
     ));
 
+    server.add_service(background_service(
+        "rate-limit-gc",
+        RateLimiterGcService {
+            registry: rate_limiter,
+        },
+    ));
+
     let _ = common;
     Ok(())
 }
@@ -535,6 +545,7 @@ fn wire_proxy_services(
         send: None,
     };
     let ca_cache = Arc::new(UpstreamCaCache::new());
+    let rate_limiter = RateLimiterRegistry::new();
 
     let ingress_specs: HashSet<ListenerSpec> =
         build_ingress_listeners(common, proxy).into_iter().collect();
@@ -563,6 +574,7 @@ fn wire_proxy_services(
                     proxy.access_log,
                     access_log_path_mode(proxy),
                     cache,
+                    rate_limiter.clone(),
                 ),
             ));
             let selector = SniCertSelector::new(source.tls_store());
@@ -588,6 +600,7 @@ fn wire_proxy_services(
                 proxy.access_log,
                 access_log_path_mode(proxy),
                 cache,
+                rate_limiter.clone(),
             ),
         ));
         let selector = SniCertSelector::new(source.tls_store());
@@ -613,6 +626,7 @@ fn wire_proxy_services(
                     proxy.access_log,
                     access_log_path_mode(proxy),
                     cache,
+                    rate_limiter.clone(),
                 ),
             ));
             let selector = SniCertSelector::new(source.tls_store());
@@ -638,6 +652,7 @@ fn wire_proxy_services(
                 proxy.access_log,
                 access_log_path_mode(proxy),
                 cache,
+                rate_limiter.clone(),
             ),
         ));
         let selector = SniCertSelector::new(source.tls_store());
@@ -661,6 +676,13 @@ fn wire_proxy_services(
             bind_addr: proxy.proxy_bind_address,
             excluded_ports: ingress_ports,
             tx: gw_tx,
+        },
+    ));
+
+    server.add_service(background_service(
+        "rate-limit-gc",
+        RateLimiterGcService {
+            registry: rate_limiter,
         },
     ));
 
@@ -707,6 +729,34 @@ impl pingora_core::services::background::BackgroundService for ListenerSpecsAdap
                         break;
                     }
                 }
+            }
+        }
+    }
+}
+
+// ── Rate-limiter GC service ───────────────────────────────────────────────────
+
+/// Background service that periodically evicts idle per-client rate-limit buckets.
+///
+/// Calls [`RateLimiterRegistry::sweep`] every 60 seconds. The sweep invokes
+/// `retain_recent` on every live governor `DashMapStateStore`, removing keys
+/// whose GCRA state has fully recovered (bucket full; client has been quiet for
+/// at least one full rate period). Routes with zero remaining keys are removed
+/// from the registry entirely, bounding memory growth under high-cardinality
+/// client spaces (many distinct IPs or many distinct header values).
+struct RateLimiterGcService {
+    registry: RateLimiterRegistry,
+}
+
+#[async_trait]
+impl pingora_core::services::background::BackgroundService for RateLimiterGcService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = interval.tick() => self.registry.sweep(),
             }
         }
     }

@@ -12,6 +12,7 @@ use crate::common::ctx::ProxyCtx;
 use crate::common::engine::RoutingEngine;
 use crate::common::hooks;
 use crate::config::AccessLogPathMode;
+use crate::rate_limit::RateLimiterRegistry;
 use crate::upstream_ca::UpstreamCaCache;
 use async_trait::async_trait;
 use coxswain_cache::ResponseCache;
@@ -45,6 +46,11 @@ pub struct GatewayProxy {
     /// `ExtensionRef`/`CoxswainCachePolicy` binding lands, so this is wired but
     /// dormant for now; the hooks gate on the per-route `cache_enabled` flag.
     pub cache: Option<ResponseCache>,
+    /// Shared per-process rate-limiter registry. Holds one governor keyed limiter
+    /// per route that has a `RateLimit` CRD `ExtensionRef` filter or an Ingress
+    /// `rate-limit-*` annotation. The same registry instance is shared with the
+    /// `IngressProxy` so both bindings draw from a common limit pool.
+    pub rate_limiter: RateLimiterRegistry,
 }
 
 impl GatewayProxy {
@@ -57,6 +63,7 @@ impl GatewayProxy {
         access_log_enabled: bool,
         access_log_path_mode: AccessLogPathMode,
         cache: Option<ResponseCache>,
+        rate_limiter: RateLimiterRegistry,
     ) -> Self {
         Self {
             engine,
@@ -65,6 +72,7 @@ impl GatewayProxy {
             access_log_enabled,
             access_log_path_mode,
             cache,
+            rate_limiter,
         }
     }
 }
@@ -81,7 +89,14 @@ impl ProxyHttp for GatewayProxy {
     where
         Self::CTX: Send + Sync,
     {
-        hooks::request_filter(&self.engine, &self.default_timeouts, session, ctx).await
+        hooks::request_filter(
+            &self.engine,
+            &self.default_timeouts,
+            &self.rate_limiter,
+            session,
+            ctx,
+        )
+        .await
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut ProxyCtx) -> Result<()> {

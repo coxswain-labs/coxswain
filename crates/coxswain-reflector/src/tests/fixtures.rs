@@ -1,3 +1,4 @@
+use coxswain_core::crd::RateLimit;
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use kube::api::ObjectMeta;
@@ -48,6 +49,10 @@ pub(crate) fn slice_store(slices: Vec<EndpointSlice>) -> reflector::Store<Endpoi
 
 pub(crate) fn empty_svc_store() -> reflector::Store<Service> {
     reflector::store::Writer::<Service>::default().as_reader()
+}
+
+pub(crate) fn empty_rate_limit_store() -> reflector::Store<RateLimit> {
+    reflector::store::Writer::<RateLimit>::default().as_reader()
 }
 
 pub(crate) fn make_svc_store(services: Vec<Service>) -> reflector::Store<Service> {

@@ -88,6 +88,7 @@ nav:
     - Operations:
       - Running in production: guides/running-in-production.md
       - TLS: guides/tls.md
+      - Rate limiting: guides/rate-limiting.md
       - Verifying releases: guides/verifying-releases.md
       - Troubleshooting: guides/troubleshooting.md
   - Reference:

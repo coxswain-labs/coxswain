@@ -17,12 +17,18 @@
 //!     > deploy/manifests/crds/coxswainingressclassparameters.yaml
 //! cp deploy/manifests/crds/coxswainingressclassparameters.yaml \
 //!     charts/coxswain/crds/coxswainingressclassparameters.yaml
+//!
+//! # RateLimit
+//! cargo run -p coxswain-core --example crdgen -- RateLimit \
+//!     > deploy/manifests/crds/ratelimits.yaml
+//! cp deploy/manifests/crds/ratelimits.yaml \
+//!     charts/coxswain/crds/ratelimits.yaml
 //! ```
 //!
 //! The snapshot tests in `coxswain-core` fail on drift between this generator
 //! and the committed YAML.
 
-use coxswain_core::crd::{CoxswainGatewayParameters, CoxswainIngressClassParameters};
+use coxswain_core::crd::{CoxswainGatewayParameters, CoxswainIngressClassParameters, RateLimit};
 use kube::CustomResourceExt;
 
 fn main() -> Result<(), serde_yaml::Error> {
@@ -31,6 +37,7 @@ fn main() -> Result<(), serde_yaml::Error> {
         "IngressClassParameters" => {
             serde_yaml::to_writer(std::io::stdout(), &CoxswainIngressClassParameters::crd())
         }
+        "RateLimit" => serde_yaml::to_writer(std::io::stdout(), &RateLimit::crd()),
         // No arg or "GatewayParameters" → gateway (backward-compatible default).
         _ => serde_yaml::to_writer(std::io::stdout(), &CoxswainGatewayParameters::crd()),
     }

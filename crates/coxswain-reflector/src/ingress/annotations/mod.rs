@@ -5,7 +5,7 @@
 //! - [`traffic_policy`] — timeout, retry, and backend-protocol annotations.
 //! - [`routing`] — path rewrite and regex opt-in annotations.
 //! - [`filters`] — request/response header modifiers, redirect, and ssl-redirect annotations.
-//! - [`security`] — edge access control (source-IP allow-list).
+//! - [`security`] — edge access control (source-IP allow-list, rate limiting).
 //! - [`caching`] — RFC 7234 response-cache opt-in.
 //! - [`session`] — sticky-session (session-affinity) binding.
 //!
@@ -33,8 +33,8 @@ pub use session::*;
 pub use traffic_policy::*;
 
 use coxswain_core::routing::{
-    BackendProtocol, FilterAction, HeaderMod, PathModifier, RetryPolicy, RouteTimeouts,
-    SessionAffinity,
+    BackendProtocol, FilterAction, HeaderMod, PathModifier, RateLimitConfig, RetryPolicy,
+    RouteTimeouts, SessionAffinity,
 };
 use std::collections::BTreeMap;
 
@@ -122,6 +122,10 @@ pub(super) struct IngressAnnotations {
     /// Sticky-session binding from the `session-*` annotations (#15).
     /// `None` (the default, or an invalid/incomplete value) keeps round-robin.
     pub session_affinity: Option<SessionAffinity>,
+    /// Per-route rate-limiting config from the `rate-limit-*` annotations (#25).
+    /// `None` (the default, or when `rate-limit-rps` is absent/invalid) disables
+    /// rate limiting for the route (fail-open).
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 impl IngressAnnotations {
@@ -381,6 +385,14 @@ impl IngressAnnotations {
         // ── Session affinity (#15) ────────────────────────────────────────────
         let session_affinity = parse_session_affinity(ann, route_id);
 
+        // ── Rate limiting (#25) ───────────────────────────────────────────────
+        let rate_limit = parse_rate_limit(
+            get(ann, RATE_LIMIT_RPS),
+            get(ann, RATE_LIMIT_BURST),
+            get(ann, RATE_LIMIT_BY),
+            route_id,
+        );
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -402,6 +414,7 @@ impl IngressAnnotations {
             allow_source_range,
             cache_enabled,
             session_affinity,
+            rate_limit,
         }
     }
 }

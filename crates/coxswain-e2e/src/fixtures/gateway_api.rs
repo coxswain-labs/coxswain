@@ -74,6 +74,14 @@ pub const BACKEND_TLS_POLICY_CONFLICT: &str = fixture!("backend_tls_policy_confl
 /// Declares one HTTP listener on `GATEWAY_HTTP_PORT`.
 pub const LISTENER_DRAIN: &str = fixture!("listener_drain.yaml");
 
+/// Gateway + `RateLimit` CRD + HTTPRoute with `ExtensionRef` capping the
+/// `/rl/` path to 1 req/s (#25). Used to verify the proxy enforces the limit
+/// (within-quota → 200; over-quota → 429 + `Retry-After`).
+pub const RATE_LIMIT_EXTENSIONREF: &str = fixture!("rate_limit_extensionref.yaml");
+/// Gateway + HTTPRoute with a dangling `ExtensionRef` pointing at a
+/// `RateLimit` CR that does not exist (#25). Used to verify fail-open:
+/// the missing CR is ignored (warn) and all traffic is served.
+pub const RATE_LIMIT_MISSING_CR: &str = fixture!("rate_limit_missing_cr.yaml");
 /// Dedicated-mode Gateway whose `CoxswainGatewayParameters` references an
 /// image that cannot be pulled (#210). The dedicated proxy Pod never becomes
 /// Ready, so the operator never publishes `DedicatedProxyReady=True` and the

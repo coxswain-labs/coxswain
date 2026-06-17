@@ -14,6 +14,7 @@ pub mod config;
 mod gateway;
 mod ingress;
 pub(crate) mod metrics;
+pub mod rate_limit;
 pub mod reflector;
 mod source;
 mod tls;
@@ -27,6 +28,7 @@ pub use common::engine::RoutingEngine;
 pub use config::AccessLogPathMode;
 pub use gateway::{GatewayEngine, GatewayProxy};
 pub use ingress::{IngressEngine, IngressProxy};
+pub use rate_limit::RateLimiterRegistry;
 pub use reflector::{
     DedicatedProxyReflector, DedicatedProxyReflectorConfig, ProxyReflector, ProxyReflectorConfig,
     spawn_dedicated_routing_table_builder, spawn_routing_table_builder,
