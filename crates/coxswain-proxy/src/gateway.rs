@@ -11,12 +11,9 @@
 use crate::common::ctx::ProxyCtx;
 use crate::common::engine::RoutingEngine;
 use crate::common::hooks;
-use crate::config::AccessLogPathMode;
-use crate::rate_limit::RateLimiterRegistry;
-use crate::upstream_ca::UpstreamCaCache;
+use crate::config::SharedProxyConfig;
 use async_trait::async_trait;
-use coxswain_cache::ResponseCache;
-use coxswain_core::routing::{Gateway, RouteTimeouts};
+use coxswain_core::routing::Gateway;
 use pingora_cache::key::{CacheKey, HashBinary};
 use pingora_cache::{CacheMeta, ForcedFreshness, HitHandler, RespCacheable};
 use pingora_core::Result;
@@ -33,47 +30,18 @@ pub type GatewayEngine = RoutingEngine<Gateway>;
 pub struct GatewayProxy {
     /// Lock-free routing engine reading the Gateway snapshot.
     pub engine: Arc<GatewayEngine>,
-    /// Global fallback timeouts applied when a matched route has no per-rule timeouts set.
-    pub default_timeouts: RouteTimeouts,
-    /// Parse cache for upstream CA bundles from `BackendTLSPolicy` attachments.
-    pub ca_cache: Arc<UpstreamCaCache>,
-    /// Whether to emit one access-log event per request.
-    pub access_log_enabled: bool,
-    /// Controls what the access log emits for the `path` field.
-    pub access_log_path_mode: AccessLogPathMode,
-    /// Shared response cache, or `None` when caching is disabled process-wide
-    /// (`--cache-max-size=0`). Gateway-API routes never opt in until the
-    /// `ExtensionRef`/`CoxswainCachePolicy` binding lands, so this is wired but
-    /// dormant for now; the hooks gate on the per-route `cache_enabled` flag.
-    pub cache: Option<ResponseCache>,
-    /// Shared per-process rate-limiter registry. Holds one governor keyed limiter
-    /// per route that has a `RateLimit` CRD `ExtensionRef` filter or an Ingress
-    /// `rate-limit-*` annotation. The same registry instance is shared with the
-    /// `IngressProxy` so both bindings draw from a common limit pool.
-    pub rate_limiter: RateLimiterRegistry,
+    /// Startup-time collaborators shared between `IngressProxy` and `GatewayProxy`.
+    ///
+    /// The engine is kept separate because it is typed differently for each
+    /// proxy; all other startup-time config lives here.
+    pub cfg: SharedProxyConfig,
 }
 
 impl GatewayProxy {
-    /// Construct a `GatewayProxy` from its runtime collaborators.
+    /// Construct a `GatewayProxy` from its engine and shared runtime config.
     #[must_use]
-    pub fn new(
-        engine: Arc<GatewayEngine>,
-        default_timeouts: RouteTimeouts,
-        ca_cache: Arc<UpstreamCaCache>,
-        access_log_enabled: bool,
-        access_log_path_mode: AccessLogPathMode,
-        cache: Option<ResponseCache>,
-        rate_limiter: RateLimiterRegistry,
-    ) -> Self {
-        Self {
-            engine,
-            default_timeouts,
-            ca_cache,
-            access_log_enabled,
-            access_log_path_mode,
-            cache,
-            rate_limiter,
-        }
+    pub fn new(engine: Arc<GatewayEngine>, cfg: SharedProxyConfig) -> Self {
+        Self { engine, cfg }
     }
 }
 
@@ -91,8 +59,9 @@ impl ProxyHttp for GatewayProxy {
     {
         hooks::request_filter(
             &self.engine,
-            &self.default_timeouts,
-            &self.rate_limiter,
+            &self.cfg.default_timeouts,
+            &self.cfg.rate_limiter,
+            &self.cfg.auth_client,
             session,
             ctx,
         )
@@ -100,7 +69,7 @@ impl ProxyHttp for GatewayProxy {
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut ProxyCtx) -> Result<()> {
-        hooks::request_cache_filter(self.cache, session, ctx)
+        hooks::request_cache_filter(self.cfg.cache, session, ctx)
     }
 
     fn cache_key_callback(&self, session: &Session, ctx: &mut ProxyCtx) -> Result<CacheKey> {
@@ -163,7 +132,7 @@ impl ProxyHttp for GatewayProxy {
         _session: &mut Session,
         ctx: &mut ProxyCtx,
     ) -> Result<Box<HttpPeer>> {
-        hooks::upstream_peer(&self.ca_cache, ctx).await
+        hooks::upstream_peer(&self.cfg.ca_cache, ctx).await
     }
 
     async fn upstream_request_filter(
@@ -229,8 +198,8 @@ impl ProxyHttp for GatewayProxy {
         Self::CTX: Send + Sync,
     {
         hooks::logging(
-            self.access_log_enabled,
-            self.access_log_path_mode,
+            self.cfg.access_log_enabled,
+            self.cfg.access_log_path_mode,
             session,
             e,
             ctx,

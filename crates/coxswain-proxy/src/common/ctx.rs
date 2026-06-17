@@ -125,6 +125,17 @@ pub struct ProxyCtx {
     /// cookie was presented), so `upstream_response_filter` must emit `Set-Cookie` for
     /// the chosen endpoint. Always `false` in header mode (the client supplies the key).
     pub affinity_set_cookie: bool,
+    /// Headers from the ext_authz response to inject into the upstream request.
+    ///
+    /// Populated by [`crate::auth::enforce`] when the auth service returns 2xx and
+    /// the route's `auth-response-headers` allow-list is non-empty.  Applied in
+    /// `upstream_request_filter` after rule-level filters.  `None` (the common
+    /// case) incurs no cost.
+    ///
+    /// Each element is `(lowercase-header-name, value)`.  The name is pre-lowercased
+    /// at the auth-response parsing step so `upstream_request_filter` can use a
+    /// case-insensitive comparison without per-request allocation.
+    pub auth_response_headers: Option<Vec<(Box<str>, Box<str>)>>,
 }
 
 // Hot types — review with the team before bumping these numbers.
@@ -143,4 +154,6 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 176);
 // ProxyCtx: +32 for the session-affinity pin — affinity_pin: Option<SocketAddr>
 // (32, no niche) plus affinity_set_cookie: bool absorbed into existing alignment
 // padding (#15) (344→376).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 376);
+// ProxyCtx: +24 for auth_response_headers: Option<Vec<(Box<str>, Box<str>)>>
+// (niche-opt on Vec's ptr; 24 bytes) (#24) (376→400).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 400);

@@ -9,6 +9,7 @@
 //! xDS client).
 
 pub(crate) mod accept;
+pub(crate) mod auth;
 pub(crate) mod common;
 pub mod config;
 mod gateway;
@@ -25,7 +26,7 @@ pub use accept::{
 };
 pub use common::ctx::{ProxyCtx, ResolvedRoute};
 pub use common::engine::RoutingEngine;
-pub use config::AccessLogPathMode;
+pub use config::{AccessLogPathMode, SharedProxyConfig};
 pub use gateway::{GatewayEngine, GatewayProxy};
 pub use ingress::{IngressEngine, IngressProxy};
 pub use rate_limit::RateLimiterRegistry;
