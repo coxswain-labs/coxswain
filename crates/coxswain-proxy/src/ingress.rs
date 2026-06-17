@@ -15,7 +15,10 @@ use crate::common::hooks;
 use crate::config::AccessLogPathMode;
 use crate::upstream_ca::UpstreamCaCache;
 use async_trait::async_trait;
+use coxswain_cache::ResponseCache;
 use coxswain_core::routing::{Ingress, RouteTimeouts};
+use pingora_cache::key::{CacheKey, HashBinary};
+use pingora_cache::{CacheMeta, ForcedFreshness, HitHandler, RespCacheable};
 use pingora_core::Result;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -38,6 +41,10 @@ pub struct IngressProxy {
     pub access_log_enabled: bool,
     /// Controls what the access log emits for the `path` field.
     pub access_log_path_mode: AccessLogPathMode,
+    /// Shared response cache, or `None` when caching is disabled process-wide
+    /// (`--cache-max-size=0`). Enabled per request only for routes carrying the
+    /// `ingress.coxswain-labs.dev/cache-enabled` opt-in.
+    pub cache: Option<ResponseCache>,
 }
 
 impl IngressProxy {
@@ -49,6 +56,7 @@ impl IngressProxy {
         ca_cache: Arc<UpstreamCaCache>,
         access_log_enabled: bool,
         access_log_path_mode: AccessLogPathMode,
+        cache: Option<ResponseCache>,
     ) -> Self {
         Self {
             engine,
@@ -56,6 +64,7 @@ impl IngressProxy {
             ca_cache,
             access_log_enabled,
             access_log_path_mode,
+            cache,
         }
     }
 }
@@ -73,6 +82,52 @@ impl ProxyHttp for IngressProxy {
         Self::CTX: Send + Sync,
     {
         hooks::request_filter(&self.engine, &self.default_timeouts, session, ctx).await
+    }
+
+    fn request_cache_filter(&self, session: &mut Session, ctx: &mut ProxyCtx) -> Result<()> {
+        hooks::request_cache_filter(self.cache, session, ctx)
+    }
+
+    fn cache_key_callback(&self, session: &Session, ctx: &mut ProxyCtx) -> Result<CacheKey> {
+        Ok(hooks::cache_key_callback(session, ctx))
+    }
+
+    fn response_cache_filter(
+        &self,
+        _session: &Session,
+        resp: &ResponseHeader,
+        _ctx: &mut ProxyCtx,
+    ) -> Result<RespCacheable> {
+        Ok(hooks::response_cache_filter(resp))
+    }
+
+    fn cache_vary_filter(
+        &self,
+        meta: &CacheMeta,
+        _ctx: &mut ProxyCtx,
+        req: &RequestHeader,
+    ) -> Option<HashBinary> {
+        hooks::cache_vary_filter(meta, req)
+    }
+
+    async fn cache_hit_filter(
+        &self,
+        _session: &mut Session,
+        _meta: &CacheMeta,
+        _hit_handler: &mut HitHandler,
+        _is_fresh: bool,
+        ctx: &mut ProxyCtx,
+    ) -> Result<Option<ForcedFreshness>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        hooks::record_cache_hit(ctx);
+        Ok(None)
+    }
+
+    fn cache_miss(&self, session: &mut Session, ctx: &mut ProxyCtx) {
+        hooks::record_cache_miss(ctx);
+        session.cache.cache_miss();
     }
 
     async fn request_body_filter(

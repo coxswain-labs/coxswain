@@ -31,6 +31,7 @@ pub use events::EventSources;
 
 use aggregator::json_response;
 use async_trait::async_trait;
+use coxswain_cache::ResponseCache;
 use coxswain_core::health::{HealthRegistry, SubsystemSnapshot};
 use coxswain_core::routing::{RoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use http::{HeaderValue, Response, StatusCode, header};
@@ -72,6 +73,7 @@ const UI_HTML: &str = include_str!(concat!(
 /// | `/metrics` | ✓ | |
 /// | `/api/v1/health` | ✓ | |
 /// | `/api/v1/routes` | proxy + dev only | |
+/// | `DELETE /cache/{host}/{path}` | proxy + dev only | |
 /// | `/api/v1/fleet/{summary,controllers,proxies}` (+ sub-resources) | | ✓ |
 /// | `/api/v1/routing/{summary,gateways,httproutes,ingresses}` | | ✓ |
 /// | `/api/v1/routing/routes/{kind}/{ns}/{name}` | | ✓ |
@@ -113,6 +115,10 @@ pub struct AdminServer {
     /// the controller and dev roles — proxy roles leave this `false` so `GET /`
     /// returns 404 structurally, the same gate as the aggregator surface.
     serve_ui: bool,
+    /// Response-cache handle for `DELETE /cache/{host}/{path}`. `Some` on proxy
+    /// and dev roles (where the cache lives); `None` on the controller, so the
+    /// endpoint returns 404 structurally there.
+    cache: Option<ResponseCache>,
     /// HTTP module pipeline (response compression) applied to every buffered
     /// endpoint. The SSE stream deliberately bypasses it — compression buffers,
     /// which would defeat streaming.
@@ -135,6 +141,7 @@ impl AdminServer {
             aggregator: None,
             events: None,
             serve_ui: false,
+            cache: None,
             modules,
         }
     }
@@ -183,6 +190,18 @@ impl AdminServer {
     #[must_use]
     pub fn with_ui(mut self) -> Self {
         self.serve_ui = true;
+        self
+    }
+
+    /// Enable `DELETE /cache/{host}/{path}` to purge a cached entry.
+    ///
+    /// Called from proxy and dev roles, where the response cache actually lives.
+    /// The controller omits this (it holds no cache), so the endpoint returns
+    /// 404 structurally there. `None` (caching disabled, `--cache-max-size=0`)
+    /// is treated the same as not wiring the handle.
+    #[must_use]
+    pub fn with_cache(mut self, cache: Option<ResponseCache>) -> Self {
+        self.cache = cache;
         self
     }
 
@@ -322,6 +341,22 @@ impl AdminServer {
             _ => {}
         }
 
+        // Cache purge — proxy + dev roles only (the cache lives in the proxy
+        // process). `DELETE /cache/{host}/{path}`, where `{path}` may itself
+        // contain slashes. Handled before the aggregator gate since proxy roles
+        // wire no aggregator. Own the parsed host/path so no borrow of `session`
+        // is held across the await.
+        if let Some(cache) = self.cache
+            && let Some((host, cache_path)) = parse_cache_purge_path(path)
+        {
+            let host = host.to_string();
+            if session.req_header().method == http::Method::DELETE {
+                let purged = cache.purge(&host, &cache_path).await;
+                return cache_purge_response(&host, &cache_path, purged);
+            }
+            return method_not_allowed(&[http::Method::DELETE]);
+        }
+
         // Aggregator endpoints — all under /api/v1/.
         // Return 404 when no aggregator is wired (proxy pod roles).
         let Some(agg) = self.aggregator.as_ref() else {
@@ -365,6 +400,48 @@ impl AdminServer {
             _ => aggregator::not_found(),
         }
     }
+}
+
+/// Parse `/cache/{host}/{path}` into `(host, path)`.
+///
+/// The `{path}` component keeps its leading slash and may contain further
+/// slashes (it is the full request path of the cached entry); `/cache/{host}`
+/// alone yields the root path `/`. Returns `None` for any non-`/cache/` path or
+/// when the host segment is empty.
+fn parse_cache_purge_path(path: &str) -> Option<(&str, String)> {
+    let rest = path.strip_prefix("/cache/")?;
+    match rest.split_once('/') {
+        Some(("", _)) => None,
+        Some((host, tail)) => Some((host, format!("/{tail}"))),
+        None if rest.is_empty() => None,
+        None => Some((rest, "/".to_string())),
+    }
+}
+
+/// Build the JSON response for a cache-purge request.
+///
+/// Always `200 OK` with `{ host, path, purged }`; `purged` is `false` when no
+/// matching entry was present (an idempotent no-op), so the caller can tell a
+/// hit from a miss.
+fn cache_purge_response(host: &str, path: &str, purged: bool) -> Response<Vec<u8>> {
+    let body = serde_json::json!({ "host": host, "path": path, "purged": purged });
+    json_response(body.to_string())
+}
+
+/// Build a `405 Method Not Allowed` response advertising the permitted methods
+/// in the `Allow` header.
+fn method_not_allowed(allowed: &[http::Method]) -> Response<Vec<u8>> {
+    let allow = allowed
+        .iter()
+        .map(http::Method::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut r = Response::new(Vec::new());
+    *r.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+    if let Ok(v) = HeaderValue::from_str(&allow) {
+        r.headers_mut().insert(header::ALLOW, v);
+    }
+    r
 }
 
 /// Extract the pod name from `/api/v1/pods/{name}/logs`, or `None` for any
@@ -642,6 +719,53 @@ mod tests {
 
     fn leader_flag(value: bool) -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(value))
+    }
+
+    #[test]
+    fn parse_cache_purge_path_splits_host_and_multi_segment_path() {
+        assert_eq!(
+            parse_cache_purge_path("/cache/example.com/foo/bar"),
+            Some(("example.com", "/foo/bar".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_cache_purge_path_host_only_yields_root() {
+        assert_eq!(
+            parse_cache_purge_path("/cache/example.com"),
+            Some(("example.com", "/".to_string()))
+        );
+        assert_eq!(
+            parse_cache_purge_path("/cache/example.com/"),
+            Some(("example.com", "/".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_cache_purge_path_rejects_non_cache_or_empty_host() {
+        assert_eq!(parse_cache_purge_path("/api/v1/routes"), None);
+        assert_eq!(parse_cache_purge_path("/cache/"), None);
+        assert_eq!(parse_cache_purge_path("/cache//foo"), None);
+    }
+
+    #[test]
+    fn cache_purge_response_reports_purged_flag() {
+        let resp = cache_purge_response("example.com", "/x", true);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(resp.body()).expect("json body");
+        assert_eq!(v["host"], "example.com");
+        assert_eq!(v["path"], "/x");
+        assert_eq!(v["purged"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn method_not_allowed_sets_allow_header() {
+        let resp = method_not_allowed(&[http::Method::DELETE]);
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            resp.headers().get(header::ALLOW).map(|h| h.as_bytes()),
+            Some(&b"DELETE"[..])
+        );
     }
 
     #[test]
