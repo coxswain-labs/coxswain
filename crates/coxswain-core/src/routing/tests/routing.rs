@@ -231,7 +231,7 @@ fn find_returns_timeouts_from_route_entry() {
     let table = b.build().unwrap();
 
     match table.find(PORT, "example.com", "/foo", &ctx_get()) {
-        RouteOutcome::Found(_, _, t, _, _) => {
+        RouteOutcome::Found(_, _, t, _, _, _) => {
             assert_eq!(t.request, timeouts.request);
             assert_eq!(t.backend_request, timeouts.backend_request);
         }

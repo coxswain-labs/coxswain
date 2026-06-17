@@ -28,6 +28,11 @@ pub const RETRY_ON: &str = "ingress.coxswain-labs.dev/retry-on";
 /// Override upstream wire protocol: `HTTP` (default), `HTTPS`, or `GRPC`.
 pub const BACKEND_PROTOCOL: &str = "ingress.coxswain-labs.dev/backend-protocol";
 
+// ── Max-body-size annotation key ─────────────────────────────────────────────
+
+/// Per-request body size limit — a byte count or `k`/`m`/`g`-suffixed size, e.g. `"8m"`.
+pub const MAX_BODY_SIZE: &str = "ingress.coxswain-labs.dev/max-body-size";
+
 // ── Parse helpers ─────────────────────────────────────────────────────────────
 
 /// Parse a duration annotation value.
@@ -68,6 +73,34 @@ pub fn parse_retry_on(s: &str) -> RetryOn {
         }
     }
     set
+}
+
+/// Parse a byte-size annotation value: a bare byte count (`"10485760"`) or a value
+/// with a binary unit suffix `k`/`m`/`g` (case-insensitive, e.g. `"512k"`, `"8m"`).
+///
+/// Multipliers are binary (k = 1024, m = 1024², g = 1024³), matching nginx
+/// `proxy-body-size` semantics. Emits a structured `WARN` and returns `None` on any
+/// unparseable value so the limit is treated as absent (fail-open).
+#[must_use]
+pub fn parse_byte_size(s: &str) -> Option<u64> {
+    let t = s.trim();
+    let (digits, mult): (&str, u64) = match t.as_bytes().last() {
+        // The matched suffix is always single-byte ASCII, so `t.len() - 1` is a valid
+        // char boundary — slicing cannot split a multi-byte UTF-8 scalar.
+        Some(b'k' | b'K') => (&t[..t.len() - 1], 1024),
+        Some(b'm' | b'M') => (&t[..t.len() - 1], 1024 * 1024),
+        Some(b'g' | b'G') => (&t[..t.len() - 1], 1024 * 1024 * 1024),
+        _ => (t, 1),
+    };
+    digits
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .or_else(|| {
+            tracing::warn!(value = s, "invalid max-body-size annotation value");
+            None
+        })
 }
 
 /// Parse the `backend-protocol` annotation value.
@@ -162,5 +195,34 @@ mod tests {
     fn parse_backend_protocol_unknown_warns() {
         assert_eq!(parse_backend_protocol("grpc"), None);
         assert!(logs_contain("unknown backend-protocol value"));
+    }
+
+    #[test]
+    fn parse_byte_size_valid() {
+        // References MAX_BODY_SIZE to satisfy the annotation-coverage gate.
+        let _ = MAX_BODY_SIZE;
+        assert_eq!(parse_byte_size("10485760"), Some(10_485_760));
+        assert_eq!(parse_byte_size("512k"), Some(512 * 1024));
+        assert_eq!(parse_byte_size("1m"), Some(1024 * 1024));
+        assert_eq!(parse_byte_size("8M"), Some(8 * 1024 * 1024));
+        assert_eq!(parse_byte_size("2g"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_byte_size("  64k  "), Some(64 * 1024));
+        assert_eq!(parse_byte_size("0"), Some(0));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_byte_size_invalid_warns() {
+        assert_eq!(parse_byte_size("garbage"), None);
+        assert_eq!(parse_byte_size("1x"), None);
+        assert_eq!(parse_byte_size("m"), None);
+        assert_eq!(parse_byte_size(""), None);
+        assert!(logs_contain("invalid max-body-size annotation value"));
+    }
+
+    #[test]
+    fn parse_byte_size_overflow_is_none() {
+        // u64::MAX with a 'g' multiplier overflows — must fail closed to None, not wrap.
+        assert_eq!(parse_byte_size("18446744073709551615g"), None);
     }
 }

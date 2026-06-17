@@ -1,0 +1,28 @@
+# max-body-size annotation fixture (apply backends::ECHO first).
+#
+# The Ingress caps request bodies at 1 KiB. The proxy must:
+#   * serve an under-limit POST (echo backend identity, 2xx), and
+#   * reject an over-limit POST with 413 — both when Content-Length declares the
+#     size up front and when a chunked/streaming body (no Content-Length) crosses
+#     the cap mid-stream.
+#
+# Host: maxbody.TESTNS.local → echo-a:3000.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: max-body-size-ingress
+  annotations:
+    ingress.coxswain-labs.dev/max-body-size: "1k"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: maxbody.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

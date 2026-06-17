@@ -27,6 +27,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/ssl-redirect` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/ssl-redirect-code` | integer | `308` | `"301"` |
 | `ingress.coxswain-labs.dev/backend-protocol` | string | `HTTP` | `"GRPC"` |
+| `ingress.coxswain-labs.dev/max-body-size` | size | _none_ | `"8m"` |
 
 ```yaml
 metadata:
@@ -276,6 +277,34 @@ Overrides the upstream wire protocol derived from the Service `appProtocol` fiel
 
 !!! note
     `GRPC` maps to cleartext HTTP/2 (`h2c`). For gRPC over TLS, use `backend-protocol: HTTPS` — gRPC-over-TLS support via a single annotation value is tracked separately.
+
+## `max-body-size`
+
+Caps the request body size. A request whose body exceeds the limit is rejected with **413 Payload Too Large** and never reaches the upstream.
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/max-body-size: "8m"
+```
+
+The value is a byte count, optionally suffixed with a binary unit (case-insensitive):
+
+| Value | Bytes |
+|-------|-------|
+| `"10485760"` | 10485760 (bare byte count) |
+| `"512k"` | 512 × 1024 |
+| `"8m"` | 8 × 1024² |
+| `"1g"` | 1 × 1024³ |
+
+Units are **binary** (`k` = 1024, `m` = 1024², `g` = 1024³), matching nginx-ingress's `proxy-body-size`.
+
+Enforcement is two-layered and never buffers the whole body:
+
+- When the request declares a `Content-Length` larger than the limit, it is rejected up front — before any upstream connection is opened.
+- For chunked or streaming uploads (no `Content-Length`), the proxy counts bytes as they arrive and aborts with 413 the moment the running total crosses the limit.
+
+Omitting the annotation imposes no limit. An unparseable value (e.g. `"8mb"`, `"lots"`) emits a controller warning and is treated as absent — the route serves with no body cap rather than being rejected (**fail-open**).
 
 ## Class-level defaults
 

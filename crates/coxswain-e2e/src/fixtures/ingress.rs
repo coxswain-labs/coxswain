@@ -79,6 +79,14 @@ pub const ANNOTATION_SSL_REDIRECT_TLS: &str = fixture!("annotation_ssl_redirect_
 /// alongside a valid `response-header-set`. Used to verify the bad modifier is dropped but
 /// the route still serves and the valid sibling modifier is applied.
 pub const ANNOTATION_INVALID_HEADER: &str = fixture!("annotation_invalid_header.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/max-body-size: "1k"` (#263). Used to verify
+/// the proxy rejects over-limit POSTs with 413 (both Content-Length and chunked) and
+/// serves under-limit POSTs.
+pub const ANNOTATION_MAX_BODY_SIZE: &str = fixture!("annotation_max_body_size.yaml");
+/// Ingress with an unparseable `max-body-size: "garbage"` value (#263). Used to verify
+/// fail-open: the invalid limit is ignored and an oversized POST still succeeds.
+pub const ANNOTATION_MAX_BODY_SIZE_INVALID: &str =
+    fixture!("annotation_max_body_size_invalid.yaml");
 /// Per-class annotation defaults via `IngressClass.spec.parameters` (#190): a
 /// `CoxswainIngressClassParameters` CR sets a default `rewrite-target`, one
 /// Ingress inherits it and a second overrides it per-key. The IngressClass is

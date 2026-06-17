@@ -11,13 +11,14 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Return type of `HostRouter::route`: backend group + filters + timeouts +
-/// path pattern + metric route id + optional error status.
+/// path pattern + metric route id + optional max body size + optional error status.
 pub(super) type RouteMatch = (
     Arc<BackendGroup>,
     Arc<[FilterAction]>,
     RouteTimeouts,
     Arc<str>,
     Arc<str>,
+    Option<u64>,
     Option<u16>,
 );
 
@@ -70,6 +71,7 @@ impl HostRouter {
                         entry.timeouts.clone(),
                         Arc::clone(&entry.path_pattern),
                         Arc::clone(&entry.metric_route_id),
+                        entry.max_body_size,
                         entry.error_status,
                     ));
                 }
@@ -87,6 +89,7 @@ impl HostRouter {
                             entry.timeouts.clone(),
                             Arc::clone(&entry.path_pattern),
                             Arc::clone(&entry.metric_route_id),
+                            entry.max_body_size,
                             entry.error_status,
                         ));
                     }

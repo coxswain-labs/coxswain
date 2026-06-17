@@ -42,10 +42,11 @@ pub(crate) async fn resolve_outcome(
         RouteTimeouts,
         Arc<str>,
         Arc<str>,
+        Option<u64>,
     )>,
 > {
     match outcome {
-        RouteOutcome::Found(u, f, t, p, m) => Ok(Some((u, f, t, p, m))),
+        RouteOutcome::Found(u, f, t, p, m, b) => Ok(Some((u, f, t, p, m, b))),
         RouteOutcome::Error(status) => {
             let resp = ResponseHeader::build(status, Some(0))?;
             session

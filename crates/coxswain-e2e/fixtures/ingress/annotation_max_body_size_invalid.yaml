@@ -1,0 +1,27 @@
+# max-body-size fail-open fixture (apply backends::ECHO first).
+#
+# The annotation value is unparseable ("garbage"), so the proxy must treat the
+# limit as absent and impose NO cap — an oversized POST that would be rejected by
+# a valid limit instead succeeds (2xx + echo identity). Proves an invalid size
+# never blocks traffic (fail-open).
+#
+# Host: maxbodybad.TESTNS.local → echo-a:3000.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: max-body-size-invalid-ingress
+  annotations:
+    ingress.coxswain-labs.dev/max-body-size: "garbage"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: maxbodybad.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
