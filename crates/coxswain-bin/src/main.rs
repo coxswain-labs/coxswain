@@ -38,6 +38,7 @@ use crate::args::{
     AccessLogPathMode as BinAccessLogPathMode, Cli, Commands, CommonArgs, ControllerArgs,
     ControllerRoleArgs, DevRoleArgs, LogFormat, ProxyArgs, ProxyRoleArgs, ProxyScope, Role,
 };
+use coxswain_cache::ResponseCache;
 use coxswain_proxy::AccessLogPathMode;
 
 fn main() -> Result<()> {
@@ -237,7 +238,15 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
 
     server.add_service(background_service("reconciler", reconciler));
 
-    wire_proxy_services(&mut server, &args.common, &args.proxy, &source, &tls_health)?;
+    let cache = build_response_cache(&args.proxy);
+    wire_proxy_services(
+        &mut server,
+        &args.common,
+        &args.proxy,
+        &source,
+        &tls_health,
+        cache,
+    )?;
 
     let leader = Arc::new(AtomicBool::new(false));
     wire_management_servers(
@@ -251,6 +260,7 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
             aggregator: None,
             events: None,
             serve_ui: false,
+            cache,
         },
     );
 
@@ -351,7 +361,15 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
 
     server.add_service(background_service("reconciler", reconciler));
 
-    wire_gateway_only_proxy_services(&mut server, &args.common, &args.proxy, &source, &tls_health)?;
+    let cache = build_response_cache(&args.proxy);
+    wire_gateway_only_proxy_services(
+        &mut server,
+        &args.common,
+        &args.proxy,
+        &source,
+        &tls_health,
+        cache,
+    )?;
 
     let leader = Arc::new(AtomicBool::new(false));
     wire_management_servers(
@@ -365,6 +383,7 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
             aggregator: None,
             events: None,
             serve_ui: false,
+            cache,
         },
     );
 
@@ -393,6 +412,7 @@ fn wire_gateway_only_proxy_services(
     proxy: &ProxyArgs,
     source: &KubernetesSource,
     tls_health: &SharedGatewayListenerHealth,
+    cache: Option<ResponseCache>,
 ) -> Result<()> {
     let default_timeouts = RouteTimeouts {
         request: proxy.proxy_default_request_timeout,
@@ -411,6 +431,7 @@ fn wire_gateway_only_proxy_services(
             ca_cache,
             proxy.access_log,
             access_log_path_mode(proxy),
+            cache,
         ),
     ));
 
@@ -483,6 +504,13 @@ fn access_log_path_mode(proxy: &ProxyArgs) -> AccessLogPathMode {
     }
 }
 
+/// Build the process-wide response cache from `--cache-max-size`, or `None` when
+/// caching is disabled (`0`). The returned handle is `Copy` and shared by every
+/// proxy in the process so they hit one cache, not one per listener.
+fn build_response_cache(proxy: &ProxyArgs) -> Option<ResponseCache> {
+    (proxy.cache_max_size > 0).then(|| ResponseCache::with_max_bytes(proxy.cache_max_size))
+}
+
 /// Register both the Ingress and Gateway dynamic proxy acceptors on the
 /// supplied server.  Shared between `run_proxy_shared` and `run_dev`.
 ///
@@ -497,6 +525,7 @@ fn wire_proxy_services(
     proxy: &ProxyArgs,
     source: &KubernetesSource,
     tls_health: &SharedGatewayListenerHealth,
+    cache: Option<ResponseCache>,
 ) -> Result<()> {
     let default_timeouts = RouteTimeouts {
         request: proxy.proxy_default_request_timeout,
@@ -533,6 +562,7 @@ fn wire_proxy_services(
                     Arc::clone(&ca_cache),
                     proxy.access_log,
                     access_log_path_mode(proxy),
+                    cache,
                 ),
             ));
             let selector = SniCertSelector::new(source.tls_store());
@@ -557,6 +587,7 @@ fn wire_proxy_services(
                 ca_cache,
                 proxy.access_log,
                 access_log_path_mode(proxy),
+                cache,
             ),
         ));
         let selector = SniCertSelector::new(source.tls_store());
@@ -581,6 +612,7 @@ fn wire_proxy_services(
                     Arc::clone(&ca_cache),
                     proxy.access_log,
                     access_log_path_mode(proxy),
+                    cache,
                 ),
             ));
             let selector = SniCertSelector::new(source.tls_store());
@@ -605,6 +637,7 @@ fn wire_proxy_services(
                 ca_cache,
                 proxy.access_log,
                 access_log_path_mode(proxy),
+                cache,
             ),
         ));
         let selector = SniCertSelector::new(source.tls_store());
@@ -779,7 +812,15 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
         }),
     ));
 
-    wire_proxy_services(&mut server, &args.common, &args.proxy, &source, &tls_health)?;
+    let cache = build_response_cache(&args.proxy);
+    wire_proxy_services(
+        &mut server,
+        &args.common,
+        &args.proxy,
+        &source,
+        &tls_health,
+        cache,
+    )?;
 
     let dev_aggregator = OperatorAggregator::new(fleet, status_writer.outputs.cluster_summary);
 
@@ -794,6 +835,7 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
             aggregator: Some(dev_aggregator),
             events: Some(events),
             serve_ui: true,
+            cache,
         },
     );
 
@@ -869,6 +911,10 @@ struct ManagementServerConfig {
     /// `true` on the dev role (serves the embedded operator UI at `GET /`).
     /// Controller wires `.with_ui()` inline; proxy roles leave this `false`.
     serve_ui: bool,
+    /// Shared response cache for the `DELETE /cache/{host}/{path}` purge
+    /// endpoint, or `None` when caching is disabled. Must be the *same* handle
+    /// the data-plane proxies were built with so a purge hits the live cache.
+    cache: Option<ResponseCache>,
 }
 
 fn wire_management_servers(
@@ -890,7 +936,8 @@ fn wire_management_servers(
 
     let admin_addr = SocketAddr::new(common.management_bind_address, common.admin_port);
     let mut admin = AdminServer::new(config.health, config.leader)
-        .with_routes(config.ingress_routes, config.gateway_routes);
+        .with_routes(config.ingress_routes, config.gateway_routes)
+        .with_cache(config.cache);
     if let Some(ag) = config.aggregator {
         admin = admin.with_aggregator(ag);
     }

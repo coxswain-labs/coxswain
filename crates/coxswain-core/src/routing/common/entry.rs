@@ -796,6 +796,14 @@ pub struct RouteEntry {
     /// source IPs. Shared as an `Arc` so cloning into the lookup result is a
     /// refcount bump, not a heap copy, on the hot path.
     pub allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    /// RFC 7234 response caching opt-in, from the
+    /// `ingress.coxswain-labs.dev/cache-enabled` annotation.
+    ///
+    /// When `true`, the proxy enables its response cache for `GET`/`HEAD`
+    /// requests on this route (subject to RFC 7234 cacheability and the
+    /// `Authorization`/`Cookie` bypass). `false` (the default, and the value for
+    /// all Gateway-API routes until the ExtensionRef binding lands) disables it.
+    pub cache_enabled: bool,
 }
 
 impl RouteEntry {
@@ -817,6 +825,7 @@ impl RouteEntry {
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
+            cache_enabled: false,
         }
     }
 
@@ -839,6 +848,7 @@ impl RouteEntry {
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
+            cache_enabled: false,
         }
     }
 
@@ -866,6 +876,7 @@ impl RouteEntry {
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
+            cache_enabled: false,
         }
     }
 
@@ -896,6 +907,7 @@ impl RouteEntry {
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
+            cache_enabled: false,
         }
     }
 
@@ -971,6 +983,18 @@ impl RouteEntry {
         self.allow_source_range = allow_source_range;
         self
     }
+
+    /// Enable RFC 7234 response caching for this route (builder-style).
+    ///
+    /// Used by the Ingress reconciler to attach the
+    /// `ingress.coxswain-labs.dev/cache-enabled` opt-in. `false` (the default)
+    /// leaves caching off; the proxy only enables its response cache for routes
+    /// where this is `true`.
+    #[must_use]
+    pub fn with_cache_enabled(mut self, cache_enabled: bool) -> Self {
+        self.cache_enabled = cache_enabled;
+        self
+    }
 }
 
 // Lock the hot-path RouteEntry and BackendPool sizes to catch accidental growth.
@@ -980,6 +1004,7 @@ impl RouteEntry {
 // Bumped 208→256 by extending RouteTimeouts with connect/read/send: 3 × Option<Duration> (48 bytes) for Ingress annotation timeouts.
 // Bumped 256→272 by adding max_body_size: Option<u64> (16 bytes) for the ingress.coxswain-labs.dev/max-body-size request-body limit.
 // Bumped 272→280 by adding allow_source_range: Option<Arc<Vec<IpNet>>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/allow-source-range IP allow-list.
+// cache_enabled: bool (#40) added without a bump — it occupies existing struct padding.
 static_assertions::assert_eq_size!(RouteEntry, [u8; 280]);
 // Hot type — review with the team before bumping this number.
 static_assertions::assert_eq_size!(BackendPool, [u8; 24]);

@@ -51,6 +51,12 @@ pub struct ResolvedRoute {
     /// Prometheus label and the `route_id` access-log field so a Grafana →
     /// log pivot has an exact join key.
     pub metric_route_id: Arc<str>,
+    /// RFC 7234 response-cache opt-in for the matched route.
+    ///
+    /// Read in `request_cache_filter` to decide whether to enable Pingora's
+    /// response cache for this request. `false` for every Gateway-API route and
+    /// for Ingress routes without the `cache-enabled` annotation.
+    pub cache_enabled: bool,
 }
 
 /// Per-request context carrying the real client address extracted from the PROXY header.
@@ -116,11 +122,13 @@ pub struct ProxyCtx {
 // ResolvedRoute: +16 bytes for path_pattern: Arc<str> (88→104).
 // ResolvedRoute: +16 bytes for metric_route_id: Arc<str> (104→120).
 // ResolvedRoute: +48 bytes because RouteTimeouts gained connect/read/send: Option<Duration> (120→168).
-const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 168);
+// ResolvedRoute: +8 (alignment) for cache_enabled: bool (#40) (168→176).
+const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 176);
 // ProxyCtx: +16 for start: Option<Instant>, +48 for upstream_addr: Option<SocketAddr>
 // with alignment padding (176→240).
 // ProxyCtx: +16 because Option<ResolvedRoute> inlines the struct (240→256).
 // ProxyCtx: +48 because ResolvedRoute grew with RouteTimeouts (256→304).
 // ProxyCtx: +24 for max_body_size: Option<u64> (16 — no niche) + body_bytes_seen: u64
 // (8) — the max-body-size request-body limit and its running counter (312→336).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 336);
+// ProxyCtx: +8 because the embedded ResolvedRoute grew for cache_enabled (#40) (336→344).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 344);

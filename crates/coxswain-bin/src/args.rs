@@ -353,6 +353,45 @@ pub(crate) struct ProxyArgs {
     /// Use `pattern` or `none` only when the pipeline cannot filter.
     #[arg(long, env = "COXSWAIN_ACCESS_LOG_PATH_MODE", default_value = "full")]
     pub access_log_path_mode: AccessLogPathMode,
+
+    /// Maximum total size of the in-memory RFC 7234 response cache.
+    ///
+    /// Accepts a bare byte count or a binary unit suffix `k`/`m`/`g` (e.g.
+    /// `100m` = 100 MiB, the default). When the cache exceeds this size,
+    /// least-recently-used entries are evicted. `0` disables response caching
+    /// entirely. Caching is opt-in per route via the
+    /// `ingress.coxswain-labs.dev/cache-enabled` annotation; this flag only
+    /// bounds the shared store those routes share.
+    #[arg(
+        long,
+        env = "COXSWAIN_CACHE_MAX_SIZE",
+        default_value = "100m",
+        value_parser = parse_cache_size,
+    )]
+    pub cache_max_size: usize,
+}
+
+/// Parse a `--cache-max-size` value: a bare byte count or a binary-unit suffix
+/// (`k`/`m`/`g`, case-insensitive). Mirrors the `max-body-size` annotation's
+/// units but errors (rather than warning) on bad input, as befits a CLI flag.
+///
+/// # Errors
+///
+/// Returns a human-readable message when the value is not a non-negative integer
+/// optionally followed by a single `k`/`m`/`g` suffix, or when it overflows `usize`.
+fn parse_cache_size(s: &str) -> Result<usize, String> {
+    let t = s.trim();
+    let (digits, mult): (&str, usize) = match t.as_bytes().last() {
+        Some(b'k' | b'K') => (&t[..t.len() - 1], 1024),
+        Some(b'm' | b'M') => (&t[..t.len() - 1], 1024 * 1024),
+        Some(b'g' | b'G') => (&t[..t.len() - 1], 1024 * 1024 * 1024),
+        _ => (t, 1),
+    };
+    let n: usize = digits.trim().parse().map_err(|_| {
+        format!("invalid cache size {s:?}: expected an integer with optional k/m/g suffix")
+    })?;
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("cache size {s:?} overflows usize"))
 }
 
 /// Flags specific to roles that run the status writer (`controller`, `dev`).

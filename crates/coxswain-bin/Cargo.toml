@@ -25,6 +25,7 @@ coxswain-core = { workspace = true }
 coxswain-reflector = { workspace = true }
 ipnet = { workspace = true }
 coxswain-admin = { workspace = true }
+coxswain-cache = { workspace = true }
 coxswain-controller = { workspace = true }
 coxswain-health = { workspace = true }
 coxswain-proxy = { workspace = true }

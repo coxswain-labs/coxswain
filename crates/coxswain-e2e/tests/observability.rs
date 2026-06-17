@@ -716,3 +716,93 @@ async fn routing_api_surfaces_gateways_routes_and_problems() -> anyhow::Result<(
 
     Ok(())
 }
+
+/// Sum the values of all `<name>{...}` series whose label set contains
+/// `label_substr`. Returns `None` when no matching series is present.
+fn metric_sum_for_label(body: &str, name: &str, label_substr: &str) -> Option<f64> {
+    let prefix = format!("{name}{{");
+    let mut total = 0.0;
+    let mut seen = false;
+    for line in body.lines().filter(|l| !l.starts_with('#')) {
+        let Some(rest) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((labels, value)) = rest.split_once('}') else {
+            continue;
+        };
+        if !labels.contains(label_substr) {
+            continue;
+        }
+        if let Ok(v) = value.trim().parse::<f64>() {
+            total += v;
+            seen = true;
+        }
+    }
+    seen.then_some(total)
+}
+
+/// Cache observability (#40): the proxy emits `coxswain_cache_misses_total` for
+/// the first (uncached) request and `coxswain_cache_hits_total` once the entry
+/// is served from cache, both labelled with the matched route. Scopes the
+/// assertion to this test's route label so it is independent of other traffic on
+/// the shared proxy.
+#[tokio::test]
+async fn cache_hit_and_miss_counters_increment_when_caching() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-cache").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_CACHE_ENABLED,
+        FixtureVars::new(&ns.name).with("CACHE_CONTROL", "max-age=300"),
+    )
+    .await?;
+
+    let host = format!("cache.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    // Drive a miss-then-hit sequence: poll an identical GET until it is served
+    // from cache (`Age` present), which guarantees both a miss and a hit have
+    // been recorded for this route.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            match h.http.get_full(&host, "/").await {
+                Ok((s, hdrs, _)) => {
+                    format!(
+                        "a cache hit; status={s}, age={}",
+                        hdrs.contains_key(reqwest::header::AGE)
+                    )
+                }
+                Err(e) => format!("a cache hit; failed: {e}"),
+            }
+        },
+        || async {
+            match h.http.get_full(&host, "/").await {
+                Ok((200, hdrs, _)) if hdrs.contains_key(reqwest::header::AGE) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    let route_label = format!("route=\"ingress/{}/cache-ingress:", ns.name);
+    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+
+    let misses = metric_sum_for_label(&metrics, "coxswain_cache_misses_total", &route_label);
+    let hits = metric_sum_for_label(&metrics, "coxswain_cache_hits_total", &route_label);
+    assert!(
+        misses.is_some_and(|v| v >= 1.0),
+        "coxswain_cache_misses_total must record at least one miss for {route_label}; \
+         got {misses:?}"
+    );
+    assert!(
+        hits.is_some_and(|v| v >= 1.0),
+        "coxswain_cache_hits_total must record at least one hit for {route_label}; \
+         got {hits:?}"
+    );
+
+    Ok(())
+}
