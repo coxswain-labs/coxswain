@@ -116,6 +116,15 @@ pub struct ProxyCtx {
     /// Compared against [`Self::max_body_size`] to abort over-limit streaming/chunked
     /// uploads with 413 without buffering the whole body.
     pub body_bytes_seen: u64,
+    /// Session-affinity endpoint resolved in `request_filter` from the request's
+    /// cookie/header against the matched `BackendGroup`'s affinity index. When `Some`,
+    /// `upstream_peer` pins to it instead of taking a round-robin tick. `None` (the
+    /// common case, or a stale/absent pin) keeps weighted round-robin.
+    pub affinity_pin: Option<SocketAddr>,
+    /// True when cookie-mode affinity established a *fresh* pin this request (no valid
+    /// cookie was presented), so `upstream_response_filter` must emit `Set-Cookie` for
+    /// the chosen endpoint. Always `false` in header mode (the client supplies the key).
+    pub affinity_set_cookie: bool,
 }
 
 // Hot types — review with the team before bumping these numbers.
@@ -131,4 +140,7 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 176);
 // ProxyCtx: +24 for max_body_size: Option<u64> (16 — no niche) + body_bytes_seen: u64
 // (8) — the max-body-size request-body limit and its running counter (312→336).
 // ProxyCtx: +8 because the embedded ResolvedRoute grew for cache_enabled (#40) (336→344).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 344);
+// ProxyCtx: +32 for the session-affinity pin — affinity_pin: Option<SocketAddr>
+// (32, no niche) plus affinity_set_cookie: bool absorbed into existing alignment
+// padding (#15) (344→376).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 376);

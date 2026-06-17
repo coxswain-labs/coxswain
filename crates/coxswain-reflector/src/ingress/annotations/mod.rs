@@ -7,6 +7,7 @@
 //! - [`filters`] — request/response header modifiers, redirect, and ssl-redirect annotations.
 //! - [`security`] — edge access control (source-IP allow-list).
 //! - [`caching`] — RFC 7234 response-cache opt-in.
+//! - [`session`] — sticky-session (session-affinity) binding.
 //!
 //! The top-level [`IngressAnnotations::parse`] function is called once per Ingress in
 //! [`super::reconcile`] and threads the results into every rule/path entry.
@@ -21,16 +22,19 @@ mod caching;
 mod filters;
 mod routing;
 mod security;
+mod session;
 mod traffic_policy;
 
 pub use caching::*;
 pub use filters::*;
 pub use routing::*;
 pub use security::*;
+pub use session::*;
 pub use traffic_policy::*;
 
 use coxswain_core::routing::{
     BackendProtocol, FilterAction, HeaderMod, PathModifier, RetryPolicy, RouteTimeouts,
+    SessionAffinity,
 };
 use std::collections::BTreeMap;
 
@@ -115,6 +119,9 @@ pub(super) struct IngressAnnotations {
     /// RFC 7234 response-cache opt-in from `cache-enabled` (#40).
     /// `false` (the default, or an invalid value) leaves caching off.
     pub cache_enabled: bool,
+    /// Sticky-session binding from the `session-*` annotations (#15).
+    /// `None` (the default, or an invalid/incomplete value) keeps round-robin.
+    pub session_affinity: Option<SessionAffinity>,
 }
 
 impl IngressAnnotations {
@@ -371,6 +378,9 @@ impl IngressAnnotations {
             .and_then(parse_cache_enabled)
             .unwrap_or(false);
 
+        // ── Session affinity (#15) ────────────────────────────────────────────
+        let session_affinity = parse_session_affinity(ann, route_id);
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -391,6 +401,7 @@ impl IngressAnnotations {
             max_body_size,
             allow_source_range,
             cache_enabled,
+            session_affinity,
         }
     }
 }

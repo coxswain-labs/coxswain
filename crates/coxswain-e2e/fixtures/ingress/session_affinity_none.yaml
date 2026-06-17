@@ -1,0 +1,62 @@
+# Baseline (#15): one Service with three pods and NO session-affinity annotation.
+# Proves a backend with no affinity binding keeps plain weighted round-robin and
+# never has affinity leak into the default path.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-aff
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: echo-aff
+  template:
+    metadata:
+      labels:
+        app: echo-aff
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: echo
+          image: ${ECHO_IMAGE}
+          ports:
+            - containerPort: 3000
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-aff
+spec:
+  selector:
+    app: echo-aff
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: affinity-none
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: affinity.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-aff
+                port:
+                  number: 3000

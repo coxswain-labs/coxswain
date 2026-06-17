@@ -205,7 +205,8 @@ impl IngressReconciler {
                 let group = Arc::new(
                     BackendGroup::new(format!("{ns}/{}", svc.name), resolved.addrs)
                         .with_protocol(protocol)
-                        .with_retries(ann.retries),
+                        .with_retries(ann.retries)
+                        .with_session_affinity(ann.session_affinity.clone()),
                 );
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
@@ -375,7 +376,8 @@ impl IngressReconciler {
                         let group = Arc::new(
                             BackendGroup::new(format!("{ns}/{}", default_svc.name), resolved.addrs)
                                 .with_protocol(protocol)
-                                .with_retries(ann.retries),
+                                .with_retries(ann.retries)
+                                .with_session_affinity(ann.session_affinity.clone()),
                         );
                         let default_metric_route_id: Arc<str> =
                             Arc::from(format!("ingress/{ns}/{ingress_name}:default"));
