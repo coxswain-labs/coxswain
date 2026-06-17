@@ -47,8 +47,9 @@ slow-timeout = { period = "900s", terminate-after = 1 }
 # with ungrouped tests). They therefore run alone, in the serial pass.
 #
 # When per-scope control lands these move back to the parallel pass:
-#   proxy_protocol_*  -> #327 (per-listener PROXY protocol)
-#   access_log_*      -> #279 (per-Ingress access-log)
+#   proxy_protocol_*        -> #327 (per-listener PROXY protocol)
+#   allow_source_range_*    -> #327 (need PROXY protocol to drive a real client IP)
+#   access_log_*            -> #279 (per-Ingress access-log)
 #
 # The two profiles below split on exactly this set via `default-filter`, so the
 # run command stays uniform (`-E 'binary(<suite>)'`) for both passes.
@@ -62,6 +63,7 @@ default-filter = '''
   not (
     test(=default_backend_serves_unmatched_requests) | test(=default_backend_alone_serves_all_hosts)
     | test(=proxy_protocol_http_v1_forwarded) | test(=proxy_protocol_https_v2_forwarded)
+    | test(=allow_source_range_in_range_allowed) | test(=allow_source_range_out_of_range_rejected)
     | test(=status_reports_load_balancer_ip)
     | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
   )
@@ -90,6 +92,7 @@ setup = ['e2e-setup']
 default-filter = '''
   test(=default_backend_serves_unmatched_requests) | test(=default_backend_alone_serves_all_hosts)
   | test(=proxy_protocol_http_v1_forwarded) | test(=proxy_protocol_https_v2_forwarded)
+  | test(=allow_source_range_in_range_allowed) | test(=allow_source_range_out_of_range_rejected)
   | test(=status_reports_load_balancer_ip)
   | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
   | binary(resilience)

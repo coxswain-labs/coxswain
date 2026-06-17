@@ -2,12 +2,11 @@
 //! sit between the lock-free table lookup and the upstream connection.
 
 use super::redirect::{RedirectOrigin, build_redirect_location};
-use coxswain_core::routing::{BackendGroup, FilterAction, RouteOutcome, RouteTimeouts};
+use coxswain_core::routing::{FilterAction, RouteMatch, RouteOutcome, RouteTimeouts};
 use http::header;
 use pingora_core::{HTTPStatus, Result};
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
-use std::sync::Arc;
 
 /// Merge per-route timeouts with global defaults; per-route wins when set.
 pub(crate) fn merge_timeouts(route: &RouteTimeouts, default: &RouteTimeouts) -> RouteTimeouts {
@@ -20,9 +19,9 @@ pub(crate) fn merge_timeouts(route: &RouteTimeouts, default: &RouteTimeouts) -> 
     }
 }
 
-/// Resolves a pre-computed [`RouteOutcome`] into its components.
+/// Resolves a pre-computed [`RouteOutcome`] into the matched [`RouteMatch`].
 ///
-/// Returns `Some(...)` on a successful match, or `None` when an explicit
+/// Returns `Some(route_match)` on a successful match, or `None` when an explicit
 /// [`RouteOutcome::Error`] was handled by writing an error response directly
 /// to `session`.
 ///
@@ -35,18 +34,9 @@ pub(crate) async fn resolve_outcome(
     host: &str,
     path: &str,
     outcome: RouteOutcome,
-) -> Result<
-    Option<(
-        Arc<BackendGroup>,
-        Arc<[FilterAction]>,
-        RouteTimeouts,
-        Arc<str>,
-        Arc<str>,
-        Option<u64>,
-    )>,
-> {
+) -> Result<Option<RouteMatch>> {
     match outcome {
-        RouteOutcome::Found(u, f, t, p, m, b) => Ok(Some((u, f, t, p, m, b))),
+        RouteOutcome::Found(m) => Ok(Some(m)),
         RouteOutcome::Error(status) => {
             let resp = ResponseHeader::build(status, Some(0))?;
             session

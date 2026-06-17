@@ -13,6 +13,7 @@ workspace = true
 arc-swap             = { workspace = true }
 form_urlencoded      = { workspace = true }
 http                 = { workspace = true }
+ipnet                = { workspace = true }
 k8s-openapi          = { workspace = true }
 kube                 = { workspace = true }
 matchit              = { workspace = true }

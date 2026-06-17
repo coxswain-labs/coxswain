@@ -1,0 +1,30 @@
+# allow-source-range annotation fixture (apply backends::ECHO first).
+#
+# The Ingress restricts access to clients in 203.0.113.0/24. The proxy must:
+#   * serve a request whose real client IP is in-range (echo backend identity, 200), and
+#   * reject a request whose real client IP is out-of-range with 403.
+#
+# e2e drives the real client IP via the PROXY protocol (the in-cluster LB NATs the
+# L4 peer), so these tests run with --proxy-accept-proxy-protocol and a permissive
+# trusted-sources CIDR.
+#
+# Host: allowrange.TESTNS.local -> echo-a:3000.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: allow-source-range-ingress
+  annotations:
+    ingress.coxswain-labs.dev/allow-source-range: "203.0.113.0/24"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: allowrange.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

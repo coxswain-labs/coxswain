@@ -421,7 +421,7 @@ mod tests {
         let empty_hdrs = http::HeaderMap::new();
         let ctx = ctx_with(&Method::GET, &empty_hdrs, None);
         match table.find(80, host, path, &ctx) {
-            RouteOutcome::Found(_, f, _, _, _, _) => f,
+            RouteOutcome::Found(m) => m.filters,
             _ => panic!("expected Found"),
         }
     }

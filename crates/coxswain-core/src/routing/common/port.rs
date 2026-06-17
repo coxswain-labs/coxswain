@@ -42,8 +42,10 @@ impl PortRoutingTable {
             return RouteOutcome::NoHost;
         };
         match router.route(path, ctx) {
-            Some((_, _, _, _, _, _, Some(status))) => RouteOutcome::Error(status),
-            Some((u, f, t, p, m, b, None)) => RouteOutcome::Found(u, f, t, p, m, b),
+            Some(m) => match m.error_status {
+                Some(status) => RouteOutcome::Error(status),
+                None => RouteOutcome::Found(m),
+            },
             None => RouteOutcome::NoPath,
         }
     }
@@ -63,14 +65,14 @@ impl PortRoutingTable {
                 .map(|(_, _, r)| r)
         };
         if let Some(r) = router
-            && let Some((group, _, _, _, _, _, _)) = r.route(path, ctx)
+            && let Some(m) = r.route(path, ctx)
         {
-            return Some(group);
+            return Some(m.backend_group);
         }
         self.catchall
             .as_ref()?
             .route(path, ctx)
-            .map(|(u, _, _, _, _, _, _)| u)
+            .map(|m| m.backend_group)
     }
 
     pub(super) fn host_routes(&self) -> Vec<(String, &HostRouter)> {

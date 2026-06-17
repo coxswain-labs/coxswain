@@ -147,6 +147,10 @@ impl IngressReconciler {
         // redirect-* annotation is already present (redirect-* takes precedence).
         let needs_ssl_redirect = ann.ssl_redirect && ann.redirect.is_none();
 
+        // Build the source-IP allow-list once and share one Arc across every route
+        // entry of this Ingress — cloning it onto each path is then a refcount bump.
+        let allow_source_range = ann.allow_source_range.clone().map(Arc::new);
+
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
         for (rule_index, rule) in rules.iter().enumerate() {
@@ -282,7 +286,8 @@ impl IngressReconciler {
                         .with_metric_route_id(Arc::clone(&metric_route_id))
                         .with_timeouts(ann.timeouts.clone())
                         .with_filter_actions(path_filters.clone())
-                        .with_max_body_size(ann.max_body_size);
+                        .with_max_body_size(ann.max_body_size)
+                        .with_allow_source_range(allow_source_range.clone());
                 if dead {
                     base_entry.error_status = Some(503);
                 }
@@ -308,7 +313,8 @@ impl IngressReconciler {
                             .with_metric_route_id(Arc::clone(&metric_route_id))
                             .with_timeouts(ann.timeouts.clone())
                             .with_filter_actions(ssl_filters)
-                            .with_max_body_size(ann.max_body_size);
+                            .with_max_body_size(ann.max_body_size)
+                            .with_allow_source_range(allow_source_range.clone());
                     if dead {
                         entry.error_status = Some(503);
                     }
@@ -392,7 +398,8 @@ impl IngressReconciler {
                                 .with_metric_route_id(Arc::clone(&default_metric_route_id))
                                 .with_timeouts(ann.timeouts.clone())
                                 .with_filter_actions(filters)
-                                .with_max_body_size(ann.max_body_size),
+                                .with_max_body_size(ann.max_body_size)
+                                .with_allow_source_range(allow_source_range.clone()),
                             )
                         };
                         for &listener_port in &ports {
@@ -1189,7 +1196,8 @@ mod tests {
         let ctx = RequestContext::default();
 
         match table.find(80, "example.com", "/svc/users/42", &ctx) {
-            RouteOutcome::Found(_, filters, _, _, _, _) => {
+            RouteOutcome::Found(m) => {
+                let filters = m.filters;
                 let pm = filters
                     .iter()
                     .find_map(|f| match f {
@@ -1770,7 +1778,7 @@ mod tests {
         use coxswain_core::routing::RouteOutcome;
         let ctx = RequestContext::default();
         match table.find(80, host, path, &ctx) {
-            RouteOutcome::Found(_, _, t, _, _, _) => t,
+            RouteOutcome::Found(m) => m.timeouts,
             _other => panic!("expected Found"),
         }
     }
@@ -1900,7 +1908,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
         match table.find(80, "example.com", "/old", &ctx) {
-            RouteOutcome::Found(_, filters, _, _, _, _) => {
+            RouteOutcome::Found(m) => {
+                let filters = m.filters;
                 let rewrite = filters.iter().find(|f| {
                     matches!(
                         f,
@@ -1972,7 +1981,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
         match table.find(80, "example.com", "/", &ctx) {
-            RouteOutcome::Found(_, filters, _, _, _, _) => {
+            RouteOutcome::Found(m) => {
+                let filters = m.filters;
                 let has_req_mod = filters
                     .iter()
                     .any(|f| matches!(f, FilterAction::RequestHeaderModifier(_)));
@@ -2003,7 +2013,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
         match table.find(80, "example.com", "/", &ctx) {
-            RouteOutcome::Found(_, filters, _, _, _, _) => {
+            RouteOutcome::Found(m) => {
+                let filters = m.filters;
                 let has_resp_mod = filters
                     .iter()
                     .any(|f| matches!(f, FilterAction::ResponseHeaderModifier(_)));
@@ -2034,7 +2045,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
         match table.find(80, "example.com", "/", &ctx) {
-            RouteOutcome::Found(_, filters, _, _, _, _) => {
+            RouteOutcome::Found(m) => {
+                let filters = m.filters;
                 let redirect = filters.iter().find(|f| {
                     matches!(
                         f,
@@ -2072,7 +2084,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
         match table.find(80, "example.com", "/old", &ctx) {
-            RouteOutcome::Found(_, filters, _, _, _, _) => {
+            RouteOutcome::Found(m) => {
+                let filters = m.filters;
                 let has_req_mod = filters
                     .iter()
                     .any(|f| matches!(f, FilterAction::RequestHeaderModifier(_)));
@@ -2107,7 +2120,8 @@ mod tests {
         let ctx = RequestContext::default();
         // Route is still installed.
         match table.find(80, "example.com", "/", &ctx) {
-            RouteOutcome::Found(_, filters, _, _, _, _) => {
+            RouteOutcome::Found(m) => {
+                let filters = m.filters;
                 let has_req_mod = filters
                     .iter()
                     .any(|f| matches!(f, FilterAction::RequestHeaderModifier(_)));
@@ -2150,7 +2164,8 @@ mod tests {
 
         // HTTP port: entry carries the ssl-redirect.
         match table.find(80, "example.com", "/", &ctx) {
-            RouteOutcome::Found(_, filters, _, _, _, _) => {
+            RouteOutcome::Found(m) => {
+                let filters = m.filters;
                 let ssl_redir = filters.iter().find(|f| {
                     matches!(
                         f,
@@ -2179,7 +2194,8 @@ mod tests {
 
         // HTTPS port: entry must NOT carry the ssl-redirect.
         match table.find(443, "example.com", "/", &ctx) {
-            RouteOutcome::Found(_, filters, _, _, _, _) => {
+            RouteOutcome::Found(m) => {
+                let filters = m.filters;
                 let ssl_redir = filters.iter().find(|f| {
                     matches!(
                         f,
@@ -2219,7 +2235,8 @@ mod tests {
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
         match table.find(80, "example.com", "/", &ctx) {
-            RouteOutcome::Found(_, filters, _, _, _, _) => {
+            RouteOutcome::Found(m) => {
+                let filters = m.filters;
                 // Exactly one RequestRedirect — the explicit redirect-*.
                 let redirect_count = filters
                     .iter()
