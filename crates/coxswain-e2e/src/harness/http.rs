@@ -189,6 +189,36 @@ impl HttpClient {
         };
         Ok((status, resp_headers, body))
     }
+
+    /// Like [`Self::get_full`], but sends `extra_headers` on the request.
+    ///
+    /// Used by caching tests to verify that a request carrying `Authorization`
+    /// bypasses the response cache (no `Age` header on the reply).
+    pub async fn get_full_with_headers(
+        &self,
+        host: &str,
+        path: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> anyhow::Result<(u16, reqwest::header::HeaderMap, Option<EchoResponse>)> {
+        let url = format!("http://{}{path}", self.proxy_addr);
+        let mut req = self.inner.get(&url).header("Host", host);
+        for (k, v) in extra_headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.send().await.context("send request")?;
+        let status = resp.status().as_u16();
+        let resp_headers = resp.headers().clone();
+        let body = if resp.status().is_success() {
+            Some(
+                resp.json::<EchoResponse>()
+                    .await
+                    .context("parse echo response")?,
+            )
+        } else {
+            None
+        };
+        Ok((status, resp_headers, body))
+    }
 }
 
 /// Send `n` GET requests to `path` and count how often each deployment prefix responded.

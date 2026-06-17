@@ -91,6 +91,13 @@ pub const ANNOTATION_MAX_BODY_SIZE_INVALID: &str =
 /// Used to verify the proxy admits an in-range client (200, echo identity) and rejects an
 /// out-of-range client with 403; the real client IP is supplied via the PROXY protocol.
 pub const ANNOTATION_ALLOW_SOURCE_RANGE: &str = fixture!("annotation_allow_source_range.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/cache-enabled: "true"` plus a
+/// `response-header-set` that injects `Cache-Control: ${CACHE_CONTROL}` (#40).
+/// Used to verify the proxy serves a second identical GET from cache (an `Age`
+/// header appears), respects `no-store`, bypasses the cache for `Authorization`
+/// requests, and honors the admin purge endpoint. Supply `CACHE_CONTROL` via
+/// `FixtureVars::with`.
+pub const ANNOTATION_CACHE_ENABLED: &str = fixture!("annotation_cache_enabled.yaml");
 /// Per-class annotation defaults via `IngressClass.spec.parameters` (#190): a
 /// `CoxswainIngressClassParameters` CR sets a default `rewrite-target`, one
 /// Ingress inherits it and a second overrides it per-key. The IngressClass is
