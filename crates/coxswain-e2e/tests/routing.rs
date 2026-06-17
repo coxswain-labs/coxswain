@@ -1320,7 +1320,7 @@ async fn ingress_request_header_modifier_sets_adds_and_removes() -> anyhow::Resu
 
     // REMOVE: X-Remove-Me must not be present in the upstream request.
     assert!(
-        resp.headers.get("X-Remove-Me").is_none(),
+        !resp.headers.contains_key("X-Remove-Me"),
         "request-header-remove: X-Remove-Me must be absent from upstream request, \
          but was still present in echo body"
     );

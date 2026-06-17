@@ -72,17 +72,53 @@ impl NamespaceGuard {
 
 impl Drop for NamespaceGuard {
     fn drop(&mut self) {
-        let client = self.client.clone();
-        let name = self.name.clone();
-        // Fire-and-forget deletion. Unique names mean a slow deletion never
-        // affects the next test. Use `kubectl delete ns -l coxswain-e2e=true`
-        // to clean up if tests were interrupted.
-        tokio::spawn(async move {
-            let api: Api<Namespace> = Api::all(client);
-            let _ = api.delete(&name, &DeleteParams::default()).await;
-            tracing::debug!(namespace = %name, "deleted test namespace");
-        });
+        // Delete the namespace synchronously on its own thread+runtime.
+        //
+        // `#[tokio::test]` builds a current-thread runtime that is torn down the
+        // instant the test function returns. A `tokio::spawn`ed deletion is
+        // therefore dropped before it ever issues the DELETE, so namespaces (and
+        // their pods) accumulate across the entire parallel pass and exhaust the
+        // node — the last-scheduled tests then fail to schedule their backends.
+        // Running the delete to completion on an independent runtime guarantees
+        // every test reaps its namespace. Use
+        // `kubectl delete ns -l coxswain-e2e=true` to clean up after an interrupt.
+        delete_resource::<Namespace>(self.client.clone(), self.name.clone(), "namespace");
     }
+}
+
+/// Issue a blocking `DELETE` for a cluster-scoped resource on a dedicated
+/// thread+runtime, so cleanup completes regardless of the calling test's
+/// runtime teardown state (see [`NamespaceGuard`]'s `Drop`). Errors are ignored:
+/// a failed delete is backstopped by the bootstrap's label-purge, and a guard's
+/// `Drop` must not panic.
+fn delete_resource<K>(client: Client, name: String, kind: &'static str)
+where
+    K: kube::Resource<Scope = k8s_openapi::ClusterResourceScope>
+        + Clone
+        + std::fmt::Debug
+        + serde::de::DeserializeOwned,
+    K::DynamicType: Default,
+{
+    let handle = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::warn!(error = %e, kind, %name, "could not build cleanup runtime");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let api: Api<K> = Api::all(client);
+            match api.delete(&name, &DeleteParams::default()).await {
+                Ok(_) => tracing::debug!(kind, %name, "deleted test resource"),
+                Err(e) => tracing::warn!(error = %e, kind, %name, "failed to delete test resource"),
+            }
+        });
+    });
+    let _ = handle.join();
 }
 
 /// RAII guard for a cluster-scoped `IngressClass`. Deletes the IngressClass on
@@ -107,12 +143,8 @@ impl IngressClassGuard {
 
 impl Drop for IngressClassGuard {
     fn drop(&mut self) {
-        let client = self.client.clone();
-        let name = self.name.clone();
-        tokio::spawn(async move {
-            let api: Api<IngressClass> = Api::all(client);
-            let _ = api.delete(&name, &DeleteParams::default()).await;
-            tracing::debug!(ingress_class = %name, "deleted test IngressClass");
-        });
+        // Synchronous cleanup on an independent runtime — see [`NamespaceGuard`]'s
+        // `Drop` for why a `tokio::spawn` here would silently never run.
+        delete_resource::<IngressClass>(self.client.clone(), self.name.clone(), "ingressclass");
     }
 }

@@ -20,6 +20,7 @@ spec:
       labels:
         app: echo-a
     spec:
+      terminationGracePeriodSeconds: 1
       containers:
         - name: echo
           image: ${ECHO_IMAGE}
@@ -60,6 +61,7 @@ spec:
       labels:
         app: echo-b
     spec:
+      terminationGracePeriodSeconds: 1
       containers:
         - name: echo
           image: ${ECHO_IMAGE}
@@ -100,6 +102,7 @@ spec:
       labels:
         app: echo-c
     spec:
+      terminationGracePeriodSeconds: 1
       containers:
         - name: echo
           image: ${ECHO_IMAGE}
