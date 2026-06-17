@@ -1,0 +1,76 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ratelimits.coxswain-labs.dev
+spec:
+  group: coxswain-labs.dev
+  names:
+    categories: []
+    kind: RateLimit
+    plural: ratelimits
+    shortNames: []
+    singular: ratelimit
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for RateLimitSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Rate-limiting policy for an `HTTPRoute` rule.
+
+              Reference this CR from an `HTTPRouteRule.filters` entry with
+              `type: ExtensionRef` pointing at `group: coxswain-labs.dev`,
+              `kind: RateLimit`.  The proxy enforces one governor GCRA token bucket per
+              distinct `by_header` value (or per client IP when `by_header` is absent) on
+              the matching route; over-limit requests receive a `429 Too Many Requests`
+              response with a `Retry-After` header.
+            properties:
+              burst:
+                default: 0
+                description: |-
+                  Extra requests allowed above the sustained rate as an initial burst.
+
+                  The effective burst capacity is `requests_per_second + burst`, matching
+                  the semantics of the Ingress `rate-limit-burst` annotation. When `0`
+                  (the default), no burst is allowed above the sustained rate.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              byHeader:
+                description: |-
+                  Header name to key rate-limit buckets by (e.g. `"X-Api-Key"`).
+
+                  When present, each distinct value of this request header gets its own
+                  token bucket — matched case-insensitively (normalised to lowercase).
+                  Requests that do not carry the header are admitted without consuming
+                  quota (fail-open), matching ingress-nginx and Envoy behaviour.
+
+                  When absent (the default), buckets are keyed by real client IP address
+                  (PROXY-protocol peer if present, else L4 downstream peer — the same
+                  resolution used by the allow-source-range filter).
+                nullable: true
+                type: string
+              requestsPerSecond:
+                description: |-
+                  Sustained request rate in requests per second (must be ≥ 1).
+
+                  A value of `0` is treated as a misconfiguration at reconcile time
+                  (WARN + fail-open: the route is not limited). Non-zero values are
+                  forwarded as-is to the governor `Quota` as the per-client cell rate.
+                format: uint32
+                minimum: 0.0
+                type: integer
+            required:
+            - requestsPerSecond
+            type: object
+        required:
+        - spec
+        title: RateLimit
+        type: object
+    served: true
+    storage: true
+    subresources: {}

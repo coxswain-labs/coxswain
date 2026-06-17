@@ -5,12 +5,16 @@ use crate::gw_types::v::httproutes::{
     HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
     HttpRouteRulesMatchesQueryParamsType,
 };
+use coxswain_core::crd::RateLimit;
 use coxswain_core::routing::{
     FilterAction, HeaderMod, HeaderPredicate, MatchPredicates, PathModifier, QueryPredicate,
-    ValueMatch,
+    RateLimitConfig, RateLimitKey, ValueMatch,
 };
 use http::{HeaderName, Method};
+use kube::runtime::reflector;
 use regex::Regex;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 
 /// Translates `HTTPRouteFilter` entries into `FilterAction` values.
 ///
@@ -364,6 +368,63 @@ pub(super) fn build_backend_ref_filters(
     out
 }
 
+/// Scans `filters` for an `ExtensionRef` pointing at a `RateLimit` CR
+/// (`group: coxswain-labs.dev`, `kind: RateLimit`) and, if found, resolves
+/// the named CR from `rate_limits` and converts its spec to a
+/// [`RateLimitConfig`].
+///
+/// Only the first matching `ExtensionRef` is used; subsequent ones are
+/// ignored. Non-`RateLimit` extension refs continue to log a warning and are
+/// skipped. Missing CRs or a zero `requestsPerSecond` value log a warning and
+/// return `None` (fail-open: the route is not limited).
+pub(super) fn resolve_rate_limit(
+    filters: &[HttpRouteRulesFilters],
+    route_ns: &str,
+    rate_limits: &reflector::Store<RateLimit>,
+) -> Option<Arc<RateLimitConfig>> {
+    for f in filters {
+        if !matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
+            continue;
+        }
+        let Some(ext) = &f.extension_ref else {
+            tracing::warn!("Skipping ExtensionRef filter — payload is missing");
+            continue;
+        };
+        if ext.group != "coxswain-labs.dev" || ext.kind != "RateLimit" {
+            tracing::warn!(
+                group = %ext.group,
+                kind  = %ext.kind,
+                name  = %ext.name,
+                "Skipping unsupported ExtensionRef (expected group=coxswain-labs.dev kind=RateLimit)"
+            );
+            continue;
+        }
+        let obj_ref = reflector::ObjectRef::<RateLimit>::new(&ext.name).within(route_ns);
+        let Some(cr) = rate_limits.get(&obj_ref) else {
+            tracing::warn!(
+                ns   = route_ns,
+                name = %ext.name,
+                "RateLimit CR not found — rate limiting skipped (fail-open)"
+            );
+            return None;
+        };
+        let Some(rps) = NonZeroU32::new(cr.spec.requests_per_second) else {
+            tracing::warn!(
+                ns   = route_ns,
+                name = %ext.name,
+                "RateLimit CR has requestsPerSecond=0 — rate limiting skipped (fail-open)"
+            );
+            return None;
+        };
+        let key = match &cr.spec.by_header {
+            Some(h) => RateLimitKey::Header(Arc::from(h.to_ascii_lowercase().as_str())),
+            None => RateLimitKey::ClientIp,
+        };
+        return Some(Arc::new(RateLimitConfig::new(rps, cr.spec.burst, key)));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +518,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -504,6 +566,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -549,6 +612,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -600,6 +664,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );

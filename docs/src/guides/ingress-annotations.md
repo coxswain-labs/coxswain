@@ -33,6 +33,9 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/session-affinity` | `cookie` or `header` | _none_ | `"cookie"` |
 | `ingress.coxswain-labs.dev/session-cookie-name` | string | `__coxswain_session` | `"SESSIONID"` |
 | `ingress.coxswain-labs.dev/session-header` | string | _none_ | `"X-Session-Id"` |
+| `ingress.coxswain-labs.dev/rate-limit-rps` | integer | _none_ (disabled) | `"100"` |
+| `ingress.coxswain-labs.dev/rate-limit-burst` | integer | `0` | `"50"` |
+| `ingress.coxswain-labs.dev/rate-limit-by` | `ip` or `header:Name` | `"ip"` | `"header:X-Api-Key"` |
 
 ```yaml
 metadata:
@@ -410,6 +413,51 @@ metadata:
 
 !!! note
     The Gateway API binding for session persistence is tracked in [#355](https://github.com/coxswain-labs/coxswain/issues/355). It is deferred because the only Gateway API surface for session persistence in our pinned crate is experimental-only (which Coxswain never compiles into release images), and the `BackendLBPolicy` resource originally proposed is not an upstream Gateway API type. Today the `session-*` annotations are the Ingress-only entry point.
+
+## Rate limiting
+
+Caps the request rate accepted from each client before forwarding to the upstream. Over-limit requests are rejected with **429 Too Many Requests** and a `Retry-After` header (in whole seconds) telling the client when to retry. See the [Rate limiting guide](rate-limiting.md) for full semantics and Gateway API usage.
+
+### `rate-limit-rps`
+
+Sustained request rate in requests per second, per client. Must be a positive integer >= 1. Absent or invalid values disable rate limiting for the route (**fail-open**).
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/rate-limit-rps: "100"
+```
+
+### `rate-limit-burst`
+
+Number of requests above the sustained rate that a client may send in a short burst when it has been idle. The total burst capacity is `rps + burst` — a client that has accumulated headroom can send that many requests before being throttled. Defaults to `0` (no burst above sustained rate).
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/rate-limit-rps: "10"
+    ingress.coxswain-labs.dev/rate-limit-burst: "50"
+```
+
+### `rate-limit-by`
+
+Selects the dimension used to identify each client for its own rate-limit bucket. Two modes:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"ip"` (default) | One bucket per real client IP (or L4 peer when not behind a PROXY-protocol LB) |
+| `"header:Name"` | One bucket per unique value of the named request header |
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/rate-limit-rps: "5"
+    ingress.coxswain-labs.dev/rate-limit-by: "header:X-Api-Key"
+```
+
+When the keying dimension is not available for a request (undeterminable IP, or absent header on a header-keyed route) the request is **admitted without counting** (**fail-open**) — a missing key never blocks traffic.
+
+An unrecognised `rate-limit-by` value emits a controller warning and falls back to `"ip"`.
 
 ## Class-level defaults
 

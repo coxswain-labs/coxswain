@@ -1,0 +1,27 @@
+# rate-limit-burst annotation fixture (apply backends::ECHO first).
+#
+# The Ingress caps sustained requests to 1 req/s with a burst of 5. The proxy must:
+#   * absorb an initial spike of up to 6 requests (1 rps + 5 burst) without throttling, and
+#   * reject further requests in the same second with 429 + Retry-After.
+#
+# Host: ratelimitburst.TESTNS.local -> echo-a:3000.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rate-limit-burst-ingress
+  annotations:
+    ingress.coxswain-labs.dev/rate-limit-rps: "1"
+    ingress.coxswain-labs.dev/rate-limit-burst: "5"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: ratelimitburst.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

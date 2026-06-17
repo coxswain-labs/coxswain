@@ -25,6 +25,7 @@ pub use common::port::PortTableBuilder;
 pub use common::predicate::{
     HeaderPredicate, MatchPredicates, QueryPredicate, RequestContext, ValueMatch,
 };
+pub use common::rate_limit::{RateLimitConfig, RateLimitKey};
 pub use common::table::{RouteOutcome, RouterError, RoutingTable, RoutingTableBuilder};
 
 pub use gateway::{

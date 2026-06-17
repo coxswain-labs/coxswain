@@ -1,0 +1,45 @@
+# RateLimit ExtensionRef with missing CR fixture (apply backends::ECHO first).
+#
+# An HTTPRoute references a RateLimit CR that does not exist. The reflector must
+# log a warning and fail-open — no rate limiting is applied and all traffic is served.
+#
+# Gateway: coxswain-test-norl on GATEWAY_HTTP_PORT.
+# Route host: gwnorl.TESTNS.local, path /rl/ -> echo-a:3000.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test-norl
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: norl-route
+spec:
+  parentRefs:
+    - name: coxswain-test-norl
+  hostnames:
+    - "gwnorl.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /rl/
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: coxswain-labs.dev
+            kind: RateLimit
+            name: does-not-exist
+      backendRefs:
+        - name: echo-a
+          port: 3000

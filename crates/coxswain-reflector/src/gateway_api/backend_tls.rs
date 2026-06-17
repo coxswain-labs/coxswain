@@ -849,6 +849,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &index,
+                rate_limits: &crate::tests::fixtures::empty_rate_limit_store(),
             },
             &mut builder,
         );

@@ -7,8 +7,10 @@
 
 pub mod gateway_parameters;
 pub mod ingress_parameters;
+pub mod rate_limit;
 
 pub use gateway_parameters::{
     CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType,
 };
 pub use ingress_parameters::{CoxswainIngressClassParameters, CoxswainIngressClassParametersSpec};
+pub use rate_limit::{RateLimit, RateLimitSpec};

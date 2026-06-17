@@ -150,6 +150,9 @@ impl IngressReconciler {
         // Build the source-IP allow-list once and share one Arc across every route
         // entry of this Ingress — cloning it onto each path is then a refcount bump.
         let allow_source_range = ann.allow_source_range.clone().map(Arc::new);
+        // Build the rate-limit config once and share one Arc across every route
+        // entry of this Ingress — same refcount-bump sharing pattern as above.
+        let rate_limit = ann.rate_limit.clone().map(Arc::new);
 
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
@@ -289,7 +292,8 @@ impl IngressReconciler {
                         .with_filter_actions(path_filters.clone())
                         .with_max_body_size(ann.max_body_size)
                         .with_allow_source_range(allow_source_range.clone())
-                        .with_cache_enabled(ann.cache_enabled);
+                        .with_cache_enabled(ann.cache_enabled)
+                        .with_rate_limit(rate_limit.clone());
                 if dead {
                     base_entry.error_status = Some(503);
                 }
@@ -317,7 +321,8 @@ impl IngressReconciler {
                             .with_filter_actions(ssl_filters)
                             .with_max_body_size(ann.max_body_size)
                             .with_allow_source_range(allow_source_range.clone())
-                            .with_cache_enabled(ann.cache_enabled);
+                            .with_cache_enabled(ann.cache_enabled)
+                            .with_rate_limit(rate_limit.clone());
                     if dead {
                         entry.error_status = Some(503);
                     }
@@ -403,7 +408,8 @@ impl IngressReconciler {
                                 .with_timeouts(ann.timeouts.clone())
                                 .with_filter_actions(filters)
                                 .with_max_body_size(ann.max_body_size)
-                                .with_allow_source_range(allow_source_range.clone()),
+                                .with_allow_source_range(allow_source_range.clone())
+                                .with_rate_limit(rate_limit.clone()),
                             )
                         };
                         for &listener_port in &ports {

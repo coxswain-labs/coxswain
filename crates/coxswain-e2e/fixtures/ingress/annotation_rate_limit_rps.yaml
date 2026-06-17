@@ -1,0 +1,27 @@
+# rate-limit-rps annotation fixture (apply backends::ECHO first).
+#
+# The Ingress caps requests to 1 req/s per client IP with no burst.
+# The proxy must:
+#   * serve a single request within quota (200, reach backend), and
+#   * reject subsequent rapid-fire requests with 429 + Retry-After.
+#
+# Host: ratelimit.TESTNS.local -> echo-a:3000.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rate-limit-rps-ingress
+  annotations:
+    ingress.coxswain-labs.dev/rate-limit-rps: "1"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: ratelimit.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

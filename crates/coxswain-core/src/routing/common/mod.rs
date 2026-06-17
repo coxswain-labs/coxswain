@@ -10,4 +10,5 @@ pub mod entry;
 pub mod host_router;
 pub mod port;
 pub mod predicate;
+pub mod rate_limit;
 pub mod table;

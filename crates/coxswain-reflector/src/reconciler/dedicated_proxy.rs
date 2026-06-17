@@ -59,6 +59,7 @@ use crate::tls::{
     SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
 };
 use async_trait::async_trait;
+use coxswain_core::crd::RateLimit;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::routing::SharedGatewayRoutingTable;
 use coxswain_core::tls::SharedTlsStore;
@@ -284,6 +285,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
     let (service_reader, service_writer) = reflector::store::<Service>();
     let (policy_reader, policy_writer) = reflector::store::<BackendTlsPolicy>();
     let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
+    let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
     // The Ingress / IngressClass reflectors are deliberately not constructed.
     // Their stores still need to exist because `build_gateway_routes` reads
     // through a `ReflectorStores` borrow that names them — we hand it empty
@@ -369,10 +371,18 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
     spawn_reflector(
         &mut set,
         configmap_writer,
-        scoped_api::<ConfigMap>(client, None),
+        scoped_api::<ConfigMap>(client.clone(), None),
         watcher::Config::default(),
         ReflectorEffects::new(&notify, controller_health, "config_map", metrics),
         "ConfigMap",
+    );
+    spawn_reflector(
+        &mut set,
+        rate_limit_writer,
+        Api::<RateLimit>::all(client),
+        watcher::Config::default(),
+        ReflectorEffects::new(&notify, controller_health, "rate_limit", metrics),
+        "RateLimit",
     );
     // The dedicated reconciler skips Ingress / IngressClass / the Ingress-class
     // params CR — but those subsystem checks were registered for the
@@ -416,6 +426,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
                 secrets: &secret_reader,
                 policies: &policy_reader,
                 configmaps: &configmap_reader,
+                rate_limits: &rate_limit_reader,
             };
             let rebuild_start = std::time::Instant::now();
             let target_spec = DedicatedRebuildTarget {
@@ -613,6 +624,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
     let mut service_readers: Vec<reflector::Store<Service>> = Vec::new();
     let mut policy_readers: Vec<reflector::Store<BackendTlsPolicy>> = Vec::new();
     let mut configmap_readers: Vec<reflector::Store<ConfigMap>> = Vec::new();
+    let mut rate_limit_readers: Vec<reflector::Store<RateLimit>> = Vec::new();
 
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
@@ -738,6 +750,17 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
             "ConfigMap",
         );
         configmap_readers.push(configmap_reader);
+
+        let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
+        spawn_reflector(
+            &mut set,
+            rate_limit_writer,
+            scoped_api::<RateLimit>(client.clone(), Some(ns)),
+            watcher::Config::default(),
+            ReflectorEffects::new(&notify, controller_health, "rate_limit", metrics),
+            "RateLimit",
+        );
+        rate_limit_readers.push(rate_limit_reader);
     }
 
     // Empty placeholder stores for resources the dedicated path never
@@ -791,6 +814,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
             let services_aggr = aggregate_into_store(&service_readers);
             let policies_aggr = aggregate_into_store(&policy_readers);
             let configmaps_aggr = aggregate_into_store(&configmap_readers);
+            let rate_limits_aggr = aggregate_into_store(&rate_limit_readers);
 
             let stores = ReflectorStores {
                 routes: &routes_aggr,
@@ -805,6 +829,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
                 secrets: &secrets_aggr,
                 policies: &policies_aggr,
                 configmaps: &configmaps_aggr,
+                rate_limits: &rate_limits_aggr,
             };
             let rebuild_start = std::time::Instant::now();
             let target_spec = DedicatedRebuildTarget {

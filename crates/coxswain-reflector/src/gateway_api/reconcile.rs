@@ -16,11 +16,12 @@ use crate::gw_types::{
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
 use crate::tls::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, load_tls_cert};
+use coxswain_core::crd::RateLimit;
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, FilterAction, GatewayRoutingTableBuilder, HostRouterBuilder,
-    MatchPredicates, RouteEntry, RouteTimeouts, UpstreamTls, WildcardKind,
+    MatchPredicates, RateLimitConfig, RouteEntry, RouteTimeouts, UpstreamTls, WildcardKind,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -34,9 +35,10 @@ use std::time::SystemTime;
 /// Precomputed lookup tables consumed by [`GatewayApiReconciler::reconcile`].
 ///
 /// Bundles the per-rebuild context that doesn't change between routes — the
-/// listener-binding table and the `BackendTLSPolicy` index — so the function
-/// stays under the workspace `clippy::too_many_arguments` threshold without
-/// each call site repeating the two-arg suffix.
+/// listener-binding table, the `BackendTLSPolicy` index, and the `RateLimit`
+/// CR store — so the function stays under the workspace
+/// `clippy::too_many_arguments` threshold without each call site repeating the
+/// three-arg suffix.
 #[non_exhaustive]
 pub struct RouteResolution<'a> {
     /// `(gw_ns, gw_name, listener_name) → (hostname, port)` mapping for every
@@ -45,6 +47,10 @@ pub struct RouteResolution<'a> {
     /// Per-(Service, port) `BackendTLSPolicy` lookup table; lookups try
     /// `(svc, Some(port))` first and fall back to `(svc, None)`.
     pub policy_index: &'a BackendTlsIndex,
+    /// `RateLimit` CR store for resolving `ExtensionRef` filters on
+    /// `HTTPRouteRule`s. Looked up by `(namespace, name)` from the filter;
+    /// missing CRs produce a WARN and fail-open (route is not limited).
+    pub rate_limits: &'a reflector::Store<RateLimit>,
 }
 
 impl GatewayApiReconciler {
@@ -69,6 +75,7 @@ impl GatewayApiReconciler {
         let RouteResolution {
             listener_info,
             policy_index,
+            rate_limits,
         } = resolution;
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
@@ -235,6 +242,8 @@ impl GatewayApiReconciler {
                 }
             };
 
+            let rate_limit =
+                super::filters::resolve_rate_limit(rule_filters, route_ns, rate_limits);
             let ctx = RuleContext {
                 filters: rule_filters,
                 timeouts: &rule_timeouts,
@@ -242,6 +251,7 @@ impl GatewayApiReconciler {
                 route_id: &route_id,
                 metric_route_id: &metric_route_id,
                 created_at,
+                rate_limit,
             };
             for (hostname_opt, port) in &bindings {
                 let pb = builder.for_port(*port);
@@ -334,6 +344,7 @@ struct RuleContext<'a> {
     route_id: &'a str,
     metric_route_id: &'a Arc<str>,
     created_at: Option<SystemTime>,
+    rate_limit: Option<Arc<RateLimitConfig>>,
 }
 
 /// Installs one HTTPRoute rule into a `HostRouterBuilder`.
@@ -368,7 +379,9 @@ fn apply_rule(
                 ctx.created_at,
             ),
         };
-        entry.with_metric_route_id(Arc::clone(ctx.metric_route_id))
+        entry
+            .with_metric_route_id(Arc::clone(ctx.metric_route_id))
+            .with_rate_limit(ctx.rate_limit.clone())
     };
 
     match rule.matches.as_deref() {
@@ -761,6 +774,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -795,6 +809,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -829,6 +844,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -855,6 +871,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -880,6 +897,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -944,6 +962,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -984,6 +1003,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -1049,6 +1069,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -1125,6 +1146,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -1176,6 +1198,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -1260,6 +1283,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -1301,6 +1325,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -1334,6 +1359,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -1369,6 +1395,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -1396,6 +1423,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );
@@ -1429,6 +1457,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
             },
             &mut builder,
         );

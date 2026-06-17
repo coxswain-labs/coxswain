@@ -4,6 +4,7 @@ use super::entry::{
     BackendGroup, FilterAction, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts,
 };
 use super::predicate::{MatchPredicates, RequestContext, ValueMatch};
+use super::rate_limit::RateLimitConfig;
 use matchit::Router;
 use regex::RegexSet;
 use std::cmp::Reverse;
@@ -37,6 +38,8 @@ pub struct RouteMatch {
     pub allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
     /// RFC 7234 response-cache opt-in for the matched rule (`false` = no caching).
     pub cache_enabled: bool,
+    /// Per-route rate-limiting configuration (`None` = no rate limiting).
+    pub rate_limit: Option<Arc<RateLimitConfig>>,
     /// When `Some`, the proxy returns this status immediately without contacting
     /// upstream (invalid/missing/forbidden backend ref). See the struct docs.
     pub error_status: Option<u16>,
@@ -55,6 +58,7 @@ impl RouteMatch {
             max_body_size: entry.max_body_size,
             allow_source_range: entry.allow_source_range.clone(),
             cache_enabled: entry.cache_enabled,
+            rate_limit: entry.rate_limit.clone(),
             error_status: entry.error_status,
         }
     }

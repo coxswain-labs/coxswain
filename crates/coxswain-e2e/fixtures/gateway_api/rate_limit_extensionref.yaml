@@ -1,0 +1,55 @@
+# RateLimit ExtensionRef fixture (apply backends::ECHO first).
+#
+# A RateLimit CR caps the /rl/ path to 1 req/s with no burst. An HTTPRoute
+# references it via an ExtensionRef filter. The proxy must:
+#   * serve the first request within quota (200, reach backend), and
+#   * reject subsequent rapid-fire requests with 429 + Retry-After.
+#
+# Gateway: coxswain-test on GATEWAY_HTTP_PORT.
+# Route host: gwratelimit.TESTNS.local, path /rl/ -> echo-a:3000.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: coxswain-labs.dev/v1alpha1
+kind: RateLimit
+metadata:
+  name: one-rps
+spec:
+  requestsPerSecond: 1
+  burst: 0
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rl-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "gwratelimit.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /rl/
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: coxswain-labs.dev
+            kind: RateLimit
+            name: one-rps
+      backendRefs:
+        - name: echo-a
+          port: 3000

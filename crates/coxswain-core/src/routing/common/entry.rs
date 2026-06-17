@@ -1,6 +1,7 @@
 //! Route entry types: backend groups, filter actions, route timeouts, and path-rule metadata.
 
 use super::predicate::MatchPredicates;
+use super::rate_limit::RateLimitConfig;
 use http::{HeaderName, HeaderValue};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1024,6 +1025,15 @@ pub struct RouteEntry {
     /// `Authorization`/`Cookie` bypass). `false` (the default, and the value for
     /// all Gateway-API routes until the ExtensionRef binding lands) disables it.
     pub cache_enabled: bool,
+    /// Per-route rate-limiting configuration, from the
+    /// `ingress.coxswain-labs.dev/rate-limit-*` annotations or a `RateLimit`
+    /// CRD `ExtensionRef` filter.
+    ///
+    /// `Some(cfg)` enables per-client rate limiting keyed by client IP or a
+    /// named request header. `None` (the default) disables rate limiting for
+    /// the route. Shared as an `Arc` so cloning into the lookup result is a
+    /// refcount bump, not a heap copy, on the hot path.
+    pub rate_limit: Option<Arc<RateLimitConfig>>,
 }
 
 impl RouteEntry {
@@ -1046,6 +1056,7 @@ impl RouteEntry {
             max_body_size: None,
             allow_source_range: None,
             cache_enabled: false,
+            rate_limit: None,
         }
     }
 
@@ -1069,6 +1080,7 @@ impl RouteEntry {
             max_body_size: None,
             allow_source_range: None,
             cache_enabled: false,
+            rate_limit: None,
         }
     }
 
@@ -1097,6 +1109,7 @@ impl RouteEntry {
             max_body_size: None,
             allow_source_range: None,
             cache_enabled: false,
+            rate_limit: None,
         }
     }
 
@@ -1128,6 +1141,7 @@ impl RouteEntry {
             max_body_size: None,
             allow_source_range: None,
             cache_enabled: false,
+            rate_limit: None,
         }
     }
 
@@ -1215,6 +1229,20 @@ impl RouteEntry {
         self.cache_enabled = cache_enabled;
         self
     }
+
+    /// Set per-route rate-limiting config for this route (builder-style).
+    ///
+    /// Used by the Ingress reconciler to attach the config parsed from the
+    /// `ingress.coxswain-labs.dev/rate-limit-*` annotations, and by the Gateway
+    /// API reconciler for `RateLimit` CRD `ExtensionRef` filters. `None`
+    /// (the default) disables rate limiting. The reconciler shares one `Arc`
+    /// across every path of an Ingress, so cloning it onto each entry is a
+    /// refcount bump.
+    #[must_use]
+    pub fn with_rate_limit(mut self, rate_limit: Option<Arc<RateLimitConfig>>) -> Self {
+        self.rate_limit = rate_limit;
+        self
+    }
 }
 
 // Lock the hot-path RouteEntry and BackendPool sizes to catch accidental growth.
@@ -1225,7 +1253,8 @@ impl RouteEntry {
 // Bumped 256→272 by adding max_body_size: Option<u64> (16 bytes) for the ingress.coxswain-labs.dev/max-body-size request-body limit.
 // Bumped 272→280 by adding allow_source_range: Option<Arc<Vec<IpNet>>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/allow-source-range IP allow-list.
 // cache_enabled: bool (#40) added without a bump — it occupies existing struct padding.
-static_assertions::assert_eq_size!(RouteEntry, [u8; 280]);
+// Bumped 280→288 by adding rate_limit: Option<Arc<RateLimitConfig>> (8 bytes, niche pointer) for per-route rate limiting (#25).
+static_assertions::assert_eq_size!(RouteEntry, [u8; 288]);
 // Hot type — review with the team before bumping this number.
 static_assertions::assert_eq_size!(BackendPool, [u8; 24]);
 
@@ -1419,7 +1448,8 @@ mod tests {
         // Bumped 208→256: RouteTimeouts gained connect/read/send: 3×Option<Duration>.
         // Bumped 256→272: max_body_size: Option<u64> added for the max-body-size limit.
         // Bumped 272→280: allow_source_range: Option<Arc<Vec<IpNet>>> added for the allow-source-range IP allow-list.
-        static_assertions::assert_eq_size!(RouteEntry, [u8; 280]);
+        // Bumped 280→288: rate_limit: Option<Arc<RateLimitConfig>> added for per-route rate limiting (#25).
+        static_assertions::assert_eq_size!(RouteEntry, [u8; 288]);
     }
 
     #[test]

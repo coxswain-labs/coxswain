@@ -32,7 +32,10 @@ use crate::config::AccessLogPathMode;
 use crate::upstream_ca::UpstreamCaCache;
 use bytes::Bytes;
 use coxswain_cache::ResponseCache;
-use coxswain_core::routing::{RequestContext, RetryOn, RouteTimeouts, SessionAffinity, UpstreamCa};
+use coxswain_core::routing::{
+    RateLimitKey, RequestContext, RetryOn, RouteTimeouts, SessionAffinity, UpstreamCa,
+};
+use http::header;
 use pingora_cache::key::{CacheKey, HashBinary};
 use pingora_cache::{CacheMeta, NoCacheReason, RespCacheable, VarianceBuilder};
 use pingora_core::upstreams::peer::HttpPeer;
@@ -84,6 +87,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
 pub(crate) async fn request_filter<K>(
     engine: &RoutingEngine<K>,
     default_timeouts: &RouteTimeouts,
+    rate_limiter: &crate::rate_limit::RateLimiterRegistry,
     session: &mut Session,
     ctx: &mut ProxyCtx,
 ) -> Result<bool> {
@@ -149,6 +153,47 @@ pub(crate) async fn request_filter<K>(
                 HTTPStatus(403),
                 "client IP not in allow-list",
             ));
+        }
+    }
+
+    // Per-route rate limiting. Enforcement runs after allow-list (denied clients
+    // never consume a rate-limit slot) and before redirect (a rate-limited client
+    // does not receive a redirect, preventing URL leakage). Fail-open on absent
+    // client key (undeterminable IP or missing header) — matches nginx + Envoy.
+    if let Some(cfg) = m.rate_limit.as_deref() {
+        let client_ip = ctx.real_client_addr.map(|a| a.ip()).or_else(|| {
+            session
+                .as_downstream()
+                .client_addr()
+                .and_then(|a| a.as_inet())
+                .map(|a| a.ip())
+        });
+        let client_key = {
+            // Scope the immutable req borrow so it does not outlive the next mutable
+            // session borrow (write_response_header below).
+            let req = session.req_header();
+            let header_val = if let RateLimitKey::Header(name) = &cfg.key {
+                req.headers.get(name.as_ref()).and_then(|v| v.to_str().ok())
+            } else {
+                None
+            };
+            crate::rate_limit::extract_client_key(cfg, client_ip, header_val)
+        };
+        if let Some(key) = client_key {
+            use crate::rate_limit::CheckOutcome;
+            if let CheckOutcome::Limited { retry_after_secs } =
+                rate_limiter.check(&m.metric_route_id, cfg, key)
+            {
+                let mut resp = ResponseHeader::build(429, Some(1))?;
+                resp.insert_header(header::RETRY_AFTER, retry_after_secs.to_string())?;
+                session
+                    .write_response_header(Box::new(resp), true)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!("failed to write rate-limit response: {e}")
+                    });
+                return Ok(true);
+            }
         }
     }
 
