@@ -1,0 +1,86 @@
+# Auth-stub backends for external-auth (ext_authz) e2e tests.
+#
+# Two services in one namespace:
+#   auth-allow  (port 4000) — returns HTTP 200 + X-Auth-User: testuser
+#   auth-deny   (port 4001) — returns HTTP 403 + Set-Cookie: session=test123
+#
+# Both are implemented with a busybox nc loop: printf the fixed HTTP response
+# into nc, which forwards it to the connecting client. Each nc invocation
+# handles one request; the while loop restarts it for the next connection.
+# This is sufficient for sequential e2e polling — one poll cycle = one nc fork.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-allow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-allow
+  template:
+    metadata:
+      labels:
+        app: auth-allow
+    spec:
+      containers:
+        - name: auth-allow
+          image: ${BUSYBOX_IMAGE}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                printf 'HTTP/1.1 200 OK\r\nX-Auth-User: testuser\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' | nc -l -p 4000
+              done
+          ports:
+            - containerPort: 4000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-allow
+spec:
+  selector:
+    app: auth-allow
+  ports:
+    - port: 4000
+      targetPort: 4000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-deny
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-deny
+  template:
+    metadata:
+      labels:
+        app: auth-deny
+    spec:
+      containers:
+        - name: auth-deny
+          image: ${BUSYBOX_IMAGE}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                printf 'HTTP/1.1 403 Forbidden\r\nSet-Cookie: session=test123\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' | nc -l -p 4001
+              done
+          ports:
+            - containerPort: 4001
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-deny
+spec:
+  selector:
+    app: auth-deny
+  ports:
+    - port: 4001
+      targetPort: 4001

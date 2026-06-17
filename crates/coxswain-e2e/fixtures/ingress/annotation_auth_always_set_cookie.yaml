@@ -1,0 +1,30 @@
+# auth-always-set-cookie fixture: on deny, proxy forwards Set-Cookie from the
+# auth response to the client.
+#
+# auth-deny returns 403 + Set-Cookie: session=test123.
+# Without always-set-cookie the proxy strips Set-Cookie from the deny response.
+# With auth-always-set-cookie: "true" the proxy forwards it, enabling login
+# redirects (e.g. IdP sets a CSRF cookie on a 302 deny).
+#
+# Host: authcookie.TESTNS.local / -> echo-a:3000 (never reached; deny fires).
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-cookie-ingress
+  annotations:
+    ingress.coxswain-labs.dev/auth-url: "http://auth-deny.${TESTNS}.svc.cluster.local:4001/"
+    ingress.coxswain-labs.dev/auth-always-set-cookie: "true"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: authcookie.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

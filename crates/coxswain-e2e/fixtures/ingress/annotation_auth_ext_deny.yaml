@@ -1,0 +1,27 @@
+# ext_authz deny fixture: auth-url points at auth-deny (always 403).
+#
+# The proxy forwards the sub-request to auth-deny.TESTNS:4001, which
+# returns 403 + Set-Cookie. The proxy returns 403 to the client;
+# echo-a is never reached.
+#
+# Host: authextdeny.TESTNS.local / -> echo-a:3000 (never reached on deny).
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-ext-deny-ingress
+  annotations:
+    ingress.coxswain-labs.dev/auth-url: "http://auth-deny.${TESTNS}.svc.cluster.local:4001/"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: authextdeny.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
