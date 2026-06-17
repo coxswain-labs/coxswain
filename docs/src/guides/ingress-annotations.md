@@ -30,6 +30,9 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/max-body-size` | size | _none_ | `"8m"` |
 | `ingress.coxswain-labs.dev/allow-source-range` | cidr-list | _none_ | `"10.0.0.0/8,192.168.1.0/24"` |
 | `ingress.coxswain-labs.dev/cache-enabled` | boolean | `false` | `"true"` |
+| `ingress.coxswain-labs.dev/session-affinity` | `cookie` or `header` | _none_ | `"cookie"` |
+| `ingress.coxswain-labs.dev/session-cookie-name` | string | `__coxswain_session` | `"SESSIONID"` |
+| `ingress.coxswain-labs.dev/session-header` | string | _none_ | `"X-Session-Id"` |
 
 ```yaml
 metadata:
@@ -363,6 +366,50 @@ For example `DELETE /cache/cache.example.com/assets/app.js` purges the `GET cach
 
 !!! note
     The Gateway API binding for caching (an `HTTPRoute` `ExtensionRef` filter pointing at a `CoxswainCachePolicy`) is tracked separately; today `cache-enabled` is the Ingress-only entry point.
+
+## Session affinity (sticky sessions)
+
+Pins each client to the same backend pod, so stateful workloads (in-memory sessions, WebSocket connections) keep reaching the endpoint that holds their state. A backend without these annotations stays on the default weighted round-robin.
+
+Affinity is **stateless** — there is no server-side session table. The pin is carried entirely in the request, so it works the same across proxy replicas and needs no coordination. Two modes:
+
+### `session-affinity: cookie`
+
+The proxy injects a cookie on the first response identifying the chosen pod, and routes subsequent requests bearing that cookie back to it.
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/session-affinity: "cookie"
+    ingress.coxswain-labs.dev/session-cookie-name: "SESSIONID"   # optional
+```
+
+- The first request (no cookie) is load-balanced normally, then pinned: the response carries `Set-Cookie: <name>=<token>; Path=/; HttpOnly`. The token encodes the endpoint; no raw pod IP is exposed.
+- `session-cookie-name` sets the cookie name (default `__coxswain_session`). A name that is not a valid cookie token warns and falls back to the default.
+- The cookie is a **session cookie** (no `Max-Age`); it lives for the browser session.
+
+### `session-affinity: header`
+
+The value of a request header is hashed to consistently select a pod — no cookie is issued. Use this when the client already carries a stable identifier (a session token, an API key).
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/session-affinity: "header"
+    ingress.coxswain-labs.dev/session-header: "X-Session-Id"
+```
+
+- `session-header` is **required** in header mode; if it is missing or not a valid header name, affinity is disabled (warning) and the route round-robins.
+- Selection uses **rendezvous (HRW) hashing** over the live endpoints, so a header value keeps its pod as long as that pod exists, and only the keys of a removed pod are redistributed.
+- A request that does not carry the header round-robins (and never receives a cookie).
+
+### Recovery and limits
+
+- If a pinned pod is **removed or scaled away**, the next request from that client no longer resolves to a live endpoint: it falls back to round-robin and (in cookie mode) re-establishes affinity with a fresh cookie.
+- An unknown `session-affinity` value (anything other than `cookie`/`header`) warns and disables affinity — the Ingress still serves.
+
+!!! note
+    The Gateway API binding for session persistence is tracked in [#355](https://github.com/coxswain-labs/coxswain/issues/355). It is deferred because the only Gateway API surface for session persistence in our pinned crate is experimental-only (which Coxswain never compiles into release images), and the `BackendLBPolicy` resource originally proposed is not an upstream Gateway API type. Today the `session-*` annotations are the Ingress-only entry point.
 
 ## Class-level defaults
 

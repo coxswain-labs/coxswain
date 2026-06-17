@@ -476,3 +476,245 @@ async fn cache_entry_purged_when_admin_delete_called() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ── Session affinity (#15) ─────────────────────────────────────────────────────
+//
+// One `echo-aff` Service with three pods backs each test, so a backend group holds
+// three endpoints: weighted round-robin spreads across them and affinity pins to
+// one. Pod identity comes from the echo body's `pod` field (Downward API).
+
+/// Extract the `name=value` pair for cookie `name` from the response's `Set-Cookie`
+/// headers, ready to replay as a `Cookie` request header. `None` if absent.
+fn set_cookie_pair(hdrs: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    for v in hdrs.get_all(reqwest::header::SET_COOKIE).iter() {
+        let Ok(s) = v.to_str() else { continue };
+        let Some(pair) = s.split(';').next().map(str::trim) else {
+            continue;
+        };
+        if pair.split_once('=').is_some_and(|(k, _)| k == name) {
+            return Some(pair.to_string());
+        }
+    }
+    None
+}
+
+/// Cookie-mode affinity (happy path): the proxy injects a `SESSIONID` cookie on the
+/// first response, and every subsequent request replaying that cookie pins to the
+/// same pod. A valid pin is not re-issued. Also proves the custom
+/// `session-cookie-name` is honored.
+#[tokio::test]
+async fn session_affinity_cookie_pins_client_to_same_backend_when_cookie_replayed()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "aff-cookie").await?;
+
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SESSION_AFFINITY_COOKIE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-aff"]).await?;
+    let host = format!("affinity.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    // First request carries no cookie → the proxy round-robins to a pod and pins it
+    // by injecting the (custom-named) SESSIONID cookie.
+    let (status, hdrs, body) = h.http.get_full(&host, "/").await?;
+    assert_eq!(status, 200, "first affinity request must succeed");
+    let first_pod = body
+        .and_then(|b| b.pod)
+        .expect("echo body must report the serving pod");
+    let cookie = set_cookie_pair(&hdrs, "SESSIONID").expect(
+        "cookie mode must inject a SESSIONID Set-Cookie (custom session-cookie-name) \
+         on the first response",
+    );
+
+    // Replaying the cookie pins every request to the original pod and does not
+    // re-issue the cookie.
+    for i in 0..10 {
+        let (status, hdrs, body) = h
+            .http
+            .get_full_with_headers(&host, "/", &[("Cookie", cookie.as_str())])
+            .await?;
+        assert_eq!(status, 200, "cookie replay {i} must succeed");
+        let pod = body.and_then(|b| b.pod).unwrap_or_default();
+        assert_eq!(
+            pod, first_pod,
+            "cookie replay {i} must pin to the original pod (got {pod}, want {first_pod})"
+        );
+        assert!(
+            set_cookie_pair(&hdrs, "SESSIONID").is_none(),
+            "cookie replay {i}: an already-valid pin must not re-issue the cookie"
+        );
+    }
+    Ok(())
+}
+
+/// Cookie-mode affinity (sad path): a cookie whose token matches no live endpoint
+/// (e.g. the pinned pod was removed) must not error — the proxy falls back to
+/// round-robin and re-establishes affinity by issuing a fresh, different cookie.
+#[tokio::test]
+async fn session_affinity_cookie_reestablishes_when_cookie_token_is_stale() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "aff-stale").await?;
+
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SESSION_AFFINITY_COOKIE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-aff"]).await?;
+    let host = format!("affinity.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    // u64::MAX is never a real endpoint token (those are FNV-1a of addr+port), so it
+    // models a pin to a pod that has been removed/scaled away.
+    let stale = "SESSIONID=ffffffffffffffff";
+    let (status, hdrs, body) = h
+        .http
+        .get_full_with_headers(&host, "/", &[("Cookie", stale)])
+        .await?;
+    assert_eq!(
+        status, 200,
+        "a stale affinity cookie must still serve a healthy pod"
+    );
+    assert!(
+        body.and_then(|b| b.pod).is_some(),
+        "the request must reach a live backend pod"
+    );
+    let fresh = set_cookie_pair(&hdrs, "SESSIONID")
+        .expect("a stale cookie must re-establish affinity with a fresh Set-Cookie");
+    assert_ne!(
+        fresh, stale,
+        "the re-established cookie must differ from the stale one"
+    );
+    Ok(())
+}
+
+/// Header-mode affinity (happy path): the value of `X-Session-Id` is rendezvous-hashed
+/// to a single pod, so a fixed value pins consistently; distinct values spread across
+/// pods; and no cookie is ever set.
+#[tokio::test]
+async fn session_affinity_header_pins_same_header_value_to_same_backend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "aff-header").await?;
+
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SESSION_AFFINITY_HEADER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-aff"]).await?;
+    let host = format!("affinity.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    // A fixed header value pins to one pod and never sets a cookie.
+    let (_, _, body) = h
+        .http
+        .get_full_with_headers(&host, "/", &[("X-Session-Id", "user-42")])
+        .await?;
+    let pinned = body
+        .and_then(|b| b.pod)
+        .expect("echo body must report the serving pod");
+    for i in 0..10 {
+        let (status, hdrs, body) = h
+            .http
+            .get_full_with_headers(&host, "/", &[("X-Session-Id", "user-42")])
+            .await?;
+        assert_eq!(status, 200, "header request {i} must succeed");
+        assert_eq!(
+            body.and_then(|b| b.pod).unwrap_or_default(),
+            pinned,
+            "request {i}: a fixed header value must pin to one pod"
+        );
+        assert!(
+            hdrs.get(reqwest::header::SET_COOKIE).is_none(),
+            "request {i}: header mode must never set a cookie"
+        );
+    }
+
+    // Distinct header values spread across more than one pod.
+    let mut pods = std::collections::HashSet::new();
+    for k in 0..50 {
+        let value = format!("user-{k}");
+        let (_, _, body) = h
+            .http
+            .get_full_with_headers(&host, "/", &[("X-Session-Id", value.as_str())])
+            .await?;
+        if let Some(p) = body.and_then(|b| b.pod) {
+            pods.insert(p);
+        }
+    }
+    assert!(
+        pods.len() >= 2,
+        "distinct session ids must spread across multiple pods, saw {pods:?}"
+    );
+    Ok(())
+}
+
+/// Header-mode affinity (sad path): with no `X-Session-Id` header, requests fall back
+/// to round-robin across pods, and header mode still never sets a cookie.
+#[tokio::test]
+async fn session_affinity_header_falls_back_to_round_robin_when_header_absent() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "aff-hdr-rr").await?;
+
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SESSION_AFFINITY_HEADER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-aff"]).await?;
+    let host = format!("affinity.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let mut pods = std::collections::HashSet::new();
+    for i in 0..30 {
+        let (status, hdrs, body) = h.http.get_full(&host, "/").await?;
+        assert_eq!(status, 200, "request {i} must succeed");
+        assert!(
+            hdrs.get(reqwest::header::SET_COOKIE).is_none(),
+            "request {i}: header mode must not set a cookie even without the header"
+        );
+        if let Some(p) = body.and_then(|b| b.pod) {
+            pods.insert(p);
+        }
+    }
+    assert!(
+        pods.len() >= 2,
+        "without the affinity header, requests must round-robin across pods, saw {pods:?}"
+    );
+    Ok(())
+}
+
+/// Baseline (sad/negative): a backend with no session-affinity annotation keeps plain
+/// round-robin and never injects an affinity cookie.
+#[tokio::test]
+async fn requests_round_robin_across_backends_when_no_affinity_annotation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "aff-none").await?;
+
+    fixtures::apply_fixture(ingress::SESSION_AFFINITY_NONE, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["echo-aff"]).await?;
+    let host = format!("affinity.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let mut pods = std::collections::HashSet::new();
+    for i in 0..30 {
+        let (status, hdrs, body) = h.http.get_full(&host, "/").await?;
+        assert_eq!(status, 200, "request {i} must succeed");
+        assert!(
+            hdrs.get(reqwest::header::SET_COOKIE).is_none(),
+            "request {i}: a backend without affinity must not inject any cookie"
+        );
+        if let Some(p) = body.and_then(|b| b.pod) {
+            pods.insert(p);
+        }
+    }
+    assert!(
+        pods.len() >= 2,
+        "a no-affinity backend must round-robin across pods, saw {pods:?}"
+    );
+    Ok(())
+}

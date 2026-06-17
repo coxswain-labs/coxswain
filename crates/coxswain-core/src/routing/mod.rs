@@ -15,8 +15,8 @@ mod tests;
 
 pub use common::entry::{
     BackendGroup, BackendProtocol, FilterAction, HeaderMod, HeaderModError, PathModifier, RetryOn,
-    RetryPolicy, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts, UpstreamCa,
-    UpstreamTls, parse_app_protocol,
+    RetryPolicy, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts, SessionAffinity,
+    UpstreamCa, UpstreamTls, affinity_hash, affinity_token, parse_app_protocol,
 };
 pub use common::host_router::{
     HostRouter, HostRouterBuilder, RouteMatch, WildcardKind, compile_path_regex,

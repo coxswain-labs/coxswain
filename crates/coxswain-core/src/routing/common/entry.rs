@@ -93,6 +93,98 @@ pub fn parse_app_protocol(raw: &str) -> BackendProtocol {
     }
 }
 
+/// Sticky-session (session-affinity) configuration attached to a [`BackendGroup`].
+///
+/// Stateless by construction (no server-side session map): the pin is encoded in the
+/// request itself, so affinity is naturally per-process and survives nothing across
+/// replicas — which is exactly the contract. Populated today only from the Ingress
+/// `ingress.coxswain-labs.dev/session-*` annotations; a backend with no affinity
+/// binding keeps plain weighted round-robin.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub enum SessionAffinity {
+    /// Cookie mode: the proxy injects a cookie whose value is the endpoint token
+    /// (`hex(affinity_token(addr))`) on the first response, and pins subsequent
+    /// requests carrying it to that endpoint. A token that no longer matches any live
+    /// endpoint (pod removed/scaled away) falls back to round-robin and re-pins.
+    Cookie {
+        /// Cookie name to emit and read back (default `__coxswain_session`).
+        cookie_name: Arc<str>,
+    },
+    /// Header mode: the value of `header` is rendezvous-hashed over the live endpoint
+    /// set to consistently select one endpoint. No cookie is injected; a request
+    /// without the header degrades to round-robin.
+    Header {
+        /// Request header whose value selects the endpoint.
+        header: HeaderName,
+    },
+}
+
+/// Deterministic FNV-1a hash of a byte slice.
+///
+/// Used for both the per-endpoint affinity token ([`affinity_token`]) and the
+/// header-mode affinity key (over the request header's value). Chosen over
+/// `std::hash::DefaultHasher` precisely because its output is stable across process
+/// restarts and crate versions — a cookie minted by one replica must resolve on
+/// another, and a header value must map to the same endpoint every time.
+#[must_use]
+pub fn affinity_hash(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Stable per-endpoint affinity token: the [`affinity_hash`] of the address (a family
+/// tag plus IP octets plus port).
+///
+/// Cookie mode renders this as hex into the `Set-Cookie` value and parses it back to
+/// locate the pinned endpoint. Distinct endpoints (differing IP or port) hash to
+/// distinct tokens; the same endpoint always hashes the same. No heap allocation — the
+/// byte sequence is assembled on the stack.
+#[must_use]
+pub fn affinity_token(addr: SocketAddr) -> u64 {
+    // 1 family tag + up to 16 IPv6 octets + 2 port bytes.
+    let mut buf = [0u8; 19];
+    let mut len = 0;
+    let mut push = |b: u8| {
+        buf[len] = b;
+        len += 1;
+    };
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            push(4);
+            for b in v4.octets() {
+                push(b);
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            push(6);
+            for b in v6.octets() {
+                push(b);
+            }
+        }
+    }
+    for b in addr.port().to_be_bytes() {
+        push(b);
+    }
+    affinity_hash(&buf[..len])
+}
+
+/// One pooled endpoint indexed for affinity lookup: its address, its stable token, and
+/// the index of the backend pool it belongs to (to recover that backend's per-backend
+/// filters on a pinned selection).
+#[derive(Clone, Copy)]
+struct AffinityEndpoint {
+    addr: SocketAddr,
+    token: u64,
+    backend_idx: u16,
+}
+
 /// One backend service's resolved pod endpoints with a round-robin counter.
 struct BackendPool {
     addrs: Box<[SocketAddr]>,
@@ -453,6 +545,14 @@ pub struct BackendGroup {
     /// without filters and `Some(filters)` otherwise. Applied AFTER rule-level
     /// filters in the proxy's `upstream_request_filter` hook.
     per_backend_filters: Option<Box<[PerBackendFilterSlot]>>,
+    /// Sticky-session configuration; `None` (the common case) means plain weighted
+    /// round-robin. Set from the Ingress `session-*` annotations.
+    session_affinity: Option<SessionAffinity>,
+    /// Flat affinity lookup index over every pooled endpoint, built once in
+    /// [`BackendGroup::with_session_affinity`]. `None` when affinity is off (zero
+    /// overhead). Carries each endpoint's stable token and owning backend index so a
+    /// pinned selection can recover the right per-backend filters.
+    affinity_endpoints: Option<Box<[AffinityEndpoint]>>,
 }
 
 impl BackendGroup {
@@ -475,6 +575,8 @@ impl BackendGroup {
             tls: None,
             retry: RetryPolicy::default(),
             per_backend_filters: None,
+            session_affinity: None,
+            affinity_endpoints: None,
         }
     }
 
@@ -523,6 +625,8 @@ impl BackendGroup {
             tls: None,
             retry: RetryPolicy::default(),
             per_backend_filters: None,
+            session_affinity: None,
+            affinity_endpoints: None,
         }
     }
 
@@ -537,6 +641,8 @@ impl BackendGroup {
             tls: None,
             retry: RetryPolicy::default(),
             per_backend_filters: None,
+            session_affinity: None,
+            affinity_endpoints: None,
         }
     }
 
@@ -609,6 +715,108 @@ impl BackendGroup {
             .collect();
         self.per_backend_filters = Some(normalised);
         self
+    }
+
+    /// Attach sticky-session configuration (builder-style).
+    ///
+    /// `None` leaves the group on plain weighted round-robin (zero overhead). When
+    /// `Some`, a flat affinity index is precomputed over every currently-pooled
+    /// endpoint so the proxy's per-request token/hash lookups never touch the backend
+    /// pools' atomics. Call after the constructor (and, if used, after
+    /// [`Self::with_per_backend_filters`]); the index records backend indices, so
+    /// filter recovery reads the latest `per_backend_filters` at lookup time.
+    #[must_use]
+    pub fn with_session_affinity(mut self, affinity: Option<SessionAffinity>) -> Self {
+        match affinity {
+            None => {
+                self.session_affinity = None;
+                self.affinity_endpoints = None;
+            }
+            Some(cfg) => {
+                let mut index = Vec::with_capacity(self.addrs_snapshot.len());
+                for (backend_idx, pool) in self.backends.iter().enumerate() {
+                    for &addr in &*pool.addrs {
+                        index.push(AffinityEndpoint {
+                            addr,
+                            token: affinity_token(addr),
+                            // backend count is bounded by backendRefs (<= a handful);
+                            // the cast is lossless in every realistic configuration.
+                            backend_idx: backend_idx as u16,
+                        });
+                    }
+                }
+                self.session_affinity = Some(cfg);
+                self.affinity_endpoints = Some(index.into_boxed_slice());
+            }
+        }
+        self
+    }
+
+    /// Per-backend filters attached to `backend_idx`, mirroring the lookup in
+    /// [`Self::next_endpoint_with_filters`]. `None` when no filters apply.
+    fn filters_for_backend(&self, backend_idx: usize) -> Option<Arc<[FilterAction]>> {
+        self.per_backend_filters
+            .as_ref()
+            .and_then(|all| all.get(backend_idx).cloned().flatten())
+    }
+
+    /// Sticky-session configuration for this group, if any.
+    pub fn session_affinity(&self) -> Option<&SessionAffinity> {
+        self.session_affinity.as_ref()
+    }
+
+    /// Resolve a cookie-mode affinity token to its pinned endpoint.
+    ///
+    /// Returns the endpoint and its per-backend filters when `token` still matches a
+    /// live endpoint. `None` means the pinned pod was removed/scaled away — the proxy
+    /// then falls back to round-robin and re-establishes affinity. Affinity is off
+    /// when no index was built, which also yields `None`.
+    #[must_use]
+    pub fn endpoint_by_token(
+        &self,
+        token: u64,
+    ) -> Option<(SocketAddr, Option<Arc<[FilterAction]>>)> {
+        let index = self.affinity_endpoints.as_ref()?;
+        // Endpoint counts are small (pods of one Service); a linear scan beats a map's
+        // allocation and indirection and stays cache-friendly.
+        index
+            .iter()
+            .find(|e| e.token == token)
+            .map(|e| (e.addr, self.filters_for_backend(e.backend_idx as usize)))
+    }
+
+    /// Resolve a header-mode affinity key to an endpoint via rendezvous hashing.
+    ///
+    /// Each live endpoint is scored by mixing `key_hash` with its stable token; the
+    /// highest score wins. Rendezvous (HRW) hashing keeps the same key on the same
+    /// endpoint as long as that endpoint exists, and re-maps only the affected keys
+    /// when an endpoint joins or leaves. `None` when affinity is off or the group has
+    /// no endpoints.
+    #[must_use]
+    pub fn endpoint_by_hash(
+        &self,
+        key_hash: u64,
+    ) -> Option<(SocketAddr, Option<Arc<[FilterAction]>>)> {
+        let index = self.affinity_endpoints.as_ref()?;
+        index
+            .iter()
+            .max_by_key(|e| rendezvous_score(key_hash, e.token))
+            .map(|e| (e.addr, self.filters_for_backend(e.backend_idx as usize)))
+    }
+
+    /// Per-backend filters for a specific pinned endpoint address.
+    ///
+    /// Used by the proxy when honoring a session-affinity pin in `upstream_peer`: the
+    /// pin carries only the address, so this recovers the owning backend's filters the
+    /// same way [`Self::next_endpoint_with_filters`] would have. `None` when the
+    /// address has no affinity index entry or its backend declares no filters.
+    #[must_use]
+    pub fn filters_for_endpoint(&self, addr: SocketAddr) -> Option<Arc<[FilterAction]>> {
+        let index = self.affinity_endpoints.as_ref()?;
+        index
+            .iter()
+            .find(|e| e.addr == addr)
+            .and_then(|e| self.filters_for_backend(e.backend_idx as usize))
     }
 
     /// Service identity used for logging.
@@ -684,6 +892,18 @@ fn gcd_reduce(weights: &[u16]) -> Vec<u16> {
 
 fn gcd(a: u16, b: u16) -> u16 {
     if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// Rendezvous (HRW) score for a `(key, endpoint-token)` pair.
+///
+/// Combines the two with a SplitMix64 finalizer so the ordering of scores is well
+/// distributed (a plain XOR would bias toward tokens that share high bits with the
+/// key). The endpoint with the maximum score owns the key.
+fn rendezvous_score(key_hash: u64, token: u64) -> u64 {
+    let mut z = key_hash ^ token.rotate_left(32);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// How a path rule was registered — for introspection only.
@@ -1282,5 +1502,116 @@ mod tests {
         let group = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a], 1)]);
         let (_addr, filters) = group.next_endpoint_with_filters().unwrap();
         assert!(filters.is_none());
+    }
+
+    // ── Session affinity ──────────────────────────────────────────────────────────
+
+    fn cookie_group(addrs: &[&str]) -> BackendGroup {
+        let parsed: Vec<SocketAddr> = addrs.iter().map(|a| a.parse().unwrap()).collect();
+        BackendGroup::new("ns/svc".to_string(), parsed).with_session_affinity(Some(
+            SessionAffinity::Cookie {
+                cookie_name: Arc::from("__coxswain_session"),
+            },
+        ))
+    }
+
+    #[test]
+    fn affinity_token_is_deterministic_and_distinct_per_endpoint() {
+        let a: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:80".parse().unwrap();
+        // Stable across calls (the cookie must survive a process restart / rebuild).
+        assert_eq!(affinity_token(a), affinity_token(a));
+        // Distinct endpoints get distinct tokens (port/IP both fold in).
+        assert_ne!(affinity_token(a), affinity_token(b));
+        let a_alt_port: SocketAddr = "10.0.0.1:81".parse().unwrap();
+        assert_ne!(affinity_token(a), affinity_token(a_alt_port));
+    }
+
+    #[test]
+    fn endpoint_by_token_pins_to_the_matching_endpoint() {
+        let group = cookie_group(&["10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80"]);
+        let target: SocketAddr = "10.0.0.2:80".parse().unwrap();
+        let (addr, _) = group
+            .endpoint_by_token(affinity_token(target))
+            .expect("token of a live endpoint must resolve");
+        assert_eq!(addr, target);
+    }
+
+    #[test]
+    fn endpoint_by_token_misses_when_pinned_pod_removed() {
+        // A token for an endpoint that is no longer pooled (scaled away) must miss so
+        // the proxy can fall back to round-robin and re-establish affinity.
+        let group = cookie_group(&["10.0.0.1:80", "10.0.0.2:80"]);
+        let gone: SocketAddr = "10.0.0.9:80".parse().unwrap();
+        assert!(group.endpoint_by_token(affinity_token(gone)).is_none());
+    }
+
+    #[test]
+    fn endpoint_by_token_is_none_without_affinity() {
+        let group = BackendGroup::new("ns/svc".to_string(), vec!["10.0.0.1:80".parse().unwrap()]);
+        assert!(group.session_affinity().is_none());
+        assert!(group.endpoint_by_token(0).is_none());
+    }
+
+    #[test]
+    fn endpoint_by_hash_is_stable_and_minimally_disrupted_on_removal() {
+        let header_group = |addrs: &[&str]| {
+            let parsed: Vec<SocketAddr> = addrs.iter().map(|a| a.parse().unwrap()).collect();
+            BackendGroup::new("ns/svc".to_string(), parsed).with_session_affinity(Some(
+                SessionAffinity::Header {
+                    header: HeaderName::from_static("x-session-id"),
+                },
+            ))
+        };
+        let full = header_group(&["10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80"]);
+        // Same key → same endpoint across repeated lookups (consistent selection).
+        let key = 0x1234_5678_9abc_def0u64;
+        let first = full.endpoint_by_hash(key).unwrap().0;
+        assert_eq!(full.endpoint_by_hash(key).unwrap().0, first);
+
+        // Rendezvous hashing: keys whose owner is still present keep their owner when
+        // an *unrelated* endpoint is removed. Find a key owned by .1, then drop .3.
+        let owner_one: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let reduced = header_group(&["10.0.0.1:80", "10.0.0.2:80"]);
+        let mut checked = 0;
+        for k in 0..2_000u64 {
+            if full.endpoint_by_hash(k).unwrap().0 == owner_one {
+                assert_eq!(
+                    reduced.endpoint_by_hash(k).unwrap().0,
+                    owner_one,
+                    "removing an unrelated endpoint must not re-map key {k} away from .1"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "expected some keys to be owned by .1");
+    }
+
+    #[test]
+    fn affinity_lookup_recovers_per_backend_filters() {
+        let a: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let b: SocketAddr = "10.0.1.1:80".parse().unwrap();
+        let filter = FilterAction::RequestHeaderModifier(HeaderMod {
+            add: vec![],
+            set: vec![(
+                HeaderName::from_static("x-backend"),
+                HeaderValue::from_static("b"),
+            )],
+            remove: vec![],
+        });
+        // Two weighted backends; only the second carries a per-backend filter.
+        let group = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a], 1), (vec![b], 1)])
+            .with_per_backend_filters(vec![vec![], vec![filter]])
+            .with_session_affinity(Some(SessionAffinity::Cookie {
+                cookie_name: Arc::from("__coxswain_session"),
+            }));
+        // Pinning to `b` must surface b's filter; pinning to `a` must surface none.
+        let (_, b_filters) = group.endpoint_by_token(affinity_token(b)).unwrap();
+        assert!(
+            b_filters.is_some(),
+            "endpoint b carries a per-backend filter"
+        );
+        let (_, a_filters) = group.endpoint_by_token(affinity_token(a)).unwrap();
+        assert!(a_filters.is_none(), "endpoint a has no per-backend filter");
     }
 }

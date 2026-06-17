@@ -22,6 +22,7 @@
 //! TLS-path allocations (once per upstream connection, not per request), and
 //! cleartext upstream connections skip them entirely.
 
+use super::affinity;
 use super::ctx::{CONN_INFO, ProxyCtx, ResolvedRoute};
 use super::engine::RoutingEngine;
 use super::filter::TrafficFilter;
@@ -31,7 +32,7 @@ use crate::config::AccessLogPathMode;
 use crate::upstream_ca::UpstreamCaCache;
 use bytes::Bytes;
 use coxswain_cache::ResponseCache;
-use coxswain_core::routing::{RequestContext, RetryOn, RouteTimeouts, UpstreamCa};
+use coxswain_core::routing::{RequestContext, RetryOn, RouteTimeouts, SessionAffinity, UpstreamCa};
 use pingora_cache::key::{CacheKey, HashBinary};
 use pingora_cache::{CacheMeta, NoCacheReason, RespCacheable, VarianceBuilder};
 use pingora_core::upstreams::peer::HttpPeer;
@@ -64,6 +65,8 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             last_retry_condition: None,
             max_body_size: None,
             body_bytes_seen: 0,
+            affinity_pin: None,
+            affinity_set_cookie: false,
         })
         .unwrap_or_default()
 }
@@ -180,6 +183,15 @@ pub(crate) async fn request_filter<K>(
             "request body exceeds max-body-size",
         ));
     }
+
+    // Per-route session affinity (ingress.coxswain-labs.dev/session-*). Resolve the
+    // pin from the request's cookie/header against the matched group's affinity index
+    // now, while the request headers are in hand; `upstream_peer` honors it and
+    // `upstream_response_filter` issues the cookie. No-op (and no allocation) for
+    // groups without affinity configured.
+    let affinity = affinity::resolve(session.req_header(), &m.backend_group);
+    ctx.affinity_pin = affinity.pin;
+    ctx.affinity_set_cookie = affinity.set_cookie;
 
     ctx.resolved = Some(ResolvedRoute {
         backend_group: m.backend_group,
@@ -406,12 +418,22 @@ pub(crate) async fn upstream_peer(
         ));
     }
 
-    let (addr, per_backend_filters) = resolved
-        .backend_group
-        .next_endpoint_with_filters()
-        .ok_or_else(|| {
-            pingora_core::Error::explain(HTTPStatus(503), "no active endpoints for backend group")
-        })?;
+    // Session affinity: honor a pin resolved in `request_filter` (a live cookie/header
+    // match), recovering that endpoint's per-backend filters; otherwise take a weighted
+    // round-robin tick. A stale pin never reaches here — it resolves to `None` and
+    // re-establishes via round-robin + a fresh cookie.
+    let (addr, per_backend_filters) = match ctx.affinity_pin {
+        Some(pinned) => (pinned, resolved.backend_group.filters_for_endpoint(pinned)),
+        None => resolved
+            .backend_group
+            .next_endpoint_with_filters()
+            .ok_or_else(|| {
+                pingora_core::Error::explain(
+                    HTTPStatus(503),
+                    "no active endpoints for backend group",
+                )
+            })?,
+    };
     ctx.selected_backend_filters = per_backend_filters;
     ctx.upstream_addr = Some(addr);
 
@@ -585,6 +607,20 @@ pub(crate) async fn upstream_response_filter(
     if let Some(resolved) = &ctx.resolved {
         TrafficFilter::apply_response_filters(upstream_response, &resolved.filters);
     }
+
+    // Session affinity (cookie mode): when a fresh pin was established this request,
+    // stamp the affinity cookie so the client returns to the same endpoint. Skipped
+    // entirely for header mode and for requests that already carried a valid cookie.
+    if ctx.affinity_set_cookie
+        && let Some(addr) = ctx.upstream_addr
+        && let Some(SessionAffinity::Cookie { cookie_name }) = ctx
+            .resolved
+            .as_ref()
+            .and_then(|r| r.backend_group.session_affinity())
+    {
+        affinity::inject_set_cookie(upstream_response, cookie_name, addr)?;
+    }
+
     let status = upstream_response.status.as_u16();
     if status >= 500 {
         inc_upstream_error(ctx, "5xx");

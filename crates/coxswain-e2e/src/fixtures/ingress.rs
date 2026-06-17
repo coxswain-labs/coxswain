@@ -98,6 +98,20 @@ pub const ANNOTATION_ALLOW_SOURCE_RANGE: &str = fixture!("annotation_allow_sourc
 /// requests, and honors the admin purge endpoint. Supply `CACHE_CONTROL` via
 /// `FixtureVars::with`.
 pub const ANNOTATION_CACHE_ENABLED: &str = fixture!("annotation_cache_enabled.yaml");
+/// Cookie-mode session affinity (#15): a 3-pod `echo-aff` Service plus an Ingress
+/// carrying `session-affinity: cookie` and a custom `session-cookie-name`
+/// (`SESSIONID`). The proxy injects the cookie on the first response and pins
+/// subsequent requests bearing it to the same pod; a stale cookie re-establishes.
+pub const ANNOTATION_SESSION_AFFINITY_COOKIE: &str =
+    fixture!("annotation_session_affinity_cookie.yaml");
+/// Header-mode session affinity (#15): a 3-pod `echo-aff` Service plus an Ingress
+/// carrying `session-affinity: header` and `session-header: X-Session-Id`. The
+/// header value is rendezvous-hashed to one pod; an absent header round-robins.
+pub const ANNOTATION_SESSION_AFFINITY_HEADER: &str =
+    fixture!("annotation_session_affinity_header.yaml");
+/// Baseline for #15: the same 3-pod `echo-aff` Service with NO session-affinity
+/// annotation — proves the default path stays plain round-robin.
+pub const SESSION_AFFINITY_NONE: &str = fixture!("session_affinity_none.yaml");
 /// Per-class annotation defaults via `IngressClass.spec.parameters` (#190): a
 /// `CoxswainIngressClassParameters` CR sets a default `rewrite-target`, one
 /// Ingress inherits it and a second overrides it per-key. The IngressClass is
