@@ -1,5 +1,5 @@
 use coxswain_core::crd::RateLimit;
-use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use kube::api::ObjectMeta;
 use kube::runtime::{reflector, watcher};
@@ -53,6 +53,10 @@ pub(crate) fn empty_svc_store() -> reflector::Store<Service> {
 
 pub(crate) fn empty_rate_limit_store() -> reflector::Store<RateLimit> {
     reflector::store::Writer::<RateLimit>::default().as_reader()
+}
+
+pub(crate) fn empty_secret_store() -> reflector::Store<Secret> {
+    reflector::store::Writer::<Secret>::default().as_reader()
 }
 
 pub(crate) fn make_svc_store(services: Vec<Service>) -> reflector::Store<Service> {

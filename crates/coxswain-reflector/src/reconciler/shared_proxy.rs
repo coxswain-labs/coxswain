@@ -454,6 +454,11 @@ pub(super) struct ReflectorStores<'a> {
     pub(super) services: &'a reflector::Store<Service>,
     pub(super) grants: &'a reflector::Store<ReferenceGrant>,
     pub(super) secrets: &'a reflector::Store<Secret>,
+    /// Label-scoped htpasswd Secrets (`ingress.coxswain-labs.dev/auth-basic=true`) used
+    /// by the `auth-basic-secret` Ingress annotation (#24).  Separate from `secrets`
+    /// (which watches TLS secrets) to bound memory — Opaque Secrets are not filtered
+    /// by type, only by label.  Fail-closed: absent/unlabeled → 503 on the route.
+    pub(super) auth_secrets: &'a reflector::Store<Secret>,
     /// `BackendTLSPolicy` resources in scope (namespaced per `watch_namespace`).
     pub(super) policies: &'a reflector::Store<BackendTlsPolicy>,
     /// All ConfigMaps in scope — used to resolve `caCertificateRefs`.
@@ -726,6 +731,7 @@ async fn spawn_tasks(
     let (slice_reader, slice_writer) = reflector::store::<EndpointSlice>();
     let (grant_reader, grant_writer) = reflector::store::<ReferenceGrant>();
     let (secret_reader, secret_writer) = reflector::store::<Secret>();
+    let (auth_secret_reader, auth_secret_writer) = reflector::store::<Secret>();
     let (service_reader, service_writer) = reflector::store::<Service>();
     let (policy_reader, policy_writer) = reader_writer::<BackendTlsPolicy>(pre_policies);
     let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
@@ -815,6 +821,17 @@ async fn spawn_tasks(
         watcher::Config::default().fields("type=kubernetes.io/tls"),
         ReflectorEffects::new(&notify, &controller_health, "secret", metrics),
         "Secret",
+    );
+    // Label-scoped to `ingress.coxswain-labs.dev/auth-basic=true` — only opt-in
+    // htpasswd Secrets are cached.  Keeps the data-plane proxy's memory footprint
+    // bounded: Opaque Secrets without this label are never loaded (#24).
+    spawn_reflector(
+        &mut set,
+        auth_secret_writer,
+        scoped_api::<Secret>(client.clone(), ns),
+        watcher::Config::default().labels("ingress.coxswain-labs.dev/auth-basic=true"),
+        ReflectorEffects::new(&notify, &controller_health, "auth_secret", metrics),
+        "AuthSecret",
     );
     // Used to resolve targetPort for backends where servicePort ≠ targetPort.
     spawn_reflector(
@@ -908,6 +925,7 @@ async fn spawn_tasks(
                 services: &service_reader,
                 grants: &grant_reader,
                 secrets: &secret_reader,
+                auth_secrets: &auth_secret_reader,
                 policies: &policy_reader,
                 configmaps: &configmap_reader,
                 rate_limits: &rate_limit_reader,
@@ -1312,6 +1330,7 @@ fn build_ingress_routes(
             &class_ctx,
             ingress_ports,
             &mut builder,
+            stores.auth_secrets,
         );
     }
 

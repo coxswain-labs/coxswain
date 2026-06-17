@@ -5,7 +5,7 @@
 //! - [`traffic_policy`] — timeout, retry, and backend-protocol annotations.
 //! - [`routing`] — path rewrite and regex opt-in annotations.
 //! - [`filters`] — request/response header modifiers, redirect, and ssl-redirect annotations.
-//! - [`security`] — edge access control (source-IP allow-list, rate limiting).
+//! - [`security`] — edge access control (source-IP allow-list, rate limiting, auth).
 //! - [`caching`] — RFC 7234 response-cache opt-in.
 //! - [`session`] — sticky-session (session-affinity) binding.
 //!
@@ -21,7 +21,7 @@
 mod caching;
 mod filters;
 mod routing;
-mod security;
+pub(crate) mod security;
 mod session;
 mod traffic_policy;
 
@@ -36,6 +36,7 @@ use coxswain_core::routing::{
     BackendProtocol, FilterAction, HeaderMod, PathModifier, RateLimitConfig, RetryPolicy,
     RouteTimeouts, SessionAffinity,
 };
+use security::AuthAnnotation;
 use std::collections::BTreeMap;
 
 // ── Annotation-namespace prefix ──────────────────────────────────────────────
@@ -126,6 +127,12 @@ pub(super) struct IngressAnnotations {
     /// `None` (the default, or when `rate-limit-rps` is absent/invalid) disables
     /// rate limiting for the route (fail-open).
     pub rate_limit: Option<RateLimitConfig>,
+    /// Auth configuration from the `auth-*` annotations (#24), in intermediate
+    /// (pre-resolved) form.  `None` when neither `auth-url` nor
+    /// `auth-basic-secret` is present.  The reconciler resolves `Basic(SecretRef)`
+    /// into [`IngressAuthConfig`][coxswain_core::routing::IngressAuthConfig] by
+    /// looking up the labeled htpasswd Secret.
+    pub auth: Option<AuthAnnotation>,
 }
 
 impl IngressAnnotations {
@@ -393,6 +400,9 @@ impl IngressAnnotations {
             route_id,
         );
 
+        // ── External / basic auth (#24) ───────────────────────────────────────
+        let auth = security::parse_auth(ann, route_id);
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -415,6 +425,7 @@ impl IngressAnnotations {
             cache_enabled,
             session_affinity,
             rate_limit,
+            auth,
         }
     }
 }

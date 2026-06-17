@@ -11,7 +11,9 @@ pub(super) use kube::api::ObjectMeta;
 pub(super) use kube::runtime::reflector;
 pub(super) use std::collections::{BTreeMap, HashMap, HashSet};
 
-pub(super) use crate::tests::fixtures::{empty_svc_store, make_slice, make_svc_store, slice_store};
+pub(super) use crate::tests::fixtures::{
+    empty_secret_store, empty_svc_store, make_slice, make_svc_store, slice_store,
+};
 
 pub(super) fn owned(names: &[&str]) -> HashSet<String> {
     names.iter().map(|s| s.to_string()).collect()
@@ -32,6 +34,7 @@ pub(super) fn reconcile_no_default(
         &IngressClassContext::new(owned, None, &no_class_defaults),
         IngressPorts::new(Some(80), None),
         b,
+        &empty_secret_store(),
     );
 }
 
@@ -52,6 +55,7 @@ pub(super) fn reconcile_with_class_defaults(
         &IngressClassContext::new(owned, None, defaults),
         IngressPorts::new(Some(80), None),
         b,
+        &empty_secret_store(),
     );
 }
 
