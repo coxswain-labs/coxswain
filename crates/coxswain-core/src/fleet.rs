@@ -123,8 +123,13 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
     let mut snapshot = FleetSnapshot::default();
 
     for pod in pods {
-        let pod_name = pod.metadata.name.clone().unwrap_or_default();
-        let pod_namespace = pod.metadata.namespace.clone().unwrap_or_default();
+        let pod_name = pod.metadata.name.as_deref().unwrap_or_default().to_owned();
+        let pod_namespace = pod
+            .metadata
+            .namespace
+            .as_deref()
+            .unwrap_or_default()
+            .to_owned();
 
         // Skip pods that haven't been assigned an IP yet.
         let pod_ip_str = match pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()) {

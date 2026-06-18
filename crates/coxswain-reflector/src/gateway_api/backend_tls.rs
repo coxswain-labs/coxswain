@@ -156,10 +156,8 @@ pub fn build_backend_tls_index(
         // plain HTTP) AND must surface as `Accepted=False/NoValidCACertificate` +
         // `ResolvedRefs=False/<specific-reason>` on the policy itself.
         let sni: Arc<str> = Arc::from(winner.spec.validation.hostname.as_str());
-        let (ca_opt, ref_reason) = resolve_ca(policy_ns, &winner.spec.validation, configmaps);
-
-        match ca_opt {
-            Some(ca) => {
+        match resolve_ca(policy_ns, &winner.spec.validation, configmaps) {
+            Ok(ca) => {
                 let group_key = compute_group_key(&sni, &ca);
                 let tls = Arc::new(UpstreamTls::new(sni, ca, group_key));
                 index.insert(
@@ -173,7 +171,7 @@ pub fn build_backend_tls_index(
                 entry.resolved_refs = true;
                 entry.resolved_refs_reason = "ResolvedRefs";
             }
-            None => {
+            Err(ref_reason) => {
                 index.insert(
                     (svc_key.clone(), port_scope),
                     ResolvedPolicy {
@@ -207,7 +205,7 @@ pub fn compute_policy_health(
     routes: &[Arc<HttpRoute>],
     owned_gateways: &HashSet<ObjectKey>,
 ) -> BackendTlsPolicyHealthMap {
-    // Step 1: for each policy in the cluster, collect every (svc_ns, svc_name) it
+    // First, for each policy in the cluster, collect every (svc_ns, svc_name) it
     // targets. We need this for losers, since `index` only carries winners.
     let mut targets_per_policy: HashMap<ObjectKey, HashSet<ObjectKey>> = HashMap::new();
     for policy in policies.state() {
@@ -223,7 +221,7 @@ pub fn compute_policy_health(
         }
     }
 
-    // Step 2: for each route, record (Service touched → owned parent Gateways).
+    // Next, for each route, record (Service touched → owned parent Gateways).
     let mut gateways_per_service: HashMap<ObjectKey, HashSet<ObjectKey>> = HashMap::new();
     for route in routes {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -254,7 +252,7 @@ pub fn compute_policy_health(
         }
     }
 
-    // Step 3: per policy, fan out its targets to their parent Gateways.
+    // Finally, per policy, fan out its targets to their parent Gateways.
     let mut ancestors_per_policy: HashMap<ObjectKey, HashSet<ObjectKey>> = HashMap::new();
     for (policy_key, targets) in &targets_per_policy {
         for svc_key in targets {
@@ -293,13 +291,13 @@ fn is_service_ref(target: &BackendTlsPolicyTargetRefs) -> bool {
 
 /// Resolve the CA source from `validation`.
 ///
-/// Returns `(Some(UpstreamCa), reason)` on success, or `(None, reason)` when the
+/// Returns `Ok(UpstreamCa)` on success, or `Err(reason)` when the
 /// reference cannot be resolved and the policy should be skipped.
 fn resolve_ca(
     policy_ns: &str,
     validation: &crate::gw_types::backendtlspolicies::BackendTlsPolicyValidation,
     configmaps: &reflector::Store<ConfigMap>,
-) -> (Option<UpstreamCa>, &'static str) {
+) -> Result<UpstreamCa, &'static str> {
     if let Some(refs) = validation.ca_certificate_refs.as_deref()
         && !refs.is_empty()
     {
@@ -308,14 +306,14 @@ fn resolve_ca(
 
     if let Some(wk) = validation.well_known_ca_certificates.as_deref() {
         if wk == "System" {
-            return (Some(UpstreamCa::System), "ResolvedRefs");
+            return Ok(UpstreamCa::System);
         }
         tracing::warn!(
             ns = policy_ns,
             value = wk,
             "BackendTLSPolicy wellKnownCACertificates value unrecognised — policy skipped"
         );
-        return (None, "ResolvedRefs");
+        return Err("ResolvedRefs");
     }
 
     // Neither caCertificateRefs nor wellKnownCACertificates — invalid policy.
@@ -323,7 +321,7 @@ fn resolve_ca(
         ns = policy_ns,
         "BackendTLSPolicy has neither caCertificateRefs nor wellKnownCACertificates — skipped"
     );
-    (None, "ResolvedRefs")
+    Err("ResolvedRefs")
 }
 
 /// Resolve a single `caCertificateRef` to raw PEM bytes.
@@ -331,7 +329,7 @@ fn resolve_ca_from_ref(
     policy_ns: &str,
     ca_ref: &BackendTlsPolicyValidationCaCertificateRefs,
     configmaps: &reflector::Store<ConfigMap>,
-) -> (Option<UpstreamCa>, &'static str) {
+) -> Result<UpstreamCa, &'static str> {
     // Only core/ConfigMap is supported (spec § Core support).
     let kind = ca_ref.kind.as_str();
     let group = ca_ref.group.as_str();
@@ -342,7 +340,7 @@ fn resolve_ca_from_ref(
             group,
             "BackendTLSPolicy caCertificateRef kind not supported (only core/ConfigMap) — skipped"
         );
-        return (None, "InvalidKind");
+        return Err("InvalidKind");
     }
 
     // Cross-namespace refs are not permitted by the spec for BackendTLSPolicy.
@@ -353,7 +351,7 @@ fn resolve_ca_from_ref(
             name = %ca_ref.name,
             "BackendTLSPolicy caCertificateRef ConfigMap not found — skipped"
         );
-        return (None, "InvalidCACertificateRef");
+        return Err("InvalidCACertificateRef");
     };
 
     let pem_bytes = cm
@@ -368,7 +366,7 @@ fn resolve_ca_from_ref(
             name = %ca_ref.name,
             "BackendTLSPolicy caCertificateRef ConfigMap missing 'ca.crt' key — skipped"
         );
-        return (None, "InvalidCACertificateRef");
+        return Err("InvalidCACertificateRef");
     };
 
     // Lightweight pre-validation: the bytes must contain a PEM header. Full X.509
@@ -380,10 +378,10 @@ fn resolve_ca_from_ref(
             name = %ca_ref.name,
             "BackendTLSPolicy caCertificateRef 'ca.crt' does not look like PEM — skipped"
         );
-        return (None, "InvalidCACertificateRef");
+        return Err("InvalidCACertificateRef");
     }
 
-    (Some(UpstreamCa::Bundle(Arc::from(pem))), "ResolvedRefs")
+    Ok(UpstreamCa::Bundle(Arc::from(pem)))
 }
 
 /// Compute a stable `u64` pool-isolation key from SNI and CA content.

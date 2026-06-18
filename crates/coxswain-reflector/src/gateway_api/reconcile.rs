@@ -524,19 +524,24 @@ fn pick_backend_tls(
     // applied to this specific port), then fall back to (svc, None) (catch-all
     // policy covering the whole Service). This matches the GEP-1897 spec where
     // section-name policies override the catch-all for their specific port.
-    let lookup = |svc_key: &ObjectKey, port: u16| -> Option<&ResolvedPolicy> {
+    let lookup = |svc_ns: &str, svc_name: &str, port: u16| -> Option<&ResolvedPolicy> {
         policy_index
-            .get(&(svc_key.clone(), Some(port)))
-            .or_else(|| policy_index.get(&(svc_key.clone(), None)))
+            .iter()
+            .find(|((k, p), _)| k.ns == svc_ns && k.name == svc_name && *p == Some(port))
+            .or_else(|| {
+                policy_index
+                    .iter()
+                    .find(|((k, p), _)| k.ns == svc_ns && k.name == svc_name && p.is_none())
+            })
+            .map(|(_, v)| v)
     };
 
     for b in backend_refs {
         let b_ns = b.namespace.as_deref().unwrap_or(route_ns);
-        let svc_key = ObjectKey::new(b_ns, &b.name);
         let Some(port) = b.port.and_then(|p| u16::try_from(p).ok()) else {
             continue;
         };
-        let Some(resolved) = lookup(&svc_key, port) else {
+        let Some(resolved) = lookup(b_ns, &b.name, port) else {
             continue;
         };
         let Some(tls) = resolved.tls.as_ref() else {
@@ -576,9 +581,8 @@ fn pick_backend_tls(
             .iter()
             .filter_map(|b| {
                 let b_ns = b.namespace.as_deref().unwrap_or(route_ns);
-                let svc_key = ObjectKey::new(b_ns, &b.name);
                 let port = b.port.and_then(|p| u16::try_from(p).ok())?;
-                lookup(&svc_key, port)
+                lookup(b_ns, &b.name, port)
             })
             .map(|r| &r.policy_key)
             .collect::<HashSet<_>>()

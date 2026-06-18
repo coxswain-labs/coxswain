@@ -23,10 +23,11 @@ use coxswain_core::routing::{RateLimitConfig, RateLimitKey};
 use governor::clock::{Clock, DefaultClock};
 use governor::state::keyed::DashMapStateStore;
 use governor::{Quota, RateLimiter};
-use std::collections::HashMap;
+
+use dashmap::DashMap;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// The per-client dimension used as the governor `DashMapStateStore` key.
 ///
@@ -66,7 +67,7 @@ struct RouteLimiterEntry {
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct RateLimiterRegistry {
-    inner: Arc<Mutex<HashMap<Arc<str>, RouteLimiterEntry>>>,
+    inner: Arc<DashMap<Arc<str>, RouteLimiterEntry>>,
     clock: DefaultClock,
 }
 
@@ -75,7 +76,7 @@ impl RateLimiterRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(DashMap::new()),
             clock: DefaultClock::default(),
         }
     }
@@ -117,10 +118,7 @@ impl RateLimiterRegistry {
     /// removed from the registry entirely. Call this from a periodic background
     /// service (~60 s interval) to bound memory growth.
     pub fn sweep(&self) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| {
-            panic!("invariant: RateLimiterRegistry mutex must not be poisoned: {e}")
-        });
-        guard.retain(|_, entry| {
+        self.inner.retain(|_, entry| {
             entry.limiter.retain_recent();
             !entry.limiter.is_empty()
         });
@@ -129,15 +127,13 @@ impl RateLimiterRegistry {
     /// Get the live limiter for `route_id`, rebuilding it when `config` has
     /// changed since last use.
     fn get_or_build(&self, route_id: &Arc<str>, config: &RateLimitConfig) -> Arc<KeyedLimiter> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| {
-            panic!("invariant: RateLimiterRegistry mutex must not be poisoned: {e}")
-        });
-        let entry = guard
-            .entry(Arc::clone(route_id))
-            .or_insert_with(|| RouteLimiterEntry {
-                config: config.clone(),
-                limiter: Arc::new(build_limiter(config)),
-            });
+        let mut entry =
+            self.inner
+                .entry(Arc::clone(route_id))
+                .or_insert_with(|| RouteLimiterEntry {
+                    config: config.clone(),
+                    limiter: Arc::new(build_limiter(config)),
+                });
         if &entry.config != config {
             entry.config = config.clone();
             entry.limiter = Arc::new(build_limiter(config));

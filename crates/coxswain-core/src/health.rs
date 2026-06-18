@@ -255,7 +255,7 @@ impl HealthRegistry {
             SEV_PENDING
         };
         let inner = Arc::new(SubsystemInner {
-            name: name_arc.clone(),
+            name: Arc::clone(&name_arc),
             checks: Mutex::new(check_map),
             aggregate_severity: AtomicU8::new(initial_severity),
         });
