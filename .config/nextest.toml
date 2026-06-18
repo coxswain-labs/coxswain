@@ -68,6 +68,7 @@ default-filter = '''
     | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
   )
   and not binary(resilience)
+  and not binary(status_conditions)
 '''
 
 # 3 concurrent tests against the shared cluster. With per-test namespace cleanup
@@ -96,6 +97,7 @@ default-filter = '''
   | test(=status_reports_load_balancer_ip)
   | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
   | binary(resilience)
+  | binary(status_conditions)
 '''
 
 test-threads = 1
