@@ -43,6 +43,13 @@ use coxswain_cache::ResponseCache;
 use coxswain_proxy::AccessLogPathMode;
 
 fn main() -> Result<()> {
+    // reqwest is compiled with `rustls-no-provider`; install ring explicitly so
+    // the ext_authz sub-request client can be constructed (rustls 0.23 requires
+    // a crypto provider before any TLS object is created).
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     let cli = Cli::parse();
     let Commands::Serve(serve) = cli.command;
 
@@ -212,9 +219,11 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
             "endpoint_slice",
             "reference_grant",
             "secret",
+            "auth_secret",
             "service",
             "backend_tls_policy",
             "config_map",
+            "rate_limit",
             "routing_table_built",
         ],
     );
@@ -339,6 +348,7 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
             "service",
             "backend_tls_policy",
             "config_map",
+            "rate_limit",
             "routing_table_built",
         ],
     );

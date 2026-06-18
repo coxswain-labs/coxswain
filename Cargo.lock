@@ -687,6 +687,7 @@ dependencies = [
  "pingora-core",
  "pingora-proxy",
  "reqwest",
+ "rustls",
  "tokio",
  "tracing",
  "tracing-subscriber",

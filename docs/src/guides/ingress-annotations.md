@@ -487,7 +487,7 @@ metadata:
 
 ### `auth-timeout`
 
-Maximum time to wait for the auth sub-request to respond. Accepts any [duration string](timeouts.md) (e.g. `"500ms"`, `"5s"`). Default: `2s`. On timeout the proxy returns **503** (fail-closed).
+Maximum time to wait for the auth sub-request to respond. Accepts any duration string (e.g. `"500ms"`, `"5s"`). Default: `2s`. On timeout the proxy returns **503** (fail-closed).
 
 ### `auth-response-headers`
 
