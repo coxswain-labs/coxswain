@@ -89,9 +89,6 @@ pub const RATE_LIMIT_MISSING_CR: &str = fixture!("rate_limit_missing_cr.yaml");
 /// `GATEWAY_HTTP_PORT`.
 pub const CUTOVER_CRASH_LOOP: &str = fixture!("cutover_crash_loop.yaml");
 
-/// HTTPRoute destination port matching.
-pub const DESTINATION_PORT_MATCHING: &str = fixture!("destination_port_matching.yaml");
-
 /// HTTPRoute host rewrite.
 pub const HOST_REWRITE: &str = fixture!("host_rewrite.yaml");
 

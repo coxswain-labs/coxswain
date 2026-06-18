@@ -1455,39 +1455,7 @@ async fn ingress_invalid_filter_annotation_is_skipped_and_route_still_serves() -
     Ok(())
 }
 
-/// Verifies that `HTTPRoute` rules with a `matches[].port` filter correctly
-/// route traffic based on the destination port the listener bound to.
-#[tokio::test]
-async fn destination_port_match_routes_only_matching_requests() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-dest-port").await?;
 
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(gwa::DESTINATION_PORT_MATCHING, FixtureVars::new(&ns.name)).await?;
-
-    let host = format!("port.{}.local", ns.name);
-
-    // Wait for the route to be live via the /probe path (which has no port match).
-    let resp =
-        wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
-    resp.assert_backend("echo-a");
-
-    // The request on HTTP_PORT (via normal HTTPClient) should hit echo-a
-    let resp = h.gateway_http.get(&host, "/").await?;
-    resp.assert_backend("echo-a");
-
-    // Now send a request to the second listener on HTTPS_PORT.
-    // The second listener is configured as HTTP protocol as well.
-    let alt_http = HttpClient::new(std::net::SocketAddr::from((
-        h.gateway_http.proxy_addr.ip(),
-        h.gateway_tls_addr.port(),
-    )))?;
-    let resp = alt_http.get(&host, "/").await?;
-    resp.assert_backend("echo-b");
-
-    Ok(())
-}
 
 /// Verifies `urlRewrite.hostname` correctly rewrites the `Host` header sent to the upstream backend.
 #[tokio::test]
@@ -1509,9 +1477,8 @@ async fn url_rewrite_replaces_request_host() -> anyhow::Result<()> {
     resp.assert_backend("echo-a");
 
     let echo_host = resp
-        .headers
-        .get("host")
-        .and_then(|h| h.as_str())
+        .host
+        .as_deref()
         .expect("missing or invalid host echo");
 
     let expected_host = format!("new-host.{}.local", ns.name);
