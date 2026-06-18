@@ -35,3 +35,15 @@ pub const ECHO_TLS_DUAL_PORT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/backends/echo_tls_dual_port.yaml"
 );
+
+/// Auth-stub deployment pair used by ext_authz e2e tests (#24).
+///
+/// Creates two Services in the test namespace:
+///   - `auth-allow` (port 4000) — always returns 200 + `X-Auth-User: testuser`.
+///   - `auth-deny` (port 4001) — always returns 403 + `Set-Cookie: session=test123`.
+///
+/// Both use a busybox nc loop (one connection per invocation).
+pub const AUTH_STUB: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/auth_stub.yaml"
+);

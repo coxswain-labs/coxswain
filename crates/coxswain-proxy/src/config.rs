@@ -4,6 +4,63 @@
 //! `coxswain-bin`) and stored on the proxy instances. They are intentionally
 //! independent of the bin crate so the proxy crate remains self-contained.
 
+use crate::rate_limit::RateLimiterRegistry;
+use crate::upstream_ca::UpstreamCaCache;
+use coxswain_cache::ResponseCache;
+use coxswain_core::routing::RouteTimeouts;
+use std::sync::Arc;
+
+/// Startup-time collaborators shared between both proxy types.
+///
+/// Passed to [`crate::IngressProxy::new`] and [`crate::GatewayProxy::new`] as a
+/// single struct so the constructors stay within the 7-argument clippy budget
+/// while the engine (which is typed differently per proxy) remains a separate
+/// argument.  All fields are low-cost to clone: `Arc<T>` pointer bumps,
+/// `Copy` values, or internally reference-counted types.
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct SharedProxyConfig {
+    /// Global fallback timeouts applied when a matched route has no per-rule
+    /// timeouts set.
+    pub default_timeouts: RouteTimeouts,
+    /// Parse cache for upstream CA bundles from `BackendTLSPolicy` attachments.
+    pub ca_cache: Arc<UpstreamCaCache>,
+    /// Whether to emit one access-log event per request.
+    pub access_log_enabled: bool,
+    /// Controls what the access log emits for the `path` field.
+    pub access_log_path_mode: AccessLogPathMode,
+    /// Shared response cache, or `None` when caching is disabled process-wide.
+    pub cache: Option<ResponseCache>,
+    /// Shared per-process rate-limiter registry.
+    pub rate_limiter: RateLimiterRegistry,
+    /// Shared HTTP client for ext_authz sub-requests (#24).
+    pub auth_client: reqwest::Client,
+}
+
+impl SharedProxyConfig {
+    /// Construct a `SharedProxyConfig` from its collaborators.
+    #[must_use]
+    pub fn new(
+        default_timeouts: RouteTimeouts,
+        ca_cache: Arc<UpstreamCaCache>,
+        access_log_enabled: bool,
+        access_log_path_mode: AccessLogPathMode,
+        cache: Option<ResponseCache>,
+        rate_limiter: RateLimiterRegistry,
+        auth_client: reqwest::Client,
+    ) -> Self {
+        Self {
+            default_timeouts,
+            ca_cache,
+            access_log_enabled,
+            access_log_path_mode,
+            cache,
+            rate_limiter,
+            auth_client,
+        }
+    }
+}
+
 /// Controls what the access log emits for the `path` field.
 ///
 /// The architecturally correct home for PII scrubbing is the log-collection

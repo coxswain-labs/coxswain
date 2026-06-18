@@ -70,6 +70,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             body_bytes_seen: 0,
             affinity_pin: None,
             affinity_set_cookie: false,
+            auth_response_headers: None,
         })
         .unwrap_or_default()
 }
@@ -88,6 +89,7 @@ pub(crate) async fn request_filter<K>(
     engine: &RoutingEngine<K>,
     default_timeouts: &RouteTimeouts,
     rate_limiter: &crate::rate_limit::RateLimiterRegistry,
+    auth_client: &reqwest::Client,
     session: &mut Session,
     ctx: &mut ProxyCtx,
 ) -> Result<bool> {
@@ -195,6 +197,17 @@ pub(crate) async fn request_filter<K>(
                 return Ok(true);
             }
         }
+    }
+
+    // Per-route authentication (#24). Runs after rate-limit (denied clients
+    // do not consume an auth-service round-trip) and before redirect (an
+    // unauthenticated client must not receive a redirect leaking the canonical
+    // URL). Both ext_authz and basic-auth write a response and return Ok(true)
+    // on denial so the caller short-circuits to the client response.
+    if let Some(auth) = m.auth.as_deref()
+        && crate::auth::enforce(auth_client, auth, session, &mut ctx.auth_response_headers).await?
+    {
+        return Ok(true);
     }
 
     let timeouts = merge_timeouts(&m.timeouts, default_timeouts);
@@ -625,6 +638,22 @@ pub(crate) async fn upstream_request_filter(
             ctx,
         )?;
     }
+
+    // Auth-response headers injected by an ext_authz `allowed_upstream_headers`
+    // / `headersToUpstreamOnAllow` allow-list — applied last so auth-service
+    // headers cannot be overwritten by upstream header modifiers.
+    if let Some(hdrs) = ctx.auth_response_headers.take() {
+        for (name, value) in hdrs {
+            // Parse into typed `HeaderName`/`HeaderValue` — `insert_header`
+            // accepts these without a `'static` requirement.
+            if let Ok(hn) = http::HeaderName::from_bytes(name.as_bytes())
+                && let Ok(hv) = http::HeaderValue::from_str(value.as_ref())
+            {
+                let _ = upstream_request.insert_header(hn, hv);
+            }
+        }
+    }
+
     Ok(())
 }
 

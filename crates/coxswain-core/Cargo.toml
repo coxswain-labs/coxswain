@@ -25,6 +25,7 @@ smallvec             = { workspace = true }
 static_assertions    = { workspace = true }
 thiserror            = { workspace = true }
 tracing              = { workspace = true }
+zeroize              = { workspace = true }
 
 [dev-dependencies]
 criterion    = { workspace = true }

@@ -16,8 +16,8 @@ use coxswain_core::routing::{RouteTimeouts, SharedGatewayRoutingTable, SharedIng
 use coxswain_proxy::{
     DedicatedProxyReflector, DedicatedProxyReflectorConfig, GatewayProxy, IngressProxy,
     KubernetesSource, ListenerProtocol, ListenerSpec, ProxyAcceptor, ProxyReflector,
-    ProxyReflectorConfig, RateLimiterRegistry, RoutingEngine, RoutingSource, SniCertSelector,
-    TrustedSources, UpstreamCaCache, spawn_dedicated_routing_table_builder,
+    ProxyReflectorConfig, RateLimiterRegistry, RoutingEngine, RoutingSource, SharedProxyConfig,
+    SniCertSelector, TrustedSources, UpstreamCaCache, spawn_dedicated_routing_table_builder,
     spawn_routing_table_builder,
 };
 use coxswain_reflector::{GatewayListenerHealth, ListenerTlsOutcome, ReconcilerHealth};
@@ -43,6 +43,13 @@ use coxswain_cache::ResponseCache;
 use coxswain_proxy::AccessLogPathMode;
 
 fn main() -> Result<()> {
+    // reqwest is compiled with `rustls-no-provider`; install ring explicitly so
+    // the ext_authz sub-request client can be constructed (rustls 0.23 requires
+    // a crypto provider before any TLS object is created).
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     let cli = Cli::parse();
     let Commands::Serve(serve) = cli.command;
 
@@ -212,9 +219,11 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
             "endpoint_slice",
             "reference_grant",
             "secret",
+            "auth_secret",
             "service",
             "backend_tls_policy",
             "config_map",
+            "rate_limit",
             "routing_table_built",
         ],
     );
@@ -339,6 +348,7 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
             "service",
             "backend_tls_policy",
             "config_map",
+            "rate_limit",
             "routing_table_built",
         ],
     );
@@ -424,18 +434,25 @@ fn wire_gateway_only_proxy_services(
     };
     let ca_cache = Arc::new(UpstreamCaCache::new());
     let rate_limiter = RateLimiterRegistry::new();
+    // Single connection-pooling reqwest::Client shared across all requests for
+    // ext_authz sub-requests.  rustls backend — no native-tls dep.
+    let auth_client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .build()
+        .unwrap_or_else(|e| panic!("invariant: reqwest::Client construction must succeed: {e}"));
+    let cfg = SharedProxyConfig::new(
+        default_timeouts,
+        ca_cache,
+        proxy.access_log,
+        access_log_path_mode(proxy),
+        cache,
+        rate_limiter.clone(),
+        auth_client,
+    );
 
     let gateway_proxy = Arc::new(pingora_proxy::http_proxy(
         &server.configuration,
-        GatewayProxy::new(
-            Arc::new(RoutingEngine::new(source.gateway_routes())),
-            default_timeouts,
-            ca_cache,
-            proxy.access_log,
-            access_log_path_mode(proxy),
-            cache,
-            rate_limiter.clone(),
-        ),
+        GatewayProxy::new(Arc::new(RoutingEngine::new(source.gateway_routes())), cfg),
     ));
 
     // Derive the initial listener set from the current health snapshot.
@@ -546,6 +563,23 @@ fn wire_proxy_services(
     };
     let ca_cache = Arc::new(UpstreamCaCache::new());
     let rate_limiter = RateLimiterRegistry::new();
+    // Single connection-pooling reqwest::Client shared across all requests for
+    // ext_authz sub-requests.  rustls backend — no native-tls dep.
+    let auth_client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .build()
+        .unwrap_or_else(|e| panic!("invariant: reqwest::Client construction must succeed: {e}"));
+    // Shared startup-time config for both proxy types.  Clone is cheap:
+    // Arc pointer bumps + Copy/Clone values.
+    let shared_cfg = SharedProxyConfig::new(
+        default_timeouts,
+        ca_cache,
+        proxy.access_log,
+        access_log_path_mode(proxy),
+        cache,
+        rate_limiter.clone(),
+        auth_client,
+    );
 
     let ingress_specs: HashSet<ListenerSpec> =
         build_ingress_listeners(common, proxy).into_iter().collect();
@@ -569,12 +603,7 @@ fn wire_proxy_services(
                 &server.configuration,
                 IngressProxy::new(
                     Arc::new(RoutingEngine::new(source.ingress_routes())),
-                    default_timeouts.clone(),
-                    Arc::clone(&ca_cache),
-                    proxy.access_log,
-                    access_log_path_mode(proxy),
-                    cache,
-                    rate_limiter.clone(),
+                    shared_cfg.clone(),
                 ),
             ));
             let selector = SniCertSelector::new(source.tls_store());
@@ -595,12 +624,7 @@ fn wire_proxy_services(
             &server.configuration,
             GatewayProxy::new(
                 Arc::new(RoutingEngine::new(source.gateway_routes())),
-                default_timeouts,
-                ca_cache,
-                proxy.access_log,
-                access_log_path_mode(proxy),
-                cache,
-                rate_limiter.clone(),
+                shared_cfg.clone(),
             ),
         ));
         let selector = SniCertSelector::new(source.tls_store());
@@ -621,12 +645,7 @@ fn wire_proxy_services(
                 &server.configuration,
                 IngressProxy::new(
                     Arc::new(RoutingEngine::new(source.ingress_routes())),
-                    default_timeouts.clone(),
-                    Arc::clone(&ca_cache),
-                    proxy.access_log,
-                    access_log_path_mode(proxy),
-                    cache,
-                    rate_limiter.clone(),
+                    shared_cfg.clone(),
                 ),
             ));
             let selector = SniCertSelector::new(source.tls_store());
@@ -647,12 +666,7 @@ fn wire_proxy_services(
             &server.configuration,
             GatewayProxy::new(
                 Arc::new(RoutingEngine::new(source.gateway_routes())),
-                default_timeouts,
-                ca_cache,
-                proxy.access_log,
-                access_log_path_mode(proxy),
-                cache,
-                rate_limiter.clone(),
+                shared_cfg,
             ),
         ));
         let selector = SniCertSelector::new(source.tls_store());

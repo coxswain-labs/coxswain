@@ -1,0 +1,27 @@
+# ext_authz allow fixture: auth-url points at auth-allow (always 200).
+#
+# The proxy forwards the sub-request to auth-allow.TESTNS:4000, which
+# returns 200 + X-Auth-User header. The proxy allows the request and
+# forwards it to echo-a.
+#
+# Host: authextallow.TESTNS.local / -> echo-a:3000 (reached on allow).
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-ext-allow-ingress
+  annotations:
+    ingress.coxswain-labs.dev/auth-url: "http://auth-allow.${TESTNS}.svc.cluster.local:4000/"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: authextallow.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

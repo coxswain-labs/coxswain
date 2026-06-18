@@ -128,6 +128,41 @@ pub const ANNOTATION_RATE_LIMIT_BY_HEADER: &str = fixture!("annotation_rate_limi
 /// Used to verify that an invalid annotation value is ignored (warn + fail-open) and
 /// traffic flows unthrottled.
 pub const ANNOTATION_RATE_LIMIT_INVALID: &str = fixture!("annotation_rate_limit_invalid.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/auth-url` pointing at the `auth-allow` stub (200)
+/// (#24 happy path). Used to verify the proxy allows the request and forwards it to echo-a.
+/// Depends on `backends::AUTH_STUB` being applied first.
+pub const ANNOTATION_AUTH_EXT_ALLOW: &str = fixture!("annotation_auth_ext_allow.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/auth-url` pointing at the `auth-deny` stub (403)
+/// (#24 sad path). Used to verify the proxy returns 403 and never reaches echo-a.
+/// Depends on `backends::AUTH_STUB` being applied first.
+pub const ANNOTATION_AUTH_EXT_DENY: &str = fixture!("annotation_auth_ext_deny.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/auth-url` pointing at `slow-echo` (never responds)
+/// and `auth-timeout: 500ms` (#24 sad path — timeout). Used to verify the proxy returns 503
+/// when the auth sub-request exceeds its timeout. Depends on `backends::SLOW_ECHO`.
+pub const ANNOTATION_AUTH_TIMEOUT: &str = fixture!("annotation_auth_timeout.yaml");
+/// Ingress with `auth-url` (auth-allow) and `auth-response-headers: X-Auth-User` (#24).
+/// Used to verify the proxy copies the named header from the auth response onto the upstream
+/// request; echo-a reflects it back in its JSON body. Depends on `backends::AUTH_STUB`.
+pub const ANNOTATION_AUTH_RESPONSE_HEADERS: &str =
+    fixture!("annotation_auth_response_headers.yaml");
+/// Ingress with `auth-url` (auth-deny) and `auth-always-set-cookie: "true"` (#24).
+/// Used to verify the proxy forwards `Set-Cookie` from the auth deny response to the client.
+/// Depends on `backends::AUTH_STUB`.
+pub const ANNOTATION_AUTH_ALWAYS_SET_COOKIE: &str =
+    fixture!("annotation_auth_always_set_cookie.yaml");
+/// Labeled htpasswd Secret for basic-auth e2e tests (#24).
+/// Carries `ingress.coxswain-labs.dev/auth-basic: "true"` so the reflector picks it up.
+/// Contains: `alice` (bcrypt, password `secret`) + `bob` (SHA1, password `secret`).
+pub const AUTH_BASIC_SECRET: &str = fixture!("auth_basic_secret.yaml");
+/// Unlabeled htpasswd Secret — the reflector ignores it, causing the proxy to return 503
+/// (fail-closed) when an Ingress references it via `auth-basic-secret` (#24 sad path).
+pub const AUTH_BASIC_SECRET_UNLABELED: &str = fixture!("auth_basic_secret_unlabeled.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/auth-basic-secret` pointing at the labeled
+/// htpasswd Secret (#24). Used by bcrypt, SHA1, and invalid-credentials tests.
+pub const ANNOTATION_AUTH_BASIC: &str = fixture!("annotation_auth_basic.yaml");
+/// Ingress with `auth-basic-secret` pointing at the UNLABELED Secret (#24 fail-closed).
+/// Used to verify the proxy returns 503 when the Secret is not opt-in labeled.
+pub const ANNOTATION_AUTH_BASIC_UNLABELED: &str = fixture!("annotation_auth_basic_unlabeled.yaml");
 /// Per-class annotation defaults via `IngressClass.spec.parameters` (#190): a
 /// `CoxswainIngressClassParameters` CR sets a default `rewrite-target`, one
 /// Ingress inherits it and a second overrides it per-key. The IngressClass is

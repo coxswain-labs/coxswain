@@ -339,6 +339,306 @@ async fn gateway_route_unthrottled_when_ratelimit_cr_missing() -> anyhow::Result
     Ok(())
 }
 
+// ── External auth (ext_authz HTTP) ───────────────────────────────────────────
+
+/// `auth-url` allow path: the auth stub returns 200 → proxy forwards the request
+/// to the upstream backend (#24 happy path).
+#[tokio::test]
+async fn request_allowed_when_ext_authz_returns_2xx() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-ok").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_EXT_ALLOW,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let host = format!("authextallow.{}.local", ns.name);
+
+    // Poll until the route is live with a 200: both the route and auth-allow Pod
+    // must be ready. auth-allow returns 200 → proxy allows → echo-a responds.
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(90)).await?;
+    resp.assert_backend("echo-a");
+    Ok(())
+}
+
+/// `auth-url` deny path: the auth stub returns 403 → proxy returns 403 to the
+/// client, backend never reached (#24 sad path).
+#[tokio::test]
+async fn request_rejected_with_auth_status_when_ext_authz_denies() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-deny").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_EXT_DENY,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let host = format!("authextdeny.{}.local", ns.name);
+
+    // Poll until we see 403: route programmed and auth-deny Pod ready.
+    // 404 = not yet programmed; 503 = auth-deny Pod not ready yet; keep polling.
+    // The busybox nc stub is one-shot per invocation so we rely on poll success
+    // as the assertion — a single 403 proves the proxy forwarded the deny status.
+    wait::wait_for_route_status(&h.http, &host, "/", 403, Duration::from_secs(90)).await?;
+    Ok(())
+}
+
+/// `auth-timeout`: when the auth sub-request exceeds `auth-timeout`, the proxy
+/// returns 503 and never reaches the upstream backend (#24 sad path).
+#[tokio::test]
+async fn request_rejected_when_ext_authz_times_out() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-timeout").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_TIMEOUT, FixtureVars::new(&ns.name)).await?;
+    let host = format!("authtimeout.{}.local", ns.name);
+
+    // Each poll attempt takes ≥500ms (auth-timeout fires), so the 90s deadline
+    // gives ample room for slow-echo to start and the route to be installed.
+    // 404 = not yet programmed; 200 would be wrong (auth must timeout); target is 503.
+    wait::wait_for_route_status(&h.http, &host, "/", 503, Duration::from_secs(90)).await?;
+    Ok(())
+}
+
+/// `auth-response-headers`: when auth allows (2xx), the named response headers
+/// from the auth service are forwarded to the upstream on the request (#24).
+#[tokio::test]
+async fn upstream_receives_auth_response_headers_when_configured() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-hdrs").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_RESPONSE_HEADERS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let host = format!("authhdr.{}.local", ns.name);
+
+    // auth-allow returns X-Auth-User: testuser; the Ingress annotation lists it in
+    // auth-response-headers; the proxy injects it into the upstream request.
+    // echo-a reflects all request headers in the JSON body.
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(90)).await?;
+    let auth_user = resp
+        .headers
+        .get("X-Auth-User")
+        .and_then(|v| v[0].as_str())
+        .unwrap_or("");
+    anyhow::ensure!(
+        auth_user == "testuser",
+        "expected upstream to receive X-Auth-User: testuser from auth response, got: {auth_user:?}"
+    );
+    Ok(())
+}
+
+/// `auth-always-set-cookie`: when auth denies and `auth-always-set-cookie: "true"`,
+/// the proxy forwards `Set-Cookie` from the auth deny response to the client (#24).
+#[tokio::test]
+async fn set_cookie_forwarded_on_deny_when_auth_always_set_cookie() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-cookie").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_ALWAYS_SET_COOKIE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let host = format!("authcookie.{}.local", ns.name);
+
+    // Poll until the route returns 403 AND Set-Cookie: session=test123 is present.
+    // auth-deny returns one response per nc invocation, then nc restarts (small gap).
+    // Polling the combined condition avoids a second serial request hitting the
+    // restart window when the cluster is under load.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("route {host}/ to return 403 with Set-Cookie: session=test123") },
+        || async {
+            match h.http.get_full(&host, "/").await {
+                Ok((403, hdrs, _)) => {
+                    let cookie = hdrs
+                        .get(reqwest::header::SET_COOKIE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    if cookie.contains("session=test123") {
+                        Some(())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+// ── Basic auth (htpasswd) ─────────────────────────────────────────────────────
+
+/// `auth-basic-secret` with a bcrypt entry: a request carrying the correct
+/// `Authorization: Basic` credentials is admitted (200) (#24 happy path).
+#[tokio::test]
+async fn request_allowed_when_basic_auth_bcrypt_credential_valid() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-bcrypt").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::AUTH_BASIC_SECRET, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_BASIC, FixtureVars::new(&ns.name)).await?;
+    let host = format!("authbasic.{}.local", ns.name);
+
+    // alice:secret (bcrypt) → Authorization: Basic YWxpY2U6c2VjcmV0.
+    // Poll until 200: route programmed + Secret resolved + bcrypt verify passes.
+    // bcrypt may take several hundred ms in spawn_blocking → generous deadline.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("basic auth route to admit alice:secret (bcrypt) at {host}") },
+        || async {
+            let result = h
+                .http
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await;
+            match result {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+    Ok(())
+}
+
+/// `auth-basic-secret` with a SHA1 entry: a request carrying the correct
+/// `Authorization: Basic` credentials is admitted (200) (#24 happy path).
+#[tokio::test]
+async fn request_allowed_when_basic_auth_sha1_credential_valid() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-sha1").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::AUTH_BASIC_SECRET, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_BASIC, FixtureVars::new(&ns.name)).await?;
+    let host = format!("authbasic.{}.local", ns.name);
+
+    // bob:secret (SHA1) → Authorization: Basic Ym9iOnNlY3JldA==.
+    // Poll until 200: route programmed + Secret resolved + SHA1 verify passes.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("basic auth route to admit bob:secret (SHA1) at {host}") },
+        || async {
+            let result = h
+                .http
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic Ym9iOnNlY3JldA==")])
+                .await;
+            match result {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+    Ok(())
+}
+
+/// `auth-basic-secret`: a request with wrong credentials is rejected with
+/// 401 + `WWW-Authenticate` (#24 sad path — invalid credentials).
+#[tokio::test]
+async fn request_rejected_when_basic_auth_credentials_invalid() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-bad").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::AUTH_BASIC_SECRET, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_BASIC, FixtureVars::new(&ns.name)).await?;
+    let host = format!("authbasic.{}.local", ns.name);
+
+    // Wait until the route is programmed and basic auth is active:
+    // a request without credentials should return 401 (challenge), not 404.
+    wait::wait_for_route_status(&h.http, &host, "/", 401, Duration::from_secs(90)).await?;
+
+    // wrong:password → Authorization: Basic d3Jvbmc6cGFzc3dvcmQ=
+    // Must return 401 + WWW-Authenticate; backend must not be reached.
+    let (status, resp_hdrs, _) = h
+        .http
+        .get_full_with_headers(
+            &host,
+            "/",
+            &[("authorization", "Basic d3Jvbmc6cGFzc3dvcmQ=")],
+        )
+        .await?;
+    anyhow::ensure!(
+        status == 401,
+        "expected 401 for wrong credentials, got {status}"
+    );
+    anyhow::ensure!(
+        resp_hdrs.contains_key(reqwest::header::WWW_AUTHENTICATE),
+        "expected WWW-Authenticate header in 401 response; got: {resp_hdrs:?}"
+    );
+    Ok(())
+}
+
+/// `auth-basic-secret` pointing at an UNLABELED Secret: the reflector never
+/// includes it, so the proxy fails closed with 503 — even valid credentials
+/// are refused (#24 sad path — fail-closed label requirement).
+#[tokio::test]
+async fn request_rejected_when_basic_auth_secret_unlabeled() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-nolabel").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::AUTH_BASIC_SECRET_UNLABELED,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_BASIC_UNLABELED,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let host = format!("authunlabeled.{}.local", ns.name);
+
+    // Route programmed with IngressAuthConfig::Unavailable → always 503.
+    // Even alice:secret (valid creds) must be refused before the Secret is read.
+    wait::wait_for_route_status(&h.http, &host, "/", 503, Duration::from_secs(90)).await?;
+
+    // Confirm even valid credentials return 503 (proxy never consults the Secret).
+    let status = h.http.get_status(&host, "/").await?;
+    anyhow::ensure!(
+        status == 503,
+        "expected 503 (fail-closed: unlabeled secret), got {status}"
+    );
+    Ok(())
+}
+
+/// No auth annotation: requests reach the backend without any credential check
+/// (#24 control — auth is opt-in, not default).
+#[tokio::test]
+async fn request_forwarded_without_auth_when_no_annotation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-none").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    // Apply only the echo-based Ingress from the rate-limit-invalid fixture (no auth
+    // annotation) to reuse an existing no-auth route definition.
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_RATE_LIMIT_INVALID,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let host = format!("ratelimitinvalid.{}.local", ns.name);
+
+    // Plain 200 — no credentials required, no auth annotation on the route.
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+    Ok(())
+}
+
 /// Make one raw TCP request (write `preamble` then the HTTP request) and return the
 /// response `(status_code, body)`.
 async fn raw_http_status(

@@ -107,7 +107,11 @@ for line in "${consts[@]}"; do
   checked=$((checked + 1))
 
   # (a) parse-test: const name referenced (whole-word) in ANY test region.
-  if ! printf '%s\n' "$combined_test_region" | grep -qw "$name"; then
+  # Use a herestring (<<<) instead of printf | grep to avoid a SIGPIPE race:
+  # when grep exits early after finding a match, the printf side of a pipe
+  # receives SIGPIPE; with `pipefail` that makes the pipeline exit non-zero
+  # even though grep succeeded, causing false-negative "missing" reports.
+  if ! grep -qw "$name" <<< "$combined_test_region"; then
     missing_parse+=("$name ($key)")
   fi
 

@@ -2,16 +2,18 @@
 
 use super::IngressReconciler;
 use super::annotations::IngressAnnotations;
+use super::annotations::security::{AuthAnnotation, parse_htpasswd};
 use super::backend::resolve_backend_port;
 use super::class::claimed_ingress_class;
 use super::ports::IngressPorts;
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
 use coxswain_core::routing::{
-    BackendGroup, FilterAction, IngressRoutingTableBuilder, PathModifier, RouteEntry, WildcardKind,
-    compile_path_regex,
+    BackendGroup, BasicCredential, ExtAuthConfig, ExtAuthTransport, FilterAction,
+    HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTableBuilder, PathModifier, RouteEntry,
+    WildcardKind, compile_path_regex,
 };
-use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::runtime::reflector;
@@ -57,6 +59,10 @@ impl IngressReconciler {
     ///
     /// Routes are inserted on `http_port` and `https_port` (whichever are `Some`).
     /// When both are `None` the Ingress is skipped with a warning.
+    ///
+    /// `auth_secrets` is the label-scoped Secret store
+    /// (`ingress.coxswain-labs.dev/auth-basic=true`).  It is used to resolve
+    /// the `auth-basic-secret` annotation into an htpasswd credential list.
     pub fn reconcile(
         ingress: &Ingress,
         slices: &reflector::Store<EndpointSlice>,
@@ -64,6 +70,7 @@ impl IngressReconciler {
         classes: &IngressClassContext<'_>,
         ports: IngressPorts,
         builder: &mut IngressRoutingTableBuilder,
+        auth_secrets: &reflector::Store<Secret>,
     ) {
         let claimed_class = claimed_ingress_class(ingress);
 
@@ -153,6 +160,9 @@ impl IngressReconciler {
         // Build the rate-limit config once and share one Arc across every route
         // entry of this Ingress — same refcount-bump sharing pattern as above.
         let rate_limit = ann.rate_limit.clone().map(Arc::new);
+        // Resolve auth annotation once per Ingress; share one Arc across every path.
+        let auth =
+            resolve_auth_config(ann.auth.as_ref(), auth_secrets, &route_id, ns).map(Arc::new);
 
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
@@ -293,7 +303,8 @@ impl IngressReconciler {
                         .with_max_body_size(ann.max_body_size)
                         .with_allow_source_range(allow_source_range.clone())
                         .with_cache_enabled(ann.cache_enabled)
-                        .with_rate_limit(rate_limit.clone());
+                        .with_rate_limit(rate_limit.clone())
+                        .with_auth(auth.clone());
                 if dead {
                     base_entry.error_status = Some(503);
                 }
@@ -322,7 +333,8 @@ impl IngressReconciler {
                             .with_max_body_size(ann.max_body_size)
                             .with_allow_source_range(allow_source_range.clone())
                             .with_cache_enabled(ann.cache_enabled)
-                            .with_rate_limit(rate_limit.clone());
+                            .with_rate_limit(rate_limit.clone())
+                            .with_auth(auth.clone());
                     if dead {
                         entry.error_status = Some(503);
                     }
@@ -409,7 +421,8 @@ impl IngressReconciler {
                                 .with_filter_actions(filters)
                                 .with_max_body_size(ann.max_body_size)
                                 .with_allow_source_range(allow_source_range.clone())
-                                .with_rate_limit(rate_limit.clone()),
+                                .with_rate_limit(rate_limit.clone())
+                                .with_auth(auth.clone()),
                             )
                         };
                         for &listener_port in &ports {
@@ -451,6 +464,117 @@ impl IngressReconciler {
                     "Ingress defaultBackend uses Resource type — only Service backends are supported; skipping"
                 );
             }
+        }
+    }
+}
+
+// ── Auth resolution ───────────────────────────────────────────────────────────
+
+/// Resolve an intermediate [`AuthAnnotation`] into a concrete
+/// [`IngressAuthConfig`] using the label-scoped `auth_secrets` store.
+///
+/// - `External` → wrapped verbatim into `IngressAuthConfig::External`.
+/// - `Basic(SecretRef)` → looked up in `auth_secrets` (the label-scoped
+///   reflector); on success, the `"auth"` key is parsed with [`parse_htpasswd`].
+///   Any failure (missing secret, missing key, no parseable entries) emits a
+///   contextual `WARN` and returns `IngressAuthConfig::Unavailable` so the proxy
+///   fails closed with 503 rather than silently bypassing auth.
+/// - `None` annotation → returns `None` (no auth configured).
+fn resolve_auth_config(
+    annotation: Option<&AuthAnnotation>,
+    auth_secrets: &reflector::Store<Secret>,
+    route_id: &str,
+    ingress_ns: &str,
+) -> Option<IngressAuthConfig> {
+    let ann = annotation?;
+    match ann {
+        AuthAnnotation::External {
+            url,
+            timeout,
+            response_headers,
+            always_set_cookie,
+        } => {
+            let resp_hdrs: Arc<[Box<str>]> = response_headers
+                .iter()
+                .map(|s| s.as_str().into())
+                .collect::<Vec<Box<str>>>()
+                .into();
+            Some(IngressAuthConfig::External(ExtAuthConfig::new(
+                *timeout,
+                ExtAuthTransport::Http(HttpExtAuthConfig::new(
+                    Arc::from(url.as_str()),
+                    resp_hdrs,
+                    *always_set_cookie,
+                )),
+            )))
+        }
+        AuthAnnotation::Basic(secret_ref) => {
+            // The `auth-basic-secret` annotation is `namespace/name`; the
+            // namespace component defaults to the Ingress's own namespace.
+            let ns = if secret_ref.namespace.is_empty() {
+                ingress_ns
+            } else {
+                &secret_ref.namespace
+            };
+            let key = reflector::ObjectRef::<Secret>::new(&secret_ref.name).within(ns);
+            let Some(secret) = auth_secrets.get(&key) else {
+                tracing::warn!(
+                    ingress = %route_id,
+                    secret_ns = %ns,
+                    secret_name = %secret_ref.name,
+                    "auth-basic-secret not found in auth-secret reflector — \
+                     is the Secret labeled ingress.coxswain-labs.dev/auth-basic=true? \
+                     failing closed (503)"
+                );
+                return Some(IngressAuthConfig::Unavailable);
+            };
+            // Belt-and-suspenders: the label-scoped reflector only shows
+            // labeled secrets, but guard against label removal during a
+            // reconcile race.
+            let has_label = secret
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("ingress.coxswain-labs.dev/auth-basic"))
+                .is_some_and(|v| v == "true");
+            if !has_label {
+                tracing::warn!(
+                    ingress = %route_id,
+                    secret_ns = %ns,
+                    secret_name = %secret_ref.name,
+                    "Secret is missing label ingress.coxswain-labs.dev/auth-basic=true — \
+                     failing closed (503)"
+                );
+                return Some(IngressAuthConfig::Unavailable);
+            }
+            let Some(data) = secret
+                .data
+                .as_ref()
+                .and_then(|d| d.get("auth"))
+                .map(|b| &b.0)
+            else {
+                tracing::warn!(
+                    ingress = %route_id,
+                    secret_ns = %ns,
+                    secret_name = %secret_ref.name,
+                    "auth-basic-secret has no 'auth' data key (expected htpasswd file) — \
+                     failing closed (503)"
+                );
+                return Some(IngressAuthConfig::Unavailable);
+            };
+            let creds: Vec<BasicCredential> = parse_htpasswd(data);
+            if creds.is_empty() {
+                tracing::warn!(
+                    ingress = %route_id,
+                    secret_ns = %ns,
+                    secret_name = %secret_ref.name,
+                    "auth-basic-secret has no parseable htpasswd entries \
+                     (supported: bcrypt $2y/$2b/$2a, SHA1 {{SHA}}...) \
+                     failing closed (503)"
+                );
+                return Some(IngressAuthConfig::Unavailable);
+            }
+            Some(IngressAuthConfig::Basic(creds.into()))
         }
     }
 }
@@ -1546,6 +1670,7 @@ mod tests {
             &IngressClassContext::new(&owned(&["coxswain"]), Some("coxswain"), &no_class_defaults),
             IngressPorts::new(Some(80), None),
             &mut builder,
+            &empty_secret_store(),
         );
         assert!(
             builder
@@ -1577,6 +1702,7 @@ mod tests {
             &IngressClassContext::new(&owned(&["coxswain"]), None, &no_class_defaults),
             IngressPorts::new(Some(80), None),
             &mut builder,
+            &empty_secret_store(),
         );
         assert!(
             builder
@@ -2168,6 +2294,7 @@ mod tests {
             &IngressClassContext::new(&owned(&["coxswain"]), None, &no_class_defaults),
             IngressPorts::new(Some(80), Some(443)),
             &mut builder,
+            &empty_secret_store(),
         );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();

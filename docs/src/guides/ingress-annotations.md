@@ -36,6 +36,11 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/rate-limit-rps` | integer | _none_ (disabled) | `"100"` |
 | `ingress.coxswain-labs.dev/rate-limit-burst` | integer | `0` | `"50"` |
 | `ingress.coxswain-labs.dev/rate-limit-by` | `ip` or `header:Name` | `"ip"` | `"header:X-Api-Key"` |
+| `ingress.coxswain-labs.dev/auth-url` | URL | _none_ | `"http://auth.ns.svc/auth"` |
+| `ingress.coxswain-labs.dev/auth-timeout` | duration | `"2s"` | `"500ms"` |
+| `ingress.coxswain-labs.dev/auth-response-headers` | csv | _none_ | `"X-Auth-User"` |
+| `ingress.coxswain-labs.dev/auth-always-set-cookie` | boolean | `false` | `"true"` |
+| `ingress.coxswain-labs.dev/auth-basic-secret` | `namespace/name` | _none_ | `"my-ns/my-htpasswd"` |
 
 ```yaml
 metadata:
@@ -458,6 +463,91 @@ metadata:
 When the keying dimension is not available for a request (undeterminable IP, or absent header on a header-keyed route) the request is **admitted without counting** (**fail-open**) — a missing key never blocks traffic.
 
 An unrecognised `rate-limit-by` value emits a controller warning and falls back to `"ip"`.
+
+## Authentication
+
+Coxswain supports two authentication modes on Ingresses: **external auth** (HTTP sub-request) and **basic auth** (htpasswd Secret). Both are enforced at the proxy before any upstream connection; a failure never reaches the backend.
+
+`auth-url` and `auth-basic-secret` are mutually exclusive. If both are present, `auth-url` wins and a controller warning is emitted.
+
+### `auth-url`
+
+Forwards a sub-request to an external authorization service before proxying. If the service returns **2xx** the original request is forwarded; any other status code is returned to the client as-is (body + headers), and the upstream is never hit.
+
+The sub-request is sent to the configured URL using the **original request method and Host header**, carrying the client's headers (`Authorization`, `Cookie`, etc.) — the auth service sees the genuine request context. No body is forwarded. On a network error or timeout (configurable via `auth-timeout`), the proxy returns **503** and blocks the request (fail-closed).
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/auth-url: "http://oauth2-proxy.oauth.svc.cluster.local/oauth2/auth"
+    ingress.coxswain-labs.dev/auth-timeout: "2s"
+    ingress.coxswain-labs.dev/auth-response-headers: "X-Auth-User,X-Auth-Groups"
+    ingress.coxswain-labs.dev/auth-always-set-cookie: "true"
+```
+
+### `auth-timeout`
+
+Maximum time to wait for the auth sub-request to respond. Accepts any duration string (e.g. `"500ms"`, `"5s"`). Default: `2s`. On timeout the proxy returns **503** (fail-closed).
+
+### `auth-response-headers`
+
+Comma-separated list of header names to copy from a **2xx auth response** onto the **upstream request** (so the backend sees e.g. `X-Auth-User`). The echo backend reflects them back in its JSON body, making this assertion testable end-to-end.
+
+### `auth-always-set-cookie`
+
+When `"true"`, any `Set-Cookie` header present in the auth **deny response** is forwarded to the client. This enables login-redirect flows where the IdP sets a session cookie on the 302 response. Default: `false`.
+
+### `auth-basic-secret`
+
+Enables **HTTP Basic Authentication** backed by an htpasswd Secret. Value is `namespace/name` of a `Secret` resource with:
+
+- **Type**: `Opaque`
+- **Key**: `auth`
+- **Value**: standard htpasswd content (one `username:hash` line per credential)
+- **Supported hash algorithms**: `bcrypt` (`$2a$`, `$2b$`, `$2y$`) and `SHA1` (`{SHA}base64`). Lines using other schemes are skipped with a controller warning.
+
+**The Secret must carry the `ingress.coxswain-labs.dev/auth-basic: "true"` label.** The proxy watches only labeled Secrets (the data-plane read-only invariant — the proxy never holds cluster-wide Secret access). A referenced Secret that is absent or unlabeled causes the proxy to return **503** for every request to that Ingress (**fail-closed**). This is intentional: misconfigured auth silences traffic rather than silently bypassing it.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-htpasswd
+  namespace: my-app
+  labels:
+    ingress.coxswain-labs.dev/auth-basic: "true"
+type: Opaque
+data:
+  # alice:secret (bcrypt)  bob:secret (SHA1)
+  auth: |
+    YWxpY2U6JDJ5JDA0JHdyUkZRU0NCZXpZTFR5V1hKS1dldXVPaHRGdWtyQWo3UHpQWXRRc09ORWg4ck9PampJTGFLCmJvYjp7U0hBfTVlbjZHNk1lelJyb1QzWEtxa2RQT21ZL0JmUT0K
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  namespace: my-app
+  annotations:
+    ingress.coxswain-labs.dev/auth-basic-secret: "my-app/my-htpasswd"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-api
+                port:
+                  number: 8080
+```
+
+Requests without credentials receive **401** with a `WWW-Authenticate: Basic realm="coxswain"` header. Invalid credentials also receive **401**.
+
+!!! tip "Hardening"
+    Credential hashes are zeroed from memory when the credential list is replaced at reconcile time (`zeroize`). The Helm chart already ships `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`, and `capabilities.drop: ALL` by default. For the remaining defense-in-depth, configure nodes with `vm.swappiness=0` so hashes can't be paged to disk — this is a node-level kernel parameter that Kubernetes cannot enforce per-pod.
 
 ## Class-level defaults
 

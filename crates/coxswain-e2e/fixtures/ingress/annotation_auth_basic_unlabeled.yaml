@@ -1,0 +1,29 @@
+# basic-auth fail-closed fixture: auth-basic-secret points at the UNLABELED
+# Secret, which the reflector never includes in its auth_secrets store.
+#
+# The reconciler resolves the missing store entry as IngressAuthConfig::Unavailable.
+# Every request to this Ingress returns 503, even with valid credentials — the
+# proxy never reads the Secret and cannot verify them. This enforces the
+# least-privilege invariant: opt-in label required, fail-closed without it.
+#
+# Host: authunlabeled.TESTNS.local / -> echo-a:3000 (never reached; 503 fires).
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-basic-unlabeled-ingress
+  annotations:
+    ingress.coxswain-labs.dev/auth-basic-secret: "${TESTNS}/auth-htpasswd-unlabeled"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: authunlabeled.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

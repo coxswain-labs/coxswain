@@ -33,6 +33,8 @@ clap = { workspace = true }
 humantime = { workspace = true }
 pingora-core = { workspace = true, features = ["boringssl"] }
 pingora-proxy = { workspace = true, features = ["boringssl"] }
+reqwest = { workspace = true }
+rustls = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

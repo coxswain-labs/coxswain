@@ -6,6 +6,7 @@
 //! also defined here and is given a distinct identity per spec via type
 //! aliases in the sibling modules.
 
+pub mod auth;
 pub mod entry;
 pub mod host_router;
 pub mod port;
