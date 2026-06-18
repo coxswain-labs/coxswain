@@ -23,7 +23,7 @@ mod filters;
 mod routing;
 pub(crate) mod security;
 mod session;
-mod traffic_policy;
+pub(crate) mod traffic_policy;
 
 pub use caching::*;
 pub use filters::*;
@@ -133,6 +133,11 @@ pub(super) struct IngressAnnotations {
     /// into [`IngressAuthConfig`][coxswain_core::routing::IngressAuthConfig] by
     /// looking up the labeled htpasswd Secret.
     pub auth: Option<AuthAnnotation>,
+    /// Fire-and-forget mirror backend ref from `mirror-target` (#283), in
+    /// intermediate (pre-resolved) form.  `None` when the annotation is absent or
+    /// unparseable (WARN emitted; mirror disabled).  The reconciler resolves this
+    /// into a `FilterAction::Mirror` by looking up the Service endpoints.
+    pub mirror_target: Option<traffic_policy::MirrorTargetRef>,
 }
 
 impl IngressAnnotations {
@@ -403,6 +408,20 @@ impl IngressAnnotations {
         // ── External / basic auth (#24) ───────────────────────────────────────
         let auth = security::parse_auth(ann, route_id);
 
+        // ── Mirror target (#283) ──────────────────────────────────────────────
+        let mirror_target = get(ann, MIRROR_TARGET).and_then(|v| {
+            let r = traffic_policy::parse_mirror_target(v);
+            if r.is_none() {
+                tracing::warn!(
+                    ingress = %route_id,
+                    annotation = MIRROR_TARGET,
+                    value = v,
+                    "invalid mirror-target — mirror disabled"
+                );
+            }
+            r
+        });
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -426,6 +445,7 @@ impl IngressAnnotations {
             session_affinity,
             rate_limit,
             auth,
+            mirror_target,
         }
     }
 }

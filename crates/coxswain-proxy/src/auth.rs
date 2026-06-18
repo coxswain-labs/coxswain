@@ -32,8 +32,9 @@ use zeroize::Zeroizing;
 
 // ── Hop-by-hop headers stripped when forwarding to the auth service ──────────
 
-/// RFC 2616 §13.5.1 hop-by-hop headers: never forward these to the auth service.
-const HOP_BY_HOP: &[&str] = &[
+/// RFC 2616 §13.5.1 hop-by-hop headers: never forward these to the auth service
+/// or mirror sub-requests.
+pub(crate) const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
     "proxy-authenticate",

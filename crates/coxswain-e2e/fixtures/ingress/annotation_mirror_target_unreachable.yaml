@@ -1,0 +1,29 @@
+# mirror-target annotation sad-path fixture (apply backends::ECHO first).
+#
+# The mirror-target references echo-b on port 9999, which has no ready
+# EndpointSlices.  The reflector warns and disables the mirror; the primary
+# route still serves normally.
+# The proxy must:
+#   * forward the primary request to echo-a (200, no error surfaced to client), and
+#   * emit no access-log mirror=true row (mirror was skipped at reconcile time).
+#
+# Host: mirrorbad.TESTNS.local -> echo-a:3000 (primary); mirror disabled.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mirror-target-unreachable-ingress
+  annotations:
+    ingress.coxswain-labs.dev/mirror-target: "echo-b.${TESTNS}.svc:9999"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: mirrorbad.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

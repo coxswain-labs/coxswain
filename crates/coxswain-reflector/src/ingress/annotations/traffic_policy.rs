@@ -33,6 +33,20 @@ pub const BACKEND_PROTOCOL: &str = "ingress.coxswain-labs.dev/backend-protocol";
 /// Per-request body size limit — a byte count or `k`/`m`/`g`-suffixed size, e.g. `"8m"`.
 pub const MAX_BODY_SIZE: &str = "ingress.coxswain-labs.dev/max-body-size";
 
+// ── Mirror-target annotation key ──────────────────────────────────────────────
+
+/// Secondary backend to shadow all matched requests to, fire-and-forget.
+///
+/// Value format: `svc.namespace:port` or `svc.namespace.svc:port` (trailing
+/// `.svc.cluster.local` labels are ignored). Example: `"echo-b.default:3000"`.
+///
+/// **Security constraint**: the target `namespace` must match the Ingress's own namespace.
+/// Cross-namespace references are rejected at reconcile time with a WARN and the mirror
+/// is disabled — an Ingress author must not be able to shadow traffic to services in
+/// namespaces they do not control.  `Authorization`, `Cookie`, and `Proxy-Authorization`
+/// headers are stripped from mirror sub-requests regardless of namespace.
+pub const MIRROR_TARGET: &str = "ingress.coxswain-labs.dev/mirror-target";
+
 // ── Parse helpers ─────────────────────────────────────────────────────────────
 
 /// Parse a duration annotation value.
@@ -118,6 +132,72 @@ pub fn parse_backend_protocol(s: &str) -> Option<BackendProtocol> {
             tracing::warn!(
                 value = s,
                 "unknown backend-protocol value — valid values are HTTP, HTTPS, GRPC"
+            );
+            None
+        }
+    }
+}
+
+// ── Mirror-target types and parser ───────────────────────────────────────────
+
+/// Intermediate representation of a `mirror-target` annotation value.
+///
+/// Service–namespace split parsed from the DNS-style host in the annotation.
+/// The concrete `BackendGroup` (pod endpoints) is resolved in
+/// `crate::ingress::reconcile` where the Service and EndpointSlice stores are
+/// available.
+#[derive(Debug, Clone)]
+pub(crate) struct MirrorTargetRef {
+    /// Kubernetes Service name.
+    pub service: String,
+    /// Kubernetes namespace of the Service.
+    pub namespace: String,
+    /// Numeric service port.
+    pub port: u16,
+}
+
+/// Parse the `ingress.coxswain-labs.dev/mirror-target` annotation value.
+///
+/// Accepted forms: `svc.namespace:port` or `svc.namespace.svc:port` (any
+/// trailing DNS labels after the second one are discarded).
+///
+/// Returns `None` and emits a structured `WARN` when the value cannot be parsed.
+/// The caller in [`super::IngressAnnotations::parse`] emits an additional
+/// contextual `WARN` with the Ingress name.
+#[must_use]
+pub(crate) fn parse_mirror_target(s: &str) -> Option<MirrorTargetRef> {
+    let Some((host, port_str)) = s.rsplit_once(':') else {
+        tracing::warn!(
+            value = s,
+            "invalid mirror-target — expected \"svc.namespace:port\" form"
+        );
+        return None;
+    };
+
+    let Ok(port) = port_str.trim().parse::<u16>() else {
+        tracing::warn!(
+            value = s,
+            "invalid mirror-target — port must be a number in 0–65535"
+        );
+        return None;
+    };
+
+    // Take the first two dot-separated labels as service and namespace;
+    // any trailing labels (.svc, .svc.cluster.local, …) are silently discarded.
+    let mut parts = host.trim().splitn(3, '.');
+    let service = parts.next().filter(|s| !s.is_empty());
+    let namespace = parts.next().filter(|s| !s.is_empty());
+
+    match (service, namespace) {
+        (Some(svc), Some(ns)) => Some(MirrorTargetRef {
+            service: svc.to_string(),
+            namespace: ns.to_string(),
+            port,
+        }),
+        _ => {
+            tracing::warn!(
+                value = s,
+                "invalid mirror-target — host must contain at least \"svc.namespace\""
             );
             None
         }
@@ -224,5 +304,65 @@ mod tests {
     fn parse_byte_size_overflow_is_none() {
         // u64::MAX with a 'g' multiplier overflows — must fail closed to None, not wrap.
         assert_eq!(parse_byte_size("18446744073709551615g"), None);
+    }
+
+    // ── parse_mirror_target ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_mirror_target_short_form() {
+        // References MIRROR_TARGET const to satisfy the annotation-coverage gate.
+        let _ = MIRROR_TARGET;
+        let r = parse_mirror_target("echo-b.default:3000").unwrap();
+        assert_eq!(r.service, "echo-b");
+        assert_eq!(r.namespace, "default");
+        assert_eq!(r.port, 3000);
+    }
+
+    #[test]
+    fn parse_mirror_target_svc_suffix_form() {
+        // "svc.namespace.svc:port" — the trailing ".svc" label is discarded.
+        let r = parse_mirror_target("echo-b.default.svc:8080").unwrap();
+        assert_eq!(r.service, "echo-b");
+        assert_eq!(r.namespace, "default");
+        assert_eq!(r.port, 8080);
+    }
+
+    #[test]
+    fn parse_mirror_target_fqdn_form() {
+        // Full FQDN — trailing labels after namespace are discarded.
+        let r = parse_mirror_target("echo-b.default.svc.cluster.local:9000").unwrap();
+        assert_eq!(r.service, "echo-b");
+        assert_eq!(r.namespace, "default");
+        assert_eq!(r.port, 9000);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_mirror_target_no_colon_warns() {
+        assert!(parse_mirror_target("echo-b.default").is_none());
+        assert!(logs_contain("expected \"svc.namespace:port\" form"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_mirror_target_invalid_port_warns() {
+        assert!(parse_mirror_target("echo-b.default:notaport").is_none());
+        assert!(logs_contain("port must be a number"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_mirror_target_missing_namespace_warns() {
+        // No dot separator — only one label before the colon.
+        assert!(parse_mirror_target("echo-b:3000").is_none());
+        assert!(logs_contain("host must contain at least"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_mirror_target_empty_label_warns() {
+        // Leading dot → empty service label.
+        assert!(parse_mirror_target(".default:3000").is_none());
+        assert!(logs_contain("host must contain at least"));
     }
 }

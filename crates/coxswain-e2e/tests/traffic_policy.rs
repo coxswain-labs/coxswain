@@ -18,6 +18,7 @@ use coxswain_e2e::{
     fixtures::{self, backends, ingress},
     harness::wait,
 };
+use reqwest::Method;
 use std::time::Duration;
 
 mod common;
@@ -685,6 +686,126 @@ async fn session_affinity_header_falls_back_to_round_robin_when_header_absent() 
         pods.len() >= 2,
         "without the affinity header, requests must round-robin across pods, saw {pods:?}"
     );
+    Ok(())
+}
+
+/// Verifies that `ingress.coxswain-labs.dev/mirror-target` fires a fire-and-forget
+/// copy of each request to the named secondary backend (#283).
+///
+/// - Primary traffic (`echo-a`) must return 200 with the primary backend identity;
+///   the client never sees the mirror response.
+/// - An access-log row with `mirror = true` and `host = mirror.<ns>.local` must
+///   appear within 30 s of the driven request — the sole observable that proves the
+///   mirror dispatch fired without any response from the echo backend being visible.
+///
+/// The fixture sets `max-body-size: 1k` so body-buffering mode is active; the POST
+/// body exercises the buffer-then-send path in `request_body_filter`.
+#[tokio::test]
+async fn request_mirrored_to_secondary_backend_when_mirror_target_set() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-mirror").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_MIRROR_TARGET,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("mirror.{}.local", ns.name);
+    let route = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    route.assert_backend("echo-a");
+
+    // POST a small body to exercise the body-buffering mirror path (max-body-size
+    // is set in the fixture, so chunks are teed to mirror_body then dispatched
+    // on end_of_stream).
+    let (status, body) = h
+        .http
+        .request_with_body(Method::POST, &host, "/", b"hello mirror".to_vec())
+        .await?;
+    assert_eq!(status, 200, "primary POST must succeed; host={host}");
+    body.expect("primary response must carry echo JSON")
+        .assert_backend("echo-a");
+
+    // Mirror dispatch is fire-and-forget; poll the shared-proxy access log until
+    // a mirror=true row for this host appears.  30 s is ample given the 5 s
+    // per-mirror timeout configured in spawn_mirror_dispatch.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            match h.controller.shared_proxy_access_logs().await {
+                Ok(logs) => {
+                    let found = logs.iter().any(|row| {
+                        row.get("mirror").and_then(|v| v.as_bool()) == Some(true)
+                            && row.get("host").and_then(|v| v.as_str()) == Some(host.as_str())
+                    });
+                    format!("mirror access-log row; found={found}, host={host}")
+                }
+                Err(e) => format!("mirror access-log row; log fetch failed: {e}"),
+            }
+        },
+        || async {
+            let logs = h.controller.shared_proxy_access_logs().await.ok()?;
+            logs.into_iter().find(|row| {
+                row.get("mirror").and_then(|v| v.as_bool()) == Some(true)
+                    && row.get("host").and_then(|v| v.as_str()) == Some(host.as_str())
+            })
+        },
+    )
+    .await?; // poll_until returns Ok(row) when found, or Err on timeout
+
+    Ok(())
+}
+
+/// Verifies that the primary route succeeds when the `mirror-target` Service has no
+/// ready endpoints (sad path for `ingress.coxswain-labs.dev/mirror-target`, #283).
+///
+/// The fixture points `mirror-target` at port 9999 of `echo-b`, which has no
+/// EndpointSlices; the reflector warns and disables the mirror filter entirely.
+/// The primary route must still serve normally — mirror misconfiguration must
+/// never degrade the primary path.
+#[tokio::test]
+async fn primary_succeeds_when_mirror_backend_unreachable() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-mirror-bad").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_MIRROR_TARGET_UNREACHABLE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("mirrorbad.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60))
+        .await?
+        .assert_backend("echo-a");
+
+    // Primary must return 200 with no mirror failure visible to the client.
+    let (status, body) = h.http.request(Method::GET, &host, "/", &[]).await?;
+    assert_eq!(
+        status, 200,
+        "primary GET must succeed even when mirror backend is unreachable; host={host}"
+    );
+    body.expect("primary response must carry echo JSON")
+        .assert_backend("echo-a");
+
+    // Mirror was disabled at reconcile time (no ready endpoints on port 9999),
+    // so no mirror=true access-log row should appear for this host.
+    let logs = h.controller.shared_proxy_access_logs().await?;
+    let mirror_fired = logs.iter().any(|row| {
+        row.get("mirror").and_then(|v| v.as_bool()) == Some(true)
+            && row.get("host").and_then(|v| v.as_str()) == Some(host.as_str())
+    });
+    assert!(
+        !mirror_fired,
+        "mirror was disabled at reconcile time (no ready endpoints on port 9999); \
+         no mirror=true access-log row must appear for host={host}"
+    );
+
     Ok(())
 }
 

@@ -23,17 +23,19 @@
 //! cleartext upstream connections skip them entirely.
 
 use super::affinity;
-use super::ctx::{CONN_INFO, ProxyCtx, ResolvedRoute};
+use super::ctx::{CONN_INFO, MirrorDispatch, ProxyCtx, ResolvedRoute};
 use super::engine::RoutingEngine;
 use super::filter::TrafficFilter;
 use super::outcome::{merge_timeouts, resolve_outcome, try_redirect};
 use super::redirect::extract_host;
+use crate::auth;
 use crate::config::AccessLogPathMode;
 use crate::upstream_ca::UpstreamCaCache;
 use bytes::Bytes;
 use coxswain_cache::ResponseCache;
 use coxswain_core::routing::{
-    RateLimitKey, RequestContext, RetryOn, RouteTimeouts, SessionAffinity, UpstreamCa,
+    BackendProtocol, FilterAction, RateLimitKey, RequestContext, RetryOn, RouteTimeouts,
+    SessionAffinity, UpstreamCa,
 };
 use http::header;
 use pingora_cache::key::{CacheKey, HashBinary};
@@ -47,6 +49,17 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, Session};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Headers stripped from mirror sub-requests beyond the standard hop-by-hop set.
+///
+/// `Authorization` and `Cookie` carry per-user credentials that must not be
+/// forwarded to mirror (shadow) backends — those backends are secondary/test
+/// endpoints that the Ingress author may not fully control.  Leaking them would
+/// make the mirror a credential-harvesting surface.
+///
+/// `proxy-authorization` is already covered by [`crate::auth::HOP_BY_HOP`];
+/// it is listed here for documentation clarity.
+const MIRROR_CREDENTIAL_HEADERS: &[&str] = &["authorization", "cookie", "proxy-authorization"];
 
 /// Construct a fresh per-request context, seeding from the connection-local
 /// `CONN_INFO` task-local when present (PROXY-protocol path).
@@ -71,6 +84,8 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             affinity_pin: None,
             affinity_set_cookie: false,
             auth_response_headers: None,
+            mirror: None,
+            mirror_body: Vec::new(),
         })
         .unwrap_or_default()
 }
@@ -261,6 +276,84 @@ pub(crate) async fn request_filter<K>(
         metric_route_id: m.metric_route_id,
         cache_enabled: m.cache_enabled,
     });
+
+    // ── Mirror setup (#283) ─────────────────────────────────────────────────
+    // Scan the resolved filters for a Mirror variant. Non-mirror routes pay nothing:
+    // the find_map short-circuits on the first non-Mirror variant without allocating.
+    let mirror_backend = ctx.resolved.as_ref().and_then(|r| {
+        r.filters.iter().find_map(|f| {
+            if let FilterAction::Mirror { backend } = f {
+                Some(Arc::clone(backend))
+            } else {
+                None
+            }
+        })
+    });
+
+    if let Some(mirror_backend) = mirror_backend {
+        let method;
+        let headers: Vec<(String, String)>;
+        {
+            // Re-borrow req_header to capture method + forwardable headers.
+            // The mutable session borrows above (auth, rate-limit, redirect) have already
+            // completed; this is a fresh immutable borrow, released before the ctx mutation.
+            let req = session.req_header();
+            method = req.method.clone();
+            headers = req
+                .headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    let lower = name.as_str().to_ascii_lowercase();
+                    if lower == "host"
+                        || auth::HOP_BY_HOP.contains(&lower.as_str())
+                        || MIRROR_CREDENTIAL_HEADERS.contains(&lower.as_str())
+                    {
+                        return None;
+                    }
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|v| (name.to_string(), v.to_string()))
+                })
+                .collect();
+        } // req borrow released
+
+        let host = ctx
+            .resolved
+            .as_ref()
+            .unwrap_or_else(|| panic!("invariant: resolved is Some after assignment above"))
+            .original_host
+            .clone();
+        let original_path = ctx
+            .resolved
+            .as_ref()
+            .unwrap_or_else(|| panic!("invariant: resolved is Some after assignment above"))
+            .original_path
+            .clone();
+        let path_and_query = match query.as_deref() {
+            Some(q) => format!("{original_path}?{q}"),
+            None => original_path.as_ref().to_string(),
+        };
+
+        let dispatch = MirrorDispatch {
+            backend: mirror_backend,
+            method,
+            host,
+            path_and_query,
+            headers,
+        };
+
+        if ctx.max_body_size.is_none() {
+            // Header-only mode: no body will be buffered; dispatch now.
+            // Covers bodyless methods (GET, HEAD) and routes without max-body-size.
+            spawn_mirror_dispatch(dispatch, auth_client.clone(), Bytes::new());
+        } else {
+            // Body-buffering mode: stash the dispatch; request_body_filter accumulates
+            // chunks and dispatches on end_of_stream.
+            ctx.mirror = Some(dispatch);
+        }
+    }
+
     Ok(false)
 }
 
@@ -422,32 +515,151 @@ pub(crate) fn record_cache_miss(ctx: &ProxyCtx) {
 }
 
 /// Pingora `request_body_filter` body: enforce the per-route request-body size limit
-/// on streaming/chunked uploads.
+/// on streaming/chunked uploads and buffer body chunks for fire-and-forget mirroring.
 ///
-/// Called for every chunk of the request body. Accumulates the running byte count on
-/// the [`ProxyCtx`] and, once it exceeds the route's `max-body-size`, returns
+/// Called for every chunk of the request body (including a final call with
+/// `end_of_stream = true` when the body is complete). Accumulates the running byte
+/// count on the [`ProxyCtx`] and, once it exceeds the route's `max-body-size`, returns
 /// `Err(Error::explain(413, …))`. Pingora propagates that through `fail_to_proxy`,
-/// which writes a clean `413 Payload Too Large` to the client. The body is never
-/// buffered — the `u64` counter is the only state — so this stays within the hot-path
-/// allocation budget. No-ops when the route carries no limit (every Gateway-API route,
-/// and Ingress routes without the annotation).
+/// which writes a clean `413 Payload Too Large` to the client. The body is not buffered
+/// for size enforcement — the `u64` counter is the only state — so this stays within the
+/// hot-path allocation budget. No-ops for size enforcement when the route carries no
+/// limit (every Gateway-API route, and Ingress routes without the annotation).
+///
+/// When `mirror-target` is active and `max-body-size` is set, each chunk is also teed
+/// into [`ProxyCtx::mirror_body`] (a [`Bytes`] refcount clone — no data copy). On
+/// `end_of_stream` the mirror dispatch fires fire-and-forget via [`spawn_mirror_dispatch`].
+/// The `auth_client` is only cloned when a mirror dispatch is triggered (i.e., when
+/// `ctx.mirror.is_some()` and `end_of_stream` is true).
 ///
 /// # Errors
 /// Returns `Error::explain(413, …)` once the cumulative body size exceeds the limit.
-pub(crate) fn request_body_filter(body: Option<&Bytes>, ctx: &mut ProxyCtx) -> Result<()> {
-    let Some(limit) = ctx.max_body_size else {
-        return Ok(());
-    };
-    ctx.body_bytes_seen = ctx
-        .body_bytes_seen
-        .saturating_add(body.map_or(0, Bytes::len) as u64);
-    if ctx.body_bytes_seen > limit {
-        return Err(pingora_core::Error::explain(
-            HTTPStatus(413),
-            "request body exceeds max-body-size",
-        ));
+pub(crate) fn request_body_filter(
+    body: Option<&Bytes>,
+    end_of_stream: bool,
+    auth_client: &reqwest::Client,
+    ctx: &mut ProxyCtx,
+) -> Result<()> {
+    // ── Body size enforcement (unchanged) ────────────────────────────────────
+    if let Some(limit) = ctx.max_body_size {
+        ctx.body_bytes_seen = ctx
+            .body_bytes_seen
+            .saturating_add(body.map_or(0, Bytes::len) as u64);
+        if ctx.body_bytes_seen > limit {
+            return Err(pingora_core::Error::explain(
+                HTTPStatus(413),
+                "request body exceeds max-body-size",
+            ));
+        }
+
+        // ── Mirror body tee ──────────────────────────────────────────────────
+        // Only active when a mirror dispatch is pending and body buffering is configured
+        // (max-body-size implies a bounded buffer; #263 rejects over-cap bodies above,
+        // so the mirror buffer is inherently bounded at the same cap).
+        if ctx.mirror.is_some() {
+            if let Some(chunk) = body
+                && !chunk.is_empty()
+            {
+                ctx.mirror_body.push(chunk.clone()); // refcount bump, no data copy
+            }
+            if end_of_stream && let Some(dispatch) = ctx.mirror.take() {
+                let body_bytes: Bytes = if ctx.mirror_body.is_empty() {
+                    Bytes::new()
+                } else {
+                    let total: usize = ctx.mirror_body.iter().map(Bytes::len).sum();
+                    let mut buf = bytes::BytesMut::with_capacity(total);
+                    for chunk in ctx.mirror_body.drain(..) {
+                        buf.extend_from_slice(&chunk);
+                    }
+                    buf.freeze()
+                };
+                spawn_mirror_dispatch(dispatch, auth_client.clone(), body_bytes);
+            }
+        }
     }
     Ok(())
+}
+
+/// Dispatch a fire-and-forget mirror request, discarding the response.
+///
+/// Spawns a Tokio task that:
+/// 1. Selects one endpoint from `dispatch.backend` via weighted round-robin.
+/// 2. Builds a `reqwest` request with the original method, forwarded headers, and
+///    the assembled body (empty for header-only mirrors).
+/// 3. Sends with a bounded 5-second timeout (mirror latency must not stall the caller).
+/// 4. Discards the response entirely.
+/// 5. Emits a `coxswain_proxy::access` log row tagged `mirror = true` carrying
+///    `host`, `path`, `upstream`, and `status` (the primary observability signal
+///    for mirroring and the e2e side channel for asserting mirror receipt).
+/// 6. Emits `WARN` on connect/send errors or timeout and drops the mirror.
+///
+/// The spawned task owns all its data; no session or primary-path state is borrowed.
+fn spawn_mirror_dispatch(dispatch: MirrorDispatch, client: reqwest::Client, body: Bytes) {
+    tokio::spawn(async move {
+        let Some((addr, _)) = dispatch.backend.next_endpoint_with_filters() else {
+            tracing::warn!(
+                host = %dispatch.host,
+                "mirror-target has no active endpoints — dropping mirror"
+            );
+            return;
+        };
+
+        let scheme = match dispatch.backend.protocol() {
+            BackendProtocol::Https => "https",
+            _ => "http",
+        };
+
+        let url = format!("{scheme}://{addr}{}", dispatch.path_and_query);
+
+        let mut builder = client.request(dispatch.method.clone(), &url).body(body);
+
+        // Re-inject the original Host first (reqwest strips it by default).
+        builder = builder.header(reqwest::header::HOST, dispatch.host.as_ref());
+
+        for (name, value) in &dispatch.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+
+        const MIRROR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let status = match tokio::time::timeout(MIRROR_TIMEOUT, builder.send()).await {
+            Ok(Ok(resp)) => {
+                let s = resp.status().as_u16();
+                // Discard the response body (no await on body, just drop the response).
+                s
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    host = %dispatch.host,
+                    upstream = %addr,
+                    error = %e,
+                    "mirror dispatch failed — dropping mirror"
+                );
+                return;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    host = %dispatch.host,
+                    upstream = %addr,
+                    timeout_ms = MIRROR_TIMEOUT.as_millis(),
+                    "mirror dispatch timed out — dropping mirror"
+                );
+                return;
+            }
+        };
+
+        // Emit an access-log row for the mirror sub-request so operators can
+        // observe mirror traffic and e2e tests can assert mirror receipt.
+        tracing::info!(
+            target: "coxswain_proxy::access",
+            mirror = true,
+            host = %dispatch.host,
+            path = %dispatch.path_and_query,
+            upstream = %addr,
+            status = status,
+            "mirror",
+        );
+    });
 }
 
 /// Pingora `upstream_peer` body: choose the backend address from the resolved

@@ -28,6 +28,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/ssl-redirect-code` | integer | `308` | `"301"` |
 | `ingress.coxswain-labs.dev/backend-protocol` | string | `HTTP` | `"GRPC"` |
 | `ingress.coxswain-labs.dev/max-body-size` | size | _none_ | `"8m"` |
+| `ingress.coxswain-labs.dev/mirror-target` | `svc.ns[:port]` | _none_ | `"echo-b.default.svc:3000"` |
 | `ingress.coxswain-labs.dev/allow-source-range` | cidr-list | _none_ | `"10.0.0.0/8,192.168.1.0/24"` |
 | `ingress.coxswain-labs.dev/cache-enabled` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/session-affinity` | `cookie` or `header` | _none_ | `"cookie"` |
@@ -318,6 +319,54 @@ Enforcement is two-layered and never buffers the whole body:
 - For chunked or streaming uploads (no `Content-Length`), the proxy counts bytes as they arrive and aborts with 413 the moment the running total crosses the limit.
 
 Omitting the annotation imposes no limit. An unparseable value (e.g. `"8mb"`, `"lots"`) emits a controller warning and is treated as absent — the route serves with no body cap rather than being rejected (**fail-open**).
+
+## `mirror-target`
+
+Sends a **fire-and-forget copy** of every matched request to a secondary backend while the primary request completes normally. The mirror response is discarded entirely — the client only ever sees the primary backend's response. Mirror failures (connect error, timeout, bad response) are logged at `WARN` level and do not affect the primary.
+
+**Typical use cases**: shadow-testing a new service version under live traffic, capturing request patterns for offline analysis, dark-launch evaluation.
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/mirror-target: "echo-b.my-namespace.svc:3000"
+```
+
+The value is `<service>.<namespace>[.svc[.cluster.local]]:<port>`:
+
+| Form | Example |
+|------|---------|
+| Short | `echo-b.my-namespace:3000` |
+| `.svc` suffix | `echo-b.my-namespace.svc:3000` |
+| FQDN | `echo-b.my-namespace.svc.cluster.local:3000` |
+
+The mirror target is resolved to pod endpoints at reconcile time (not per-request). If the Service does not exist or has no ready endpoints, a controller warning is emitted and the mirror is **silently disabled** — the primary route still serves. The Ingress is never rejected.
+
+**The target namespace must match the Ingress namespace.** Cross-namespace references are rejected at reconcile time (controller warning + mirror disabled). An Ingress author can only shadow traffic to Services they own — they must not be able to send mirrored requests (which include request headers) to Services in other namespaces.
+
+### Body mirroring
+
+By default (without `max-body-size`) the mirror receives the request headers and an empty body. To mirror the full request body, set `max-body-size` on the same Ingress — the proxy buffers each request body up to the cap and includes it verbatim in the mirror sub-request:
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/mirror-target: "shadow-svc.my-namespace.svc:8080"
+    ingress.coxswain-labs.dev/max-body-size: "1m"
+```
+
+`max-body-size` already rejects requests exceeding the cap with 413, so the mirror buffer is inherently bounded — no additional memory risk is introduced.
+
+!!! note "Body-mirroring for large payloads"
+    Stream-concurrent mirroring (mirror body as it arrives, no buffering) is planned (#360). Until then, mirror with a body cap is the recommended pattern for production use.
+
+### Observability
+
+Every mirror sub-request appears in the **proxy access log** as a separate row with `mirror = true`. The row carries the same fields as a primary row (`host`, `path`, `upstream`, `status`) so mirror traffic is visible in any log aggregation pipeline.
+
+A mirror timeout of 5 s is applied per sub-request; the primary never waits for the mirror to finish.
+
+`Authorization`, `Cookie`, and `Proxy-Authorization` headers are **always stripped** from mirror sub-requests. The mirror backend is a shadow endpoint whose trustworthiness is not guaranteed; forwarding user credentials to it would make it a credential-harvesting surface.
 
 ## `allow-source-range`
 
