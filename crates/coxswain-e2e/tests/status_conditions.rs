@@ -268,10 +268,10 @@ async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     // Programmed=True takes a moment: we wait for both pod readiness and
-    // the operator's reconcile to propagate. 120s window accommodates image
+    // the operator's reconcile to propagate. 60s window accommodates image
     // pull and pod startup on a cold local cluster.
     let gw = wait::poll_until(
-        Duration::from_secs(120),
+        Duration::from_secs(60),
         wait::POLL,
         || async {
             let observed = gateways.get(GATEWAY_NAME).await.ok().map_or_else(
@@ -529,7 +529,7 @@ async fn lifecycle_gateway_status_conditions_and_addresses() -> anyhow::Result<(
 
     fixtures::apply_fixture(dedicated::PROVISIONING, FixtureVars::new(&ns.name)).await?;
 
-    wait::wait_for_gateway_programmed(&h.client, GATEWAY_NAME, &ns.name, Duration::from_secs(120))
+    wait::wait_for_gateway_programmed(&h.client, GATEWAY_NAME, &ns.name, Duration::from_secs(60))
         .await?;
 
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
