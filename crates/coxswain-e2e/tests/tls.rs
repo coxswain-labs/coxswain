@@ -1534,7 +1534,7 @@ async fn backend_tls_policy_cross_namespace_ca_fails_gracefully() -> anyhow::Res
 
     // Once implemented, this test should assert a successful 200 response from echo-tls.
     // Right now, it'll fail or result in 502 Bad Gateway due to missing CA bundle resolution.
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-tls");
 
     Ok(())
