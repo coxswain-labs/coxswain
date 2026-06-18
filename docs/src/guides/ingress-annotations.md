@@ -342,6 +342,8 @@ The value is `<service>.<namespace>[.svc[.cluster.local]]:<port>`:
 
 The mirror target is resolved to pod endpoints at reconcile time (not per-request). If the Service does not exist or has no ready endpoints, a controller warning is emitted and the mirror is **silently disabled** — the primary route still serves. The Ingress is never rejected.
 
+**The target namespace must match the Ingress namespace.** Cross-namespace references are rejected at reconcile time (controller warning + mirror disabled). An Ingress author can only shadow traffic to Services they own — they must not be able to send mirrored requests (which include request headers) to Services in other namespaces.
+
 ### Body mirroring
 
 By default (without `max-body-size`) the mirror receives the request headers and an empty body. To mirror the full request body, set `max-body-size` on the same Ingress — the proxy buffers each request body up to the cap and includes it verbatim in the mirror sub-request:
@@ -363,6 +365,8 @@ metadata:
 Every mirror sub-request appears in the **proxy access log** as a separate row with `mirror = true`. The row carries the same fields as a primary row (`host`, `path`, `upstream`, `status`) so mirror traffic is visible in any log aggregation pipeline.
 
 A mirror timeout of 5 s is applied per sub-request; the primary never waits for the mirror to finish.
+
+`Authorization`, `Cookie`, and `Proxy-Authorization` headers are **always stripped** from mirror sub-requests. The mirror backend is a shadow endpoint whose trustworthiness is not guaranteed; forwarding user credentials to it would make it a credential-harvesting surface.
 
 ## `allow-source-range`
 

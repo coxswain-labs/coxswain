@@ -50,6 +50,17 @@ use pingora_proxy::{FailToProxy, Session};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Headers stripped from mirror sub-requests beyond the standard hop-by-hop set.
+///
+/// `Authorization` and `Cookie` carry per-user credentials that must not be
+/// forwarded to mirror (shadow) backends — those backends are secondary/test
+/// endpoints that the Ingress author may not fully control.  Leaking them would
+/// make the mirror a credential-harvesting surface.
+///
+/// `proxy-authorization` is already covered by [`crate::auth::HOP_BY_HOP`];
+/// it is listed here for documentation clarity.
+const MIRROR_CREDENTIAL_HEADERS: &[&str] = &["authorization", "cookie", "proxy-authorization"];
+
 /// Construct a fresh per-request context, seeding from the connection-local
 /// `CONN_INFO` task-local when present (PROXY-protocol path).
 #[must_use]
@@ -293,7 +304,10 @@ pub(crate) async fn request_filter<K>(
                 .iter()
                 .filter_map(|(name, value)| {
                     let lower = name.as_str().to_ascii_lowercase();
-                    if lower == "host" || auth::HOP_BY_HOP.contains(&lower.as_str()) {
+                    if lower == "host"
+                        || auth::HOP_BY_HOP.contains(&lower.as_str())
+                        || MIRROR_CREDENTIAL_HEADERS.contains(&lower.as_str())
+                    {
                         return None;
                     }
                     value

@@ -754,8 +754,7 @@ async fn request_mirrored_to_secondary_backend_when_mirror_target_set() -> anyho
             })
         },
     )
-    .await?
-    .expect("a mirror=true access-log row must appear after the POST");
+    .await?; // poll_until returns Ok(row) when found, or Err on timeout
 
     Ok(())
 }

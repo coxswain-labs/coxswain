@@ -39,6 +39,12 @@ pub const MAX_BODY_SIZE: &str = "ingress.coxswain-labs.dev/max-body-size";
 ///
 /// Value format: `svc.namespace:port` or `svc.namespace.svc:port` (trailing
 /// `.svc.cluster.local` labels are ignored). Example: `"echo-b.default:3000"`.
+///
+/// **Security constraint**: the target `namespace` must match the Ingress's own namespace.
+/// Cross-namespace references are rejected at reconcile time with a WARN and the mirror
+/// is disabled — an Ingress author must not be able to shadow traffic to services in
+/// namespaces they do not control.  `Authorization`, `Cookie`, and `Proxy-Authorization`
+/// headers are stripped from mirror sub-requests regardless of namespace.
 pub const MIRROR_TARGET: &str = "ingress.coxswain-labs.dev/mirror-target";
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────

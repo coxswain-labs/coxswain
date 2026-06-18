@@ -155,40 +155,54 @@ impl IngressReconciler {
         // Service WARNs and skips the mirror filter — the Ingress keeps serving normally.
         // An empty-endpoint group is installed (proxy WARNs on dispatch and drops the mirror).
         if let Some(ref mirror_ref) = ann.mirror_target {
-            let mirror_ns = &mirror_ref.namespace;
-            let resolved = endpoints::resolve(
-                mirror_ns,
-                &mirror_ref.service,
-                mirror_ref.port as i32,
-                slices,
-                services,
-            );
-            if !resolved.service_exists {
+            // Cross-namespace mirror references are rejected: an Ingress author can only
+            // mirror to Services in the same namespace as the Ingress itself.  Allowing
+            // cross-namespace references would let any Ingress owner redirect (and potentially
+            // leak credentials from) traffic to services in namespaces they don't control.
+            if mirror_ref.namespace != ns {
                 tracing::warn!(
                     ingress = %route_id,
-                    service = %mirror_ref.service,
-                    namespace = %mirror_ns,
-                    port = mirror_ref.port,
-                    "mirror-target Service not found — mirror disabled"
+                    mirror_namespace = %mirror_ref.namespace,
+                    ingress_namespace = %ns,
+                    "mirror-target namespace differs from Ingress namespace — cross-namespace \
+                     mirror references are not permitted; mirror disabled"
                 );
             } else {
-                if resolved.addrs.is_empty() {
+                let mirror_ns = &mirror_ref.namespace;
+                let resolved = endpoints::resolve(
+                    mirror_ns,
+                    &mirror_ref.service,
+                    mirror_ref.port as i32,
+                    slices,
+                    services,
+                );
+                if !resolved.service_exists {
                     tracing::warn!(
                         ingress = %route_id,
                         service = %mirror_ref.service,
                         namespace = %mirror_ns,
                         port = mirror_ref.port,
-                        "mirror-target has no ready endpoints"
+                        "mirror-target Service not found — mirror disabled"
                     );
+                } else {
+                    if resolved.addrs.is_empty() {
+                        tracing::warn!(
+                            ingress = %route_id,
+                            service = %mirror_ref.service,
+                            namespace = %mirror_ns,
+                            port = mirror_ref.port,
+                            "mirror-target has no ready endpoints"
+                        );
+                    }
+                    let mirror_group = Arc::new(BackendGroup::new(
+                        format!("{mirror_ns}/{}", mirror_ref.service),
+                        resolved.addrs,
+                    ));
+                    base_filters.push(FilterAction::Mirror {
+                        backend: mirror_group,
+                    });
                 }
-                let mirror_group = Arc::new(BackendGroup::new(
-                    format!("{mirror_ns}/{}", mirror_ref.service),
-                    resolved.addrs,
-                ));
-                base_filters.push(FilterAction::Mirror {
-                    backend: mirror_group,
-                });
-            }
+            } // end cross-namespace else
         }
 
         // ssl-redirect fires only on the HTTP listener; it is suppressed when an explicit
