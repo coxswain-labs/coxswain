@@ -88,3 +88,22 @@ pub const RATE_LIMIT_MISSING_CR: &str = fixture!("rate_limit_missing_cr.yaml");
 /// shared pool must keep serving. Declares one HTTP listener on
 /// `GATEWAY_HTTP_PORT`.
 pub const CUTOVER_CRASH_LOOP: &str = fixture!("cutover_crash_loop.yaml");
+
+/// HTTPRoute destination port matching.
+pub const DESTINATION_PORT_MATCHING: &str = fixture!("destination_port_matching.yaml");
+
+/// HTTPRoute host rewrite.
+pub const HOST_REWRITE: &str = fixture!("host_rewrite.yaml");
+
+/// HTTPRoute redirect status codes.
+pub const REDIRECT_STATUS_CODES: &str = fixture!("redirect_status_codes.yaml");
+
+/// Gateway empty address.
+pub const EMPTY_ADDRESS: &str = fixture!("empty_address.yaml");
+
+/// BackendTLSPolicy cross-namespace.
+pub const BACKEND_TLS_POLICY_CROSS_NAMESPACE_ROUTE: &str =
+    fixture!("backend_tls_policy_cross_namespace_route.yaml");
+/// BackendTLSPolicy cross-namespace (tenant side).
+pub const BACKEND_TLS_POLICY_CROSS_NAMESPACE_TENANT: &str =
+    fixture!("backend_tls_policy_cross_namespace_tenant.yaml");
