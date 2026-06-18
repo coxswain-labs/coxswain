@@ -405,6 +405,18 @@ pub enum FilterAction {
         /// Path rewrite applied to the upstream request.
         path: Option<PathModifier>,
     },
+    /// Mirror the matched request, fire-and-forget, to a secondary backend.
+    ///
+    /// The primary request is unaffected by the mirror outcome; the mirror response is
+    /// discarded entirely. The backend is resolved to pod endpoints at reconcile time so
+    /// the hot path performs no per-request resolution. Shared with the HTTPRoute
+    /// `HTTPRequestMirrorFilter` surface (#261).
+    ///
+    /// Ingress surface: `ingress.coxswain-labs.dev/mirror-target` (#283).
+    Mirror {
+        /// Pre-resolved mirror backend (round-robins to a concrete endpoint at dispatch time).
+        backend: Arc<BackendGroup>,
+    },
 }
 
 /// Per-rule timeout configuration.
@@ -555,6 +567,24 @@ pub struct BackendGroup {
     /// overhead). Carries each endpoint's stable token and owning backend index so a
     /// pinned selection can recover the right per-backend filters.
     affinity_endpoints: Option<Box<[AffinityEndpoint]>>,
+}
+
+/// Manual `Debug` implementation that avoids the `FilterAction` ↔ `BackendGroup` cycle.
+///
+/// `per_backend_filters` contains `Arc<[FilterAction]>` slices; `FilterAction::Mirror`
+/// embeds `Arc<BackendGroup>` — making these types mutually recursive. Deriving `Debug`
+/// on either would require the other to implement `Debug` first, creating a compile-time
+/// cycle. The manual impl below shows the identifying fields (`name`, endpoint count)
+/// without recursing into `per_backend_filters`, breaking the cycle.
+impl std::fmt::Debug for BackendGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendGroup")
+            .field("name", &self.name)
+            .field("endpoints", &self.addrs_snapshot.len())
+            .field("backends", &self.backends.len())
+            .field("protocol", &self.protocol)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BackendGroup {

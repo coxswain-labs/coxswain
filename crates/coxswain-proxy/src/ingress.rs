@@ -119,13 +119,13 @@ impl ProxyHttp for IngressProxy {
         &self,
         _session: &mut Session,
         body: &mut Option<bytes::Bytes>,
-        _end_of_stream: bool,
+        end_of_stream: bool,
         ctx: &mut ProxyCtx,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync,
     {
-        hooks::request_body_filter(body.as_ref(), ctx)
+        hooks::request_body_filter(body.as_ref(), end_of_stream, &self.cfg.auth_client, ctx)
     }
 
     async fn upstream_peer(

@@ -178,3 +178,14 @@ pub const CLASS_DEFAULT_TIMEOUT: &str = fixture!("class_default_timeout.yaml");
 /// built-in defaults (graceful degrade). Cluster-scoped IngressClass — wrap it in
 /// an `IngressClassGuard`.
 pub const CLASS_DEFAULT_DANGLING: &str = fixture!("class_default_dangling.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/mirror-target: "echo-b.TESTNS.svc:3000"`
+/// and `max-body-size: 1k` (#283). Primary traffic routes to echo-a; every request
+/// is mirrored fire-and-forget to echo-b. Used to verify the access-log
+/// `mirror = true` row appears and the primary response is unaffected.
+pub const ANNOTATION_MIRROR_TARGET: &str = fixture!("annotation_mirror_target.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/mirror-target: "echo-b.TESTNS.svc:9999"` (#283
+/// sad path). Port 9999 has no ready EndpointSlices so the reflector disables the
+/// mirror. Used to verify the primary route still returns 200 and no mirror row
+/// appears in the access log.
+pub const ANNOTATION_MIRROR_TARGET_UNREACHABLE: &str =
+    fixture!("annotation_mirror_target_unreachable.yaml");

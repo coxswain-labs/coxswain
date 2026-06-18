@@ -1,6 +1,8 @@
 //! Per-request and per-connection context types for the Pingora proxy.
 
+use bytes::Bytes;
 use coxswain_core::routing::{BackendGroup, FilterAction, RetryOn, RouteTimeouts};
+use http::Method;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -57,6 +59,26 @@ pub struct ResolvedRoute {
     /// response cache for this request. `false` for every Gateway-API route and
     /// for Ingress routes without the `cache-enabled` annotation.
     pub cache_enabled: bool,
+}
+
+/// Pending fire-and-forget mirror dispatch.
+///
+/// Populated by `request_filter` when the matched route carries a
+/// [`coxswain_core::routing::FilterAction::Mirror`] filter.  Consumed by
+/// `request_body_filter` on end-of-stream (with body) or dispatched immediately
+/// in `request_filter` when no body buffering is configured.
+pub(crate) struct MirrorDispatch {
+    /// Pre-resolved mirror backend; a single endpoint is round-robin-selected at
+    /// dispatch time via [`BackendGroup::next_endpoint_with_filters`].
+    pub backend: Arc<BackendGroup>,
+    /// HTTP method of the original request — forwarded verbatim to the mirror.
+    pub method: Method,
+    /// Original `Host` header value (forwarded as the mirror `Host`).
+    pub host: Arc<str>,
+    /// Path-and-query component, e.g. `/foo?bar=1` (forwarded verbatim).
+    pub path_and_query: String,
+    /// Forwardable request headers (hop-by-hop stripped, `Host` excluded).
+    pub headers: Vec<(String, String)>,
 }
 
 /// Per-request context carrying the real client address extracted from the PROXY header.
@@ -136,6 +158,21 @@ pub struct ProxyCtx {
     /// at the auth-response parsing step so `upstream_request_filter` can use a
     /// case-insensitive comparison without per-request allocation.
     pub auth_response_headers: Option<Vec<(Box<str>, Box<str>)>>,
+    /// Pending fire-and-forget mirror dispatch (#283).
+    ///
+    /// Set in `request_filter` when the route carries a `FilterAction::Mirror` filter
+    /// and `max-body-size` is configured (body-mirroring mode).  `request_body_filter`
+    /// accumulates body chunks in [`Self::mirror_body`] and `take`s this on
+    /// end-of-stream to dispatch. When `max-body-size` is absent (header-only mode),
+    /// this is never set — the dispatch fires immediately in `request_filter`.
+    pub(crate) mirror: Option<MirrorDispatch>,
+    /// Body chunks collected for fire-and-forget body mirroring.
+    ///
+    /// Only populated when [`Self::mirror`] is `Some` and the route has
+    /// `max-body-size` set.  Each chunk is a [`Bytes`] refcount clone of the
+    /// original request chunk — zero data copies.  Consumed (and cleared) by
+    /// `request_body_filter` on end-of-stream.
+    pub mirror_body: Vec<Bytes>,
 }
 
 // Hot types — review with the team before bumping these numbers.
@@ -156,4 +193,7 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 176);
 // padding (#15) (344→376).
 // ProxyCtx: +24 for auth_response_headers: Option<Vec<(Box<str>, Box<str>)>>
 // (niche-opt on Vec's ptr; 24 bytes) (#24) (376→400).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 400);
+// ProxyCtx: +120 for mirror: Option<MirrorDispatch> (96 — method 24, host 16,
+// path_and_query 24, headers 24, backend 8; Option adds niche) + 24 for
+// mirror_body: Vec<Bytes> (#283) (400→520).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 520);
