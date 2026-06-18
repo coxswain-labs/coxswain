@@ -833,3 +833,49 @@ fn route_parent_condition(route: &HTTPRoute, type_: &str) -> Option<(String, Str
             .map(|c| (c.status.clone(), c.reason.clone()))
     })
 }
+
+/// Verifies that a Gateway with no `addresses` field provided is still correctly processed
+/// and its status correctly reflects whatever IP is allocated by the Service.
+#[tokio::test]
+async fn gateway_address_empty_allocates_dynamically() -> anyhow::Result<()> {
+    // Start controller with a specific status address representing the LB IP
+    let h = Harness::start_with_options(ControllerOptions {
+        status_address: Some("203.0.113.8".to_string()),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-empty-addr").await?;
+
+    fixtures::apply_fixture(gwa::EMPTY_ADDRESS, FixtureVars::new(&ns.name)).await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // Wait for the gateway to become Accepted=True and get its addresses populated
+    let (addresses, _) = wait::poll_until(
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        || async {
+            let gw = gw_api.get("coxswain-test").await.unwrap();
+            let cond = gateway_condition(&gw, "Accepted");
+            let addrs = gateway_addresses(&gw);
+            format!("Accepted: {cond:?}, addresses: {addrs:?}")
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let is_accepted = gateway_condition(&gw, "Accepted").is_some_and(|(s, _)| s == "True");
+            let addrs = gateway_addresses(&gw);
+            if is_accepted && !addrs.is_empty() {
+                Some((addrs, gw))
+            } else {
+                None
+            }
+        },
+    )
+    .await?;
+
+    assert_eq!(addresses.len(), 1, "expected exactly one address");
+    assert_eq!(addresses[0].0, "IPAddress");
+    assert_eq!(addresses[0].1, "203.0.113.8");
+
+    Ok(())
+}

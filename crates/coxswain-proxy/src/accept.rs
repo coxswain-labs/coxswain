@@ -41,6 +41,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use crate::SniCertSelector;
 use crate::common::ctx::{CONN_INFO, ConnectionInfo};
@@ -300,7 +301,7 @@ where
 /// its in-flight connections.
 struct ListenerHandle {
     /// Set `true` to stop the accept loop (no new connections on this listener).
-    drain_tx: watch::Sender<bool>,
+    drain_token: CancellationToken,
     /// Set `true` to signal all active connections to close after their
     /// current request completes (Pingora will stop keepalive and close idle
     /// connections on the next loop iteration).
@@ -366,7 +367,7 @@ async fn reconcile_listeners<P>(
                 .with_label_values(&["draining"])
                 .inc();
             // Stop accepting new connections on this listener.
-            let _ = handle.drain_tx.send(true);
+            handle.drain_token.cancel();
             // Signal existing connections: no more keepalive.
             let _ = handle.conn_shutdown_tx.send(true);
             // The listener task is already in `all_tasks`; it will run its
@@ -390,7 +391,7 @@ async fn reconcile_listeners<P>(
                 continue;
             }
         };
-        let (drain_tx, drain_rx) = watch::channel(false);
+        let drain_token = CancellationToken::new();
         let (conn_shutdown_tx, conn_shutdown_rx) = watch::channel(false);
 
         let listener_cfg = ListenerConfig {
@@ -413,7 +414,7 @@ async fn reconcile_listeners<P>(
             addr,
             protocol,
             listener_cfg,
-            drain_rx,
+            drain_token.clone(),
             conn_shutdown_rx,
             global_shutdown.clone(),
         ));
@@ -421,7 +422,7 @@ async fn reconcile_listeners<P>(
         active.insert(
             addr,
             ListenerHandle {
-                drain_tx,
+                drain_token,
                 conn_shutdown_tx,
             },
         );
@@ -431,7 +432,7 @@ async fn reconcile_listeners<P>(
 /// Signal all active listeners to stop accepting and start draining.
 fn signal_all_drain(active: &HashMap<SocketAddr, ListenerHandle>) {
     for handle in active.values() {
-        let _ = handle.drain_tx.send(true);
+        handle.drain_token.cancel();
         let _ = handle.conn_shutdown_tx.send(true);
     }
 }
@@ -447,7 +448,7 @@ async fn run_listener<P>(
     addr: SocketAddr,
     protocol: ListenerProtocol,
     cfg: ListenerConfig<P>,
-    mut drain_rx: watch::Receiver<bool>,
+    drain_token: CancellationToken,
     conn_shutdown_rx: watch::Receiver<bool>,
     mut global_shutdown: ShutdownWatch,
 ) where
@@ -463,8 +464,8 @@ async fn run_listener<P>(
             biased;
 
             // Stop accepting: explicit drain signal.
-            Ok(()) = drain_rx.changed() => {
-                if *drain_rx.borrow() { break; }
+            _ = drain_token.cancelled() => {
+                break;
             }
             // Stop accepting: global process shutdown.
             Ok(()) = global_shutdown.changed() => { break; }
@@ -477,7 +478,7 @@ async fn run_listener<P>(
                             Ok(permit) => {
                                 let handler = ConnHandler {
                                     proxy: Arc::clone(&cfg.proxy),
-                                    trusted: cfg.trusted.clone(),
+                                    trusted: cfg.trusted.as_ref().map(Arc::clone),
                                     tls_selector: cfg.tls_selector.clone(),
                                     local_addr: addr,
                                     protocol,

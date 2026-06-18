@@ -614,20 +614,17 @@ impl ProxyRoleArgs {
             // Invariant: clap's `scope` ArgGroup guarantees exactly one of
             // `shared`/`dedicated` is set, and `required_if_eq` guarantees the
             // identifiers are present whenever `dedicated` is.
-            let name = self.gateway_name.clone().unwrap_or_else(|| {
-                panic!(
-                    "invariant: --gateway-name required by clap scope group when --dedicated is set"
-                )
-            });
-            let namespace = self.gateway_namespace.clone().unwrap_or_else(|| {
-                panic!("invariant: --gateway-namespace required by clap scope group when --dedicated is set")
-            });
-            ProxyScope::Gateway {
-                name,
-                namespace,
-                allow_cluster_wide_route_read: self.allow_cluster_wide_route_read,
-                allow_cluster_wide_namespace_read: self.allow_cluster_wide_namespace_read,
-                watch_namespaces: self.proxy_watch_namespaces.clone(),
+            match (&self.gateway_name, &self.gateway_namespace) {
+                (Some(name), Some(namespace)) => ProxyScope::Gateway {
+                    name: name.clone(),
+                    namespace: namespace.clone(),
+                    allow_cluster_wide_route_read: self.allow_cluster_wide_route_read,
+                    allow_cluster_wide_namespace_read: self.allow_cluster_wide_namespace_read,
+                    watch_namespaces: self.proxy_watch_namespaces.clone(),
+                },
+                _ => panic!(
+                    "invariant: --gateway-name and --gateway-namespace required by clap scope group when --dedicated is set"
+                ),
             }
         }
     }

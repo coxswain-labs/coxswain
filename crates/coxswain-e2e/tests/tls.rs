@@ -1490,3 +1490,52 @@ async fn ingress_ssl_redirect_noop_on_https_listener() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Tracking issue for cross-namespace `BackendTLSPolicy` CA certs.
+/// Currently unsupported per `rbac.rs`. Test validates that we correctly hit the graceful failure mode
+/// (or tracks when it magically starts working so we know to remove the ignore).
+#[ignore = "Cross-namespace BackendTLSPolicy caCertificateRef is currently unsupported (#XXX)"]
+#[tokio::test]
+async fn backend_tls_policy_cross_namespace_ca_fails_gracefully() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns_primary = NamespaceGuard::create(&h.client, "btls-cross-primary").await?;
+    let ns_tenant = NamespaceGuard::create(&h.client, "btls-cross-tenant").await?;
+
+    let host = format!("backend-tls.{}.local", ns_primary.name);
+    let cert = GeneratedCert::for_host(&host);
+
+    // Apply the echo-tls backend in the primary namespace so it matches the policy target.
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns_primary.name)
+            .with("TLS_CRT_B64", cert.cert_b64())
+            .with("TLS_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+
+    // Apply the ConfigMap CA + ReferenceGrant in the tenant namespace
+    let ca_pem_indented = cert.cert_pem.replace("\n", "\n    ");
+    fixtures::apply_fixture(
+        gwa::BACKEND_TLS_POLICY_CROSS_NAMESPACE_TENANT,
+        FixtureVars::new(&ns_tenant.name)
+            .with("TESTNS", &ns_primary.name)
+            .with("CA_PEM", &ca_pem_indented),
+    )
+    .await?;
+
+    // Apply the Gateway, HTTPRoute, and BackendTLSPolicy in the primary namespace
+    fixtures::apply_fixture(
+        gwa::BACKEND_TLS_POLICY_CROSS_NAMESPACE_ROUTE,
+        FixtureVars::new(&ns_primary.name)
+            .with("TENANTNS", &ns_tenant.name)
+            .with("TLS_HOSTNAME", &host),
+    )
+    .await?;
+
+    // Once implemented, this test should assert a successful 200 response from echo-tls.
+    // Right now, it'll fail or result in 502 Bad Gateway due to missing CA bundle resolution.
+    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-tls");
+
+    Ok(())
+}

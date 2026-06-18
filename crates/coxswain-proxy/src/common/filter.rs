@@ -66,12 +66,14 @@ impl TrafficFilter {
             let proto = ctx.real_client_proto.unwrap_or("http");
             // Build the Forwarded value in a single allocation (RFC 7239). IPv6
             // addresses are bracketed (`[2001:db8::1]:12345`); IPv4 are not.
-            let value = match addr {
+            use std::fmt::Write;
+            let mut value = String::with_capacity(64);
+            match addr {
                 std::net::SocketAddr::V4(v4) => {
-                    format!("for=\"{}:{}\";proto={proto}", v4.ip(), v4.port())
+                    let _ = write!(value, "for=\"{}:{}\";proto={proto}", v4.ip(), v4.port());
                 }
                 std::net::SocketAddr::V6(v6) => {
-                    format!("for=\"[{}]:{}\";proto={proto}", v6.ip(), v6.port())
+                    let _ = write!(value, "for=\"[{}]:{}\";proto={proto}", v6.ip(), v6.port());
                 }
             };
             upstream_request.insert_header("Forwarded", value)?;

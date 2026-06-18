@@ -60,6 +60,7 @@ http               = { version = "1" }
 humantime          = { version = "2" }
 ipnet              = { version = "2" }
 itoa               = { version = "1" }
+dashmap            = { version = "5.5" }
 # Enable the "experimental" feature to expose alpha Gateway API resources
 # (GRPCRoute, TCPRoute, BackendTLSPolicy, etc.) and experimental fields on
 # stable CRDs. This feature is for contributor/CI/preview builds ONLY —
@@ -98,6 +99,7 @@ thiserror          = { version = "2.0" }
 tokio              = { version = "1", features = ["full"] }
 tokio-rustls       = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-stream       = { version = "0.1", features = ["sync"] }
+tokio-util         = { version = "0.7", features = ["rt"] }
 tokio-tungstenite  = { version = "0.29" }
 tracing            = { version = "0.1" }
 x509-parser        = { version = "0.18" }

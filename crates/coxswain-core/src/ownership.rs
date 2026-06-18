@@ -49,7 +49,7 @@ pub fn parent_ref_owned(
         return false;
     }
     let ns = namespace.unwrap_or(default_ns);
-    owned.contains(&ObjectKey::new(ns, name))
+    owned.iter().any(|k| k.ns == ns && k.name == name)
 }
 
 #[cfg(test)]

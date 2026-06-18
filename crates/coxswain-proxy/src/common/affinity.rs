@@ -86,7 +86,10 @@ pub(crate) fn inject_set_cookie(
     cookie_name: &str,
     addr: SocketAddr,
 ) -> pingora_core::Result<()> {
-    let value = format!(
+    use std::fmt::Write;
+    let mut value = String::with_capacity(cookie_name.len() + 32);
+    let _ = write!(
+        value,
         "{cookie_name}={token:x}; Path=/; HttpOnly",
         token = affinity_token(addr)
     );

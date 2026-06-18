@@ -1454,3 +1454,109 @@ async fn ingress_invalid_filter_annotation_is_skipped_and_route_still_serves() -
 
     Ok(())
 }
+
+
+
+/// Verifies `urlRewrite.hostname` correctly rewrites the `Host` header sent to the upstream backend.
+#[tokio::test]
+async fn url_rewrite_replaces_request_host() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-host-rewrite").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::HOST_REWRITE, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("rewrite.{}.local", ns.name);
+
+    let resp =
+        wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    let resp = h.gateway_http.get(&host, "/test").await?;
+    resp.assert_backend("echo-a");
+
+    let echo_host = resp
+        .host
+        .as_deref()
+        .expect("missing or invalid host echo");
+
+    let expected_host = format!("new-host.{}.local", ns.name);
+    assert_eq!(
+        echo_host, expected_host,
+        "URLRewrite: expected rewritten host {expected_host:?}, got {echo_host:?}"
+    );
+
+    Ok(())
+}
+
+/// Verifies `RequestRedirect` correctly emits 303, 307, and 308 status codes.
+#[tokio::test]
+async fn request_redirect_returns_various_status_codes() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-redirect-status").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::REDIRECT_STATUS_CODES, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("redirect.{}.local", ns.name);
+
+    let _ = wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+
+    // HTTP 303
+    let req = reqwest::Request::new(
+        Method::GET,
+        format!(
+            "http://{}:{}/303",
+            h.gateway_http.proxy_addr.ip(),
+            h.gateway_http.proxy_addr.port()
+        )
+        .parse()
+        .unwrap(),
+    );
+    let mut req = req;
+    req.headers_mut().insert("Host", host.parse().unwrap());
+
+    // Create a client that doesn't follow redirects.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    let resp = client.execute(req).await?;
+    assert_eq!(resp.status().as_u16(), 303);
+
+    // HTTP 307
+    let req = reqwest::Request::new(
+        Method::GET,
+        format!(
+            "http://{}:{}/307",
+            h.gateway_http.proxy_addr.ip(),
+            h.gateway_http.proxy_addr.port()
+        )
+        .parse()
+        .unwrap(),
+    );
+    let mut req = req;
+    req.headers_mut().insert("Host", host.parse().unwrap());
+    let resp = client.execute(req).await?;
+    assert_eq!(resp.status().as_u16(), 307);
+
+    // HTTP 308
+    let req = reqwest::Request::new(
+        Method::GET,
+        format!(
+            "http://{}:{}/308",
+            h.gateway_http.proxy_addr.ip(),
+            h.gateway_http.proxy_addr.port()
+        )
+        .parse()
+        .unwrap(),
+    );
+    let mut req = req;
+    req.headers_mut().insert("Host", host.parse().unwrap());
+    let resp = client.execute(req).await?;
+    assert_eq!(resp.status().as_u16(), 308);
+
+    Ok(())
+}
