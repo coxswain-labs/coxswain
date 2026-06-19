@@ -57,6 +57,8 @@ spec:
               value: "json"
             - name: COXSWAIN_PROXY_THREADS
               value: "2"
+            - name: COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE
+              value: "128"
             - name: COXSWAIN_HEALTH_PORT
               value: "8081"
             - name: COXSWAIN_ADMIN_PORT

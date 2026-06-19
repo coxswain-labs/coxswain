@@ -250,6 +250,12 @@ proxy:
     # COXSWAIN_PROXY_THREADS — worker threads per proxy service.
     threads: 2
 
+    # COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE — maximum idle upstream
+    # connections held in Pingora's keepalive pool.  Connections beyond this
+    # limit are evicted on an LRU basis.  Raise when high-cardinality
+    # upstream fleets cause frequent reconnects; lower to reduce fd usage.
+    upstreamKeepalivePoolSize: 128
+
     # COXSWAIN_PROXY_BIND_ADDRESS — IP address all proxy data-plane listeners
     # bind to (independent from management.bindAddress).
     bindAddress: "0.0.0.0"
