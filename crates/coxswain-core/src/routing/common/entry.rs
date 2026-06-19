@@ -567,6 +567,16 @@ pub struct BackendGroup {
     /// overhead). Carries each endpoint's stable token and owning backend index so a
     /// pinned selection can recover the right per-backend filters.
     affinity_endpoints: Option<Box<[AffinityEndpoint]>>,
+    /// How long an idle upstream connection stays in Pingora's keepalive pool before
+    /// being evicted, from the Ingress
+    /// `ingress.coxswain-labs.dev/upstream-keepalive-timeout` annotation.
+    ///
+    /// `None` (the default, or an invalid/absent annotation) defers to Pingora's
+    /// built-in behaviour: connections remain in the pool until the pool's LRU
+    /// capacity is exhausted. Gateway API routes always carry `None` (annotation is
+    /// Ingress-only). Applied per-request in `upstream_peer` via
+    /// `HttpPeer.options.idle_timeout`.
+    keepalive_timeout: Option<std::time::Duration>,
 }
 
 /// Manual `Debug` implementation that avoids the `FilterAction` ↔ `BackendGroup` cycle.
@@ -609,6 +619,7 @@ impl BackendGroup {
             per_backend_filters: None,
             session_affinity: None,
             affinity_endpoints: None,
+            keepalive_timeout: None,
         }
     }
 
@@ -659,6 +670,7 @@ impl BackendGroup {
             per_backend_filters: None,
             session_affinity: None,
             affinity_endpoints: None,
+            keepalive_timeout: None,
         }
     }
 
@@ -675,6 +687,7 @@ impl BackendGroup {
             per_backend_filters: None,
             session_affinity: None,
             affinity_endpoints: None,
+            keepalive_timeout: None,
         }
     }
 
@@ -703,6 +716,21 @@ impl BackendGroup {
     #[must_use]
     pub fn with_retries(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Set the upstream keepalive idle timeout (builder-style).
+    ///
+    /// Parsed from the Ingress
+    /// `ingress.coxswain-labs.dev/upstream-keepalive-timeout` annotation.
+    /// `None` (the default, or when the annotation is absent or invalid) leaves
+    /// Pingora's built-in keepalive behaviour unchanged — connections stay in the
+    /// pool until the global LRU capacity forces eviction.
+    ///
+    /// Gateway API routes always leave this `None`; the annotation is Ingress-only.
+    #[must_use]
+    pub fn with_keepalive_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.keepalive_timeout = timeout;
         self
     }
 
@@ -873,6 +901,16 @@ impl BackendGroup {
     /// `retry-on` annotations.
     pub fn retry_policy(&self) -> RetryPolicy {
         self.retry
+    }
+
+    /// Upstream keepalive idle timeout from the
+    /// `ingress.coxswain-labs.dev/upstream-keepalive-timeout` annotation, if any.
+    ///
+    /// `None` means "use Pingora's default" (connections stay in the LRU pool until
+    /// evicted by capacity pressure). The proxy applies this to
+    /// `HttpPeer.options.idle_timeout` in `upstream_peer`.
+    pub fn keepalive_timeout(&self) -> Option<std::time::Duration> {
+        self.keepalive_timeout
     }
 
     /// Flat list of all pod addresses — used by the admin `/api/v1/routes` endpoint.
@@ -1702,5 +1740,36 @@ mod tests {
         );
         let (_, a_filters) = group.endpoint_by_token(affinity_token(a)).unwrap();
         assert!(a_filters.is_none(), "endpoint a has no per-backend filter");
+    }
+
+    // ── with_keepalive_timeout ────────────────────────────────────────────────────
+
+    #[test]
+    fn keepalive_timeout_default_is_none() {
+        let group = BackendGroup::new("ns/svc".to_string(), vec![]);
+        assert!(
+            group.keepalive_timeout().is_none(),
+            "no annotation → None (Pingora default)"
+        );
+    }
+
+    #[test]
+    fn with_keepalive_timeout_round_trips() {
+        let t = std::time::Duration::from_secs(60);
+        let group = BackendGroup::new("ns/svc".to_string(), vec![]).with_keepalive_timeout(Some(t));
+        assert_eq!(
+            group.keepalive_timeout(),
+            Some(t),
+            "with_keepalive_timeout should store and return the duration"
+        );
+    }
+
+    #[test]
+    fn with_keepalive_timeout_none_leaves_none() {
+        let group = BackendGroup::new("ns/svc".to_string(), vec![]).with_keepalive_timeout(None);
+        assert!(
+            group.keepalive_timeout().is_none(),
+            "with_keepalive_timeout(None) must leave the field None"
+        );
     }
 }
