@@ -835,7 +835,9 @@ async fn client_cert_mtls_valid_cert_forwarded_to_backend() -> anyhow::Result<()
     // The proxy must forward the verified cert as X-SSL-Client-Cert when
     // auth-tls-pass-certificate-to-upstream is "true".
     anyhow::ensure!(
-        resp.headers.contains_key("x-ssl-client-cert"),
+        resp.headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("x-ssl-client-cert")),
         "expected X-SSL-Client-Cert header in echo response \
          (auth-tls-pass-certificate-to-upstream=true); \
          got headers: {:?}",
