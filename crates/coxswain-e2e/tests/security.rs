@@ -113,6 +113,155 @@ async fn allow_source_range_out_of_range_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `deny-source-range`: a request whose **real client IP** (carried in the PROXY header)
+/// is inside the deny-listed CIDR is rejected with 403 before reaching any backend
+/// (#268 happy path — block in effect).
+#[tokio::test]
+async fn deny_source_range_blocks_listed_client() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "deny-range-in").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_DENY_SOURCE_RANGE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("denyrange.{}.local", ns.name);
+    // 203.0.113.10 ∈ 203.0.113.0/24 — blocked.
+    // Polling until 403 absorbs route-install latency: before the route exists the
+    // proxy answers 404, so a 403 is an unambiguous signal that the route is live
+    // AND the deny-list blocked this client.
+    let proxy_line = "PROXY TCP4 203.0.113.10 10.0.0.1 12345 80\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        proxy_line,
+        &http_req,
+        403,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// `deny-source-range`: a request whose real client IP is **outside** the deny-listed
+/// CIDR is served normally (#268 negative path — block list does not over-block).
+#[tokio::test]
+async fn deny_source_range_allows_unlisted_client() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "deny-range-out").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_DENY_SOURCE_RANGE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("denyrange.{}.local", ns.name);
+    // 192.0.2.1 ∉ 203.0.113.0/24 — admitted.
+    let proxy_line = "PROXY TCP4 192.0.2.1 10.0.0.1 12345 80\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    let body = wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        proxy_line,
+        &http_req,
+        200,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let echo: EchoResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+    echo.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// `deny-source-range` + `allow-source-range`: when both are set, deny is evaluated
+/// first — a client matching both lists is rejected with 403 (#268 precedence test).
+/// A client in the allow range but not the deny range is admitted normally.
+#[tokio::test]
+async fn deny_takes_precedence_over_allow_when_both_match() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "deny-allow-prec").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_DENY_AND_ALLOW_SOURCE_RANGE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("denyallow.{}.local", ns.name);
+
+    // 203.0.113.5 ∈ deny-list (203.0.113.5/32) AND ∈ allow-list (203.0.113.0/24) — blocked.
+    // Deny wins: polling until 403 confirms the route is live and deny has priority.
+    let deny_line = "PROXY TCP4 203.0.113.5 10.0.0.1 12345 80\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        deny_line,
+        &http_req,
+        403,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // 203.0.113.9 ∉ deny-list AND ∈ allow-list — admitted.
+    let allow_line = "PROXY TCP4 203.0.113.9 10.0.0.1 12345 80\r\n";
+    let body = wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        allow_line,
+        &http_req,
+        200,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let echo: EchoResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+    echo.assert_backend("echo-a");
+
+    Ok(())
+}
+
 /// Poll: send a v1 PROXY header + HTTP request over raw TCP until the response status
 /// equals `want_status`; returns the response body. Self-diagnosing on timeout (renders
 /// the last observed status/error).

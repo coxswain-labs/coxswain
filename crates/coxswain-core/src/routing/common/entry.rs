@@ -1086,6 +1086,16 @@ pub struct RouteEntry {
     /// source IPs. Shared as an `Arc` so cloning into the lookup result is a
     /// refcount bump, not a heap copy, on the hot path.
     pub allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    /// Source-IP block list from the
+    /// `ingress.coxswain-labs.dev/deny-source-range` annotation.
+    ///
+    /// `Some(nets)` rejects any request whose real client IP falls inside any
+    /// listed CIDR with 403 Forbidden, **regardless of `allow_source_range`**
+    /// (deny is evaluated first). `None` (the default) blocks nothing.
+    /// Shared as an `Arc` for the same zero-copy-on-hot-path reason as
+    /// `allow_source_range`. A `None` client IP is *not* denied — a block list
+    /// only acts on IPs it can positively attribute to a listed range.
+    pub deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
     /// RFC 7234 response caching opt-in, from the
     /// `ingress.coxswain-labs.dev/cache-enabled` annotation.
     ///
@@ -1133,6 +1143,7 @@ impl RouteEntry {
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
+            deny_source_range: None,
             cache_enabled: false,
             rate_limit: None,
             auth: None,
@@ -1158,6 +1169,7 @@ impl RouteEntry {
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
+            deny_source_range: None,
             cache_enabled: false,
             rate_limit: None,
             auth: None,
@@ -1188,6 +1200,7 @@ impl RouteEntry {
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
+            deny_source_range: None,
             cache_enabled: false,
             rate_limit: None,
             auth: None,
@@ -1221,6 +1234,7 @@ impl RouteEntry {
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
+            deny_source_range: None,
             cache_enabled: false,
             rate_limit: None,
             auth: None,
@@ -1300,6 +1314,22 @@ impl RouteEntry {
         self
     }
 
+    /// Set the source-IP block list for this route (builder-style).
+    ///
+    /// Used by the Ingress reconciler to attach the CIDR set parsed from the
+    /// `ingress.coxswain-labs.dev/deny-source-range` annotation. `None` (the
+    /// default) blocks nothing. The reconciler shares one `Arc` across every path
+    /// of an Ingress, so cloning it onto each entry is a refcount bump.
+    /// Deny is enforced before `allow_source_range` in the proxy.
+    #[must_use]
+    pub fn with_deny_source_range(
+        mut self,
+        deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    ) -> Self {
+        self.deny_source_range = deny_source_range;
+        self
+    }
+
     /// Enable RFC 7234 response caching for this route (builder-style).
     ///
     /// Used by the Ingress reconciler to attach the
@@ -1350,7 +1380,8 @@ impl RouteEntry {
 // cache_enabled: bool (#40) added without a bump — it occupies existing struct padding.
 // Bumped 280→288 by adding rate_limit: Option<Arc<RateLimitConfig>> (8 bytes, niche pointer) for per-route rate limiting (#25).
 // Bumped 288→296 by adding auth: Option<Arc<IngressAuthConfig>> (8 bytes, niche pointer) for ingress.coxswain-labs.dev/auth-* (#24).
-static_assertions::assert_eq_size!(RouteEntry, [u8; 296]);
+// Bumped 296→304 by adding deny_source_range: Option<Arc<Vec<IpNet>>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/deny-source-range IP block-list (#268).
+static_assertions::assert_eq_size!(RouteEntry, [u8; 304]);
 // Hot type — review with the team before bumping this number.
 static_assertions::assert_eq_size!(BackendPool, [u8; 24]);
 
@@ -1546,7 +1577,8 @@ mod tests {
         // Bumped 272→280: allow_source_range: Option<Arc<Vec<IpNet>>> added for the allow-source-range IP allow-list.
         // Bumped 280→288: rate_limit: Option<Arc<RateLimitConfig>> added for per-route rate limiting (#25).
         // Bumped 288→296: auth: Option<Arc<IngressAuthConfig>> added for auth-* annotations (#24).
-        static_assertions::assert_eq_size!(RouteEntry, [u8; 296]);
+        // Bumped 296→304: deny_source_range: Option<Arc<Vec<IpNet>>> added for the deny-source-range IP block-list (#268).
+        static_assertions::assert_eq_size!(RouteEntry, [u8; 304]);
     }
 
     #[test]
@@ -1571,6 +1603,18 @@ mod tests {
         let entry = RouteEntry::path_only(group, "ns/r".to_string(), None)
             .with_allow_source_range(Some(Arc::clone(&nets)));
         assert_eq!(entry.allow_source_range.as_deref(), Some(&*nets));
+    }
+
+    #[test]
+    fn with_deny_source_range_round_trips() {
+        let group = Arc::new(BackendGroup::new("ns/svc".to_string(), vec![]));
+        let bare = RouteEntry::path_only(Arc::clone(&group), "ns/r".to_string(), None);
+        assert!(bare.deny_source_range.is_none());
+
+        let nets = Arc::new(vec!["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]);
+        let entry = RouteEntry::path_only(group, "ns/r".to_string(), None)
+            .with_deny_source_range(Some(Arc::clone(&nets)));
+        assert_eq!(entry.deny_source_range.as_deref(), Some(&*nets));
     }
 
     #[test]

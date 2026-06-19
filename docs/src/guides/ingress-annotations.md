@@ -30,6 +30,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/max-body-size` | size | _none_ | `"8m"` |
 | `ingress.coxswain-labs.dev/mirror-target` | `svc.ns[:port]` | _none_ | `"echo-b.default.svc:3000"` |
 | `ingress.coxswain-labs.dev/allow-source-range` | cidr-list | _none_ | `"10.0.0.0/8,192.168.1.0/24"` |
+| `ingress.coxswain-labs.dev/deny-source-range` | cidr-list | _none_ | `"1.2.3.0/24,5.6.7.8/32"` |
 | `ingress.coxswain-labs.dev/cache-enabled` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/session-affinity` | `cookie` or `header` | _none_ | `"cookie"` |
 | `ingress.coxswain-labs.dev/session-cookie-name` | string | `__coxswain_session` | `"SESSIONID"` |
@@ -389,6 +390,31 @@ The value is a comma-separated list of IPv4/IPv6 CIDR blocks. A bare address wit
 - An invalid CIDR token emits a controller warning and is **skipped**; the remaining valid ranges still apply.
 - If **every** token is invalid (or the annotation is absent/empty), the allow-list is treated as absent — **all** source IPs are admitted (**fail-open** at parse time, so a typo never locks out all traffic).
 - Once an allow-list is in effect, a request whose source IP cannot be determined is **denied** (**fail-closed** at request time) — an un-attributable client must not pass a security control.
+
+## `deny-source-range`
+
+Blocks a set of client source IPs. A request whose client IP falls inside **any** listed range is rejected with **403 Forbidden** before any upstream connection is opened. All other clients are admitted (unless an `allow-source-range` annotation is also set — see below).
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/deny-source-range: "1.2.3.0/24,5.6.7.8/32"
+```
+
+The value is a comma-separated list of IPv4/IPv6 CIDR blocks. A bare address without a prefix (`10.0.0.1`, `2001:db8::1`) is accepted as a host route (`/32` / `/128`). Whitespace around entries is trimmed.
+
+**Which IP is matched.** Same as `allow-source-range`: the real client IP from the PROXY protocol when available, otherwise the L4 peer address.
+
+**Matching is strict.** CIDR membership is exact per address family — an IPv4-mapped IPv6 client (`::ffff:10.0.0.1`) does **not** match an IPv4 CIDR.
+
+**Evaluation order.** `deny-source-range` is evaluated **before** `allow-source-range`. When both annotations are set, a client IP that falls inside the deny list is rejected with 403 even if the allow-list would have admitted it.
+
+**Unattributable client IP.** If the client's IP cannot be determined, the deny-list does **not** block the request — a block list only acts on IPs it can positively attribute to a listed range. (This is the inverse of `allow-source-range`'s fail-closed behaviour.)
+
+**Failure handling:**
+
+- An invalid CIDR token emits a controller warning and is **skipped**; the remaining valid ranges still apply.
+- If **every** token is invalid (or the annotation is absent/empty), the block list is treated as absent — **no** source IPs are blocked (**fail-open** at parse time, so a typo never silently blocks all traffic).
 
 ## `cache-enabled`
 

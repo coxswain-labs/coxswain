@@ -151,12 +151,32 @@ pub(crate) async fn request_filter<K>(
         return Ok(true);
     };
 
+    // Per-route source-IP block list (ingress.coxswain-labs.dev/deny-source-range).
+    // Evaluated BEFORE the allow-list: a denied IP is blocked even when the allow-list
+    // would admit it. A None client IP is fail-open (not denied) — a block list only
+    // acts on IPs it can positively attribute to a listed range.
+    if let Some(nets) = m.deny_source_range.as_deref() {
+        let client_ip = ctx.real_client_addr.map(|a| a.ip()).or_else(|| {
+            session
+                .as_downstream()
+                .client_addr()
+                .and_then(|a| a.as_inet())
+                .map(|a| a.ip())
+        });
+        if ip_denied(client_ip, nets) {
+            return Err(pingora_core::Error::explain(
+                HTTPStatus(403),
+                "client IP in deny-list",
+            ));
+        }
+    }
+
     // Per-route source-IP allow-list (ingress.coxswain-labs.dev/allow-source-range).
-    // Access control runs first — ahead of redirect and body handling — so an
-    // out-of-range client gets 403 and never receives a redirect (which would leak
-    // the canonical host/URL) nor has its body read. Match the *real* client IP:
-    // the PROXY-protocol peer when present, else the L4 downstream peer. Both are
-    // `Copy`; the CIDR scan borrows the `Arc`'d set — no per-request allocation.
+    // Access control runs ahead of redirect and body handling — so an out-of-range
+    // client gets 403 and never receives a redirect (which would leak the canonical
+    // host/URL) nor has its body read. Match the *real* client IP: the PROXY-protocol
+    // peer when present, else the L4 downstream peer. Both are `Copy`; the CIDR scan
+    // borrows the `Arc`'d set — no per-request allocation.
     if let Some(nets) = m.allow_source_range.as_deref() {
         let client_ip = ctx.real_client_addr.map(|a| a.ip()).or_else(|| {
             session
@@ -365,6 +385,18 @@ pub(crate) async fn request_filter<K>(
 /// default and the `TrustedSources` PROXY-protocol check.
 #[must_use]
 pub(crate) fn ip_allowed(client_ip: Option<std::net::IpAddr>, nets: &[ipnet::IpNet]) -> bool {
+    client_ip.is_some_and(|ip| nets.iter().any(|n| n.contains(&ip)))
+}
+
+/// Returns `true` if `client_ip` falls inside any CIDR in the deny-list `nets`.
+///
+/// Inverse-fail-open on identity: a `None` client IP (peer could not be determined)
+/// is **not** considered to match any CIDR and is therefore **not** denied — a block
+/// list only blocks IPs it can positively attribute to a listed range. This is the
+/// inverse of [`ip_allowed`]'s fail-closed semantics.
+/// Matching is strict (no IPv4-mapped-IPv6 normalization).
+#[must_use]
+pub(crate) fn ip_denied(client_ip: Option<std::net::IpAddr>, nets: &[ipnet::IpNet]) -> bool {
     client_ip.is_some_and(|ip| nets.iter().any(|n| n.contains(&ip)))
 }
 
@@ -1223,7 +1255,7 @@ pub(crate) async fn logging(
 
 #[cfg(test)]
 mod tests {
-    use super::ip_allowed;
+    use super::{ip_allowed, ip_denied};
     use std::net::IpAddr;
 
     fn nets(cidrs: &[&str]) -> Vec<ipnet::IpNet> {
@@ -1281,6 +1313,46 @@ mod tests {
         // Strict matching: an IPv4-mapped IPv6 client does NOT satisfy an IPv4 CIDR.
         // Locks the documented behavior so leniency would be a deliberate change.
         assert!(!ip_allowed(ip("::ffff:10.0.0.1"), &nets(&["10.0.0.0/8"])));
+    }
+
+    // ── ip_denied ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn in_range_v4_denied() {
+        assert!(ip_denied(ip("10.1.2.3"), &nets(&["10.0.0.0/8"])));
+    }
+
+    #[test]
+    fn out_of_range_v4_not_denied() {
+        assert!(!ip_denied(ip("192.168.0.1"), &nets(&["10.0.0.0/8"])));
+    }
+
+    #[test]
+    fn in_range_v6_denied() {
+        assert!(ip_denied(ip("2001:db8::1"), &nets(&["2001:db8::/32"])));
+    }
+
+    #[test]
+    fn out_of_range_v6_not_denied() {
+        assert!(!ip_denied(ip("2001:dead::1"), &nets(&["2001:db8::/32"])));
+    }
+
+    #[test]
+    fn missing_client_ip_is_not_denied_fail_open() {
+        // A peer we cannot attribute must NOT be auto-denied — a block list only
+        // blocks IPs it can positively attribute to a listed range.
+        assert!(!ip_denied(None, &nets(&["10.0.0.0/8"])));
+    }
+
+    #[test]
+    fn empty_deny_list_denies_nothing() {
+        assert!(!ip_denied(ip("10.0.0.1"), &[]));
+    }
+
+    #[test]
+    fn v4_mapped_v6_does_not_match_deny_v4_cidr() {
+        // Strict matching: an IPv4-mapped IPv6 client does NOT match an IPv4 deny CIDR.
+        assert!(!ip_denied(ip("::ffff:10.0.0.1"), &nets(&["10.0.0.0/8"])));
     }
 
     #[test]

@@ -117,6 +117,9 @@ pub(super) struct IngressAnnotations {
     /// Source-IP allow-list (CIDR set) from `allow-source-range` (#264).
     /// `None` (the default, or an all-invalid/absent value) admits all source IPs.
     pub allow_source_range: Option<Vec<ipnet::IpNet>>,
+    /// Source-IP block list (CIDR set) from `deny-source-range` (#268).
+    /// `None` (the default, or an all-invalid/absent value) blocks nothing.
+    pub deny_source_range: Option<Vec<ipnet::IpNet>>,
     /// RFC 7234 response-cache opt-in from `cache-enabled` (#40).
     /// `false` (the default, or an invalid value) leaves caching off.
     pub cache_enabled: bool,
@@ -395,6 +398,9 @@ impl IngressAnnotations {
         // ── Allow-source-range (#264) ─────────────────────────────────────────
         let allow_source_range = get(ann, ALLOW_SOURCE_RANGE).and_then(parse_allow_source_range);
 
+        // ── Deny-source-range (#268) ──────────────────────────────────────────
+        let deny_source_range = get(ann, DENY_SOURCE_RANGE).and_then(parse_deny_source_range);
+
         // ── Response caching (#40) ────────────────────────────────────────────
         let cache_enabled = get(ann, CACHE_ENABLED)
             .and_then(parse_cache_enabled)
@@ -461,6 +467,7 @@ impl IngressAnnotations {
             ssl_redirect_code,
             max_body_size,
             allow_source_range,
+            deny_source_range,
             cache_enabled,
             session_affinity,
             rate_limit,

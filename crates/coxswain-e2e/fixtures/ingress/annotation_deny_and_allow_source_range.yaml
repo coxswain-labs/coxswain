@@ -1,0 +1,28 @@
+# deny-source-range + allow-source-range combined fixture (apply backends::ECHO first).
+#
+# The Ingress allows 203.0.113.0/24 but blocks 203.0.113.5/32 specifically.
+# Deny is evaluated before allow, so a client in both the allow and deny ranges
+# must be rejected with 403 (deny wins). A client in the allow range but not in
+# the deny range must be admitted (200).
+#
+# Host: denyallow.TESTNS.local -> echo-a:3000.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: deny-and-allow-source-range-ingress
+  annotations:
+    ingress.coxswain-labs.dev/allow-source-range: "203.0.113.0/24"
+    ingress.coxswain-labs.dev/deny-source-range: "203.0.113.5/32"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: denyallow.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
