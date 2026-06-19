@@ -138,6 +138,12 @@ pub(super) struct IngressAnnotations {
     /// unparseable (WARN emitted; mirror disabled).  The reconciler resolves this
     /// into a `FilterAction::Mirror` by looking up the Service endpoints.
     pub mirror_target: Option<traffic_policy::MirrorTargetRef>,
+    /// Upstream keepalive idle timeout from
+    /// `ingress.coxswain-labs.dev/upstream-keepalive-timeout` (#266).
+    /// `None` (the default, or an absent/invalid value — WARN emitted) defers to
+    /// Pingora's built-in behaviour. Applied in the proxy via
+    /// `HttpPeer.options.idle_timeout`.
+    pub keepalive_timeout: Option<std::time::Duration>,
 }
 
 impl IngressAnnotations {
@@ -422,6 +428,20 @@ impl IngressAnnotations {
             r
         });
 
+        // ── Upstream keepalive timeout (#266) ─────────────────────────────────
+        let keepalive_timeout = get(ann, UPSTREAM_KEEPALIVE_TIMEOUT).and_then(|v| {
+            let d = parse_duration(v);
+            if d.is_none() {
+                tracing::warn!(
+                    ingress = %route_id,
+                    annotation = UPSTREAM_KEEPALIVE_TIMEOUT,
+                    value = v,
+                    "invalid duration — using Pingora default keepalive timeout"
+                );
+            }
+            d
+        });
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -446,6 +466,7 @@ impl IngressAnnotations {
             rate_limit,
             auth,
             mirror_target,
+            keepalive_timeout,
         }
     }
 }
