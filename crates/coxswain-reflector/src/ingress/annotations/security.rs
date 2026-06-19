@@ -20,6 +20,31 @@ pub const ALLOW_SOURCE_RANGE: &str = "ingress.coxswain-labs.dev/allow-source-ran
 /// Bare addresses without a prefix are accepted as host routes (`/32` / `/128`).
 pub const DENY_SOURCE_RANGE: &str = "ingress.coxswain-labs.dev/deny-source-range";
 
+/// Master switch for trusting a forwarded client-IP header on this Ingress.
+/// When `"true"`, the proxy reads the client IP from the header named by
+/// `forwarded-for-header` (default `X-Forwarded-For`) instead of the L4 peer.
+/// When combined with `forwarded-for-trusted-cidrs`, the header is only trusted
+/// when the L4 peer IP falls inside one of those CIDRs (anti-spoofing guard).
+/// When absent or `"false"`, the L4 peer address is always used (current behavior).
+pub const TRUST_FORWARDED_FOR: &str = "ingress.coxswain-labs.dev/trust-forwarded-for";
+
+/// Header name from which to read the real client IP when `trust-forwarded-for`
+/// is `"true"`.  Defaults to `X-Forwarded-For` when absent.  The proxy performs a
+/// case-insensitive header lookup, so `x-forwarded-for`, `X-Forwarded-For`, and
+/// `CF-Connecting-IP` are all valid values.  The first non-private IP in the
+/// header value is used as the client IP.
+pub const FORWARDED_FOR_HEADER: &str = "ingress.coxswain-labs.dev/forwarded-for-header";
+
+/// Comma-separated IPv4/IPv6 CIDR blocks that identify trusted upstream proxies.
+/// When set, the forwarded header is only trusted when the L4 peer IP falls
+/// inside one of these CIDRs; requests from outside the list use the L4 peer
+/// address directly, preventing spoofing from untrusted callers.  When absent,
+/// the header is trusted unconditionally (suitable when Coxswain is always behind
+/// a controlled proxy).  Bare addresses without a prefix are accepted as host
+/// routes (`/32` / `/128`).
+pub const FORWARDED_FOR_TRUSTED_CIDRS: &str =
+    "ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs";
+
 /// Sustained rate limit in requests per second. Must be a positive integer >= 1.
 /// When absent or invalid, rate limiting is disabled for the route (fail-open).
 pub const RATE_LIMIT_RPS: &str = "ingress.coxswain-labs.dev/rate-limit-rps";
@@ -56,6 +81,51 @@ pub fn parse_allow_source_range(s: &str) -> Option<Vec<ipnet::IpNet>> {
 #[must_use]
 pub fn parse_deny_source_range(s: &str) -> Option<Vec<ipnet::IpNet>> {
     parse_cidr_list(s, "deny-source-range")
+}
+
+/// Parse the `trust-forwarded-for` annotation cluster into a [`ForwardedForConfig`].
+///
+/// Returns `None` when `trust-forwarded-for` is absent or does not parse as
+/// `"true"` — the proxy uses the L4 peer address as the client IP (current
+/// behavior, fail-safe). When truthy, the header name defaults to
+/// `X-Forwarded-For` when `forwarded-for-header` is absent. Invalid CIDR tokens
+/// in `forwarded-for-trusted-cidrs` emit a `WARN` and are skipped; a completely
+/// empty list after skipping is treated the same as absent (trust unconditionally).
+///
+/// # Arguments
+/// * `annotations` — raw annotation map for the Ingress.
+/// * `route_id` — human-readable identifier used in `WARN` log messages.
+#[must_use]
+pub fn parse_forwarded_for(
+    annotations: &std::collections::BTreeMap<String, String>,
+    route_id: &str,
+) -> Option<coxswain_core::routing::ForwardedForConfig> {
+    use coxswain_core::routing::ForwardedForConfig;
+
+    let trust = super::get(annotations, TRUST_FORWARDED_FOR)?;
+    if !super::parse_bool(trust).unwrap_or(false) {
+        if super::parse_bool(trust).is_none() {
+            tracing::warn!(
+                ingress = %route_id,
+                annotation = TRUST_FORWARDED_FOR,
+                value = trust,
+                "invalid trust-forwarded-for — expected \"true\" or \"false\"; treating as false"
+            );
+        }
+        return None;
+    }
+
+    let header: Box<str> = super::get(annotations, FORWARDED_FOR_HEADER)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| Box::from(s.trim()))
+        .unwrap_or_else(|| Box::from("X-Forwarded-For"));
+
+    let trusted_cidrs: Box<[ipnet::IpNet]> = super::get(annotations, FORWARDED_FOR_TRUSTED_CIDRS)
+        .and_then(|s| parse_cidr_list(s, "forwarded-for-trusted-cidrs"))
+        .unwrap_or_default()
+        .into_boxed_slice();
+
+    Some(ForwardedForConfig::new(header, trusted_cidrs))
 }
 
 /// Shared CIDR-list parser used by both `parse_allow_source_range` and
@@ -283,6 +353,78 @@ mod tests {
     fn deny_parse_empty_is_none() {
         assert!(parse_deny_source_range("").is_none());
         assert!(parse_deny_source_range("  ,  ").is_none());
+    }
+
+    // ── trust-forwarded-for ───────────────────────────────────────────────────
+
+    fn ann(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn forwarded_for_absent_is_none() {
+        // References all three consts to satisfy check-annotation-coverage.sh part (a).
+        let _ = TRUST_FORWARDED_FOR;
+        let _ = FORWARDED_FOR_HEADER;
+        let _ = FORWARDED_FOR_TRUSTED_CIDRS;
+        assert!(parse_forwarded_for(&ann(&[]), "ns/test").is_none());
+    }
+
+    #[test]
+    fn forwarded_for_false_is_none() {
+        let m = ann(&[(TRUST_FORWARDED_FOR, "false")]);
+        assert!(parse_forwarded_for(&m, "ns/test").is_none());
+    }
+
+    #[test]
+    fn forwarded_for_true_defaults_to_x_forwarded_for() {
+        let m = ann(&[(TRUST_FORWARDED_FOR, "true")]);
+        let cfg = parse_forwarded_for(&m, "ns/test").expect("Some");
+        assert_eq!(&*cfg.header, "X-Forwarded-For");
+        assert!(cfg.trusted_cidrs.is_empty());
+    }
+
+    #[test]
+    fn forwarded_for_custom_header() {
+        let m = ann(&[
+            (TRUST_FORWARDED_FOR, "true"),
+            (FORWARDED_FOR_HEADER, "CF-Connecting-IP"),
+        ]);
+        let cfg = parse_forwarded_for(&m, "ns/test").expect("Some");
+        assert_eq!(&*cfg.header, "CF-Connecting-IP");
+    }
+
+    #[test]
+    fn forwarded_for_trusted_cidrs_populated() {
+        let m = ann(&[
+            (TRUST_FORWARDED_FOR, "true"),
+            (FORWARDED_FOR_TRUSTED_CIDRS, "10.0.0.0/8,192.168.0.0/16"),
+        ]);
+        let cfg = parse_forwarded_for(&m, "ns/test").expect("Some");
+        assert_eq!(cfg.trusted_cidrs.len(), 2);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn forwarded_for_bad_cidr_warns_and_is_skipped() {
+        let m = ann(&[
+            (TRUST_FORWARDED_FOR, "true"),
+            (FORWARDED_FOR_TRUSTED_CIDRS, "10.0.0.0/8,not-a-cidr"),
+        ]);
+        let cfg = parse_forwarded_for(&m, "ns/test").expect("Some");
+        assert_eq!(cfg.trusted_cidrs.len(), 1);
+        assert!(logs_contain("invalid CIDR"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn forwarded_for_invalid_bool_warns_and_is_none() {
+        let m = ann(&[(TRUST_FORWARDED_FOR, "yes")]);
+        assert!(parse_forwarded_for(&m, "ns/test").is_none());
+        assert!(logs_contain("invalid trust-forwarded-for"));
     }
 
     // ── rate-limit annotation coverage ────────────────────────────────────────

@@ -31,6 +31,9 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/mirror-target` | `svc.ns[:port]` | _none_ | `"echo-b.default.svc:3000"` |
 | `ingress.coxswain-labs.dev/allow-source-range` | cidr-list | _none_ | `"10.0.0.0/8,192.168.1.0/24"` |
 | `ingress.coxswain-labs.dev/deny-source-range` | cidr-list | _none_ | `"1.2.3.0/24,5.6.7.8/32"` |
+| `ingress.coxswain-labs.dev/trust-forwarded-for` | boolean | `false` | `"true"` |
+| `ingress.coxswain-labs.dev/forwarded-for-header` | string | `X-Forwarded-For` | `"CF-Connecting-IP"` |
+| `ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs` | cidr-list | _none_ (unconditional) | `"10.0.0.0/8"` |
 | `ingress.coxswain-labs.dev/cache-enabled` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/session-affinity` | `cookie` or `header` | _none_ | `"cookie"` |
 | `ingress.coxswain-labs.dev/session-cookie-name` | string | `__coxswain_session` | `"SESSIONID"` |
@@ -389,7 +392,7 @@ metadata:
 
 The value is a comma-separated list of IPv4/IPv6 CIDR blocks. A bare address without a prefix (`10.0.0.1`, `2001:db8::1`) is accepted as a host route (`/32` / `/128`). Whitespace around entries is trimmed.
 
-**Which IP is matched.** When the proxy sits behind a load balancer speaking the [PROXY protocol](../reference/configuration.md) (`--proxy-accept-proxy-protocol`), the match uses the **real client IP** carried in the PROXY header. Otherwise it uses the L4 peer address of the connection. Deploy behind a PROXY-protocol-aware load balancer (or set `externalTrafficPolicy: Local`) so the proxy observes real client IPs rather than the LB's address.
+**Which IP is matched.** When the proxy sits behind a load balancer speaking the [PROXY protocol](../reference/configuration.md) (`--proxy-accept-proxy-protocol`), the match uses the **real client IP** carried in the PROXY header. Otherwise it uses the L4 peer address of the connection. Deploy behind a PROXY-protocol-aware load balancer (or set `externalTrafficPolicy: Local`) so the proxy observes real client IPs rather than the LB's address. When `trust-forwarded-for` is also set, see the [Trusted proxy headers](#trust-forwarded-for) section — the effective client IP may come from a forwarded header instead.
 
 **Matching is strict.** CIDR membership is exact per address family — an IPv4-mapped IPv6 client (`::ffff:10.0.0.1`) does **not** match an IPv4 CIDR. List both families if your clients can arrive over either.
 
@@ -411,7 +414,7 @@ metadata:
 
 The value is a comma-separated list of IPv4/IPv6 CIDR blocks. A bare address without a prefix (`10.0.0.1`, `2001:db8::1`) is accepted as a host route (`/32` / `/128`). Whitespace around entries is trimmed.
 
-**Which IP is matched.** Same as `allow-source-range`: the real client IP from the PROXY protocol when available, otherwise the L4 peer address.
+**Which IP is matched.** Same as `allow-source-range`: the real client IP from the PROXY protocol when available, otherwise the L4 peer address. When `trust-forwarded-for` is also set, the effective client IP may come from a forwarded header — see [Trusted proxy headers](#trust-forwarded-for).
 
 **Matching is strict.** CIDR membership is exact per address family — an IPv4-mapped IPv6 client (`::ffff:10.0.0.1`) does **not** match an IPv4 CIDR.
 
@@ -423,6 +426,66 @@ The value is a comma-separated list of IPv4/IPv6 CIDR blocks. A bare address wit
 
 - An invalid CIDR token emits a controller warning and is **skipped**; the remaining valid ranges still apply.
 - If **every** token is invalid (or the annotation is absent/empty), the block list is treated as absent — **no** source IPs are blocked (**fail-open** at parse time, so a typo never silently blocks all traffic).
+
+## `trust-forwarded-for`
+
+Lets the proxy extract the **real client IP** from a forwarded-for header — necessary when Coxswain sits behind a cloud LB or CDN that terminates the connection and puts the original client IP in a header like `X-Forwarded-For` or `CF-Connecting-IP`.
+
+Without this annotation, IP-based features (`allow-source-range`, `deny-source-range`, `rate-limit-by: ip`) always see the **L4 peer address** (the LB's IP), making per-client controls ineffective behind a proxy.
+
+**Master switch — disabled by default** to prevent header injection by untrusted peers:
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/trust-forwarded-for: "true"
+```
+
+### IP resolution algorithm
+
+When `trust-forwarded-for: "true"` is set, the proxy resolves the effective client IP once per request (after route matching) using this four-step algorithm:
+
+1. **L4 base IP** — real client addr from PROXY protocol if present, otherwise the TCP peer addr.
+2. **No config** — if the Ingress has no `trust-forwarded-for`, use the L4 base IP (current behavior unchanged).
+3. **CIDR gate** — if `forwarded-for-trusted-cidrs` is non-empty AND the L4 base IP is **not** in any listed CIDR, the forwarded header is ignored (anti-spoofing) and the L4 base IP is used.
+4. **Header parse** — parse the configured header (default `X-Forwarded-For`), scan the comma-separated IP list left-to-right, and use the **first non-private IP** found. If no non-private IP is found, fall back to the L4 base IP.
+
+"Private/reserved" means RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), loopback (`127/8`, `::1`), link-local (`169.254/16`, `fe80::/10`), ULA (`fc00::/7`), and unspecified.
+
+### `forwarded-for-header`
+
+Which header to read the forwarded IP from. Defaults to `X-Forwarded-For`. Override for CDNs that use a proprietary header:
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/trust-forwarded-for: "true"
+    ingress.coxswain-labs.dev/forwarded-for-header: "CF-Connecting-IP"
+```
+
+Header lookup is case-insensitive. The value is trimmed of surrounding whitespace. If the annotation is absent or empty, `X-Forwarded-For` is used.
+
+### `forwarded-for-trusted-cidrs`
+
+The anti-spoofing gate: only trust the forwarded header when the **L4 peer address** is inside one of the listed CIDRs. A request from a peer outside this list is treated as if `trust-forwarded-for` were off — the forwarded header is silently ignored and the L4 IP is used instead.
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/trust-forwarded-for: "true"
+    ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs: "10.0.0.0/8,172.16.0.0/12"
+```
+
+The value is a comma-separated list of IPv4/IPv6 CIDR blocks (same format as `allow-source-range`). Whitespace is trimmed.
+
+**When absent or empty**, the forwarded header is trusted unconditionally for **every** L4 peer — only do this when the deployment topology guarantees that only a trusted proxy can reach Coxswain directly.
+
+**Security note.** Always set `forwarded-for-trusted-cidrs` to the IP range of your load balancer or CDN edge nodes. Without it, any client that can reach the proxy port can forge the forwarded header and bypass IP-based controls.
+
+**Failure handling:**
+
+- An invalid CIDR token emits a controller warning and is skipped.
+- If every token is invalid, the CIDR list is treated as absent (unconditional trust) and a controller warning is emitted.
 
 ## `cache-enabled`
 

@@ -19,9 +19,10 @@ pub use common::auth::{
 };
 pub use common::compression::CompressionConfig;
 pub use common::entry::{
-    BackendGroup, BackendProtocol, FilterAction, HeaderMod, HeaderModError, PathModifier, RetryOn,
-    RetryPolicy, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts, SessionAffinity,
-    UpstreamCa, UpstreamTls, affinity_hash, affinity_token, parse_app_protocol,
+    BackendGroup, BackendProtocol, FilterAction, ForwardedForConfig, HeaderMod, HeaderModError,
+    PathModifier, RetryOn, RetryPolicy, RouteConflict, RouteEntry, RouteInfo, RouteKind,
+    RouteTimeouts, SessionAffinity, UpstreamCa, UpstreamTls, affinity_hash, affinity_token,
+    parse_app_protocol,
 };
 pub use common::host_router::{
     HostRouter, HostRouterBuilder, RouteMatch, WildcardKind, compile_path_regex,

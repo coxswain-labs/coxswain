@@ -202,6 +202,16 @@ pub struct ProxyCtx {
     /// `X-SSL-Client-Cert` header (URL-encoded PEM).  `None` (the common case)
     /// incurs no cost.
     pub client_cert_pem: Option<String>,
+    /// Effective client IP resolved in `request_filter` (#271).
+    ///
+    /// When the matched route carries a `ForwardedForConfig`, this is the first
+    /// non-private IP extracted from the configured forwarded header (if the L4
+    /// peer is within the trusted CIDRs, or unconditionally when no CIDRs are
+    /// set); otherwise it is the PROXY-protocol addr (`real_client_addr`) or the
+    /// L4 peer. Computed once per request and consumed by allow/deny-source-range,
+    /// rate limiting, and access logging.  `None` when the peer address could not
+    /// be determined.
+    pub client_ip: Option<std::net::IpAddr>,
 }
 
 // Hot types — review with the team before bumping these numbers.
@@ -230,4 +240,5 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 184);
 // ProxyCtx: +16 for compression_encoder: Option<Box<dyn Encode + Send + Sync>>
 // (fat pointer, niche-opted, 16 bytes) (#270) (528→544).
 // ProxyCtx: +24 for client_cert_pem: Option<String> (niche-opt on String's ptr; 24 bytes) (#267) (544→568).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 568);
+// ProxyCtx: +16 for client_ip: Option<IpAddr> (17 bytes packed into existing alignment gap by Rust layout; 568→584) (#271).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 584);

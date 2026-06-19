@@ -1,2 +1,5 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+# RouteMatch (208 bytes) in RouteOutcome::Found is intentionally stack-resident: it's
+# per-request short-lived data and boxing it would add a gratuitous heap allocation.
+enum-variant-size-threshold = 300
