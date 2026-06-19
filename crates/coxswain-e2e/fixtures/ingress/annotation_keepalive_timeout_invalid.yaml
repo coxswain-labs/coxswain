@@ -1,0 +1,26 @@
+# upstream-keepalive-timeout sad-path fixture (apply backends::ECHO first).
+#
+# The annotation value "notaduration" is unparseable, so the proxy must treat the
+# timeout as absent (fail-open) and serve requests normally using Pingora's default
+# LRU-eviction keepalive behaviour. Proves an invalid timeout never blocks traffic.
+#
+# Host: keepalivebad.TESTNS.local → echo-a:3000.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keepalive-invalid-ingress
+  annotations:
+    ingress.coxswain-labs.dev/upstream-keepalive-timeout: "notaduration"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: keepalivebad.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

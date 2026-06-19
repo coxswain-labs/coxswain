@@ -839,3 +839,106 @@ async fn requests_round_robin_across_backends_when_no_affinity_annotation() -> a
     );
     Ok(())
 }
+
+/// Happy path (#266): `ingress.coxswain-labs.dev/upstream-keepalive-timeout: 60s`
+/// causes Pingora to keep idle upstream connections alive for 60 s.
+///
+/// After the route is installed, 20 sequential requests are fired on a single
+/// keep-alive client connection. At least one of those requests must reuse an
+/// existing upstream connection — asserted via
+/// `coxswain_proxy_upstream_connections_total{state="reused"}` on the admin
+/// /metrics endpoint.
+///
+/// Determinism: all requests go to the same single-backend route; a 60-second
+/// idle window exceeds any CI scheduling jitter between sequential HTTP requests.
+/// No bare sleeps — the metric assert is polled via `poll_until`.
+#[tokio::test]
+async fn upstream_keepalive_reuses_connections() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "kp-reuse").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_KEEPALIVE_TIMEOUT,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("keepalive.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    // Fire 20 sequential requests — the keepalive pool is warm after the first,
+    // so every subsequent request reuses the existing upstream connection.
+    for i in 0..20u32 {
+        let (status, _, _) = h.http.get_full(&host, "/").await?;
+        assert_eq!(status, 200, "sequential request {i} must return 200");
+    }
+
+    // Poll the admin metrics endpoint until the reused counter appears and is > 0.
+    wait::poll_until(
+        Duration::from_secs(10),
+        wait::POLL,
+        || async {
+            "coxswain_proxy_upstream_connections_total{state=\"reused\"} to be > 0".to_string()
+        },
+        || async {
+            let metrics = reqwest::get(h.admin_url("/metrics"))
+                .await
+                .ok()?
+                .text()
+                .await
+                .ok()?;
+            // The Prometheus text format line looks like:
+            //   coxswain_proxy_upstream_connections_total{state="reused"} N
+            // We parse the N and check it is > 0.
+            metrics.lines().find_map(|line| {
+                if line.starts_with("coxswain_proxy_upstream_connections_total{")
+                    && line.contains("state=\"reused\"")
+                {
+                    let count: u64 = line.split_whitespace().last()?.parse().ok()?;
+                    if count > 0 { Some(count) } else { None }
+                } else {
+                    None
+                }
+            })
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("reused connection counter never climbed above 0: {e}"))?;
+
+    Ok(())
+}
+
+/// Sad path (#266): an unparseable `upstream-keepalive-timeout` value is ignored
+/// (fail-open) — the route must still serve 2xx requests normally.
+///
+/// The WARN emitted by the reflector parse path is verified by the unit tests
+/// in `coxswain-reflector::ingress::annotations::traffic_policy`; this test
+/// only checks that the data plane is unaffected.
+#[tokio::test]
+async fn upstream_keepalive_invalid_timeout_keeps_serving() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "kp-bad").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_KEEPALIVE_TIMEOUT_INVALID,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("keepalivebad.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let (status, _, body) = h.http.get_full(&host, "/").await?;
+    assert_eq!(
+        status, 200,
+        "route with unparseable keepalive-timeout must still return 200 (fail-open)"
+    );
+    body.expect("response body must be present")
+        .assert_backend("echo-a");
+
+    Ok(())
+}
