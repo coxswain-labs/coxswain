@@ -202,6 +202,169 @@ impl TlsStoreBuilder {
 /// independently of route edits) and are swapped independently.
 pub type SharedTlsStore = Shared<TlsStore>;
 
+// ---------------------------------------------------------------------------
+// Client-certificate mTLS store (#267)
+// ---------------------------------------------------------------------------
+
+/// Per-host client-certificate mTLS state resolved from an [`Ingress`] annotation.
+///
+/// Keyed by SNI host pattern in [`ClientCertStore`] and read by the proxy during
+/// every TLS handshake. The enum is crypto-free; PEM parsing happens at reconcile
+/// time (reflector) and at handshake time (proxy).
+///
+/// [`Ingress`]: k8s_openapi::api::networking::v1::Ingress
+#[non_exhaustive]
+#[derive(Debug, PartialEq)]
+pub enum ClientCertConfigState {
+    /// mTLS configured and the CA Secret was resolved successfully.
+    Config(ClientCertConfig),
+    /// The annotation is present but the CA Secret was missing, unlabeled,
+    /// lacked a `ca.crt` key, or held unparseable PEM. Fail-closed: the proxy
+    /// aborts every TLS handshake to this host until the Secret is corrected.
+    Unavailable,
+}
+
+/// Resolved client-certificate mTLS configuration for a single Ingress host.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct ClientCertConfig {
+    /// PEM-encoded CA certificate bundle sourced from `Secret.data["ca.crt"]`.
+    pub ca_pem: Vec<u8>,
+    /// Maximum client-certificate chain verification depth. Default is `1`
+    /// (leaf certificate only, matching Istio's default for `tls.mode: MUTUAL`).
+    pub verify_depth: u32,
+    /// When `true` the verified client certificate is forwarded to the upstream
+    /// as `X-SSL-Client-Cert` (URL-encoded PEM).
+    pub pass_to_upstream: bool,
+}
+
+impl ClientCertConfig {
+    /// Construct a new [`ClientCertConfig`].
+    pub fn new(ca_pem: Vec<u8>, verify_depth: u32, pass_to_upstream: bool) -> Self {
+        Self {
+            ca_pem,
+            verify_depth,
+            pass_to_upstream,
+        }
+    }
+}
+
+/// Equality compares PEM bytes, depth, and pass flag only. The diagnostic `source`
+/// label (if any) is excluded so a CA moving between Secrets does not churn the
+/// [`ArcSwap`] — same pattern as [`TlsCert`].
+///
+/// [`ArcSwap`]: arc_swap::ArcSwap
+impl PartialEq for ClientCertConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.ca_pem == other.ca_pem
+            && self.verify_depth == other.verify_depth
+            && self.pass_to_upstream == other.pass_to_upstream
+    }
+}
+
+/// Immutable snapshot of per-host mTLS configuration, keyed by SNI pattern.
+///
+/// Built once per reconcile cycle and shared read-only with the proxy via
+/// [`SharedClientCertStore`]. Swapped independently of [`SharedTlsStore`] so
+/// CA rotation does not churn the server-cert snapshot.
+#[non_exhaustive]
+#[derive(Debug, Default, PartialEq)]
+pub struct ClientCertStore {
+    exact: HashMap<String, Arc<ClientCertConfigState>>,
+    /// Sorted most-specific (longest suffix) first.
+    wildcard: Vec<(String, Arc<ClientCertConfigState>)>,
+    /// Fallback config when no exact/wildcard pattern matches the SNI.
+    default: Option<Arc<ClientCertConfigState>>,
+}
+
+impl ClientCertStore {
+    /// Look up the client-cert config for `sni`.
+    ///
+    /// Returns `None` when no pattern matches — mTLS is not required for this
+    /// SNI. Exact match wins over wildcard, wildcard over default, matching the
+    /// precedence of [`TlsStore::find_cert`].
+    pub fn find_config(&self, sni: &str) -> Option<Arc<ClientCertConfigState>> {
+        if let Some(cfg) = self.exact.get(sni) {
+            return Some(Arc::clone(cfg));
+        }
+        if let Some((_, cfg)) = self
+            .wildcard
+            .iter()
+            .find(|(suffix, _)| wildcard_matches(sni, suffix))
+        {
+            return Some(Arc::clone(cfg));
+        }
+        self.default.as_ref().map(Arc::clone)
+    }
+
+    /// Total number of configured host patterns (exact + wildcard + default).
+    pub fn host_count(&self) -> usize {
+        self.exact.len() + self.wildcard.len() + self.default.is_some() as usize
+    }
+}
+
+/// Builder for [`ClientCertStore`]. Not thread-safe; used only inside the
+/// debounced rebuild, mirroring [`TlsStoreBuilder`].
+#[non_exhaustive]
+#[derive(Default)]
+pub struct ClientCertStoreBuilder {
+    exact: HashMap<String, Arc<ClientCertConfigState>>,
+    /// Keyed by suffix (e.g. `"example.com"` for the pattern `"*.example.com"`).
+    wildcard: HashMap<String, Arc<ClientCertConfigState>>,
+    default: Option<Arc<ClientCertConfigState>>,
+}
+
+impl ClientCertStoreBuilder {
+    /// Construct an empty builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register client-cert config for `host_pattern`.
+    ///
+    /// - `*.suffix` → wildcard bucket (suffix stored without the `*.` prefix).
+    /// - Exact hostname → exact bucket.
+    /// - `""` or `"*"` → default fallback.
+    /// - Duplicate host → last-writer-wins with a `WARN` log.
+    pub fn add_client_cert(&mut self, host_pattern: &str, cfg: Arc<ClientCertConfigState>) {
+        if host_pattern.is_empty() || host_pattern == "*" {
+            self.default = Some(cfg);
+            return;
+        }
+        if let Some(suffix) = host_pattern.strip_prefix("*.") {
+            if self.wildcard.insert(suffix.to_string(), cfg).is_some() {
+                tracing::warn!(
+                    host = %host_pattern,
+                    "mTLS client-cert config overwritten by a later Ingress"
+                );
+            }
+        } else if self.exact.insert(host_pattern.to_string(), cfg).is_some() {
+            tracing::warn!(
+                host = %host_pattern,
+                "mTLS client-cert config overwritten by a later Ingress"
+            );
+        }
+    }
+
+    /// Compile accumulated configs into an immutable [`ClientCertStore`].
+    pub fn build(self) -> ClientCertStore {
+        let mut wildcard: Vec<(String, Arc<ClientCertConfigState>)> =
+            self.wildcard.into_iter().collect();
+        wildcard.sort_by_key(|(suffix, _)| Reverse(suffix.len()));
+        ClientCertStore {
+            exact: self.exact,
+            wildcard,
+            default: self.default,
+        }
+    }
+}
+
+/// A cheaply-cloneable handle to the active client-cert mTLS configuration store.
+///
+/// Swapped independently of [`SharedTlsStore`] so CA rotation does not churn
+/// the server-cert snapshot.
+pub type SharedClientCertStore = Shared<ClientCertStore>;
+
 #[cfg(test)]
 mod tests {
     use crate::tls::*;
@@ -339,5 +502,130 @@ mod tests {
             "long"
         );
         assert_eq!(store.find_cert("web.example.com").unwrap().source, "short");
+    }
+
+    // --- ClientCertStore tests ---
+
+    fn cfg(ca: &[u8]) -> Arc<ClientCertConfigState> {
+        Arc::new(ClientCertConfigState::Config(ClientCertConfig::new(
+            ca.to_vec(),
+            1,
+            false,
+        )))
+    }
+
+    fn unavailable() -> Arc<ClientCertConfigState> {
+        Arc::new(ClientCertConfigState::Unavailable)
+    }
+
+    #[test]
+    fn client_cert_exact_lookup() {
+        let mut b = ClientCertStoreBuilder::new();
+        b.add_client_cert("example.com", cfg(b"ca"));
+        let store = b.build();
+        assert!(store.find_config("example.com").is_some());
+        assert!(store.find_config("other.com").is_none());
+    }
+
+    #[test]
+    fn client_cert_wildcard_lookup() {
+        let mut b = ClientCertStoreBuilder::new();
+        b.add_client_cert("*.example.com", cfg(b"ca"));
+        let store = b.build();
+        assert!(store.find_config("api.example.com").is_some());
+        assert!(store.find_config("example.com").is_none());
+        assert!(store.find_config("a.b.example.com").is_none());
+    }
+
+    #[test]
+    fn client_cert_exact_beats_wildcard() {
+        let mut b = ClientCertStoreBuilder::new();
+        b.add_client_cert("api.example.com", cfg(b"exact-ca"));
+        b.add_client_cert("*.example.com", cfg(b"wildcard-ca"));
+        let store = b.build();
+        match store.find_config("api.example.com").unwrap().as_ref() {
+            ClientCertConfigState::Config(c) => assert_eq!(c.ca_pem, b"exact-ca"),
+            _ => panic!("expected Config"),
+        }
+    }
+
+    #[test]
+    fn client_cert_no_match_returns_none() {
+        let store = ClientCertStoreBuilder::new().build();
+        assert!(store.find_config("example.com").is_none());
+    }
+
+    #[test]
+    fn client_cert_default_fallback() {
+        let mut b = ClientCertStoreBuilder::new();
+        b.add_client_cert("*", cfg(b"default-ca"));
+        let store = b.build();
+        assert!(store.find_config("anything.example.com").is_some());
+    }
+
+    #[test]
+    fn client_cert_unavailable_variant_stored() {
+        let mut b = ClientCertStoreBuilder::new();
+        b.add_client_cert("broken.example.com", unavailable());
+        let store = b.build();
+        assert!(matches!(
+            store.find_config("broken.example.com").unwrap().as_ref(),
+            ClientCertConfigState::Unavailable
+        ));
+    }
+
+    #[test]
+    fn client_cert_partial_eq_same_bytes() {
+        let s1 = {
+            let mut b = ClientCertStoreBuilder::new();
+            b.add_client_cert("example.com", cfg(b"ca"));
+            b.build()
+        };
+        let s2 = {
+            let mut b = ClientCertStoreBuilder::new();
+            b.add_client_cert("example.com", cfg(b"ca"));
+            b.build()
+        };
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn client_cert_partial_eq_different_bytes() {
+        let s1 = {
+            let mut b = ClientCertStoreBuilder::new();
+            b.add_client_cert("example.com", cfg(b"ca-a"));
+            b.build()
+        };
+        let s2 = {
+            let mut b = ClientCertStoreBuilder::new();
+            b.add_client_cert("example.com", cfg(b"ca-b"));
+            b.build()
+        };
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn client_cert_wildcard_sorted_longest_first() {
+        let mut b = ClientCertStoreBuilder::new();
+        b.add_client_cert("*.example.com", cfg(b"short"));
+        b.add_client_cert("*.api.example.com", cfg(b"long"));
+        let store = b.build();
+        match store.find_config("v1.api.example.com").unwrap().as_ref() {
+            ClientCertConfigState::Config(c) => assert_eq!(c.ca_pem, b"long"),
+            _ => panic!("expected Config"),
+        }
+        match store.find_config("web.example.com").unwrap().as_ref() {
+            ClientCertConfigState::Config(c) => assert_eq!(c.ca_pem, b"short"),
+            _ => panic!("expected Config"),
+        }
+    }
+
+    #[test]
+    fn client_cert_host_count() {
+        let mut b = ClientCertStoreBuilder::new();
+        b.add_client_cert("a.com", cfg(b"ca"));
+        b.add_client_cert("*.b.com", cfg(b"ca"));
+        b.add_client_cert("*", cfg(b"ca"));
+        assert_eq!(b.build().host_count(), 3);
     }
 }

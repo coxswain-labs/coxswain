@@ -30,6 +30,7 @@ use super::outcome::{merge_timeouts, resolve_outcome, try_redirect};
 use super::redirect::extract_host;
 use crate::auth;
 use crate::config::AccessLogPathMode;
+use crate::tls::ClientCertInfo;
 use crate::upstream_ca::UpstreamCaCache;
 use bytes::Bytes;
 use coxswain_cache::ResponseCache;
@@ -37,7 +38,9 @@ use coxswain_core::routing::{
     BackendProtocol, CompressionConfig, FilterAction, RateLimitKey, RequestContext, RetryOn,
     RouteTimeouts, SessionAffinity, UpstreamCa,
 };
+use coxswain_core::tls::{ClientCertConfigState, SharedClientCertStore};
 use http::header;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use pingora_cache::key::{CacheKey, HashBinary};
 use pingora_cache::{CacheMeta, NoCacheReason, RespCacheable, VarianceBuilder};
 use pingora_core::protocols::http::compression::Algorithm;
@@ -88,6 +91,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             mirror: None,
             mirror_body: Vec::new(),
             compression_encoder: None,
+            client_cert_pem: None,
         })
         .unwrap_or_default()
 }
@@ -107,6 +111,7 @@ pub(crate) async fn request_filter<K>(
     default_timeouts: &RouteTimeouts,
     rate_limiter: &crate::rate_limit::RateLimiterRegistry,
     auth_client: &reqwest::Client,
+    client_certs: &SharedClientCertStore,
     session: &mut Session,
     ctx: &mut ProxyCtx,
 ) -> Result<bool> {
@@ -152,6 +157,38 @@ pub(crate) async fn request_filter<K>(
     let Some(m) = resolve_outcome(session, &host, &path, outcome).await? else {
         return Ok(true);
     };
+
+    // ── Per-Ingress client-certificate mTLS cross-SNI guard (#267) ──────────────
+    //
+    // If this Host requires mTLS, the connection MUST carry a verified `ClientCertInfo`
+    // in the TLS digest extension. A TLS connection whose SNI matched a different (non-mTLS)
+    // host will have no peer cert; return 421 Misdirected Request so the client reconnects
+    // on the correct SNI, which will trigger the mTLS handshake. Plain-HTTP connections
+    // (no ssl_digest) are exempt — the operator forces HTTPS via `ssl-redirect`.
+    {
+        let cc_store = client_certs.load();
+        if let Some(config_state) = cc_store.find_config(&host) {
+            let ssl_digest = session
+                .as_downstream()
+                .digest()
+                .and_then(|d| d.ssl_digest.as_ref());
+            if let Some(ssl_digest) = ssl_digest {
+                let cert_info = ssl_digest.extension.get::<ClientCertInfo>();
+                if cert_info.is_none() {
+                    return Err(pingora_core::Error::explain(
+                        HTTPStatus(421),
+                        "client certificate required for this host",
+                    ));
+                }
+                if let ClientCertConfigState::Config(cc_cfg) = config_state.as_ref()
+                    && cc_cfg.pass_to_upstream
+                    && let Some(ci) = cert_info
+                {
+                    ctx.client_cert_pem = Some(ci.cert_pem.clone());
+                }
+            }
+        }
+    }
 
     // Per-route source-IP block list (ingress.coxswain-labs.dev/deny-source-range).
     // Evaluated BEFORE the allow-list: a denied IP is blocked even when the allow-list
@@ -904,6 +941,19 @@ pub(crate) async fn upstream_request_filter(
             {
                 let _ = upstream_request.insert_header(hn, hv);
             }
+        }
+    }
+
+    // Verified client-certificate forwarding (#267): when the Ingress annotation
+    // `auth-tls-pass-certificate-to-upstream: "true"` is set and a client cert was
+    // verified at the TLS handshake, forward its PEM as `X-SSL-Client-Cert`
+    // (URL-encoded, per nginx-ingress convention). Applied after auth-response headers
+    // so auth-service overrides cannot clobber it. `.take()` clears the field so the
+    // header is never duplicated on retries.
+    if let Some(pem) = ctx.client_cert_pem.take() {
+        let encoded = utf8_percent_encode(&pem, NON_ALPHANUMERIC).to_string();
+        if let Ok(hv) = http::HeaderValue::from_str(&encoded) {
+            let _ = upstream_request.insert_header("x-ssl-client-cert", hv);
         }
     }
 

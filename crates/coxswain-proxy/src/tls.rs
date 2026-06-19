@@ -1,28 +1,50 @@
-//! SNI-driven certificate selector for the Pingora TLS listener.
+//! SNI-driven certificate selector and per-SNI client-certificate mTLS for the Pingora TLS listener.
 
 use async_trait::async_trait;
-use coxswain_core::tls::SharedTlsStore;
+use coxswain_core::tls::{ClientCertConfigState, SharedClientCertStore, SharedTlsStore};
 use pingora_core::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
-use pingora_core::tls::{ext, pkey::PKey, ssl::NameType, x509::X509};
+use pingora_core::tls::{
+    ext,
+    pkey::PKey,
+    ssl::{NameType, SslVerifyMode},
+    x509::{X509, store::X509StoreBuilder},
+};
+use std::any::Any;
+use std::sync::Arc;
+
+/// Information about the verified client certificate, stored in the connection's
+/// `SslDigest.extension` after a successful mTLS handshake.
+///
+/// Present iff this connection completed an mTLS handshake with a verified
+/// client certificate. Absence means the SNI did not require mTLS.
+pub(crate) struct ClientCertInfo {
+    /// PEM-encoded client certificate as presented by the peer.
+    pub(crate) cert_pem: String,
+}
 
 /// SNI-driven certificate selector for the Pingora TLS listener.
 ///
-/// Loaded on every TLS handshake from the live [`SharedTlsStore`] — no locks,
-/// no channels. If no cert matches the client's SNI, the handshake is allowed
-/// to fail naturally (OpenSSL/BoringSSL sends `unrecognized_name`).
+/// On every handshake:
+/// 1. Selects the server certificate by SNI.
+/// 2. If the SNI maps to a client-cert mTLS config, configures BoringSSL to
+///    require and verify a peer certificate (`PEER | FAIL_IF_NO_PEER_CERT`).
+///    A missing/invalid/over-depth cert aborts the TLS handshake (Istio MUTUAL
+///    semantics). An `Unavailable` config installs an empty verify store so all
+///    handshakes to that host fail-closed.
 ///
-/// Cheaply clonable: the underlying [`SharedTlsStore`] is `Arc`-backed.
+/// Cheaply clonable: the underlying stores are `Arc`-backed.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct SniCertSelector {
     tls: SharedTlsStore,
+    client_certs: SharedClientCertStore,
 }
 
 impl SniCertSelector {
-    /// Wrap a [`SharedTlsStore`] in an SNI certificate selector.
-    pub fn new(tls: SharedTlsStore) -> Self {
-        Self { tls }
+    /// Wrap a [`SharedTlsStore`] and [`SharedClientCertStore`] in an SNI certificate selector.
+    pub fn new(tls: SharedTlsStore, client_certs: SharedClientCertStore) -> Self {
+        Self { tls, client_certs }
     }
 }
 
@@ -36,6 +58,7 @@ impl TlsAccept for SniCertSelector {
             return;
         };
 
+        // ── Server certificate ────────────────────────────────────────────────
         let store = self.tls.load();
         let Some(cert) = store.find_cert(&sni) else {
             tracing::debug!(sni, "No TLS cert for SNI — handshake will fail");
@@ -62,6 +85,99 @@ impl TlsAccept for SniCertSelector {
         }
         if let Err(e) = ext::ssl_use_private_key(ssl, &pkey) {
             tracing::warn!(sni, error = %e, "ssl_use_private_key failed");
+            return;
+        }
+
+        // ── Per-SNI client certificate mTLS (#267) ────────────────────────────
+        //
+        // `find_config` is None when the SNI has no mTLS annotation —
+        // the connection proceeds as a standard one-way TLS handshake.
+        let cc_store = self.client_certs.load();
+        let Some(config_state) = cc_store.find_config(&sni) else {
+            return;
+        };
+
+        match config_state.as_ref() {
+            ClientCertConfigState::Config(cfg) => {
+                // Build an X509Store from the operator-supplied CA PEM bundle.
+                match build_ca_store(&cfg.ca_pem, &sni) {
+                    Ok(ca_store) => {
+                        if let Err(e) = ext::ssl_set_verify_cert_store(ssl, &ca_store) {
+                            tracing::warn!(sni, error = %e, "ssl_set_verify_cert_store failed — fail-closing mTLS");
+                        }
+                        ssl.set_verify_depth(cfg.verify_depth);
+                    }
+                    Err(e) => {
+                        tracing::warn!(sni, error = %e, "CA store build failed — fail-closing mTLS");
+                        // Fall through to set PEER|FAIL_IF_NO_PEER_CERT with no store
+                        // installed: BoringSSL will reject every client cert.
+                    }
+                }
+                // Require the client to present a certificate.  BoringSSL aborts
+                // the handshake on a missing, invalid, or over-depth cert.
+                ssl.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+                tracing::debug!(sni, depth = cfg.verify_depth, "mTLS: requiring client cert");
+            }
+            ClientCertConfigState::Unavailable => {
+                // CA Secret missing/unlabeled/unparseable — fail-closed: every
+                // handshake to this SNI will fail (no CA store, but verify mode
+                // requires a valid cert).
+                ssl.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+                tracing::warn!(
+                    sni,
+                    "mTLS: CA Unavailable — fail-closing all client handshakes"
+                );
+            }
+            // Forward-compatible: future variants are treated as no mTLS for this SNI.
+            _ => {}
         }
     }
+
+    async fn handshake_complete_callback(
+        &self,
+        ssl: &TlsRef,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        // Capture the verified peer cert (present iff mTLS was configured AND
+        // the client passed verification).  The cert is stored in the
+        // connection's `SslDigest.extension`; the request path reads it to
+        // enforce the cross-SNI guard and optionally forward it upstream.
+        let peer = ssl.peer_certificate()?;
+        match peer.to_pem() {
+            Ok(pem) => {
+                let cert_pem = String::from_utf8_lossy(&pem).into_owned();
+                Some(Arc::new(ClientCertInfo { cert_pem }))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "peer_certificate().to_pem() failed — not forwarding");
+                None
+            }
+        }
+    }
+}
+
+/// Build an [`X509Store`] from a PEM-encoded CA bundle.
+///
+/// # Errors
+///
+/// Returns an error if any certificate in the PEM bundle cannot be parsed or
+/// if the `X509Store` cannot be created.
+fn build_ca_store(
+    ca_pem: &[u8],
+    sni: &str,
+) -> Result<pingora_core::tls::x509::store::X509Store, Box<dyn std::error::Error + Send + Sync>> {
+    let certs = X509::stack_from_pem(ca_pem).map_err(|e| {
+        tracing::warn!(sni, error = %e, "CA PEM parse failed");
+        e
+    })?;
+    let mut builder = X509StoreBuilder::new().map_err(|e| {
+        tracing::warn!(sni, error = %e, "X509StoreBuilder::new() failed");
+        e
+    })?;
+    for cert in certs {
+        builder.add_cert(cert).map_err(|e| {
+            tracing::warn!(sni, error = %e, "X509Store::add_cert failed");
+            e
+        })?;
+    }
+    Ok(builder.build())
 }

@@ -1,0 +1,56 @@
+# Per-Ingress client-certificate mTLS fixture (#267).
+#
+# Applies:
+#   1. A kubernetes.io/tls Secret (server certificate for the TLS listener).
+#   2. A TLS-terminated Ingress annotated with all three auth-tls annotations:
+#        ingress.coxswain-labs.dev/auth-tls-secret
+#        ingress.coxswain-labs.dev/auth-tls-verify-depth
+#        ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream
+#
+# The proxy aborts the TLS handshake when the client presents no certificate or
+# one not signed by the CA referenced in auth-tls-secret.  When a valid cert is
+# presented and pass-certificate-to-upstream is "true", the verified cert is
+# URL-encoded and injected as X-SSL-Client-Cert on the upstream request.
+#
+# Placeholders:
+#   SECRET_NAME  — name of the kubernetes.io/tls Secret for the TLS listener
+#   TLS_CRT_B64  — base64-encoded PEM server certificate
+#   TLS_KEY_B64  — base64-encoded PEM server private key
+#
+# Host: mtls.TESTNS.local / -> echo-a:3000
+# Apply auth_tls_ca_secret.yaml (in the same namespace) before this fixture.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SECRET_NAME}
+type: kubernetes.io/tls
+data:
+  tls.crt: ${TLS_CRT_B64}
+  tls.key: ${TLS_KEY_B64}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-tls-ingress
+  annotations:
+    ingress.coxswain-labs.dev/auth-tls-secret: "${TESTNS}/auth-tls-ca"
+    ingress.coxswain-labs.dev/auth-tls-verify-depth: "1"
+    ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream: "true"
+spec:
+  ingressClassName: coxswain
+  tls:
+    - hosts:
+        - mtls.${TESTNS}.local
+      secretName: ${SECRET_NAME}
+  rules:
+    - host: mtls.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

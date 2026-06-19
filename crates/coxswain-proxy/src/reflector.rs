@@ -15,7 +15,7 @@
 use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
-use coxswain_core::tls::SharedTlsStore;
+use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
 use coxswain_reflector::{
     DedicatedConfig, DedicatedOutputs, DedicatedProxyReconciler, IngressDefaultBackend,
     IngressPorts, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
@@ -91,6 +91,7 @@ pub fn spawn_routing_table_builder(config: ProxyReflectorConfig) -> ProxyReflect
     let ingress_routes = SharedIngressRoutingTable::new();
     let gateway_routes = SharedGatewayRoutingTable::new();
     let tls_store = SharedTlsStore::new();
+    let client_cert_store = SharedClientCertStore::new();
     let tls_health = SharedGatewayListenerHealth::new();
     let cluster_summary = SharedClusterSummary::new();
     let owned_gateways = OwnedGateways::new();
@@ -104,6 +105,7 @@ pub fn spawn_routing_table_builder(config: ProxyReflectorConfig) -> ProxyReflect
             ingress_routes.clone(),
             gateway_routes.clone(),
             tls_store.clone(),
+            client_cert_store.clone(),
             tls_health.clone(),
             cluster_summary,
         ),
@@ -120,7 +122,8 @@ pub fn spawn_routing_table_builder(config: ProxyReflectorConfig) -> ProxyReflect
         },
     );
 
-    let source = KubernetesSource::new(ingress_routes, gateway_routes, tls_store);
+    let source =
+        KubernetesSource::new(ingress_routes, gateway_routes, tls_store, client_cert_store);
 
     ProxyReflector {
         source,
@@ -199,9 +202,12 @@ pub fn spawn_dedicated_routing_table_builder(
     // dedicated pod registers no `IngressProxy`. Keeping a placeholder
     // `SharedIngressRoutingTable` here lets `KubernetesSource` stay
     // identically-shaped across the two proxy modes.
+    // Likewise, `client_cert_store` is always empty for the dedicated proxy:
+    // per-Ingress mTLS (#267) is a shared-proxy feature only.
     let ingress_routes = SharedIngressRoutingTable::new();
     let gateway_routes = SharedGatewayRoutingTable::new();
     let tls_store = SharedTlsStore::new();
+    let client_cert_store = SharedClientCertStore::new();
     let tls_health = SharedGatewayListenerHealth::new();
     let owned_gateways = OwnedGateways::new();
     let _leader: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -226,7 +232,8 @@ pub fn spawn_dedicated_routing_table_builder(
         health,
     );
 
-    let source = KubernetesSource::new(ingress_routes, gateway_routes, tls_store);
+    let source =
+        KubernetesSource::new(ingress_routes, gateway_routes, tls_store, client_cert_store);
 
     DedicatedProxyReflector {
         source,

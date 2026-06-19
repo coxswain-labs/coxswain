@@ -1,6 +1,6 @@
 use super::*;
 pub(super) use coxswain_core::routing::IngressRoutingTableBuilder;
-pub(super) use coxswain_core::tls::TlsStoreBuilder;
+pub(super) use coxswain_core::tls::{ClientCertStoreBuilder, TlsStoreBuilder};
 pub(super) use k8s_openapi::api::core::v1::{Secret, Service};
 pub(super) use k8s_openapi::api::discovery::v1::EndpointSlice;
 pub(super) use k8s_openapi::api::networking::v1::{
@@ -66,6 +66,15 @@ pub(super) fn reconcile_tls_no_default(
     b: &mut TlsStoreBuilder,
 ) {
     IngressReconciler::reconcile_tls(ing, secrets, owned, None, b);
+}
+
+pub(super) fn reconcile_client_certs_no_default(
+    ing: &Ingress,
+    auth_tls_secrets: &reflector::Store<Secret>,
+    owned: &HashSet<String>,
+    b: &mut ClientCertStoreBuilder,
+) {
+    IngressReconciler::reconcile_client_certs(ing, auth_tls_secrets, owned, None, b);
 }
 
 pub(super) fn make_service_with_named_port(

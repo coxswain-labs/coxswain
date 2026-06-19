@@ -229,6 +229,7 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
             "reference_grant",
             "secret",
             "auth_secret",
+            "auth_tls_secret",
             "service",
             "backend_tls_policy",
             "config_map",
@@ -483,7 +484,7 @@ fn wire_gateway_only_proxy_services(
             );
         }
         let trusted = Arc::new(TrustedSources::new(proxy.proxy_trusted_sources.clone()));
-        let selector = SniCertSelector::new(source.tls_store());
+        let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
         server.add_service(
             ProxyAcceptor::new(
                 gateway_proxy,
@@ -496,7 +497,7 @@ fn wire_gateway_only_proxy_services(
             .context("build dedicated GatewayProxy acceptor (PROXY protocol)")?,
         );
     } else {
-        let selector = SniCertSelector::new(source.tls_store());
+        let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
         server.add_service(
             ProxyAcceptor::new(
                 gateway_proxy,
@@ -580,7 +581,7 @@ fn wire_proxy_services(
         .unwrap_or_else(|e| panic!("invariant: reqwest::Client construction must succeed: {e}"));
     // Shared startup-time config for both proxy types.  Clone is cheap:
     // Arc pointer bumps + Copy/Clone values.
-    let shared_cfg = SharedProxyConfig::new(
+    let mut shared_cfg = SharedProxyConfig::new(
         default_timeouts,
         ca_cache,
         proxy.access_log,
@@ -589,6 +590,11 @@ fn wire_proxy_services(
         rate_limiter.clone(),
         auth_client,
     );
+    // Wire the live per-Ingress mTLS store from the reflector (#267).
+    // The store is populated on the first reconcile cycle; reads before that
+    // see an empty store (no mTLS enforced), which is correct — no Ingresses
+    // have been observed yet.
+    shared_cfg.client_certs = source.client_cert_store();
 
     let ingress_specs: HashSet<ListenerSpec> =
         build_ingress_listeners(common, proxy).into_iter().collect();
@@ -615,7 +621,7 @@ fn wire_proxy_services(
                     shared_cfg.clone(),
                 ),
             ));
-            let selector = SniCertSelector::new(source.tls_store());
+            let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
             server.add_service(
                 ProxyAcceptor::new(
                     p,
@@ -636,7 +642,7 @@ fn wire_proxy_services(
                 shared_cfg.clone(),
             ),
         ));
-        let selector = SniCertSelector::new(source.tls_store());
+        let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
         server.add_service(
             ProxyAcceptor::new(
                 p,
@@ -657,7 +663,7 @@ fn wire_proxy_services(
                     shared_cfg.clone(),
                 ),
             ));
-            let selector = SniCertSelector::new(source.tls_store());
+            let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
             server.add_service(
                 ProxyAcceptor::new(
                     p,
@@ -678,7 +684,7 @@ fn wire_proxy_services(
                 shared_cfg,
             ),
         ));
-        let selector = SniCertSelector::new(source.tls_store());
+        let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
         server.add_service(
             ProxyAcceptor::new(
                 p,
@@ -849,6 +855,7 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
         status_writer.outputs.ingress_routes.clone(),
         status_writer.outputs.gateway_routes.clone(),
         status_writer.outputs.tls.clone(),
+        status_writer.outputs.client_certs.clone(),
     );
     let tls_health = status_writer.outputs.tls_health.clone();
     // Operator's reconcile-all retrigger consumes both health channels — see

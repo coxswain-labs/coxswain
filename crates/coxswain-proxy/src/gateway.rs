@@ -62,6 +62,7 @@ impl ProxyHttp for GatewayProxy {
             &self.cfg.default_timeouts,
             &self.cfg.rate_limiter,
             &self.cfg.auth_client,
+            &self.cfg.client_certs,
             session,
             ctx,
         )

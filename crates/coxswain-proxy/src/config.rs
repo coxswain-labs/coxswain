@@ -8,6 +8,7 @@ use crate::rate_limit::RateLimiterRegistry;
 use crate::upstream_ca::UpstreamCaCache;
 use coxswain_cache::ResponseCache;
 use coxswain_core::routing::RouteTimeouts;
+use coxswain_core::tls::SharedClientCertStore;
 use std::sync::Arc;
 
 /// Startup-time collaborators shared between both proxy types.
@@ -35,6 +36,13 @@ pub struct SharedProxyConfig {
     pub rate_limiter: RateLimiterRegistry,
     /// Shared HTTP client for ext_authz sub-requests (#24).
     pub auth_client: reqwest::Client,
+    /// Per-Ingress client-certificate mTLS config store (#267).
+    ///
+    /// Looked up per-host in `request_filter` to enforce the mTLS handshake
+    /// guard and optionally forward the verified cert as `X-SSL-Client-Cert`.
+    /// Defaults to an empty store (no mTLS enforced) until the reflector's
+    /// first reconcile cycle completes.
+    pub client_certs: SharedClientCertStore,
 }
 
 impl SharedProxyConfig {
@@ -57,6 +65,7 @@ impl SharedProxyConfig {
             cache,
             rate_limiter,
             auth_client,
+            client_certs: SharedClientCertStore::new(),
         }
     }
 }

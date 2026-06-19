@@ -227,3 +227,16 @@ pub const ANNOTATION_KEEPALIVE_TIMEOUT: &str = fixture!("annotation_keepalive_ti
 /// reject traffic due to the invalid annotation.
 pub const ANNOTATION_KEEPALIVE_TIMEOUT_INVALID: &str =
     fixture!("annotation_keepalive_timeout_invalid.yaml");
+/// Labeled CA Secret for per-Ingress client-certificate mTLS tests (#267).
+/// Carries `ingress.coxswain-labs.dev/auth-tls: "true"` so the reflector's
+/// label-scoped watcher picks it up; without the label the proxy fails closed for
+/// every Ingress that references it. Requires `CA_CRT_B64` fixture var (base64-encoded
+/// PEM of the CA certificate stored under key `ca.crt`).
+pub const AUTH_TLS_CA_SECRET: &str = fixture!("auth_tls_ca_secret.yaml");
+/// TLS-terminated Ingress carrying `auth-tls-secret`, `auth-tls-verify-depth`, and
+/// `auth-tls-pass-certificate-to-upstream` annotations (#267), plus the
+/// `kubernetes.io/tls` server-cert Secret. The proxy aborts the TLS handshake when no
+/// valid client cert is presented; a verified cert is forwarded as `X-SSL-Client-Cert`.
+/// Requires `SECRET_NAME`, `TLS_CRT_B64`, `TLS_KEY_B64` fixture vars; host is
+/// `mtls.TESTNS.local`. Apply `AUTH_TLS_CA_SECRET` first.
+pub const ANNOTATION_AUTH_TLS: &str = fixture!("annotation_auth_tls.yaml");
