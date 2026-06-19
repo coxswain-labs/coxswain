@@ -1132,6 +1132,238 @@ async fn request_forwarded_without_auth_when_no_annotation() -> anyhow::Result<(
     Ok(())
 }
 
+// ── satisfy any/all (#273) ────────────────────────────────────────────────────
+//
+// These tests use the PROXY-protocol harness to drive a controlled L4 client IP
+// (same approach as the allow/deny-source-range tests above) alongside the
+// auth-allow/auth-deny stubs from backends::AUTH_STUB. All five run in the serial
+// pass — registered in `.config/nextest.toml`.
+
+/// `satisfy: any` — when the client IP is inside the allow-list the request is
+/// admitted even though the auth stub denies it. Proves that `any` mode short-circuits
+/// on the IP gate and skips the auth round-trip (#273 happy path).
+#[tokio::test]
+async fn satisfy_any_admits_when_ip_in_range_even_if_auth_denies() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "satisfy-any-ipin").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SATISFY_ANY_AUTHDENY,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("satisfyanydeny.{}.local", ns.name);
+    // 203.0.113.5 ∈ 203.0.113.0/24 → IP gate passes → admitted even though auth denies.
+    let proxy_line = "PROXY TCP4 203.0.113.5 10.0.0.1 12345 80\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    let body = wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        proxy_line,
+        &http_req,
+        200,
+        Duration::from_secs(90),
+    )
+    .await?;
+
+    let echo: EchoResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+    echo.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// `satisfy: any` — when auth passes the request is admitted even though the
+/// client IP is outside the allow-list. Proves the OR logic admits on either gate
+/// (#273 happy path, auth-wins variant).
+#[tokio::test]
+async fn satisfy_any_admits_when_auth_passes_even_if_ip_out_of_range() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "satisfy-any-auth").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SATISFY_ANY_AUTHALLOW,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("satisfyanyallow.{}.local", ns.name);
+    // 198.51.100.5 ∉ 203.0.113.0/24 → IP gate fails, but auth-allow returns 200 → admitted.
+    let proxy_line = "PROXY TCP4 198.51.100.5 10.0.0.1 12345 80\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    let body = wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        proxy_line,
+        &http_req,
+        200,
+        Duration::from_secs(90),
+    )
+    .await?;
+
+    let echo: EchoResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+    echo.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// `satisfy: any` — when both the IP check and auth check fail the request is
+/// denied. Proves that `any` only helps when at least one gate passes (#273 sad path).
+#[tokio::test]
+async fn satisfy_any_denies_when_both_ip_and_auth_fail() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "satisfy-any-both").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SATISFY_ANY_AUTHDENY,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("satisfyanydeny.{}.local", ns.name);
+    // 198.51.100.5 ∉ 203.0.113.0/24 → IP gate fails; auth-deny returns 403 → both fail → denied.
+    // Poll until 403: before the route is live the proxy returns 404; a 403 confirms
+    // the route is installed AND both gates denied.
+    let proxy_line = "PROXY TCP4 198.51.100.5 10.0.0.1 12345 80\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        proxy_line,
+        &http_req,
+        403,
+        Duration::from_secs(90),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// `satisfy: all` (explicit default) — when the IP is in-range but auth denies
+/// the request is still rejected. Proves the AND semantic is not changed by
+/// explicitly annotating the default (#273 regression guard for the `all` path).
+#[tokio::test]
+async fn satisfy_all_denies_when_ip_passes_but_auth_denies() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "satisfy-all").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SATISFY_ALL_AUTHDENY,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("satisfyallauthdeny.{}.local", ns.name);
+    // 203.0.113.5 ∈ 203.0.113.0/24 → IP gate passes; but auth-deny returns 403 → denied.
+    let proxy_line = "PROXY TCP4 203.0.113.5 10.0.0.1 12345 80\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        proxy_line,
+        &http_req,
+        403,
+        Duration::from_secs(90),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// `deny-source-range` always blocks first regardless of `satisfy` mode: even
+/// when `satisfy: any`, `allow-source-range`, and `auth-allow` would all admit
+/// the request, the `deny-source-range` match results in 403 (#273 AC: deny-always-first).
+#[tokio::test]
+async fn deny_source_range_blocks_under_satisfy_any_despite_ip_and_auth_passing()
+-> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "satisfy-deny-wins").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SATISFY_ANY_DENY_WINS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("satisfyanydenywin.{}.local", ns.name);
+    // 203.0.113.5 ∈ deny-range → blocked immediately; allow + auth-allow are never reached.
+    let proxy_line = "PROXY TCP4 203.0.113.5 10.0.0.1 12345 80\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        proxy_line,
+        &http_req,
+        403,
+        Duration::from_secs(90),
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// Make one raw TCP request (write `preamble` then the HTTP request) and return the
 /// response `(status_code, body)`.
 async fn raw_http_status(

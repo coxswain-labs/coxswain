@@ -36,7 +36,7 @@ use bytes::Bytes;
 use coxswain_cache::ResponseCache;
 use coxswain_core::routing::{
     BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, RateLimitKey,
-    RequestContext, RetryOn, RouteTimeouts, SessionAffinity, UpstreamCa,
+    RequestContext, RetryOn, RouteTimeouts, Satisfy, SessionAffinity, UpstreamCa,
 };
 use coxswain_core::tls::{ClientCertConfigState, SharedClientCertStore};
 use http::header;
@@ -212,20 +212,28 @@ pub(crate) async fn request_filter<K>(
     }
 
     // Per-route source-IP allow-list (ingress.coxswain-labs.dev/allow-source-range).
-    // Access control runs ahead of redirect and body handling — so an out-of-range
-    // client gets 403 and never receives a redirect (which would leak the canonical
-    // host/URL) nor has its body read. Match the *real* client IP: resolved once
-    // above by resolve_client_ip (considers forwarded headers if configured) and
-    // cached on ctx — no per-request allocation for the CIDR scan.
-    if let Some(nets) = m.allow_source_range.as_deref() {
-        let client_ip = ctx.client_ip;
-        if !ip_allowed(client_ip, nets) {
-            return Err(pingora_core::Error::explain(
-                HTTPStatus(403),
-                "client IP not in allow-list",
-            ));
+    // Access control runs ahead of redirect and body handling — so a denied client
+    // never receives a redirect (which would leak the canonical host/URL) nor has
+    // its body read. The real client IP is resolved once by resolve_client_ip (above)
+    // and cached on ctx — no per-request allocation for the CIDR scan.
+    //
+    // In `All` mode (the default) a failing IP check is a hard 403 — same as before
+    // #273. In `Any` mode we record the result and let auth have a say: the request
+    // is admitted if either check passes, denied only if both fail. The recorded
+    // value (`ip_satisfied`) is consumed below in the auth ⊕ satisfy block.
+    let ip_satisfied: Option<bool> = match m.allow_source_range.as_deref() {
+        Some(nets) => {
+            let ok = ip_allowed(ctx.client_ip, nets);
+            if !ok && matches!(m.satisfy, Satisfy::All) {
+                return Err(pingora_core::Error::explain(
+                    HTTPStatus(403),
+                    "client IP not in allow-list",
+                ));
+            }
+            Some(ok)
         }
-    }
+        None => None,
+    };
 
     // Per-route rate limiting. Enforcement runs after allow-list (denied clients
     // never consume a rate-limit slot) and before redirect (a rate-limited client
@@ -262,15 +270,57 @@ pub(crate) async fn request_filter<K>(
         }
     }
 
-    // Per-route authentication (#24). Runs after rate-limit (denied clients
-    // do not consume an auth-service round-trip) and before redirect (an
-    // unauthenticated client must not receive a redirect leaking the canonical
-    // URL). Both ext_authz and basic-auth write a response and return Ok(true)
-    // on denial so the caller short-circuits to the client response.
-    if let Some(auth) = m.auth.as_deref()
-        && crate::auth::enforce(auth_client, auth, session, &mut ctx.auth_response_headers).await?
-    {
-        return Ok(true);
+    // Auth ⊕ satisfy resolution (#24 + #273). Runs after rate-limit (denied
+    // clients do not consume an auth-service round-trip) and before redirect
+    // (an unauthenticated client must not receive a redirect leaking the
+    // canonical URL).
+    //
+    // `All` (default): auth (if configured) must pass; short-circuit on denial
+    // — identical to the pre-#273 behaviour.
+    //
+    // `Any`: the IP allow-check already ran above and recorded `ip_satisfied`.
+    //   - `Some(true)`: IP admitted → skip auth entirely (avoid firing the
+    //     auth-service round-trip AND avoid writing a denial response to the
+    //     session when auth would have denied).
+    //   - `Some(false)` or `None`: IP did not admit (or no allow-list); try
+    //     auth as the last-chance gate.  On auth denial both gates have now
+    //     failed — auth's response stands.  If there is no auth either, the
+    //     allow-list failure turns into a 403.
+    //
+    // `enforce()` writes a response and returns `Ok(true)` on denial; we must
+    // not call it unless we intend to commit that response.
+    match m.satisfy {
+        Satisfy::All => {
+            if let Some(auth) = m.auth.as_deref()
+                && crate::auth::enforce(auth_client, auth, session, &mut ctx.auth_response_headers)
+                    .await?
+            {
+                return Ok(true);
+            }
+        }
+        Satisfy::Any => {
+            if ip_satisfied == Some(true) {
+                // IP alone admits — no auth round-trip, no denial response.
+            } else if let Some(auth) = m.auth.as_deref() {
+                // IP did not admit (out-of-range, or no allow-list); auth is
+                // the last chance.  If auth also denies, both gates failed and
+                // auth's response is already written to the session.
+                if crate::auth::enforce(auth_client, auth, session, &mut ctx.auth_response_headers)
+                    .await?
+                {
+                    return Ok(true);
+                }
+            } else if ip_satisfied == Some(false) {
+                // allow-list present and failed, no auth fallback → deny.
+                return Err(pingora_core::Error::explain(
+                    HTTPStatus(403),
+                    "client IP not in allow-list",
+                ));
+            }
+            // ip_satisfied == None && no auth → nothing to gate; proceed.
+        }
+        // #[non_exhaustive]: future Satisfy variants land here.
+        _ => {}
     }
 
     let timeouts = merge_timeouts(&m.timeouts, default_timeouts);

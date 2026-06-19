@@ -1,0 +1,31 @@
+# satisfy:all + auth-deny fixture: IP in-range is still rejected because auth
+# denies — the default AND mode requires both gates to pass.
+#
+# satisfy: all (the default) — both IP allow AND auth must pass.
+# allow-source-range: 203.0.113.0/24 (IP gate passes for 203.0.113.0/24 clients).
+# auth-url: auth-deny stub (always returns 403) — fails the auth gate.
+#
+# Host: satisfyallauthdeny.TESTNS.local -> echo-a:3000 (never reached on deny).
+# Apply backends::ECHO + backends::AUTH_STUB before this fixture.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: satisfy-all-authdeny-ingress
+  annotations:
+    ingress.coxswain-labs.dev/satisfy: "all"
+    ingress.coxswain-labs.dev/allow-source-range: "203.0.113.0/24"
+    ingress.coxswain-labs.dev/auth-url: "http://auth-deny.${TESTNS}.svc.cluster.local:4001/"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: satisfyallauthdeny.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
