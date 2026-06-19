@@ -46,7 +46,6 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/auth-response-headers` | csv | _none_ | `"X-Auth-User"` |
 | `ingress.coxswain-labs.dev/auth-always-set-cookie` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/auth-basic-secret` | `namespace/name` | _none_ | `"my-ns/my-htpasswd"` |
-| `ingress.coxswain-labs.dev/satisfy` | `any` or `all` | `all` | `"any"` |
 | `ingress.coxswain-labs.dev/compression-gzip` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/compression-brotli` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/compression-level` | integer 1–9 | `6` | `"5"` |
@@ -695,35 +694,6 @@ Requests without credentials receive **401** with a `WWW-Authenticate: Basic rea
 
 !!! tip "Hardening"
     Credential hashes are zeroed from memory when the credential list is replaced at reconcile time (`zeroize`). The Helm chart already ships `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`, and `capabilities.drop: ALL` by default. For the remaining defense-in-depth, configure nodes with `vm.swappiness=0` so hashes can't be paged to disk — this is a node-level kernel parameter that Kubernetes cannot enforce per-pod.
-
-## `satisfy`
-
-Controls how `allow-source-range` and the authentication annotations (`auth-url`, `auth-basic-secret`) combine when **both** are configured on the same Ingress. With only one of the two gates present, `satisfy` has no observable effect.
-
-| Value | Behaviour |
-|-------|-----------|
-| `all` (**default**) | Both the IP allow-list **and** auth must pass. This matches the behaviour you get when `satisfy` is absent. |
-| `any` | The IP allow-list **or** auth passing is sufficient. A request is denied only when **both** gates fail. |
-
-**`deny-source-range` always fires first** — regardless of `satisfy`. A client IP that matches the deny-list is rejected with **403** before allow-list or auth is consulted.
-
-**Typical use case — office IP bypasses the login page:**
-
-```yaml
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/satisfy: "any"
-    ingress.coxswain-labs.dev/allow-source-range: "203.0.113.0/24"
-    ingress.coxswain-labs.dev/auth-url: "http://oauth2-proxy.oauth.svc/oauth2/auth"
-```
-
-Requests from `203.0.113.0/24` (trusted office network) are admitted without an auth round-trip. Requests from any other IP go through OAuth2. A client that is neither on the trusted network nor authenticated is rejected with the auth service's denial response.
-
-**`any` with no allow-list.** When `satisfy: any` is set but `allow-source-range` is absent, only the auth gate exists — every request goes through auth as usual (no change in behaviour).
-
-**`any` with no auth.** When `satisfy: any` is set but no auth annotation is present, every request that passes the IP allow-list is admitted — again, no change from the `all` behaviour (the second gate doesn't exist).
-
-An unknown value emits a controller warning and falls back to `"all"` (fail-safe: the stricter gate).
 
 ## Client certificate mTLS
 

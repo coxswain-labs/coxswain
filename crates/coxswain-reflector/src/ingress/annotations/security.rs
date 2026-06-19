@@ -552,19 +552,6 @@ pub const AUTH_ALWAYS_SET_COOKIE: &str = "ingress.coxswain-labs.dev/auth-always-
 /// Mutually exclusive with `auth-url`.
 pub const AUTH_BASIC_SECRET: &str = "ingress.coxswain-labs.dev/auth-basic-secret";
 
-/// How `allow-source-range` and the `auth-*` access controls combine when **both**
-/// are configured on the same Ingress.  Mirrors nginx-ingress's `satisfy`.
-///
-/// - `"any"` — the request is admitted when **either** the IP is in the allow-list
-///   **or** the auth check passes; denied only if both fail.
-/// - `"all"` (default, and the value when absent) — the request must pass **both**
-///   the allow-list **and** the auth check.
-///
-/// `deny-source-range` and rate-limiting are independent gates; they always apply
-/// regardless of this setting.  Invalid values emit a `WARN` and fall back to
-/// `"all"` (the stricter, safer default).
-pub const SATISFY: &str = "ingress.coxswain-labs.dev/satisfy";
-
 // ── Intermediate annotation representation (pre-reconcile) ──────────────────
 
 /// A reference to a Kubernetes Secret in `namespace/name` form.
@@ -765,36 +752,6 @@ pub(crate) fn parse_htpasswd(data: &[u8]) -> Vec<coxswain_core::routing::BasicCr
         .collect()
 }
 
-/// Parse the `satisfy` annotation into a [`Satisfy`] mode.
-///
-/// `"any"` → [`Satisfy::Any`]; `"all"` or absent → [`Satisfy::All`] (the
-/// stricter, safer default).  Any other value emits a `WARN` and returns
-/// `Satisfy::All` — the Ingress is never dropped because of an unknown value.
-///
-/// [`Satisfy`]: coxswain_core::routing::Satisfy
-#[must_use]
-pub(crate) fn parse_satisfy(
-    annotations: &std::collections::BTreeMap<String, String>,
-    route_id: &str,
-) -> coxswain_core::routing::Satisfy {
-    use super::get;
-    use coxswain_core::routing::Satisfy;
-
-    match get(annotations, SATISFY) {
-        None | Some("all") => Satisfy::All,
-        Some("any") => Satisfy::Any,
-        Some(v) => {
-            tracing::warn!(
-                ingress = %route_id,
-                annotation = SATISFY,
-                value = v,
-                "unknown satisfy value (expected \"any\" or \"all\") — defaulting to \"all\""
-            );
-            Satisfy::All
-        }
-    }
-}
-
 #[cfg(test)]
 mod auth_tests {
     use super::*;
@@ -832,43 +789,6 @@ mod auth_tests {
     #[test]
     fn auth_basic_secret_const_referenced() {
         let _ = AUTH_BASIC_SECRET;
-    }
-
-    #[test]
-    fn satisfy_const_referenced() {
-        let _ = SATISFY;
-    }
-
-    // ── parse_satisfy ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_satisfy_absent_defaults_to_all() {
-        use coxswain_core::routing::Satisfy;
-        let m = ann(&[]);
-        assert_eq!(parse_satisfy(&m, "ns/test"), Satisfy::All);
-    }
-
-    #[test]
-    fn parse_satisfy_all_explicit() {
-        use coxswain_core::routing::Satisfy;
-        let m = ann(&[(SATISFY, "all")]);
-        assert_eq!(parse_satisfy(&m, "ns/test"), Satisfy::All);
-    }
-
-    #[test]
-    fn parse_satisfy_any() {
-        use coxswain_core::routing::Satisfy;
-        let m = ann(&[(SATISFY, "any")]);
-        assert_eq!(parse_satisfy(&m, "ns/test"), Satisfy::Any);
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_satisfy_unknown_value_warns_and_defaults_all() {
-        use coxswain_core::routing::Satisfy;
-        let m = ann(&[(SATISFY, "ANY")]);
-        assert_eq!(parse_satisfy(&m, "ns/test"), Satisfy::All);
-        assert!(logs_contain("unknown satisfy value"));
     }
 
     // ── parse_auth: ext_authz ─────────────────────────────────────────────────

@@ -71,6 +71,7 @@ coxswain-bin
 | No bare sleeps in e2e test bodies; waits poll a real post-condition | `scripts/check-no-e2e-sleeps.sh` |
 | Exactly one canonical e2e `poll_until`; no shadow pollers | `scripts/check-e2e-single-poller.sh` |
 | Every `ingress.coxswain-labs.dev/*` annotation has a parse test + e2e effect test | `scripts/check-annotation-coverage.sh` |
+| Every new `ingress.coxswain-labs.dev/*` annotation maps to a Gateway API field/GEP **or** a first-class Istio/Envoy concept | code review gate — pure nginx-isms (no GW-API, no Istio typed field, no Envoy native filter) require explicit written justification before merging |
 | `coxswain-e2e/tests/*.rs` files belong to an approved behaviour plane | `scripts/check-e2e-plane-layout.sh` |
 | Every e2e fixture image is `@sha256:`-pinned | `scripts/check-e2e-images-pinned.sh` |
 

@@ -1142,15 +1142,6 @@ pub struct RouteEntry {
     /// trusted CIDRs in `cfg.trusted_cidrs`. Shared as an `Arc` so cloning into
     /// the lookup result is a refcount bump.
     pub forwarded_for: Option<Arc<ForwardedForConfig>>,
-    /// How `allow-source-range` and `auth` combine when **both** are configured
-    /// (from the `ingress.coxswain-labs.dev/satisfy` annotation).
-    ///
-    /// [`Satisfy::All`] (the default) requires **both** to pass — the implicit
-    /// AND behaviour before #273. [`Satisfy::Any`] admits the request when
-    /// **either** passes — useful when an office IP range should bypass login.
-    /// `deny-source-range` and rate-limiting are independent gates that always
-    /// apply regardless of this setting. `Copy`, so no `Arc` needed.
-    pub satisfy: Satisfy,
 }
 
 /// Configuration for trusting a forwarded client-IP header on a per-Ingress basis.
@@ -1180,24 +1171,6 @@ impl ForwardedForConfig {
     }
 }
 
-/// How `allow-source-range` and `auth` combine when **both** are configured on a route.
-///
-/// Parsed from the `ingress.coxswain-labs.dev/satisfy` annotation. Only changes behaviour
-/// when **both** `allow-source-range` and `auth` are present on the same Ingress.
-/// `deny-source-range` and rate-limiting are independent gates that always apply regardless
-/// of this setting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum Satisfy {
-    /// Logical AND: IP-allow **and** auth must both pass. Default — matches the implicit
-    /// pre-#273 behaviour for routes that had both configured.
-    #[default]
-    All,
-    /// Logical OR: IP-allow **or** auth passing is enough to admit the request. The
-    /// request is denied only if **both** the IP check and the auth check fail.
-    Any,
-}
-
 impl RouteEntry {
     /// Constructs an entry with no predicates, no filters, and no timeouts.
     pub fn path_only(
@@ -1223,7 +1196,6 @@ impl RouteEntry {
             auth: None,
             compression: None,
             forwarded_for: None,
-            satisfy: Satisfy::default(),
         }
     }
 
@@ -1252,7 +1224,6 @@ impl RouteEntry {
             auth: None,
             compression: None,
             forwarded_for: None,
-            satisfy: Satisfy::default(),
         }
     }
 
@@ -1286,7 +1257,6 @@ impl RouteEntry {
             auth: None,
             compression: None,
             forwarded_for: None,
-            satisfy: Satisfy::default(),
         }
     }
 
@@ -1323,7 +1293,6 @@ impl RouteEntry {
             auth: None,
             compression: None,
             forwarded_for: None,
-            satisfy: Satisfy::default(),
         }
     }
 
@@ -1478,19 +1447,6 @@ impl RouteEntry {
     #[must_use]
     pub fn with_forwarded_for(mut self, forwarded_for: Option<Arc<ForwardedForConfig>>) -> Self {
         self.forwarded_for = forwarded_for;
-        self
-    }
-
-    /// Set the `satisfy` mode for this route (builder-style).
-    ///
-    /// Used by the Ingress reconciler to attach the value parsed from the
-    /// `ingress.coxswain-labs.dev/satisfy` annotation. [`Satisfy::All`] (the
-    /// default) keeps the implicit AND behaviour; [`Satisfy::Any`] relaxes it to
-    /// OR for the `allow-source-range` + `auth` pair. `Satisfy` is `Copy`, so
-    /// no heap allocation occurs here or on the hot path.
-    #[must_use]
-    pub fn with_satisfy(mut self, satisfy: Satisfy) -> Self {
-        self.satisfy = satisfy;
         self
     }
 }
@@ -1761,25 +1717,6 @@ mod tests {
         let entry = RouteEntry::path_only(group, "ns/r".to_string(), None)
             .with_forwarded_for(Some(Arc::clone(&cfg)));
         assert_eq!(entry.forwarded_for.as_deref(), Some(cfg.as_ref()));
-    }
-
-    #[test]
-    fn with_satisfy_round_trips() {
-        let group = Arc::new(BackendGroup::new("ns/svc".to_string(), vec![]));
-
-        // Default is All (implicit AND — unchanged from pre-#273 behaviour).
-        let bare = RouteEntry::path_only(Arc::clone(&group), "ns/r".to_string(), None);
-        assert_eq!(bare.satisfy, Satisfy::All);
-
-        // Explicit Any toggles to OR mode.
-        let entry = RouteEntry::path_only(Arc::clone(&group), "ns/r".to_string(), None)
-            .with_satisfy(Satisfy::Any);
-        assert_eq!(entry.satisfy, Satisfy::Any);
-
-        // Explicit All round-trips.
-        let entry =
-            RouteEntry::path_only(group, "ns/r".to_string(), None).with_satisfy(Satisfy::All);
-        assert_eq!(entry.satisfy, Satisfy::All);
     }
 
     #[test]

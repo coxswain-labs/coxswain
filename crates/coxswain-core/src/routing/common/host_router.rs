@@ -4,7 +4,7 @@ use super::auth::IngressAuthConfig;
 use super::compression::CompressionConfig;
 use super::entry::{
     BackendGroup, FilterAction, ForwardedForConfig, RouteConflict, RouteEntry, RouteInfo,
-    RouteKind, RouteTimeouts, Satisfy,
+    RouteKind, RouteTimeouts,
 };
 use super::predicate::{MatchPredicates, RequestContext, ValueMatch};
 use super::rate_limit::RateLimitConfig;
@@ -66,11 +66,7 @@ pub struct RouteMatch {
     /// configured header and stores it in `ProxyCtx::client_ip` for use by all
     /// IP-based features (allow/deny-source-range, rate limiting, access logs).
     pub forwarded_for: Option<Arc<ForwardedForConfig>>,
-    /// How `allow-source-range` and `auth` combine when both are configured.
-    ///
-    /// Populated from `RouteEntry::satisfy`. [`Satisfy::All`] (the default)
-    /// requires both to pass; [`Satisfy::Any`] admits on either passing.
-    pub satisfy: Satisfy,
+
     /// When `Some`, the proxy returns this status immediately without contacting
     /// upstream (invalid/missing/forbidden backend ref). See the struct docs.
     pub error_status: Option<u16>,
@@ -94,7 +90,7 @@ impl RouteMatch {
             auth: entry.auth.clone(),
             compression: entry.compression.clone(),
             forwarded_for: entry.forwarded_for.clone(),
-            satisfy: entry.satisfy,
+
             error_status: entry.error_status,
         }
     }

@@ -252,34 +252,3 @@ pub const AUTH_TLS_CA_SECRET: &str = fixture!("auth_tls_ca_secret.yaml");
 pub const ANNOTATION_AUTH_TLS: &str = fixture!("annotation_auth_tls.yaml");
 
 // ── satisfy any/all (#273) ────────────────────────────────────────────────────
-
-/// Ingress with `satisfy: "any"`, `allow-source-range: "203.0.113.0/24"`, and
-/// `auth-url` pointing at the `auth-deny` stub (#273). IP in-range admits despite
-/// auth denying (any gate passing is sufficient); IP out-of-range is denied when
-/// auth also denies (both gates fail). Apply `backends::ECHO` + `backends::AUTH_STUB`
-/// first. Host is `satisfyanydeny.TESTNS.local`. Requires PROXY-protocol harness.
-pub const ANNOTATION_SATISFY_ANY_AUTHDENY: &str = fixture!("annotation_satisfy_any_authdeny.yaml");
-
-/// Ingress with `satisfy: "any"`, `allow-source-range: "203.0.113.0/24"`, and
-/// `auth-url` pointing at the `auth-allow` stub (#273). IP out-of-range is still
-/// admitted because auth passes (either gate is enough). Apply `backends::ECHO` +
-/// `backends::AUTH_STUB` first. Host is `satisfyanyallow.TESTNS.local`. Requires
-/// PROXY-protocol harness.
-pub const ANNOTATION_SATISFY_ANY_AUTHALLOW: &str =
-    fixture!("annotation_satisfy_any_authallow.yaml");
-
-/// Ingress with `satisfy: "all"` (explicit default), `allow-source-range:
-/// "203.0.113.0/24"`, and `auth-url` pointing at the `auth-deny` stub (#273).
-/// IP in-range is still rejected because auth denies — the AND mode requires
-/// both gates to pass. Apply `backends::ECHO` + `backends::AUTH_STUB` first.
-/// Host is `satisfyallauthdeny.TESTNS.local`. Requires PROXY-protocol harness.
-pub const ANNOTATION_SATISFY_ALL_AUTHDENY: &str = fixture!("annotation_satisfy_all_authdeny.yaml");
-
-/// Ingress with `satisfy: "any"`, `deny-source-range: "203.0.113.0/24"`,
-/// `allow-source-range: "203.0.113.0/24"`, and `auth-url` → `auth-allow` stub (#273).
-/// Proves that `deny-source-range` always blocks first regardless of `satisfy` mode
-/// — the client is denied (403) even though both the IP allow-list and auth would
-/// admit it under `satisfy: any`. Apply `backends::ECHO` + `backends::AUTH_STUB` first.
-/// Host is `satisfyanydenywin.TESTNS.local`. Requires PROXY-protocol harness.
-pub const ANNOTATION_SATISFY_ANY_DENY_WINS: &str =
-    fixture!("annotation_satisfy_any_deny_wins.yaml");

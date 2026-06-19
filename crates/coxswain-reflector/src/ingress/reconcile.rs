@@ -224,9 +224,6 @@ impl IngressReconciler {
         let compression = ann.compression.clone().map(Arc::new);
         // Build the trusted-proxy forwarded-IP config once and share one Arc across every path.
         let forwarded_for = ann.forwarded_for.clone().map(Arc::new);
-        // Satisfy is Copy — no Arc needed; copy from annotations directly.
-        let satisfy = ann.satisfy;
-
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
         for (rule_index, rule) in rules.iter().enumerate() {
@@ -371,8 +368,7 @@ impl IngressReconciler {
                         .with_rate_limit(rate_limit.clone())
                         .with_auth(auth.clone())
                         .with_compression(compression.clone())
-                        .with_forwarded_for(forwarded_for.clone())
-                        .with_satisfy(satisfy);
+                        .with_forwarded_for(forwarded_for.clone());
                 if dead {
                     base_entry.error_status = Some(503);
                 }
@@ -405,8 +401,7 @@ impl IngressReconciler {
                             .with_rate_limit(rate_limit.clone())
                             .with_auth(auth.clone())
                             .with_compression(compression.clone())
-                            .with_forwarded_for(forwarded_for.clone())
-                            .with_satisfy(satisfy);
+                            .with_forwarded_for(forwarded_for.clone());
                     if dead {
                         entry.error_status = Some(503);
                     }
@@ -498,8 +493,7 @@ impl IngressReconciler {
                                 .with_rate_limit(rate_limit.clone())
                                 .with_auth(auth.clone())
                                 .with_compression(compression.clone())
-                                .with_forwarded_for(forwarded_for.clone())
-                                .with_satisfy(satisfy),
+                                .with_forwarded_for(forwarded_for.clone()),
                             )
                         };
                         for &listener_port in &ports {
