@@ -212,6 +212,8 @@ impl IngressReconciler {
         // Build the source-IP allow-list once and share one Arc across every route
         // entry of this Ingress — cloning it onto each path is then a refcount bump.
         let allow_source_range = ann.allow_source_range.clone().map(Arc::new);
+        // Build the source-IP block list (deny-source-range) the same way.
+        let deny_source_range = ann.deny_source_range.clone().map(Arc::new);
         // Build the rate-limit config once and share one Arc across every route
         // entry of this Ingress — same refcount-bump sharing pattern as above.
         let rate_limit = ann.rate_limit.clone().map(Arc::new);
@@ -358,6 +360,7 @@ impl IngressReconciler {
                         .with_filter_actions(path_filters.clone())
                         .with_max_body_size(ann.max_body_size)
                         .with_allow_source_range(allow_source_range.clone())
+                        .with_deny_source_range(deny_source_range.clone())
                         .with_cache_enabled(ann.cache_enabled)
                         .with_rate_limit(rate_limit.clone())
                         .with_auth(auth.clone());
@@ -388,6 +391,7 @@ impl IngressReconciler {
                             .with_filter_actions(ssl_filters)
                             .with_max_body_size(ann.max_body_size)
                             .with_allow_source_range(allow_source_range.clone())
+                            .with_deny_source_range(deny_source_range.clone())
                             .with_cache_enabled(ann.cache_enabled)
                             .with_rate_limit(rate_limit.clone())
                             .with_auth(auth.clone());
@@ -478,6 +482,7 @@ impl IngressReconciler {
                                 .with_filter_actions(filters)
                                 .with_max_body_size(ann.max_body_size)
                                 .with_allow_source_range(allow_source_range.clone())
+                                .with_deny_source_range(deny_source_range.clone())
                                 .with_rate_limit(rate_limit.clone())
                                 .with_auth(auth.clone()),
                             )

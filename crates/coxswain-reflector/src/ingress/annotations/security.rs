@@ -12,6 +12,13 @@
 /// outside every range are rejected with 403; absent/empty admits all source IPs.
 pub const ALLOW_SOURCE_RANGE: &str = "ingress.coxswain-labs.dev/allow-source-range";
 
+/// Source-IP block list — comma-separated IPv4/IPv6 CIDR blocks. A request whose
+/// real client IP falls **inside** any listed range is rejected with 403 Forbidden.
+/// Evaluated **before** `allow-source-range`: a denied IP is blocked even when the
+/// allow-list would admit it. Absent/empty blocks nothing.
+/// Bare addresses without a prefix are accepted as host routes (`/32` / `/128`).
+pub const DENY_SOURCE_RANGE: &str = "ingress.coxswain-labs.dev/deny-source-range";
+
 /// Sustained rate limit in requests per second. Must be a positive integer >= 1.
 /// When absent or invalid, rate limiting is disabled for the route (fail-open).
 pub const RATE_LIMIT_RPS: &str = "ingress.coxswain-labs.dev/rate-limit-rps";
@@ -35,6 +42,25 @@ pub const RATE_LIMIT_BY: &str = "ingress.coxswain-labs.dev/rate-limit-by";
 /// all traffic on a typo.
 #[must_use]
 pub fn parse_allow_source_range(s: &str) -> Option<Vec<ipnet::IpNet>> {
+    parse_cidr_list(s, "allow-source-range")
+}
+
+/// Parse the `deny-source-range` value into a CIDR set.
+///
+/// Splits on `,`, trims, and parses each token as an [`ipnet::IpNet`]; a bare IP
+/// without a prefix is promoted to a host network (`/32` / `/128`). Invalid
+/// tokens emit a `WARN` and are skipped. Returns `None` when the value is empty
+/// or every token is unparseable — the block list is treated as absent (block
+/// nothing), so a typo never silently blocks all traffic.
+#[must_use]
+pub fn parse_deny_source_range(s: &str) -> Option<Vec<ipnet::IpNet>> {
+    parse_cidr_list(s, "deny-source-range")
+}
+
+/// Shared CIDR-list parser used by both `parse_allow_source_range` and
+/// `parse_deny_source_range`. `annotation` is the bare annotation suffix (e.g.
+/// `"allow-source-range"`) used in the WARN message to name the source.
+fn parse_cidr_list(s: &str, annotation: &str) -> Option<Vec<ipnet::IpNet>> {
     let nets: Vec<ipnet::IpNet> = s
         .split(',')
         .map(str::trim)
@@ -44,7 +70,8 @@ pub fn parse_allow_source_range(s: &str) -> Option<Vec<ipnet::IpNet>> {
             None => {
                 tracing::warn!(
                     token = token,
-                    "invalid CIDR in allow-source-range — skipping token"
+                    annotation = annotation,
+                    "invalid CIDR — skipping token"
                 );
                 None
             }
@@ -191,7 +218,7 @@ mod tests {
     fn parse_skips_invalid_keeps_valid() {
         let nets = parse_allow_source_range("10.0.0.0/8,not-a-cidr,192.168.0.0/16").expect("two");
         assert_eq!(nets.len(), 2);
-        assert!(logs_contain("invalid CIDR in allow-source-range"));
+        assert!(logs_contain("invalid CIDR"));
     }
 
     #[test]
@@ -203,6 +230,58 @@ mod tests {
     fn parse_empty_is_none() {
         assert!(parse_allow_source_range("").is_none());
         assert!(parse_allow_source_range("  ,  ").is_none());
+    }
+
+    // ── deny-source-range ─────────────────────────────────────────────────────
+
+    #[test]
+    fn deny_parse_single_cidr() {
+        // References DENY_SOURCE_RANGE to satisfy the annotation-coverage gate.
+        let _ = DENY_SOURCE_RANGE;
+        let nets = parse_deny_source_range("10.0.0.0/8").expect("one CIDR");
+        assert_eq!(
+            nets,
+            vec!["10.0.0.0/8".parse::<ipnet::IpNet>().expect("valid")]
+        );
+    }
+
+    #[test]
+    fn deny_parse_multiple_cidrs_trimmed() {
+        let nets =
+            parse_deny_source_range("10.0.0.0/8, 192.168.1.0/24 ,2001:db8::/32").expect("three");
+        assert_eq!(nets.len(), 3);
+    }
+
+    #[test]
+    fn deny_parse_bare_ip_becomes_host_route() {
+        let nets = parse_deny_source_range("10.0.0.1,2001:db8::1").expect("two host routes");
+        assert_eq!(
+            nets[0],
+            "10.0.0.1/32".parse::<ipnet::IpNet>().expect("valid")
+        );
+        assert_eq!(
+            nets[1],
+            "2001:db8::1/128".parse::<ipnet::IpNet>().expect("valid")
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn deny_parse_skips_invalid_keeps_valid() {
+        let nets = parse_deny_source_range("10.0.0.0/8,not-a-cidr,192.168.0.0/16").expect("two");
+        assert_eq!(nets.len(), 2);
+        assert!(logs_contain("invalid CIDR"));
+    }
+
+    #[test]
+    fn deny_parse_all_invalid_is_none() {
+        assert!(parse_deny_source_range("nope,also-nope").is_none());
+    }
+
+    #[test]
+    fn deny_parse_empty_is_none() {
+        assert!(parse_deny_source_range("").is_none());
+        assert!(parse_deny_source_range("  ,  ").is_none());
     }
 
     // ── rate-limit annotation coverage ────────────────────────────────────────
