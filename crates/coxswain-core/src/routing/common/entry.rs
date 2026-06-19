@@ -1,6 +1,7 @@
 //! Route entry types: backend groups, filter actions, route timeouts, and path-rule metadata.
 
 use super::auth::IngressAuthConfig;
+use super::compression::CompressionConfig;
 use super::predicate::MatchPredicates;
 use super::rate_limit::RateLimitConfig;
 use http::{HeaderName, HeaderValue};
@@ -1122,6 +1123,15 @@ pub struct RouteEntry {
     /// proxy enforce auth before touching the upstream.  Shared as an `Arc` so
     /// the per-request cost is a refcount bump.
     pub auth: Option<Arc<IngressAuthConfig>>,
+    /// Per-route response-compression configuration from the
+    /// `ingress.coxswain-labs.dev/compression-*` annotations.
+    ///
+    /// `None` (the default, and the value for all Gateway-API routes) disables
+    /// compression — upstream responses are forwarded verbatim. `Some(cfg)`
+    /// makes the proxy negotiate gzip/brotli with the client and compress the
+    /// response stream chunk-by-chunk. Shared as an `Arc` so cloning into the
+    /// lookup result is a refcount bump.
+    pub compression: Option<Arc<CompressionConfig>>,
 }
 
 impl RouteEntry {
@@ -1147,6 +1157,7 @@ impl RouteEntry {
             cache_enabled: false,
             rate_limit: None,
             auth: None,
+            compression: None,
         }
     }
 
@@ -1173,6 +1184,7 @@ impl RouteEntry {
             cache_enabled: false,
             rate_limit: None,
             auth: None,
+            compression: None,
         }
     }
 
@@ -1204,6 +1216,7 @@ impl RouteEntry {
             cache_enabled: false,
             rate_limit: None,
             auth: None,
+            compression: None,
         }
     }
 
@@ -1238,6 +1251,7 @@ impl RouteEntry {
             cache_enabled: false,
             rate_limit: None,
             auth: None,
+            compression: None,
         }
     }
 
@@ -1368,6 +1382,19 @@ impl RouteEntry {
         self.auth = auth;
         self
     }
+
+    /// Set per-route response-compression config for this route (builder-style).
+    ///
+    /// Used by the Ingress reconciler to attach the config parsed from the
+    /// `ingress.coxswain-labs.dev/compression-*` annotations. `None` (the
+    /// default, and the value for all Gateway-API routes) disables compression.
+    /// The reconciler shares one `Arc` across every path of an Ingress so
+    /// cloning onto each entry is a refcount bump.
+    #[must_use]
+    pub fn with_compression(mut self, compression: Option<Arc<CompressionConfig>>) -> Self {
+        self.compression = compression;
+        self
+    }
 }
 
 // Lock the hot-path RouteEntry and BackendPool sizes to catch accidental growth.
@@ -1381,7 +1408,8 @@ impl RouteEntry {
 // Bumped 280→288 by adding rate_limit: Option<Arc<RateLimitConfig>> (8 bytes, niche pointer) for per-route rate limiting (#25).
 // Bumped 288→296 by adding auth: Option<Arc<IngressAuthConfig>> (8 bytes, niche pointer) for ingress.coxswain-labs.dev/auth-* (#24).
 // Bumped 296→304 by adding deny_source_range: Option<Arc<Vec<IpNet>>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/deny-source-range IP block-list (#268).
-static_assertions::assert_eq_size!(RouteEntry, [u8; 304]);
+// Bumped 304→312 by adding compression: Option<Arc<CompressionConfig>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/compression-* response compression (#270).
+static_assertions::assert_eq_size!(RouteEntry, [u8; 312]);
 // Hot type — review with the team before bumping this number.
 static_assertions::assert_eq_size!(BackendPool, [u8; 24]);
 
@@ -1578,7 +1606,8 @@ mod tests {
         // Bumped 280→288: rate_limit: Option<Arc<RateLimitConfig>> added for per-route rate limiting (#25).
         // Bumped 288→296: auth: Option<Arc<IngressAuthConfig>> added for auth-* annotations (#24).
         // Bumped 296→304: deny_source_range: Option<Arc<Vec<IpNet>>> added for the deny-source-range IP block-list (#268).
-        static_assertions::assert_eq_size!(RouteEntry, [u8; 304]);
+        // Bumped 304→312: compression: Option<Arc<CompressionConfig>> added for compression-* annotations (#270).
+        static_assertions::assert_eq_size!(RouteEntry, [u8; 312]);
     }
 
     #[test]

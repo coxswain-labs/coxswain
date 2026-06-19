@@ -14,6 +14,7 @@ use crate::common::engine::RoutingEngine;
 use crate::common::hooks;
 use crate::config::SharedProxyConfig;
 use async_trait::async_trait;
+use bytes::Bytes;
 use coxswain_core::routing::Ingress;
 use pingora_cache::key::{CacheKey, HashBinary};
 use pingora_cache::{CacheMeta, ForcedFreshness, HitHandler, RespCacheable};
@@ -172,6 +173,20 @@ impl ProxyHttp for IngressProxy {
         Self::CTX: Send + Sync,
     {
         hooks::upstream_response_filter(session, upstream_response, ctx).await
+    }
+
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut ProxyCtx,
+    ) -> Result<Option<std::time::Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        hooks::response_body_filter(body, end_of_stream, ctx)?;
+        Ok(None)
     }
 
     fn fail_to_connect(

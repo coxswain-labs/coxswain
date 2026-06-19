@@ -33,8 +33,8 @@ pub use session::*;
 pub use traffic_policy::*;
 
 use coxswain_core::routing::{
-    BackendProtocol, FilterAction, HeaderMod, PathModifier, RateLimitConfig, RetryPolicy,
-    RouteTimeouts, SessionAffinity,
+    BackendProtocol, CompressionConfig, FilterAction, HeaderMod, PathModifier, RateLimitConfig,
+    RetryPolicy, RouteTimeouts, SessionAffinity,
 };
 use security::AuthAnnotation;
 use std::collections::BTreeMap;
@@ -147,6 +147,9 @@ pub(super) struct IngressAnnotations {
     /// Pingora's built-in behaviour. Applied in the proxy via
     /// `HttpPeer.options.idle_timeout`.
     pub keepalive_timeout: Option<std::time::Duration>,
+    /// Response compression config from the `compression-*` annotations (#270).
+    /// `None` when neither `compression-gzip` nor `compression-brotli` is `"true"`.
+    pub compression: Option<CompressionConfig>,
 }
 
 impl IngressAnnotations {
@@ -448,6 +451,9 @@ impl IngressAnnotations {
             d
         });
 
+        // ── Response compression (#270) ───────────────────────────────────────
+        let compression = traffic_policy::parse_compression(ann, route_id);
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -474,6 +480,7 @@ impl IngressAnnotations {
             auth,
             mirror_target,
             keepalive_timeout,
+            compression,
         }
     }
 }

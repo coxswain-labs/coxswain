@@ -1,6 +1,7 @@
 //! Per-host path router: exact, prefix, and regex path matching with predicate filtering.
 
 use super::auth::IngressAuthConfig;
+use super::compression::CompressionConfig;
 use super::entry::{
     BackendGroup, FilterAction, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts,
 };
@@ -49,6 +50,13 @@ pub struct RouteMatch {
     /// carry one of the `ingress.coxswain-labs.dev/auth-*` annotations.  The
     /// proxy enforces it in `request_filter` before forwarding to upstream.
     pub auth: Option<Arc<IngressAuthConfig>>,
+    /// Per-route response-compression configuration (`None` = no compression).
+    ///
+    /// Populated from `RouteEntry::compression`; `Some` only for Ingress routes
+    /// that opt in via `ingress.coxswain-labs.dev/compression-gzip: "true"` or
+    /// `compression-brotli: "true"`. The proxy reads this in
+    /// `upstream_response_filter` to negotiate and stream compressed responses.
+    pub compression: Option<Arc<CompressionConfig>>,
     /// When `Some`, the proxy returns this status immediately without contacting
     /// upstream (invalid/missing/forbidden backend ref). See the struct docs.
     pub error_status: Option<u16>,
@@ -70,6 +78,7 @@ impl RouteMatch {
             cache_enabled: entry.cache_enabled,
             rate_limit: entry.rate_limit.clone(),
             auth: entry.auth.clone(),
+            compression: entry.compression.clone(),
             error_status: entry.error_status,
         }
     }

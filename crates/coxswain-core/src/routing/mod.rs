@@ -17,6 +17,7 @@ pub use common::auth::{
     BasicCredential, ExtAuthConfig, ExtAuthTransport, HttpExtAuthConfig, IngressAuthConfig,
     PasswordHash,
 };
+pub use common::compression::CompressionConfig;
 pub use common::entry::{
     BackendGroup, BackendProtocol, FilterAction, HeaderMod, HeaderModError, PathModifier, RetryOn,
     RetryPolicy, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts, SessionAffinity,

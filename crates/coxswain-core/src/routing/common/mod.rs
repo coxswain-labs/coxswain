@@ -7,6 +7,7 @@
 //! aliases in the sibling modules.
 
 pub mod auth;
+pub mod compression;
 pub mod entry;
 pub mod host_router;
 pub mod port;

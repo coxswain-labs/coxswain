@@ -43,6 +43,11 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/auth-response-headers` | csv | _none_ | `"X-Auth-User"` |
 | `ingress.coxswain-labs.dev/auth-always-set-cookie` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/auth-basic-secret` | `namespace/name` | _none_ | `"my-ns/my-htpasswd"` |
+| `ingress.coxswain-labs.dev/compression-gzip` | boolean | `false` | `"true"` |
+| `ingress.coxswain-labs.dev/compression-brotli` | boolean | `false` | `"true"` |
+| `ingress.coxswain-labs.dev/compression-level` | integer 1–9 | `6` | `"5"` |
+| `ingress.coxswain-labs.dev/compression-types` | csv of MIME types | see below | `"text/html,application/json"` |
+| `ingress.coxswain-labs.dev/compression-min-size` | size | `1024` | `"4k"` |
 
 ```yaml
 metadata:
@@ -639,6 +644,90 @@ metadata:
 **Observability**: the `coxswain_proxy_upstream_connections_total{state="reused"}` counter increments every time a request reuses a pooled connection. Compare it with `{state="new"}` to gauge keepalive efficiency for a route.
 
 **Global pool size**: the total number of idle upstream connections across all routes is bounded by `--proxy-upstream-keepalive-pool-size` (default: 128). Set it via the Helm value `proxy.shared.upstreamKeepalivePoolSize` or the env var `COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE`. Raise it for deployments with many distinct upstream hosts/ports; lower it to reduce file-descriptor usage.
+
+## `compression-*`
+
+Opt-in, per-Ingress on-the-fly response compression. The proxy compresses upstream responses before
+forwarding them to the client, negotiated against the client's `Accept-Encoding` header. Nothing is
+compressed unless at least one codec is explicitly enabled.
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/compression-gzip: "true"
+    ingress.coxswain-labs.dev/compression-brotli: "true"
+    ingress.coxswain-labs.dev/compression-level: "6"
+    ingress.coxswain-labs.dev/compression-types: "text/html,text/plain,text/css,application/json,application/javascript"
+    ingress.coxswain-labs.dev/compression-min-size: "1024"
+```
+
+| Annotation | Type | Default |
+|---|---|---|
+| `compression-gzip` | boolean | `false` |
+| `compression-brotli` | boolean | `false` |
+| `compression-level` | integer, 1–9 | `6` |
+| `compression-types` | CSV of MIME types | `text/html,text/plain,text/css,application/json,application/javascript` |
+| `compression-min-size` | byte count (suffixes `k`/`m`/`g` accepted) | `1024` |
+
+### `compression-gzip` / `compression-brotli`
+
+Enable the respective codec. Both are `false` by default — no compression is applied to any Ingress
+unless at least one is set to `"true"`. Setting both to `"true"` enables dual-codec support: brotli
+is preferred when the client advertises `br` in `Accept-Encoding`; gzip is used otherwise.
+
+### `compression-level`
+
+Compression effort on a 1–9 scale (1 = fastest/least compression, 9 = slowest/best compression).
+The same level is applied to both gzip and brotli. Values outside the 1–9 range emit a warning and
+fall back to `6`. The default of `6` is a good balance for most workloads.
+
+### `compression-types`
+
+Comma-separated list of MIME types to compress. Only responses whose `Content-Type` header matches
+an entry in this list (the media type before any `;parameters`) are compressed. Matching is
+case-insensitive. The default list covers the most common compressible types:
+
+```
+text/html, text/plain, text/css, application/json, application/javascript
+```
+
+An empty or entirely-invalid list falls back to the default. Responses with binary types such as
+`image/png`, `video/mp4`, or `application/octet-stream` are passed through unmodified regardless of
+this setting.
+
+### `compression-min-size`
+
+Minimum response body size, in bytes, before compression is attempted. Responses whose
+`Content-Length` is present and smaller than this threshold are passed through without compression.
+When `Content-Length` is absent (chunked transfer encoding), the response is always eligible —
+the proxy cannot know the full size without buffering.
+
+The default is `1024` bytes (1 KiB). The value accepts the `k`/`m`/`g` suffix for convenience
+(`"4k"` = 4096, `"1m"` = 1048576). Invalid values warn and fall back to `1024`.
+
+### Behaviour
+
+Compression is applied only when **all** of the following hold:
+
+1. At least one codec (`compression-gzip` or `compression-brotli`) is enabled.
+2. The client advertises the codec in `Accept-Encoding`.
+3. The upstream response does not already have a `Content-Encoding` header — pre-compressed
+   responses (e.g. assets served pre-compressed by the upstream) are forwarded unchanged.
+4. The response `Content-Type` (before `;`) matches an entry in `compression-types`.
+5. Either `Content-Length` is absent, or its value is ≥ `compression-min-size`.
+6. The response status is a normal body-bearing code (1xx, 204, and 304 responses are passed through).
+
+When compression fires, the proxy:
+- Sets `Content-Encoding: gzip` or `Content-Encoding: br`.
+- Appends `Accept-Encoding` to the `Vary` header (or creates it), so downstream caches serve the
+  correct variant.
+- Removes `Content-Length` (the compressed size differs from the original) and `Accept-Ranges`
+  (byte-range requests are incompatible with on-the-fly compression).
+
+!!! note "q-values"
+    q-values in `Accept-Encoding` are not arbitrated — presence of a codec token is sufficient to
+    select it. This matches Pingora's own behaviour. When both codecs are enabled and the client
+    sends both `br` and `gzip`, brotli always wins regardless of q-values.
 
 ## Class-level defaults
 
