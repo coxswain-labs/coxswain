@@ -1,0 +1,20 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: send-timeout-ingress
+  annotations:
+    ingress.coxswain-labs.dev/send-timeout: "100ms"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: send-timeout.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: slow-echo
+                port:
+                  number: 3000

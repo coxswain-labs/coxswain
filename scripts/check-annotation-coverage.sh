@@ -28,14 +28,8 @@ ANNOTATIONS_DIR="crates/coxswain-reflector/src/ingress/annotations"
 E2E_DIR="crates/coxswain-e2e"
 
 # Annotation keys whose e2e effect test is tracked, not yet landed.
-#   send-timeout → #341: triggering Pingora's upstream write_timeout
-#   deterministically needs a backend that stalls reads + a body large enough to
-#   fill the socket buffers, which is kernel/buffer-size dependent and would flake
-#   (violating the charter's zero-flakes rule). connect-timeout and read-timeout
-#   (#331) and backend-protocol (#339) now have effect tests.
-E2E_ALLOWLIST=(
-  "ingress.coxswain-labs.dev/send-timeout"      # #341
-)
+#   (none — all annotations now have effect tests)
+E2E_ALLOWLIST=()
 
 is_allowlisted() {
   local key="$1"

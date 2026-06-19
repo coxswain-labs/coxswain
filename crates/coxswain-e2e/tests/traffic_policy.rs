@@ -121,6 +121,74 @@ async fn annotation_read_timeout_returns_502() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Verifies `ingress.coxswain-labs.dev/send-timeout` bounds the upstream
+/// request-send phase (#341).
+///
+/// The slow-echo backend (`nc -lk -e /bin/sleep 30`) accepts TCP connections
+/// but never calls `read()`, so its kernel receive buffer fills with incoming
+/// data and is never drained. With `send-timeout: 100ms`, a 16 MiB chunked
+/// POST overflows the backend's kernel receive buffer (capped at ~6 MiB by
+/// `/proc/sys/net/ipv4/tcp_rmem` on stock Linux), blocking the proxy's
+/// `write()` beyond the 100 ms deadline; the proxy abandons the write and
+/// returns 502.
+///
+/// Determinism gate: run ≥ 20 times before committing. A client-side timeout
+/// (not a proxy 502) means the kernel buffer exceeds 16 MiB on this node —
+/// increase the body size or document the finding on #341.
+#[tokio::test]
+async fn annotation_send_timeout_returns_502() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-send-timeout").await?;
+
+    fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_SEND_TIMEOUT, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("send-timeout.{}.local", ns.name);
+
+    // A GET sends only ~200 B of headers, which fit in the kernel buffer without
+    // blocking; the write succeeds and the proxy then waits for a response that
+    // never arrives. Only a body large enough to overflow the kernel receive
+    // buffer (~6 MiB max on stock Linux) causes the proxy's write() to block
+    // and the send-timeout to fire. Poll with a 16 MiB chunked POST until the
+    // proxy returns 502 — 502 doubles as the route-ready signal.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!(
+                "send-timeout route {host} to return 502 on 16 MiB POST; \
+                 if looping, kernel recv buffer may exceed 16 MiB on this node"
+            )
+        },
+        || async {
+            let chunks = vec![vec![b'x'; 1024 * 1024]; 16];
+            match h
+                .http
+                .request_with_streamed_body(Method::POST, &host, "/", chunks)
+                .await
+            {
+                Ok((502, _)) => Some(()),
+                Ok((status, _)) => {
+                    tracing::debug!(host, status, "not 502 yet");
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        host,
+                        error = %e,
+                        "request error — route may not be installed yet"
+                    );
+                    None
+                }
+            }
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// Verifies a class-level `connect-timeout` default sourced from
 /// `IngressClass.spec.parameters` (#190) reaches the data plane — proving the
 /// class-defaults merge is annotation-agnostic, not specific to `rewrite-target`.
