@@ -3,7 +3,8 @@
 use super::auth::IngressAuthConfig;
 use super::compression::CompressionConfig;
 use super::entry::{
-    BackendGroup, FilterAction, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts,
+    BackendGroup, FilterAction, ForwardedForConfig, RouteConflict, RouteEntry, RouteInfo,
+    RouteKind, RouteTimeouts,
 };
 use super::predicate::{MatchPredicates, RequestContext, ValueMatch};
 use super::rate_limit::RateLimitConfig;
@@ -57,6 +58,14 @@ pub struct RouteMatch {
     /// `compression-brotli: "true"`. The proxy reads this in
     /// `upstream_response_filter` to negotiate and stream compressed responses.
     pub compression: Option<Arc<CompressionConfig>>,
+    /// Trusted-proxy forwarded-IP configuration (`None` = use L4 peer as client IP).
+    ///
+    /// Populated from `RouteEntry::forwarded_for`; `Some` only for Ingress routes
+    /// that set `ingress.coxswain-labs.dev/trust-forwarded-for: "true"`. The
+    /// proxy reads this in `request_filter` to extract the real client IP from the
+    /// configured header and stores it in `ProxyCtx::client_ip` for use by all
+    /// IP-based features (allow/deny-source-range, rate limiting, access logs).
+    pub forwarded_for: Option<Arc<ForwardedForConfig>>,
     /// When `Some`, the proxy returns this status immediately without contacting
     /// upstream (invalid/missing/forbidden backend ref). See the struct docs.
     pub error_status: Option<u16>,
@@ -79,6 +88,7 @@ impl RouteMatch {
             rate_limit: entry.rate_limit.clone(),
             auth: entry.auth.clone(),
             compression: entry.compression.clone(),
+            forwarded_for: entry.forwarded_for.clone(),
             error_status: entry.error_status,
         }
     }

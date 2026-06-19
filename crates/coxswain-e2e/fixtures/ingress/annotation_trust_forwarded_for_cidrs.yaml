@@ -1,0 +1,30 @@
+# trust-forwarded-for with trusted-cidrs + custom header fixture (apply backends::ECHO first).
+#
+# The Ingress trusts X-Real-IP only when the L4 peer is 10.0.0.1/32; requests
+# from other peers must be treated as untrusted (the forwarded header is ignored).
+# allow-source-range restricts access to 203.0.113.0/24 so the test can observe
+# which IP the proxy used as the effective client.
+#
+# Host: trustfwdcidr.TESTNS.local -> echo-a:3000.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: trust-forwarded-for-cidrs-ingress
+  annotations:
+    ingress.coxswain-labs.dev/trust-forwarded-for: "true"
+    ingress.coxswain-labs.dev/forwarded-for-header: "X-Real-IP"
+    ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs: "10.0.0.1/32"
+    ingress.coxswain-labs.dev/allow-source-range: "10.0.0.1/32,203.0.113.0/24"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: trustfwdcidr.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

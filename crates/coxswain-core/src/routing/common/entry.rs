@@ -1132,6 +1132,43 @@ pub struct RouteEntry {
     /// response stream chunk-by-chunk. Shared as an `Arc` so cloning into the
     /// lookup result is a refcount bump.
     pub compression: Option<Arc<CompressionConfig>>,
+    /// Trusted-proxy forwarding configuration from the
+    /// `ingress.coxswain-labs.dev/trust-forwarded-for` family of annotations.
+    ///
+    /// `None` (the default, and the value for all Gateway-API routes) means the
+    /// proxy uses the L4 peer address as the client IP. `Some(cfg)` instructs
+    /// the proxy to extract the real client IP from a forwarded header (e.g.
+    /// `X-Forwarded-For`), optionally only when the L4 peer is in one of the
+    /// trusted CIDRs in `cfg.trusted_cidrs`. Shared as an `Arc` so cloning into
+    /// the lookup result is a refcount bump.
+    pub forwarded_for: Option<Arc<ForwardedForConfig>>,
+}
+
+/// Configuration for trusting a forwarded client-IP header on a per-Ingress basis.
+///
+/// Parsed from the `ingress.coxswain-labs.dev/trust-forwarded-for` family of annotations.
+/// When present on a `RouteEntry`, the proxy extracts the real client IP from `header`
+/// instead of using the L4 peer address. The `trusted_cidrs` set gates this trust: if
+/// non-empty, the header is only trusted when the L4 peer falls inside one of those
+/// CIDRs (anti-spoofing guard). An empty `trusted_cidrs` means unconditional trust.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardedForConfig {
+    /// Header name to read the client IP from (case-insensitive; e.g. `X-Forwarded-For`).
+    pub header: Box<str>,
+    /// L4-peer CIDR gate. Empty = trust the header unconditionally.
+    pub trusted_cidrs: Box<[ipnet::IpNet]>,
+}
+
+impl ForwardedForConfig {
+    /// Construct a [`ForwardedForConfig`] from its parts.
+    #[must_use]
+    pub fn new(header: Box<str>, trusted_cidrs: Box<[ipnet::IpNet]>) -> Self {
+        Self {
+            header,
+            trusted_cidrs,
+        }
+    }
 }
 
 impl RouteEntry {
@@ -1158,6 +1195,7 @@ impl RouteEntry {
             rate_limit: None,
             auth: None,
             compression: None,
+            forwarded_for: None,
         }
     }
 
@@ -1185,6 +1223,7 @@ impl RouteEntry {
             rate_limit: None,
             auth: None,
             compression: None,
+            forwarded_for: None,
         }
     }
 
@@ -1217,6 +1256,7 @@ impl RouteEntry {
             rate_limit: None,
             auth: None,
             compression: None,
+            forwarded_for: None,
         }
     }
 
@@ -1252,6 +1292,7 @@ impl RouteEntry {
             rate_limit: None,
             auth: None,
             compression: None,
+            forwarded_for: None,
         }
     }
 
@@ -1395,6 +1436,19 @@ impl RouteEntry {
         self.compression = compression;
         self
     }
+
+    /// Set the trusted-proxy forwarded-IP config for this route (builder-style).
+    ///
+    /// Used by the Ingress reconciler to attach the config parsed from the
+    /// `ingress.coxswain-labs.dev/trust-forwarded-for` family of annotations.
+    /// `None` (the default, and the value for all Gateway-API routes) keeps the
+    /// L4 peer as the client IP. The reconciler shares one `Arc` across every
+    /// path of an Ingress so cloning onto each entry is a refcount bump.
+    #[must_use]
+    pub fn with_forwarded_for(mut self, forwarded_for: Option<Arc<ForwardedForConfig>>) -> Self {
+        self.forwarded_for = forwarded_for;
+        self
+    }
 }
 
 // Lock the hot-path RouteEntry and BackendPool sizes to catch accidental growth.
@@ -1409,7 +1463,8 @@ impl RouteEntry {
 // Bumped 288→296 by adding auth: Option<Arc<IngressAuthConfig>> (8 bytes, niche pointer) for ingress.coxswain-labs.dev/auth-* (#24).
 // Bumped 296→304 by adding deny_source_range: Option<Arc<Vec<IpNet>>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/deny-source-range IP block-list (#268).
 // Bumped 304→312 by adding compression: Option<Arc<CompressionConfig>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/compression-* response compression (#270).
-static_assertions::assert_eq_size!(RouteEntry, [u8; 312]);
+// Bumped 312→320 by adding forwarded_for: Option<Arc<ForwardedForConfig>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/trust-forwarded-for trusted-proxy headers (#271).
+static_assertions::assert_eq_size!(RouteEntry, [u8; 320]);
 // Hot type — review with the team before bumping this number.
 static_assertions::assert_eq_size!(BackendPool, [u8; 24]);
 
@@ -1607,7 +1662,8 @@ mod tests {
         // Bumped 288→296: auth: Option<Arc<IngressAuthConfig>> added for auth-* annotations (#24).
         // Bumped 296→304: deny_source_range: Option<Arc<Vec<IpNet>>> added for the deny-source-range IP block-list (#268).
         // Bumped 304→312: compression: Option<Arc<CompressionConfig>> added for compression-* annotations (#270).
-        static_assertions::assert_eq_size!(RouteEntry, [u8; 312]);
+        // Bumped 312→320: forwarded_for: Option<Arc<ForwardedForConfig>> added for trust-forwarded-for (#271).
+        static_assertions::assert_eq_size!(RouteEntry, [u8; 320]);
     }
 
     #[test]
@@ -1644,6 +1700,21 @@ mod tests {
         let entry = RouteEntry::path_only(group, "ns/r".to_string(), None)
             .with_deny_source_range(Some(Arc::clone(&nets)));
         assert_eq!(entry.deny_source_range.as_deref(), Some(&*nets));
+    }
+
+    #[test]
+    fn with_forwarded_for_round_trips() {
+        let group = Arc::new(BackendGroup::new("ns/svc".to_string(), vec![]));
+        let bare = RouteEntry::path_only(Arc::clone(&group), "ns/r".to_string(), None);
+        assert!(bare.forwarded_for.is_none());
+
+        let cfg = Arc::new(ForwardedForConfig::new(
+            Box::from("X-Forwarded-For"),
+            Box::from(["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()].as_slice()),
+        ));
+        let entry = RouteEntry::path_only(group, "ns/r".to_string(), None)
+            .with_forwarded_for(Some(Arc::clone(&cfg)));
+        assert_eq!(entry.forwarded_for.as_deref(), Some(cfg.as_ref()));
     }
 
     #[test]

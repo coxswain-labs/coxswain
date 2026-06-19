@@ -33,8 +33,8 @@ pub use session::*;
 pub use traffic_policy::*;
 
 use coxswain_core::routing::{
-    BackendProtocol, CompressionConfig, FilterAction, HeaderMod, PathModifier, RateLimitConfig,
-    RetryPolicy, RouteTimeouts, SessionAffinity,
+    BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HeaderMod, PathModifier,
+    RateLimitConfig, RetryPolicy, RouteTimeouts, SessionAffinity,
 };
 use security::AuthAnnotation;
 use std::collections::BTreeMap;
@@ -150,6 +150,9 @@ pub(super) struct IngressAnnotations {
     /// Response compression config from the `compression-*` annotations (#270).
     /// `None` when neither `compression-gzip` nor `compression-brotli` is `"true"`.
     pub compression: Option<CompressionConfig>,
+    /// Trusted-proxy forwarded-IP config from the `trust-forwarded-for` family (#271).
+    /// `None` when `trust-forwarded-for` is absent or `"false"`.
+    pub forwarded_for: Option<ForwardedForConfig>,
 }
 
 impl IngressAnnotations {
@@ -454,6 +457,9 @@ impl IngressAnnotations {
         // ── Response compression (#270) ───────────────────────────────────────
         let compression = traffic_policy::parse_compression(ann, route_id);
 
+        // ── Trusted-proxy forwarded-IP headers (#271) ─────────────────────────
+        let forwarded_for = security::parse_forwarded_for(ann, route_id);
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -481,6 +487,7 @@ impl IngressAnnotations {
             mirror_target,
             keepalive_timeout,
             compression,
+            forwarded_for,
         }
     }
 }

@@ -101,6 +101,16 @@ pub const ANNOTATION_DENY_SOURCE_RANGE: &str = fixture!("annotation_deny_source_
 /// but not the deny range is admitted (200).
 pub const ANNOTATION_DENY_AND_ALLOW_SOURCE_RANGE: &str =
     fixture!("annotation_deny_and_allow_source_range.yaml");
+/// Ingress with `trust-forwarded-for: "true"` and `allow-source-range: "203.0.113.0/24"` (#271).
+/// Used to verify the proxy uses the first non-private IP from `X-Forwarded-For` as the effective
+/// client IP when header trust is enabled (no CIDR gate — unconditional trust).
+pub const ANNOTATION_TRUST_FORWARDED_FOR: &str = fixture!("annotation_trust_forwarded_for.yaml");
+/// Ingress with `trust-forwarded-for: "true"`, `forwarded-for-header: "X-Real-IP"`,
+/// `forwarded-for-trusted-cidrs: "10.0.0.1/32"`, and `allow-source-range: "10.0.0.1/32,203.0.113.0/24"` (#271).
+/// Used to verify the anti-spoofing gate: the proxy only trusts the custom header when the L4
+/// peer is within the configured CIDR; requests from other peers ignore the header and use the L4 IP.
+pub const ANNOTATION_TRUST_FORWARDED_FOR_CIDRS: &str =
+    fixture!("annotation_trust_forwarded_for_cidrs.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/cache-enabled: "true"` plus a
 /// `response-header-set` that injects `Cache-Control: ${CACHE_CONTROL}` (#40).
 /// Used to verify the proxy serves a second identical GET from cache (an `Age`

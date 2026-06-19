@@ -35,8 +35,8 @@ use crate::upstream_ca::UpstreamCaCache;
 use bytes::Bytes;
 use coxswain_cache::ResponseCache;
 use coxswain_core::routing::{
-    BackendProtocol, CompressionConfig, FilterAction, RateLimitKey, RequestContext, RetryOn,
-    RouteTimeouts, SessionAffinity, UpstreamCa,
+    BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, RateLimitKey,
+    RequestContext, RetryOn, RouteTimeouts, SessionAffinity, UpstreamCa,
 };
 use coxswain_core::tls::{ClientCertConfigState, SharedClientCertStore};
 use http::header;
@@ -92,6 +92,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             mirror_body: Vec::new(),
             compression_encoder: None,
             client_cert_pem: None,
+            client_ip: None,
         })
         .unwrap_or_default()
 }
@@ -158,6 +159,12 @@ pub(crate) async fn request_filter<K>(
         return Ok(true);
     };
 
+    // Resolve the effective client IP once per request (#271).  When the matched route
+    // carries a ForwardedForConfig, the IP is extracted from the configured header
+    // (subject to the trusted-CIDR anti-spoofing gate); otherwise the PROXY-protocol
+    // addr or L4 peer is used directly.  All IP-based features below read ctx.client_ip.
+    ctx.client_ip = resolve_client_ip(session, ctx.real_client_addr, m.forwarded_for.as_deref());
+
     // ── Per-Ingress client-certificate mTLS cross-SNI guard (#267) ──────────────
     //
     // If this Host requires mTLS, the connection MUST carry a verified `ClientCertInfo`
@@ -195,13 +202,7 @@ pub(crate) async fn request_filter<K>(
     // would admit it. A None client IP is fail-open (not denied) — a block list only
     // acts on IPs it can positively attribute to a listed range.
     if let Some(nets) = m.deny_source_range.as_deref() {
-        let client_ip = ctx.real_client_addr.map(|a| a.ip()).or_else(|| {
-            session
-                .as_downstream()
-                .client_addr()
-                .and_then(|a| a.as_inet())
-                .map(|a| a.ip())
-        });
+        let client_ip = ctx.client_ip;
         if ip_denied(client_ip, nets) {
             return Err(pingora_core::Error::explain(
                 HTTPStatus(403),
@@ -213,17 +214,11 @@ pub(crate) async fn request_filter<K>(
     // Per-route source-IP allow-list (ingress.coxswain-labs.dev/allow-source-range).
     // Access control runs ahead of redirect and body handling — so an out-of-range
     // client gets 403 and never receives a redirect (which would leak the canonical
-    // host/URL) nor has its body read. Match the *real* client IP: the PROXY-protocol
-    // peer when present, else the L4 downstream peer. Both are `Copy`; the CIDR scan
-    // borrows the `Arc`'d set — no per-request allocation.
+    // host/URL) nor has its body read. Match the *real* client IP: resolved once
+    // above by resolve_client_ip (considers forwarded headers if configured) and
+    // cached on ctx — no per-request allocation for the CIDR scan.
     if let Some(nets) = m.allow_source_range.as_deref() {
-        let client_ip = ctx.real_client_addr.map(|a| a.ip()).or_else(|| {
-            session
-                .as_downstream()
-                .client_addr()
-                .and_then(|a| a.as_inet())
-                .map(|a| a.ip())
-        });
+        let client_ip = ctx.client_ip;
         if !ip_allowed(client_ip, nets) {
             return Err(pingora_core::Error::explain(
                 HTTPStatus(403),
@@ -237,13 +232,7 @@ pub(crate) async fn request_filter<K>(
     // does not receive a redirect, preventing URL leakage). Fail-open on absent
     // client key (undeterminable IP or missing header) — matches nginx + Envoy.
     if let Some(cfg) = m.rate_limit.as_deref() {
-        let client_ip = ctx.real_client_addr.map(|a| a.ip()).or_else(|| {
-            session
-                .as_downstream()
-                .client_addr()
-                .and_then(|a| a.as_inet())
-                .map(|a| a.ip())
-        });
+        let client_ip = ctx.client_ip;
         let client_key = {
             // Scope the immutable req borrow so it does not outlive the next mutable
             // session borrow (write_response_header below).
@@ -415,6 +404,99 @@ pub(crate) async fn request_filter<K>(
     }
 
     Ok(false)
+}
+
+/// Private and reserved IP ranges that are never treated as a real client IP when
+/// extracting from a forwarded header.  Includes RFC 1918 private ranges, loopback,
+/// link-local, ULA (fc00::/7), and the unspecified address.
+static PRIVATE_NETS: std::sync::LazyLock<[ipnet::IpNet; 9]> = std::sync::LazyLock::new(|| {
+    [
+        "10.0.0.0/8"
+            .parse()
+            .unwrap_or_else(|e| panic!("invariant: {e}")),
+        "172.16.0.0/12"
+            .parse()
+            .unwrap_or_else(|e| panic!("invariant: {e}")),
+        "192.168.0.0/16"
+            .parse()
+            .unwrap_or_else(|e| panic!("invariant: {e}")),
+        "127.0.0.0/8"
+            .parse()
+            .unwrap_or_else(|e| panic!("invariant: {e}")),
+        "169.254.0.0/16"
+            .parse()
+            .unwrap_or_else(|e| panic!("invariant: {e}")),
+        "::1/128"
+            .parse()
+            .unwrap_or_else(|e| panic!("invariant: {e}")),
+        "fe80::/10"
+            .parse()
+            .unwrap_or_else(|e| panic!("invariant: {e}")),
+        "fc00::/7"
+            .parse()
+            .unwrap_or_else(|e| panic!("invariant: {e}")),
+        "::/128"
+            .parse()
+            .unwrap_or_else(|e| panic!("invariant: {e}")),
+    ]
+});
+
+/// Scan a comma-separated header value for the first non-private, non-loopback
+/// IP address.  Returns `None` when every token is private, unparseable, or the
+/// value is empty.
+///
+/// "First" is left-to-right per the XFF convention: the leftmost value is the
+/// one closest to the original client and furthest from potential LB injection.
+fn first_non_private_ip(header_value: &str) -> Option<std::net::IpAddr> {
+    header_value
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .filter_map(|t| t.parse::<std::net::IpAddr>().ok())
+        .find(|ip| !PRIVATE_NETS.iter().any(|n| n.contains(ip)))
+}
+
+/// Resolve the effective client IP for the current request.
+///
+/// Resolution order (per `ForwardedForConfig` doc):
+/// 1. If no config → L4 IP (current behavior).
+/// 2. If `trusted_cidrs` non-empty AND L4 IP ∉ any CIDR → L4 IP (anti-spoofing).
+/// 3. Else extract the first non-private IP from the configured header; fall back
+///    to L4 IP when absent or all entries are private.
+fn resolve_client_ip(
+    session: &Session,
+    real_client_addr: Option<std::net::SocketAddr>,
+    fwd: Option<&ForwardedForConfig>,
+) -> Option<std::net::IpAddr> {
+    let l4_ip = real_client_addr.map(|a| a.ip()).or_else(|| {
+        session
+            .as_downstream()
+            .client_addr()
+            .and_then(|a| a.as_inet())
+            .map(|a| a.ip())
+    });
+
+    let Some(cfg) = fwd else {
+        return l4_ip;
+    };
+
+    // Anti-spoofing gate: if trusted CIDRs are configured, only trust the header
+    // when the L4 peer is within one of those CIDRs.
+    if !cfg.trusted_cidrs.is_empty()
+        && !l4_ip.is_some_and(|ip| cfg.trusted_cidrs.iter().any(|n| n.contains(&ip)))
+    {
+        return l4_ip;
+    }
+
+    // Trust the header: grab the forwarded-IP value and find the first public IP.
+    let header_ip = session
+        .req_header()
+        .headers
+        .get(cfg.header.as_ref())
+        .and_then(|v| v.to_str().ok())
+        .and_then(first_non_private_ip);
+
+    header_ip.or(l4_ip)
 }
 
 /// Returns `true` if `client_ip` is admitted by the CIDR allow-list `nets`.
@@ -1463,9 +1545,10 @@ pub(crate) async fn logging(
         return;
     }
 
-    // `SocketAddr::to_string` allocates — keep it inside the access-log branch
-    // so operators silencing the log don't pay the alloc on every request.
+    // `SocketAddr::to_string` / `IpAddr::to_string` allocate — keep both inside the
+    // access-log branch so operators silencing the log don't pay the alloc every request.
     let upstream_addr_str = ctx.upstream_addr.map(|a| a.to_string());
+    let client_ip_str = ctx.client_ip.map(|ip| ip.to_string());
 
     // path_str is Option<&str>: tracing's Value impl for Option silently omits
     // the field when None, giving us free conditional emission for `None` mode.
@@ -1496,6 +1579,7 @@ pub(crate) async fn logging(
         route_id = route_id,
         upstream = upstream,
         upstream_addr = upstream_addr_str.as_deref(),
+        client_ip = client_ip_str.as_deref(),
         duration_ms = duration_ms,
         bytes_sent = bytes_sent,
         error = err_msg.as_deref(),
@@ -1604,6 +1688,41 @@ mod tests {
         // Strict matching: an IPv4-mapped IPv6 client does NOT match an IPv4 deny CIDR.
         assert!(!ip_denied(ip("::ffff:10.0.0.1"), &nets(&["10.0.0.0/8"])));
     }
+
+    // ── first_non_private_ip ──────────────────────────────────────────────────
+
+    #[test]
+    fn first_non_private_ip_skips_private_finds_public() {
+        let result = super::first_non_private_ip("10.0.0.1, 203.0.113.5, 198.51.100.1");
+        assert_eq!(result, "203.0.113.5".parse::<IpAddr>().ok());
+    }
+
+    #[test]
+    fn first_non_private_ip_single_public() {
+        let result = super::first_non_private_ip("1.2.3.4");
+        assert_eq!(result, "1.2.3.4".parse::<IpAddr>().ok());
+    }
+
+    #[test]
+    fn first_non_private_ip_all_private_is_none() {
+        let result = super::first_non_private_ip("10.0.0.1, 192.168.0.1, 172.16.0.1");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn first_non_private_ip_empty_is_none() {
+        assert!(super::first_non_private_ip("").is_none());
+        assert!(super::first_non_private_ip("  ,  ").is_none());
+    }
+
+    #[test]
+    fn first_non_private_ip_loopback_is_private() {
+        assert!(super::first_non_private_ip("127.0.0.1").is_none());
+        assert!(super::first_non_private_ip("::1").is_none());
+    }
+
+    // ── resolve_client_ip: unit tests (no Session available; tested via integration) ─
+    // The per-request happy/sad path is covered by the e2e security-plane tests.
 
     #[test]
     fn cacheable_response_without_set_cookie_is_admitted() {
