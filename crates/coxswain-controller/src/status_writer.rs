@@ -18,6 +18,7 @@ use crate::{Controller, ControllerConfig, StatusHealthChannels};
 use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::OwnedGateways;
+use coxswain_core::tls::SharedClientCertStore;
 use coxswain_reflector::{
     ControllerReconciler, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
     SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
@@ -110,6 +111,7 @@ pub fn spawn_status_writer(
     let ingress_routes = coxswain_core::routing::SharedIngressRoutingTable::new();
     let gateway_routes = coxswain_core::routing::SharedGatewayRoutingTable::new();
     let tls_store = coxswain_core::tls::SharedTlsStore::new();
+    let client_cert_store = SharedClientCertStore::new();
     let gateway_tls_health = SharedGatewayListenerHealth::new();
     let cluster_summary = SharedClusterSummary::new();
     let leader = Arc::new(AtomicBool::new(false));
@@ -128,6 +130,7 @@ pub fn spawn_status_writer(
             "reference_grant",
             "secret",
             "auth_secret",
+            "auth_tls_secret",
             "service",
             "backend_tls_policy",
             "config_map",
@@ -142,6 +145,7 @@ pub fn spawn_status_writer(
         ingress_routes,
         gateway_routes,
         tls_store,
+        client_cert_store,
         gateway_tls_health.clone(),
         cluster_summary,
     );
@@ -151,6 +155,7 @@ pub fn spawn_status_writer(
             outputs.ingress_routes.clone(),
             outputs.gateway_routes.clone(),
             outputs.tls.clone(),
+            outputs.client_certs.clone(),
             outputs.tls_health.clone(),
             outputs.cluster_summary.clone(),
         ),

@@ -331,3 +331,56 @@ pub async fn https_get(
         Ok((status, None))
     }
 }
+
+/// Make a single HTTPS GET presenting `client_cert_pem` + `client_key_pem` as
+/// the TLS client identity.  The server certificate is accepted unconditionally
+/// (test context; self-signed server cert).  Routing `host` to `tls_addr` via
+/// reqwest's `.resolve()`.
+///
+/// Returns `Ok((status, Some(body)))` on a 2xx JSON echo response.  Returns
+/// `Ok((status, None))` for non-2xx HTTP responses (e.g. 403, 421).  Returns
+/// `Err(...)` when the TLS handshake fails — for example when the server
+/// requires a client certificate but none is presented, or when the presented
+/// certificate is rejected.
+///
+/// # Errors
+///
+/// Returns an error if reqwest fails to build the client, the `Identity` PEM is
+/// invalid, or the request fails (including TLS handshake errors).
+pub async fn https_get_with_client_cert(
+    host: &str,
+    path: &str,
+    tls_addr: std::net::SocketAddr,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+) -> anyhow::Result<(u16, Option<EchoResponse>)> {
+    // reqwest `Identity::from_pem` parses a PEM that contains both the certificate
+    // chain and the private key in any order.  Concatenate cert + key.
+    let pem = format!("{client_cert_pem}{client_key_pem}");
+    let identity = reqwest::Identity::from_pem(pem.as_bytes())
+        .context("build client TLS identity from PEM")?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .resolve(host, tls_addr)
+        .identity(identity)
+        .build()
+        .context("build HTTPS client with client cert")?;
+
+    let url = format!("https://{}:{}{path}", host, tls_addr.port());
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("HTTPS GET with client cert")?;
+    let status = resp.status().as_u16();
+    if resp.status().is_success() {
+        let body = resp
+            .json::<EchoResponse>()
+            .await
+            .context("parse echo response")?;
+        Ok((status, Some(body)))
+    } else {
+        Ok((status, None))
+    }
+}

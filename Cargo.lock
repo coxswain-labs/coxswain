@@ -830,6 +830,7 @@ dependencies = [
  "http",
  "ipnet",
  "itoa",
+ "percent-encoding",
  "pingora",
  "pingora-cache",
  "pingora-core",

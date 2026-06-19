@@ -193,6 +193,15 @@ pub struct ProxyCtx {
     /// state and exactly one allocation is made when an encoder is created.
     /// The encoder is consumed by `response_body_filter`, chunk by chunk.
     pub compression_encoder: Option<Box<dyn Encode + Send + Sync>>,
+    /// PEM-encoded verified client certificate to forward upstream (#267).
+    ///
+    /// Set in `request_filter` when the matched Ingress has
+    /// `auth-tls-pass-certificate-to-upstream: "true"` AND the connection's
+    /// `SslDigest` carries a verified [`crate::tls::ClientCertInfo`].
+    /// Consumed (`.take()`d) in `upstream_request_filter` to inject the
+    /// `X-SSL-Client-Cert` header (URL-encoded PEM).  `None` (the common case)
+    /// incurs no cost.
+    pub client_cert_pem: Option<String>,
 }
 
 // Hot types — review with the team before bumping these numbers.
@@ -220,4 +229,5 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 184);
 // ProxyCtx: +8 because embedded ResolvedRoute grew for compression field (#270) (520→528).
 // ProxyCtx: +16 for compression_encoder: Option<Box<dyn Encode + Send + Sync>>
 // (fat pointer, niche-opted, 16 bytes) (#270) (528→544).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 544);
+// ProxyCtx: +24 for client_cert_pem: Option<String> (niche-opt on String's ptr; 24 bytes) (#267) (544→568).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 568);

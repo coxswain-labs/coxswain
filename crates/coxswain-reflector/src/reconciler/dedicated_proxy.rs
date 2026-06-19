@@ -414,7 +414,8 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
                 }
             }
             // Dedicated proxy is Gateway-API-only; Ingress auth is not processed
-            // here.  An empty store satisfies the ReflectorStores contract.
+            // here.  An empty store satisfies the ReflectorStores contract for
+            // both htpasswd (auth_secrets) and client-cert CA (auth_tls_secrets).
             let empty_auth_secrets =
                 kube::runtime::reflector::store::Writer::<Secret>::default().as_reader();
             let stores = ReflectorStores {
@@ -429,6 +430,7 @@ async fn spawn_cluster_wide_tasks(client: Client, rec: &DedicatedProxyReconciler
                 grants: &grant_reader,
                 secrets: &secret_reader,
                 auth_secrets: &empty_auth_secrets,
+                auth_tls_secrets: &empty_auth_secrets,
                 policies: &policy_reader,
                 configmaps: &configmap_reader,
                 rate_limits: &rate_limit_reader,
@@ -822,7 +824,8 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
             let rate_limits_aggr = aggregate_into_store(&rate_limit_readers);
 
             // Dedicated proxy is Gateway-API-only; Ingress auth is not processed
-            // here.  An empty store satisfies the ReflectorStores contract.
+            // here.  An empty store satisfies the ReflectorStores contract for
+            // both htpasswd (auth_secrets) and client-cert CA (auth_tls_secrets).
             let empty_auth_secrets =
                 kube::runtime::reflector::store::Writer::<Secret>::default().as_reader();
             let stores = ReflectorStores {
@@ -837,6 +840,7 @@ async fn spawn_per_namespace_tasks(client: Client, rec: &DedicatedProxyReconcile
                 grants: &grants_aggr,
                 secrets: &secrets_aggr,
                 auth_secrets: &empty_auth_secrets,
+                auth_tls_secrets: &empty_auth_secrets,
                 policies: &policies_aggr,
                 configmaps: &configmaps_aggr,
                 rate_limits: &rate_limits_aggr,

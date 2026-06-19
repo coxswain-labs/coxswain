@@ -48,6 +48,9 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/compression-level` | integer 1–9 | `6` | `"5"` |
 | `ingress.coxswain-labs.dev/compression-types` | csv of MIME types | see below | `"text/html,application/json"` |
 | `ingress.coxswain-labs.dev/compression-min-size` | size | `1024` | `"4k"` |
+| `ingress.coxswain-labs.dev/auth-tls-secret` | `namespace/name` | _none_ | `"my-ns/my-ca"` |
+| `ingress.coxswain-labs.dev/auth-tls-verify-depth` | integer | `1` | `"2"` |
+| `ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream` | boolean | `false` | `"true"` |
 
 ```yaml
 metadata:
@@ -628,6 +631,83 @@ Requests without credentials receive **401** with a `WWW-Authenticate: Basic rea
 
 !!! tip "Hardening"
     Credential hashes are zeroed from memory when the credential list is replaced at reconcile time (`zeroize`). The Helm chart already ships `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`, and `capabilities.drop: ALL` by default. For the remaining defense-in-depth, configure nodes with `vm.swappiness=0` so hashes can't be paged to disk — this is a node-level kernel parameter that Kubernetes cannot enforce per-pod.
+
+## Client certificate mTLS
+
+Requires clients to present a valid TLS certificate during the handshake — **mutual TLS (mTLS)**. When enabled, the proxy aborts the handshake if the client presents no certificate or one not signed by the configured CA. This matches the semantics of Istio's `tls.mode: MUTUAL`: enforcement is at the TLS layer, not HTTP, so there is no 400/403 response — the connection simply does not complete.
+
+**Enforcement model.** The proxy aborts the TLS handshake (BoringSSL `FAIL_IF_NO_PEER_CERT`). Clients that present no cert or a cert from an unknown CA receive a TLS alert; HTTP never starts. The backend pod is never reached.
+
+**HTTP listener.** Plain-HTTP (port 80) requests to an mTLS host are not affected by these annotations. If you want to prevent clients from sending plain-HTTP requests at all, combine `auth-tls-secret` with `ssl-redirect: "true"` on the same Ingress.
+
+**Cross-SNI guard.** On a shared TLS connection whose SNI selected a different (non-mTLS) host, a `Host:` header naming an mTLS host returns `421 Misdirected Request` — the connection never verified a client cert and cannot be reused to access the mTLS resource.
+
+**Fail-closed on bad CA.** If the referenced Secret is absent, unlabeled, missing the `ca.crt` key, or its PEM is unparseable, the proxy installs an empty verify store for that host. Every TLS handshake to that host is aborted until the Secret is corrected. This matches the `auth-basic-secret` fail-closed policy.
+
+### `auth-tls-secret`
+
+Reference to a Kubernetes `Opaque` Secret in `namespace/name` form whose `ca.crt` key holds one or more PEM-encoded CA certificates used to verify the client certificate chain.
+
+**The Secret must carry the `ingress.coxswain-labs.dev/auth-tls: "true"` label.** The data-plane proxy watches only labeled Secrets (the read-only-proxy invariant — the proxy never holds cluster-wide Secret access). An unlabeled or missing Secret causes every TLS handshake to the Ingress host to be aborted (**fail-closed**).
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-client-ca
+  namespace: my-app
+  labels:
+    ingress.coxswain-labs.dev/auth-tls: "true"
+type: Opaque
+data:
+  ca.crt: <base64-encoded PEM CA cert(s)>
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  namespace: my-app
+  annotations:
+    ingress.coxswain-labs.dev/auth-tls-secret: "my-app/my-client-ca"
+spec:
+  ingressClassName: coxswain
+  tls:
+    - hosts:
+        - api.example.com
+      secretName: api-server-cert
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-api
+                port:
+                  number: 8080
+```
+
+### `auth-tls-verify-depth`
+
+Maximum TLS certificate chain verification depth. With depth `1` (the default) only a direct CA-signed leaf is accepted — no intermediate CAs. With depth `2`, one intermediate CA is allowed. Must be a positive integer >= 1. Absent or invalid values warn and fall back to `1`.
+
+```yaml
+ingress.coxswain-labs.dev/auth-tls-verify-depth: "2"
+```
+
+### `auth-tls-pass-certificate-to-upstream`
+
+When `"true"`, the verified client certificate PEM is URL-encoded and injected on the upstream request as the `X-SSL-Client-Cert` header. The backend can decode it for audit logging, identity extraction, or further authorization. Default: `false`.
+
+```yaml
+ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream: "true"
+```
+
+The header value is the raw PEM of the client leaf certificate, percent-encoded (all non-alphanumeric characters encoded). Backends decode it with a standard URL-decode.
+
+!!! note "v1 limitation"
+    `auth-tls-*` annotations are read directly off `Ingress.metadata.annotations`. They do not inherit class-level defaults from a `CoxswainIngressClassParameters` resource. Per-class mTLS defaults are tracked for a future release.
 
 ## `upstream-keepalive-timeout`
 

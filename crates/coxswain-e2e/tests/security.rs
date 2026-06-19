@@ -15,9 +15,13 @@
 //! (`BackendTLSPolicy`, mTLS to the backend) lives in `tls.rs`.
 
 use coxswain_e2e::{
-    ControllerOptions, ControllerProcess, FixtureVars, Harness, NamespaceGuard, bootstrap,
+    ControllerOptions, ControllerProcess, FixtureVars, GeneratedCert, Harness, MtlsCerts,
+    NamespaceGuard, bootstrap,
     fixtures::{self, backends, gateway_api as gwa, ingress},
-    harness::{http::EchoResponse, wait},
+    harness::{
+        http::{EchoResponse, https_get, https_get_with_client_cert},
+        wait,
+    },
 };
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -763,6 +767,151 @@ async fn request_rejected_when_basic_auth_secret_unlabeled() -> anyhow::Result<(
         status == 503,
         "expected 503 (fail-closed: unlabeled secret), got {status}"
     );
+    Ok(())
+}
+
+// ── Per-Ingress client-certificate mTLS (#267) ───────────────────────────────
+
+/// `auth-tls-secret` + `auth-tls-pass-certificate-to-upstream`: a TLS connection
+/// presenting a valid client certificate (signed by the configured CA) is admitted
+/// (200) and the verified cert is forwarded to the backend as `X-SSL-Client-Cert`
+/// (#267 happy path).
+#[tokio::test]
+async fn client_cert_mtls_valid_cert_forwarded_to_backend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "mtls-valid").await?;
+
+    // Generate a fresh CA + client leaf pair (CA-signed, clientAuth EKU).
+    let mtls = MtlsCerts::generate();
+    // Generate a self-signed server certificate for the TLS listener.
+    let server_cert = GeneratedCert::for_host(&format!("mtls.{}.local", ns.name));
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    // Apply the CA Secret first so the reflector can resolve it before the Ingress lands.
+    fixtures::apply_fixture(
+        ingress::AUTH_TLS_CA_SECRET,
+        FixtureVars::new(&ns.name).with("CA_CRT_B64", mtls.ca_cert_b64()),
+    )
+    .await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_TLS,
+        FixtureVars::new(&ns.name)
+            .with("SECRET_NAME", "mtls-server-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64()),
+    )
+    .await?;
+
+    let host = format!("mtls.{}.local", ns.name);
+
+    // Poll until the mTLS-protected route admits the valid client cert and routes to
+    // echo-a.  This also confirms the CA Secret has been reconciled into the proxy's
+    // ClientCertStore.  Before the CA arrives the route is either absent (404) or
+    // returns a non-2xx; once the CA is applied the handshake succeeds and we get a
+    // 2xx echo body.
+    let resp = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("mTLS route {host}/ to admit a valid client cert (200 echo body)") },
+        || async {
+            match https_get_with_client_cert(
+                &host,
+                "/",
+                h.tls_addr,
+                &mtls.client_cert_pem,
+                &mtls.client_key_pem,
+            )
+            .await
+            {
+                Ok((_, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    resp.assert_backend("echo-a");
+
+    // The proxy must forward the verified cert as X-SSL-Client-Cert when
+    // auth-tls-pass-certificate-to-upstream is "true".
+    anyhow::ensure!(
+        resp.headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("x-ssl-client-cert")),
+        "expected X-SSL-Client-Cert header in echo response \
+         (auth-tls-pass-certificate-to-upstream=true); \
+         got headers: {:?}",
+        resp.headers.keys().collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+/// `auth-tls-secret`: a TLS connection that presents **no** client certificate is
+/// rejected at the TLS handshake — the server aborts before the HTTP layer is ever
+/// reached (#267 sad path — Istio MUTUAL model, no HTTP 400).
+#[tokio::test]
+async fn client_cert_mtls_missing_cert_rejected_at_handshake() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "mtls-nocert").await?;
+
+    let mtls = MtlsCerts::generate();
+    let server_cert = GeneratedCert::for_host(&format!("mtls.{}.local", ns.name));
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::AUTH_TLS_CA_SECRET,
+        FixtureVars::new(&ns.name).with("CA_CRT_B64", mtls.ca_cert_b64()),
+    )
+    .await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_TLS,
+        FixtureVars::new(&ns.name)
+            .with("SECRET_NAME", "mtls-server-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64()),
+    )
+    .await?;
+
+    let host = format!("mtls.{}.local", ns.name);
+
+    // Wait until the CA Secret is reconciled and mTLS is active on this host: a valid
+    // client cert must be accepted (200).  This is the reliable pre-condition before
+    // testing the negative — we know the handshake policy is enforced.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!("mTLS route {host}/ to be active (valid cert accepted, CA reconciled)")
+        },
+        || async {
+            match https_get_with_client_cert(
+                &host,
+                "/",
+                h.tls_addr,
+                &mtls.client_cert_pem,
+                &mtls.client_key_pem,
+            )
+            .await
+            {
+                Ok((_, Some(_))) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    // Now attempt without a client certificate.  The server must abort the TLS
+    // handshake (BoringSSL SslVerifyMode::FAIL_IF_NO_PEER_CERT), so reqwest returns
+    // an error before any HTTP response can be decoded.  The backend is never hit.
+    let result = https_get(&host, "/", h.tls_addr).await;
+    anyhow::ensure!(
+        result.is_err(),
+        "expected TLS handshake failure when no client cert is presented on mTLS host {host}; \
+         got Ok: {:?}",
+        result.ok()
+    );
+
     Ok(())
 }
 

@@ -48,7 +48,9 @@ use coxswain_core::routing::{
     RoutingTableBuilder, SharedGatewayRoutingTable, SharedIngressRoutingTable,
 };
 use coxswain_core::shared::Shared;
-use coxswain_core::tls::{SharedTlsStore, TlsStoreBuilder};
+use coxswain_core::tls::{
+    ClientCertStoreBuilder, SharedClientCertStore, SharedTlsStore, TlsStoreBuilder,
+};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -209,6 +211,8 @@ pub struct SharedProxyReconciler {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
     tls: SharedTlsStore,
+    /// Per-Ingress client-certificate mTLS config (#267). Keyed by SNI host, parallel to `tls`.
+    client_certs: SharedClientCertStore,
     tls_health: SharedGatewayListenerHealth,
     cluster_summary: SharedClusterSummary,
     route_health: SharedHttpRouteHealth,
@@ -241,6 +245,9 @@ pub struct ReconcilerOutputs {
     pub gateway_routes: SharedGatewayRoutingTable,
     /// TLS certificate store snapshot, updated whenever a `kubernetes.io/tls` Secret changes.
     pub tls: SharedTlsStore,
+    /// Per-Ingress client-certificate mTLS config snapshot, updated whenever an
+    /// `auth-tls`-labelled Secret changes (#267). Keyed by SNI host, parallel to `tls`.
+    pub client_certs: SharedClientCertStore,
     /// Per-listener Gateway health used by status writes and the hot-reloader.
     pub tls_health: SharedGatewayListenerHealth,
     /// Cluster aggregate (per-Gateway / per-Ingress summary) consumed by the
@@ -255,6 +262,7 @@ impl ReconcilerOutputs {
         ingress_routes: SharedIngressRoutingTable,
         gateway_routes: SharedGatewayRoutingTable,
         tls: SharedTlsStore,
+        client_certs: SharedClientCertStore,
         tls_health: SharedGatewayListenerHealth,
         cluster_summary: SharedClusterSummary,
     ) -> Self {
@@ -262,6 +270,7 @@ impl ReconcilerOutputs {
             ingress_routes,
             gateway_routes,
             tls,
+            client_certs,
             tls_health,
             cluster_summary,
         }
@@ -327,6 +336,7 @@ impl SharedProxyReconciler {
             ingress_routes,
             gateway_routes,
             tls,
+            client_certs,
             tls_health,
             cluster_summary,
         } = outputs;
@@ -384,6 +394,7 @@ impl SharedProxyReconciler {
             ingress_routes,
             gateway_routes,
             tls,
+            client_certs,
             tls_health,
             cluster_summary,
             route_health: SharedHttpRouteHealth::new(),
@@ -459,6 +470,11 @@ pub(super) struct ReflectorStores<'a> {
     /// (which watches TLS secrets) to bound memory — Opaque Secrets are not filtered
     /// by type, only by label.  Fail-closed: absent/unlabeled → 503 on the route.
     pub(super) auth_secrets: &'a reflector::Store<Secret>,
+    /// Label-scoped CA Secrets (`ingress.coxswain-labs.dev/auth-tls=true`) used by the
+    /// `auth-tls-secret` Ingress annotation (#267).  Separate from `secrets` (TLS certs)
+    /// and `auth_secrets` (htpasswd) to bound memory.  Fail-closed: absent/unlabeled →
+    /// handshake abort for that host.
+    pub(super) auth_tls_secrets: &'a reflector::Store<Secret>,
     /// `BackendTLSPolicy` resources in scope (namespaced per `watch_namespace`).
     pub(super) policies: &'a reflector::Store<BackendTlsPolicy>,
     /// All ConfigMaps in scope — used to resolve `caCertificateRefs`.
@@ -475,6 +491,7 @@ struct SharedOutputs<'a> {
     ingress_routes: &'a SharedIngressRoutingTable,
     gateway_routes: &'a SharedGatewayRoutingTable,
     tls: &'a SharedTlsStore,
+    client_certs: &'a SharedClientCertStore,
     tls_health: &'a SharedGatewayListenerHealth,
     cluster_summary: &'a SharedClusterSummary,
     route_health: &'a SharedHttpRouteHealth,
@@ -600,6 +617,7 @@ impl BackgroundService for SharedProxyReconciler {
             ingress_routes: self.ingress_routes.clone(),
             gateway_routes: self.gateway_routes.clone(),
             tls: self.tls.clone(),
+            client_certs: self.client_certs.clone(),
             tls_health: self.tls_health.clone(),
             cluster_summary: self.cluster_summary.clone(),
             route_health: self.route_health.clone(),
@@ -640,6 +658,7 @@ struct SharedHandles {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
     tls: SharedTlsStore,
+    client_certs: SharedClientCertStore,
     tls_health: SharedGatewayListenerHealth,
     cluster_summary: SharedClusterSummary,
     route_health: SharedHttpRouteHealth,
@@ -681,6 +700,7 @@ async fn spawn_tasks(
         ingress_routes,
         gateway_routes,
         tls,
+        client_certs,
         tls_health,
         cluster_summary,
         route_health,
@@ -732,6 +752,7 @@ async fn spawn_tasks(
     let (grant_reader, grant_writer) = reflector::store::<ReferenceGrant>();
     let (secret_reader, secret_writer) = reflector::store::<Secret>();
     let (auth_secret_reader, auth_secret_writer) = reflector::store::<Secret>();
+    let (auth_tls_secret_reader, auth_tls_secret_writer) = reflector::store::<Secret>();
     let (service_reader, service_writer) = reflector::store::<Service>();
     let (policy_reader, policy_writer) = reader_writer::<BackendTlsPolicy>(pre_policies);
     let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
@@ -833,6 +854,18 @@ async fn spawn_tasks(
         ReflectorEffects::new(&notify, &controller_health, "auth_secret", metrics),
         "AuthSecret",
     );
+    // Label-scoped to `ingress.coxswain-labs.dev/auth-tls=true` — only opt-in CA
+    // Secrets for per-Ingress client-certificate mTLS are cached (#267).  Separate
+    // watch from `secrets` (server-TLS) and `auth_secrets` (htpasswd) to bound
+    // memory: only operator-tagged CA Secrets are loaded.
+    spawn_reflector(
+        &mut set,
+        auth_tls_secret_writer,
+        scoped_api::<Secret>(client.clone(), ns),
+        watcher::Config::default().labels("ingress.coxswain-labs.dev/auth-tls=true"),
+        ReflectorEffects::new(&notify, &controller_health, "auth_tls_secret", metrics),
+        "AuthTlsSecret",
+    );
     // Used to resolve targetPort for backends where servicePort ≠ targetPort.
     spawn_reflector(
         &mut set,
@@ -926,6 +959,7 @@ async fn spawn_tasks(
                 grants: &grant_reader,
                 secrets: &secret_reader,
                 auth_secrets: &auth_secret_reader,
+                auth_tls_secrets: &auth_tls_secret_reader,
                 policies: &policy_reader,
                 configmaps: &configmap_reader,
                 rate_limits: &rate_limit_reader,
@@ -934,6 +968,7 @@ async fn spawn_tasks(
                 ingress_routes: &ingress_routes,
                 gateway_routes: &gateway_routes,
                 tls: &tls,
+                client_certs: &client_certs,
                 tls_health: &tls_health,
                 cluster_summary: &cluster_summary,
                 route_health: &route_health,
@@ -1039,6 +1074,7 @@ fn rebuild(
     );
 
     let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, outputs.tls, true);
+    build_client_certs(stores, &ingresses, &ownership, outputs.client_certs);
 
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
 
@@ -1496,6 +1532,42 @@ pub(super) fn build_tls(
     }
 
     gateway_tls_health
+}
+
+/// Build and publish the per-Ingress client-certificate mTLS config store.
+///
+/// Mirrors [`build_tls`], but iterates over `auth-tls-*` Ingress annotations instead of
+/// `spec.tls[].secretName`.  Gateway API routes do not support per-listener client-cert config
+/// via Coxswain annotations, so only Ingresses are reconciled here.
+///
+/// Uses a `PartialEq` short-circuit identical to [`build_tls`]: if the new store is byte-for-byte
+/// equal to the current snapshot (same CA PEMs, depths, and pass-to-upstream flags) the
+/// [`SharedClientCertStore`] ArcSwap is NOT updated, preventing a spurious hot-reload.
+pub(super) fn build_client_certs(
+    stores: &ReflectorStores<'_>,
+    ingresses: &[Arc<Ingress>],
+    ownership: &Ownership<'_>,
+    client_certs_shared: &SharedClientCertStore,
+) {
+    let mut builder = ClientCertStoreBuilder::new();
+    for ingress in ingresses {
+        IngressReconciler::reconcile_client_certs(
+            ingress,
+            stores.auth_tls_secrets,
+            ownership.ingress_classes,
+            ownership.default_ingress_class,
+            &mut builder,
+        );
+    }
+    let store = builder.build();
+    let count = store.host_count();
+    let current = client_certs_shared.load();
+    if *current != store {
+        tracing::debug!(count, "Client-cert store swapped");
+        client_certs_shared.store(Arc::new(store));
+    } else {
+        tracing::trace!(count, "Client-cert store unchanged, skip swap");
+    }
 }
 
 /// Returns true iff the Gateway has been cut over to a dedicated proxy and

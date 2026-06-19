@@ -10,14 +10,15 @@
 //! crate stay agnostic to "where does the routing table come from".
 
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
-use coxswain_core::tls::SharedTlsStore;
+use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
 
 /// Source of routing snapshots for the proxy data plane.
 ///
 /// Implementations expose `Shared` handles to the Ingress routing table, the
-/// Gateway-API routing table, and the TLS cert store. The proxy holds these
-/// handles and consults them on the hot path; `Shared` is cheap to clone and
-/// the `load()` call is a single atomic pointer read.
+/// Gateway-API routing table, the TLS cert store, and the per-Ingress
+/// client-certificate mTLS config store. The proxy holds these handles and
+/// consults them on the hot path; `Shared` is cheap to clone and the `load()`
+/// call is a single atomic pointer read.
 pub trait RoutingSource: Send + Sync {
     /// Handle to the Ingress-flavored routing table snapshot.
     #[must_use]
@@ -30,12 +31,16 @@ pub trait RoutingSource: Send + Sync {
     /// Handle to the TLS certificate store snapshot.
     #[must_use]
     fn tls_store(&self) -> SharedTlsStore;
+
+    /// Handle to the per-Ingress client-certificate mTLS config store (#267).
+    #[must_use]
+    fn client_cert_store(&self) -> SharedClientCertStore;
 }
 
 /// Routing source backed by in-process Kubernetes reflectors.
 ///
 /// Holds cheap clones of the `Shared` handles that the controller's
-/// reconciler writes into. Construction takes the same three handles that
+/// reconciler writes into. Construction takes the same four handles that
 /// will be threaded into the per-source proxies, so the `RoutingSource`
 /// trait is purely a passive view over what the rest of the binary already
 /// owns — no new lifecycle, no new spawned tasks.
@@ -44,6 +49,7 @@ pub struct KubernetesSource {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
     tls_store: SharedTlsStore,
+    client_cert_store: SharedClientCertStore,
 }
 
 impl KubernetesSource {
@@ -53,11 +59,13 @@ impl KubernetesSource {
         ingress_routes: SharedIngressRoutingTable,
         gateway_routes: SharedGatewayRoutingTable,
         tls_store: SharedTlsStore,
+        client_cert_store: SharedClientCertStore,
     ) -> Self {
         Self {
             ingress_routes,
             gateway_routes,
             tls_store,
+            client_cert_store,
         }
     }
 }
@@ -73,5 +81,9 @@ impl RoutingSource for KubernetesSource {
 
     fn tls_store(&self) -> SharedTlsStore {
         self.tls_store.clone()
+    }
+
+    fn client_cert_store(&self) -> SharedClientCertStore {
+        self.client_cert_store.clone()
     }
 }
