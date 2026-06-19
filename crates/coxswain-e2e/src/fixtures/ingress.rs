@@ -275,14 +275,4 @@ pub const ANNOTATION_LOAD_BALANCE_IP_HASH: &str = fixture!("annotation_load_bala
 /// Apply `backends::ECHO_TWO_REPLICAS` first.
 pub const ANNOTATION_LOAD_BALANCE_UNKNOWN: &str = fixture!("annotation_load_balance_unknown.yaml");
 
-// ── send-timeout (#341) ───────────────────────────────────────────────────────
-
-/// Ingress with `ingress.coxswain-labs.dev/send-timeout: "100ms"` (#341),
-/// pointed at slow-echo (accepts TCP but never reads — its kernel receive
-/// buffer fills with incoming data). Used for the send-timeout feasibility
-/// spike: a 16 MiB chunked POST overflows the backend's kernel receive buffer,
-/// blocking the proxy's `write()` beyond the 100 ms deadline; the proxy then
-/// returns 502. Apply `backends::SLOW_ECHO` first.
-pub const ANNOTATION_SEND_TIMEOUT: &str = fixture!("annotation_send_timeout.yaml");
-
 // ── satisfy any/all (#273) ────────────────────────────────────────────────────
