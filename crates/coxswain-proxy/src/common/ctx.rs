@@ -212,6 +212,15 @@ pub struct ProxyCtx {
     /// rate limiting, and access logging.  `None` when the peer address could not
     /// be determined.
     pub client_ip: Option<std::net::IpAddr>,
+    /// Flat index into [`BackendGroup::lb_endpoints`] for the upstream selected
+    /// this request by a stateful load-balancing algorithm (#275).
+    ///
+    /// `None` for `RoundRobin` and `IpHash` (stateless; `track` is always `None`
+    /// from `select_upstream`) and for every Gateway API route. When `Some`,
+    /// `logging` calls [`BackendGroup::complete`] exactly once to decrement the
+    /// active-connection count or update the EWMA latency. On a retriable failure,
+    /// `upstream_peer` calls [`BackendGroup::release`] before re-selecting.
+    pub lb_track: Option<u32>,
 }
 
 // Hot types — review with the team before bumping these numbers.
@@ -241,4 +250,5 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 184);
 // (fat pointer, niche-opted, 16 bytes) (#270) (528→544).
 // ProxyCtx: +24 for client_cert_pem: Option<String> (niche-opt on String's ptr; 24 bytes) (#267) (544→568).
 // ProxyCtx: +16 for client_ip: Option<IpAddr> (17 bytes packed into existing alignment gap by Rust layout; 568→584) (#271).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 584);
+// ProxyCtx: +8 for lb_track: Option<u32> (discriminant + padding + u32 = 8 bytes; 584→592) (#275).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 592);

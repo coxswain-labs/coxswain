@@ -93,6 +93,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             compression_encoder: None,
             client_cert_pem: None,
             client_ip: None,
+            lb_track: None,
         })
         .unwrap_or_default()
 }
@@ -216,13 +217,13 @@ pub(crate) async fn request_filter<K>(
     // never receives a redirect (which would leak the canonical host/URL) nor has
     // its body read. The real client IP is resolved once by resolve_client_ip (above)
     // and cached on ctx — no per-request allocation for the CIDR scan.
-    if let Some(nets) = m.allow_source_range.as_deref() {
-        if !ip_allowed(ctx.client_ip, nets) {
-            return Err(pingora_core::Error::explain(
-                HTTPStatus(403),
-                "client IP not in allow-list",
-            ));
-        }
+    if let Some(nets) = m.allow_source_range.as_deref()
+        && !ip_allowed(ctx.client_ip, nets)
+    {
+        return Err(pingora_core::Error::explain(
+            HTTPStatus(403),
+            "client IP not in allow-list",
+        ));
     }
 
     // Per-route rate limiting. Enforcement runs after allow-list (denied clients
@@ -840,20 +841,29 @@ pub(crate) async fn upstream_peer(
     }
 
     // Session affinity: honor a pin resolved in `request_filter` (a live cookie/header
-    // match), recovering that endpoint's per-backend filters; otherwise take a weighted
-    // round-robin tick. A stale pin never reaches here — it resolves to `None` and
-    // re-establishes via round-robin + a fresh cookie.
+    // match), recovering that endpoint's per-backend filters; otherwise apply the
+    // per-route load-balancing algorithm via `select_upstream`. A stale pin never
+    // reaches here — it resolves to `None` and re-establishes via normal selection
+    // + a fresh cookie.
     let (addr, per_backend_filters) = match ctx.affinity_pin {
         Some(pinned) => (pinned, resolved.backend_group.filters_for_endpoint(pinned)),
-        None => resolved
-            .backend_group
-            .next_endpoint_with_filters()
-            .ok_or_else(|| {
+        None => {
+            // On a retry: release the prior selection's accounting before re-selecting.
+            if let Some(prev_track) = ctx.lb_track.take() {
+                resolved.backend_group.release(prev_track);
+            }
+            // Clone the Arc to avoid holding a shared borrow on `resolved` while
+            // mutating `ctx.lb_track` (borrow checker splits borrows).
+            let group = Arc::clone(&resolved.backend_group);
+            let sel = group.select_upstream(ctx.client_ip).ok_or_else(|| {
                 pingora_core::Error::explain(
                     HTTPStatus(503),
                     "no active endpoints for backend group",
                 )
-            })?,
+            })?;
+            ctx.lb_track = sel.track;
+            (sel.addr, sel.filters)
+        }
     };
     ctx.selected_backend_filters = per_backend_filters;
     ctx.upstream_addr = Some(addr);
@@ -1509,8 +1519,14 @@ pub(crate) async fn logging(
     let method = req.method.as_str();
     let status = session.response_written().map(|h| h.status.as_u16());
     let bytes_sent = session.body_bytes_sent() as u64;
-    let duration = ctx.start.map(|s| s.elapsed()).unwrap_or_default();
-    let duration_ms = duration.as_millis() as u64;
+    let duration = ctx.start.map(|s| s.elapsed());
+    let duration_ms = duration.unwrap_or_default().as_millis() as u64;
+
+    // LB accounting: complete the in-flight tracking for LeastConn/Ewma (#275).
+    // Always fires; `None` lb_track (RoundRobin, IpHash, GW-API routes) is a no-op.
+    if let (Some(idx), Some(r)) = (ctx.lb_track, ctx.resolved.as_ref()) {
+        r.backend_group.complete(idx, duration);
+    }
 
     // Prefer the pre-resolved host from context; fall back to parsing the header.
     let mut host_buf = String::new();
@@ -1536,7 +1552,7 @@ pub(crate) async fn logging(
         .inc();
     crate::metrics::request_duration_seconds()
         .with_label_values(&[listener_label, route_label])
-        .observe(duration.as_secs_f64());
+        .observe(duration.unwrap_or_default().as_secs_f64());
 
     if !access_log_enabled {
         return;
