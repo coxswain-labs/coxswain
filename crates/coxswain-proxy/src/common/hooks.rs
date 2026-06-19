@@ -1095,11 +1095,6 @@ fn maybe_setup_compression(
         // Safety: choose_algorithm only returns Gzip or Brotli.
         _ => return,
     };
-    // SAFETY: "gzip" and "br" are valid header values.
-    if let Ok(v) = http::HeaderValue::from_str(ce_value) {
-        resp.headers.insert(CONTENT_ENCODING, v);
-    }
-
     // Vary: extend the existing value rather than clobber it.
     let vary = resp
         .headers
@@ -1111,18 +1106,21 @@ fn maybe_setup_compression(
         Some(existing) => format!("{existing}, Accept-Encoding"),
         None => "Accept-Encoding".to_string(),
     };
-    if let Ok(v) = http::HeaderValue::from_str(&new_vary) {
-        resp.headers.insert(VARY, v);
-    }
 
-    resp.headers.remove(CONTENT_LENGTH);
-    resp.headers.remove(ACCEPT_RANGES);
+    // Use Pingora's safe header API so both `base.headers` and `header_name_map`
+    // stay in sync.  Direct `resp.headers.insert/remove` (via DerefMut) only
+    // touches `base.headers`; `write_response_header` later zips the two maps
+    // via `case_header_iter` and asserts key-order parity — a mismatch panics,
+    // aborting the proxy process (`panic = "abort"` in release profile).
+    let _ = resp.insert_header(CONTENT_ENCODING, ce_value);
+    let _ = resp.insert_header(VARY, new_vary.as_str());
+    resp.remove_header(&CONTENT_LENGTH);
+    resp.remove_header(&ACCEPT_RANGES);
     // Pingora's H1 handler decides whether to add Transfer-Encoding: chunked
     // *before* calling upstream_response_filter, based on the upstream's
     // Content-Length.  Because we remove Content-Length here, we must set
     // chunked ourselves so the downstream has a valid body framing.
-    resp.headers
-        .insert(TRANSFER_ENCODING, http::HeaderValue::from_static("chunked"));
+    let _ = resp.insert_header(TRANSFER_ENCODING, "chunked");
 }
 
 /// Choose a compression algorithm from the client's `Accept-Encoding` string,
