@@ -34,7 +34,7 @@ pub use traffic_policy::*;
 
 use coxswain_core::routing::{
     BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HeaderMod, PathModifier,
-    RateLimitConfig, RetryPolicy, RouteTimeouts, SessionAffinity,
+    RateLimitConfig, RetryPolicy, RouteTimeouts, Satisfy, SessionAffinity,
 };
 use security::AuthAnnotation;
 use std::collections::BTreeMap;
@@ -153,6 +153,9 @@ pub(super) struct IngressAnnotations {
     /// Trusted-proxy forwarded-IP config from the `trust-forwarded-for` family (#271).
     /// `None` when `trust-forwarded-for` is absent or `"false"`.
     pub forwarded_for: Option<ForwardedForConfig>,
+    /// How `allow-source-range` and `auth` combine when both are configured (#273).
+    /// Defaults to [`Satisfy::All`] (require both). `Satisfy` is `Copy`.
+    pub satisfy: Satisfy,
 }
 
 impl IngressAnnotations {
@@ -460,6 +463,9 @@ impl IngressAnnotations {
         // ── Trusted-proxy forwarded-IP headers (#271) ─────────────────────────
         let forwarded_for = security::parse_forwarded_for(ann, route_id);
 
+        // ── Satisfy mode (#273) ───────────────────────────────────────────────
+        let satisfy = security::parse_satisfy(ann, route_id);
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -488,6 +494,7 @@ impl IngressAnnotations {
             keepalive_timeout,
             compression,
             forwarded_for,
+            satisfy,
         }
     }
 }
