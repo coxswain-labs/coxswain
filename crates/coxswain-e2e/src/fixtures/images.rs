@@ -33,3 +33,9 @@ pub(crate) const WEBSOCKET_ECHO: &str = "jmalloc/echo-server:0.3.6@sha256:86f2c4
 /// `pause` — the upstream Kubernetes pause container; lets a provisioned proxy
 /// Pod reach Ready immediately without building a coxswain image.
 pub(crate) const PAUSE: &str = "registry.k8s.io/pause:3.10@sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a";
+
+/// `go-httpbin` — a minimal HTTP server that supports `/delay/<seconds>` for
+/// load-balance algorithm tests (one fast + one slow upstream, `least_conn`
+/// steers more requests to the fast one). Used instead of `busybox` `nc/sleep`
+/// because it serves well-formed HTTP/1.1 responses with proper keep-alive.
+pub(crate) const GO_HTTPBIN: &str = "ghcr.io/mccutchen/go-httpbin:latest@sha256:90ac1702685468aa592938e65b2ba1b4757e0c006934a962ef7271a8717aaa3b";

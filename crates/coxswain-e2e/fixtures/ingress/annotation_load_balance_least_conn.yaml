@@ -1,0 +1,25 @@
+# Ingress with load-balance: least_conn, routing to the shared lb-pool Service (#275).
+# lb-pool selects two pods: lb-fast (echo-basic, instant) and lb-slow (go-httpbin,
+# delays on /delay/<N>). Under least_conn the proxy accumulates more active in-flight
+# counts on lb-slow, so subsequent selections favour lb-fast.
+# Apply backends::LB_MIXED before this fixture.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lb-leastconn
+  annotations:
+    ingress.coxswain-labs.dev/load-balance: "least_conn"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: lb.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: lb-pool
+                port:
+                  number: 3000

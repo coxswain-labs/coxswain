@@ -47,3 +47,26 @@ pub const AUTH_STUB: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/backends/auth_stub.yaml"
 );
+
+/// Mixed-latency backend pair for load-balance algorithm tests (#275).
+///
+/// Creates:
+///   - `lb-fast` Deployment (echo-basic, port 3000) — immediate JSON response with `POD_NAME`.
+///   - `lb-slow` Deployment (go-httpbin, port 3000) — serves `/delay/<N>` for configurable latency.
+///   - `lb-pool` Service (port 3000) selecting both Deployments via `app: lb-pool`.
+///
+/// Tests assert that `least_conn` routes more requests to `lb-fast` by observing
+/// which pod name appears in responses (`lb-fast-*` prefix vs. absent for go-httpbin).
+pub const LB_MIXED: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/lb_mixed.yaml"
+);
+
+/// Two-replica echo backend for `ip_hash` and fallback load-balance tests (#275).
+///
+/// Same image as [`ECHO`] but with `replicas: 2` so the Ingress has two endpoints
+/// to distribute across (necessary to observe consistent-hash pinning and round-robin spread).
+pub const ECHO_TWO_REPLICAS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/echo_two_replicas.yaml"
+);
