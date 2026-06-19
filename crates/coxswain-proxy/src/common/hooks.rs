@@ -812,6 +812,12 @@ pub(crate) async fn upstream_peer(
         peer.options.read_timeout = Some(t);
     }
 
+    // Apply per-route upstream keepalive idle timeout (Ingress-only; Gateway-API routes
+    // leave this None and Pingora uses its LRU-eviction default).
+    if let Some(t) = resolved.backend_group.keepalive_timeout() {
+        peer.options.idle_timeout = Some(t);
+    }
+
     Ok(Box::new(peer))
 }
 
@@ -867,6 +873,20 @@ pub(crate) async fn upstream_request_filter(
     }
 
     Ok(())
+}
+
+/// Pingora `connected_to_upstream` body: record whether the connection to the
+/// upstream was freshly established or reused from the keepalive pool.
+///
+/// Increments [`crate::metrics::upstream_connections_total`] with
+/// `state="reused"` or `state="new"` — the only labels that make this metric
+/// meaningful for keepalive observability. No allocation: the label values are
+/// `'static` string literals.
+pub(crate) fn connected_to_upstream(reused: bool) {
+    let state = if reused { "reused" } else { "new" };
+    crate::metrics::upstream_connections_total()
+        .with_label_values(&[state])
+        .inc();
 }
 
 /// Pingora `upstream_response_filter` body: apply rule-level response filters and

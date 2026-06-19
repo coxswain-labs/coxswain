@@ -598,6 +598,22 @@ Requests without credentials receive **401** with a `WWW-Authenticate: Basic rea
 !!! tip "Hardening"
     Credential hashes are zeroed from memory when the credential list is replaced at reconcile time (`zeroize`). The Helm chart already ships `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`, and `capabilities.drop: ALL` by default. For the remaining defense-in-depth, configure nodes with `vm.swappiness=0` so hashes can't be paged to disk — this is a node-level kernel parameter that Kubernetes cannot enforce per-pod.
 
+## `upstream-keepalive-timeout`
+
+Controls how long Pingora keeps an idle upstream connection in its keepalive pool before evicting it.
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/upstream-keepalive-timeout: "60s"
+```
+
+**Format**: a Go `time.ParseDuration` string, e.g. `"30s"`, `"2m"`, `"90s"`. Absent or invalid values warn and fall back to Pingora's default (connections are evicted by LRU capacity pressure, not by age).
+
+**Observability**: the `coxswain_proxy_upstream_connections_total{state="reused"}` counter increments every time a request reuses a pooled connection. Compare it with `{state="new"}` to gauge keepalive efficiency for a route.
+
+**Global pool size**: the total number of idle upstream connections across all routes is bounded by `--proxy-upstream-keepalive-pool-size` (default: 128). Set it via the Helm value `proxy.shared.upstreamKeepalivePoolSize` or the env var `COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE`. Raise it for deployments with many distinct upstream hosts/ports; lower it to reduce file-descriptor usage.
+
 ## Class-level defaults
 
 Any of the annotations above can be defaulted for **every Ingress claiming an IngressClass** by pointing the class at a `CoxswainIngressClassParameters` resource via `IngressClass.spec.parameters`. This is the GitOps-friendly way to set a baseline policy (timeouts, retries, upstream protocol) once per class instead of repeating it on each Ingress.

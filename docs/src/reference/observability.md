@@ -24,6 +24,7 @@ Route id formats:
 | `coxswain_proxy_request_duration_seconds` | Histogram | `listener`, `route` |
 | `coxswain_proxy_upstream_errors_total` | Counter | `listener`, `route`, `upstream`, `error_type` (`connect`/`timeout`/`refused`/`tls`/`5xx`/`other`) |
 | `coxswain_proxy_upstream_retries_total` | Counter | `listener`, `route`, `upstream`, `condition` (`connect-failure`/`timeout`/`5xx`) |
+| `coxswain_proxy_upstream_connections_total` | Counter | `state` (`new`/`reused`) — incremented once per request; `reused` climbs when upstream keepalive is effective |
 | `coxswain_proxy_active_upstreams` | Gauge | `upstream` |
 | `coxswain_proxy_routing_table_hosts` | Gauge | — |
 | `coxswain_proxy_routing_table_routes` | Gauge | `kind` (`ingress`/`gateway`) |

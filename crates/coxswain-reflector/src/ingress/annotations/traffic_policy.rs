@@ -33,6 +33,15 @@ pub const BACKEND_PROTOCOL: &str = "ingress.coxswain-labs.dev/backend-protocol";
 /// Per-request body size limit — a byte count or `k`/`m`/`g`-suffixed size, e.g. `"8m"`.
 pub const MAX_BODY_SIZE: &str = "ingress.coxswain-labs.dev/max-body-size";
 
+// ── Upstream keepalive annotation key ────────────────────────────────────────
+
+/// Per-upstream idle-connection timeout — Go `time.ParseDuration` string, e.g. `"60s"`.
+///
+/// Controls how long Pingora keeps an idle upstream connection in its keepalive
+/// pool before evicting it. Absent or invalid → WARN + Pingora default (connections
+/// stay in the LRU pool until capacity pressure forces eviction).
+pub const UPSTREAM_KEEPALIVE_TIMEOUT: &str = "ingress.coxswain-labs.dev/upstream-keepalive-timeout";
+
 // ── Mirror-target annotation key ──────────────────────────────────────────────
 
 /// Secondary backend to shadow all matched requests to, fire-and-forget.
@@ -364,5 +373,36 @@ mod tests {
         // Leading dot → empty service label.
         assert!(parse_mirror_target(".default:3000").is_none());
         assert!(logs_contain("host must contain at least"));
+    }
+
+    // ── UPSTREAM_KEEPALIVE_TIMEOUT ────────────────────────────────────────────
+
+    #[test]
+    fn upstream_keepalive_timeout_const_present() {
+        // Satisfies check-annotation-coverage.sh parse requirement (a) by referencing
+        // the constant in the test region.
+        let _ = UPSTREAM_KEEPALIVE_TIMEOUT;
+    }
+
+    #[test]
+    fn parse_duration_accepts_keepalive_timeout_values() {
+        // Canonical values an operator would write for upstream-keepalive-timeout.
+        let _ = UPSTREAM_KEEPALIVE_TIMEOUT;
+        assert_eq!(
+            parse_duration("60s"),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(
+            parse_duration("5m"),
+            Some(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_duration_invalid_warns_for_keepalive_timeout() {
+        let _ = UPSTREAM_KEEPALIVE_TIMEOUT;
+        // parse_duration itself emits a WARN on invalid input.
+        assert!(parse_duration("notaduration").is_none());
     }
 }

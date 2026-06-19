@@ -282,6 +282,30 @@ pub(crate) fn connections_total() -> &'static IntCounterVec {
     })
 }
 
+/// Counter: upstream connections established by the proxy, classified by whether
+/// the connection was freshly opened or reused from the keepalive pool.
+///
+/// Incremented once per request in the `connected_to_upstream` Pingora hook.
+///
+/// Labels: `state ∈ {"new", "reused"}`.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
+pub(crate) fn upstream_connections_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_proxy_upstream_connections_total",
+                "Upstream connections established by the proxy, by connection state",
+            ),
+            &["state"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
 /// Histogram: downstream connection lifetime in seconds, observed on close.
 ///
 /// # Panics

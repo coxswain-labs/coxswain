@@ -1,0 +1,27 @@
+# upstream-keepalive-timeout happy-path fixture (apply backends::ECHO first).
+#
+# Sets `upstream-keepalive-timeout: 60s` so Pingora keeps idle connections to
+# echo-a alive for up to 60 seconds. Sequential requests over the same client
+# connection will reuse pooled upstream connections, incrementing
+# `coxswain_proxy_upstream_connections_total{state="reused"}`.
+#
+# Host: keepalive.TESTNS.local → echo-a:3000.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keepalive-ingress
+  annotations:
+    ingress.coxswain-labs.dev/upstream-keepalive-timeout: "60s"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: keepalive.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

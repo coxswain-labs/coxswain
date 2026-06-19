@@ -91,6 +91,8 @@ spec:
               value: {{ .Values.logFormat | quote }}
             - name: COXSWAIN_PROXY_THREADS
               value: {{ .Values.proxy.shared.threads | quote }}
+            - name: COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE
+              value: {{ .Values.proxy.shared.upstreamKeepalivePoolSize | quote }}
             - name: COXSWAIN_HEALTH_PORT
               value: {{ .Values.health.port | quote }}
             - name: COXSWAIN_ADMIN_PORT

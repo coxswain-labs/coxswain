@@ -445,6 +445,12 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         args.push("--allow-cluster-wide-namespace-read".to_string());
     }
     args.push("--log-format=json".to_string());
+    // Keepalive pool size: pass through to dedicated proxies so their pools
+    // are governed by the same operator-configured default (inherited from the
+    // shared proxy Helm value via the controller's own env).
+    if let Ok(pool_size) = std::env::var("COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE") {
+        args.push(format!("--proxy-upstream-keepalive-pool-size={pool_size}"));
+    }
 
     let coxswain_container = Container {
         name: "coxswain".to_string(),

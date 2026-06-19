@@ -145,6 +145,23 @@ impl ProxyHttp for IngressProxy {
         hooks::upstream_request_filter(session, upstream_request, ctx).await
     }
 
+    async fn connected_to_upstream(
+        &self,
+        _session: &mut Session,
+        reused: bool,
+        _peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        _digest: Option<&pingora_core::protocols::Digest>,
+        _ctx: &mut ProxyCtx,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        hooks::connected_to_upstream(reused);
+        Ok(())
+    }
+
     async fn upstream_response_filter(
         &self,
         session: &mut Session,

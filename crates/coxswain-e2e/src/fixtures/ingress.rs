@@ -189,3 +189,13 @@ pub const ANNOTATION_MIRROR_TARGET: &str = fixture!("annotation_mirror_target.ya
 /// appears in the access log.
 pub const ANNOTATION_MIRROR_TARGET_UNREACHABLE: &str =
     fixture!("annotation_mirror_target_unreachable.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/upstream-keepalive-timeout: 60s` (#266).
+/// Used to verify that sequential requests to the same upstream reuse pooled
+/// connections — `coxswain_proxy_upstream_connections_total{state="reused"}` must
+/// increment above zero.
+pub const ANNOTATION_KEEPALIVE_TIMEOUT: &str = fixture!("annotation_keepalive_timeout.yaml");
+/// Ingress with an unparseable `ingress.coxswain-labs.dev/upstream-keepalive-timeout`
+/// value (#266 sad path). The proxy must serve requests normally (fail-open) and not
+/// reject traffic due to the invalid annotation.
+pub const ANNOTATION_KEEPALIVE_TIMEOUT_INVALID: &str =
+    fixture!("annotation_keepalive_timeout_invalid.yaml");

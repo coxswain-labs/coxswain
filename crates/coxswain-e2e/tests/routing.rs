@@ -1455,8 +1455,6 @@ async fn ingress_invalid_filter_annotation_is_skipped_and_route_still_serves() -
     Ok(())
 }
 
-
-
 /// Verifies `urlRewrite.hostname` correctly rewrites the `Host` header sent to the upstream backend.
 #[tokio::test]
 async fn url_rewrite_replaces_request_host() -> anyhow::Result<()> {
@@ -1476,10 +1474,7 @@ async fn url_rewrite_replaces_request_host() -> anyhow::Result<()> {
     let resp = h.gateway_http.get(&host, "/test").await?;
     resp.assert_backend("echo-a");
 
-    let echo_host = resp
-        .host
-        .as_deref()
-        .expect("missing or invalid host echo");
+    let echo_host = resp.host.as_deref().expect("missing or invalid host echo");
 
     let expected_host = format!("new-host.{}.local", ns.name);
     assert_eq!(
