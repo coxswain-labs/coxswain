@@ -91,6 +91,16 @@ pub const ANNOTATION_MAX_BODY_SIZE_INVALID: &str =
 /// Used to verify the proxy admits an in-range client (200, echo identity) and rejects an
 /// out-of-range client with 403; the real client IP is supplied via the PROXY protocol.
 pub const ANNOTATION_ALLOW_SOURCE_RANGE: &str = fixture!("annotation_allow_source_range.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/deny-source-range: "203.0.113.0/24"` (#268).
+/// Used to verify the proxy rejects an in-range client with 403 and admits an out-of-range
+/// client (200, echo identity); the real client IP is supplied via the PROXY protocol.
+pub const ANNOTATION_DENY_SOURCE_RANGE: &str = fixture!("annotation_deny_source_range.yaml");
+/// Ingress with both `allow-source-range: "203.0.113.0/24"` and
+/// `deny-source-range: "203.0.113.5/32"` (#268). Used to verify that deny is evaluated
+/// before allow: a client that matches both is rejected (403); a client in the allow range
+/// but not the deny range is admitted (200).
+pub const ANNOTATION_DENY_AND_ALLOW_SOURCE_RANGE: &str =
+    fixture!("annotation_deny_and_allow_source_range.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/cache-enabled: "true"` plus a
 /// `response-header-set` that injects `Cache-Control: ${CACHE_CONTROL}` (#40).
 /// Used to verify the proxy serves a second identical GET from cache (an `Age`
