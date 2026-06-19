@@ -1028,6 +1028,7 @@ fn build_server(args: &ProxyArgs) -> Server {
         threads: args.proxy_threads,
         grace_period_seconds: Some(args.proxy_shutdown_grace_period.as_secs()),
         graceful_shutdown_timeout_seconds: Some(args.proxy_shutdown_timeout.as_secs()),
+        upstream_keepalive_pool_size: args.proxy_upstream_keepalive_pool_size,
         ..Default::default()
     };
 

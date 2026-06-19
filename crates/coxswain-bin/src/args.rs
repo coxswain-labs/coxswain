@@ -256,6 +256,19 @@ pub(crate) struct ProxyArgs {
     )]
     pub proxy_listener_drain_timeout: Duration,
 
+    /// Maximum number of idle upstream connections held in Pingora's keepalive pool.
+    ///
+    /// Connections beyond this limit are evicted on an LRU basis. Raise when upstream
+    /// services have many distinct hosts or ports and you observe high connection
+    /// establishment rates in `coxswain_proxy_upstream_connections_total{state="new"}`.
+    /// Lowering saves file descriptors at the cost of more reconnects.
+    #[arg(
+        long,
+        env = "COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE",
+        default_value_t = 128
+    )]
+    pub proxy_upstream_keepalive_pool_size: usize,
+
     /// IP address to bind all proxy listeners to.
     ///
     /// Shared by both HTTP and HTTPS listeners; combine with
@@ -1001,5 +1014,33 @@ mod tests {
             help.contains("--access-log-path-mode"),
             "dev help lists --access-log-path-mode"
         );
+    }
+
+    /// `--proxy-upstream-keepalive-pool-size` defaults to 128 and parses a
+    /// custom value correctly on `serve proxy --shared`.
+    #[test]
+    fn proxy_upstream_keepalive_pool_size_parses() {
+        // Default
+        let cli = Cli::try_parse_from(["coxswain", "serve", "proxy", "--shared"]).expect("parses");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Proxy(args)) = serve.role else {
+            panic!("expected Role::Proxy");
+        };
+        assert_eq!(args.proxy.proxy_upstream_keepalive_pool_size, 128);
+
+        // Explicit value
+        let cli = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "proxy",
+            "--shared",
+            "--proxy-upstream-keepalive-pool-size=256",
+        ])
+        .expect("parses with explicit value");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Proxy(args)) = serve.role else {
+            panic!("expected Role::Proxy");
+        };
+        assert_eq!(args.proxy.proxy_upstream_keepalive_pool_size, 256);
     }
 }
