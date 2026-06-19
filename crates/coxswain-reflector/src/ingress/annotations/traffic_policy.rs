@@ -5,7 +5,7 @@
 //! and return `None` (or the empty default) so the affected annotation is treated
 //! as absent — the Ingress keeps serving.
 
-use coxswain_core::routing::{BackendProtocol, CompressionConfig, RetryOn};
+use coxswain_core::routing::{BackendProtocol, CompressionConfig, LoadBalance, RetryOn};
 
 // ── Timeout annotation keys ───────────────────────────────────────────────────
 
@@ -310,6 +310,36 @@ fn default_compression_types() -> Box<[Box<str>]> {
         .into_boxed_slice()
 }
 
+// ── Load-balance annotation key and parser ────────────────────────────────────
+
+/// Per-route upstream load-balancing algorithm.
+///
+/// Valid values: `round_robin` (default), `least_conn`, `ewma`, `ip_hash`.
+/// Unknown values emit a `WARN` and fall back to `round_robin`.
+pub const LOAD_BALANCE: &str = "ingress.coxswain-labs.dev/load-balance";
+
+/// Parse the `load-balance` annotation value.
+///
+/// Valid values: `round_robin`, `least_conn`, `ewma`, `ip_hash`.
+/// Unknown values emit a structured `WARN` and return `LoadBalance::RoundRobin`
+/// so the Ingress keeps serving with the default algorithm.
+#[must_use]
+pub(crate) fn parse_load_balance(s: &str) -> LoadBalance {
+    match s {
+        "round_robin" => LoadBalance::RoundRobin,
+        "least_conn" => LoadBalance::LeastConn,
+        "ewma" => LoadBalance::Ewma,
+        "ip_hash" => LoadBalance::IpHash,
+        _ => {
+            tracing::warn!(
+                value = s,
+                "unknown load-balance value — valid values are round_robin, least_conn, ewma, ip_hash; falling back to round_robin"
+            );
+            LoadBalance::RoundRobin
+        }
+    }
+}
+
 // ── Mirror-target types and parser ───────────────────────────────────────────
 
 /// Intermediate representation of a `mirror-target` annotation value.
@@ -567,6 +597,25 @@ mod tests {
         let _ = UPSTREAM_KEEPALIVE_TIMEOUT;
         // parse_duration itself emits a WARN on invalid input.
         assert!(parse_duration("notaduration").is_none());
+    }
+
+    // ── parse_load_balance ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_load_balance_all_valid_values() {
+        // References LOAD_BALANCE to satisfy the annotation-coverage gate.
+        let _ = LOAD_BALANCE;
+        assert_eq!(parse_load_balance("round_robin"), LoadBalance::RoundRobin);
+        assert_eq!(parse_load_balance("least_conn"), LoadBalance::LeastConn);
+        assert_eq!(parse_load_balance("ewma"), LoadBalance::Ewma);
+        assert_eq!(parse_load_balance("ip_hash"), LoadBalance::IpHash);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_load_balance_unknown_value_warns_and_returns_round_robin() {
+        assert_eq!(parse_load_balance("bogus"), LoadBalance::RoundRobin);
+        assert!(logs_contain("unknown load-balance value"));
     }
 
     // ── parse_compression ─────────────────────────────────────────────────────

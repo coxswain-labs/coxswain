@@ -33,8 +33,8 @@ pub use session::*;
 pub use traffic_policy::*;
 
 use coxswain_core::routing::{
-    BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HeaderMod, PathModifier,
-    RateLimitConfig, RetryPolicy, RouteTimeouts, SessionAffinity,
+    BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HeaderMod, LoadBalance,
+    PathModifier, RateLimitConfig, RetryPolicy, RouteTimeouts, SessionAffinity,
 };
 use security::AuthAnnotation;
 use std::collections::BTreeMap;
@@ -153,6 +153,9 @@ pub(super) struct IngressAnnotations {
     /// Trusted-proxy forwarded-IP config from the `trust-forwarded-for` family (#271).
     /// `None` when `trust-forwarded-for` is absent or `"false"`.
     pub forwarded_for: Option<ForwardedForConfig>,
+    /// Per-route upstream load-balancing algorithm from `load-balance` (#275).
+    /// Defaults to `RoundRobin` when the annotation is absent or carries an unknown value.
+    pub load_balance: LoadBalance,
 }
 
 impl IngressAnnotations {
@@ -460,6 +463,11 @@ impl IngressAnnotations {
         // ── Trusted-proxy forwarded-IP headers (#271) ─────────────────────────
         let forwarded_for = security::parse_forwarded_for(ann, route_id);
 
+        // ── Load-balance algorithm (#275) ──────────────────────────────────────
+        let load_balance = get(ann, LOAD_BALANCE)
+            .map(traffic_policy::parse_load_balance)
+            .unwrap_or_default();
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -488,6 +496,7 @@ impl IngressAnnotations {
             keepalive_timeout,
             compression,
             forwarded_for,
+            load_balance,
         }
     }
 }
