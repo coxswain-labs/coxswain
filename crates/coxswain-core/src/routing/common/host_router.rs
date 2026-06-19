@@ -37,6 +37,8 @@ pub struct RouteMatch {
     pub max_body_size: Option<u64>,
     /// Per-route source-IP allow-list (`None` = admit all source IPs).
     pub allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    /// Per-route source-IP block list (`None` = block nothing; deny checked before allow).
+    pub deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
     /// RFC 7234 response-cache opt-in for the matched rule (`false` = no caching).
     pub cache_enabled: bool,
     /// Per-route rate-limiting configuration (`None` = no rate limiting).
@@ -64,6 +66,7 @@ impl RouteMatch {
             metric_route_id: Arc::clone(&entry.metric_route_id),
             max_body_size: entry.max_body_size,
             allow_source_range: entry.allow_source_range.clone(),
+            deny_source_range: entry.deny_source_range.clone(),
             cache_enabled: entry.cache_enabled,
             rate_limit: entry.rate_limit.clone(),
             auth: entry.auth.clone(),
