@@ -54,6 +54,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/auth-tls-secret` | `namespace/name` | _none_ | `"my-ns/my-ca"` |
 | `ingress.coxswain-labs.dev/auth-tls-verify-depth` | integer | `1` | `"2"` |
 | `ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream` | boolean | `false` | `"true"` |
+| `ingress.coxswain-labs.dev/load-balance` | `round_robin`, `least_conn`, `ewma`, `ip_hash` | `round_robin` | `"least_conn"` |
 
 ```yaml
 metadata:
@@ -871,6 +872,44 @@ When compression fires, the proxy:
     q-values in `Accept-Encoding` are not arbitrated — presence of a codec token is sufficient to
     select it. This matches Pingora's own behaviour. When both codecs are enabled and the client
     sends both `br` and `gzip`, brotli always wins regardless of q-values.
+
+## `load-balance`
+
+Selects the algorithm used to pick an upstream endpoint for each request within the backend group of a route.
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/load-balance: "least_conn"
+```
+
+| Value | Description |
+|-------|-------------|
+| `round_robin` | _(default)_ Weighted round-robin using the GCD-reduced slot array. Zero per-request overhead. |
+| `least_conn` | Routes to the endpoint with the fewest in-flight requests. Maintains an atomic in-flight counter per endpoint; the counter is incremented on selection and decremented when the response completes (or when a retry selects a different endpoint). |
+| `ewma` | Routes to the endpoint with the lowest exponentially-weighted moving-average response latency (α = 1/8). Unsampled endpoints (active=0) are probed first. Latency is folded in at end-of-request. |
+| `ip_hash` | Consistent hash on the resolved client IP (see [`trust-forwarded-for`](#trust-forwarded-for) for how the IP is resolved). Requests from the same IP always land on the same endpoint; unlike cookie affinity, no state is injected into the response. Falls back to round-robin if the client IP is unavailable. |
+
+Unknown values warn and fall back to `round_robin`; routing is never interrupted.
+
+### Mapping to Gateway API / Istio
+
+`load-balance` maps to `DestinationRule.trafficPolicy.loadBalancer` in Istio:
+
+| Coxswain value | Istio / Envoy equivalent |
+|----------------|--------------------------|
+| `round_robin` | `ROUND_ROBIN` |
+| `least_conn` | `LEAST_REQUEST` |
+| `ewma` | `LEAST_REQUEST` with latency-weighted selection |
+| `ip_hash` | `CONSISTENT_HASH` (source-ip) |
+
+### `ip_hash` and forwarded-for
+
+When [`trust-forwarded-for`](#trust-forwarded-for) is enabled, `ip_hash` uses the resolved client IP (the first non-private address from the forwarded header, gated by [`forwarded-for-trusted-cidrs`](#forwarded-for-trusted-cidrs) if set). This means a load balancer that rewrites the source IP still produces consistent upstream pinning based on the real client address.
+
+### Performance
+
+All algorithms run on the hot path without locks. `round_robin` allocates nothing per request. `least_conn` and `ewma` perform a linear scan over the endpoint list (typically 1–10 pods per Service) using relaxed atomics, which is negligible compared to I/O. `ip_hash` hashes IP octets with FNV-1a and does a modular index — also negligible.
 
 ## Class-level defaults
 

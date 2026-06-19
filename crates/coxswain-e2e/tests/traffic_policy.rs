@@ -19,6 +19,7 @@ use coxswain_e2e::{
     harness::wait,
 };
 use reqwest::Method;
+use std::sync::Arc;
 use std::time::Duration;
 
 mod common;
@@ -1129,6 +1130,184 @@ async fn upstream_keepalive_invalid_timeout_keeps_serving() -> anyhow::Result<()
     );
     body.expect("response body must be present")
         .assert_backend("echo-a");
+
+    Ok(())
+}
+
+// ── Load-balance algorithms (#275) ────────────────────────────────────────────
+
+/// Happy path (#275): with `load-balance: least_conn`, the proxy accumulates
+/// in-flight counts per endpoint and routes new requests to whichever endpoint
+/// has the fewest active connections.
+///
+/// The fixture routes to `lb-pool`, a Service backed by two pods:
+/// - `lb-fast` (echo-basic) — responds in < 1 ms.
+/// - `lb-slow` (go-httpbin) — holds the connection for 1 second via `/delay/1`.
+///
+/// 20 requests are issued with a concurrency of 4. Once `lb-slow` holds a slot
+/// for 1 second, all subsequent selections prefer `lb-fast` (active=0 vs active≥1).
+/// Asserts `fast_count > slow_count` and `slow_count ≥ 1` (both endpoints reachable).
+#[tokio::test]
+async fn least_conn_sends_more_requests_to_the_fast_upstream() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "lb-leastconn").await?;
+
+    fixtures::apply_fixture(backends::LB_MIXED, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["lb-fast", "lb-slow"]).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_LOAD_BALANCE_LEAST_CONN,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("lb.{}.local", ns.name);
+    // Route readiness: both backends return 200 for /delay/1 (echo instantly, httpbin after 1s).
+    wait::wait_for_route_status(&h.http, &host, "/delay/1", 200, Duration::from_secs(90)).await?;
+
+    // Pipelined concurrency: 20 requests with up to 4 in-flight at a time.
+    // `lb-slow` holds each connection for 1 s; new selections see lb-slow.active ≥ 1
+    // and route to lb-fast instead. A standalone reqwest client is used so the
+    // futures can be spawned as independent tokio tasks (no lifetime conflict with &h.http).
+    let client = Arc::new(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?,
+    );
+    let sem = Arc::new(tokio::sync::Semaphore::new(4));
+    let proxy_addr = h.http.proxy_addr;
+
+    let handles: Vec<_> = (0..20u32)
+        .map(|_| {
+            let client = Arc::clone(&client);
+            let sem = Arc::clone(&sem);
+            let url = format!("http://{proxy_addr}/delay/1");
+            let host = host.clone();
+            tokio::spawn(async move {
+                let _permit = sem
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
+                let resp = client
+                    .get(&url)
+                    .header("Host", &host)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("send: {e}"))?;
+                let status = resp.status().as_u16();
+                anyhow::ensure!(status == 200, "expected 200, got {status}");
+                let body = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("parse body: {e}"))?;
+                Ok::<Option<String>, anyhow::Error>(body["pod"].as_str().map(String::from))
+            })
+        })
+        .collect();
+
+    let mut fast_count = 0usize;
+    let mut slow_count = 0usize;
+    for handle in handles {
+        let pod_opt = handle.await.map_err(|e| anyhow::anyhow!("task: {e}"))??;
+        // lb-fast (echo-basic) sets POD_NAME; lb-slow (go-httpbin) does not.
+        if pod_opt
+            .as_deref()
+            .is_some_and(|p| p.starts_with("lb-fast-"))
+        {
+            fast_count += 1;
+        } else {
+            slow_count += 1;
+        }
+    }
+
+    assert!(
+        fast_count > slow_count,
+        "least_conn must route more requests to the fast upstream; \
+         fast_count={fast_count}, slow_count={slow_count}"
+    );
+    assert!(
+        slow_count >= 1,
+        "least_conn must route at least one request to the slow upstream \
+         (both endpoints reachable); fast_count={fast_count}, slow_count={slow_count}"
+    );
+
+    Ok(())
+}
+
+/// Happy path (#275): with `load-balance: ip_hash`, all requests from the same
+/// source IP must hash to the same endpoint, pinning the client to one pod for
+/// the lifetime of the route.
+///
+/// The fixture routes to `echo-two-replicas` (2 pods). The test runner's source
+/// IP is `127.0.0.1` (port-forwarded loopback), which hashes to a fixed slot.
+/// All 10 sequential GETs must return the same `pod` name.
+#[tokio::test]
+async fn ip_hash_pins_a_client_to_one_upstream() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "lb-iphash").await?;
+
+    fixtures::apply_fixture(backends::ECHO_TWO_REPLICAS, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["echo-two-replicas"]).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_LOAD_BALANCE_IP_HASH,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("lb.{}.local", ns.name);
+    let first = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    let pinned_pod = first
+        .pod
+        .expect("echo body must report the serving pod on first request");
+
+    // All subsequent requests from the same source IP must land on the same pod.
+    for i in 0..10u32 {
+        let body = h.http.get(&host, "/").await?;
+        let pod = body.pod.unwrap_or_default();
+        assert_eq!(
+            pod, pinned_pod,
+            "ip_hash must pin the client to one pod (request {i}: got '{pod}', want '{pinned_pod}')"
+        );
+    }
+
+    Ok(())
+}
+
+/// Sad path (#275): an unknown `load-balance` value must warn and fall back to
+/// `round_robin`, never blocking routing. All requests must succeed (200) and
+/// both pods of the two-replica Service must be reachable, proving the fallback
+/// distributes traffic normally.
+#[tokio::test]
+async fn unknown_load_balance_value_falls_back_to_round_robin() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "lb-unknown").await?;
+
+    fixtures::apply_fixture(backends::ECHO_TWO_REPLICAS, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["echo-two-replicas"]).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_LOAD_BALANCE_UNKNOWN,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("lb.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let mut pods = std::collections::HashSet::new();
+    for i in 0..30u32 {
+        let (status, _, body) = h.http.get_full(&host, "/").await?;
+        assert_eq!(
+            status, 200,
+            "unknown load-balance value must not break routing (request {i} returned {status})"
+        );
+        if let Some(p) = body.and_then(|b| b.pod) {
+            pods.insert(p);
+        }
+    }
+    assert!(
+        pods.len() >= 2,
+        "unknown load-balance value must fall back to round_robin and spread across \
+         both pods; saw only {pods:?}"
+    );
 
     Ok(())
 }

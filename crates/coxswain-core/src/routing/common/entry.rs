@@ -5,9 +5,9 @@ use super::compression::CompressionConfig;
 use super::predicate::MatchPredicates;
 use super::rate_limit::RateLimitConfig;
 use http::{HeaderName, HeaderValue};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// CA certificate source for a [`BackendTLSPolicy`](https://gateway-api.sigs.k8s.io/references/spec/#gateway.networking.k8s.io/v1alpha3.BackendTLSPolicy) attachment.
@@ -123,6 +123,28 @@ pub enum SessionAffinity {
     },
 }
 
+/// Per-route upstream load-balancing algorithm from the
+/// `ingress.coxswain-labs.dev/load-balance` annotation.
+///
+/// Gateway API routes always carry `RoundRobin` (the annotation is Ingress-only).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoadBalance {
+    /// Standard weighted round-robin (the default; current behaviour).
+    #[default]
+    RoundRobin,
+    /// Route to the endpoint with the fewest active in-flight connections.
+    LeastConn,
+    /// Route to the endpoint with the lowest exponentially-weighted moving average
+    /// response latency (`α = 1/8`). New or idle endpoints (never sampled) are
+    /// probed first so the estimate stays fresh.
+    Ewma,
+    /// Consistent hash on the resolved client IP (honours the #271
+    /// `ingress.coxswain-labs.dev/trust-forwarded-for` configuration when set).
+    /// Falls back to round-robin when the client IP cannot be determined.
+    IpHash,
+}
+
 /// Deterministic FNV-1a hash of a byte slice.
 ///
 /// Used for both the per-endpoint affinity token ([`affinity_token`]) and the
@@ -186,6 +208,38 @@ struct AffinityEndpoint {
     addr: SocketAddr,
     token: u64,
     backend_idx: u16,
+}
+
+/// Per-endpoint accounting state for non-`RoundRobin` algorithms.
+///
+/// Built once in [`BackendGroup::with_load_balance`]; all fields are atomics so
+/// the hot-path read + update is lock-free and never holds a guard across `.await`.
+struct LbEndpoint {
+    addr: SocketAddr,
+    /// Owning backend pool index — used to recover per-backend filters from
+    /// [`BackendGroup::per_backend_filters`], matching the layout of [`AffinityEndpoint`].
+    backend_idx: u16,
+    /// Active in-flight request count (incremented on selection, decremented on completion/release).
+    active: AtomicU32,
+    /// Smoothed response latency in nanoseconds (`0` = never sampled).
+    ewma_ns: AtomicU64,
+}
+
+/// Result of [`BackendGroup::select_upstream`]: the chosen endpoint, any per-backend
+/// filters, and an optional tracking index for `LeastConn`/`Ewma` accounting.
+#[non_exhaustive]
+pub struct Selected {
+    /// Pod address to connect to.
+    pub addr: SocketAddr,
+    /// Per-backend filters attached to this specific backend ref, if any.
+    pub filters: Option<Arc<[FilterAction]>>,
+    /// Flat index into the `lb_endpoints` slice for post-request accounting.
+    ///
+    /// `None` for `RoundRobin` and `IpHash` (stateless algorithms). When `Some`,
+    /// the proxy must call [`BackendGroup::release`] (on a retriable failure, before
+    /// re-selecting) or [`BackendGroup::complete`] (at request end) exactly once to
+    /// keep counters balanced.
+    pub track: Option<u32>,
 }
 
 /// One backend service's resolved pod endpoints with a round-robin counter.
@@ -578,6 +632,18 @@ pub struct BackendGroup {
     /// Ingress-only). Applied per-request in `upstream_peer` via
     /// `HttpPeer.options.idle_timeout`.
     keepalive_timeout: Option<std::time::Duration>,
+    /// Per-route upstream load-balancing algorithm from the
+    /// `ingress.coxswain-labs.dev/load-balance` annotation.
+    ///
+    /// `RoundRobin` (the default) delegates to the existing weighted slot array;
+    /// any other value activates [`Self::lb_endpoints`] for per-request selection.
+    load_balance: LoadBalance,
+    /// Per-endpoint accounting index for non-`RoundRobin` algorithms.
+    ///
+    /// `None` when `load_balance == RoundRobin` (zero overhead on the hot path).
+    /// Built by [`BackendGroup::with_load_balance`]; covers every pooled address
+    /// with its owning backend index, active-connection counter, and EWMA latency.
+    lb_endpoints: Option<Box<[LbEndpoint]>>,
 }
 
 /// Manual `Debug` implementation that avoids the `FilterAction` ↔ `BackendGroup` cycle.
@@ -621,6 +687,8 @@ impl BackendGroup {
             session_affinity: None,
             affinity_endpoints: None,
             keepalive_timeout: None,
+            load_balance: LoadBalance::default(),
+            lb_endpoints: None,
         }
     }
 
@@ -672,6 +740,8 @@ impl BackendGroup {
             session_affinity: None,
             affinity_endpoints: None,
             keepalive_timeout: None,
+            load_balance: LoadBalance::default(),
+            lb_endpoints: None,
         }
     }
 
@@ -689,6 +759,8 @@ impl BackendGroup {
             session_affinity: None,
             affinity_endpoints: None,
             keepalive_timeout: None,
+            load_balance: LoadBalance::default(),
+            lb_endpoints: None,
         }
     }
 
@@ -732,6 +804,40 @@ impl BackendGroup {
     #[must_use]
     pub fn with_keepalive_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
         self.keepalive_timeout = timeout;
+        self
+    }
+
+    /// Set the upstream load-balancing algorithm (builder-style).
+    ///
+    /// Builds the per-endpoint accounting index when `lb != RoundRobin`.  Call
+    /// after the constructor (and, if used, after [`Self::with_per_backend_filters`]);
+    /// the index records backend indices so filter recovery reads `per_backend_filters`
+    /// at lookup time. Gateway API routes always keep the default `RoundRobin`.
+    #[must_use]
+    pub fn with_load_balance(mut self, lb: LoadBalance) -> Self {
+        self.load_balance = lb;
+        if lb == LoadBalance::RoundRobin {
+            self.lb_endpoints = None;
+            return self;
+        }
+        let mut index = Vec::with_capacity(self.addrs_snapshot.len());
+        for (backend_idx, pool) in self.backends.iter().enumerate() {
+            for &addr in &*pool.addrs {
+                index.push(LbEndpoint {
+                    addr,
+                    // backend count is bounded by backendRefs (<= a handful);
+                    // the cast is lossless in every realistic configuration.
+                    backend_idx: backend_idx as u16,
+                    active: AtomicU32::new(0),
+                    ewma_ns: AtomicU64::new(0),
+                });
+            }
+        }
+        self.lb_endpoints = if index.is_empty() {
+            None
+        } else {
+            Some(index.into_boxed_slice())
+        };
         self
     }
 
@@ -948,6 +1054,145 @@ impl BackendGroup {
             .as_ref()
             .and_then(|all| all.get(backend_idx).cloned().flatten());
         Some((pool.next(), filters))
+    }
+
+    /// Select the next upstream endpoint using the configured load-balancing algorithm.
+    ///
+    /// `client_ip` is the resolved real client IP (from `ctx.client_ip` in the proxy,
+    /// honouring the #271 forwarded-for configuration); used only by `IpHash`. All
+    /// other algorithms ignore it. Returns `None` when the group has no endpoints.
+    ///
+    /// Callers that receive a `Selected` with `track: Some(idx)` MUST call either
+    /// [`Self::release`] (before re-selecting on a retry) or [`Self::complete`] (at
+    /// request end) exactly once; this keeps `LeastConn` and `Ewma` counters balanced.
+    #[must_use]
+    pub fn select_upstream(&self, client_ip: Option<IpAddr>) -> Option<Selected> {
+        match self.load_balance {
+            LoadBalance::RoundRobin => {
+                let (addr, filters) = self.next_endpoint_with_filters()?;
+                Some(Selected {
+                    addr,
+                    filters,
+                    track: None,
+                })
+            }
+            LoadBalance::IpHash => {
+                let eps = self.lb_endpoints.as_deref()?;
+                let ip = match client_ip {
+                    Some(ip) => ip,
+                    None => {
+                        // No client IP available; fall back to round-robin.
+                        let (addr, filters) = self.next_endpoint_with_filters()?;
+                        return Some(Selected {
+                            addr,
+                            filters,
+                            track: None,
+                        });
+                    }
+                };
+                let hash = match ip {
+                    IpAddr::V4(v4) => affinity_hash(&v4.octets()),
+                    IpAddr::V6(v6) => affinity_hash(&v6.octets()),
+                };
+                let idx = (hash % eps.len() as u64) as usize;
+                let ep = &eps[idx];
+                let filters = self.filters_for_backend(ep.backend_idx as usize);
+                Some(Selected {
+                    addr: ep.addr,
+                    filters,
+                    track: None,
+                })
+            }
+            LoadBalance::LeastConn => {
+                let eps = self.lb_endpoints.as_deref()?;
+                // Linear scan for minimum active count; ties break by index order
+                // (natural pool order — deterministic, no allocation).
+                let (idx, _) = eps
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.active.load(Ordering::Relaxed))?;
+                let ep = &eps[idx];
+                ep.active.fetch_add(1, Ordering::Relaxed);
+                let filters = self.filters_for_backend(ep.backend_idx as usize);
+                Some(Selected {
+                    addr: ep.addr,
+                    filters,
+                    track: Some(idx as u32),
+                })
+            }
+            LoadBalance::Ewma => {
+                let eps = self.lb_endpoints.as_deref()?;
+                // `0` (never sampled) sorts first so new/idle endpoints are probed
+                // before stale estimates from prior traffic.
+                let (idx, _) = eps
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.ewma_ns.load(Ordering::Relaxed))?;
+                let ep = &eps[idx];
+                let filters = self.filters_for_backend(ep.backend_idx as usize);
+                Some(Selected {
+                    addr: ep.addr,
+                    filters,
+                    track: Some(idx as u32),
+                })
+            }
+        }
+    }
+
+    /// Undo in-flight accounting for a prior [`Self::select_upstream`] call.
+    ///
+    /// Called on a retriable failure before re-invoking `select_upstream` for the
+    /// retry attempt. `idx` is the `Selected::track` value from the call being
+    /// released. No-op for `RoundRobin` and `IpHash` (where `track` is always `None`).
+    pub fn release(&self, idx: u32) {
+        let eps = match self.lb_endpoints.as_deref() {
+            Some(e) => e,
+            None => return,
+        };
+        if let Some(ep) = eps.get(idx as usize)
+            && self.load_balance == LoadBalance::LeastConn
+        {
+            ep.active.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record the completion of a request selected by [`Self::select_upstream`].
+    ///
+    /// - `LeastConn`: decrements the active-connection counter.
+    /// - `Ewma`: folds `elapsed` into the endpoint's smoothed latency
+    ///   (`α = 1/8`; `new = if old==0 { sample } else { old − old/8 + sample/8 }`).
+    ///   A `None` elapsed is ignored (no update).
+    /// - `RoundRobin`/`IpHash`: no-op (`track` is always `None` for these algorithms).
+    ///
+    /// `idx` must be the `Selected::track` value from the original selection and must
+    /// be called exactly once per tracked selection to keep counters balanced.
+    pub fn complete(&self, idx: u32, elapsed: Option<Duration>) {
+        let eps = match self.lb_endpoints.as_deref() {
+            Some(e) => e,
+            None => return,
+        };
+        let ep = match eps.get(idx as usize) {
+            Some(e) => e,
+            None => return,
+        };
+        match self.load_balance {
+            LoadBalance::LeastConn => {
+                ep.active.fetch_sub(1, Ordering::Relaxed);
+            }
+            LoadBalance::Ewma => {
+                if let Some(d) = elapsed {
+                    let sample = d.as_nanos().min(u64::MAX as u128) as u64;
+                    let old = ep.ewma_ns.load(Ordering::Relaxed);
+                    let new = if old == 0 {
+                        sample
+                    } else {
+                        old.saturating_sub(old / 8).saturating_add(sample / 8)
+                    };
+                    ep.ewma_ns.store(new, Ordering::Relaxed);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1916,6 +2161,180 @@ mod tests {
         assert!(
             group.keepalive_timeout().is_none(),
             "with_keepalive_timeout(None) must leave the field None"
+        );
+    }
+
+    // ── LoadBalance / select_upstream ─────────────────────────────────────────────
+
+    fn addrs(n: usize, base_port: u16) -> Vec<SocketAddr> {
+        (0..n)
+            .map(|i| {
+                format!("127.0.0.1:{}", base_port + i as u16)
+                    .parse()
+                    .expect("valid addr")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn with_load_balance_round_robin_leaves_lb_endpoints_none() {
+        let group = BackendGroup::new("test/svc".to_string(), addrs(3, 8000))
+            .with_load_balance(LoadBalance::RoundRobin);
+        // RoundRobin: no lb_endpoints index (zero overhead).
+        assert!(group.lb_endpoints.is_none());
+    }
+
+    #[test]
+    fn with_load_balance_non_rr_builds_lb_endpoints() {
+        let group = BackendGroup::new("test/svc".to_string(), addrs(2, 9000))
+            .with_load_balance(LoadBalance::LeastConn);
+        let eps = group
+            .lb_endpoints
+            .as_deref()
+            .expect("lb_endpoints built for LeastConn");
+        assert_eq!(eps.len(), 2, "one entry per pooled address");
+    }
+
+    #[test]
+    fn select_upstream_round_robin_returns_none_on_empty() {
+        let group = BackendGroup::new("test/empty".to_string(), vec![])
+            .with_load_balance(LoadBalance::RoundRobin);
+        assert!(group.select_upstream(None).is_none());
+    }
+
+    #[test]
+    fn select_upstream_ip_hash_is_stable_for_same_ip() {
+        let group = BackendGroup::new("test/svc".to_string(), addrs(3, 7000))
+            .with_load_balance(LoadBalance::IpHash);
+        let ip: std::net::IpAddr = "10.0.0.1".parse().expect("valid IP");
+        let first = group.select_upstream(Some(ip)).expect("Some").addr;
+        for _ in 0..20 {
+            assert_eq!(
+                group.select_upstream(Some(ip)).expect("Some").addr,
+                first,
+                "same client IP must always select the same endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn select_upstream_ip_hash_varies_across_ips() {
+        let group = BackendGroup::new("test/svc".to_string(), addrs(4, 6000))
+            .with_load_balance(LoadBalance::IpHash);
+        let seen: std::collections::HashSet<SocketAddr> = (0u8..64)
+            .filter_map(|i| {
+                let ip: std::net::IpAddr = format!("10.0.1.{i}").parse().expect("valid IP");
+                group.select_upstream(Some(ip)).map(|s| s.addr)
+            })
+            .collect();
+        assert!(
+            seen.len() > 1,
+            "ip_hash must distribute across multiple endpoints"
+        );
+    }
+
+    #[test]
+    fn select_upstream_ip_hash_no_ip_falls_back_to_rr() {
+        let group = BackendGroup::new("test/svc".to_string(), addrs(2, 5000))
+            .with_load_balance(LoadBalance::IpHash);
+        // Should not panic; falls back to round-robin selection.
+        assert!(group.select_upstream(None).is_some());
+    }
+
+    #[test]
+    fn select_upstream_least_conn_picks_min_active() {
+        let group = BackendGroup::new("test/svc".to_string(), addrs(3, 4000))
+            .with_load_balance(LoadBalance::LeastConn);
+        let eps = group.lb_endpoints.as_deref().expect("built");
+        // Pre-load endpoints 0 and 1 with artificial active counts.
+        eps[0].active.store(5, Ordering::Relaxed);
+        eps[1].active.store(3, Ordering::Relaxed);
+        eps[2].active.store(0, Ordering::Relaxed);
+        let sel = group.select_upstream(None).expect("Some");
+        // Endpoint 2 has minimum active (0) — must win.
+        assert_eq!(
+            sel.addr, eps[2].addr,
+            "least_conn picks endpoint with fewest actives"
+        );
+        assert_eq!(sel.track, Some(2), "track index must be 2");
+        // Counter was incremented.
+        assert_eq!(
+            eps[2].active.load(Ordering::Relaxed),
+            1,
+            "active count incremented on selection"
+        );
+    }
+
+    #[test]
+    fn release_decrements_least_conn_active() {
+        let group = BackendGroup::new("test/svc".to_string(), addrs(2, 3000))
+            .with_load_balance(LoadBalance::LeastConn);
+        let sel = group.select_upstream(None).expect("Some");
+        let idx = sel.track.expect("track for LeastConn");
+        let eps = group.lb_endpoints.as_deref().expect("built");
+        assert_eq!(eps[idx as usize].active.load(Ordering::Relaxed), 1);
+        group.release(idx);
+        assert_eq!(
+            eps[idx as usize].active.load(Ordering::Relaxed),
+            0,
+            "release decrements active"
+        );
+    }
+
+    #[test]
+    fn complete_decrements_least_conn_active() {
+        let group = BackendGroup::new("test/svc".to_string(), addrs(2, 2000))
+            .with_load_balance(LoadBalance::LeastConn);
+        let sel = group.select_upstream(None).expect("Some");
+        let idx = sel.track.expect("track for LeastConn");
+        group.complete(idx, Some(Duration::from_millis(10)));
+        let eps = group.lb_endpoints.as_deref().expect("built");
+        assert_eq!(
+            eps[idx as usize].active.load(Ordering::Relaxed),
+            0,
+            "complete decrements active"
+        );
+    }
+
+    #[test]
+    fn ewma_starts_at_zero_and_folds_latency() {
+        // Single-endpoint group so the same endpoint is always selected,
+        // letting us verify the fold formula without endpoint-switching noise.
+        let group = BackendGroup::new("test/svc".to_string(), addrs(1, 1000))
+            .with_load_balance(LoadBalance::Ewma);
+        let eps = group.lb_endpoints.as_deref().expect("built");
+        assert_eq!(eps[0].ewma_ns.load(Ordering::Relaxed), 0, "starts at 0");
+
+        // First sample is stored as-is (old == 0).
+        let idx = group
+            .select_upstream(None)
+            .expect("Some")
+            .track
+            .expect("track");
+        let sample_a = Duration::from_millis(100);
+        group.complete(idx, Some(sample_a));
+        assert_eq!(
+            eps[0].ewma_ns.load(Ordering::Relaxed),
+            sample_a.as_nanos() as u64,
+            "first sample stored verbatim"
+        );
+
+        // Second sample on the same endpoint folds via alpha = 1/8.
+        let old = eps[0].ewma_ns.load(Ordering::Relaxed);
+        let idx2 = group
+            .select_upstream(None)
+            .expect("Some")
+            .track
+            .expect("track");
+        let sample_b = Duration::from_millis(200);
+        group.complete(idx2, Some(sample_b));
+        let expected = old
+            .saturating_sub(old / 8)
+            .saturating_add(sample_b.as_nanos() as u64 / 8);
+        assert_eq!(
+            eps[0].ewma_ns.load(Ordering::Relaxed),
+            expected,
+            "EWMA folds via alpha=1/8"
         );
     }
 }

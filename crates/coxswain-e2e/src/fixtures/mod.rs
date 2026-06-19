@@ -84,6 +84,7 @@ pub async fn apply_fixture(path: impl AsRef<Path>, vars: FixtureVars) -> anyhow:
     content = substitute(&content, "BUSYBOX_IMAGE", images::BUSYBOX);
     content = substitute(&content, "WEBSOCKET_ECHO_IMAGE", images::WEBSOCKET_ECHO);
     content = substitute(&content, "PAUSE_IMAGE", images::PAUSE);
+    content = substitute(&content, "GO_HTTPBIN_IMAGE", images::GO_HTTPBIN);
 
     // Extra vars (caller-supplied, e.g. `${TLS_HOSTNAME}`, `${CA_PEM}`).
     for (key, val) in &vars.extra {

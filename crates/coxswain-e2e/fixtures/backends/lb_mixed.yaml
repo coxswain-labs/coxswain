@@ -1,0 +1,75 @@
+# Load-balance mixed-latency backends for least_conn effect tests (#275).
+# lb-fast: echo-basic — responds instantly with JSON body containing POD_NAME.
+# lb-slow: go-httpbin  — serves /delay/<N> for configurable latency.
+# Both share the pod label `app: lb-pool` so the lb-pool Service selects
+# endpoints from both Deployments, giving BackendGroup two endpoints to
+# distribute across.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lb-fast
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lb-pool
+      role: fast
+  template:
+    metadata:
+      labels:
+        app: lb-pool
+        role: fast
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: echo
+          image: ${ECHO_IMAGE}
+          ports:
+            - containerPort: 3000
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lb-slow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lb-pool
+      role: slow
+  template:
+    metadata:
+      labels:
+        app: lb-pool
+        role: slow
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: go-httpbin
+          image: ${GO_HTTPBIN_IMAGE}
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lb-pool
+spec:
+  selector:
+    app: lb-pool
+  ports:
+    - port: 3000
+      targetPort: 3000

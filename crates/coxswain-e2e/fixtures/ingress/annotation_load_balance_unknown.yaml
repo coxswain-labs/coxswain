@@ -1,0 +1,24 @@
+# Ingress with an unknown load-balance value, routing to the two-replica echo Service (#275).
+# An unknown value must warn and fall back to round_robin; traffic must still flow (200)
+# and both pods must be reachable, proving the annotation never blocks routing.
+# Apply backends::ECHO_TWO_REPLICAS before this fixture.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lb-unknown
+  annotations:
+    ingress.coxswain-labs.dev/load-balance: "bogus"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: lb.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-two-replicas
+                port:
+                  number: 3000

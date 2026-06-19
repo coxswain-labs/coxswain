@@ -251,4 +251,28 @@ pub const AUTH_TLS_CA_SECRET: &str = fixture!("auth_tls_ca_secret.yaml");
 /// `mtls.TESTNS.local`. Apply `AUTH_TLS_CA_SECRET` first.
 pub const ANNOTATION_AUTH_TLS: &str = fixture!("annotation_auth_tls.yaml");
 
+// ── load-balance (#275) ───────────────────────────────────────────────────────
+
+/// Ingress with `ingress.coxswain-labs.dev/load-balance: "least_conn"` (#275),
+/// routing to the shared `lb-pool` Service (two endpoints: `lb-fast` echo-basic +
+/// `lb-slow` go-httpbin). Under `least_conn`, concurrent requests accumulate higher
+/// in-flight counts on `lb-slow`, so subsequent selections favour `lb-fast`.
+/// Apply `backends::LB_MIXED` first.
+pub const ANNOTATION_LOAD_BALANCE_LEAST_CONN: &str =
+    fixture!("annotation_load_balance_least_conn.yaml");
+
+/// Ingress with `ingress.coxswain-labs.dev/load-balance: "ip_hash"` (#275),
+/// routing to the `echo-two-replicas` Service (2 pods). A fixed client IP hashes
+/// to the same endpoint, so every sequential request from the test runner lands on
+/// the same pod.
+/// Apply `backends::ECHO_TWO_REPLICAS` first.
+pub const ANNOTATION_LOAD_BALANCE_IP_HASH: &str = fixture!("annotation_load_balance_ip_hash.yaml");
+
+/// Ingress with an unknown `load-balance` value (`"bogus"`) (#275 sad path),
+/// routing to the `echo-two-replicas` Service. An unknown value warns and falls
+/// back to `round_robin`; all requests must succeed (200) and both pods must be
+/// reachable, proving the invalid annotation never blocks routing.
+/// Apply `backends::ECHO_TWO_REPLICAS` first.
+pub const ANNOTATION_LOAD_BALANCE_UNKNOWN: &str = fixture!("annotation_load_balance_unknown.yaml");
+
 // ── satisfy any/all (#273) ────────────────────────────────────────────────────
