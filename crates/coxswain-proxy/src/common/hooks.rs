@@ -1028,7 +1028,9 @@ fn maybe_setup_compression(
     ctx: &mut ProxyCtx,
     cfg: &CompressionConfig,
 ) {
-    use http::header::{ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, VARY};
+    use http::header::{
+        ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING, VARY,
+    };
 
     // Guard 1: skip 1xx, 204 (no content), 304 (not modified) — no body.
     let status = resp.status.as_u16();
@@ -1115,6 +1117,12 @@ fn maybe_setup_compression(
 
     resp.headers.remove(CONTENT_LENGTH);
     resp.headers.remove(ACCEPT_RANGES);
+    // Pingora's H1 handler decides whether to add Transfer-Encoding: chunked
+    // *before* calling upstream_response_filter, based on the upstream's
+    // Content-Length.  Because we remove Content-Length here, we must set
+    // chunked ourselves so the downstream has a valid body framing.
+    resp.headers
+        .insert(TRANSFER_ENCODING, http::HeaderValue::from_static("chunked"));
 }
 
 /// Choose a compression algorithm from the client's `Accept-Encoding` string,
