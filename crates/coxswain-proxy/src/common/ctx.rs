@@ -1,8 +1,11 @@
 //! Per-request and per-connection context types for the Pingora proxy.
 
 use bytes::Bytes;
-use coxswain_core::routing::{BackendGroup, FilterAction, RetryOn, RouteTimeouts};
+use coxswain_core::routing::{
+    BackendGroup, CompressionConfig, FilterAction, RetryOn, RouteTimeouts,
+};
 use http::Method;
+use pingora_core::protocols::http::compression::Encode;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -59,6 +62,13 @@ pub struct ResolvedRoute {
     /// response cache for this request. `false` for every Gateway-API route and
     /// for Ingress routes without the `cache-enabled` annotation.
     pub cache_enabled: bool,
+    /// Per-route response-compression configuration (`None` = no compression).
+    ///
+    /// Populated from `RouteMatch::compression`; `Some` only for Ingress routes
+    /// that opt in via `compression-gzip`/`compression-brotli`. The proxy reads
+    /// this in `upstream_response_filter` to decide whether to compress and
+    /// constructs an encoder, stored in [`ProxyCtx::compression_encoder`].
+    pub compression: Option<Arc<CompressionConfig>>,
 }
 
 /// Pending fire-and-forget mirror dispatch.
@@ -173,6 +183,16 @@ pub struct ProxyCtx {
     /// original request chunk — zero data copies.  Consumed (and cleared) by
     /// `request_body_filter` on end-of-stream.
     pub mirror_body: Vec<Bytes>,
+    /// Live streaming compressor for the current response, set by
+    /// `upstream_response_filter` when the route has compression enabled and
+    /// the response qualifies. `None` for every Gateway-API route, for Ingress
+    /// routes without compression annotations, and for responses that are
+    /// already compressed or below the `min-size` threshold.
+    ///
+    /// Holds a fat pointer (data + vtable), so it is 16 bytes in its `Some`
+    /// state and exactly one allocation is made when an encoder is created.
+    /// The encoder is consumed by `response_body_filter`, chunk by chunk.
+    pub compression_encoder: Option<Box<dyn Encode + Send + Sync>>,
 }
 
 // Hot types — review with the team before bumping these numbers.
@@ -180,7 +200,8 @@ pub struct ProxyCtx {
 // ResolvedRoute: +16 bytes for metric_route_id: Arc<str> (104→120).
 // ResolvedRoute: +48 bytes because RouteTimeouts gained connect/read/send: Option<Duration> (120→168).
 // ResolvedRoute: +8 (alignment) for cache_enabled: bool (#40) (168→176).
-const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 176);
+// ResolvedRoute: +8 for compression: Option<Arc<CompressionConfig>> (niche pointer) (#270) (176→184).
+const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 184);
 // ProxyCtx: +16 for start: Option<Instant>, +48 for upstream_addr: Option<SocketAddr>
 // with alignment padding (176→240).
 // ProxyCtx: +16 because Option<ResolvedRoute> inlines the struct (240→256).
@@ -196,4 +217,7 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 176);
 // ProxyCtx: +120 for mirror: Option<MirrorDispatch> (96 — method 24, host 16,
 // path_and_query 24, headers 24, backend 8; Option adds niche) + 24 for
 // mirror_body: Vec<Bytes> (#283) (400→520).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 520);
+// ProxyCtx: +8 because embedded ResolvedRoute grew for compression field (#270) (520→528).
+// ProxyCtx: +16 for compression_encoder: Option<Box<dyn Encode + Send + Sync>>
+// (fat pointer, niche-opted, 16 bytes) (#270) (528→544).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 544);

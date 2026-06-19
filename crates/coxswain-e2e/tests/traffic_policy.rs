@@ -910,6 +910,196 @@ async fn upstream_keepalive_reuses_connections() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── Compression (#270) ──────────────────────────────────────────────────────
+
+/// Happy path (#270): a route annotated with `compression-gzip: "true"` and
+/// `compression-min-size: "1"` returns a gzip-compressed body when the client
+/// sends `Accept-Encoding: gzip`.
+///
+/// Asserts:
+/// - Status 200.
+/// - `Content-Encoding: gzip` is set on the response.
+/// - `Vary` contains `Accept-Encoding`.
+/// - `Content-Length` is absent (body is chunked after compression).
+/// - The gzip-decompressed body is valid JSON (the echo response).
+#[tokio::test]
+async fn compression_gzip_compresses_eligible_response() -> anyhow::Result<()> {
+    use flate2::read::GzDecoder;
+    use std::io::Read as _;
+
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "comp-gzip").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_COMPRESSION_GZIP,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("compression-gzip.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let (status, resp_headers, body) = h
+        .http
+        .get_full_raw(&host, "/", &[("Accept-Encoding", "gzip")])
+        .await?;
+
+    assert_eq!(
+        status, 200,
+        "compression-gzip route must return 200; got {status}"
+    );
+    assert_eq!(
+        resp_headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "proxy must set Content-Encoding: gzip on the response"
+    );
+    let vary = resp_headers
+        .get("vary")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        vary.to_ascii_lowercase().contains("accept-encoding"),
+        "Vary must include Accept-Encoding (got: {vary:?})"
+    );
+    assert!(
+        resp_headers.get("content-length").is_none(),
+        "Content-Length must be absent after compression (body is now chunked)"
+    );
+
+    // Decompress and check that the body is valid JSON.
+    let mut decoder = GzDecoder::new(body.as_ref());
+    let mut decompressed = String::new();
+    decoder
+        .read_to_string(&mut decompressed)
+        .map_err(|e| anyhow::anyhow!("failed to gzip-decompress response: {e}"))?;
+    serde_json::from_str::<serde_json::Value>(&decompressed).map_err(|e| {
+        anyhow::anyhow!("decompressed body is not valid JSON: {e}; body: {decompressed}")
+    })?;
+
+    Ok(())
+}
+
+/// Behaviour test (#270): when both `compression-gzip` and `compression-brotli`
+/// are enabled, brotli is preferred when the client advertises `br` in
+/// `Accept-Encoding`.
+///
+/// Asserts `Content-Encoding: br` when the client sends `Accept-Encoding: br, gzip`.
+#[tokio::test]
+async fn compression_prefers_brotli_when_client_supports_br() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "comp-brotli").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_COMPRESSION_BROTLI,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("compression-brotli.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let (status, resp_headers, _) = h
+        .http
+        .get_full_raw(&host, "/", &[("Accept-Encoding", "br, gzip")])
+        .await?;
+
+    assert_eq!(
+        status, 200,
+        "compression-brotli route must return 200; got {status}"
+    );
+    assert_eq!(
+        resp_headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("br"),
+        "brotli must be preferred over gzip when both enabled and br offered"
+    );
+
+    Ok(())
+}
+
+/// Sad path (#270): the proxy passes a response through uncompressed when its
+/// `Content-Length` is below the `compression-min-size` threshold (1 MiB here).
+///
+/// The echo backend's JSON response is always well under 1 MiB, so the proxy
+/// must skip compression entirely. Asserts no `Content-Encoding` header.
+#[tokio::test]
+async fn compression_skips_response_below_min_size() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "comp-minsize").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_COMPRESSION_MIN_SIZE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("compression-minsize.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let (status, resp_headers, _) = h
+        .http
+        .get_full_raw(&host, "/", &[("Accept-Encoding", "gzip")])
+        .await?;
+
+    assert_eq!(
+        status, 200,
+        "route must still return 200 when response is below min-size"
+    );
+    assert!(
+        resp_headers.get("content-encoding").is_none(),
+        "proxy must NOT compress responses below compression-min-size"
+    );
+
+    Ok(())
+}
+
+/// Sad path (#270): the proxy passes a response through uncompressed when its
+/// `Content-Type` is not in the `compression-types` allow-list.
+///
+/// The fixture allows only `text/plain`; the echo backend responds with
+/// `application/json`. Asserts no `Content-Encoding` header.
+#[tokio::test]
+async fn compression_skips_disallowed_content_type() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "comp-types").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_COMPRESSION_TYPES,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("compression-types.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let (status, resp_headers, _) = h
+        .http
+        .get_full_raw(&host, "/", &[("Accept-Encoding", "gzip")])
+        .await?;
+
+    assert_eq!(
+        status, 200,
+        "route must still return 200 when content-type is not in compression-types"
+    );
+    assert!(
+        resp_headers.get("content-encoding").is_none(),
+        "proxy must NOT compress application/json when only text/plain is in compression-types"
+    );
+
+    Ok(())
+}
+
 /// Sad path (#266): an unparseable `upstream-keepalive-timeout` value is ignored
 /// (fail-open) — the route must still serve 2xx requests normally.
 ///

@@ -762,6 +762,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
+ "flate2",
  "futures",
  "gateway-api",
  "k8s-openapi",

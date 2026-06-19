@@ -190,6 +190,32 @@ impl HttpClient {
         Ok((status, resp_headers, body))
     }
 
+    /// Send a GET with `extra_headers` and return the raw response bytes (not parsed JSON).
+    ///
+    /// Unlike [`Self::get_full_with_headers`] this method never attempts to
+    /// parse the body as JSON, so it works correctly when the body is
+    /// compressed (e.g. the caller sent `Accept-Encoding: gzip` and the proxy
+    /// returned a `Content-Encoding: gzip` body). Use this for compression
+    /// effect tests where you need to decompress and inspect the body manually.
+    pub async fn get_full_raw(
+        &self,
+        host: &str,
+        path: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> anyhow::Result<(u16, reqwest::header::HeaderMap, bytes::Bytes)> {
+        use anyhow::Context as _;
+        let url = format!("http://{}{path}", self.proxy_addr);
+        let mut req = self.inner.get(&url).header("Host", host);
+        for (k, v) in extra_headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.send().await.context("send request")?;
+        let status = resp.status().as_u16();
+        let resp_headers = resp.headers().clone();
+        let body = resp.bytes().await.context("read response bytes")?;
+        Ok((status, resp_headers, body))
+    }
+
     /// Like [`Self::get_full`], but sends `extra_headers` on the request.
     ///
     /// Used by caching tests to verify that a request carrying `Authorization`

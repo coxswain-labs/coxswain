@@ -52,6 +52,7 @@ constant_time_eq   = { version = "0.3" }
 bytes              = { version = "1" }
 clap               = { version = "4.6", features = ["derive", "env"] }
 criterion          = { version = "0.8", features = ["html_reports"] }
+flate2             = { version = "1" }
 form_urlencoded    = { version = "1.2" }
 governor           = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
 futures            = { version = "0.3" }

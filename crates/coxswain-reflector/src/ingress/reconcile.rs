@@ -220,6 +220,8 @@ impl IngressReconciler {
         // Resolve auth annotation once per Ingress; share one Arc across every path.
         let auth =
             resolve_auth_config(ann.auth.as_ref(), auth_secrets, &route_id, ns).map(Arc::new);
+        // Build the compression config once and share one Arc across every route entry.
+        let compression = ann.compression.clone().map(Arc::new);
 
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
@@ -363,7 +365,8 @@ impl IngressReconciler {
                         .with_deny_source_range(deny_source_range.clone())
                         .with_cache_enabled(ann.cache_enabled)
                         .with_rate_limit(rate_limit.clone())
-                        .with_auth(auth.clone());
+                        .with_auth(auth.clone())
+                        .with_compression(compression.clone());
                 if dead {
                     base_entry.error_status = Some(503);
                 }
@@ -394,7 +397,8 @@ impl IngressReconciler {
                             .with_deny_source_range(deny_source_range.clone())
                             .with_cache_enabled(ann.cache_enabled)
                             .with_rate_limit(rate_limit.clone())
-                            .with_auth(auth.clone());
+                            .with_auth(auth.clone())
+                            .with_compression(compression.clone());
                     if dead {
                         entry.error_status = Some(503);
                     }
@@ -484,7 +488,8 @@ impl IngressReconciler {
                                 .with_allow_source_range(allow_source_range.clone())
                                 .with_deny_source_range(deny_source_range.clone())
                                 .with_rate_limit(rate_limit.clone())
-                                .with_auth(auth.clone()),
+                                .with_auth(auth.clone())
+                                .with_compression(compression.clone()),
                             )
                         };
                         for &listener_port in &ports {
