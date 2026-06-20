@@ -43,7 +43,7 @@ async fn default_backend_serves_unmatched_requests() -> anyhow::Result<()> {
     // controller, so the default-backend endpoints are ready on first sync.
     bootstrap().await?;
     let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "ing-default").await?;
+    let ns = NamespaceGuard::create(&client, "rt-ing-default").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -84,7 +84,7 @@ async fn default_backend_serves_unmatched_requests() -> anyhow::Result<()> {
 #[tokio::test]
 async fn default_backend_alone_serves_all_hosts() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-default-only").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-default-only").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -105,7 +105,7 @@ async fn default_backend_alone_serves_all_hosts() -> anyhow::Result<()> {
 #[tokio::test]
 async fn ingress_path_match_routes_to_backend() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-path").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-path").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -131,7 +131,7 @@ async fn ingress_path_match_routes_to_backend() -> anyhow::Result<()> {
 #[tokio::test]
 async fn ingress_deleted_route_stops_serving() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-delete-stops").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-delete-stops").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -159,7 +159,7 @@ async fn ingress_deleted_route_stops_serving() -> anyhow::Result<()> {
 #[tokio::test]
 async fn gateway_deleted_route_stops_serving() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-delete-stops").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-delete-stops").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -196,7 +196,7 @@ async fn gateway_deleted_route_stops_serving() -> anyhow::Result<()> {
 #[tokio::test]
 async fn ingress_wildcard_host_matches_single_label_only() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-wildcard").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-wildcard").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -228,7 +228,7 @@ async fn ingress_wildcard_host_matches_single_label_only() -> anyhow::Result<()>
 #[tokio::test]
 async fn named_port_backend_resolves_to_target_port() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-named-port").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-named-port").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -256,7 +256,7 @@ async fn named_port_backend_resolves_to_target_port() -> anyhow::Result<()> {
 #[tokio::test]
 async fn default_ingress_class_claims_unannotated_ingress() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-default-class").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-default-class").await?;
 
     // Create a uniquely-named default IngressClass scoped to this test run.
     // The guard deletes it on drop so the cluster-scoped resource doesn't leak.
@@ -284,7 +284,7 @@ async fn default_ingress_class_claims_unannotated_ingress() -> anyhow::Result<()
 #[tokio::test]
 async fn annotation_rewrite_target_rewrites_upstream_path() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-rewrite").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-rewrite").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -314,7 +314,7 @@ async fn annotation_rewrite_target_rewrites_upstream_path() -> anyhow::Result<()
 #[tokio::test]
 async fn ingress_use_regex_matches_implementation_specific_path() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-regex-match").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-regex-match").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -345,7 +345,7 @@ async fn ingress_use_regex_matches_implementation_specific_path() -> anyhow::Res
 #[tokio::test]
 async fn ingress_use_regex_leaves_sibling_prefix_path_unaffected() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-regex-mixed").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-regex-mixed").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -377,7 +377,7 @@ async fn ingress_use_regex_leaves_sibling_prefix_path_unaffected() -> anyhow::Re
 #[tokio::test]
 async fn ingress_use_regex_rewrite_target_substitutes_capture_group() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-regex-rewrite").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-regex-rewrite").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -409,7 +409,7 @@ async fn ingress_use_regex_rewrite_target_substitutes_capture_group() -> anyhow:
 #[tokio::test]
 async fn ingress_use_regex_invalid_pattern_skips_only_that_path() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-regex-invalid").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-regex-invalid").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -442,7 +442,7 @@ async fn ingress_use_regex_invalid_pattern_skips_only_that_path() -> anyhow::Res
 async fn ingress_without_use_regex_treats_implementation_specific_literally() -> anyhow::Result<()>
 {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-regex-off").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-regex-off").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -477,7 +477,7 @@ async fn ingress_without_use_regex_treats_implementation_specific_literally() ->
 async fn ingress_class_parameters_default_annotation_applies_and_is_overridable()
 -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-class-params").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-class-params").await?;
 
     // The IngressClass is cluster-scoped and uniquely named; the guard deletes it
     // on drop so the resource doesn't leak. The name matches the fixture's
@@ -521,7 +521,7 @@ async fn ingress_class_parameters_default_annotation_applies_and_is_overridable(
 #[tokio::test]
 async fn ingress_class_parameters_dangling_ref_degrades_gracefully() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-class-dangling").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-class-dangling").await?;
 
     let ic_name = format!("coxswain-clsdangling-{}", ns.name);
     let _ic_guard = IngressClassGuard::new(&ic_name);
@@ -547,7 +547,7 @@ async fn ingress_class_parameters_dangling_ref_degrades_gracefully() -> anyhow::
 #[tokio::test]
 async fn gateway_path_match_routes_to_backend() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-path").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-path").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -572,7 +572,7 @@ async fn gateway_path_match_routes_to_backend() -> anyhow::Result<()> {
 #[tokio::test]
 async fn host_pool_round_robins_across_backends() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-pool").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-pool").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -606,7 +606,7 @@ async fn host_pool_round_robins_across_backends() -> anyhow::Result<()> {
 #[tokio::test]
 async fn gateway_wildcard_host_matches_multi_label_subdomains() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-wildcard").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-wildcard").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -633,8 +633,8 @@ async fn gateway_wildcard_host_matches_multi_label_subdomains() -> anyhow::Resul
 #[tokio::test]
 async fn cross_namespace_grant_allows_backend_routing() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-xns").await?;
-    let tenant = NamespaceGuard::create(&h.client, "gw-xns-tenant").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "rt-gw-xns-tenant").await?;
 
     // Deploy the backend + ReferenceGrant into the tenant namespace.
     fixtures::apply_fixture(
@@ -661,8 +661,8 @@ async fn cross_namespace_grant_allows_backend_routing() -> anyhow::Result<()> {
 #[tokio::test]
 async fn cross_namespace_without_grant_blocks_backend() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-xns-deny").await?;
-    let tenant = NamespaceGuard::create(&h.client, "gw-xns-deny-tenant").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-xns-deny").await?;
+    let tenant = NamespaceGuard::create(&h.client, "rt-gw-xns-deny-tenant").await?;
 
     // Deploy tenant backend WITHOUT a ReferenceGrant.
     // Apply only the Deployment + Service from the tenant fixture
@@ -706,7 +706,7 @@ async fn cross_namespace_without_grant_blocks_backend() -> anyhow::Result<()> {
 #[tokio::test]
 async fn header_match_routes_only_matching_requests() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-hdr").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-hdr").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -747,7 +747,7 @@ async fn header_match_routes_only_matching_requests() -> anyhow::Result<()> {
 #[tokio::test]
 async fn method_match_routes_by_method() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-method").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-method").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -778,7 +778,7 @@ async fn method_match_routes_by_method() -> anyhow::Result<()> {
 #[tokio::test]
 async fn query_param_match_routes_only_matching_requests() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-query").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-query").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -819,7 +819,7 @@ async fn query_param_match_routes_only_matching_requests() -> anyhow::Result<()>
 #[tokio::test]
 async fn combined_match_applies_and_or_semantics() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-combined").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-combined").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -860,7 +860,7 @@ async fn combined_match_applies_and_or_semantics() -> anyhow::Result<()> {
 #[tokio::test]
 async fn request_header_modifier_injects_request_header() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-req-hdr").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-req-hdr").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -894,7 +894,7 @@ async fn request_header_modifier_injects_request_header() -> anyhow::Result<()> 
 #[tokio::test]
 async fn response_header_modifier_sets_response_header() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-resp-hdr").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-resp-hdr").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -929,7 +929,7 @@ async fn response_header_modifier_sets_response_header() -> anyhow::Result<()> {
 #[tokio::test]
 async fn request_redirect_returns_302_to_target() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-redirect").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-redirect").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -975,7 +975,7 @@ async fn request_redirect_returns_302_to_target() -> anyhow::Result<()> {
 #[tokio::test]
 async fn url_rewrite_replaces_request_path() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-rewrite").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-rewrite").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -1004,7 +1004,7 @@ async fn url_rewrite_replaces_request_path() -> anyhow::Result<()> {
 #[tokio::test]
 async fn timeouts_request_returns_504() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-timeouts-req").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-timeouts-req").await?;
 
     fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
@@ -1035,7 +1035,7 @@ async fn timeouts_request_returns_504() -> anyhow::Result<()> {
 #[tokio::test]
 async fn timeouts_backend_request_returns_504() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-timeouts-be").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-timeouts-be").await?;
 
     fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
@@ -1066,7 +1066,7 @@ async fn timeouts_backend_request_returns_504() -> anyhow::Result<()> {
 #[tokio::test]
 async fn weighted_split_distributes_by_weight() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-weighted").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-weighted").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -1104,7 +1104,7 @@ async fn weighted_split_distributes_by_weight() -> anyhow::Result<()> {
 #[tokio::test]
 async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-serving").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-serving").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -1172,7 +1172,7 @@ async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
 #[tokio::test]
 async fn parent_ref_port_match_binds_only_pinned_listener() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-port").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-port").await?;
 
     // Any unused high port that coxswain is definitely NOT listening on.
     let wrong_port = "19999";
@@ -1270,7 +1270,7 @@ async fn parent_ref_port_match_binds_only_pinned_listener() -> anyhow::Result<()
 #[tokio::test]
 async fn ingress_request_header_modifier_sets_adds_and_removes() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-req-hdr").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-req-hdr").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -1336,7 +1336,7 @@ async fn ingress_request_header_modifier_sets_adds_and_removes() -> anyhow::Resu
 #[tokio::test]
 async fn ingress_response_header_modifier_sets_adds_and_removes() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-resp-hdr").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-resp-hdr").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -1389,7 +1389,7 @@ async fn ingress_response_header_modifier_sets_adds_and_removes() -> anyhow::Res
 #[tokio::test]
 async fn ingress_request_redirect_returns_configured_status_and_location() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-redirect").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-redirect").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -1421,7 +1421,7 @@ async fn ingress_request_redirect_returns_configured_status_and_location() -> an
 async fn ingress_invalid_filter_annotation_is_skipped_and_route_still_serves() -> anyhow::Result<()>
 {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-bad-hdr").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-bad-hdr").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -1459,7 +1459,7 @@ async fn ingress_invalid_filter_annotation_is_skipped_and_route_still_serves() -
 #[tokio::test]
 async fn url_rewrite_replaces_request_host() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-host-rewrite").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-host-rewrite").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -1489,7 +1489,7 @@ async fn url_rewrite_replaces_request_host() -> anyhow::Result<()> {
 #[tokio::test]
 async fn request_redirect_returns_various_status_codes() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-redirect-status").await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-redirect-status").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;

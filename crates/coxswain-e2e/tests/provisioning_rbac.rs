@@ -49,7 +49,7 @@ use common::dedicated::{
 #[tokio::test]
 async fn provisions_resources_for_dedicated_proxy() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-create").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-create").await?;
 
     let (_, _, _, deploy, svc, sa) = apply_and_wait(&h, &ns).await?;
 
@@ -92,7 +92,7 @@ async fn provisions_resources_for_dedicated_proxy() -> anyhow::Result<()> {
 #[tokio::test]
 async fn gateway_deletion_garbage_collects_resources() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-gc").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-gc").await?;
 
     let (deployments, services, sas, _, _, _) = apply_and_wait(&h, &ns).await?;
 
@@ -127,7 +127,7 @@ async fn gateway_deletion_garbage_collects_resources() -> anyhow::Result<()> {
 #[tokio::test]
 async fn provisions_role_binding_in_gateway_namespace() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-own").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-rbac-own").await?;
 
     fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
@@ -193,7 +193,7 @@ async fn provisions_role_binding_in_gateway_namespace() -> anyhow::Result<()> {
 #[tokio::test]
 async fn gateway_deletion_drives_role_binding_cleanup() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-gc").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-rbac-gc").await?;
 
     fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
@@ -253,7 +253,7 @@ async fn gateway_deletion_drives_role_binding_cleanup() -> anyhow::Result<()> {
 #[tokio::test]
 async fn out_of_band_binding_deletion_is_recreated() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-drift").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-rbac-drift").await?;
 
     fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
@@ -295,7 +295,7 @@ async fn out_of_band_binding_deletion_is_recreated() -> anyhow::Result<()> {
 #[tokio::test]
 async fn deployment_container_carries_watch_namespaces_arg() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-rbac-args").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-rbac-args").await?;
 
     fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
@@ -371,7 +371,7 @@ fn coxswain_container(deploy: &Deployment) -> &k8s_openapi::api::core::v1::Conta
 #[tokio::test]
 async fn params_replicas_sets_deployment_replicas() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-replicas").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-replicas").await?;
     let (deploy, _) = provision_field_gateway(&h, &ns).await?;
     assert_eq!(
         deploy.spec.as_ref().and_then(|s| s.replicas),
@@ -385,7 +385,7 @@ async fn params_replicas_sets_deployment_replicas() -> anyhow::Result<()> {
 #[tokio::test]
 async fn params_image_sets_container_image() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-image").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-image").await?;
     let (deploy, _) = provision_field_gateway(&h, &ns).await?;
     assert_eq!(
         coxswain_container(&deploy).image.as_deref(),
@@ -399,7 +399,7 @@ async fn params_image_sets_container_image() -> anyhow::Result<()> {
 #[tokio::test]
 async fn params_resources_set_container_resources() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-resources").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-resources").await?;
     let (deploy, _) = provision_field_gateway(&h, &ns).await?;
     let resources = coxswain_container(&deploy)
         .resources
@@ -434,7 +434,7 @@ async fn params_resources_set_container_resources() -> anyhow::Result<()> {
 #[tokio::test]
 async fn params_pod_template_merges_onto_template() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-podtemplate").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-podtemplate").await?;
     let (deploy, _) = provision_field_gateway(&h, &ns).await?;
     let tmpl = &deploy.spec.as_ref().expect("Deployment spec").template;
     let labels = tmpl
@@ -466,7 +466,7 @@ async fn params_pod_template_merges_onto_template() -> anyhow::Result<()> {
 #[tokio::test]
 async fn params_service_type_sets_service_type() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-svctype").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-svctype").await?;
     let (_, svc) = provision_field_gateway(&h, &ns).await?;
     assert_eq!(
         svc.spec.as_ref().and_then(|s| s.type_.as_deref()),
@@ -482,7 +482,7 @@ async fn params_service_type_sets_service_type() -> anyhow::Result<()> {
 #[tokio::test]
 async fn lifecycle_provisioning_creates_resources() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ded-life-prov").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ded-life-prov").await?;
 
     fixtures::apply_fixture(dedicated::PROVISIONING, FixtureVars::new(&ns.name)).await?;
 
@@ -507,7 +507,7 @@ async fn lifecycle_provisioning_creates_resources() -> anyhow::Result<()> {
 #[tokio::test]
 async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ded-life-traffic").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ded-life-traffic").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -583,8 +583,8 @@ async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
 #[tokio::test]
 async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ded-life-xns").await?;
-    let tenant = NamespaceGuard::create(&h.client, "ded-life-xns-tenant").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ded-life-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "prov-ded-life-xns-tenant").await?;
 
     fixtures::apply_fixture(
         dedicated::CROSS_NAMESPACE_TENANT,
@@ -624,8 +624,8 @@ async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
 #[tokio::test]
 async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ded-life-revoke").await?;
-    let tenant = NamespaceGuard::create(&h.client, "ded-life-revoke-tenant").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ded-life-revoke").await?;
+    let tenant = NamespaceGuard::create(&h.client, "prov-ded-life-revoke-tenant").await?;
 
     fixtures::apply_fixture(
         dedicated::CROSS_NAMESPACE_TENANT,
@@ -686,7 +686,7 @@ async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<
 #[tokio::test]
 async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ded-life-gc").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ded-life-gc").await?;
 
     fixtures::apply_fixture(dedicated::PROVISIONING, FixtureVars::new(&ns.name)).await?;
 
@@ -729,7 +729,7 @@ async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
 #[tokio::test]
 async fn cluster_wide_binding_created_and_removed_with_listener_mode() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-clusterwide-toggle").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-clusterwide-toggle").await?;
 
     // Gateway fixture with from: All.
     fixtures::apply_fixture(
@@ -819,7 +819,7 @@ async fn cluster_wide_binding_created_and_removed_with_listener_mode() -> anyhow
 #[tokio::test]
 async fn cluster_wide_binding_deleted_on_gateway_deletion() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-clusterwide-gc").await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-clusterwide-gc").await?;
 
     fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_FROM_ALL,
