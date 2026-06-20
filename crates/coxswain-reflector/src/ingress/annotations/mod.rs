@@ -33,9 +33,8 @@ pub use session::*;
 pub use traffic_policy::*;
 
 use coxswain_core::routing::{
-    BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HashSource, HeaderMod,
-    LoadBalance, NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicy, RouteTimeouts,
-    SessionAffinity,
+    BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HeaderMod, LoadBalance,
+    NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicy, RouteTimeouts, SessionAffinity,
 };
 use security::AuthAnnotation;
 use std::collections::BTreeMap;
@@ -156,9 +155,9 @@ pub(super) struct IngressAnnotations {
     pub forwarded_for: Option<ForwardedForConfig>,
     /// Per-route upstream load-balancing algorithm from `load-balance` (#275, #276).
     /// Defaults to `RoundRobin` when the annotation is absent or carries an unknown value.
+    /// The `hash:*` forms carry their consistent-hash attribute inline via
+    /// [`LoadBalance::Hash`] (#397).
     pub load_balance: LoadBalance,
-    /// Consistent-hash attribute when `load_balance == Hash` (#276); `None` otherwise.
-    pub hash_by: Option<HashSource>,
     /// Envoy/Istio-style path normalization level from `path-normalize` (#280).
     ///
     /// `None` when the annotation is absent (the host builder uses its default,
@@ -414,10 +413,12 @@ impl IngressAnnotations {
         });
 
         // ── Allow-source-range (#264) ─────────────────────────────────────────
-        let allow_source_range = get(ann, ALLOW_SOURCE_RANGE).and_then(parse_allow_source_range);
+        let allow_source_range =
+            get(ann, ALLOW_SOURCE_RANGE).and_then(|s| parse_allow_source_range(s, route_id));
 
         // ── Deny-source-range (#268) ──────────────────────────────────────────
-        let deny_source_range = get(ann, DENY_SOURCE_RANGE).and_then(parse_deny_source_range);
+        let deny_source_range =
+            get(ann, DENY_SOURCE_RANGE).and_then(|s| parse_deny_source_range(s, route_id));
 
         // ── Response caching (#40) ────────────────────────────────────────────
         let cache_enabled = get(ann, CACHE_ENABLED)
@@ -473,9 +474,9 @@ impl IngressAnnotations {
         let forwarded_for = security::parse_forwarded_for(ann, route_id);
 
         // ── Load-balance algorithm (#275, #276) ───────────────────────────────
-        let (load_balance, hash_by) = get(ann, LOAD_BALANCE)
-            .map(traffic_policy::parse_load_balance)
-            .unwrap_or((LoadBalance::RoundRobin, None));
+        let load_balance = get(ann, LOAD_BALANCE)
+            .map(|s| traffic_policy::parse_load_balance(s, route_id))
+            .unwrap_or_default();
 
         // ── Path normalization level (#280) ───────────────────────────────────
         let path_normalize = get(ann, PATH_NORMALIZE).map(|v| {
@@ -519,7 +520,6 @@ impl IngressAnnotations {
             compression,
             forwarded_for,
             load_balance,
-            hash_by,
             path_normalize,
         }
     }
