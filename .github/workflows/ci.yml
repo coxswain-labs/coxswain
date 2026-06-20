@@ -49,11 +49,13 @@ jobs:
               - '.github/workflows/ci.yml'
             anti_drift:
               - 'crates/**'
+              - 'Cargo.toml'
               - 'scripts/check-module-headers.sh'
               - 'scripts/check-no-anyhow-libs.sh'
               - 'scripts/check-workspace-lints-decl.sh'
               - 'scripts/check-no-per-site-allow.sh'
               - 'scripts/check-must-use-builders.sh'
+              - 'scripts/check-must-use-results.sh'
               - 'scripts/check-no-e2e-sleeps.sh'
               - 'scripts/check-e2e-single-poller.sh'
               - 'scripts/check-annotation-coverage.sh'
@@ -182,6 +184,13 @@ jobs:
         run: bash scripts/check-no-per-site-allow.sh
       - name: Builders / predicates carry #[must_use]
         run: bash scripts/check-must-use-builders.sh
+      - name: Result-returning pub fns carry #[must_use]
+        run: bash scripts/check-must-use-results.sh
+      - name: No unused dependencies (cargo-machete)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      - run: cargo-machete
       - name: No bare sleeps in e2e test bodies (poll a post-condition)
         run: bash scripts/check-no-e2e-sleeps.sh
       - name: Exactly one canonical e2e poll_until (no shadow pollers)
