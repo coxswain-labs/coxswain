@@ -1311,3 +1311,168 @@ async fn unknown_load_balance_value_falls_back_to_round_robin() -> anyhow::Resul
 
     Ok(())
 }
+
+/// Happy path (#276): with `load-balance: hash:uri`, every request to the same
+/// URI must consistently hash (HRW) to the same upstream pod.
+///
+/// The fixture routes to `echo-two-replicas` (2 pods). The test fires 10 sequential
+/// GETs to `/` and asserts they all reach the same pod (URI is stable, so the hash
+/// key is stable). It then fires requests to a different path (`/other`) and asserts
+/// those too are stable (possibly a different pod, but deterministic).
+#[tokio::test]
+async fn same_uri_always_reaches_the_same_upstream() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "lb-hash-uri").await?;
+
+    fixtures::apply_fixture(backends::ECHO_TWO_REPLICAS, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["echo-two-replicas"]).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_LOAD_BALANCE_HASH_URI,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("lb.{}.local", ns.name);
+    let first = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    let pinned_pod = first
+        .pod
+        .expect("echo body must report the serving pod on first request");
+
+    for i in 0..10u32 {
+        let body = h.http.get(&host, "/").await?;
+        let pod = body.pod.unwrap_or_default();
+        assert_eq!(
+            pod, pinned_pod,
+            "hash:uri must pin '/' to one pod (request {i}: got '{pod}', want '{pinned_pod}')"
+        );
+    }
+
+    // A different path may or may not land on a different pod, but must be stable.
+    let first_other = h.http.get(&host, "/other").await?;
+    let pinned_other = first_other.pod.unwrap_or_default();
+    for i in 0..10u32 {
+        let body = h.http.get(&host, "/other").await?;
+        let pod = body.pod.unwrap_or_default();
+        assert_eq!(
+            pod, pinned_other,
+            "hash:uri must pin '/other' to one pod (request {i}: got '{pod}', want '{pinned_other}')"
+        );
+    }
+
+    Ok(())
+}
+
+/// Happy path (#276): with `load-balance: hash:header=x-hash-key`, every request
+/// carrying the same `X-Hash-Key` header value must consistently reach the same pod.
+///
+/// The fixture routes to `echo-two-replicas` (2 pods). The test sends 10 sequential
+/// GETs with `X-Hash-Key: alpha` and asserts they all land on one pod. It also sends
+/// GETs with `X-Hash-Key: beta` and asserts those are stable (may differ from alpha).
+#[tokio::test]
+async fn same_hash_header_value_pins_the_upstream() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "lb-hash-hdr").await?;
+
+    fixtures::apply_fixture(backends::ECHO_TWO_REPLICAS, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["echo-two-replicas"]).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_LOAD_BALANCE_HASH_HEADER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("lb.{}.local", ns.name);
+
+    // Wait until the route is live before sending the first header request —
+    // wait_for_route polls with a plain GET; only after 200 do we know the
+    // route is installed and pods are ready.
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let (_, _, first_body) = h
+        .http
+        .get_full_with_headers(&host, "/", &[("x-hash-key", "alpha")])
+        .await?;
+    let pinned_alpha = first_body.and_then(|b| b.pod).unwrap_or_default();
+
+    for i in 0..10u32 {
+        let (status, _, body) = h
+            .http
+            .get_full_with_headers(&host, "/", &[("x-hash-key", "alpha")])
+            .await?;
+        assert_eq!(
+            status, 200,
+            "hash:header=x-hash-key must route successfully (request {i} returned {status})"
+        );
+        let pod = body.and_then(|b| b.pod).unwrap_or_default();
+        assert_eq!(
+            pod, pinned_alpha,
+            "X-Hash-Key: alpha must always reach the same pod \
+             (request {i}: got '{pod}', want '{pinned_alpha}')"
+        );
+    }
+
+    // A different header value may hash to a different pod, but must itself be stable.
+    let (_, _, first_beta) = h
+        .http
+        .get_full_with_headers(&host, "/", &[("x-hash-key", "beta")])
+        .await?;
+    let pinned_beta = first_beta.and_then(|b| b.pod).unwrap_or_default();
+    for i in 0..10u32 {
+        let (status, _, body) = h
+            .http
+            .get_full_with_headers(&host, "/", &[("x-hash-key", "beta")])
+            .await?;
+        assert_eq!(
+            status, 200,
+            "X-Hash-Key: beta must route successfully (request {i})"
+        );
+        let pod = body.and_then(|b| b.pod).unwrap_or_default();
+        assert_eq!(
+            pod, pinned_beta,
+            "X-Hash-Key: beta must always reach the same pod \
+             (request {i}: got '{pod}', want '{pinned_beta}')"
+        );
+    }
+
+    Ok(())
+}
+
+/// Sad path (#276): with `load-balance: hash:header=x-hash-key`, requests that
+/// omit the header must fall back to round-robin. The test fires 30 requests
+/// without `X-Hash-Key` and asserts that both pods are reached, proving the
+/// fallback distributes traffic rather than pinning to one upstream.
+#[tokio::test]
+async fn missing_hash_attribute_falls_back_to_round_robin() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "lb-hash-fb").await?;
+
+    fixtures::apply_fixture(backends::ECHO_TWO_REPLICAS, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["echo-two-replicas"]).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_LOAD_BALANCE_HASH_HEADER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("lb.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let mut pods = std::collections::HashSet::new();
+    for i in 0..30u32 {
+        let (status, _, body) = h.http.get_full(&host, "/").await?;
+        assert_eq!(
+            status, 200,
+            "hash:header fallback must not break routing (request {i} returned {status})"
+        );
+        if let Some(p) = body.and_then(|b| b.pod) {
+            pods.insert(p);
+        }
+    }
+    assert!(
+        pods.len() >= 2,
+        "missing hash attribute must fall back to round_robin and spread across \
+         both pods; saw only {pods:?}"
+    );
+
+    Ok(())
+}
