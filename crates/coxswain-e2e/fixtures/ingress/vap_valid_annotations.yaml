@@ -2,18 +2,18 @@
 #
 # Exercises one annotation from each validated format category so the VAP
 # acceptance path is confirmed end-to-end, not just the rejection path.
+# Intentionally omits annotations whose valid values would block test traffic
+# (allow-source-range, auth-url) — VAP format coverage, not behaviour tests.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: vap-valid-annotations
   annotations:
     ingress.coxswain-labs.dev/connect-timeout: "5s"
-    ingress.coxswain-labs.dev/use-regex: "true"
+    ingress.coxswain-labs.dev/use-regex: "false"
     ingress.coxswain-labs.dev/max-body-size: "1m"
-    ingress.coxswain-labs.dev/rate-limit-rps: "10"
+    ingress.coxswain-labs.dev/rate-limit-rps: "100"
     ingress.coxswain-labs.dev/backend-protocol: "http"
-    ingress.coxswain-labs.dev/allow-source-range: "10.0.0.0/8,192.168.0.0/16"
-    ingress.coxswain-labs.dev/auth-url: "http://auth.example.com/validate"
     ingress.coxswain-labs.dev/redirect-port: "8443"
 spec:
   ingressClassName: coxswain

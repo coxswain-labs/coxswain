@@ -1118,17 +1118,11 @@ async fn request_forwarded_without_auth_when_no_annotation() -> anyhow::Result<(
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "auth-none").await?;
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    // Apply only the echo-based Ingress from the rate-limit-invalid fixture (no auth
-    // annotation) to reuse an existing no-auth route definition.
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_RATE_LIMIT_INVALID,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-    let host = format!("ratelimitinvalid.{}.local", ns.name);
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    let host = format!("ingress.{}.local", ns.name);
 
     // Plain 200 — no credentials required, no auth annotation on the route.
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
     Ok(())
 }
