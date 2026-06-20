@@ -281,7 +281,8 @@ impl IngressReconciler {
                         .with_retries(ann.retries)
                         .with_session_affinity(ann.session_affinity.clone())
                         .with_keepalive_timeout(ann.keepalive_timeout)
-                        .with_load_balance(ann.load_balance),
+                        .with_load_balance(ann.load_balance)
+                        .with_hash_by(ann.hash_by.clone()),
                 );
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
@@ -464,7 +465,8 @@ impl IngressReconciler {
                                 .with_retries(ann.retries)
                                 .with_session_affinity(ann.session_affinity.clone())
                                 .with_keepalive_timeout(ann.keepalive_timeout)
-                                .with_load_balance(ann.load_balance),
+                                .with_load_balance(ann.load_balance)
+                                .with_hash_by(ann.hash_by.clone()),
                         );
                         let default_metric_route_id: Arc<str> =
                             Arc::from(format!("ingress/{ns}/{ingress_name}:default"));

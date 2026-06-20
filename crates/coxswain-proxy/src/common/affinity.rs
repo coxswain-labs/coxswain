@@ -101,7 +101,7 @@ pub(crate) fn inject_set_cookie(
 /// Returns the first match. Cookie syntax is `name=value` pairs separated by `"; "`
 /// (RFC 6265 §5.4); names are case-sensitive. No allocation — returns a borrow into
 /// the header value.
-fn cookie_value<'a>(req: &'a RequestHeader, name: &str) -> Option<&'a str> {
+pub(crate) fn cookie_value<'a>(req: &'a RequestHeader, name: &str) -> Option<&'a str> {
     let raw = req.headers.get(http::header::COOKIE)?.to_str().ok()?;
     raw.split(';').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;

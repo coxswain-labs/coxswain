@@ -5,7 +5,7 @@ use super::compression::CompressionConfig;
 use super::predicate::MatchPredicates;
 use super::rate_limit::RateLimitConfig;
 use http::{HeaderName, HeaderValue};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
@@ -123,6 +123,25 @@ pub enum SessionAffinity {
     },
 }
 
+/// Request attribute to extract as the consistent-hash key for [`LoadBalance::Hash`].
+///
+/// The proxy extracts the value per request, hashes it with FNV-1a, and selects the
+/// upstream via rendezvous (HRW) hashing — only the keys whose owner is removed remap
+/// on endpoint changes. All variants fall back to round-robin when the attribute is
+/// absent or empty.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HashSource {
+    /// Path + query of the request URI (`/path?query`).
+    Uri,
+    /// Resolved real client IP — honours `trust-forwarded-for` (#271) configuration.
+    SourceIp,
+    /// Value of a specific request header (case-insensitive lookup).
+    Header(HeaderName),
+    /// Value of a specific named cookie from the `Cookie` header.
+    Cookie(Arc<str>),
+}
+
 /// Per-route upstream load-balancing algorithm from the
 /// `ingress.coxswain-labs.dev/load-balance` annotation.
 ///
@@ -139,10 +158,11 @@ pub enum LoadBalance {
     /// response latency (`α = 1/8`). New or idle endpoints (never sampled) are
     /// probed first so the estimate stays fresh.
     Ewma,
-    /// Consistent hash on the resolved client IP (honours the #271
-    /// `ingress.coxswain-labs.dev/trust-forwarded-for` configuration when set).
-    /// Falls back to round-robin when the client IP cannot be determined.
-    IpHash,
+    /// Rendezvous (HRW) consistent hash on the request attribute configured via
+    /// [`BackendGroup::with_hash_by`]. The attribute is extracted and hashed by the
+    /// proxy before calling [`BackendGroup::select_upstream`]. Falls back to
+    /// round-robin when the attribute value is unavailable.
+    Hash,
 }
 
 /// Deterministic FNV-1a hash of a byte slice.
@@ -219,6 +239,9 @@ struct LbEndpoint {
     /// Owning backend pool index — used to recover per-backend filters from
     /// [`BackendGroup::per_backend_filters`], matching the layout of [`AffinityEndpoint`].
     backend_idx: u16,
+    /// Stable endpoint token (`affinity_token(addr)`) for rendezvous scoring in `Hash` mode.
+    /// Populated for all non-`RoundRobin` algorithms; ignored by `LeastConn` and `Ewma`.
+    token: u64,
     /// Active in-flight request count (incremented on selection, decremented on completion/release).
     active: AtomicU32,
     /// Smoothed response latency in nanoseconds (`0` = never sampled).
@@ -235,7 +258,7 @@ pub struct Selected {
     pub filters: Option<Arc<[FilterAction]>>,
     /// Flat index into the `lb_endpoints` slice for post-request accounting.
     ///
-    /// `None` for `RoundRobin` and `IpHash` (stateless algorithms). When `Some`,
+    /// `None` for `RoundRobin` and `Hash` (stateless algorithms). When `Some`,
     /// the proxy must call [`BackendGroup::release`] (on a retriable failure, before
     /// re-selecting) or [`BackendGroup::complete`] (at request end) exactly once to
     /// keep counters balanced.
@@ -642,8 +665,13 @@ pub struct BackendGroup {
     ///
     /// `None` when `load_balance == RoundRobin` (zero overhead on the hot path).
     /// Built by [`BackendGroup::with_load_balance`]; covers every pooled address
-    /// with its owning backend index, active-connection counter, and EWMA latency.
+    /// with its owning backend index, stable token, active-connection counter, and EWMA latency.
     lb_endpoints: Option<Box<[LbEndpoint]>>,
+    /// Consistent-hash attribute for `LoadBalance::Hash` — `None` for all other algorithms.
+    ///
+    /// The proxy reads this in `request_filter` to determine which request attribute to
+    /// extract and hash before calling [`BackendGroup::select_upstream`].
+    hash_source: Option<HashSource>,
 }
 
 /// Manual `Debug` implementation that avoids the `FilterAction` ↔ `BackendGroup` cycle.
@@ -689,6 +717,7 @@ impl BackendGroup {
             keepalive_timeout: None,
             load_balance: LoadBalance::default(),
             lb_endpoints: None,
+            hash_source: None,
         }
     }
 
@@ -742,6 +771,7 @@ impl BackendGroup {
             keepalive_timeout: None,
             load_balance: LoadBalance::default(),
             lb_endpoints: None,
+            hash_source: None,
         }
     }
 
@@ -761,6 +791,7 @@ impl BackendGroup {
             keepalive_timeout: None,
             load_balance: LoadBalance::default(),
             lb_endpoints: None,
+            hash_source: None,
         }
     }
 
@@ -809,10 +840,11 @@ impl BackendGroup {
 
     /// Set the upstream load-balancing algorithm (builder-style).
     ///
-    /// Builds the per-endpoint accounting index when `lb != RoundRobin`.  Call
+    /// Builds the per-endpoint accounting index when `lb != RoundRobin`. Call
     /// after the constructor (and, if used, after [`Self::with_per_backend_filters`]);
     /// the index records backend indices so filter recovery reads `per_backend_filters`
     /// at lookup time. Gateway API routes always keep the default `RoundRobin`.
+    /// For `Hash`, also call [`Self::with_hash_by`] to configure the key attribute.
     #[must_use]
     pub fn with_load_balance(mut self, lb: LoadBalance) -> Self {
         self.load_balance = lb;
@@ -828,6 +860,7 @@ impl BackendGroup {
                     // backend count is bounded by backendRefs (<= a handful);
                     // the cast is lossless in every realistic configuration.
                     backend_idx: backend_idx as u16,
+                    token: affinity_token(addr),
                     active: AtomicU32::new(0),
                     ewma_ns: AtomicU64::new(0),
                 });
@@ -839,6 +872,25 @@ impl BackendGroup {
             Some(index.into_boxed_slice())
         };
         self
+    }
+
+    /// Set the consistent-hash attribute for `LoadBalance::Hash` (builder-style).
+    ///
+    /// `None` disables hash selection (the group falls back to round-robin for all
+    /// requests). Has no effect unless `load_balance` is [`LoadBalance::Hash`] — call
+    /// after [`Self::with_load_balance`].
+    #[must_use]
+    pub fn with_hash_by(mut self, source: Option<HashSource>) -> Self {
+        self.hash_source = source;
+        self
+    }
+
+    /// The consistent-hash attribute configured for this group, if any.
+    ///
+    /// The proxy reads this in `request_filter` to determine which request attribute
+    /// to extract and hash before calling [`Self::select_upstream`].
+    pub fn hash_by(&self) -> Option<&HashSource> {
+        self.hash_source.as_ref()
     }
 
     /// Attach per-backend `RequestHeaderModifier` filter actions (builder-style).
@@ -1058,15 +1110,15 @@ impl BackendGroup {
 
     /// Select the next upstream endpoint using the configured load-balancing algorithm.
     ///
-    /// `client_ip` is the resolved real client IP (from `ctx.client_ip` in the proxy,
-    /// honouring the #271 forwarded-for configuration); used only by `IpHash`. All
-    /// other algorithms ignore it. Returns `None` when the group has no endpoints.
+    /// `hash_key` is the pre-computed FNV-1a hash of the request attribute for `Hash`
+    /// mode — extracted and hashed by the proxy (see `ctx.hash_key`) before this call.
+    /// All other algorithms ignore it. Returns `None` when the group has no endpoints.
     ///
     /// Callers that receive a `Selected` with `track: Some(idx)` MUST call either
     /// [`Self::release`] (before re-selecting on a retry) or [`Self::complete`] (at
     /// request end) exactly once; this keeps `LeastConn` and `Ewma` counters balanced.
     #[must_use]
-    pub fn select_upstream(&self, client_ip: Option<IpAddr>) -> Option<Selected> {
+    pub fn select_upstream(&self, hash_key: Option<u64>) -> Option<Selected> {
         match self.load_balance {
             LoadBalance::RoundRobin => {
                 let (addr, filters) = self.next_endpoint_with_filters()?;
@@ -1076,26 +1128,21 @@ impl BackendGroup {
                     track: None,
                 })
             }
-            LoadBalance::IpHash => {
+            LoadBalance::Hash => {
                 let eps = self.lb_endpoints.as_deref()?;
-                let ip = match client_ip {
-                    Some(ip) => ip,
-                    None => {
-                        // No client IP available; fall back to round-robin.
-                        let (addr, filters) = self.next_endpoint_with_filters()?;
-                        return Some(Selected {
-                            addr,
-                            filters,
-                            track: None,
-                        });
-                    }
+                let Some(key) = hash_key else {
+                    // Key unavailable (attribute absent/empty): fall back to round-robin.
+                    let (addr, filters) = self.next_endpoint_with_filters()?;
+                    return Some(Selected {
+                        addr,
+                        filters,
+                        track: None,
+                    });
                 };
-                let hash = match ip {
-                    IpAddr::V4(v4) => affinity_hash(&v4.octets()),
-                    IpAddr::V6(v6) => affinity_hash(&v6.octets()),
-                };
-                let idx = (hash % eps.len() as u64) as usize;
-                let ep = &eps[idx];
+                // Rendezvous (HRW): score each endpoint by mixing key with its stable
+                // token; the highest score wins. Only keys whose owner was removed
+                // remap on endpoint changes — no full reshuffling.
+                let ep = eps.iter().max_by_key(|e| rendezvous_score(key, e.token))?;
                 let filters = self.filters_for_backend(ep.backend_idx as usize);
                 Some(Selected {
                     addr: ep.addr,
@@ -1143,7 +1190,7 @@ impl BackendGroup {
     ///
     /// Called on a retriable failure before re-invoking `select_upstream` for the
     /// retry attempt. `idx` is the `Selected::track` value from the call being
-    /// released. No-op for `RoundRobin` and `IpHash` (where `track` is always `None`).
+    /// released. No-op for `RoundRobin` and `Hash` (where `track` is always `None`).
     pub fn release(&self, idx: u32) {
         let eps = match self.lb_endpoints.as_deref() {
             Some(e) => e,
@@ -1162,7 +1209,7 @@ impl BackendGroup {
     /// - `Ewma`: folds `elapsed` into the endpoint's smoothed latency
     ///   (`α = 1/8`; `new = if old==0 { sample } else { old − old/8 + sample/8 }`).
     ///   A `None` elapsed is ignored (no update).
-    /// - `RoundRobin`/`IpHash`: no-op (`track` is always `None` for these algorithms).
+    /// - `RoundRobin`/`Hash`: no-op (`track` is always `None` for these algorithms).
     ///
     /// `idx` must be the `Selected::track` value from the original selection and must
     /// be called exactly once per tracked selection to keep counters balanced.
@@ -2202,43 +2249,90 @@ mod tests {
         assert!(group.select_upstream(None).is_none());
     }
 
+    // ── Hash / consistent-hash ────────────────────────────────────────────────
+
+    fn hash_group(n: usize, base_port: u16) -> BackendGroup {
+        BackendGroup::new("test/svc".to_string(), addrs(n, base_port))
+            .with_load_balance(LoadBalance::Hash)
+            .with_hash_by(Some(HashSource::SourceIp))
+    }
+
+    fn ip_key(ip: &str) -> u64 {
+        let parsed: std::net::IpAddr = ip.parse().expect("valid IP");
+        match parsed {
+            std::net::IpAddr::V4(v4) => affinity_hash(&v4.octets()),
+            std::net::IpAddr::V6(v6) => affinity_hash(&v6.octets()),
+        }
+    }
+
     #[test]
-    fn select_upstream_ip_hash_is_stable_for_same_ip() {
-        let group = BackendGroup::new("test/svc".to_string(), addrs(3, 7000))
-            .with_load_balance(LoadBalance::IpHash);
-        let ip: std::net::IpAddr = "10.0.0.1".parse().expect("valid IP");
-        let first = group.select_upstream(Some(ip)).expect("Some").addr;
+    fn select_upstream_hash_is_stable_for_same_key() {
+        let group = hash_group(3, 7000);
+        let key = ip_key("10.0.0.1");
+        let first = group.select_upstream(Some(key)).expect("Some").addr;
         for _ in 0..20 {
             assert_eq!(
-                group.select_upstream(Some(ip)).expect("Some").addr,
+                group.select_upstream(Some(key)).expect("Some").addr,
                 first,
-                "same client IP must always select the same endpoint"
+                "same hash key must always select the same endpoint (rendezvous HRW)"
             );
         }
     }
 
     #[test]
-    fn select_upstream_ip_hash_varies_across_ips() {
-        let group = BackendGroup::new("test/svc".to_string(), addrs(4, 6000))
-            .with_load_balance(LoadBalance::IpHash);
+    fn select_upstream_hash_varies_across_keys() {
+        let group = hash_group(4, 6000);
         let seen: std::collections::HashSet<SocketAddr> = (0u8..64)
             .filter_map(|i| {
-                let ip: std::net::IpAddr = format!("10.0.1.{i}").parse().expect("valid IP");
-                group.select_upstream(Some(ip)).map(|s| s.addr)
+                let key = ip_key(&format!("10.0.1.{i}"));
+                group.select_upstream(Some(key)).map(|s| s.addr)
             })
             .collect();
         assert!(
             seen.len() > 1,
-            "ip_hash must distribute across multiple endpoints"
+            "hash must distribute across multiple endpoints"
         );
     }
 
     #[test]
-    fn select_upstream_ip_hash_no_ip_falls_back_to_rr() {
-        let group = BackendGroup::new("test/svc".to_string(), addrs(2, 5000))
-            .with_load_balance(LoadBalance::IpHash);
-        // Should not panic; falls back to round-robin selection.
+    fn select_upstream_hash_none_key_falls_back_to_rr() {
+        let group = hash_group(2, 5000);
+        // No key → must not panic; falls back to round-robin.
         assert!(group.select_upstream(None).is_some());
+    }
+
+    #[test]
+    fn select_upstream_hash_is_minimally_disrupted_on_endpoint_removal() {
+        let full_group = hash_group(3, 4100);
+        let reduced_group = BackendGroup::new("test/svc".to_string(), addrs(2, 4100))
+            .with_load_balance(LoadBalance::Hash)
+            .with_hash_by(Some(HashSource::SourceIp));
+        // Keys whose owner survives must still map to the same endpoint.
+        let survivor: SocketAddr = "127.0.0.1:4100".parse().unwrap();
+        let mut checked = 0;
+        for i in 0u8..200 {
+            let key = ip_key(&format!("10.0.2.{i}"));
+            if full_group.select_upstream(Some(key)).expect("Some").addr == survivor {
+                assert_eq!(
+                    reduced_group.select_upstream(Some(key)).expect("Some").addr,
+                    survivor,
+                    "rendezvous must not remap key {i} away from survivor when an unrelated endpoint is removed"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "expected some keys to map to the survivor");
+    }
+
+    #[test]
+    fn select_upstream_hash_no_track() {
+        let group = hash_group(2, 4300);
+        let key = affinity_hash(b"test-uri");
+        let sel = group.select_upstream(Some(key)).expect("Some");
+        assert!(
+            sel.track.is_none(),
+            "Hash selection is stateless; track must be None"
+        );
     }
 
     #[test]

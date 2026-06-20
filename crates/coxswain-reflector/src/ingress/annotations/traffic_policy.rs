@@ -5,7 +5,11 @@
 //! and return `None` (or the empty default) so the affected annotation is treated
 //! as absent — the Ingress keeps serving.
 
-use coxswain_core::routing::{BackendProtocol, CompressionConfig, LoadBalance, RetryOn};
+use coxswain_core::routing::{
+    BackendProtocol, CompressionConfig, HashSource, LoadBalance, RetryOn,
+};
+use http::HeaderName;
+use std::sync::Arc;
 
 // ── Timeout annotation keys ───────────────────────────────────────────────────
 
@@ -320,22 +324,79 @@ pub const LOAD_BALANCE: &str = "ingress.coxswain-labs.dev/load-balance";
 
 /// Parse the `load-balance` annotation value.
 ///
-/// Valid values: `round_robin`, `least_conn`, `ewma`, `ip_hash`.
-/// Unknown values emit a structured `WARN` and return `LoadBalance::RoundRobin`
-/// so the Ingress keeps serving with the default algorithm.
+/// Returns the `(LoadBalance, Option<HashSource>)` pair. Valid values:
+/// - `round_robin`, `least_conn`, `ewma` — stateless/stateful LB algorithms.
+/// - `hash:uri` — consistent hash by request path + query.
+/// - `hash:source-ip` — consistent hash by resolved client IP.
+/// - `hash:header=<name>` — consistent hash by request header value.
+/// - `hash:cookie=<name>` — consistent hash by cookie value.
+/// - `ip_hash` — backward-compatible alias for `hash:source-ip`.
+///
+/// Unknown values emit a structured `WARN` and return `(RoundRobin, None)`.
 #[must_use]
-pub(crate) fn parse_load_balance(s: &str) -> LoadBalance {
+pub(crate) fn parse_load_balance(s: &str) -> (LoadBalance, Option<HashSource>) {
     match s {
-        "round_robin" => LoadBalance::RoundRobin,
-        "least_conn" => LoadBalance::LeastConn,
-        "ewma" => LoadBalance::Ewma,
-        "ip_hash" => LoadBalance::IpHash,
+        "round_robin" => (LoadBalance::RoundRobin, None),
+        "least_conn" => (LoadBalance::LeastConn, None),
+        "ewma" => (LoadBalance::Ewma, None),
+        // Backward-compatible alias: ip_hash → hash:source-ip
+        "ip_hash" => (LoadBalance::Hash, Some(HashSource::SourceIp)),
+        _ if s.starts_with("hash:") => parse_hash_attribute(&s["hash:".len()..], s),
         _ => {
             tracing::warn!(
                 value = s,
-                "unknown load-balance value — valid values are round_robin, least_conn, ewma, ip_hash; falling back to round_robin"
+                "unknown load-balance value — valid values: round_robin, least_conn, ewma, \
+                 hash:uri, hash:source-ip, hash:header=<name>, hash:cookie=<name>, ip_hash; \
+                 falling back to round_robin"
             );
-            LoadBalance::RoundRobin
+            (LoadBalance::RoundRobin, None)
+        }
+    }
+}
+
+/// Parse the attribute portion of a `hash:<attr>` load-balance value.
+fn parse_hash_attribute(attr: &str, full: &str) -> (LoadBalance, Option<HashSource>) {
+    match attr {
+        "uri" => (LoadBalance::Hash, Some(HashSource::Uri)),
+        "source-ip" => (LoadBalance::Hash, Some(HashSource::SourceIp)),
+        _ if attr.starts_with("header=") => {
+            let name = &attr["header=".len()..];
+            if name.is_empty() {
+                tracing::warn!(
+                    value = full,
+                    "empty header name in load-balance hash expression; falling back to round_robin"
+                );
+                return (LoadBalance::RoundRobin, None);
+            }
+            match HeaderName::from_bytes(name.as_bytes()) {
+                Ok(h) => (LoadBalance::Hash, Some(HashSource::Header(h))),
+                Err(_) => {
+                    tracing::warn!(
+                        value = full,
+                        "invalid header name in load-balance hash expression; falling back to round_robin"
+                    );
+                    (LoadBalance::RoundRobin, None)
+                }
+            }
+        }
+        _ if attr.starts_with("cookie=") => {
+            let name = &attr["cookie=".len()..];
+            if name.is_empty() {
+                tracing::warn!(
+                    value = full,
+                    "empty cookie name in load-balance hash expression; falling back to round_robin"
+                );
+                return (LoadBalance::RoundRobin, None);
+            }
+            (LoadBalance::Hash, Some(HashSource::Cookie(Arc::from(name))))
+        }
+        _ => {
+            tracing::warn!(
+                value = full,
+                "unknown hash attribute in load-balance; valid forms: hash:uri, hash:source-ip, \
+                 hash:header=<name>, hash:cookie=<name>; falling back to round_robin"
+            );
+            (LoadBalance::RoundRobin, None)
         }
     }
 }
@@ -602,19 +663,101 @@ mod tests {
     // ── parse_load_balance ────────────────────────────────────────────────────
 
     #[test]
-    fn parse_load_balance_all_valid_values() {
+    fn parse_load_balance_stateless_algorithms() {
         // References LOAD_BALANCE to satisfy the annotation-coverage gate.
         let _ = LOAD_BALANCE;
-        assert_eq!(parse_load_balance("round_robin"), LoadBalance::RoundRobin);
-        assert_eq!(parse_load_balance("least_conn"), LoadBalance::LeastConn);
-        assert_eq!(parse_load_balance("ewma"), LoadBalance::Ewma);
-        assert_eq!(parse_load_balance("ip_hash"), LoadBalance::IpHash);
+        assert_eq!(
+            parse_load_balance("round_robin"),
+            (LoadBalance::RoundRobin, None)
+        );
+        assert_eq!(
+            parse_load_balance("least_conn"),
+            (LoadBalance::LeastConn, None)
+        );
+        assert_eq!(parse_load_balance("ewma"), (LoadBalance::Ewma, None));
+    }
+
+    #[test]
+    fn parse_load_balance_ip_hash_backward_compat_alias() {
+        assert_eq!(
+            parse_load_balance("ip_hash"),
+            (LoadBalance::Hash, Some(HashSource::SourceIp)),
+            "ip_hash must remain a valid alias for hash:source-ip"
+        );
+    }
+
+    #[test]
+    fn parse_load_balance_hash_uri() {
+        assert_eq!(
+            parse_load_balance("hash:uri"),
+            (LoadBalance::Hash, Some(HashSource::Uri))
+        );
+    }
+
+    #[test]
+    fn parse_load_balance_hash_source_ip() {
+        assert_eq!(
+            parse_load_balance("hash:source-ip"),
+            (LoadBalance::Hash, Some(HashSource::SourceIp))
+        );
+    }
+
+    #[test]
+    fn parse_load_balance_hash_header() {
+        assert_eq!(
+            parse_load_balance("hash:header=x-api-key"),
+            (
+                LoadBalance::Hash,
+                Some(HashSource::Header(HeaderName::from_static("x-api-key")))
+            )
+        );
+    }
+
+    #[test]
+    fn parse_load_balance_hash_cookie() {
+        assert_eq!(
+            parse_load_balance("hash:cookie=session"),
+            (
+                LoadBalance::Hash,
+                Some(HashSource::Cookie(Arc::from("session")))
+            )
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_load_balance_hash_empty_header_warns() {
+        assert_eq!(
+            parse_load_balance("hash:header="),
+            (LoadBalance::RoundRobin, None)
+        );
+        assert!(logs_contain("empty header name"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_load_balance_hash_empty_cookie_warns() {
+        assert_eq!(
+            parse_load_balance("hash:cookie="),
+            (LoadBalance::RoundRobin, None)
+        );
+        assert!(logs_contain("empty cookie name"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_load_balance_hash_unknown_attr_warns() {
+        assert_eq!(
+            parse_load_balance("hash:unknown"),
+            (LoadBalance::RoundRobin, None)
+        );
+        assert!(logs_contain("unknown hash attribute"));
     }
 
     #[test]
     #[tracing_test::traced_test]
     fn parse_load_balance_unknown_value_warns_and_returns_round_robin() {
-        assert_eq!(parse_load_balance("bogus"), LoadBalance::RoundRobin);
+        assert_eq!(parse_load_balance("bogus"), (LoadBalance::RoundRobin, None));
         assert!(logs_contain("unknown load-balance value"));
     }
 

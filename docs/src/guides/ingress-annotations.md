@@ -54,7 +54,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/auth-tls-secret` | `namespace/name` | _none_ | `"my-ns/my-ca"` |
 | `ingress.coxswain-labs.dev/auth-tls-verify-depth` | integer | `1` | `"2"` |
 | `ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream` | boolean | `false` | `"true"` |
-| `ingress.coxswain-labs.dev/load-balance` | `round_robin`, `least_conn`, `ewma`, `ip_hash` | `round_robin` | `"least_conn"` |
+| `ingress.coxswain-labs.dev/load-balance` | `round_robin`, `least_conn`, `ewma`, `ip_hash`, `hash:uri`, `hash:source-ip`, `hash:header=<name>`, `hash:cookie=<name>` | `round_robin` | `"hash:uri"` |
 
 ```yaml
 metadata:
@@ -888,7 +888,13 @@ metadata:
 | `round_robin` | _(default)_ Weighted round-robin using the GCD-reduced slot array. Zero per-request overhead. |
 | `least_conn` | Routes to the endpoint with the fewest in-flight requests. Maintains an atomic in-flight counter per endpoint; the counter is incremented on selection and decremented when the response completes (or when a retry selects a different endpoint). |
 | `ewma` | Routes to the endpoint with the lowest exponentially-weighted moving-average response latency (α = 1/8). Unsampled endpoints (active=0) are probed first. Latency is folded in at end-of-request. |
-| `ip_hash` | Consistent hash on the resolved client IP (see [`trust-forwarded-for`](#trust-forwarded-for) for how the IP is resolved). Requests from the same IP always land on the same endpoint; unlike cookie affinity, no state is injected into the response. Falls back to round-robin if the client IP is unavailable. |
+| `ip_hash` | Alias for `hash:source-ip` (backward-compatible). |
+| `hash:uri` | Consistent hash on the full request URI (path + query string). Requests to the same URI always land on the same endpoint. Falls back to round-robin if the path is empty. |
+| `hash:source-ip` | Consistent hash on the resolved client IP (see [`trust-forwarded-for`](#trust-forwarded-for) for how the IP is resolved). Requests from the same IP always land on the same endpoint; unlike cookie affinity, no state is injected into the response. Falls back to round-robin if the client IP is unavailable. |
+| `hash:header=<name>` | Consistent hash on the value of the named request header (e.g. `hash:header=x-user-id`). An empty or absent header falls back to round-robin. |
+| `hash:cookie=<name>` | Consistent hash on the value of the named cookie (e.g. `hash:cookie=session`). An absent or empty cookie falls back to round-robin. |
+
+All `hash:*` values (and `ip_hash`) use **rendezvous (HRW) hashing**: when an endpoint is removed, only its keys are redistributed; all other keys remain on their existing endpoints. This is strictly better than modulo hashing, which reshuffles nearly every key on a membership change.
 
 Unknown values warn and fall back to `round_robin`; routing is never interrupted.
 
@@ -901,15 +907,18 @@ Unknown values warn and fall back to `round_robin`; routing is never interrupted
 | `round_robin` | `ROUND_ROBIN` |
 | `least_conn` | `LEAST_REQUEST` |
 | `ewma` | `LEAST_REQUEST` with latency-weighted selection |
-| `ip_hash` | `CONSISTENT_HASH` (source-ip) |
+| `ip_hash` / `hash:source-ip` | `CONSISTENT_HASH` (`useSourceIp: true`) |
+| `hash:uri` | `CONSISTENT_HASH` (HTTP URI — closest analogue) |
+| `hash:header=<name>` | `CONSISTENT_HASH` (`httpHeaderName: <name>`) |
+| `hash:cookie=<name>` | `CONSISTENT_HASH` (`httpCookie.name: <name>`) |
 
-### `ip_hash` and forwarded-for
+### `hash:source-ip` and forwarded-for
 
-When [`trust-forwarded-for`](#trust-forwarded-for) is enabled, `ip_hash` uses the resolved client IP (the first non-private address from the forwarded header, gated by [`forwarded-for-trusted-cidrs`](#forwarded-for-trusted-cidrs) if set). This means a load balancer that rewrites the source IP still produces consistent upstream pinning based on the real client address.
+When [`trust-forwarded-for`](#trust-forwarded-for) is enabled, `hash:source-ip` (and its alias `ip_hash`) uses the resolved client IP (the first non-private address from the forwarded header, gated by [`forwarded-for-trusted-cidrs`](#forwarded-for-trusted-cidrs) if set). This means a load balancer that rewrites the source IP still produces consistent upstream pinning based on the real client address.
 
 ### Performance
 
-All algorithms run on the hot path without locks. `round_robin` allocates nothing per request. `least_conn` and `ewma` perform a linear scan over the endpoint list (typically 1–10 pods per Service) using relaxed atomics, which is negligible compared to I/O. `ip_hash` hashes IP octets with FNV-1a and does a modular index — also negligible.
+All algorithms run on the hot path without locks. `round_robin` allocates nothing per request. `least_conn` and `ewma` perform a linear scan over the endpoint list (typically 1–10 pods per Service) using relaxed atomics, which is negligible compared to I/O. `hash:*` values extract and hash the relevant request attribute with FNV-1a, then perform a linear rendezvous scan — negligible. The `hash:uri` path allocates a single joined `path?query` string only when a query string is present; all other hash sources are allocation-free on the hot path.
 
 ## Class-level defaults
 

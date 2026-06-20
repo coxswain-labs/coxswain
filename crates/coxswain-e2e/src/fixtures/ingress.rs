@@ -275,4 +275,19 @@ pub const ANNOTATION_LOAD_BALANCE_IP_HASH: &str = fixture!("annotation_load_bala
 /// Apply `backends::ECHO_TWO_REPLICAS` first.
 pub const ANNOTATION_LOAD_BALANCE_UNKNOWN: &str = fixture!("annotation_load_balance_unknown.yaml");
 
+/// Ingress with `ingress.coxswain-labs.dev/load-balance: "hash:uri"` (#276),
+/// routing to the `echo-two-replicas` Service (2 pods). Every request to the same
+/// URI consistently hashes (HRW) to the same endpoint.
+/// Apply `backends::ECHO_TWO_REPLICAS` first.
+pub const ANNOTATION_LOAD_BALANCE_HASH_URI: &str =
+    fixture!("annotation_load_balance_hash_uri.yaml");
+
+/// Ingress with `ingress.coxswain-labs.dev/load-balance: "hash:header=x-hash-key"` (#276),
+/// routing to the `echo-two-replicas` Service (2 pods). Requests carrying the same
+/// `X-Hash-Key` value consistently hash (HRW) to the same endpoint; requests omitting
+/// the header fall back to round-robin.
+/// Apply `backends::ECHO_TWO_REPLICAS` first.
+pub const ANNOTATION_LOAD_BALANCE_HASH_HEADER: &str =
+    fixture!("annotation_load_balance_hash_header.yaml");
+
 // ── satisfy any/all (#273) ────────────────────────────────────────────────────
