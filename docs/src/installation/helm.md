@@ -65,6 +65,18 @@ helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
 !!! note
     `controller.watchNamespace` only narrows what the controller reads — the chart still installs the cluster-wide `ClusterRole`/`ClusterRoleBinding`. To scope RBAC as well, render the manifests with `helm template` and edit them by hand before applying.
 
+## ValidatingAdmissionPolicy
+
+On Kubernetes ≥ 1.30, the chart installs a `ValidatingAdmissionPolicy` that rejects Ingresses carrying malformed `ingress.coxswain-labs.dev/*` annotation values at `kubectl apply` time. The policy is enabled by default and silently skipped on clusters that do not advertise `admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy`, so installing on an older cluster is safe.
+
+To disable it explicitly:
+
+```bash
+helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
+  --namespace coxswain-system --create-namespace \
+  --set vap.enabled=false
+```
+
 ## Uninstall
 
 ```bash

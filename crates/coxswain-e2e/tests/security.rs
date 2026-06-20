@@ -608,23 +608,24 @@ async fn rate_limit_not_applied_when_keying_header_absent() -> anyhow::Result<()
     Ok(())
 }
 
-/// `rate-limit-rps: notanumber`: an invalid annotation value is ignored with a
-/// WARN and traffic flows unthrottled (#25 sad path — invalid annotation).
+/// `rate-limit-rps: notanumber`: the VAP rejects the Ingress at admission time
+/// (#25 sad path — invalid annotation, #29 VAP).
+///
+/// Fail-open proxy semantics (warn + serve unthrottled) remain the backstop for
+/// VAP-disabled installs, covered by the `parse_rate_limit_rps_invalid` unit test.
 #[tokio::test]
-async fn invalid_rate_limit_annotation_ignored() -> anyhow::Result<()> {
+async fn invalid_rate_limit_annotation_rejected_by_vap() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "rl-invalid").await?;
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(
+    let msg = fixtures::apply_fixture_expect_rejected(
         ingress::ANNOTATION_RATE_LIMIT_INVALID,
         FixtureVars::new(&ns.name),
     )
     .await?;
-    let host = format!("ratelimitinvalid.{}.local", ns.name);
-
-    // The route must be live and unthrottled — invalid annotation is warn+drop.
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
-    resp.assert_backend("echo-a");
+    anyhow::ensure!(
+        msg.contains("rate-limit-rps"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
+    );
     Ok(())
 }
 

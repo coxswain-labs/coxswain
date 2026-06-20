@@ -73,6 +73,76 @@ impl FixtureVars {
 /// Returns an error if the fixture file can't be read or `kubectl apply` fails.
 pub async fn apply_fixture(path: impl AsRef<Path>, vars: FixtureVars) -> anyhow::Result<()> {
     let path = path.as_ref();
+    let content = prepare_fixture_content(path, vars)?;
+
+    let mut child = tokio::process::Command::new("kubectl")
+        .args(["apply", "-n", &content.1, "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("kubectl apply")?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(content.0.as_bytes())
+            .await
+            .context("write to kubectl stdin")?;
+    }
+    drop(child.stdin.take());
+
+    let status = child.wait().await.context("kubectl wait")?;
+    anyhow::ensure!(
+        status.success(),
+        "kubectl apply failed for {}",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Apply a fixture YAML file and assert that the API server **rejects** it.
+///
+/// Returns the combined error output from kubectl so the caller can assert on
+/// the rejection message (e.g. that it mentions the expected annotation and
+/// format). Fails the test if `kubectl apply` unexpectedly succeeds.
+///
+/// # Errors
+/// Returns an error if the fixture file can't be read or `kubectl apply`
+/// succeeds when rejection was expected.
+pub async fn apply_fixture_expect_rejected(
+    path: impl AsRef<Path>,
+    vars: FixtureVars,
+) -> anyhow::Result<String> {
+    let path = path.as_ref();
+    let (content, namespace) = prepare_fixture_content(path, vars)?;
+
+    let mut child = tokio::process::Command::new("kubectl")
+        .args(["apply", "-n", &namespace, "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("kubectl apply")?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(content.as_bytes())
+            .await
+            .context("write to kubectl stdin")?;
+    }
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().await.context("kubectl wait")?;
+    anyhow::ensure!(
+        !output.status.success(),
+        "expected kubectl apply to be rejected for {} but it succeeded",
+        path.display()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(format!("{stderr}{stdout}"))
+}
+
+/// Substitute template placeholders in `path` and return `(content, namespace)`.
+fn prepare_fixture_content(path: &Path, vars: FixtureVars) -> anyhow::Result<(String, String)> {
     let mut content =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
 
@@ -104,29 +174,10 @@ pub async fn apply_fixture(path: impl AsRef<Path>, vars: FixtureVars) -> anyhow:
     );
     content = substitute(&content, "HTTP_PORT", &INGRESS_HTTP_PORT.to_string());
     content = substitute(&content, "HTTPS_PORT", &INGRESS_HTTPS_PORT.to_string());
+    let namespace = vars.namespace.clone();
     content = substitute(&content, "TESTNS", &vars.namespace);
 
-    let mut child = tokio::process::Command::new("kubectl")
-        .args(["apply", "-n", &vars.namespace, "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .context("kubectl apply")?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(content.as_bytes())
-            .await
-            .context("write to kubectl stdin")?;
-    }
-    drop(child.stdin.take());
-
-    let status = child.wait().await.context("kubectl wait")?;
-    anyhow::ensure!(
-        status.success(),
-        "kubectl apply failed for {}",
-        path.display()
-    );
-    Ok(())
+    Ok((content, namespace))
 }
 
 /// Replace every occurrence of the sentinel token `${key}` in `content` with

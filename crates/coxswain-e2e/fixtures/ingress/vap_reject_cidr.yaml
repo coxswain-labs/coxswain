@@ -1,0 +1,23 @@
+# VAP rejection fixture: invalid CIDR list annotation value.
+#
+# `allow-source-range: "not-a-cidr"` fails the per-token CIDR check. The VAP
+# must reject this Ingress at admission time.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vap-reject-cidr
+  annotations:
+    ingress.coxswain-labs.dev/allow-source-range: "not-a-cidr"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: vap-cidr.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

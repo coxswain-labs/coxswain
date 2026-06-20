@@ -1,0 +1,409 @@
+# Validates ingress.coxswain-labs.dev/* annotation values at admission time.
+# Requires Kubernetes ≥ 1.30 (ValidatingAdmissionPolicy GA in admissionregistration.k8s.io/v1).
+#
+# Scope: any Ingress that carries at least one ingress.coxswain-labs.dev/ annotation.
+# Annotations not listed here (free-form strings, header names, path fragments,
+# namespace/name references) are not validated — unknown values fall through to
+# the proxy's fail-open check, which emits a Warning event (#401).
+#
+# To disable: remove this file from kustomization.yaml.
+# For Helm: set vap.enabled=false.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: coxswain-ingress-annotations
+  labels:
+    app.kubernetes.io/name: coxswain
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["ingresses"]
+  matchConditions:
+    - name: has-coxswain-annotations
+      expression: >-
+        has(object.metadata.annotations) &&
+        object.metadata.annotations.exists(k, k.startsWith('ingress.coxswain-labs.dev/'))
+  variables:
+    - name: ann
+      expression: object.metadata.annotations
+  validations:
+
+    # ── Duration annotations ──────────────────────────────────────────────────
+    # Go time.ParseDuration strings: one or more <int>[.<frac>]<unit> pairs
+    # (no spaces), where unit ∈ {ns, us, ms, s, m, h}. Examples: "5s", "1m30s".
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/connect-timeout' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/connect-timeout'].matches(
+          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/connect-timeout: "' +
+        variables.ann['ingress.coxswain-labs.dev/connect-timeout'] +
+        '" — must be a Go duration string (e.g. "5s", "1m30s", "500ms")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/read-timeout' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/read-timeout'].matches(
+          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/read-timeout: "' +
+        variables.ann['ingress.coxswain-labs.dev/read-timeout'] +
+        '" — must be a Go duration string (e.g. "60s", "1m")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/send-timeout' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/send-timeout'].matches(
+          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/send-timeout: "' +
+        variables.ann['ingress.coxswain-labs.dev/send-timeout'] +
+        '" — must be a Go duration string (e.g. "60s", "1m")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/upstream-keepalive-timeout' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/upstream-keepalive-timeout'].matches(
+          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/upstream-keepalive-timeout: "' +
+        variables.ann['ingress.coxswain-labs.dev/upstream-keepalive-timeout'] +
+        '" — must be a Go duration string (e.g. "60s", "5m")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/auth-timeout' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/auth-timeout'].matches(
+          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/auth-timeout: "' +
+        variables.ann['ingress.coxswain-labs.dev/auth-timeout'] +
+        '" — must be a Go duration string (e.g. "500ms", "2s")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/circuit-breaker-window' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-window'].matches(
+          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/circuit-breaker-window: "' +
+        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-window'] +
+        '" — must be a Go duration string (e.g. "10s", "1m")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/circuit-breaker-open-duration' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-open-duration'].matches(
+          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/circuit-breaker-open-duration: "' +
+        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-open-duration'] +
+        '" — must be a Go duration string (e.g. "5s", "30s")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/circuit-breaker-max-open-duration' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-max-open-duration'].matches(
+          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/circuit-breaker-max-open-duration: "' +
+        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-max-open-duration'] +
+        '" — must be a Go duration string (e.g. "60s", "5m")'
+
+    # ── Boolean annotations ───────────────────────────────────────────────────
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/use-regex' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/use-regex'].matches('^(?i)(true|false)$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/use-regex: "' +
+        variables.ann['ingress.coxswain-labs.dev/use-regex'] +
+        '" — must be "true" or "false"'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/ssl-redirect' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/ssl-redirect'].matches('^(?i)(true|false)$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/ssl-redirect: "' +
+        variables.ann['ingress.coxswain-labs.dev/ssl-redirect'] +
+        '" — must be "true" or "false"'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/cache-enabled' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/cache-enabled'].matches('^(?i)(true|false)$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/cache-enabled: "' +
+        variables.ann['ingress.coxswain-labs.dev/cache-enabled'] +
+        '" — must be "true" or "false"'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/compression-gzip' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/compression-gzip'].matches('^(?i)(true|false)$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/compression-gzip: "' +
+        variables.ann['ingress.coxswain-labs.dev/compression-gzip'] +
+        '" — must be "true" or "false"'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/compression-brotli' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/compression-brotli'].matches('^(?i)(true|false)$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/compression-brotli: "' +
+        variables.ann['ingress.coxswain-labs.dev/compression-brotli'] +
+        '" — must be "true" or "false"'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/trust-forwarded-for' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/trust-forwarded-for'].matches(
+          '^(?i)(true|false)$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/trust-forwarded-for: "' +
+        variables.ann['ingress.coxswain-labs.dev/trust-forwarded-for'] +
+        '" — must be "true" or "false"'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/auth-always-set-cookie' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/auth-always-set-cookie'].matches(
+          '^(?i)(true|false)$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/auth-always-set-cookie: "' +
+        variables.ann['ingress.coxswain-labs.dev/auth-always-set-cookie'] +
+        '" — must be "true" or "false"'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream'].matches(
+          '^(?i)(true|false)$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream: "' +
+        variables.ann['ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream'] +
+        '" — must be "true" or "false"'
+
+    # ── Integer annotations ───────────────────────────────────────────────────
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/max-retries' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/max-retries'].matches('^[0-9]+$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/max-retries: "' +
+        variables.ann['ingress.coxswain-labs.dev/max-retries'] +
+        '" — must be a non-negative integer (e.g. "3")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/rate-limit-burst' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/rate-limit-burst'].matches('^[0-9]+$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/rate-limit-burst: "' +
+        variables.ann['ingress.coxswain-labs.dev/rate-limit-burst'] +
+        '" — must be a non-negative integer (e.g. "10")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/rate-limit-rps' in variables.ann) ||
+        (variables.ann['ingress.coxswain-labs.dev/rate-limit-rps'].matches('^[0-9]+$') &&
+         int(variables.ann['ingress.coxswain-labs.dev/rate-limit-rps']) >= 1)
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/rate-limit-rps: "' +
+        variables.ann['ingress.coxswain-labs.dev/rate-limit-rps'] +
+        '" — must be a positive integer >= 1 (e.g. "10")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/circuit-breaker-threshold' in variables.ann) ||
+        (variables.ann['ingress.coxswain-labs.dev/circuit-breaker-threshold'].matches(
+           '^[0-9]+$') &&
+         int(variables.ann['ingress.coxswain-labs.dev/circuit-breaker-threshold']) >= 1 &&
+         int(variables.ann['ingress.coxswain-labs.dev/circuit-breaker-threshold']) <= 100)
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/circuit-breaker-threshold: "' +
+        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-threshold'] +
+        '" — must be an integer in 1-100 (error-rate percentage)'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/circuit-breaker-min-requests' in variables.ann) ||
+        (variables.ann['ingress.coxswain-labs.dev/circuit-breaker-min-requests'].matches(
+           '^[0-9]+$') &&
+         int(variables.ann['ingress.coxswain-labs.dev/circuit-breaker-min-requests']) >= 1)
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/circuit-breaker-min-requests: "' +
+        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-min-requests'] +
+        '" — must be a positive integer >= 1 (e.g. "10")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/compression-level' in variables.ann) ||
+        (variables.ann['ingress.coxswain-labs.dev/compression-level'].matches('^[0-9]+$') &&
+         int(variables.ann['ingress.coxswain-labs.dev/compression-level']) >= 1 &&
+         int(variables.ann['ingress.coxswain-labs.dev/compression-level']) <= 9)
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/compression-level: "' +
+        variables.ann['ingress.coxswain-labs.dev/compression-level'] +
+        '" — must be an integer in 1-9'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/auth-tls-verify-depth' in variables.ann) ||
+        (variables.ann['ingress.coxswain-labs.dev/auth-tls-verify-depth'].matches('^[0-9]+$') &&
+         int(variables.ann['ingress.coxswain-labs.dev/auth-tls-verify-depth']) >= 1)
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/auth-tls-verify-depth: "' +
+        variables.ann['ingress.coxswain-labs.dev/auth-tls-verify-depth'] +
+        '" — must be a positive integer >= 1 (certificate chain depth)'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/redirect-port' in variables.ann) ||
+        (variables.ann['ingress.coxswain-labs.dev/redirect-port'].matches('^[0-9]+$') &&
+         int(variables.ann['ingress.coxswain-labs.dev/redirect-port']) <= 65535)
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/redirect-port: "' +
+        variables.ann['ingress.coxswain-labs.dev/redirect-port'] +
+        '" — must be an integer in 0-65535'
+
+    # ── Size-string annotations ───────────────────────────────────────────────
+    # Byte count or <digits>[kmgKMG] suffix (k=1024, m=1024^2, g=1024^3).
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/max-body-size' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/max-body-size'].matches('^[0-9]+[kmgKMG]?$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/max-body-size: "' +
+        variables.ann['ingress.coxswain-labs.dev/max-body-size'] +
+        '" — must be a byte count or size string (e.g. "8m", "512k", "10485760")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/compression-min-size' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/compression-min-size'].matches(
+          '^[0-9]+[kmgKMG]?$')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/compression-min-size: "' +
+        variables.ann['ingress.coxswain-labs.dev/compression-min-size'] +
+        '" — must be a byte count or size string (e.g. "1024", "4k")'
+
+    # ── Enum annotations ──────────────────────────────────────────────────────
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/backend-protocol' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/backend-protocol'].lowerAscii() in
+          ['http', 'https', 'grpc']
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/backend-protocol: "' +
+        variables.ann['ingress.coxswain-labs.dev/backend-protocol'] +
+        '" — must be one of: HTTP, HTTPS, GRPC (case-insensitive)'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/session-affinity' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/session-affinity'].lowerAscii() in
+          ['cookie', 'header']
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/session-affinity: "' +
+        variables.ann['ingress.coxswain-labs.dev/session-affinity'] +
+        '" — must be one of: cookie, header (case-insensitive)'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/path-normalize' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/path-normalize'].lowerAscii() in
+          ['none', 'base', 'merge-slashes', 'decode-and-merge-slashes']
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/path-normalize: "' +
+        variables.ann['ingress.coxswain-labs.dev/path-normalize'] +
+        '" — must be one of: none, base, merge-slashes, decode-and-merge-slashes (case-insensitive)'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/redirect-scheme' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/redirect-scheme'] in ['http', 'https']
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/redirect-scheme: "' +
+        variables.ann['ingress.coxswain-labs.dev/redirect-scheme'] +
+        '" — must be one of: http, https'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/redirect-status-code' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/redirect-status-code'] in
+          ['301', '302', '307', '308']
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/redirect-status-code: "' +
+        variables.ann['ingress.coxswain-labs.dev/redirect-status-code'] +
+        '" — must be one of: 301, 302, 307, 308'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/ssl-redirect-code' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/ssl-redirect-code'] in
+          ['301', '302', '307', '308']
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/ssl-redirect-code: "' +
+        variables.ann['ingress.coxswain-labs.dev/ssl-redirect-code'] +
+        '" — must be one of: 301, 302, 307, 308'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/load-balance' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/load-balance'] in
+          ['round_robin', 'least_conn', 'ewma', 'ip_hash', 'hash:uri', 'hash:source-ip'] ||
+        (variables.ann['ingress.coxswain-labs.dev/load-balance'].startsWith('hash:header=') &&
+         variables.ann['ingress.coxswain-labs.dev/load-balance'].size() > 12) ||
+        (variables.ann['ingress.coxswain-labs.dev/load-balance'].startsWith('hash:cookie=') &&
+         variables.ann['ingress.coxswain-labs.dev/load-balance'].size() > 12)
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/load-balance: "' +
+        variables.ann['ingress.coxswain-labs.dev/load-balance'] +
+        '" — must be one of: round_robin, least_conn, ewma, ip_hash, hash:uri, hash:source-ip, hash:header=<name>, hash:cookie=<name>'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/retry-on' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/retry-on'].split(',').all(tok,
+          tok.trim() == '' ||
+          tok.trim() == 'connect-failure' ||
+          tok.trim() == 'timeout' ||
+          tok.trim() == '5xx')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/retry-on: "' +
+        variables.ann['ingress.coxswain-labs.dev/retry-on'] +
+        '" — must be a comma-separated list of: connect-failure, timeout, 5xx'
+
+    # ── URL annotation ────────────────────────────────────────────────────────
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/auth-url' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/auth-url'].startsWith('http://') ||
+        variables.ann['ingress.coxswain-labs.dev/auth-url'].startsWith('https://')
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/auth-url: "' +
+        variables.ann['ingress.coxswain-labs.dev/auth-url'] +
+        '" — must be a URL starting with http:// or https://'
+
+    # ── CIDR-list annotations ─────────────────────────────────────────────────
+    # Character-set check per comma-separated token. Full structural validation
+    # (prefix length, address range) is left to the proxy's fail-open check.
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/allow-source-range' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/allow-source-range'].split(',').all(tok,
+          tok.trim() == '' ||
+          tok.trim().matches('^[0-9a-fA-F:./]+$'))
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/allow-source-range: "' +
+        variables.ann['ingress.coxswain-labs.dev/allow-source-range'] +
+        '" — must be a comma-separated list of CIDR blocks or IPs (e.g. "10.0.0.0/8,192.168.1.0/24")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/deny-source-range' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/deny-source-range'].split(',').all(tok,
+          tok.trim() == '' ||
+          tok.trim().matches('^[0-9a-fA-F:./]+$'))
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/deny-source-range: "' +
+        variables.ann['ingress.coxswain-labs.dev/deny-source-range'] +
+        '" — must be a comma-separated list of CIDR blocks or IPs (e.g. "10.0.0.0/8,2001:db8::/32")'
+
+    - expression: >-
+        !('ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs' in variables.ann) ||
+        variables.ann['ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs'].split(',').all(tok,
+          tok.trim() == '' ||
+          tok.trim().matches('^[0-9a-fA-F:./]+$'))
+      messageExpression: >-
+        'ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs: "' +
+        variables.ann['ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs'] +
+        '" — must be a comma-separated list of CIDR blocks or IPs (e.g. "10.0.0.0/8,192.168.0.0/16")'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: coxswain-ingress-annotations
+  labels:
+    app.kubernetes.io/name: coxswain
+spec:
+  policyName: coxswain-ingress-annotations
+  validationActions: [Deny]
