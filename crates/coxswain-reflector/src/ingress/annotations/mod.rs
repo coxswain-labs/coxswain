@@ -34,7 +34,8 @@ pub use traffic_policy::*;
 
 use coxswain_core::routing::{
     BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HashSource, HeaderMod,
-    LoadBalance, PathModifier, RateLimitConfig, RetryPolicy, RouteTimeouts, SessionAffinity,
+    LoadBalance, NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicy, RouteTimeouts,
+    SessionAffinity,
 };
 use security::AuthAnnotation;
 use std::collections::BTreeMap;
@@ -158,6 +159,12 @@ pub(super) struct IngressAnnotations {
     pub load_balance: LoadBalance,
     /// Consistent-hash attribute when `load_balance == Hash` (#276); `None` otherwise.
     pub hash_by: Option<HashSource>,
+    /// Envoy/Istio-style path normalization level from `path-normalize` (#280).
+    ///
+    /// `None` when the annotation is absent (the host builder uses its default,
+    /// `NormalizeLevel::Base`).  An explicit `"none"` disables normalization.
+    /// Unrecognized values emit `WARN` and fall back to `Base`.
+    pub path_normalize: Option<NormalizeLevel>,
 }
 
 impl IngressAnnotations {
@@ -470,6 +477,19 @@ impl IngressAnnotations {
             .map(traffic_policy::parse_load_balance)
             .unwrap_or((LoadBalance::RoundRobin, None));
 
+        // ── Path normalization level (#280) ───────────────────────────────────
+        let path_normalize = get(ann, PATH_NORMALIZE).map(|v| {
+            parse_normalize_level(v).unwrap_or_else(|| {
+                tracing::warn!(
+                    ingress = %route_id,
+                    annotation = PATH_NORMALIZE,
+                    value = v,
+                    "unknown path-normalize value — falling back to base"
+                );
+                NormalizeLevel::Base
+            })
+        });
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -500,7 +520,24 @@ impl IngressAnnotations {
             forwarded_for,
             load_balance,
             hash_by,
+            path_normalize,
         }
+    }
+}
+
+/// Parse a `path-normalize` annotation value to a [`NormalizeLevel`].
+///
+/// Accepts `none`, `base`, `merge-slashes`, `decode-and-merge-slashes`
+/// (ASCII-case-insensitive).  Returns `None` for unrecognized values; the
+/// caller emits a `WARN` and falls back to `Base`.
+#[must_use]
+pub fn parse_normalize_level(s: &str) -> Option<NormalizeLevel> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(NormalizeLevel::None),
+        "base" => Some(NormalizeLevel::Base),
+        "merge-slashes" => Some(NormalizeLevel::MergeSlashes),
+        "decode-and-merge-slashes" => Some(NormalizeLevel::DecodeAndMergeSlashes),
+        _ => None,
     }
 }
 
@@ -994,5 +1031,84 @@ mod tests {
         let a = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(!a.cache_enabled);
         assert!(logs_contain("treating cache-enabled as false"));
+    }
+
+    // ── path-normalize (#280) ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_normalize_level_all_variants() {
+        assert_eq!(parse_normalize_level("none"), Some(NormalizeLevel::None));
+        assert_eq!(parse_normalize_level("base"), Some(NormalizeLevel::Base));
+        assert_eq!(
+            parse_normalize_level("merge-slashes"),
+            Some(NormalizeLevel::MergeSlashes)
+        );
+        assert_eq!(
+            parse_normalize_level("decode-and-merge-slashes"),
+            Some(NormalizeLevel::DecodeAndMergeSlashes)
+        );
+    }
+
+    #[test]
+    fn parse_normalize_level_case_insensitive() {
+        assert_eq!(parse_normalize_level("NONE"), Some(NormalizeLevel::None));
+        assert_eq!(parse_normalize_level("Base"), Some(NormalizeLevel::Base));
+        assert_eq!(
+            parse_normalize_level("Merge-Slashes"),
+            Some(NormalizeLevel::MergeSlashes)
+        );
+    }
+
+    #[test]
+    fn parse_normalize_level_unknown_returns_none() {
+        assert!(parse_normalize_level("aggressive").is_none());
+        assert!(parse_normalize_level("").is_none());
+    }
+
+    #[test]
+    fn parse_annotation_path_normalize_absent_is_none() {
+        let a = IngressAnnotations::parse(None, "default/test");
+        assert!(a.path_normalize.is_none());
+    }
+
+    #[test]
+    fn parse_annotation_path_normalize_base() {
+        let m = ann(&[(PATH_NORMALIZE, "base")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert_eq!(a.path_normalize, Some(NormalizeLevel::Base));
+    }
+
+    #[test]
+    fn parse_annotation_path_normalize_none_disables() {
+        let m = ann(&[(PATH_NORMALIZE, "none")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert_eq!(a.path_normalize, Some(NormalizeLevel::None));
+    }
+
+    #[test]
+    fn parse_annotation_path_normalize_merge_slashes() {
+        let m = ann(&[(PATH_NORMALIZE, "merge-slashes")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert_eq!(a.path_normalize, Some(NormalizeLevel::MergeSlashes));
+    }
+
+    #[test]
+    fn parse_annotation_path_normalize_decode_and_merge() {
+        let m = ann(&[(PATH_NORMALIZE, "decode-and-merge-slashes")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert_eq!(
+            a.path_normalize,
+            Some(NormalizeLevel::DecodeAndMergeSlashes)
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_annotation_path_normalize_unknown_warns_and_falls_back_to_base() {
+        let m = ann(&[(PATH_NORMALIZE, "aggressive")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        // Unknown value → explicit Base (not absent)
+        assert_eq!(a.path_normalize, Some(NormalizeLevel::Base));
+        assert!(logs_contain("unknown path-normalize value"));
     }
 }
