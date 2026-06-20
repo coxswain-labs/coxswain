@@ -10,6 +10,7 @@ pub mod auth;
 pub mod compression;
 pub mod entry;
 pub mod host_router;
+pub mod path_normalize;
 pub mod port;
 pub mod predicate;
 pub mod rate_limit;

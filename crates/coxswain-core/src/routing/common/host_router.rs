@@ -6,6 +6,7 @@ use super::entry::{
     BackendGroup, FilterAction, ForwardedForConfig, RouteConflict, RouteEntry, RouteInfo,
     RouteKind, RouteTimeouts,
 };
+use super::path_normalize::NormalizeLevel;
 use super::predicate::{MatchPredicates, RequestContext, ValueMatch};
 use super::rate_limit::RateLimitConfig;
 use matchit::Router;
@@ -67,6 +68,16 @@ pub struct RouteMatch {
     /// IP-based features (allow/deny-source-range, rate limiting, access logs).
     pub forwarded_for: Option<Arc<ForwardedForConfig>>,
 
+    /// Normalized form of the request path, when it differs from the raw path.
+    ///
+    /// Set by [`super::port::PortRoutingTable::find`] after applying the host's
+    /// [`NormalizeLevel`] to the request path before the routing lookup.
+    /// `None` when normalization was a no-op (the path was already canonical or
+    /// the level is `None`) — the raw request path is used verbatim.  When
+    /// `Some`, the proxy adopts this as `ResolvedRoute::original_path` so the
+    /// normalized path is both matched and forwarded upstream.
+    pub normalized_path: Option<Arc<str>>,
+
     /// When `Some`, the proxy returns this status immediately without contacting
     /// upstream (invalid/missing/forbidden backend ref). See the struct docs.
     pub error_status: Option<u16>,
@@ -90,6 +101,7 @@ impl RouteMatch {
             auth: entry.auth.clone(),
             compression: entry.compression.clone(),
             forwarded_for: entry.forwarded_for.clone(),
+            normalized_path: None,
 
             error_status: entry.error_status,
         }
@@ -122,12 +134,23 @@ pub struct HostRouter {
     regex_routes: Vec<(RegexSet, Box<[Arc<RouteEntry>]>)>,
     has_query_predicates: bool,
     route_info: Vec<RouteInfo>,
+    /// Path normalization level applied before every routing lookup and retained
+    /// as the forwarded path.  Defaults to [`NormalizeLevel::Base`].
+    normalize: NormalizeLevel,
 }
 
 impl HostRouter {
     /// All registered path rules, in insertion order, for introspection.
     pub fn routes(&self) -> &[RouteInfo] {
         &self.route_info
+    }
+
+    /// Path normalization level in effect for this host.
+    ///
+    /// Read by [`super::port::PortRoutingTable::find`] to normalize the request
+    /// path once, before the routing lookup.
+    pub(super) fn normalize_level(&self) -> NormalizeLevel {
+        self.normalize
     }
 
     /// Resolves `path` to an upstream, filters, and timeouts, applying predicates from `ctx`.
@@ -308,9 +331,40 @@ pub struct HostRouterBuilder {
     exact_routes: Vec<(String, Arc<RouteEntry>)>,
     prefix_routes: Vec<(String, Arc<RouteEntry>)>,
     regex_routes: Vec<(String, Arc<RouteEntry>)>,
+    /// Explicit path normalization level set via `set_path_normalize`.
+    /// `None` means "use the default" (`NormalizeLevel::Base`) at build time.
+    normalize: Option<NormalizeLevel>,
 }
 
 impl HostRouterBuilder {
+    /// Set the path normalization level for all routes on this host.
+    ///
+    /// The first explicit level set wins.  A subsequent call with a *different*
+    /// level emits a `tracing::warn!` and is ignored — ensuring the more
+    /// specific (first-registered) Ingress wins when multiple Ingresses share a
+    /// host.  Calling with the same level as already set is a no-op.
+    ///
+    /// Absent any call, the host defaults to [`NormalizeLevel::Base`].
+    pub fn set_path_normalize(&mut self, level: NormalizeLevel) -> &mut Self {
+        match self.normalize {
+            Some(existing) if existing == level => {
+                // Same level — no-op, no warning needed.
+            }
+            Some(existing) => {
+                tracing::warn!(
+                    existing = ?existing,
+                    requested = ?level,
+                    "path-normalize level conflict on shared host: \
+                     keeping first-registered level"
+                );
+            }
+            None => {
+                self.normalize = Some(level);
+            }
+        }
+        self
+    }
+
     /// Register an exact-path route.
     pub fn add_exact_route(&mut self, path: &str, entry: Arc<RouteEntry>) -> &mut Self {
         self.exact_routes.push((path.to_string(), entry));
@@ -469,6 +523,7 @@ impl HostRouterBuilder {
                 regex_routes: compiled_regex_routes,
                 has_query_predicates,
                 route_info,
+                normalize: self.normalize.unwrap_or_default(),
             },
             conflicts,
         ))
