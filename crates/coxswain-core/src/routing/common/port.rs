@@ -13,7 +13,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::entry::BackendGroup;
+use super::backend::BackendGroup;
 
 /// Per-port routing bucket: the host+path+predicate logic for one listener port.
 ///

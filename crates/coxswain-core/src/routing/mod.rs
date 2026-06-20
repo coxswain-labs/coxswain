@@ -17,12 +17,15 @@ pub use common::auth::{
     BasicCredential, ExtAuthConfig, ExtAuthTransport, HttpExtAuthConfig, IngressAuthConfig,
     PasswordHash,
 };
+pub use common::backend::{
+    BackendGroup, HashSource, LoadBalance, Selected, SessionAffinity, affinity_hash,
+    affinity_hash_parts, affinity_token,
+};
 pub use common::compression::CompressionConfig;
 pub use common::entry::{
-    BackendGroup, BackendProtocol, FilterAction, ForwardedForConfig, HashSource, HeaderMod,
-    HeaderModError, LoadBalance, PathModifier, RetryOn, RetryPolicy, RouteConflict, RouteEntry,
-    RouteInfo, RouteKind, RouteTimeouts, Selected, SessionAffinity, UpstreamCa, UpstreamTls,
-    affinity_hash, affinity_token, parse_app_protocol,
+    BackendProtocol, FilterAction, ForwardedForConfig, HeaderMod, HeaderModError, PathModifier,
+    RetryOn, RetryPolicy, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts,
+    UpstreamCa, UpstreamTls, parse_app_protocol,
 };
 pub use common::host_router::{
     HostRouter, HostRouterBuilder, RouteMatch, WildcardKind, compile_path_regex,
