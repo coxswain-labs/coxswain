@@ -718,7 +718,6 @@ name = "coxswain-cache"
 version = "0.2.0"
 dependencies = [
  "coxswain-core",
- "itoa",
  "pingora-cache",
  "prometheus 0.14.0",
  "tokio",
@@ -740,7 +739,6 @@ dependencies = [
  "kube-leader-election",
  "pingora-core",
  "prometheus 0.14.0",
- "regex",
  "serde",
  "serde_json",
  "serde_yaml",
