@@ -5,17 +5,20 @@ use http::header;
 use pingora_http::RequestHeader;
 
 /// Extract the bare hostname from a request (strips port suffix, prefers URI host over Host header).
-pub(crate) fn extract_host<'a>(req: &'a RequestHeader, host_hdr: &'a mut String) -> &'a str {
+///
+/// Returns a slice borrowed from `req` — the Host-header fallback splits on `:`
+/// over the borrowed header value rather than allocating a scratch `String`, so
+/// the caller's `Arc::from` is the only allocation on the request path (#397).
+pub(crate) fn extract_host(req: &RequestHeader) -> &str {
     if let Some(h) = req.uri.host() {
         return h;
     }
-    *host_hdr = req
+    let host = req
         .headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    host_hdr.split(':').next().unwrap_or("")
+        .unwrap_or("");
+    host.split(':').next().unwrap_or("")
 }
 
 /// Request-context fields needed to build a redirect `Location` URL.
