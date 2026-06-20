@@ -320,4 +320,16 @@ pub const ANNOTATION_PATH_NORMALIZE_NONE: &str = fixture!("annotation_path_norma
 /// terminating endpoint after it enters the `terminating=true` state.
 pub const DRAIN_INGRESS: &str = fixture!("drain_ingress.yaml");
 
+// ── circuit breaker (#282) ───────────────────────────────────────────────────
+
+/// Ingress with `circuit-breaker-threshold: "50"`, `circuit-breaker-window: "10s"`,
+/// `circuit-breaker-open-duration: "2s"`, and `circuit-breaker-min-requests: "4"` (#282).
+///
+/// Routes `breaker.<namespace>.local → go-httpbin:3000`. The short `open-duration`
+/// is intentional: it allows the half-open probe to fire within seconds so the
+/// recovery test completes promptly without a bare sleep.
+///
+/// Apply [`backends::GO_HTTPBIN`] first.
+pub const ANNOTATION_CIRCUIT_BREAKER: &str = fixture!("annotation_circuit_breaker.yaml");
+
 // ── satisfy any/all (#273) ────────────────────────────────────────────────────

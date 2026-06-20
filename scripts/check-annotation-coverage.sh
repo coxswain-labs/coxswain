@@ -72,12 +72,30 @@ for f in "${src_files[@]}"; do
 done
 
 # Extract (const-name, annotation-key) pairs from all source files.
+# Handles two forms rustfmt may produce (depending on line length):
+#   Single-line: pub const NAME: &str = "ingress.coxswain-labs.dev/key";
+#   Two-line:    pub const NAME: &str =
+#                    "ingress.coxswain-labs.dev/key";
 # Skip PREFIX (value ends in '/', i.e. it has no per-annotation key).
 consts=()
 for f in "${src_files[@]}"; do
   while IFS= read -r line; do
     consts+=("$line")
-  done < <(grep -E 'const [A-Z_]+: &str = "ingress\.coxswain-labs\.dev/[^"]+"' "$f" || true)
+  done < <(
+    awk '
+      /^(pub )?const [A-Z_]+: *&str *=[[:space:]]*$/ { held = $0; next }
+      held != "" {
+        val = $0
+        sub(/^[[:space:]]+/, "", val)
+        combined = held " " val
+        held = ""
+        if (combined ~ /"ingress\.coxswain-labs\.dev\/[^"]+"/) { print combined }
+        next
+      }
+      /^(pub )?const [A-Z_]+: *&str *= *"ingress\.coxswain-labs\.dev\/[^"]+"/ { print; next }
+      { held = "" }
+    ' "$f" || true
+  )
 done
 
 if [ "${#consts[@]}" -eq 0 ]; then

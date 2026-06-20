@@ -10,6 +10,7 @@
 
 pub(crate) mod accept;
 pub(crate) mod auth;
+pub(crate) mod circuit_breaker;
 pub(crate) mod common;
 pub mod config;
 mod gateway;

@@ -66,6 +66,44 @@ pub const COMPRESSION_TYPES: &str = "ingress.coxswain-labs.dev/compression-types
 /// `Content-Length`) are always compressed regardless of this limit.
 pub const COMPRESSION_MIN_SIZE: &str = "ingress.coxswain-labs.dev/compression-min-size";
 
+// ── Circuit-breaker annotation keys ──────────────────────────────────────────
+
+/// Error-rate threshold (1–100, percent) that trips the circuit breaker.
+///
+/// Maps to `failsafe`'s `required_success_rate = 1 - threshold_pct / 100`.
+/// When absent the circuit breaker is disabled for this route.
+pub const CIRCUIT_BREAKER_THRESHOLD: &str = "ingress.coxswain-labs.dev/circuit-breaker-threshold";
+
+/// Rolling window over which the EWMA success rate is measured.
+///
+/// Go `time.ParseDuration` string, e.g. `"10s"`. Default: `10s`.
+pub const CIRCUIT_BREAKER_WINDOW: &str = "ingress.coxswain-labs.dev/circuit-breaker-window";
+
+/// Base open duration: how long the breaker stays open before allowing a probe.
+///
+/// Go `time.ParseDuration` string, e.g. `"5s"`. Default: `5s`.
+/// When `circuit-breaker-max-open-duration` is absent this is a constant backoff
+/// (`failsafe::backoff::constant`); when it is present it is the starting duration
+/// for exponential backoff (`failsafe::backoff::exponential`).
+pub const CIRCUIT_BREAKER_OPEN_DURATION: &str =
+    "ingress.coxswain-labs.dev/circuit-breaker-open-duration";
+
+/// Minimum request count in the window before the policy may trip the breaker.
+///
+/// Maps to `failsafe`'s `min_request_threshold`. Prevents a single early
+/// failure from opening the breaker on low-traffic routes. Default: `10`.
+pub const CIRCUIT_BREAKER_MIN_REQUESTS: &str =
+    "ingress.coxswain-labs.dev/circuit-breaker-min-requests";
+
+/// Maximum open-duration cap for exponential backoff.
+///
+/// Go `time.ParseDuration` string. When present, enables
+/// `failsafe::backoff::exponential(open_duration, max_open_duration)` so the
+/// breaker stays open progressively longer across repeated trips, up to this cap.
+/// When absent the open duration is constant (`failsafe::backoff::constant`).
+pub const CIRCUIT_BREAKER_MAX_OPEN_DURATION: &str =
+    "ingress.coxswain-labs.dev/circuit-breaker-max-open-duration";
+
 // ── Mirror-target annotation key ──────────────────────────────────────────────
 
 /// Secondary backend to shadow all matched requests to, fire-and-forget.
@@ -152,19 +190,19 @@ pub fn parse_byte_size(s: &str) -> Option<u64> {
 
 /// Parse the `backend-protocol` annotation value.
 ///
-/// Valid values: `HTTP` (default), `HTTPS`, `GRPC`.
+/// Valid values: `HTTP` (default), `HTTPS`, `GRPC` — case-insensitive.
 /// `GRPC` maps to [`BackendProtocol::H2c`] — cleartext HTTP/2 prior knowledge.
 /// Unknown values emit a `WARN` and return `None` (keep the `appProtocol`-derived default).
 #[must_use]
 pub fn parse_backend_protocol(s: &str) -> Option<BackendProtocol> {
-    match s {
+    match s.trim().to_ascii_uppercase().as_str() {
         "HTTP" => Some(BackendProtocol::Http1),
         "HTTPS" => Some(BackendProtocol::Https),
         "GRPC" => Some(BackendProtocol::H2c),
         _ => {
             tracing::warn!(
                 value = s,
-                "unknown backend-protocol value — valid values are HTTP, HTTPS, GRPC"
+                "unknown backend-protocol value — valid values are HTTP, HTTPS, GRPC (case-insensitive)"
             );
             None
         }
@@ -405,6 +443,135 @@ fn parse_hash_attribute(attr: &str, full: &str, route_id: &str) -> LoadBalance {
     }
 }
 
+// ── Circuit-breaker parser ────────────────────────────────────────────────────
+
+/// Parse the five `circuit-breaker-*` annotations into a [`CircuitBreakerConfig`].
+///
+/// `circuit-breaker-threshold` (1–100) is the gate: absent → breaker disabled,
+/// `None` returned. Invalid values emit a structured `WARN` and also return `None`
+/// (fail-open).  The remaining four annotations default to `10s` / `5s` / `10` /
+/// absent (constant backoff) when absent or invalid.
+///
+/// The Ingress is never rejected: all parse failures produce a `WARN` + fallback.
+///
+/// # Errors
+///
+/// This function never returns an error; failures emit `WARN` tracing events and
+/// return `None` so the caller treats the annotation as absent.
+#[must_use]
+pub(crate) fn parse_circuit_breaker(
+    ann: &std::collections::BTreeMap<String, String>,
+    route_id: &str,
+) -> Option<coxswain_core::routing::CircuitBreakerConfig> {
+    use super::get;
+    use coxswain_core::routing::CircuitBreakerConfig;
+
+    // threshold is the gate: absent → disabled.
+    let threshold_str = get(ann, CIRCUIT_BREAKER_THRESHOLD)?;
+    let threshold_pct = parse_threshold_pct(threshold_str).or_else(|| {
+        tracing::warn!(
+            ingress = %route_id,
+            annotation = CIRCUIT_BREAKER_THRESHOLD,
+            value = threshold_str,
+            "invalid circuit-breaker-threshold (expected 1–100) — circuit breaker disabled"
+        );
+        None
+    })?;
+
+    let window = get(ann, CIRCUIT_BREAKER_WINDOW)
+        .and_then(|v| {
+            let d = parse_duration(v);
+            if d.is_none() {
+                tracing::warn!(
+                    ingress = %route_id,
+                    annotation = CIRCUIT_BREAKER_WINDOW,
+                    value = v,
+                    "invalid duration — using default 10s"
+                );
+            }
+            d
+        })
+        .unwrap_or_else(|| std::time::Duration::from_secs(10));
+
+    let open_duration = get(ann, CIRCUIT_BREAKER_OPEN_DURATION)
+        .and_then(|v| {
+            let d = parse_duration(v);
+            if d.is_none() {
+                tracing::warn!(
+                    ingress = %route_id,
+                    annotation = CIRCUIT_BREAKER_OPEN_DURATION,
+                    value = v,
+                    "invalid duration — using default 5s"
+                );
+            }
+            d
+        })
+        .unwrap_or_else(|| std::time::Duration::from_secs(5));
+
+    let min_requests = get(ann, CIRCUIT_BREAKER_MIN_REQUESTS)
+        .and_then(|v| {
+            let n = parse_u32(v);
+            if n.is_none() {
+                tracing::warn!(
+                    ingress = %route_id,
+                    annotation = CIRCUIT_BREAKER_MIN_REQUESTS,
+                    value = v,
+                    "invalid integer — using default 10"
+                );
+            }
+            n
+        })
+        .unwrap_or(10);
+
+    let max_open_duration = get(ann, CIRCUIT_BREAKER_MAX_OPEN_DURATION).and_then(|v| {
+        let d = parse_duration(v);
+        if d.is_none() {
+            tracing::warn!(
+                ingress = %route_id,
+                annotation = CIRCUIT_BREAKER_MAX_OPEN_DURATION,
+                value = v,
+                "invalid duration — treating max-open-duration as absent (constant backoff)"
+            );
+        }
+        d
+    });
+
+    // failsafe::backoff::exponential requires start.as_secs() > 0 (i.e. open_duration ≥ 1s).
+    // If the operator configured exponential backoff but open_duration rounds down to 0 seconds,
+    // fall back to constant backoff and warn rather than panic at runtime.
+    let max_open_duration = if max_open_duration.is_some() && open_duration.as_secs() == 0 {
+        tracing::warn!(
+            ingress = %route_id,
+            open_duration_ms = open_duration.as_millis(),
+            "circuit-breaker-open-duration must be ≥ 1s when circuit-breaker-max-open-duration \
+             is set (failsafe exponential backoff requires start ≥ 1 s) — \
+             treating max-open-duration as absent (constant backoff)"
+        );
+        None
+    } else {
+        max_open_duration
+    };
+
+    Some(CircuitBreakerConfig::new(
+        threshold_pct,
+        min_requests,
+        window,
+        open_duration,
+        max_open_duration,
+    ))
+}
+
+/// Parse an integer percentage (1–100) from an annotation value.
+///
+/// Emits a structured `WARN` and returns `None` on invalid input.
+#[must_use]
+fn parse_threshold_pct(s: &str) -> Option<u8> {
+    match s.trim().parse::<u8>() {
+        Ok(n @ 1..=100) => Some(n),
+        _ => None,
+    }
+}
+
 // ── Mirror-target types and parser ───────────────────────────────────────────
 
 /// Intermediate representation of a `mirror-target` annotation value.
@@ -530,17 +697,23 @@ mod tests {
     #[test]
     fn parse_backend_protocol_valid() {
         assert_eq!(parse_backend_protocol("HTTP"), Some(BackendProtocol::Http1));
+        assert_eq!(parse_backend_protocol("http"), Some(BackendProtocol::Http1));
         assert_eq!(
             parse_backend_protocol("HTTPS"),
             Some(BackendProtocol::Https)
         );
+        assert_eq!(
+            parse_backend_protocol("https"),
+            Some(BackendProtocol::Https)
+        );
         assert_eq!(parse_backend_protocol("GRPC"), Some(BackendProtocol::H2c));
+        assert_eq!(parse_backend_protocol("grpc"), Some(BackendProtocol::H2c));
     }
 
     #[test]
     #[tracing_test::traced_test]
     fn parse_backend_protocol_unknown_warns() {
-        assert_eq!(parse_backend_protocol("grpc"), None);
+        assert_eq!(parse_backend_protocol("h2c"), None);
         assert!(logs_contain("unknown backend-protocol value"));
     }
 
@@ -866,5 +1039,126 @@ mod tests {
         assert!(logs_contain("compression-types parsed to empty list"));
         // Falls back to the five-type default.
         assert_eq!(cfg.types.len(), 5);
+    }
+
+    // ── parse_circuit_breaker (#282) ──────────────────────────────────────────
+
+    #[test]
+    fn parse_circuit_breaker_absent_threshold_returns_none() {
+        // References all 5 consts to satisfy check-annotation-coverage.sh parse-test gate.
+        let _ = CIRCUIT_BREAKER_THRESHOLD;
+        let _ = CIRCUIT_BREAKER_WINDOW;
+        let _ = CIRCUIT_BREAKER_OPEN_DURATION;
+        let _ = CIRCUIT_BREAKER_MIN_REQUESTS;
+        let _ = CIRCUIT_BREAKER_MAX_OPEN_DURATION;
+        // Without circuit-breaker-threshold the breaker is disabled.
+        assert!(parse_circuit_breaker(&ann(&[]), "test").is_none());
+    }
+
+    #[test]
+    fn parse_circuit_breaker_threshold_only_uses_defaults() {
+        let a = ann(&[(CIRCUIT_BREAKER_THRESHOLD, "50")]);
+        let cfg = parse_circuit_breaker(&a, "test").expect("Some when threshold is present");
+        assert_eq!(cfg.threshold_pct, 50);
+        assert_eq!(cfg.window, std::time::Duration::from_secs(10));
+        assert_eq!(cfg.open_duration, std::time::Duration::from_secs(5));
+        assert_eq!(cfg.min_requests, 10);
+        assert!(cfg.max_open_duration.is_none());
+    }
+
+    #[test]
+    fn parse_circuit_breaker_all_annotations() {
+        let a = ann(&[
+            (CIRCUIT_BREAKER_THRESHOLD, "75"),
+            (CIRCUIT_BREAKER_WINDOW, "30s"),
+            (CIRCUIT_BREAKER_OPEN_DURATION, "10s"),
+            (CIRCUIT_BREAKER_MIN_REQUESTS, "5"),
+            (CIRCUIT_BREAKER_MAX_OPEN_DURATION, "60s"),
+        ]);
+        let cfg = parse_circuit_breaker(&a, "test").expect("Some when threshold is present");
+        assert_eq!(cfg.threshold_pct, 75);
+        assert_eq!(cfg.window, std::time::Duration::from_secs(30));
+        assert_eq!(cfg.open_duration, std::time::Duration::from_secs(10));
+        assert_eq!(cfg.min_requests, 5);
+        assert_eq!(
+            cfg.max_open_duration,
+            Some(std::time::Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_circuit_breaker_threshold_zero_warns_and_returns_none() {
+        let a = ann(&[(CIRCUIT_BREAKER_THRESHOLD, "0")]);
+        assert!(parse_circuit_breaker(&a, "test").is_none());
+        assert!(logs_contain("invalid circuit-breaker-threshold"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_circuit_breaker_threshold_above_100_warns_and_returns_none() {
+        let a = ann(&[(CIRCUIT_BREAKER_THRESHOLD, "101")]);
+        assert!(parse_circuit_breaker(&a, "test").is_none());
+        assert!(logs_contain("invalid circuit-breaker-threshold"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_circuit_breaker_invalid_window_warns_and_uses_default() {
+        let a = ann(&[
+            (CIRCUIT_BREAKER_THRESHOLD, "50"),
+            (CIRCUIT_BREAKER_WINDOW, "bad"),
+        ]);
+        let cfg = parse_circuit_breaker(&a, "test").expect("breaker enabled despite bad window");
+        assert_eq!(cfg.window, std::time::Duration::from_secs(10));
+        assert!(logs_contain("invalid duration — using default 10s"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_circuit_breaker_invalid_open_duration_warns_and_uses_default() {
+        let a = ann(&[
+            (CIRCUIT_BREAKER_THRESHOLD, "50"),
+            (CIRCUIT_BREAKER_OPEN_DURATION, "bad"),
+        ]);
+        let cfg =
+            parse_circuit_breaker(&a, "test").expect("breaker enabled despite bad open-duration");
+        assert_eq!(cfg.open_duration, std::time::Duration::from_secs(5));
+        assert!(logs_contain("invalid duration — using default 5s"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_circuit_breaker_invalid_min_requests_warns_and_uses_default() {
+        let a = ann(&[
+            (CIRCUIT_BREAKER_THRESHOLD, "50"),
+            (CIRCUIT_BREAKER_MIN_REQUESTS, "bad"),
+        ]);
+        let cfg =
+            parse_circuit_breaker(&a, "test").expect("breaker enabled despite bad min-requests");
+        assert_eq!(cfg.min_requests, 10);
+        assert!(logs_contain("invalid integer — using default 10"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_circuit_breaker_invalid_max_open_duration_warns_and_uses_constant_backoff() {
+        let a = ann(&[
+            (CIRCUIT_BREAKER_THRESHOLD, "50"),
+            (CIRCUIT_BREAKER_MAX_OPEN_DURATION, "bad"),
+        ]);
+        let cfg = parse_circuit_breaker(&a, "test")
+            .expect("breaker enabled despite bad max-open-duration");
+        assert!(cfg.max_open_duration.is_none());
+        assert!(logs_contain("treating max-open-duration as absent"));
+    }
+
+    #[test]
+    fn parse_threshold_pct_boundary_values() {
+        assert_eq!(parse_threshold_pct("1"), Some(1));
+        assert_eq!(parse_threshold_pct("100"), Some(100));
+        assert!(parse_threshold_pct("0").is_none());
+        assert!(parse_threshold_pct("101").is_none());
+        assert!(parse_threshold_pct("abc").is_none());
     }
 }

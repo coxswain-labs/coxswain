@@ -10,6 +10,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+failsafe = { workspace = true }
 governor = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }

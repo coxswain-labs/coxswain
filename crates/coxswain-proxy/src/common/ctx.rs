@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use coxswain_core::routing::{
-    BackendGroup, CompressionConfig, FilterAction, RetryOn, RouteTimeouts,
+    BackendGroup, CircuitBreakerConfig, CompressionConfig, FilterAction, RetryOn, RouteTimeouts,
 };
 use http::Method;
 use pingora_core::protocols::http::compression::Encode;
@@ -69,6 +69,14 @@ pub struct ResolvedRoute {
     /// this in `upstream_response_filter` to decide whether to compress and
     /// constructs an encoder, stored in [`ProxyCtx::compression_encoder`].
     pub compression: Option<Arc<CompressionConfig>>,
+    /// Per-route circuit-breaker configuration (`None` = disabled).
+    ///
+    /// Populated from [`RouteEntry::circuit_breaker`]; `Some` only for Ingress
+    /// routes configured with `circuit-breaker-threshold`. The proxy consumes
+    /// this in `upstream_peer` to gate the request through the per-endpoint
+    /// [`crate::circuit_breaker::CircuitBreakerRegistry`], and in `logging` to
+    /// record the outcome.
+    pub circuit_breaker: Option<Arc<CircuitBreakerConfig>>,
 }
 
 /// Pending fire-and-forget mirror dispatch.
@@ -230,6 +238,11 @@ pub struct ProxyCtx {
     /// `BackendGroup::hash_by()` and passed to `BackendGroup::select_upstream`.
     /// `None` for all other algorithms (zero overhead) or when the attribute is absent.
     pub hash_key: Option<u64>,
+    /// `true` when `upstream_peer` returned 503 because the endpoint's circuit breaker
+    /// was Open (fail-fast path, #282). When set, `logging` skips recording the outcome
+    /// in the [`crate::circuit_breaker::CircuitBreakerRegistry`] — no upstream request
+    /// was ever attempted, so there is no success/failure to record.
+    pub circuit_breaker_rejected: bool,
 }
 
 // Hot types — review with the team before bumping these numbers.
@@ -238,7 +251,8 @@ pub struct ProxyCtx {
 // ResolvedRoute: +48 bytes because RouteTimeouts gained connect/read/send: Option<Duration> (120→168).
 // ResolvedRoute: +8 (alignment) for cache_enabled: bool (#40) (168→176).
 // ResolvedRoute: +8 for compression: Option<Arc<CompressionConfig>> (niche pointer) (#270) (176→184).
-const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 184);
+// ResolvedRoute: +8 for circuit_breaker: Option<Arc<CircuitBreakerConfig>> (niche pointer) (#282) (184→192).
+const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 192);
 // ProxyCtx: +16 for start: Option<Instant>, +48 for upstream_addr: Option<SocketAddr>
 // with alignment padding (176→240).
 // ProxyCtx: +16 because Option<ResolvedRoute> inlines the struct (240→256).
@@ -262,4 +276,6 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 184);
 // ProxyCtx: +8 for lb_track: Option<u32> (discriminant + padding + u32 = 8 bytes; 584→592) (#275).
 // ProxyCtx: +16 for hash_key: Option<u64> (discriminant padded to u64 align; 592→608) (#276).
 // ProxyCtx: -8 for MirrorDispatch.path_and_query String→Arc<str> (16 not 24; #397) (608→600).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 600);
+// ProxyCtx: +8 because embedded ResolvedRoute grew for circuit_breaker field (#282) (600→608).
+// ProxyCtx: +0 for circuit_breaker_rejected: bool absorbed into existing alignment padding (#282).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 608);

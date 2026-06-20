@@ -33,8 +33,9 @@ pub use session::*;
 pub use traffic_policy::*;
 
 use coxswain_core::routing::{
-    BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HeaderMod, LoadBalance,
-    NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicy, RouteTimeouts, SessionAffinity,
+    BackendProtocol, CircuitBreakerConfig, CompressionConfig, FilterAction, ForwardedForConfig,
+    HeaderMod, LoadBalance, NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicy,
+    RouteTimeouts, SessionAffinity,
 };
 use security::AuthAnnotation;
 use std::collections::BTreeMap;
@@ -164,6 +165,12 @@ pub(super) struct IngressAnnotations {
     /// `NormalizeLevel::Base`).  An explicit `"none"` disables normalization.
     /// Unrecognized values emit `WARN` and fall back to `Base`.
     pub path_normalize: Option<NormalizeLevel>,
+    /// Per-route circuit-breaker config from `circuit-breaker-*` annotations (#282).
+    ///
+    /// `None` (the default) when `circuit-breaker-threshold` is absent or invalid,
+    /// disabling the circuit breaker for this route. Gateway-API routes always see
+    /// `None` — the circuit breaker is Ingress-only.
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
 impl IngressAnnotations {
@@ -491,6 +498,9 @@ impl IngressAnnotations {
             })
         });
 
+        // ── Circuit breaker (#282) ────────────────────────────────────────────
+        let circuit_breaker = traffic_policy::parse_circuit_breaker(ann, route_id);
+
         Self {
             timeouts: RouteTimeouts {
                 request: None,
@@ -521,6 +531,7 @@ impl IngressAnnotations {
             forwarded_for,
             load_balance,
             path_normalize,
+            circuit_breaker,
         }
     }
 }
@@ -744,6 +755,16 @@ mod tests {
         let m = ann(&[(BACKEND_PROTOCOL, "HTTPS")]);
         let a = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(a.backend_protocol, Some(BackendProtocol::Https));
+    }
+
+    #[test]
+    fn parse_backend_protocol_lowercase_accepted() {
+        let m = ann(&[(BACKEND_PROTOCOL, "https")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert_eq!(a.backend_protocol, Some(BackendProtocol::Https));
+        let m = ann(&[(BACKEND_PROTOCOL, "grpc")]);
+        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        assert_eq!(a.backend_protocol, Some(BackendProtocol::H2c));
     }
 
     #[test]

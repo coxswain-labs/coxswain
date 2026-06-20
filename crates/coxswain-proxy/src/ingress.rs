@@ -135,7 +135,7 @@ impl ProxyHttp for IngressProxy {
         _session: &mut Session,
         ctx: &mut ProxyCtx,
     ) -> Result<Box<HttpPeer>> {
-        hooks::upstream_peer(&self.cfg.ca_cache, ctx).await
+        hooks::upstream_peer(&self.cfg.ca_cache, &self.cfg.circuit_breakers, ctx).await
     }
 
     async fn upstream_request_filter(
@@ -234,6 +234,7 @@ impl ProxyHttp for IngressProxy {
         hooks::logging(
             self.cfg.access_log_enabled,
             self.cfg.access_log_path_mode,
+            &self.cfg.circuit_breakers,
             session,
             e,
             ctx,

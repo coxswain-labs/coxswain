@@ -6,6 +6,7 @@
 
 use super::auth::IngressAuthConfig;
 use super::backend::BackendGroup;
+use super::circuit_breaker::CircuitBreakerConfig;
 use super::compression::CompressionConfig;
 use super::predicate::MatchPredicates;
 use super::rate_limit::RateLimitConfig;
@@ -572,6 +573,19 @@ pub struct RouteEntry {
     /// trusted CIDRs in `cfg.trusted_cidrs`. Shared as an `Arc` so cloning into
     /// the lookup result is a refcount bump.
     pub forwarded_for: Option<Arc<ForwardedForConfig>>,
+    /// Per-route circuit-breaker configuration from the
+    /// `ingress.coxswain-labs.dev/circuit-breaker-*` annotation family (#282).
+    ///
+    /// `Some(cfg)` enables an endpoint-level circuit breaker backed by `failsafe`.
+    /// When the endpoint's EWMA error rate exceeds `cfg.threshold_pct` over
+    /// `cfg.window` (and at least `cfg.min_requests` have been seen), the breaker
+    /// opens and subsequent requests to that endpoint are failed fast with 503.
+    /// After `cfg.open_duration` a single probe is allowed; success closes the
+    /// breaker, failure re-opens it (with exponential backoff up to
+    /// `cfg.max_open_duration` if set). `None` (the default, and the value for all
+    /// Gateway-API routes) disables the circuit breaker. Shared as an `Arc` so
+    /// cloning into the lookup result is a refcount bump.
+    pub circuit_breaker: Option<Arc<CircuitBreakerConfig>>,
 }
 
 /// Configuration for trusting a forwarded client-IP header on a per-Ingress basis.
@@ -626,6 +640,7 @@ impl RouteEntry {
             auth: None,
             compression: None,
             forwarded_for: None,
+            circuit_breaker: None,
         }
     }
 
@@ -654,6 +669,7 @@ impl RouteEntry {
             auth: None,
             compression: None,
             forwarded_for: None,
+            circuit_breaker: None,
         }
     }
 
@@ -687,6 +703,7 @@ impl RouteEntry {
             auth: None,
             compression: None,
             forwarded_for: None,
+            circuit_breaker: None,
         }
     }
 
@@ -723,6 +740,7 @@ impl RouteEntry {
             auth: None,
             compression: None,
             forwarded_for: None,
+            circuit_breaker: None,
         }
     }
 
@@ -879,6 +897,22 @@ impl RouteEntry {
         self.forwarded_for = forwarded_for;
         self
     }
+
+    /// Set the per-endpoint circuit-breaker config for this route (builder-style).
+    ///
+    /// Used by the Ingress reconciler to attach the config parsed from the
+    /// `ingress.coxswain-labs.dev/circuit-breaker-*` annotation family (#282).
+    /// `None` (the default, and the value for all Gateway-API routes) disables
+    /// the circuit breaker. The reconciler shares one `Arc` across every path of
+    /// an Ingress so cloning onto each entry is a refcount bump.
+    #[must_use]
+    pub fn with_circuit_breaker(
+        mut self,
+        circuit_breaker: Option<Arc<CircuitBreakerConfig>>,
+    ) -> Self {
+        self.circuit_breaker = circuit_breaker;
+        self
+    }
 }
 
 // Lock the hot-path RouteEntry size to catch accidental growth (the BackendPool
@@ -896,7 +930,8 @@ impl RouteEntry {
 // Bumped 304→312 by adding compression: Option<Arc<CompressionConfig>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/compression-* response compression (#270).
 // Bumped 312→320 by adding forwarded_for: Option<Arc<ForwardedForConfig>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/trust-forwarded-for trusted-proxy headers (#271).
 // satisfy: Satisfy (#273) added without a bump — 1-byte enum occupies existing struct padding.
-static_assertions::assert_eq_size!(RouteEntry, [u8; 320]);
+// Bumped 320→328 by adding circuit_breaker: Option<Arc<CircuitBreakerConfig>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/circuit-breaker-* per-endpoint circuit breaker (#282).
+static_assertions::assert_eq_size!(RouteEntry, [u8; 328]);
 
 #[cfg(test)]
 mod tests {
@@ -978,7 +1013,8 @@ mod tests {
         // Bumped 304→312: compression: Option<Arc<CompressionConfig>> added for compression-* annotations (#270).
         // Bumped 312→320: forwarded_for: Option<Arc<ForwardedForConfig>> added for trust-forwarded-for (#271).
         // satisfy: Satisfy (#273) added without a bump — 1-byte enum occupies existing struct padding.
-        static_assertions::assert_eq_size!(RouteEntry, [u8; 320]);
+        // Bumped 320→328: circuit_breaker: Option<Arc<CircuitBreakerConfig>> added for circuit-breaker-* annotations (#282).
+        static_assertions::assert_eq_size!(RouteEntry, [u8; 328]);
     }
 
     #[test]

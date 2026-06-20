@@ -19,8 +19,37 @@ use coxswain_e2e::{
     harness::wait,
 };
 use reqwest::Method;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+// ── Circuit-breaker helpers ───────────────────────────────────────────────────
+//
+// go-httpbin's `/status/:code` responses may carry a non-echo-format body.
+// The shared `HttpClient` tries to deserialise 200 responses as `EchoResponse`
+// JSON, which would fail for go-httpbin. These helpers use a plain `reqwest`
+// client so callers receive just the status code without body parsing.
+
+/// Make a raw HTTP GET to the proxy and return the status code only.
+///
+/// Does not attempt JSON body parsing — safe to call with go-httpbin backends
+/// whose `/status/:code` endpoints return plain-text or empty bodies.
+async fn raw_status(proxy_addr: SocketAddr, host: &str, path: &str) -> u16 {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let c = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build reqwest client")
+    });
+    let url = format!("http://{proxy_addr}{path}");
+    c.get(&url)
+        .header("Host", host)
+        .send()
+        .await
+        .map(|r| r.status().as_u16())
+        .unwrap_or(0)
+}
 
 mod common;
 
@@ -1472,6 +1501,241 @@ async fn missing_hash_attribute_falls_back_to_round_robin() -> anyhow::Result<()
         pods.len() >= 2,
         "missing hash attribute must fall back to round_robin and spread across \
          both pods; saw only {pods:?}"
+    );
+
+    Ok(())
+}
+
+// ── Circuit breaker (#282) ────────────────────────────────────────────────────
+//
+// Annotations exercised (satisfies check-annotation-coverage.sh rubric #11):
+//   ingress.coxswain-labs.dev/circuit-breaker-threshold
+//   ingress.coxswain-labs.dev/circuit-breaker-window
+//   ingress.coxswain-labs.dev/circuit-breaker-open-duration
+//   ingress.coxswain-labs.dev/circuit-breaker-min-requests
+//   ingress.coxswain-labs.dev/circuit-breaker-max-open-duration
+//
+// The fixture sets threshold=50%, min-requests=4, window=500ms, open-duration=2s.
+// window=500ms is sub-second: failsafe's EWMA time gate (elapsed >= window_millis)
+// is always satisfied because 500ms.as_secs()*1000 == 0. This lets the breaker trip
+// as soon as min-requests is met without sleeping in the test body.
+// go-httpbin's /status/:code lets tests drive configurable upstream status codes.
+
+/// Happy path (#282): after enough upstream 500s the EWMA success rate falls
+/// below `threshold`, the circuit breaker opens, and subsequent requests are
+/// fail-fast 503 (never reaching the upstream).
+///
+/// Asserts the negative: a single baseline error is a real upstream 500 (breaker
+/// still closed). After the trip batch, requests fail-fast as 503.
+/// Also asserts the `coxswain_proxy_circuit_breaker_state` gauge reads `1`
+/// (open) and `coxswain_proxy_circuit_breaker_rejected_total` is > 0.
+#[tokio::test]
+async fn breaker_opens_and_fails_fast_when_upstream_errors() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-cb-open").await?;
+
+    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_CIRCUIT_BREAKER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("breaker.{}.local", ns.name);
+    let proxy = h.http.proxy_addr;
+
+    // Route readiness: poll /status/200 until the proxy forwards it to go-httpbin.
+    // (Uses raw_status to avoid EchoResponse JSON-parse failure on go-httpbin's body.)
+    // Note: readiness requests go through the circuit breaker and contribute to its
+    // rolling request counter — we send enough errors below to guarantee the trip
+    // threshold is reached regardless of how many readiness requests are still in
+    // the 500ms window.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!(
+                "breaker.{}.local / route to return 200 from go-httpbin",
+                ns.name
+            )
+        },
+        || async {
+            if raw_status(proxy, &host, "/status/200").await == 200 {
+                Some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await?;
+
+    // Negative baseline: the circuit breaker is still closed — the first error
+    // must reach the upstream (500), not be rejected by the breaker (503).
+    let pre = raw_status(proxy, &host, "/status/500").await;
+    assert_eq!(
+        pre, 500,
+        "before the trip sequence the upstream 500 must reach the client (not a breaker 503)"
+    );
+
+    // Trip sequence: send enough errors to guarantee the breaker opens, regardless
+    // of how many readiness /status/200 requests are still in the rolling window.
+    // Individual responses may be 500 (breaker still closing) or 503 (just opened);
+    // we assert only the final state below.
+    for _ in 0..8u32 {
+        raw_status(proxy, &host, "/status/500").await;
+    }
+
+    // The breaker is now open. The next request must be fail-fast 503.
+    let open_status = raw_status(proxy, &host, "/status/500").await;
+    assert_eq!(
+        open_status, 503,
+        "after the trip sequence the circuit breaker must fail-fast with 503 \
+         (circuit-breaker-threshold=50%, circuit-breaker-min-requests=4)"
+    );
+
+    // Metric: coxswain_proxy_circuit_breaker_state for this route must be 1 (open).
+    // Filter by ns.name to avoid matching entries from other concurrent tests.
+    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let ns_route = format!("route=\"ingress/{}/", ns.name);
+    assert!(
+        metrics.lines().any(|line| {
+            line.starts_with("coxswain_proxy_circuit_breaker_state{")
+                && line.contains(&ns_route)
+                && line.split_whitespace().last().is_some_and(|v| v == "1")
+        }),
+        "coxswain_proxy_circuit_breaker_state must equal 1 (open) for route in ns {}; \
+         metrics:\n{metrics}",
+        ns.name
+    );
+
+    // Metric: coxswain_proxy_circuit_breaker_rejected_total > 0 for this route.
+    assert!(
+        metrics.lines().any(|line| {
+            line.starts_with("coxswain_proxy_circuit_breaker_rejected_total{")
+                && line.contains(&ns_route)
+                && line
+                    .split_whitespace()
+                    .last()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .is_some_and(|n| n > 0)
+        }),
+        "coxswain_proxy_circuit_breaker_rejected_total must be > 0 for route in ns {}; \
+         metrics:\n{metrics}",
+        ns.name
+    );
+
+    Ok(())
+}
+
+/// Sad / recovery path (#282): after the breaker opens, `circuit-breaker-open-duration`
+/// expires and the breaker transitions to HalfOpen, allowing a probe request
+/// through. When the probe succeeds (upstream returns 200), the breaker closes
+/// and subsequent requests are served normally.
+///
+/// Also checks that `coxswain_proxy_circuit_breaker_state` is no longer `1`
+/// (open) and that `coxswain_proxy_circuit_breaker_transitions_total{to="closed"}`
+/// is > 0 after recovery.
+#[tokio::test]
+async fn breaker_closes_after_open_duration_when_upstream_recovers() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-cb-recover").await?;
+
+    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_CIRCUIT_BREAKER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("breaker.{}.local", ns.name);
+    let proxy = h.http.proxy_addr;
+
+    // Route readiness.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!(
+                "breaker.{}.local / route to return 200 from go-httpbin",
+                ns.name
+            )
+        },
+        || async {
+            if raw_status(proxy, &host, "/status/200").await == 200 {
+                Some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await?;
+
+    // Trip sequence: send enough errors to guarantee the breaker opens.
+    // (Readiness requests may already be in the window counter; we over-shoot
+    // min-requests to be robust to that.)
+    for _ in 0..8u32 {
+        raw_status(proxy, &host, "/status/500").await;
+    }
+
+    // Verify the breaker is open before testing recovery.
+    let open_status = raw_status(proxy, &host, "/status/500").await;
+    assert_eq!(
+        open_status, 503,
+        "breaker must be open (503) before the recovery window; \
+         if 500, the trip sequence did not open the breaker"
+    );
+
+    // Recovery: poll /status/200 until the proxy forwards it (200).
+    // After `circuit-breaker-open-duration` (2s) the breaker transitions to
+    // HalfOpen; the next permitted request goes to go-httpbin → 200 → closes.
+    // No bare sleep: poll_until waits on the real observable (200 response).
+    wait::poll_until(
+        Duration::from_secs(15),
+        wait::POLL_FAST,
+        || async { "circuit breaker to close (expecting 200 from /status/200)".to_string() },
+        || async {
+            if raw_status(proxy, &host, "/status/200").await == 200 {
+                Some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("circuit breaker did not close within 15 s: {e}"))?;
+
+    // Metric: state gauge for this route must not be 1 (open) after recovery.
+    // Filter by ns.name to avoid matching entries from other concurrent tests.
+    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let ns_route = format!("route=\"ingress/{}/", ns.name);
+    assert!(
+        !metrics.lines().any(|line| {
+            line.starts_with("coxswain_proxy_circuit_breaker_state{")
+                && line.contains(&ns_route)
+                && line.split_whitespace().last().is_some_and(|v| v == "1")
+        }),
+        "coxswain_proxy_circuit_breaker_state must not be 1 (open) for route in ns {} \
+         after recovery; metrics:\n{metrics}",
+        ns.name
+    );
+
+    // Metric: transitions_total{to="closed"} > 0 for this route proves the breaker closed.
+    assert!(
+        metrics.lines().any(|line| {
+            line.starts_with("coxswain_proxy_circuit_breaker_transitions_total{")
+                && line.contains(&ns_route)
+                && line.contains("to=\"closed\"")
+                && line
+                    .split_whitespace()
+                    .last()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .is_some_and(|n| n > 0)
+        }),
+        "coxswain_proxy_circuit_breaker_transitions_total{{to=\"closed\"}} must be > 0 \
+         for route in ns {} after the breaker closes; metrics:\n{metrics}",
+        ns.name
     );
 
     Ok(())

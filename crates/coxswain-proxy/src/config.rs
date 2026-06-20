@@ -4,6 +4,7 @@
 //! `coxswain-bin`) and stored on the proxy instances. They are intentionally
 //! independent of the bin crate so the proxy crate remains self-contained.
 
+use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::rate_limit::RateLimiterRegistry;
 use crate::upstream_ca::UpstreamCaCache;
 use coxswain_cache::ResponseCache;
@@ -43,6 +44,14 @@ pub struct SharedProxyConfig {
     /// Defaults to an empty store (no mTLS enforced) until the reflector's
     /// first reconcile cycle completes.
     pub client_certs: SharedClientCertStore,
+    /// Per-process per-endpoint circuit-breaker registry (#282).
+    ///
+    /// Keyed by `(metric_route_id, SocketAddr)`. Built once at startup; gated in
+    /// `upstream_peer` (fail-fast 503 when Open) and recorded in `logging` (success
+    /// or failure after each real upstream request). Gateway-API routes never carry
+    /// a `CircuitBreakerConfig` so the registry is only touched for Ingress routes
+    /// that configure `circuit-breaker-threshold`.
+    pub circuit_breakers: CircuitBreakerRegistry,
 }
 
 impl SharedProxyConfig {
@@ -66,6 +75,7 @@ impl SharedProxyConfig {
             rate_limiter,
             auth_client,
             client_certs: SharedClientCertStore::new(),
+            circuit_breakers: CircuitBreakerRegistry::new(),
         }
     }
 }

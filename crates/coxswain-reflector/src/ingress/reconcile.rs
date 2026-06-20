@@ -224,6 +224,8 @@ impl IngressReconciler {
         let compression = ann.compression.clone().map(Arc::new);
         // Build the trusted-proxy forwarded-IP config once and share one Arc across every path.
         let forwarded_for = ann.forwarded_for.clone().map(Arc::new);
+        // Build the circuit-breaker config once and share one Arc across every route entry.
+        let circuit_breaker = ann.circuit_breaker.clone().map(Arc::new);
 
         // One RouteEntry builder shared by all three insertion sites — rule path,
         // ssl-redirect variant, and spec.defaultBackend. Centralising the chain
@@ -249,6 +251,7 @@ impl IngressReconciler {
                 .with_auth(auth.clone())
                 .with_compression(compression.clone())
                 .with_forwarded_for(forwarded_for.clone())
+                .with_circuit_breaker(circuit_breaker.clone())
         };
 
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
