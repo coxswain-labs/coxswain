@@ -120,7 +120,7 @@ Proxy request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet
 
 Always include the issue reference in commit footers: `Refs #N` (intermediate work) or `Fixes #N` (final commit). Closing via `Fixes #N` auto-flips the Project's `Status` to `Done`; never manually close + flip.
 
-When a PR is approved for merge: `gh pr merge --squash --delete-branch`. Then ask the user before `git checkout main && git pull --ff-only origin main`.
+When a PR is approved for merge: squash-merge it (via the GitHub MCP merge tool). The repo auto-deletes the head branch on merge, so no `--delete-branch` flag or manual remote deletion is needed — only the local branch lingers. Then ask the user before `git checkout main && git pull --ff-only origin main`, and drop the merged local branch with `git branch -d issue-N`.
 
 ### Commit message convention
 
