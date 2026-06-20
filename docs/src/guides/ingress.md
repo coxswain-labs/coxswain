@@ -174,6 +174,91 @@ rules:
                 number: 80
 ```
 
+### Multiple Ingresses on the same host
+
+When multiple `Ingress` objects name the same host, Coxswain merges their paths automatically. Each `Ingress` is reconciled independently; all routes accumulate into a single per-host routing table, so serving different paths from separate `Ingress` objects works out of the box:
+
+```yaml
+# Ingress "api"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service     # serves /api/*
+                port:
+                  number: 80
+```
+
+```yaml
+# Ingress "web"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-service     # serves everything else
+                port:
+                  number: 80
+```
+
+Both `Ingress` objects are active simultaneously — `/api/*` goes to `api-service` and everything else to `web-service`.
+
+**Collision precedence**
+
+When two `Ingress` objects define the same `(host, path, pathType)`, exactly one wins. Since Ingress routes carry no method, header, or query predicates, Coxswain falls through to the timestamp tie-break: the `Ingress` with the **oldest `creationTimestamp`** serves the path; the newer one is shadowed. This matches ingress-nginx's default behaviour.
+
+```yaml
+# Ingress "old-app" — created first
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /foo
+            pathType: Prefix
+            backend:
+              service:
+                name: old-svc         # wins — created first
+                port:
+                  number: 80
+```
+
+```yaml
+# Ingress "new-app" — created later
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /foo
+            pathType: Prefix
+            backend:
+              service:
+                name: new-svc         # shadowed — created later
+                port:
+                  number: 80
+```
+
+`old-svc` wins; `new-svc` is shadowed and never receives traffic for `Prefix /foo`. Delete or rename the conflicting path in one of the `Ingress` objects to restore it. Conflicts are reported via `GET /api/v1/problems` (`routing.conflicts`) on the controller admin port.
+
+Routes with the same `(host, path)` but **different predicate conditions** — for example, an `HTTPRoute` rule with a method or header constraint on the same host and path — are not a conflict: they coexist and each serves its matching traffic.
+
+!!! note
+    The Kubernetes Ingress spec does not define how conflicts between `Ingress` objects on the same host are resolved — it delegates the behaviour to the controller. The merge model and precedence rules described here are Coxswain-specific.
+
 ### TLS
 
 Add a `spec.tls` block and reference a `kubernetes.io/tls` Secret in the same namespace. Coxswain reloads the cert automatically when the Secret changes. See the [TLS guide](tls.md) for cert-manager integration.
