@@ -25,7 +25,8 @@ use coxswain_e2e::{
 };
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
-use kube::api::{Api, Patch, PatchParams};
+use k8s_openapi::api::networking::v1::Ingress;
+use kube::api::{Api, DeleteParams, Patch, PatchParams};
 use reqwest::Method;
 use serde_json::json;
 use std::future::Future;
@@ -779,6 +780,128 @@ async fn catch_up_reconciles_gateway_created_during_controller_downtime() -> any
         Duration::from_secs(60),
     )
     .await?;
+
+    Ok(())
+}
+
+/// 21 — Controller catch-up after a watch-stream downtime window: route
+/// mutations and deletions committed to the API server while the controller is
+/// at zero replicas must be reflected on the data plane after the controller
+/// restarts and relists.
+///
+/// Two Ingresses are seeded and confirmed live on the data plane. With the
+/// controller scaled to zero, one Ingress is mutated (backend repointed from
+/// `echo-a` to `echo-b`) and the other is deleted. After the controller comes
+/// back and the shared proxy relists, the data plane must show the mutation
+/// (`echo-b` is the serving pod) and the deletion (404 — route removed from the
+/// routing table) — proving that neither a missed update event nor a missed
+/// delete event leaves a stale routing entry.
+#[tokio::test]
+async fn catch_up_reconciles_ingress_mutations_and_deletes_during_controller_downtime()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    // Persistent namespace: the second Harness::start() below runs bootstrap(),
+    // which purges namespaces labelled coxswain-e2e=true. A persistent namespace
+    // skips that label so the Ingresses we mutate during downtime survive the purge.
+    let ns = NamespaceGuard::create_persistent(&h.client, "ctrl-mu-del").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host_a = format!("catchup-a.{}.local", ns.name);
+    let host_b = format!("catchup-b.{}.local", ns.name);
+    let ingresses: Api<Ingress> = Api::namespaced(h.client.clone(), &ns.name);
+    let params = PatchParams::apply("e2e-test");
+
+    // ── Seed two Ingresses ────────────────────────────────────────────────────
+
+    // Ingress A: will be mutated (echo-a → echo-b) during downtime.
+    let ing_a = json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": { "name": "catchup-mutate", "namespace": &ns.name },
+        "spec": {
+            "ingressClassName": "coxswain",
+            "rules": [{ "host": &host_a, "http": { "paths": [{
+                "path": "/", "pathType": "Prefix",
+                "backend": { "service": { "name": "echo-a", "port": { "number": 3000 } } }
+            }] } }]
+        }
+    });
+    ingresses
+        .patch("catchup-mutate", &params, &Patch::Apply(&ing_a))
+        .await
+        .context("apply catchup-mutate ingress")?;
+
+    // Ingress B: will be deleted entirely during downtime.
+    let ing_b = json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": { "name": "catchup-delete", "namespace": &ns.name },
+        "spec": {
+            "ingressClassName": "coxswain",
+            "rules": [{ "host": &host_b, "http": { "paths": [{
+                "path": "/", "pathType": "Prefix",
+                "backend": { "service": { "name": "echo-a", "port": { "number": 3000 } } }
+            }] } }]
+        }
+    });
+    ingresses
+        .patch("catchup-delete", &params, &Patch::Apply(&ing_b))
+        .await
+        .context("apply catchup-delete ingress")?;
+
+    // Confirm data-plane baseline: both routes serve echo-a.
+    wait::wait_for_backend(&h.http, &host_a, "/", "echo-a", Duration::from_secs(60)).await?;
+    wait::wait_for_backend(&h.http, &host_b, "/", "echo-a", Duration::from_secs(60)).await?;
+
+    // ── Downtime window ───────────────────────────────────────────────────────
+
+    // Take the controller fully down; mutations below land while nothing is
+    // writing status or potentially re-reconciling stale state.
+    scale_controller(0).await?;
+
+    // Mutation: repoint catchup-mutate from echo-a to echo-b.
+    let ing_a_mutated = json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": { "name": "catchup-mutate", "namespace": &ns.name },
+        "spec": {
+            "ingressClassName": "coxswain",
+            "rules": [{ "host": &host_a, "http": { "paths": [{
+                "path": "/", "pathType": "Prefix",
+                "backend": { "service": { "name": "echo-b", "port": { "number": 3000 } } }
+            }] } }]
+        }
+    });
+    ingresses
+        .patch("catchup-mutate", &params, &Patch::Apply(&ing_a_mutated))
+        .await
+        .context("mutate catchup-mutate to echo-b during downtime")?;
+
+    // Deletion: remove catchup-delete so the proxy must eventually return 404.
+    ingresses
+        .delete("catchup-delete", &DeleteParams::default())
+        .await
+        .context("delete catchup-delete ingress during downtime")?;
+
+    // ── Controller restart + convergence assertions ───────────────────────────
+
+    scale_controller(1).await?;
+    let h2 = Harness::start().await?;
+    // Poll the real post-condition: new leader elected + at least one successful
+    // reconcile on the fresh process.
+    wait::wait_for_controller_reconciled(
+        &h2.controller_admin_url("/metrics"),
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Mutated route: proxy must serve echo-b (not stale echo-a).
+    wait::wait_for_backend(&h2.http, &host_a, "/", "echo-b", Duration::from_secs(60)).await?;
+
+    // Deleted route: proxy must return 404 (route removed from routing table).
+    wait::wait_for_route_status(&h2.http, &host_b, "/", 404, Duration::from_secs(60)).await?;
 
     Ok(())
 }
