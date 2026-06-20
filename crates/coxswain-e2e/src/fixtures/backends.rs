@@ -70,3 +70,14 @@ pub const ECHO_TWO_REPLICAS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/backends/echo_two_replicas.yaml"
 );
+
+/// Two-replica echo backend for endpoint-drain tests (#281).
+///
+/// Each pod carries a `preStop: sleep 20` hook and
+/// `terminationGracePeriodSeconds: 30` so a deleted pod stays
+/// `terminating+serving` for ~20 seconds — a deterministic window to verify
+/// that new requests are NOT routed to the terminating endpoint.
+pub const DRAIN_ECHO: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/drain_echo.yaml"
+);

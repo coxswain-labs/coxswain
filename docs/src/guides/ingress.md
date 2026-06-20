@@ -198,7 +198,21 @@ spec:
                   number: 80
 ```
 
-The referenced Secret must have `type: kubernetes.io/tls` with `tls.crt` and `tls.key`:
+The referenced Secret must have `type: kubernetes.io/tls` with `tls.crt` and `tls.key`.
+
+## Graceful endpoint removal
+
+When a pod is deleted (rolling deploy, scale-down, preStop hook), the Kubernetes EndpointSlice
+controller marks its endpoint `terminating=true`. Coxswain's reflector reads this condition and
+immediately removes the endpoint from the active routing pool: **no new requests are sent to the
+pod once it enters the terminating state**.
+
+Requests that are already in flight on an open connection to that pod complete naturally — the
+underlying TCP stream is unaffected by routing-table swaps, so in-flight work is not interrupted.
+New requests are routed to the remaining healthy endpoints.
+
+The effective drain window is bounded by the pod's `terminationGracePeriodSeconds`. Design your
+`preStop` hooks to complete within this budget.
 
 ```yaml
 apiVersion: v1

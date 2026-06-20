@@ -1,0 +1,53 @@
+# Two-replica echo backend for endpoint-drain tests (#281).
+#
+# Each pod carries a preStop sleep hook so a deleted pod stays terminating+serving
+# for ~20 seconds — a deterministic window to observe whether new requests are
+# routed to it. terminationGracePeriodSeconds: 30 ensures SIGKILL only fires after
+# the preStop hook completes.
+#
+# Host: drain-ep.TESTNS.local → drain-echo:3000.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drain-echo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: drain-echo
+  template:
+    metadata:
+      labels:
+        app: drain-echo
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: echo
+          image: ${ECHO_IMAGE}
+          ports:
+            - containerPort: 3000
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 20"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drain-echo
+spec:
+  selector:
+    app: drain-echo
+  ports:
+    - port: 3000
+      targetPort: 3000
