@@ -312,4 +312,12 @@ pub const ANNOTATION_PATH_NORMALIZE_MERGE_SLASHES: &str =
 /// path — raw path miss).
 pub const ANNOTATION_PATH_NORMALIZE_NONE: &str = fixture!("annotation_path_normalize_none.yaml");
 
+// ── endpoint drain (#281) ────────────────────────────────────────────────────
+
+/// Plain Ingress routing `drain-ep.<namespace>.local → drain-echo:3000` (#281).
+///
+/// Used with [`backends::DRAIN_ECHO`] to verify that no new requests reach a
+/// terminating endpoint after it enters the `terminating=true` state.
+pub const DRAIN_INGRESS: &str = fixture!("drain_ingress.yaml");
+
 // ── satisfy any/all (#273) ────────────────────────────────────────────────────

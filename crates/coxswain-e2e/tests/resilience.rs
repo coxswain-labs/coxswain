@@ -20,13 +20,14 @@
 use anyhow::Context as _;
 use coxswain_e2e::{
     FixtureVars, Harness, HttpClient, NamespaceGuard,
-    fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa},
+    fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress as ing},
     harness::wait,
 };
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::networking::v1::Ingress;
-use kube::api::{Api, DeleteParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use reqwest::Method;
 use serde_json::json;
 use std::future::Future;
@@ -902,6 +903,111 @@ async fn catch_up_reconciles_ingress_mutations_and_deletes_during_controller_dow
 
     // Deleted route: proxy must return 404 (route removed from routing table).
     wait::wait_for_route_status(&h2.http, &host_b, "/", 404, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
+// ── Scenario: terminating endpoint excluded from active pool (#281) ───────────
+
+/// A terminating pod must receive no new requests while the proxy routing table
+/// reflects the `terminating=true` EndpointSlice condition.
+///
+/// Setup: 2-replica `drain-echo` backend with a 20-second `preStop` hook so the
+/// pod keeps serving during the drain window. One pod is deleted; the proxy must
+/// stop routing to it BEFORE the pod exits.
+///
+/// This test is the Phase-0 empirical check as well as the happy-path assertion:
+/// it FAILS before the reflector's `terminating` exclusion fix is applied
+/// (confirming the bug) and PASSES after the fix lands.
+#[tokio::test]
+async fn no_requests_reach_terminating_endpoint_during_drain() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "drain-ep").await?;
+
+    fixtures::apply_fixture(backends::DRAIN_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["drain-echo"]).await?;
+
+    fixtures::apply_fixture(ing::DRAIN_INGRESS, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("drain-ep.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(30)).await?;
+
+    // Discover the two running pods.
+    let pods_api: Api<Pod> = Api::namespaced(h.client.clone(), &ns.name);
+    let pod_list = pods_api
+        .list(&ListParams::default().labels("app=drain-echo"))
+        .await
+        .context("list drain-echo pods")?;
+    anyhow::ensure!(
+        pod_list.items.len() == 2,
+        "expected 2 drain-echo pods, got {}",
+        pod_list.items.len()
+    );
+    let target_pod = pod_list.items[0]
+        .metadata
+        .name
+        .clone()
+        .context("pod has no name")?;
+
+    // Delete the first pod with the default grace period (preStop hook runs).
+    pods_api
+        .delete(&target_pod, &DeleteParams::default())
+        .await
+        .context("delete target pod")?;
+
+    // Poll until the pod has a deletionTimestamp (K8s acknowledged the delete;
+    // the preStop hook is now running — pod keeps serving for ~20 s).
+    {
+        let pods_api = pods_api.clone();
+        let target_pod = target_pod.clone();
+        wait::poll_until(
+            Duration::from_secs(10),
+            wait::POLL_FAST,
+            || async { format!("pod {target_pod} to have deletionTimestamp") },
+            || async {
+                pods_api
+                    .get(&target_pod)
+                    .await
+                    .ok()
+                    .filter(|p| p.metadata.deletion_timestamp.is_some())
+                    .map(|_| ())
+            },
+        )
+        .await
+        .context("pod deletion not acknowledged")?;
+    }
+
+    // Poll until N consecutive requests all land on the surviving pod.
+    // - Happy path (fix applied): the reflector stops routing to the terminating
+    //   endpoint within ~2 s; this loop exits quickly.
+    // - Sad path (bug present): the terminating pod keeps receiving traffic
+    //   indefinitely; this loop times out → test fails, confirming the bug.
+    //
+    // Timeout (15 s) is well within the preStop window (20 s), so the assertion
+    // fires while the pod is still alive and capable of serving.
+    const BURST: usize = 20;
+    wait::poll_until(
+        Duration::from_secs(15),
+        wait::POLL,
+        || async {
+            format!("all {BURST} consecutive requests to avoid terminating pod {target_pod}")
+        },
+        || async {
+            let mut all_avoided = true;
+            for _ in 0..BURST {
+                match h.http.get(&host, "/").await {
+                    Ok(resp) if resp.pod.as_deref() == Some(target_pod.as_str()) => {
+                        all_avoided = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if all_avoided { Some(()) } else { None }
+        },
+    )
+    .await
+    .context("terminating endpoint still received new requests during drain window")?;
 
     Ok(())
 }

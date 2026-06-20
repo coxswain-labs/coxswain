@@ -107,10 +107,26 @@ pub(crate) fn resolve(
             continue;
         }
         for ep in &slice.endpoints {
+            let cond = ep.conditions.as_ref();
+
+            // Exclude terminating endpoints unconditionally — they must not
+            // receive new requests regardless of the `drain-timeout` annotation
+            // value. This matches the K8s EndpointSlice spec: `terminating=true`
+            // means the pod's deletion has been acknowledged; the preStop hook may
+            // still be running, but routing new traffic to it races the shutdown.
+            if cond.is_some_and(|c| c.terminating == Some(true)) {
+                tracing::debug!(
+                    ns,
+                    svc,
+                    addrs = ?ep.addresses,
+                    "Skipping terminating endpoint"
+                );
+                continue;
+            }
+
             // `serving` is authoritative when set (K8s 1.22+); fall back to `ready`
             // for older clusters. Skip only when the effective signal is explicitly
             // false; treat unknown (None) as eligible.
-            let cond = ep.conditions.as_ref();
             let eligible = cond.and_then(|c| c.serving.or(c.ready));
             if eligible == Some(false) {
                 continue;
@@ -145,7 +161,8 @@ pub(crate) fn resolve(
 mod tests {
     use crate::endpoints::resolve;
     use crate::tests::fixtures::{
-        empty_svc_store, make_slice_with_conditions, make_svc_store, slice_store,
+        empty_svc_store, make_slice_with_all_conditions, make_slice_with_conditions,
+        make_svc_store, slice_store,
     };
     use coxswain_core::routing::BackendProtocol;
     use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
@@ -377,6 +394,88 @@ mod tests {
                 .addrs
                 .len(),
             1
+        );
+    }
+
+    // --- terminating condition tests (#281) ---
+
+    #[test]
+    fn resolve_excludes_terminating_endpoints_regardless_of_serving() {
+        // terminating=true + serving=true: endpoint is shutting down — must be excluded
+        // so new requests do not race the pod's preStop hook.
+        let store = slice_store(vec![make_slice_with_all_conditions(
+            "ns",
+            "svc",
+            "10.0.0.1",
+            Some(true),
+            Some(true),
+            Some(true),
+        )]);
+        assert!(
+            resolve("ns", "svc", 8080, &store, &empty_svc_store())
+                .addrs
+                .is_empty(),
+            "terminating=true must exclude even when serving=true"
+        );
+    }
+
+    #[test]
+    fn resolve_excludes_terminating_endpoints_with_unknown_serving() {
+        // terminating=true + serving=None: older cluster; still must exclude.
+        let store = slice_store(vec![make_slice_with_all_conditions(
+            "ns",
+            "svc",
+            "10.0.0.1",
+            None,
+            Some(true),
+            Some(true),
+        )]);
+        assert!(
+            resolve("ns", "svc", 8080, &store, &empty_svc_store())
+                .addrs
+                .is_empty(),
+            "terminating=true must exclude even when serving is unset"
+        );
+    }
+
+    #[test]
+    fn resolve_includes_non_terminating_endpoints_normally() {
+        // terminating=false: endpoint is live — must be included as normal.
+        let store = slice_store(vec![make_slice_with_all_conditions(
+            "ns",
+            "svc",
+            "10.0.0.1",
+            Some(true),
+            Some(true),
+            Some(false),
+        )]);
+        assert_eq!(
+            resolve("ns", "svc", 8080, &store, &empty_svc_store())
+                .addrs
+                .len(),
+            1,
+            "terminating=false must not exclude the endpoint"
+        );
+    }
+
+    #[test]
+    fn resolve_includes_endpoint_when_terminating_unset() {
+        // terminating=None: condition absent (pre-1.22 or not yet set) — keep existing
+        // serving/ready gate behaviour with no additional exclusion.
+        let store = slice_store(vec![make_slice_with_all_conditions(
+            "ns",
+            "svc",
+            "10.0.0.1",
+            Some(true),
+            Some(true),
+            None,
+        )]);
+        assert_eq!(
+            resolve("ns", "svc", 8080, &store, &empty_svc_store())
+                .addrs
+                .len(),
+            1,
+            "terminating=None must not exclude the endpoint"
         );
     }
 

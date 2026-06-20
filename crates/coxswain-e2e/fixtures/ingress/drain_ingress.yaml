@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: drain-ingress
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: drain-ep.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: drain-echo
+                port:
+                  number: 3000

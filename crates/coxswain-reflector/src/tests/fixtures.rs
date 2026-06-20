@@ -16,6 +16,18 @@ pub(crate) fn make_slice_with_conditions(
     serving: Option<bool>,
     ready: Option<bool>,
 ) -> EndpointSlice {
+    make_slice_with_all_conditions(ns, svc, ip, serving, ready, None)
+}
+
+/// Like [`make_slice_with_conditions`] but also sets `terminating`.
+pub(crate) fn make_slice_with_all_conditions(
+    ns: &str,
+    svc: &str,
+    ip: &str,
+    serving: Option<bool>,
+    ready: Option<bool>,
+    terminating: Option<bool>,
+) -> EndpointSlice {
     let mut labels = BTreeMap::new();
     labels.insert("kubernetes.io/service-name".to_string(), svc.to_string());
     EndpointSlice {
@@ -31,6 +43,7 @@ pub(crate) fn make_slice_with_conditions(
             conditions: Some(EndpointConditions {
                 serving,
                 ready,
+                terminating,
                 ..Default::default()
             }),
             ..Default::default()
