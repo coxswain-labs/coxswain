@@ -10,6 +10,13 @@
 //! `String` for query); everything downstream — routing lookup, upstream
 //! selection, metric emission, and error counters — runs allocation-free.
 //!
+//! Path normalization (#280) runs inside [`RoutingEngine::find`].  The
+//! common case (path already canonical) costs one linear scan and zero
+//! allocation; the slow path allocates exactly one `String` (and one
+//! `Arc<str>` to box it) only when the path actually changes.  When the path
+//! changed, [`upstream_request_filter`] rewrites the upstream request clone
+//! before traffic filters run, so the normalized path is forwarded upstream.
+//!
 //! Metric label rendering used to allocate a `String` per `u16` port and
 //! status code (regression introduced by #237/#239 access logging + metrics);
 //! both labels now write into stack-only [`itoa::Buffer`]s. The optional
@@ -161,6 +168,18 @@ pub(crate) async fn request_filter<K>(
         return Ok(true);
     };
 
+    // Adopt the normalized path (#280): the routing layer applies normalization
+    // inside `find()` and surfaces the result in `m.normalized_path` when the
+    // path actually changed.  Use it as the canonical path everywhere downstream
+    // — redirect URL construction, consistent-hash key, and the `original_path`
+    // forwarded upstream — so all handlers agree on the same form.  When
+    // normalization is `none` or the path was already canonical, `normalized_path`
+    // is `None` (zero allocation) and we fall back to the raw captured `path`.
+    let effective_path = m
+        .normalized_path
+        .clone()
+        .unwrap_or_else(|| Arc::clone(&path));
+
     // Resolve the effective client IP once per request (#271).  When the matched route
     // carries a ForwardedForConfig, the IP is extracted from the configured header
     // (subject to the trusted-CIDR anti-spoofing gate); otherwise the PROXY-protocol
@@ -281,7 +300,7 @@ pub(crate) async fn request_filter<K>(
         proto,
         &host,
         port,
-        &path,
+        &effective_path,
         query.as_deref(),
     )
     .await?
@@ -319,7 +338,7 @@ pub(crate) async fn request_filter<K>(
     ctx.hash_key = extract_hash_key(
         session.req_header(),
         &m.backend_group,
-        &path,
+        &effective_path,
         query.as_deref(),
         ctx.client_ip,
     );
@@ -329,7 +348,7 @@ pub(crate) async fn request_filter<K>(
         filters: m.filters,
         timeouts,
         original_host: host,
-        original_path: path,
+        original_path: effective_path,
         path_pattern: m.path_pattern,
         metric_route_id: m.metric_route_id,
         cache_enabled: m.cache_enabled,
@@ -1049,6 +1068,22 @@ pub(crate) async fn upstream_request_filter(
         .as_ref()
         .map(|r| (r.filters.as_ref(), &*r.original_host, &*r.original_path))
         .unwrap_or((&[], "", ""));
+
+    // Forward the normalized path (#280): if path normalization changed the
+    // downstream path (e.g. `merge-slashes` collapsed `//`), `original_path`
+    // carries the normalized form while `upstream_request` still holds the raw
+    // downstream bytes.  Rewrite the clone here so all traffic filters below
+    // see the correct base path and the upstream receives the normalized form.
+    if !original_path.is_empty() && upstream_request.uri.path() != original_path {
+        let pq = match upstream_request.uri.query() {
+            Some(q) => format!("{original_path}?{q}"),
+            None => original_path.to_string(),
+        };
+        if let Ok(uri) = http::Uri::builder().path_and_query(pq.as_str()).build() {
+            upstream_request.set_uri(uri);
+        }
+    }
+
     TrafficFilter::apply_request_filters(
         upstream_request,
         filters,
