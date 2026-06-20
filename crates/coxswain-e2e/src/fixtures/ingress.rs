@@ -290,4 +290,26 @@ pub const ANNOTATION_LOAD_BALANCE_HASH_URI: &str =
 pub const ANNOTATION_LOAD_BALANCE_HASH_HEADER: &str =
     fixture!("annotation_load_balance_hash_header.yaml");
 
+// ── path-normalize (#280) ─────────────────────────────────────────────────────
+
+/// No annotation (default `base` normalization): routes `/v1` and `/api/v1` on
+/// `pn-default.<namespace>.local`. Used to verify that `%2E%2E` encoded
+/// dot-dot segments are decoded and removed under the default level, and that
+/// `%2F` stays encoded (traversal guard).
+pub const ANNOTATION_PATH_NORMALIZE_DEFAULT: &str =
+    fixture!("annotation_path_normalize_default.yaml");
+
+/// `ingress.coxswain-labs.dev/path-normalize: merge-slashes` (#280): route
+/// `/api/v1` on `pn-merge.<namespace>.local`. Used to verify that consecutive
+/// slashes (`/api//v1`) are collapsed before routing under `merge-slashes`, and
+/// that they are NOT collapsed under the default `base` level (sad path).
+pub const ANNOTATION_PATH_NORMALIZE_MERGE_SLASHES: &str =
+    fixture!("annotation_path_normalize_merge_slashes.yaml");
+
+/// `ingress.coxswain-labs.dev/path-normalize: none` (#280): route `/v1` on
+/// `pn-none.<namespace>.local`. Used to verify that normalization is fully
+/// disabled: a request with `%2E%2E` in the path does not reach `/v1` (sad
+/// path — raw path miss).
+pub const ANNOTATION_PATH_NORMALIZE_NONE: &str = fixture!("annotation_path_normalize_none.yaml");
+
 // ── satisfy any/all (#273) ────────────────────────────────────────────────────

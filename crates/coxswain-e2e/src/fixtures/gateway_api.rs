@@ -104,3 +104,10 @@ pub const BACKEND_TLS_POLICY_CROSS_NAMESPACE_ROUTE: &str =
 /// BackendTLSPolicy cross-namespace (tenant side).
 pub const BACKEND_TLS_POLICY_CROSS_NAMESPACE_TENANT: &str =
     fixture!("backend_tls_policy_cross_namespace_tenant.yaml");
+
+// ── path-normalize (#280) ─────────────────────────────────────────────────────
+
+/// Default `base` normalization applies to Gateway API HTTPRoutes with no
+/// per-route annotation. Used to verify that `%2E%2E` encoded dot-dot segments
+/// are decoded and removed so the route `/v1` is reachable via `/api/%2E%2E/v1`.
+pub const PATH_NORMALIZE_DEFAULT: &str = fixture!("path_normalize_default.yaml");

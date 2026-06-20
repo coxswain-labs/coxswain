@@ -1555,3 +1555,196 @@ async fn request_redirect_returns_various_status_codes() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ── path-normalize (#280) ─────────────────────────────────────────────────────
+
+/// `path-normalize` default `base`: a `%2E%2E`-encoded dot-dot segment is
+/// decoded (unreserved-char decode step) and then removed by dot-segment
+/// removal, so a request for `/api/%2E%2E/v1` routes to the `/v1` prefix and
+/// the upstream sees `/v1`.
+///
+/// Uses a percent-encoded path to bypass client-side URL normalization —
+/// `reqwest` resolves literal `..` segments before sending, but preserves
+/// `%2E%2E` as-is. This lets the proxy be the sole normalizer.
+#[tokio::test]
+async fn encoded_dot_segment_resolved_at_base_by_default() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "pn-base-happy").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_PATH_NORMALIZE_DEFAULT,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("pn-default.{}.local", ns.name);
+    // Prime the route (waits until /v1 is reachable).
+    wait::wait_for_route(&h.http, &host, "/v1", Duration::from_secs(60)).await?;
+
+    // Now request /api/%2E%2E/v1 — the proxy must normalise to /v1 and forward it.
+    let resp = h.http.get(&host, "/api/%2E%2E/v1").await?;
+    assert_eq!(
+        resp.path.as_deref(),
+        Some("/v1"),
+        "upstream must see the dot-segment-resolved path /v1, not the original /api/%2E%2E/v1"
+    );
+
+    Ok(())
+}
+
+/// `path-normalize` default `base`: the encoded slash `%2F` is NOT decoded at
+/// the `base` level (only `decode-and-merge-slashes` decodes it). A request
+/// for `/api%2Fv1` therefore does not match the `/api/v1` prefix route and the
+/// proxy returns 404 — proving the security guard against path-traversal via
+/// encoded slashes is active by default.
+#[tokio::test]
+async fn encoded_slash_not_decoded_at_base() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "pn-enc-slash").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_PATH_NORMALIZE_DEFAULT,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("pn-default.{}.local", ns.name);
+    // Prime with a clean path to ensure the route table is live.
+    wait::wait_for_route(&h.http, &host, "/api/v1", Duration::from_secs(60)).await?;
+
+    // /api%2Fv1 must NOT match /api/v1 (no slash between segments at the routing layer).
+    let status = h.http.get_status(&host, "/api%2Fv1").await?;
+    assert_eq!(
+        status, 404,
+        "encoded %2F must not be decoded at base level — /api%2Fv1 must not match /api/v1"
+    );
+
+    Ok(())
+}
+
+/// `path-normalize: merge-slashes` collapses consecutive slashes before
+/// routing, so `/api//v1` matches the `/api/v1` prefix route and the upstream
+/// sees the normalised `/api/v1`.
+#[tokio::test]
+async fn double_slash_collapsed_when_merge_slashes() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "pn-merge-happy").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_PATH_NORMALIZE_MERGE_SLASHES,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("pn-merge.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/api/v1", Duration::from_secs(60)).await?;
+
+    // /api//v1 → collapsed to /api/v1 → matches → upstream sees /api/v1.
+    let resp = h.http.get(&host, "/api//v1").await?;
+    assert_eq!(
+        resp.path.as_deref(),
+        Some("/api/v1"),
+        "upstream must see the slash-merged path /api/v1, not the original /api//v1"
+    );
+
+    Ok(())
+}
+
+/// Default `base` normalization does NOT merge consecutive slashes.  A request
+/// for `/api//v1` does not match the `/api/v1` prefix route and returns 404 —
+/// proving that slash merging is opt-in via `merge-slashes`.
+#[tokio::test]
+async fn double_slash_not_collapsed_at_base() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "pn-merge-sad").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_PATH_NORMALIZE_DEFAULT,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("pn-default.{}.local", ns.name);
+    // Prime with the exact clean path — proves the routing table is live.
+    wait::wait_for_route(&h.http, &host, "/api/v1", Duration::from_secs(60)).await?;
+
+    // /api//v1 should NOT match /api/v1 at base (no slash merging).
+    let status = h.http.get_status(&host, "/api//v1").await?;
+    assert_eq!(
+        status, 404,
+        "consecutive slashes must not be merged at base level — /api//v1 must not match /api/v1"
+    );
+
+    Ok(())
+}
+
+/// `path-normalize: none` disables normalization entirely: the raw request path
+/// is matched AND forwarded verbatim.  Send `/v1/%7E` (tilde percent-encoded);
+/// both `none` and `base` match the `/v1` prefix (via the `{*rest}` wildcard),
+/// but `base` decodes `%7E` → `~` before forwarding while `none` forwards the
+/// raw `%7E`.  Asserting `resp.path == "/v1/%7E"` proves end-to-end that no
+/// decoding occurred on the forwarded path.
+#[tokio::test]
+async fn normalization_disabled_when_none() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "pn-none-sad").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_PATH_NORMALIZE_NONE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("pn-none.{}.local", ns.name);
+    // Prime the route table with the clean path.
+    wait::wait_for_route(&h.http, &host, "/v1", Duration::from_secs(60)).await?;
+
+    // /v1/%7E matches the /v1 prefix (rest = %7E); with none the upstream sees
+    // the encoded form — no decoding, no rewriting.
+    let resp = h.http.get(&host, "/v1/%7E").await?;
+    assert_eq!(
+        resp.path.as_deref(),
+        Some("/v1/%7E"),
+        "with path-normalize: none, %7E must reach the upstream undecoded"
+    );
+
+    Ok(())
+}
+
+/// Gateway API `HTTPRoute`s default to `base` normalization (no per-route
+/// annotation; the default is infrastructure-level, mirroring Istio).  A
+/// request for `/api/%2E%2E/v1` reaches the `/v1` prefix route and the
+/// upstream sees the normalised `/v1`.
+#[tokio::test]
+async fn gateway_route_encoded_dot_segment_resolved_by_default() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "pn-gw-base").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::PATH_NORMALIZE_DEFAULT, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("pn-gw.{}.local", ns.name);
+    // Wait for the probe path to confirm the Gateway + HTTPRoute are live.
+    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+
+    // Send /api/%2E%2E/v1 — proxy must normalise and route to /v1.
+    let resp = h.gateway_http.get(&host, "/api/%2E%2E/v1").await?;
+    assert_eq!(
+        resp.path.as_deref(),
+        Some("/v1"),
+        "Gateway HTTPRoute: upstream must see /v1 after dot-segment removal from /api/%2E%2E/v1"
+    );
+
+    Ok(())
+}
