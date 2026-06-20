@@ -7,7 +7,8 @@
 //! [`crate::routing::gateway`][crate::routing::gateway] sub-modules instantiate
 //! this generic via type aliases and supply the marker types.
 
-use super::entry::{BackendGroup, RouteConflict};
+use super::backend::BackendGroup;
+use super::entry::RouteConflict;
 use super::host_router::{HostRouter, RouteMatch};
 use super::port::{PortRoutingTable, PortTableBuilder};
 use super::predicate::RequestContext;
@@ -179,6 +180,7 @@ impl<Kind> RoutingTableBuilder<Kind> {
     /// Returns [`RouterError::MatchitInsert`] if a path pattern was rejected by
     /// the `matchit` router, or [`RouterError::Regex`] if a regex pattern
     /// failed to compile.
+    #[must_use = "the built RoutingTable is the reconcile output; dropping it discards all routes"]
     pub fn build(self) -> Result<RoutingTable<Kind>, RouterError> {
         let mut conflicts: Vec<RouteConflict> = Vec::new();
         let mut by_port: HashMap<u16, PortRoutingTable> = HashMap::new();

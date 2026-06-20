@@ -40,7 +40,7 @@ async fn status_reports_load_balancer_ip() -> anyhow::Result<()> {
         ..Default::default()
     })
     .await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-lb-status").await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-ing-lb-status").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -64,7 +64,7 @@ async fn status_reports_load_balancer_ip() -> anyhow::Result<()> {
 #[tokio::test]
 async fn gateway_becomes_accepted_and_programmed() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-status").await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-status").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -99,7 +99,7 @@ async fn gateway_becomes_accepted_and_programmed() -> anyhow::Result<()> {
 #[tokio::test]
 async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-gen-tracking").await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-gen-tracking").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -246,7 +246,7 @@ async fn gatewayclass_supported_features() -> anyhow::Result<()> {
 #[tokio::test]
 async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-status-clusterip").await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-dedgw-status-clusterip").await?;
 
     fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_CLUSTERIP,
@@ -332,7 +332,7 @@ async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow
 #[tokio::test]
 async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-status-lb").await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-dedgw-status-lb").await?;
 
     fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_LOADBALANCER,
@@ -461,7 +461,7 @@ async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> any
 #[tokio::test]
 async fn invalid_parameters_yields_accepted_false_invalid_parameters() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "dedgw-status-invalid").await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-dedgw-status-invalid").await?;
 
     fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_INVALID_PARAMS,
@@ -525,7 +525,7 @@ async fn invalid_parameters_yields_accepted_false_invalid_parameters() -> anyhow
 #[tokio::test]
 async fn lifecycle_gateway_status_conditions_and_addresses() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ded-life-status").await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-ded-life-status").await?;
 
     fixtures::apply_fixture(dedicated::PROVISIONING, FixtureVars::new(&ns.name)).await?;
 
@@ -641,7 +641,7 @@ async fn ingress_status_skips_unowned_ingress_class() -> anyhow::Result<()> {
         ..Default::default()
     })
     .await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-foreign-class").await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-ing-foreign-class").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -844,7 +844,7 @@ async fn gateway_address_empty_allocates_dynamically() -> anyhow::Result<()> {
         ..Default::default()
     })
     .await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-empty-addr").await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-empty-addr").await?;
 
     fixtures::apply_fixture(gwa::EMPTY_ADDRESS, FixtureVars::new(&ns.name)).await?;
 

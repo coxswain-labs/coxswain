@@ -44,6 +44,7 @@ use coxswain_cache::ResponseCache;
 use coxswain_core::routing::{
     BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HashSource, RateLimitKey,
     RequestContext, RetryOn, RouteTimeouts, SessionAffinity, UpstreamCa, affinity_hash,
+    affinity_hash_parts,
 };
 use coxswain_core::tls::{ClientCertConfigState, SharedClientCertStore};
 use http::header;
@@ -129,8 +130,7 @@ pub(crate) async fn request_filter<K>(
     ctx.start.get_or_insert_with(Instant::now);
 
     let req = session.req_header();
-    let mut host_buf = String::new();
-    let host: Arc<str> = Arc::from(extract_host(req, &mut host_buf));
+    let host: Arc<str> = Arc::from(extract_host(req));
     let path: Arc<str> = Arc::from(req.uri.path());
     let query = req.uri.query().map(str::to_string);
     // PROXY-protocol path sets real_client_proto directly; standard Pingora TLS path
@@ -269,7 +269,13 @@ pub(crate) async fn request_filter<K>(
                 rate_limiter.check(&m.metric_route_id, cfg, key)
             {
                 let mut resp = ResponseHeader::build(429, Some(1))?;
-                resp.insert_header(header::RETRY_AFTER, retry_after_secs.to_string())?;
+                // Render the u16 Retry-After into a stack buffer — matches the
+                // file's itoa label discipline, no heap allocation (#397).
+                let mut retry_after_buf = itoa::Buffer::new();
+                resp.insert_header(
+                    header::RETRY_AFTER,
+                    retry_after_buf.format(retry_after_secs),
+                )?;
                 session
                     .write_response_header(Box::new(resp), true)
                     .await
@@ -408,9 +414,11 @@ pub(crate) async fn request_filter<K>(
             .unwrap_or_else(|| panic!("invariant: resolved is Some after assignment above"))
             .original_path
             .clone();
-        let path_and_query = match query.as_deref() {
-            Some(q) => format!("{original_path}?{q}"),
-            None => original_path.as_ref().to_string(),
+        // Reuse the captured `Arc<str>` when there is no query to append — only the
+        // query arm allocates (#397).
+        let path_and_query: Arc<str> = match query.as_deref() {
+            Some(q) => Arc::from(format!("{original_path}?{q}")),
+            None => Arc::clone(&original_path),
         };
 
         let dispatch = MirrorDispatch {
@@ -438,9 +446,9 @@ pub(crate) async fn request_filter<K>(
 /// Extract and hash the configured `load-balance: hash:*` attribute value from the request.
 ///
 /// Returns `None` when the group uses a non-`Hash` algorithm (zero-overhead fast path),
-/// or when the attribute is absent/empty (caller falls back to round-robin). For `Uri`,
-/// one `String` allocation is made when a query string is present; all other variants
-/// are borrow-only (no allocation).
+/// or when the attribute is absent/empty (caller falls back to round-robin). Every
+/// variant is allocation-free: `Uri` streams FNV-1a over `path`, `b"?"`, and `query`
+/// via [`affinity_hash_parts`] rather than building a joined `String` (#397).
 fn extract_hash_key(
     req: &RequestHeader,
     group: &coxswain_core::routing::BackendGroup,
@@ -449,14 +457,11 @@ fn extract_hash_key(
     client_ip: Option<std::net::IpAddr>,
 ) -> Option<u64> {
     match group.hash_by()? {
-        HashSource::Uri => {
-            // Hash path + optional "?query" — one allocation only when a query is present.
-            let key = match query {
-                Some(q) => format!("{path}?{q}"),
-                None => return Some(affinity_hash(path.as_bytes())),
-            };
-            Some(affinity_hash(key.as_bytes()))
-        }
+        HashSource::Uri => Some(match query {
+            // Same byte sequence as `path ++ "?" ++ query`, hashed in place.
+            Some(q) => affinity_hash_parts(&[path.as_bytes(), b"?", q.as_bytes()]),
+            None => affinity_hash(path.as_bytes()),
+        }),
         HashSource::SourceIp => client_ip.map(|ip| match ip {
             std::net::IpAddr::V4(v4) => affinity_hash(&v4.octets()),
             std::net::IpAddr::V6(v6) => affinity_hash(&v6.octets()),
@@ -958,9 +963,13 @@ pub(crate) async fn upstream_peer(
                 }
                 _ => None, // non-exhaustive guard
             };
+            // SNI must be an owned `String`: `HttpPeer::new` takes ownership, so a
+            // fresh allocation is unavoidable here regardless of any cache (#397).
+            // This is once per outbound TLS connection, not per request.
             (true, btls.sni.to_string(), btls.group_key, ca)
         } else if protocol.is_tls() {
             // appProtocol-driven TLS: use the request Host as SNI (existing behaviour).
+            // Owned for the same `HttpPeer::new` reason as the BackendTLSPolicy arm.
             (true, resolved.original_host.to_string(), 0u64, None)
         } else {
             (false, String::new(), 0u64, None)
@@ -1616,12 +1625,11 @@ pub(crate) async fn logging(
     }
 
     // Prefer the pre-resolved host from context; fall back to parsing the header.
-    let mut host_buf = String::new();
     let host: &str = ctx
         .resolved
         .as_ref()
         .map(|r| r.original_host.as_ref())
-        .unwrap_or_else(|| extract_host(req, &mut host_buf));
+        .unwrap_or_else(|| extract_host(req));
 
     let upstream = ctx.resolved.as_ref().map(|r| r.backend_group.name());
     let route_id = ctx.resolved.as_ref().map(|r| r.metric_route_id.as_ref());

@@ -86,7 +86,10 @@ pub(crate) struct MirrorDispatch {
     /// Original `Host` header value (forwarded as the mirror `Host`).
     pub host: Arc<str>,
     /// Path-and-query component, e.g. `/foo?bar=1` (forwarded verbatim).
-    pub path_and_query: String,
+    ///
+    /// `Arc<str>` so the no-query mirror arm can reuse the captured request path
+    /// without a copy (#397); matches the sibling [`Self::host`].
+    pub path_and_query: Arc<str>,
     /// Forwardable request headers (hop-by-hop stripped, `Host` excluded).
     pub headers: Vec<(String, String)>,
 }
@@ -258,4 +261,5 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 184);
 // ProxyCtx: +16 for client_ip: Option<IpAddr> (17 bytes packed into existing alignment gap by Rust layout; 568→584) (#271).
 // ProxyCtx: +8 for lb_track: Option<u32> (discriminant + padding + u32 = 8 bytes; 584→592) (#275).
 // ProxyCtx: +16 for hash_key: Option<u64> (discriminant padded to u64 align; 592→608) (#276).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 608);
+// ProxyCtx: -8 for MirrorDispatch.path_and_query String→Arc<str> (16 not 24; #397) (608→600).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 600);

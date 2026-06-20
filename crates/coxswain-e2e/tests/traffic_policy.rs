@@ -38,7 +38,7 @@ mod common;
 #[tokio::test]
 async fn annotation_connect_retry_retries_failed_connect() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-retry").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-retry").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -77,7 +77,7 @@ async fn annotation_connect_retry_retries_failed_connect() -> anyhow::Result<()>
 #[tokio::test]
 async fn annotation_connect_timeout_returns_502() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-connect-timeout").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-connect-timeout").await?;
 
     fixtures::apply_fixture(
         ingress::ANNOTATION_CONNECT_TIMEOUT,
@@ -106,7 +106,7 @@ async fn annotation_connect_timeout_returns_502() -> anyhow::Result<()> {
 #[tokio::test]
 async fn annotation_read_timeout_returns_502() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-read-timeout").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-read-timeout").await?;
 
     fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
@@ -132,7 +132,7 @@ async fn annotation_read_timeout_returns_502() -> anyhow::Result<()> {
 #[tokio::test]
 async fn class_default_connect_timeout_returns_502() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-cls-timeout").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-cls-timeout").await?;
 
     // Cluster-scoped IngressClass — guard deletes it on drop. Name matches the
     // fixture's `coxswain-clstimeout-${TESTNS}`.
@@ -163,7 +163,7 @@ async fn class_default_connect_timeout_returns_502() -> anyhow::Result<()> {
 #[tokio::test]
 async fn max_body_size_enforces_limit() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-maxbody").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-maxbody").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -227,7 +227,7 @@ async fn max_body_size_enforces_limit() -> anyhow::Result<()> {
 #[tokio::test]
 async fn max_body_size_invalid_value_fails_open() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-maxbody-bad").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-maxbody-bad").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -263,7 +263,7 @@ async fn max_body_size_invalid_value_fails_open() -> anyhow::Result<()> {
 #[tokio::test]
 async fn response_served_from_cache_when_cache_enabled_and_cacheable() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-cache-hit").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-cache-hit").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -316,7 +316,7 @@ async fn response_served_from_cache_when_cache_enabled_and_cacheable() -> anyhow
 #[tokio::test]
 async fn response_not_cached_when_response_is_no_store() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-cache-nostore").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-cache-nostore").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -353,7 +353,7 @@ async fn response_not_cached_when_response_is_no_store() -> anyhow::Result<()> {
 #[tokio::test]
 async fn request_bypasses_cache_when_authorization_header_present() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-cache-auth").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-cache-auth").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -414,7 +414,7 @@ async fn request_bypasses_cache_when_authorization_header_present() -> anyhow::R
 #[tokio::test]
 async fn cache_entry_purged_when_admin_delete_called() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-cache-purge").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-cache-purge").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -704,7 +704,7 @@ async fn session_affinity_header_falls_back_to_round_robin_when_header_absent() 
 #[tokio::test]
 async fn request_mirrored_to_secondary_backend_when_mirror_target_set() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-mirror").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-mirror").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -770,7 +770,7 @@ async fn request_mirrored_to_secondary_backend_when_mirror_target_set() -> anyho
 #[tokio::test]
 async fn primary_succeeds_when_mirror_backend_unreachable() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ing-mirror-bad").await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-mirror-bad").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;

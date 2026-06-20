@@ -15,26 +15,21 @@ workspace = true
 experimental = ["gateway-api/experimental"]
 
 [dependencies]
-arc-swap = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 coxswain-core = { workspace = true }
 coxswain-reflector = { workspace = true }
 futures = { workspace = true }
 gateway-api = { workspace = true }
-http = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 kube-leader-election = { workspace = true }
 pingora-core = { workspace = true }
 prometheus = { workspace = true }
-regex = { workspace = true }
 thiserror = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
 
 [dev-dependencies]
 tracing-test = { workspace = true }

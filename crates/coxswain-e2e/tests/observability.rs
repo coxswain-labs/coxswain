@@ -546,7 +546,7 @@ async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
 #[tokio::test]
 async fn routing_api_surfaces_gateways_routes_and_problems() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "gw-routing-endpoints").await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-gw-routing-endpoints").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;

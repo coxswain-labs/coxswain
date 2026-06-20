@@ -491,7 +491,7 @@ async fn restart_controller_does_not_bump_generation() -> anyhow::Result<()> {
     // and the second bootstrap would delete it before we could verify the
     // SSA idempotency — defeating the test. The persistent variant skips
     // the label; the `Drop` still cleans up at end-of-test.
-    let ns = NamespaceGuard::create_persistent(&h.client, "dedgw-idempotent").await?;
+    let ns = NamespaceGuard::create_persistent(&h.client, "res-dedgw-idempotent").await?;
 
     let (_deployments, _services, _sas, deploy, _svc, _sa) = apply_and_wait(&h, &ns).await?;
 
@@ -549,7 +549,7 @@ async fn restart_controller_does_not_bump_generation() -> anyhow::Result<()> {
 #[tokio::test]
 async fn lifecycle_mode_migration_shared_to_dedicated() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ded-life-m-s2d").await?;
+    let ns = NamespaceGuard::create(&h.client, "res-ded-life-m-s2d").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -604,7 +604,7 @@ async fn lifecycle_mode_migration_shared_to_dedicated() -> anyhow::Result<()> {
 #[tokio::test]
 async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "ded-life-m-d2s").await?;
+    let ns = NamespaceGuard::create(&h.client, "res-ded-life-m-d2s").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -674,7 +674,7 @@ async fn lifecycle_controller_restart_is_idempotent() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     // Persistent namespace so the bootstrap purge on the second `Harness::start()`
     // doesn't delete it.
-    let ns = NamespaceGuard::create_persistent(&h.client, "ded-life-restart").await?;
+    let ns = NamespaceGuard::create_persistent(&h.client, "res-ded-life-restart").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;

@@ -1,10 +1,11 @@
 //! Per-host path router: exact, prefix, and regex path matching with predicate filtering.
 
 use super::auth::IngressAuthConfig;
+use super::backend::BackendGroup;
 use super::compression::CompressionConfig;
 use super::entry::{
-    BackendGroup, FilterAction, ForwardedForConfig, RouteConflict, RouteEntry, RouteInfo,
-    RouteKind, RouteTimeouts,
+    FilterAction, ForwardedForConfig, RouteConflict, RouteEntry, RouteInfo, RouteKind,
+    RouteTimeouts,
 };
 use super::path_normalize::NormalizeLevel;
 use super::predicate::{MatchPredicates, RequestContext, ValueMatch};
@@ -123,6 +124,7 @@ impl RouteMatch {
 ///
 /// # Errors
 /// Returns [`regex::Error`] if `pattern` is not a valid regular expression.
+#[must_use = "the compiled Regex is the result; dropping it discards the compile work"]
 pub fn compile_path_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
     regex::Regex::new(pattern)
 }

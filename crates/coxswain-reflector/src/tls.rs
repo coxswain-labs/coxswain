@@ -13,15 +13,15 @@ use tokio::sync::watch;
 
 #[derive(Debug, Error)]
 pub(crate) enum TlsLoadError {
-    #[error("Secret not found in store")]
+    #[error("secret not found in store")]
     NotFound,
-    #[error("Secret has type {0:?}, expected 'kubernetes.io/tls'")]
+    #[error("secret has type {0:?}, expected 'kubernetes.io/tls'")]
     WrongType(String),
-    #[error("Secret is missing 'tls.crt' key")]
+    #[error("secret is missing 'tls.crt' key")]
     MissingCert,
-    #[error("Secret is missing 'tls.key' key")]
+    #[error("secret is missing 'tls.key' key")]
     MissingKey,
-    #[error("Secret TLS data is not valid PEM")]
+    #[error("secret TLS data is not valid PEM")]
     InvalidPem,
 }
 

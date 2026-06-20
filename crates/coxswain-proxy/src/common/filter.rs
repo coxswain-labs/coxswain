@@ -26,6 +26,7 @@ impl TrafficFilter {
     ///
     /// # Errors
     /// Propagates Pingora header-mutation errors from the fixed-header inserts.
+    #[must_use = "ignoring the result drops request-filter header-mutation errors"]
     pub fn apply_request_filters(
         upstream_request: &mut RequestHeader,
         filters: &[FilterAction],

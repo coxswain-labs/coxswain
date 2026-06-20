@@ -74,6 +74,8 @@ coxswain-bin
 | `[lints] workspace = true` in every `crates/*/Cargo.toml` | `scripts/check-workspace-lints-decl.sh` |
 | No per-site `#[allow]` / `#[expect]` in non-test source | `scripts/check-no-per-site-allow.sh` |
 | Builder `with_*` methods + `is_/has_/can_` predicates carry `#[must_use]` | `scripts/check-must-use-builders.sh` |
+| Crate-public `pub fn … -> Result` carry `#[must_use = "…"]` (message form; bare trips `double_must_use`) | `scripts/check-must-use-results.sh` |
+| No unused crate dependencies | `cargo-machete` (CI step) |
 | Gateway API SupportedFeatures Rust↔Go parity | `scripts/check-supported-features.sh` |
 | No bare sleeps in e2e test bodies; waits poll a real post-condition | `scripts/check-no-e2e-sleeps.sh` |
 | Exactly one canonical e2e `poll_until`; no shadow pollers | `scripts/check-e2e-single-poller.sh` |

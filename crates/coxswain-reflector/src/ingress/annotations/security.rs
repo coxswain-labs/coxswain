@@ -65,10 +65,10 @@ pub const RATE_LIMIT_BY: &str = "ingress.coxswain-labs.dev/rate-limit-by";
 /// tokens emit a `WARN` and are skipped — the remaining valid ranges still apply.
 /// Returns `None` when the value is empty or every token is unparseable, so the
 /// caller treats the annotation as absent (admit all) rather than locking out
-/// all traffic on a typo.
+/// all traffic on a typo. `route_id` names the Ingress in skipped-token WARNs.
 #[must_use]
-pub fn parse_allow_source_range(s: &str) -> Option<Vec<ipnet::IpNet>> {
-    parse_cidr_list(s, "allow-source-range")
+pub fn parse_allow_source_range(s: &str, route_id: &str) -> Option<Vec<ipnet::IpNet>> {
+    parse_cidr_list(s, "allow-source-range", route_id)
 }
 
 /// Parse the `deny-source-range` value into a CIDR set.
@@ -77,10 +77,11 @@ pub fn parse_allow_source_range(s: &str) -> Option<Vec<ipnet::IpNet>> {
 /// without a prefix is promoted to a host network (`/32` / `/128`). Invalid
 /// tokens emit a `WARN` and are skipped. Returns `None` when the value is empty
 /// or every token is unparseable — the block list is treated as absent (block
-/// nothing), so a typo never silently blocks all traffic.
+/// nothing), so a typo never silently blocks all traffic. `route_id` names the
+/// Ingress in skipped-token WARNs.
 #[must_use]
-pub fn parse_deny_source_range(s: &str) -> Option<Vec<ipnet::IpNet>> {
-    parse_cidr_list(s, "deny-source-range")
+pub fn parse_deny_source_range(s: &str, route_id: &str) -> Option<Vec<ipnet::IpNet>> {
+    parse_cidr_list(s, "deny-source-range", route_id)
 }
 
 /// Parse the `trust-forwarded-for` annotation cluster into a [`ForwardedForConfig`].
@@ -121,7 +122,7 @@ pub fn parse_forwarded_for(
         .unwrap_or_else(|| Box::from("X-Forwarded-For"));
 
     let trusted_cidrs: Box<[ipnet::IpNet]> = super::get(annotations, FORWARDED_FOR_TRUSTED_CIDRS)
-        .and_then(|s| parse_cidr_list(s, "forwarded-for-trusted-cidrs"))
+        .and_then(|s| parse_cidr_list(s, "forwarded-for-trusted-cidrs", route_id))
         .unwrap_or_default()
         .into_boxed_slice();
 
@@ -131,7 +132,7 @@ pub fn parse_forwarded_for(
 /// Shared CIDR-list parser used by both `parse_allow_source_range` and
 /// `parse_deny_source_range`. `annotation` is the bare annotation suffix (e.g.
 /// `"allow-source-range"`) used in the WARN message to name the source.
-fn parse_cidr_list(s: &str, annotation: &str) -> Option<Vec<ipnet::IpNet>> {
+fn parse_cidr_list(s: &str, annotation: &str, route_id: &str) -> Option<Vec<ipnet::IpNet>> {
     let nets: Vec<ipnet::IpNet> = s
         .split(',')
         .map(str::trim)
@@ -140,6 +141,7 @@ fn parse_cidr_list(s: &str, annotation: &str) -> Option<Vec<ipnet::IpNet>> {
             Some(net) => Some(net),
             None => {
                 tracing::warn!(
+                    ingress = %route_id,
                     token = token,
                     annotation = annotation,
                     "invalid CIDR — skipping token"
@@ -266,20 +268,22 @@ mod tests {
     fn parse_single_cidr() {
         // References ALLOW_SOURCE_RANGE to satisfy the annotation-coverage gate.
         let _ = ALLOW_SOURCE_RANGE;
-        let nets = parse_allow_source_range("10.0.0.0/8").expect("one CIDR");
+        let nets = parse_allow_source_range("10.0.0.0/8", "test-ingress").expect("one CIDR");
         assert_eq!(nets, vec!["10.0.0.0/8".parse().expect("valid")]);
     }
 
     #[test]
     fn parse_multiple_cidrs_trimmed() {
         let nets =
-            parse_allow_source_range("10.0.0.0/8, 192.168.1.0/24 ,2001:db8::/32").expect("three");
+            parse_allow_source_range("10.0.0.0/8, 192.168.1.0/24 ,2001:db8::/32", "test-ingress")
+                .expect("three");
         assert_eq!(nets.len(), 3);
     }
 
     #[test]
     fn parse_bare_ip_becomes_host_route() {
-        let nets = parse_allow_source_range("10.0.0.1,2001:db8::1").expect("two host routes");
+        let nets = parse_allow_source_range("10.0.0.1,2001:db8::1", "test-ingress")
+            .expect("two host routes");
         assert_eq!(nets[0], "10.0.0.1/32".parse().expect("valid"));
         assert_eq!(nets[1], "2001:db8::1/128".parse().expect("valid"));
     }
@@ -287,20 +291,21 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn parse_skips_invalid_keeps_valid() {
-        let nets = parse_allow_source_range("10.0.0.0/8,not-a-cidr,192.168.0.0/16").expect("two");
+        let nets = parse_allow_source_range("10.0.0.0/8,not-a-cidr,192.168.0.0/16", "test-ingress")
+            .expect("two");
         assert_eq!(nets.len(), 2);
         assert!(logs_contain("invalid CIDR"));
     }
 
     #[test]
     fn parse_all_invalid_is_none() {
-        assert!(parse_allow_source_range("nope,also-nope").is_none());
+        assert!(parse_allow_source_range("nope,also-nope", "test-ingress").is_none());
     }
 
     #[test]
     fn parse_empty_is_none() {
-        assert!(parse_allow_source_range("").is_none());
-        assert!(parse_allow_source_range("  ,  ").is_none());
+        assert!(parse_allow_source_range("", "test-ingress").is_none());
+        assert!(parse_allow_source_range("  ,  ", "test-ingress").is_none());
     }
 
     // ── deny-source-range ─────────────────────────────────────────────────────
@@ -309,7 +314,7 @@ mod tests {
     fn deny_parse_single_cidr() {
         // References DENY_SOURCE_RANGE to satisfy the annotation-coverage gate.
         let _ = DENY_SOURCE_RANGE;
-        let nets = parse_deny_source_range("10.0.0.0/8").expect("one CIDR");
+        let nets = parse_deny_source_range("10.0.0.0/8", "test-ingress").expect("one CIDR");
         assert_eq!(
             nets,
             vec!["10.0.0.0/8".parse::<ipnet::IpNet>().expect("valid")]
@@ -319,13 +324,15 @@ mod tests {
     #[test]
     fn deny_parse_multiple_cidrs_trimmed() {
         let nets =
-            parse_deny_source_range("10.0.0.0/8, 192.168.1.0/24 ,2001:db8::/32").expect("three");
+            parse_deny_source_range("10.0.0.0/8, 192.168.1.0/24 ,2001:db8::/32", "test-ingress")
+                .expect("three");
         assert_eq!(nets.len(), 3);
     }
 
     #[test]
     fn deny_parse_bare_ip_becomes_host_route() {
-        let nets = parse_deny_source_range("10.0.0.1,2001:db8::1").expect("two host routes");
+        let nets = parse_deny_source_range("10.0.0.1,2001:db8::1", "test-ingress")
+            .expect("two host routes");
         assert_eq!(
             nets[0],
             "10.0.0.1/32".parse::<ipnet::IpNet>().expect("valid")
@@ -339,20 +346,21 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn deny_parse_skips_invalid_keeps_valid() {
-        let nets = parse_deny_source_range("10.0.0.0/8,not-a-cidr,192.168.0.0/16").expect("two");
+        let nets = parse_deny_source_range("10.0.0.0/8,not-a-cidr,192.168.0.0/16", "test-ingress")
+            .expect("two");
         assert_eq!(nets.len(), 2);
         assert!(logs_contain("invalid CIDR"));
     }
 
     #[test]
     fn deny_parse_all_invalid_is_none() {
-        assert!(parse_deny_source_range("nope,also-nope").is_none());
+        assert!(parse_deny_source_range("nope,also-nope", "test-ingress").is_none());
     }
 
     #[test]
     fn deny_parse_empty_is_none() {
-        assert!(parse_deny_source_range("").is_none());
-        assert!(parse_deny_source_range("  ,  ").is_none());
+        assert!(parse_deny_source_range("", "test-ingress").is_none());
+        assert!(parse_deny_source_range("  ,  ", "test-ingress").is_none());
     }
 
     // ── trust-forwarded-for ───────────────────────────────────────────────────
