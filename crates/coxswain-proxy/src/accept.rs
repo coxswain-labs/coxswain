@@ -185,6 +185,7 @@ where
     /// Returns [`AcceptorBuildError::TlsAcceptorBuild`] when the TLS acceptor
     /// context cannot be initialised (reported eagerly so the process fails
     /// fast rather than at first HTTPS connection).
+    #[must_use = "the constructed ProxyAcceptor must be used to serve connections"]
     pub fn new(
         proxy: Arc<HttpProxy<P>>,
         initial_specs: HashSet<ListenerSpec>,

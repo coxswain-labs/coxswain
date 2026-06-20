@@ -73,7 +73,7 @@ pub enum StatusWriterError {
 /// registers with the Pingora server, plus the shared handles the bin needs to
 /// expose via the admin server (the leader flag and the routing-table snapshots,
 /// which the controller pod does not serve traffic from but does aggregate
-/// for the future `/cluster` endpoint). Same rationale as
+/// for the admin `/api/v1` endpoints and operator UI). Same rationale as
 /// [`StatusWriterConfig`] for the lack of `#[non_exhaustive]`.
 #[non_exhaustive]
 pub struct SpawnedStatusWriter {
@@ -84,7 +84,7 @@ pub struct SpawnedStatusWriter {
     /// Leader flag — `true` when this pod is the elected leader.
     pub leader: Arc<AtomicBool>,
     /// Routing-table outputs. Controller doesn't serve traffic from these, but
-    /// the admin server uses them to render `/cluster`-style aggregates.
+    /// the admin server uses them to render the `/api/v1` cluster views and UI.
     pub outputs: ReconcilerOutputs,
 }
 
@@ -96,6 +96,7 @@ pub struct SpawnedStatusWriter {
 ///
 /// Returns [`StatusWriterError::Config`] if the underlying [`ControllerConfig`]
 /// failed validation (e.g. malformed status address).
+#[must_use = "the spawned writer handle must be retained or the status-writer task is dropped"]
 pub fn spawn_status_writer(
     config: StatusWriterConfig,
     health: HealthRegistry,
