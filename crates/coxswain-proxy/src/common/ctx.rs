@@ -215,12 +215,18 @@ pub struct ProxyCtx {
     /// Flat index into [`BackendGroup::lb_endpoints`] for the upstream selected
     /// this request by a stateful load-balancing algorithm (#275).
     ///
-    /// `None` for `RoundRobin` and `IpHash` (stateless; `track` is always `None`
+    /// `None` for `RoundRobin` and `Hash` (stateless; `track` is always `None`
     /// from `select_upstream`) and for every Gateway API route. When `Some`,
     /// `logging` calls [`BackendGroup::complete`] exactly once to decrement the
     /// active-connection count or update the EWMA latency. On a retriable failure,
     /// `upstream_peer` calls [`BackendGroup::release`] before re-selecting.
     pub lb_track: Option<u32>,
+    /// Pre-computed FNV-1a hash key for `LoadBalance::Hash` selection (#276).
+    ///
+    /// Extracted once in `request_filter` from the attribute configured via
+    /// `BackendGroup::hash_by()` and passed to `BackendGroup::select_upstream`.
+    /// `None` for all other algorithms (zero overhead) or when the attribute is absent.
+    pub hash_key: Option<u64>,
 }
 
 // Hot types — review with the team before bumping these numbers.
@@ -251,4 +257,5 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 184);
 // ProxyCtx: +24 for client_cert_pem: Option<String> (niche-opt on String's ptr; 24 bytes) (#267) (544→568).
 // ProxyCtx: +16 for client_ip: Option<IpAddr> (17 bytes packed into existing alignment gap by Rust layout; 568→584) (#271).
 // ProxyCtx: +8 for lb_track: Option<u32> (discriminant + padding + u32 = 8 bytes; 584→592) (#275).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 592);
+// ProxyCtx: +16 for hash_key: Option<u64> (discriminant padded to u64 align; 592→608) (#276).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 608);

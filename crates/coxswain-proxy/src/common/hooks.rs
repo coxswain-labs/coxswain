@@ -35,8 +35,8 @@ use crate::upstream_ca::UpstreamCaCache;
 use bytes::Bytes;
 use coxswain_cache::ResponseCache;
 use coxswain_core::routing::{
-    BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, RateLimitKey,
-    RequestContext, RetryOn, RouteTimeouts, SessionAffinity, UpstreamCa,
+    BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HashSource, RateLimitKey,
+    RequestContext, RetryOn, RouteTimeouts, SessionAffinity, UpstreamCa, affinity_hash,
 };
 use coxswain_core::tls::{ClientCertConfigState, SharedClientCertStore};
 use http::header;
@@ -94,6 +94,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             client_cert_pem: None,
             client_ip: None,
             lb_track: None,
+            hash_key: None,
         })
         .unwrap_or_default()
 }
@@ -312,6 +313,17 @@ pub(crate) async fn request_filter<K>(
     ctx.affinity_pin = affinity.pin;
     ctx.affinity_set_cookie = affinity.set_cookie;
 
+    // Consistent-hash load balancing (#276): extract the key attribute once per request
+    // while the headers are in hand, then hash it. No allocation for routes that don't
+    // use hash:* — the `None` fast-path is a single branch on `hash_by()`.
+    ctx.hash_key = extract_hash_key(
+        session.req_header(),
+        &m.backend_group,
+        &path,
+        query.as_deref(),
+        ctx.client_ip,
+    );
+
     ctx.resolved = Some(ResolvedRoute {
         backend_group: m.backend_group,
         filters: m.filters,
@@ -402,6 +414,46 @@ pub(crate) async fn request_filter<K>(
     }
 
     Ok(false)
+}
+
+/// Extract and hash the configured `load-balance: hash:*` attribute value from the request.
+///
+/// Returns `None` when the group uses a non-`Hash` algorithm (zero-overhead fast path),
+/// or when the attribute is absent/empty (caller falls back to round-robin). For `Uri`,
+/// one `String` allocation is made when a query string is present; all other variants
+/// are borrow-only (no allocation).
+fn extract_hash_key(
+    req: &RequestHeader,
+    group: &coxswain_core::routing::BackendGroup,
+    path: &str,
+    query: Option<&str>,
+    client_ip: Option<std::net::IpAddr>,
+) -> Option<u64> {
+    match group.hash_by()? {
+        HashSource::Uri => {
+            // Hash path + optional "?query" — one allocation only when a query is present.
+            let key = match query {
+                Some(q) => format!("{path}?{q}"),
+                None => return Some(affinity_hash(path.as_bytes())),
+            };
+            Some(affinity_hash(key.as_bytes()))
+        }
+        HashSource::SourceIp => client_ip.map(|ip| match ip {
+            std::net::IpAddr::V4(v4) => affinity_hash(&v4.octets()),
+            std::net::IpAddr::V6(v6) => affinity_hash(&v6.octets()),
+        }),
+        HashSource::Header(name) => req
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+            .map(|v| affinity_hash(v.as_bytes())),
+        HashSource::Cookie(name) => affinity::cookie_value(req, name)
+            .filter(|v| !v.is_empty())
+            .map(|v| affinity_hash(v.as_bytes())),
+        // `HashSource` is `#[non_exhaustive]`; a future variant degrades to round-robin.
+        _ => None,
+    }
 }
 
 /// Private and reserved IP ranges that are never treated as a real client IP when
@@ -855,7 +907,7 @@ pub(crate) async fn upstream_peer(
             // Clone the Arc to avoid holding a shared borrow on `resolved` while
             // mutating `ctx.lb_track` (borrow checker splits borrows).
             let group = Arc::clone(&resolved.backend_group);
-            let sel = group.select_upstream(ctx.client_ip).ok_or_else(|| {
+            let sel = group.select_upstream(ctx.hash_key).ok_or_else(|| {
                 pingora_core::Error::explain(
                     HTTPStatus(503),
                     "no active endpoints for backend group",
