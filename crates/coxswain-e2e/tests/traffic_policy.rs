@@ -250,36 +250,23 @@ async fn max_body_size_enforces_limit() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Verifies that an unparseable `max-body-size` value fails open (#263): the limit is
-/// ignored and an oversized 4 KiB POST still reaches the backend (200). Proves an
-/// invalid size can never block traffic — the inverse of the enforced case above.
+/// Verifies that an unparseable `max-body-size` value is rejected by the VAP at
+/// admission time (#263, #29 VAP). Fail-open proxy semantics remain the backstop for
+/// VAP-disabled installs, covered by the `parse_max_body_size_invalid` unit test.
 #[tokio::test]
-async fn max_body_size_invalid_value_fails_open() -> anyhow::Result<()> {
+async fn max_body_size_invalid_value_rejected_by_vap() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "tp-ing-maxbody-bad").await?;
 
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
+    let msg = fixtures::apply_fixture_expect_rejected(
         ingress::ANNOTATION_MAX_BODY_SIZE_INVALID,
         FixtureVars::new(&ns.name),
     )
     .await?;
-
-    let host = format!("maxbodybad.{}.local", ns.name);
-
-    wait::wait_for_route_status(&h.http, &host, "/", 200, Duration::from_secs(60)).await?;
-
-    let (status, body) = h
-        .http
-        .request_with_body(reqwest::Method::POST, &host, "/", vec![b'x'; 4096])
-        .await?;
-    assert_eq!(
-        status, 200,
-        "fail-open: oversized POST must still be served when the limit is invalid"
+    anyhow::ensure!(
+        msg.contains("max-body-size"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
     );
-    body.expect("served POST must return an echo body")
-        .assert_backend("echo-a");
 
     Ok(())
 }
@@ -1130,35 +1117,23 @@ async fn compression_skips_disallowed_content_type() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sad path (#266): an unparseable `upstream-keepalive-timeout` value is ignored
-/// (fail-open) — the route must still serve 2xx requests normally.
-///
-/// The WARN emitted by the reflector parse path is verified by the unit tests
-/// in `coxswain-reflector::ingress::annotations::traffic_policy`; this test
-/// only checks that the data plane is unaffected.
+/// Sad path (#266, #29 VAP): an unparseable `upstream-keepalive-timeout` value is
+/// rejected by the VAP at admission time. Fail-open proxy semantics remain the
+/// backstop for VAP-disabled installs, verified by the reflector unit tests.
 #[tokio::test]
-async fn upstream_keepalive_invalid_timeout_keeps_serving() -> anyhow::Result<()> {
+async fn upstream_keepalive_invalid_timeout_rejected_by_vap() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "kp-bad").await?;
 
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
+    let msg = fixtures::apply_fixture_expect_rejected(
         ingress::ANNOTATION_KEEPALIVE_TIMEOUT_INVALID,
         FixtureVars::new(&ns.name),
     )
     .await?;
-
-    let host = format!("keepalivebad.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
-
-    let (status, _, body) = h.http.get_full(&host, "/").await?;
-    assert_eq!(
-        status, 200,
-        "route with unparseable keepalive-timeout must still return 200 (fail-open)"
+    anyhow::ensure!(
+        msg.contains("upstream-keepalive-timeout"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
     );
-    body.expect("response body must be present")
-        .assert_backend("echo-a");
 
     Ok(())
 }

@@ -1,0 +1,23 @@
+# VAP rejection fixture: invalid URL annotation value.
+#
+# `auth-url: "ftp://bad.example.com"` does not match the required http(s):// prefix.
+# The VAP must reject this Ingress at admission time.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vap-reject-url
+  annotations:
+    ingress.coxswain-labs.dev/auth-url: "ftp://bad.example.com"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: vap-url.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

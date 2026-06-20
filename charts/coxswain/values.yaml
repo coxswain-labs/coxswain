@@ -354,3 +354,11 @@ podMonitor:
   # Extra labels merged onto the PodMonitor metadata (e.g. to attach the
   # resource to a specific Prometheus instance).
   labels: {}
+
+# -- ValidatingAdmissionPolicy for ingress.coxswain-labs.dev/* annotations.
+# Requires admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy (Kubernetes >= 1.30).
+# The template is silently omitted on clusters that do not advertise this API version,
+# so installing on an older cluster is safe (annotations fall through to the proxy's
+# fail-open check and Warning events — see issue #401).
+vap:
+  enabled: true

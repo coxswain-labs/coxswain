@@ -1,0 +1,23 @@
+# VAP rejection fixture: out-of-range port annotation value.
+#
+# `redirect-port: "99999"` exceeds the valid range 0–65535. The VAP must
+# reject this Ingress at admission time.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vap-reject-port
+  annotations:
+    ingress.coxswain-labs.dev/redirect-port: "99999"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: vap-port.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

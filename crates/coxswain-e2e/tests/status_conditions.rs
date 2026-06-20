@@ -879,3 +879,161 @@ async fn gateway_address_empty_allocates_dynamically() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ── ValidatingAdmissionPolicy (#29) ──────────────────────────────────────────
+
+/// VAP positive path: a well-formed Ingress with valid coxswain annotations
+/// (one per validated format category) must be accepted unchanged (#29).
+#[tokio::test]
+async fn vap_accepts_well_formed_annotations() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-valid").await?;
+    fixtures::apply_fixture(ingress::VAP_VALID_ANNOTATIONS, FixtureVars::new(&ns.name)).await?;
+    Ok(())
+}
+
+/// VAP rejects a boolean annotation with an invalid value (`use-regex: "yep"`) (#29).
+#[tokio::test]
+async fn vap_rejects_invalid_boolean_annotation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-bool").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        ingress::VAP_REJECT_BOOLEAN,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("use-regex"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
+    );
+    Ok(())
+}
+
+/// VAP rejects an enum annotation with an invalid value (`backend-protocol: "websocket"`) (#29).
+#[tokio::test]
+async fn vap_rejects_invalid_enum_annotation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-enum").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        ingress::VAP_REJECT_ENUM,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("backend-protocol"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
+    );
+    Ok(())
+}
+
+/// VAP rejects a CIDR-list annotation with an invalid token (`allow-source-range: "not-a-cidr"`) (#29).
+#[tokio::test]
+async fn vap_rejects_invalid_cidr_annotation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-cidr").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        ingress::VAP_REJECT_CIDR,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("allow-source-range"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
+    );
+    Ok(())
+}
+
+/// VAP rejects a URL annotation with an invalid scheme (`auth-url: "ftp://..."`) (#29).
+#[tokio::test]
+async fn vap_rejects_invalid_url_annotation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-url").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        ingress::VAP_REJECT_URL,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("auth-url"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
+    );
+    Ok(())
+}
+
+/// VAP rejects a port annotation out of range (`redirect-port: "99999"`) (#29).
+#[tokio::test]
+async fn vap_rejects_out_of_range_port_annotation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-port").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        ingress::VAP_REJECT_PORT,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("redirect-port"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
+    );
+    Ok(())
+}
+
+/// VAP rejects a duration annotation with an invalid value (`upstream-keepalive-timeout: "notaduration"`) (#29).
+#[tokio::test]
+async fn vap_rejects_invalid_duration_annotation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-dur").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        ingress::ANNOTATION_KEEPALIVE_TIMEOUT_INVALID,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("upstream-keepalive-timeout"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
+    );
+    Ok(())
+}
+
+/// VAP rejects a size-string annotation with an invalid value (`max-body-size: "garbage"`) (#29).
+#[tokio::test]
+async fn vap_rejects_invalid_size_string_annotation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-size").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        ingress::ANNOTATION_MAX_BODY_SIZE_INVALID,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("max-body-size"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
+    );
+    Ok(())
+}
+
+/// VAP rejects a positive-integer annotation with an invalid value (`rate-limit-rps: "notanumber"`) (#29).
+#[tokio::test]
+async fn vap_rejects_invalid_positive_integer_annotation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-int").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        ingress::ANNOTATION_RATE_LIMIT_INVALID,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("rate-limit-rps"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
+    );
+    Ok(())
+}
+
+/// Ingress with no coxswain annotations must not be touched by the VAP (#29).
+#[tokio::test]
+async fn vap_ignores_ingress_without_coxswain_annotations() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-noanno").await?;
+    // DEFAULT_BACKEND carries no coxswain annotations — must apply cleanly.
+    fixtures::apply_fixture(ingress::DEFAULT_BACKEND, FixtureVars::new(&ns.name)).await?;
+    Ok(())
+}

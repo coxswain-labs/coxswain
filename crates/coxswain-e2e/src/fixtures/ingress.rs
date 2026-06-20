@@ -332,4 +332,24 @@ pub const DRAIN_INGRESS: &str = fixture!("drain_ingress.yaml");
 /// Apply [`backends::GO_HTTPBIN`] first.
 pub const ANNOTATION_CIRCUIT_BREAKER: &str = fixture!("annotation_circuit_breaker.yaml");
 
+// ── ValidatingAdmissionPolicy (#29) ─────────────────────────────────────────
+
+/// Ingress with `use-regex: "yep"` — invalid boolean value rejected by the VAP.
+pub const VAP_REJECT_BOOLEAN: &str = fixture!("vap_reject_boolean.yaml");
+
+/// Ingress with `backend-protocol: "websocket"` — invalid enum value rejected by the VAP.
+pub const VAP_REJECT_ENUM: &str = fixture!("vap_reject_enum.yaml");
+
+/// Ingress with `allow-source-range: "not-a-cidr"` — invalid CIDR rejected by the VAP.
+pub const VAP_REJECT_CIDR: &str = fixture!("vap_reject_cidr.yaml");
+
+/// Ingress with `auth-url: "ftp://bad.example.com"` — invalid URL rejected by the VAP.
+pub const VAP_REJECT_URL: &str = fixture!("vap_reject_url.yaml");
+
+/// Ingress with `redirect-port: "99999"` — out-of-range port rejected by the VAP.
+pub const VAP_REJECT_PORT: &str = fixture!("vap_reject_port.yaml");
+
+/// Ingress with one valid annotation per validated format category — accepted by the VAP.
+pub const VAP_VALID_ANNOTATIONS: &str = fixture!("vap_valid_annotations.yaml");
+
 // ── satisfy any/all (#273) ────────────────────────────────────────────────────

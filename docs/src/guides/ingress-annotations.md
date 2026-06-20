@@ -1,6 +1,8 @@
 # Ingress annotations
 
-Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per-Ingress configuration. All annotations are optional and are set once per Ingress; most apply uniformly to every rule and path (`use-regex` additionally keys off each rule's `pathType`). Invalid values emit a controller warning and are treated as absent — the Ingress is never rejected.
+Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per-Ingress configuration. All annotations are optional and are set once per Ingress; most apply uniformly to every rule and path (`use-regex` additionally keys off each rule's `pathType`).
+
+**Admission-time validation.** On Kubernetes ≥ 1.30, Coxswain installs a `ValidatingAdmissionPolicy` that rejects Ingresses with invalid annotation values at `kubectl apply` time, surfacing the error immediately. On older clusters, or when `vap.enabled=false` is set in the Helm values, invalid values are handled fail-open: the controller emits a warning and treats the annotation as absent, so traffic is never blocked. Disable the VAP only if your cluster does not support `admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy`.
 
 ## Quick reference
 

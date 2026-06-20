@@ -1,0 +1,23 @@
+# VAP rejection fixture: invalid boolean annotation value.
+#
+# `use-regex: "yep"` is not a valid boolean (must be "true" or "false",
+# case-insensitive). The VAP must reject this Ingress at admission time.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vap-reject-boolean
+  annotations:
+    ingress.coxswain-labs.dev/use-regex: "yep"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: vap-bool.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
