@@ -717,7 +717,6 @@ dependencies = [
 name = "coxswain-cache"
 version = "0.2.0"
 dependencies = [
- "coxswain-core",
  "pingora-cache",
  "prometheus 0.14.0",
  "tokio",
@@ -727,24 +726,20 @@ dependencies = [
 name = "coxswain-controller"
 version = "0.2.0"
 dependencies = [
- "arc-swap",
  "async-trait",
  "coxswain-core",
  "coxswain-reflector",
  "futures",
  "gateway-api",
- "http",
  "k8s-openapi",
  "kube",
  "kube-leader-election",
  "pingora-core",
  "prometheus 0.14.0",
- "serde",
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
  "tracing",
  "tracing-test",
 ]
@@ -791,7 +786,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -813,7 +807,6 @@ dependencies = [
 name = "coxswain-proxy"
 version = "0.2.0"
 dependencies = [
- "arc-swap",
  "async-trait",
  "base64",
  "bcrypt",
@@ -829,7 +822,6 @@ dependencies = [
  "ipnet",
  "itoa",
  "percent-encoding",
- "pingora",
  "pingora-cache",
  "pingora-core",
  "pingora-http",
@@ -861,7 +853,6 @@ dependencies = [
  "prometheus 0.14.0",
  "regex",
  "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2336,12 +2327,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "linux-raw-sys"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
-
-[[package]]
 name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2748,20 +2733,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "pingora"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54a75f2ff8e122aa80ab202dc865294fe59cd856c2a5dab2d3df6e122c93b941"
-dependencies = [
- "pingora-cache",
- "pingora-core",
- "pingora-http",
- "pingora-load-balancing",
- "pingora-proxy",
- "pingora-timeout",
-]
-
-[[package]]
 name = "pingora-boringssl"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2895,37 +2866,6 @@ dependencies = [
  "bytes",
  "http",
  "pingora-error",
-]
-
-[[package]]
-name = "pingora-ketama"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e2a2e43a14f1d291fba7905542c7c1d1f89528f470b3cd48b6806e702ea772f"
-dependencies = [
- "crc32fast",
-]
-
-[[package]]
-name = "pingora-load-balancing"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "361b69af0234d2e4d10234e2efd106bb3b8147c575d52f45604a46aaf26def7a"
-dependencies = [
- "arc-swap",
- "async-trait",
- "derivative",
- "fnv",
- "futures",
- "http",
- "log",
- "pingora-core",
- "pingora-error",
- "pingora-http",
- "pingora-ketama",
- "pingora-runtime",
- "rand 0.8.6",
- "tokio",
 ]
 
 [[package]]
@@ -3464,19 +3404,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustix"
-version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
-dependencies = [
- "bitflags 2.13.0",
- "errno",
- "libc",
- "linux-raw-sys",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "rustls"
 version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3943,19 +3870,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tempfile"
-version = "3.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
-dependencies = [
- "fastrand",
- "getrandom 0.3.4",
- "once_cell",
- "rustix",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4112,7 +4026,6 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]
