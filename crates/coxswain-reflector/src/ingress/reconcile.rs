@@ -10,8 +10,8 @@ use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
 use coxswain_core::routing::{
     BackendGroup, BasicCredential, ExtAuthConfig, ExtAuthTransport, FilterAction,
-    HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTableBuilder, PathModifier, RouteEntry,
-    WildcardKind, compile_path_regex,
+    HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTableBuilder,
+    NormalizeLevel, PathModifier, RouteEntry, WildcardKind, compile_path_regex,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -172,7 +172,7 @@ impl IngressReconciler {
                 let resolved = endpoints::resolve(
                     mirror_ns,
                     &mirror_ref.service,
-                    mirror_ref.port as i32,
+                    i32::from(mirror_ref.port),
                     slices,
                     services,
                 );
@@ -224,6 +224,33 @@ impl IngressReconciler {
         let compression = ann.compression.clone().map(Arc::new);
         // Build the trusted-proxy forwarded-IP config once and share one Arc across every path.
         let forwarded_for = ann.forwarded_for.clone().map(Arc::new);
+
+        // One RouteEntry builder shared by all three insertion sites — rule path,
+        // ssl-redirect variant, and spec.defaultBackend. Centralising the chain
+        // guarantees every per-route knob is applied uniformly; the defaultBackend
+        // path previously hand-rolled the chain and silently dropped
+        // `with_cache_enabled`, so `cache-enabled` did not apply there (#397).
+        // Captures the Ingress-wide knobs by reference; callers pass the per-entry
+        // group, path pattern, metric id, and filter list.
+        let build_route_entry = |group: Arc<BackendGroup>,
+                                 path_pattern: Arc<str>,
+                                 metric_route_id: Arc<str>,
+                                 filters: Vec<FilterAction>| {
+            RouteEntry::path_only(group, route_id.clone(), created_at)
+                .with_path_pattern(path_pattern)
+                .with_metric_route_id(metric_route_id)
+                .with_timeouts(ann.timeouts.clone())
+                .with_filter_actions(filters)
+                .with_max_body_size(ann.max_body_size)
+                .with_allow_source_range(allow_source_range.clone())
+                .with_deny_source_range(deny_source_range.clone())
+                .with_cache_enabled(ann.cache_enabled)
+                .with_rate_limit(rate_limit.clone())
+                .with_auth(auth.clone())
+                .with_compression(compression.clone())
+                .with_forwarded_for(forwarded_for.clone())
+        };
+
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
         for (rule_index, rule) in rules.iter().enumerate() {
@@ -281,8 +308,7 @@ impl IngressReconciler {
                         .with_retries(ann.retries)
                         .with_session_affinity(ann.session_affinity.clone())
                         .with_keepalive_timeout(ann.keepalive_timeout)
-                        .with_load_balance(ann.load_balance)
-                        .with_hash_by(ann.hash_by.clone()),
+                        .with_load_balance(ann.load_balance.clone()),
                 );
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
@@ -357,20 +383,12 @@ impl IngressReconciler {
                 let metric_route_id: Arc<str> = Arc::from(format!(
                     "ingress/{ns}/{ingress_name}:{rule_index}.{path_index}"
                 ));
-                let mut base_entry =
-                    RouteEntry::path_only(Arc::clone(&group), route_id.clone(), created_at)
-                        .with_path_pattern(Arc::from(path))
-                        .with_metric_route_id(Arc::clone(&metric_route_id))
-                        .with_timeouts(ann.timeouts.clone())
-                        .with_filter_actions(path_filters.clone())
-                        .with_max_body_size(ann.max_body_size)
-                        .with_allow_source_range(allow_source_range.clone())
-                        .with_deny_source_range(deny_source_range.clone())
-                        .with_cache_enabled(ann.cache_enabled)
-                        .with_rate_limit(rate_limit.clone())
-                        .with_auth(auth.clone())
-                        .with_compression(compression.clone())
-                        .with_forwarded_for(forwarded_for.clone());
+                let mut base_entry = build_route_entry(
+                    Arc::clone(&group),
+                    Arc::from(path),
+                    Arc::clone(&metric_route_id),
+                    path_filters.clone(),
+                );
                 if dead {
                     base_entry.error_status = Some(503);
                 }
@@ -380,30 +398,14 @@ impl IngressReconciler {
                 // same Arc<RouteEntry>.
                 let e = Arc::new(base_entry);
                 let e_ssl = needs_ssl_redirect.then(|| {
-                    let ssl_status = ann.ssl_redirect_code.unwrap_or(308);
-                    let mut ssl_filters = Vec::with_capacity(path_filters.len() + 1);
-                    ssl_filters.push(FilterAction::RequestRedirect {
-                        scheme: Some("https".to_string()),
-                        hostname: None,
-                        port: None,
-                        status_code: ssl_status,
-                        path: None,
-                    });
-                    ssl_filters.extend_from_slice(&path_filters);
-                    let mut entry =
-                        RouteEntry::path_only(Arc::clone(&group), route_id.clone(), created_at)
-                            .with_path_pattern(Arc::from(path))
-                            .with_metric_route_id(Arc::clone(&metric_route_id))
-                            .with_timeouts(ann.timeouts.clone())
-                            .with_filter_actions(ssl_filters)
-                            .with_max_body_size(ann.max_body_size)
-                            .with_allow_source_range(allow_source_range.clone())
-                            .with_deny_source_range(deny_source_range.clone())
-                            .with_cache_enabled(ann.cache_enabled)
-                            .with_rate_limit(rate_limit.clone())
-                            .with_auth(auth.clone())
-                            .with_compression(compression.clone())
-                            .with_forwarded_for(forwarded_for.clone());
+                    let ssl_filters =
+                        prepend_ssl_redirect(ann.ssl_redirect_code.unwrap_or(308), &path_filters);
+                    let mut entry = build_route_entry(
+                        Arc::clone(&group),
+                        Arc::from(path),
+                        Arc::clone(&metric_route_id),
+                        ssl_filters,
+                    );
                     if dead {
                         entry.error_status = Some(503);
                     }
@@ -417,15 +419,12 @@ impl IngressReconciler {
                         Some(ssl_e) if Some(listener_port) == http_port => Arc::clone(ssl_e),
                         _ => Arc::clone(&e),
                     };
-                    let host_builder = builder
-                        .for_port(listener_port)
-                        .host_for(rule.host.as_deref(), WildcardKind::SingleLabel);
-                    // Propagate the path-normalize level (#280) to the host builder.
-                    // First-writer-wins across Ingresses sharing the same host; the
-                    // builder emits a WARN and keeps the first level on conflict.
-                    if let Some(level) = ann.path_normalize {
-                        host_builder.set_path_normalize(level);
-                    }
+                    let host_builder = resolve_host_builder(
+                        builder,
+                        listener_port,
+                        rule.host.as_deref(),
+                        ann.path_normalize,
+                    );
                     if path_regex.is_some() {
                         host_builder.add_regex_route(path, route_entry);
                     } else {
@@ -471,8 +470,7 @@ impl IngressReconciler {
                                 .with_retries(ann.retries)
                                 .with_session_affinity(ann.session_affinity.clone())
                                 .with_keepalive_timeout(ann.keepalive_timeout)
-                                .with_load_balance(ann.load_balance)
-                                .with_hash_by(ann.hash_by.clone()),
+                                .with_load_balance(ann.load_balance.clone()),
                         );
                         let default_metric_route_id: Arc<str> =
                             Arc::from(format!("ingress/{ns}/{ingress_name}:default"));
@@ -487,58 +485,34 @@ impl IngressReconciler {
                             });
                         }
                         let make_entry = |filters: Vec<FilterAction>| {
-                            Arc::new(
-                                RouteEntry::path_only(
-                                    Arc::clone(&group),
-                                    route_id.clone(),
-                                    created_at,
-                                )
-                                .with_path_pattern(Arc::from("/"))
-                                .with_metric_route_id(Arc::clone(&default_metric_route_id))
-                                .with_timeouts(ann.timeouts.clone())
-                                .with_filter_actions(filters)
-                                .with_max_body_size(ann.max_body_size)
-                                .with_allow_source_range(allow_source_range.clone())
-                                .with_deny_source_range(deny_source_range.clone())
-                                .with_rate_limit(rate_limit.clone())
-                                .with_auth(auth.clone())
-                                .with_compression(compression.clone())
-                                .with_forwarded_for(forwarded_for.clone()),
-                            )
+                            Arc::new(build_route_entry(
+                                Arc::clone(&group),
+                                Arc::from("/"),
+                                Arc::clone(&default_metric_route_id),
+                                filters,
+                            ))
                         };
                         for &listener_port in &ports {
                             let effective =
                                 if needs_ssl_redirect && Some(listener_port) == http_port {
-                                    let ssl_status = ann.ssl_redirect_code.unwrap_or(308);
-                                    let mut f = Vec::with_capacity(default_filters.len() + 1);
-                                    f.push(FilterAction::RequestRedirect {
-                                        scheme: Some("https".to_string()),
-                                        hostname: None,
-                                        port: None,
-                                        status_code: ssl_status,
-                                        path: None,
-                                    });
-                                    f.extend_from_slice(&default_filters);
-                                    f
+                                    prepend_ssl_redirect(
+                                        ann.ssl_redirect_code.unwrap_or(308),
+                                        &default_filters,
+                                    )
                                 } else {
                                     default_filters.clone()
                                 };
                             for rule in rules {
-                                let hb = builder
-                                    .for_port(listener_port)
-                                    .host_for(rule.host.as_deref(), WildcardKind::SingleLabel);
-                                if let Some(level) = ann.path_normalize {
-                                    hb.set_path_normalize(level);
-                                }
-                                hb.add_prefix_route("/", make_entry(effective.clone()));
+                                resolve_host_builder(
+                                    builder,
+                                    listener_port,
+                                    rule.host.as_deref(),
+                                    ann.path_normalize,
+                                )
+                                .add_prefix_route("/", make_entry(effective.clone()));
                             }
-                            let hb = builder
-                                .for_port(listener_port)
-                                .host_for(None, WildcardKind::SingleLabel);
-                            if let Some(level) = ann.path_normalize {
-                                hb.set_path_normalize(level);
-                            }
-                            hb.add_prefix_route("/", make_entry(effective));
+                            resolve_host_builder(builder, listener_port, None, ann.path_normalize)
+                                .add_prefix_route("/", make_entry(effective));
                         }
                     }
                 }
@@ -666,6 +640,48 @@ fn resolve_auth_config(
     }
 }
 
+/// Prepend an HTTPS `RequestRedirect` to `base`, returning the combined filter list.
+///
+/// The HTTP-listener entry of an `ssl-redirect` route carries this leading
+/// redirect (308 by default); the HTTPS-listener entry serves `base` unchanged.
+/// Shared by the rule-path and defaultBackend insertion sites so the two stay in
+/// sync (#397).
+fn prepend_ssl_redirect(status_code: u16, base: &[FilterAction]) -> Vec<FilterAction> {
+    let mut filters = Vec::with_capacity(base.len() + 1);
+    filters.push(FilterAction::RequestRedirect {
+        scheme: Some("https".to_string()),
+        hostname: None,
+        port: None,
+        status_code,
+        path: None,
+    });
+    filters.extend_from_slice(base);
+    filters
+}
+
+/// Resolve the host-router builder for `(port, host)` and apply the Ingress's
+/// path-normalize level (#280) before any routes are added.
+///
+/// First-writer-wins across Ingresses sharing the same host: the builder emits a
+/// WARN and keeps the first level on conflict. Centralising the
+/// `set_path_normalize` call here keeps the three host-builder resolution sites
+/// (rule paths, defaultBackend on rule hosts, defaultBackend catch-all) in sync
+/// (#397).
+fn resolve_host_builder<'b>(
+    builder: &'b mut IngressRoutingTableBuilder,
+    port: u16,
+    host: Option<&str>,
+    path_normalize: Option<NormalizeLevel>,
+) -> &'b mut HostRouterBuilder {
+    let host_builder = builder
+        .for_port(port)
+        .host_for(host, WildcardKind::SingleLabel);
+    if let Some(level) = path_normalize {
+        host_builder.set_path_normalize(level);
+    }
+    host_builder
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +776,52 @@ mod tests {
                 .name(),
             "default/default-svc"
         );
+    }
+
+    #[test]
+    fn reconcile_cache_enabled_applies_to_default_backend() {
+        use crate::ingress::annotations::CACHE_ENABLED;
+        use coxswain_core::routing::RouteOutcome;
+
+        let store = slice_store(vec![
+            make_slice("default", "rule-svc", "10.0.0.1"),
+            make_slice("default", "default-svc", "10.0.0.2"),
+        ]);
+        let mut ingress = make_ingress_with_default(
+            "default",
+            Some("a.com"),
+            "/api",
+            "rule-svc",
+            Some("default-svc"),
+        );
+        ingress
+            .metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new)
+            .insert(CACHE_ENABLED.to_string(), "true".to_string());
+
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &empty_svc_store(),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        // Regression (#397): the defaultBackend builder previously omitted
+        // `with_cache_enabled`, so `cache-enabled` silently did not apply to
+        // spec.defaultBackend. An unmatched host falls through to defaultBackend.
+        if let RouteOutcome::Found(m) = table.find(80, "unmatched.example", "/", &ctx) {
+            assert!(
+                m.cache_enabled,
+                "cache-enabled annotation must apply to the spec.defaultBackend route"
+            );
+        } else {
+            panic!("expected defaultBackend route for an unmatched host");
+        }
     }
 
     #[test]
