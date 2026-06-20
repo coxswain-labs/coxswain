@@ -306,6 +306,82 @@ pub(crate) fn upstream_connections_total() -> &'static IntCounterVec {
     })
 }
 
+// ── Circuit-breaker metrics (#282) ────────────────────────────────────────────
+
+/// Gauge: current circuit-breaker state per `(route, upstream)` pair.
+///
+/// Values: `0` = Closed, `1` = Open, `2` = HalfOpen.
+/// Labels: `route` (the `metric_route_id`), `upstream` (the `SocketAddr` string).
+///
+/// Updated by [`crate::circuit_breaker::MetricsInstrument`] in the `on_open`,
+/// `on_half_open`, and `on_closed` [`failsafe::Instrument`] callbacks — transition
+/// time only, never on the per-request hot path.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
+pub(crate) fn circuit_breaker_state() -> &'static IntGaugeVec {
+    static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        register_int_gauge_vec!(
+            Opts::new(
+                "coxswain_proxy_circuit_breaker_state",
+                "Per-endpoint circuit-breaker state: 0=closed, 1=open, 2=half_open",
+            ),
+            &["route", "upstream"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: cumulative requests rejected by an Open circuit breaker (fail-fast 503s).
+///
+/// Labels: `route` (the `metric_route_id`), `upstream` (the `SocketAddr` string).
+///
+/// Bumped in the `on_call_rejected` [`failsafe::Instrument`] callback.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
+pub(crate) fn circuit_breaker_rejected_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_proxy_circuit_breaker_rejected_total",
+                "Cumulative requests rejected by an open circuit breaker (fail-fast 503s)",
+            ),
+            &["route", "upstream"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: cumulative circuit-breaker state transitions.
+///
+/// Labels: `route` (the `metric_route_id`), `upstream` (the `SocketAddr` string),
+/// `to ∈ {"open", "half_open", "closed"}`.
+///
+/// Bumped in the `on_open`, `on_half_open`, and `on_closed` [`failsafe::Instrument`]
+/// callbacks alongside the state gauge update.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
+pub(crate) fn circuit_breaker_transitions_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_proxy_circuit_breaker_transitions_total",
+                "Cumulative circuit-breaker state transitions, by target state",
+            ),
+            &["route", "upstream", "to"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
 /// Histogram: downstream connection lifetime in seconds, observed on close.
 ///
 /// # Panics

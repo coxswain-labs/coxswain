@@ -81,3 +81,14 @@ pub const DRAIN_ECHO: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/backends/drain_echo.yaml"
 );
+
+/// Standalone go-httpbin backend for circuit-breaker tests (#282).
+///
+/// Exposes `/status/:code` so tests can drive configurable upstream HTTP
+/// status codes — `/status/500` to record errors and trip the circuit
+/// breaker, `/status/200` to let the half-open probe succeed and close it.
+/// A single `go-httpbin` Deployment + `go-httpbin` Service, port 3000.
+pub const GO_HTTPBIN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/go_httpbin.yaml"
+);

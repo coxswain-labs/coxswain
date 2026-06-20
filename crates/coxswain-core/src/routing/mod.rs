@@ -21,6 +21,7 @@ pub use common::backend::{
     BackendGroup, HashSource, LoadBalance, Selected, SessionAffinity, affinity_hash,
     affinity_hash_parts, affinity_token,
 };
+pub use common::circuit_breaker::CircuitBreakerConfig;
 pub use common::compression::CompressionConfig;
 pub use common::entry::{
     BackendProtocol, FilterAction, ForwardedForConfig, HeaderMod, HeaderModError, PathModifier,

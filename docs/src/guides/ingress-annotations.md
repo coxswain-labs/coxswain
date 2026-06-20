@@ -56,6 +56,11 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/load-balance` | `round_robin`, `least_conn`, `ewma`, `ip_hash`, `hash:uri`, `hash:source-ip`, `hash:header=<name>`, `hash:cookie=<name>` | `round_robin` | `"hash:uri"` |
 | `ingress.coxswain-labs.dev/path-normalize` | `none`, `base`, `merge-slashes`, `decode-and-merge-slashes` | `base` | `"merge-slashes"` |
+| `ingress.coxswain-labs.dev/circuit-breaker-threshold` | integer 1–100 | _none_ (disabled) | `"50"` |
+| `ingress.coxswain-labs.dev/circuit-breaker-window` | duration | `10s` | `"30s"` |
+| `ingress.coxswain-labs.dev/circuit-breaker-open-duration` | duration | `5s` | `"10s"` |
+| `ingress.coxswain-labs.dev/circuit-breaker-min-requests` | integer | `10` | `"5"` |
+| `ingress.coxswain-labs.dev/circuit-breaker-max-open-duration` | duration | _none_ (constant) | `"60s"` |
 
 ```yaml
 metadata:
@@ -609,6 +614,72 @@ metadata:
 
 !!! note
     The Gateway API binding for session persistence is tracked in [#355](https://github.com/coxswain-labs/coxswain/issues/355). It is deferred because the only Gateway API surface for session persistence in our pinned crate is experimental-only (which Coxswain never compiles into release images), and the `BackendLBPolicy` resource originally proposed is not an upstream Gateway API type. Today the `session-*` annotations are the Ingress-only entry point.
+
+## Circuit breaker
+
+The per-upstream-endpoint circuit breaker trips when a backend pod's **error rate** exceeds a threshold, returning fail-fast **503** responses to clients until the pod shows signs of recovery. This is the Ingress equivalent of Envoy/Istio **outlier detection**: a single degraded pod trips only its own breaker; healthy pods serving the same Ingress keep accepting traffic.
+
+The breaker is implemented with [failsafe](https://docs.rs/failsafe)'s EWMA (exponentially weighted moving average) success-rate policy. Breaker state is tracked per `(route, endpoint-IP:port)` pair — one state machine per upstream pod, per route.
+
+**State machine:**
+
+1. **Closed** (initial) — requests flow normally; errors accumulate against the EWMA window.
+2. **Open** — error rate exceeded `threshold` after `min-requests` samples; requests fail-fast 503 without reaching the upstream. The breaker stays Open for `open-duration` (or exponentially longer, up to `max-open-duration`, on repeated trips).
+3. **HalfOpen** — after `open-duration` one probe request is let through. If it succeeds, the breaker closes; if it fails, it re-opens for another `open-duration`.
+
+**Observability** — three Prometheus series on the proxy admin `/metrics` endpoint:
+
+- `coxswain_proxy_circuit_breaker_state{route, upstream}` — `0` = closed, `1` = open, `2` = half-open.
+- `coxswain_proxy_circuit_breaker_rejected_total{route, upstream}` — count of fail-fast 503s issued while the breaker was open.
+- `coxswain_proxy_circuit_breaker_transitions_total{route, upstream, to}` — cumulative state transitions; `to` is `"open"`, `"half_open"`, or `"closed"`.
+
+### `circuit-breaker-threshold`
+
+**Required.** Error-rate percentage (1–100) that trips the breaker. Absent or invalid → breaker disabled (fail-open).
+
+Maps to `failsafe`'s `required_success_rate = 1 - threshold/100`. A value of `50` trips the breaker when fewer than 50% of requests succeed.
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/circuit-breaker-threshold: "50"
+```
+
+### `circuit-breaker-window`
+
+EWMA sliding window over which the success rate is measured. Duration string (e.g. `"10s"`). Default: `10s`.
+
+### `circuit-breaker-open-duration`
+
+How long the breaker stays Open before allowing a half-open probe. Duration string. Default: `5s`.
+
+When `circuit-breaker-max-open-duration` is absent this is a **constant** backoff (every trip stays Open for exactly this duration). When `max-open-duration` is set this is the **initial** duration and the window grows exponentially across repeated trips.
+
+### `circuit-breaker-min-requests`
+
+Minimum number of requests that must have been observed in the current window before the policy evaluates and can trip the breaker. Prevents a single early failure on a low-traffic route from opening the breaker. Integer ≥ 1. Default: `10`.
+
+### `circuit-breaker-max-open-duration`
+
+**Optional.** Upper bound for exponential backoff. When set, each successive trip doubles the open-duration (starting from `circuit-breaker-open-duration`) up to this cap. Absent → constant backoff (each trip uses the same `open-duration`).
+
+### Example
+
+```yaml
+metadata:
+  annotations:
+    ingress.coxswain-labs.dev/circuit-breaker-threshold: "50"
+    ingress.coxswain-labs.dev/circuit-breaker-window: "10s"
+    ingress.coxswain-labs.dev/circuit-breaker-open-duration: "5s"
+    ingress.coxswain-labs.dev/circuit-breaker-min-requests: "10"
+    ingress.coxswain-labs.dev/circuit-breaker-max-open-duration: "60s"
+```
+
+**Fail-fast behaviour:** when the breaker is Open, the proxy returns 503 immediately without connecting to the upstream. The client sees 503; other healthy pods serving the same route continue accepting traffic via load-balancing.
+
+**Invalid values** (zero threshold, unparseable duration, non-integer min-requests) emit a controller warning and disable the breaker for that route (**fail-open**) — a misconfigured annotation never blocks all traffic.
+
+---
 
 ## Rate limiting
 

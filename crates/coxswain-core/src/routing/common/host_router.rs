@@ -2,6 +2,7 @@
 
 use super::auth::IngressAuthConfig;
 use super::backend::BackendGroup;
+use super::circuit_breaker::CircuitBreakerConfig;
 use super::compression::CompressionConfig;
 use super::entry::{
     FilterAction, ForwardedForConfig, RouteConflict, RouteEntry, RouteInfo, RouteKind,
@@ -68,6 +69,13 @@ pub struct RouteMatch {
     /// configured header and stores it in `ProxyCtx::client_ip` for use by all
     /// IP-based features (allow/deny-source-range, rate limiting, access logs).
     pub forwarded_for: Option<Arc<ForwardedForConfig>>,
+    /// Per-route circuit-breaker configuration (`None` = disabled).
+    ///
+    /// Populated from `RouteEntry::circuit_breaker`; `Some` only for Ingress routes
+    /// that configure `ingress.coxswain-labs.dev/circuit-breaker-threshold`. The
+    /// proxy gates each request through the per-endpoint
+    /// `CircuitBreakerRegistry` in `upstream_peer` and records the outcome in `logging`.
+    pub circuit_breaker: Option<Arc<CircuitBreakerConfig>>,
 
     /// Normalized form of the request path, when it differs from the raw path.
     ///
@@ -102,6 +110,7 @@ impl RouteMatch {
             auth: entry.auth.clone(),
             compression: entry.compression.clone(),
             forwarded_for: entry.forwarded_for.clone(),
+            circuit_breaker: entry.circuit_breaker.clone(),
             normalized_path: None,
 
             error_status: entry.error_status,

@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod backend;
+pub mod circuit_breaker;
 pub mod compression;
 pub mod entry;
 pub mod host_router;

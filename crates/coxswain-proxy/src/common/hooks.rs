@@ -103,6 +103,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             client_ip: None,
             lb_track: None,
             hash_key: None,
+            circuit_breaker_rejected: false,
         })
         .unwrap_or_default()
 }
@@ -359,6 +360,7 @@ pub(crate) async fn request_filter<K>(
         metric_route_id: m.metric_route_id,
         cache_enabled: m.cache_enabled,
         compression: m.compression,
+        circuit_breaker: m.circuit_breaker,
     });
 
     // ── Mirror setup (#283) ─────────────────────────────────────────────────
@@ -900,6 +902,7 @@ fn spawn_mirror_dispatch(dispatch: MirrorDispatch, client: reqwest::Client, body
 /// `BackendTLSPolicy` CA bundle).
 pub(crate) async fn upstream_peer(
     ca_cache: &UpstreamCaCache,
+    circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry,
     ctx: &mut ProxyCtx,
 ) -> Result<Box<HttpPeer>> {
     let resolved = ctx.resolved.as_ref().ok_or_else(|| {
@@ -943,6 +946,22 @@ pub(crate) async fn upstream_peer(
     };
     ctx.selected_backend_filters = per_backend_filters;
     ctx.upstream_addr = Some(addr);
+
+    // ── Circuit-breaker gate (#282) ───────────────────────────────────────────
+    // When the route carries a circuit-breaker config, check whether the selected
+    // endpoint's breaker permits this request. An Open breaker returns 503
+    // immediately (fail-fast). Routes without the annotation short-circuit on the
+    // `None` check — zero overhead.
+    if let Some(cfg) = resolved.circuit_breaker.as_deref() {
+        let route_id = Arc::clone(&resolved.metric_route_id);
+        if !circuit_breakers.is_call_permitted(&route_id, addr, cfg) {
+            ctx.circuit_breaker_rejected = true;
+            return Err(pingora_core::Error::explain(
+                HTTPStatus(503),
+                "circuit breaker open — endpoint temporarily unavailable",
+            ));
+        }
+    }
 
     let protocol = resolved.backend_group.protocol();
 
@@ -1607,6 +1626,7 @@ fn inc_upstream_error(ctx: &ProxyCtx, error_type: &'static str) {
 pub(crate) async fn logging(
     access_log_enabled: bool,
     access_log_path_mode: AccessLogPathMode,
+    circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry,
     session: &mut Session,
     e: Option<&pingora_core::Error>,
     ctx: &ProxyCtx,
@@ -1622,6 +1642,23 @@ pub(crate) async fn logging(
     // Always fires; `None` lb_track (RoundRobin, IpHash, GW-API routes) is a no-op.
     if let (Some(idx), Some(r)) = (ctx.lb_track, ctx.resolved.as_ref()) {
         r.backend_group.complete(idx, duration);
+    }
+
+    // Circuit-breaker outcome recording (#282).
+    // Only record when: the route has a breaker config, an upstream address was
+    // selected, and the request was not fail-fast rejected (no real upstream attempt
+    // was made in that case, so there is no outcome to record).
+    if !ctx.circuit_breaker_rejected
+        && let (Some(cfg), Some(addr), Some(r)) = (
+            ctx.resolved
+                .as_ref()
+                .and_then(|r| r.circuit_breaker.as_deref()),
+            ctx.upstream_addr,
+            ctx.resolved.as_ref(),
+        )
+    {
+        let success = status.is_some_and(|s| s < 500);
+        circuit_breakers.record(&r.metric_route_id, addr, cfg, success);
     }
 
     // Prefer the pre-resolved host from context; fall back to parsing the header.
