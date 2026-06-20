@@ -258,9 +258,32 @@ pub async fn count_backends(
     path: &str,
     n: usize,
 ) -> anyhow::Result<std::collections::HashMap<String, usize>> {
+    // A traffic-distribution count fires hundreds of sequential requests at the
+    // shared single-replica proxy. Under the parallel pass a lone request can
+    // hit the 5 s client timeout on connection setup (LB/connection jitter under
+    // concurrent load) — a transient blip that must not collapse a test asserting
+    // proportions over the whole batch. Retry ONLY transient transport errors
+    // (timeout/connect/send), never an HTTP-status error; no sleep is needed
+    // because a timed-out attempt already burned its 5 s budget.
+    const MAX_TRANSIENT_RETRIES: usize = 3;
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for _ in 0..n {
-        let resp = http.get(host, path).await?;
+    for i in 0..n {
+        let mut attempt = 0;
+        let resp = loop {
+            match http.get(host, path).await {
+                Ok(r) => break r,
+                Err(e) if attempt < MAX_TRANSIENT_RETRIES && is_transient_transport_error(&e) => {
+                    attempt += 1;
+                    tracing::debug!(
+                        request = i,
+                        attempt,
+                        error = %e,
+                        "transient transport error counting backends; retrying"
+                    );
+                }
+                Err(e) => return Err(e.context(format!("count_backends request {i} of {n}"))),
+            }
+        };
         let pod = resp.pod.as_deref().unwrap_or("");
         // Pod name format: "<deployment>-<replicaset>-<random>" — take the first two segments.
         let key = pod.splitn(3, '-').take(2).collect::<Vec<_>>().join("-");
@@ -272,6 +295,18 @@ pub async fn count_backends(
         *counts.entry(key).or_insert(0) += 1;
     }
     Ok(counts)
+}
+
+/// Whether `e` is a transient transport-level failure (connection timeout,
+/// connect failure, or request-send failure) safe to retry on an idempotent GET.
+///
+/// A non-2xx HTTP status surfaces as an `anyhow` error without a `reqwest::Error`
+/// transport cause, so it is never classified transient — those must fail loudly.
+/// `anyhow::Error::downcast_ref` reaches the underlying `reqwest::Error` even
+/// through the `.context("send request")` layer added by [`HttpClient::request`].
+fn is_transient_transport_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<reqwest::Error>()
+        .is_some_and(|re| re.is_timeout() || re.is_connect() || re.is_request())
 }
 
 /// Make a single HTTPS GET and return the peer's leaf certificate as DER bytes.

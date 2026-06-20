@@ -8,6 +8,13 @@ Source-of-truth guidance for Claude Code in this repository.
 
 Roadmap: [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2). `gh project view 2 --owner coxswain-labs` and `gh issue list --milestone v0.X --state all` enumerate scope.
 
+## Agent rules
+
+- **Always be concise and to the point**
+- **Do not over-explain, keep the prose short unless asked to explain**
+- **Do not over-emphasize**
+- **Do not be sycophantic**
+
 ## Project Overview
 
 **Coxswain** is a pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora). It watches `Ingress` and `Gateway API` resources and dynamically routes traffic without a full reload.

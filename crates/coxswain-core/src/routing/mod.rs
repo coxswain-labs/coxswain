@@ -27,6 +27,7 @@ pub use common::entry::{
 pub use common::host_router::{
     HostRouter, HostRouterBuilder, RouteMatch, WildcardKind, compile_path_regex,
 };
+pub use common::path_normalize::NormalizeLevel;
 pub use common::port::PortTableBuilder;
 pub use common::predicate::{
     HeaderPredicate, MatchPredicates, QueryPredicate, RequestContext, ValueMatch,

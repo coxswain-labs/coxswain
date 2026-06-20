@@ -1,0 +1,32 @@
+# path-normalize default behavior fixture (no annotation).
+# Normalization defaults to "base": unreserved percent-decodes + dot-segment
+# removal, but no slash merging and no %2F/%5C decoding.
+#
+# Routes on pn-default.<namespace>.local:
+#   /v1        → echo-a  (encoded dot-segment tests: %2E%2E decoded to ..)
+#   /api/v1    → echo-a  (encoded-slash guard: %2F stays encoded at base)
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pn-default
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: pn-default.${TESTNS}.local
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
+          - path: /api/v1
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

@@ -55,6 +55,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/auth-tls-verify-depth` | integer | `1` | `"2"` |
 | `ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/load-balance` | `round_robin`, `least_conn`, `ewma`, `ip_hash`, `hash:uri`, `hash:source-ip`, `hash:header=<name>`, `hash:cookie=<name>` | `round_robin` | `"hash:uri"` |
+| `ingress.coxswain-labs.dev/path-normalize` | `none`, `base`, `merge-slashes`, `decode-and-merge-slashes` | `base` | `"merge-slashes"` |
 
 ```yaml
 metadata:
@@ -185,6 +186,49 @@ spec:
 **Invalid patterns.** A path whose value is not a valid regular expression is skipped with a controller `WARN`; the rest of the Ingress (and the routing table) is unaffected.
 
 **Migrating from nginx-ingress.** The canonical nginx pairing — `nginx.ingress.kubernetes.io/use-regex` + `nginx.ingress.kubernetes.io/rewrite-target: /$2` with `pathType: ImplementationSpecific` — maps directly onto the Coxswain annotations of the same names. See [capture-group substitution](#capture-group-substitution).
+
+## `path-normalize`
+
+Controls how request paths are normalised before routing and before being forwarded upstream. Coxswain mirrors [Envoy/Istio's `pathNormalization`](https://istio.io/latest/docs/reference/config/istio.mesh.v1alpha1/#MeshConfig-ProxyPathNormalization) — the same four-level enum with `base` as the cluster-wide default.
+
+Normalisation runs **before** the routing lookup; the canonical path is used for the path match _and_ is sent to the upstream unchanged by a `rewrite-target` (if one is configured, it is applied on top of the normalised path).
+
+**Gateway API `HTTPRoute` resources always use `base` normalization.** There is no per-`HTTPRoute` override annotation; the behaviour is controlled at the infrastructure level, matching Istio's model.
+
+| Level | Transformations applied |
+|-------|------------------------|
+| `none` | No-op — raw request path is routed and forwarded as-is. |
+| `base` _(default)_ | Percent-decode unreserved characters (`%2e`→`.`, `%2d`→`-`, etc.); convert `\` to `/`; remove dot segments (`.` and `..`, RFC 3986 §5.2.4). `%2f` and `%5c` are **not** decoded — they remain encoded to prevent path-traversal bypasses. |
+| `merge-slashes` | Everything in `base`, plus collapse consecutive slashes (`//` → `/`). |
+| `decode-and-merge-slashes` | Everything in `merge-slashes`, plus decode `%2f`→`/` and `%5c`→`\` before the rest of the pipeline. Use only when your backend expects literal `/` from encoded segments and you understand the security trade-off. |
+
+Each level includes all transformations of the levels before it.
+
+```yaml
+metadata:
+  annotations:
+    # Collapse // produced by client-side path joining.
+    ingress.coxswain-labs.dev/path-normalize: "merge-slashes"
+spec:
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /api/v1
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+```
+
+**Conflict resolution.** Multiple Ingresses can share the same host (using the standard Ingress host/path merging). When they set different `path-normalize` levels for the same host, the **first Ingress** (ordered by `creationTimestamp`, namespace/name for ties) wins; subsequent conflicting levels are ignored with a controller `WARN`. Setting the same level on two Ingresses sharing a host is not a conflict.
+
+**Performance.** Paths that are already in canonical form take a single linear scan and allocate nothing; allocation only occurs when the path actually changes, and then it is bounded by the path length. The common case (clean paths through `base`) is effectively free.
+
+!!! warning
+    `decode-and-merge-slashes` decodes `%2f`/`%5c` before routing, which allows a request for `/api%2fv1` to match the `/api/v1` prefix. Only enable this level if your backend requires it — it removes the URL-encoding layer that prevents path-traversal via encoded slashes.
 
 ## Request header modification
 

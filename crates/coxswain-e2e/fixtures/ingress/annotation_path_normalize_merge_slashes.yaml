@@ -1,0 +1,26 @@
+# path-normalize: merge-slashes fixture.
+# Consecutive slashes in the path are collapsed to one before routing and
+# forwarding; the level includes all base transformations as well.
+#
+# Route on pn-merge.<namespace>.local:
+#   /api/v1 → echo-a
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pn-merge
+  annotations:
+    ingress.coxswain-labs.dev/path-normalize: merge-slashes
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: pn-merge.${TESTNS}.local
+      http:
+        paths:
+          - path: /api/v1
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

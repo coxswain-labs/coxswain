@@ -420,6 +420,12 @@ impl IngressReconciler {
                     let host_builder = builder
                         .for_port(listener_port)
                         .host_for(rule.host.as_deref(), WildcardKind::SingleLabel);
+                    // Propagate the path-normalize level (#280) to the host builder.
+                    // First-writer-wins across Ingresses sharing the same host; the
+                    // builder emits a WARN and keeps the first level on conflict.
+                    if let Some(level) = ann.path_normalize {
+                        host_builder.set_path_normalize(level);
+                    }
                     if path_regex.is_some() {
                         host_builder.add_regex_route(path, route_entry);
                     } else {
@@ -518,15 +524,21 @@ impl IngressReconciler {
                                     default_filters.clone()
                                 };
                             for rule in rules {
-                                builder
+                                let hb = builder
                                     .for_port(listener_port)
-                                    .host_for(rule.host.as_deref(), WildcardKind::SingleLabel)
-                                    .add_prefix_route("/", make_entry(effective.clone()));
+                                    .host_for(rule.host.as_deref(), WildcardKind::SingleLabel);
+                                if let Some(level) = ann.path_normalize {
+                                    hb.set_path_normalize(level);
+                                }
+                                hb.add_prefix_route("/", make_entry(effective.clone()));
                             }
-                            builder
+                            let hb = builder
                                 .for_port(listener_port)
-                                .host_for(None, WildcardKind::SingleLabel)
-                                .add_prefix_route("/", make_entry(effective));
+                                .host_for(None, WildcardKind::SingleLabel);
+                            if let Some(level) = ann.path_normalize {
+                                hb.set_path_normalize(level);
+                            }
+                            hb.add_prefix_route("/", make_entry(effective));
                         }
                     }
                 }

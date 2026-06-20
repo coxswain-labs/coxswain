@@ -1,0 +1,46 @@
+# Gateway API path-normalize default behavior fixture.
+# Every HTTPRoute defaults to "base" normalization (no per-route annotation
+# exists; the default is applied at the infrastructure level, mirroring Istio).
+#
+# Routes on pn-gw.<namespace>.local:
+#   /v1 → echo-a  (encoded dot-segment test: %2E%2E decoded to ..)
+#   /probe (exact) → echo-a  (readiness probe)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: pn-gw-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "pn-gw.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      backendRefs:
+        - name: echo-a
+          port: 3000
+    - matches:
+        - path:
+            type: Exact
+            value: /probe
+      backendRefs:
+        - name: echo-a
+          port: 3000

@@ -8,6 +8,7 @@ use super::entry::RouteConflict;
 use super::host_router::{HostRouter, HostRouterBuilder, WildcardKind, wildcard_matches};
 use super::predicate::RequestContext;
 use super::table::{RouteOutcome, RouterError};
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,11 +42,27 @@ impl PortRoutingTable {
         } else {
             return RouteOutcome::NoHost;
         };
-        match router.route(path, ctx) {
-            Some(m) => match m.error_status {
-                Some(status) => RouteOutcome::Error(status),
-                None => RouteOutcome::Found(m),
-            },
+
+        // Apply path normalization once, after the single host resolution.
+        // `Borrowed` on the common (already-canonical) path costs one linear
+        // scan and zero allocation; `Owned` allocates exactly one `String` only
+        // when the path actually changes.
+        let normalized: Cow<str> = router.normalize_level().apply(path);
+
+        match router.route(&normalized, ctx) {
+            Some(mut m) => {
+                // Surface the normalized path so the proxy can forward it
+                // upstream without re-computing normalization.  Set only when
+                // the path actually changed (`Owned`); `None` means "use the
+                // raw path" and avoids an `Arc` allocation on the common case.
+                if let Cow::Owned(s) = normalized {
+                    m.normalized_path = Some(Arc::from(s));
+                }
+                match m.error_status {
+                    Some(status) => RouteOutcome::Error(status),
+                    None => RouteOutcome::Found(m),
+                }
+            }
             None => RouteOutcome::NoPath,
         }
     }
