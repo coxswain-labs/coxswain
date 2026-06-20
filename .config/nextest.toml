@@ -52,6 +52,14 @@ slow-timeout = { period = "900s", terminate-after = 1 }
 #   deny_source_range_*     -> #327 (need PROXY protocol to drive a real client IP)
 #   access_log_*            -> #279 (per-Ingress access-log)
 #
+# Flake isolation (NOT global-config mutators): the two `timeouts_*_returns_504`
+# routing tests drive a deliberately slow upstream so the proxy holds connections
+# open until a 504 fires. Run concurrently with the high-volume `count_backends`
+# distribution tests (also in the routing binary), they raise connection-setup
+# tail latency on the single shared proxy enough to trip the 5 s client timeout.
+# They mutate no global config, so correctness never required serialization —
+# they sit in the serial pass purely to keep the parallel routing pass stable.
+#
 # The two profiles below split on exactly this set via `default-filter`, so the
 # run command stays uniform (`-E 'binary(<suite>)'`) for both passes.
 
@@ -72,6 +80,7 @@ default-filter = '''
     | test(=satisfy_all_denies_when_ip_passes_but_auth_denies) | test(=deny_source_range_blocks_under_satisfy_any_despite_ip_and_auth_passing)
     | test(=status_reports_load_balancer_ip)
     | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
+    | test(=timeouts_request_returns_504) | test(=timeouts_backend_request_returns_504)
   )
   and not binary(resilience)
   and not binary(status_conditions)
@@ -107,6 +116,7 @@ default-filter = '''
   | test(=satisfy_all_denies_when_ip_passes_but_auth_denies) | test(=deny_source_range_blocks_under_satisfy_any_despite_ip_and_auth_passing)
   | test(=status_reports_load_balancer_ip)
   | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
+  | test(=timeouts_request_returns_504) | test(=timeouts_backend_request_returns_504)
   | binary(resilience)
   | binary(status_conditions)
 '''
