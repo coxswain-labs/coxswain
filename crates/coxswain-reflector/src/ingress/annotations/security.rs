@@ -203,6 +203,8 @@ fn parse_cidr_or_host(token: &str) -> Option<ipnet::IpNet> {
 /// * `burst_val` — raw value of `rate-limit-burst`.
 /// * `by_val` — raw value of `rate-limit-by`.
 /// * `route_id` — forwarded from the parent `IngressAnnotations::parse` for log context.
+/// * `has_auth` — `true` when either `auth-url` or `auth-basic-secret` is also set on the
+///   same Ingress; used to suppress the key-rotation-bypass advisory for auth-gated routes.
 /// * `diag` — collects machine-readable issues alongside the warn log.
 #[must_use]
 pub fn parse_rate_limit(
@@ -210,6 +212,7 @@ pub fn parse_rate_limit(
     burst_val: Option<&str>,
     by_val: Option<&str>,
     route_id: &str,
+    has_auth: bool,
     diag: &mut Vec<AnnotationIssue>,
 ) -> Option<coxswain_core::routing::RateLimitConfig> {
     use coxswain_core::routing::{RateLimitConfig, RateLimitKey};
@@ -279,6 +282,21 @@ pub fn parse_rate_limit(
     } else {
         RateLimitKey::ClientIp
     };
+
+    if matches!(key, RateLimitKey::Header(_)) && !has_auth {
+        tracing::warn!(
+            ingress = %route_id,
+            annotation = RATE_LIMIT_BY,
+            "header keying allows rate-limit bypass via header-value rotation; \
+             pair with rate-limit-by: ip or an auth-* annotation"
+        );
+        diag.push(AnnotationIssue {
+            annotation: RATE_LIMIT_BY,
+            message: "header keying allows rate-limit bypass via header-value rotation; \
+                      pair with rate-limit-by: ip or an auth-* annotation"
+                .into(),
+        });
+    }
 
     Some(RateLimitConfig::new(requests_per_second, burst, key))
 }
@@ -505,24 +523,27 @@ mod tests {
         let _ = RATE_LIMIT_RPS;
         let _ = RATE_LIMIT_BURST;
         let _ = RATE_LIMIT_BY;
-        assert!(parse_rate_limit(None, None, None, "ns/test", &mut vec![]).is_none());
+        assert!(parse_rate_limit(None, None, None, "ns/test", false, &mut vec![]).is_none());
     }
 
     #[test]
     fn rate_limit_rps_zero_is_none() {
-        assert!(parse_rate_limit(Some("0"), None, None, "ns/test", &mut vec![]).is_none());
+        assert!(parse_rate_limit(Some("0"), None, None, "ns/test", false, &mut vec![]).is_none());
     }
 
     #[test]
     #[tracing_test::traced_test]
     fn rate_limit_invalid_rps_warns_and_is_none() {
-        assert!(parse_rate_limit(Some("nope"), None, None, "ns/test", &mut vec![]).is_none());
+        assert!(
+            parse_rate_limit(Some("nope"), None, None, "ns/test", false, &mut vec![]).is_none()
+        );
         assert!(logs_contain("invalid or zero rate-limit-rps"));
     }
 
     #[test]
     fn rate_limit_basic_ip_config() {
-        let cfg = parse_rate_limit(Some("10"), None, None, "ns/test", &mut vec![]).expect("valid");
+        let cfg =
+            parse_rate_limit(Some("10"), None, None, "ns/test", false, &mut vec![]).expect("valid");
         assert_eq!(cfg.requests_per_second.get(), 10);
         assert_eq!(cfg.burst, 0);
         assert_eq!(cfg.key, RateLimitKey::ClientIp);
@@ -530,8 +551,8 @@ mod tests {
 
     #[test]
     fn rate_limit_with_burst() {
-        let cfg =
-            parse_rate_limit(Some("5"), Some("20"), None, "ns/test", &mut vec![]).expect("valid");
+        let cfg = parse_rate_limit(Some("5"), Some("20"), None, "ns/test", false, &mut vec![])
+            .expect("valid");
         assert_eq!(cfg.requests_per_second.get(), 5);
         assert_eq!(cfg.burst, 20);
     }
@@ -539,16 +560,16 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn rate_limit_invalid_burst_defaults_to_zero() {
-        let cfg =
-            parse_rate_limit(Some("5"), Some("bad"), None, "ns/test", &mut vec![]).expect("valid");
+        let cfg = parse_rate_limit(Some("5"), Some("bad"), None, "ns/test", false, &mut vec![])
+            .expect("valid");
         assert_eq!(cfg.burst, 0);
         assert!(logs_contain("invalid rate-limit-burst"));
     }
 
     #[test]
     fn rate_limit_by_ip_explicit() {
-        let cfg =
-            parse_rate_limit(Some("10"), None, Some("ip"), "ns/test", &mut vec![]).expect("valid");
+        let cfg = parse_rate_limit(Some("10"), None, Some("ip"), "ns/test", false, &mut vec![])
+            .expect("valid");
         assert_eq!(cfg.key, RateLimitKey::ClientIp);
     }
 
@@ -559,6 +580,7 @@ mod tests {
             None,
             Some("header:X-Api-Key"),
             "ns/test",
+            true, // has_auth=true: test the key type; bypass-warning tested separately
             &mut vec![],
         )
         .expect("valid");
@@ -575,6 +597,7 @@ mod tests {
             None,
             Some("header:Authorization"),
             "ns/test",
+            true, // has_auth=true: test lowercasing; bypass-warning tested separately
             &mut vec![],
         )
         .expect("valid");
@@ -592,11 +615,53 @@ mod tests {
             None,
             Some("bad-selector"),
             "ns/test",
+            false,
             &mut vec![],
         )
         .expect("valid");
         assert_eq!(cfg.key, RateLimitKey::ClientIp);
         assert!(logs_contain("invalid rate-limit-by"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn rate_limit_by_header_without_auth_warns() {
+        let mut diag = vec![];
+        let cfg = parse_rate_limit(
+            Some("10"),
+            None,
+            Some("header:X-Api-Key"),
+            "ns/test",
+            false,
+            &mut diag,
+        )
+        .expect("valid");
+        assert_eq!(
+            cfg.key,
+            RateLimitKey::Header(std::sync::Arc::from("x-api-key"))
+        );
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, RATE_LIMIT_BY);
+        assert!(logs_contain("header keying allows rate-limit bypass"));
+    }
+
+    #[test]
+    fn rate_limit_by_header_with_auth_no_warn() {
+        let mut diag = vec![];
+        let cfg = parse_rate_limit(
+            Some("10"),
+            None,
+            Some("header:X-Api-Key"),
+            "ns/test",
+            true,
+            &mut diag,
+        )
+        .expect("valid");
+        assert_eq!(
+            cfg.key,
+            RateLimitKey::Header(std::sync::Arc::from("x-api-key"))
+        );
+        assert!(diag.is_empty());
     }
 
     #[test]

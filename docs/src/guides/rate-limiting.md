@@ -82,6 +82,9 @@ metadata:
     ingress.coxswain-labs.dev/rate-limit-by: "header:X-Api-Key"
 ```
 
+!!! warning
+    Header keying can be bypassed by rotating the header value. Pair it with `auth-url` or `auth-basic-secret` to ensure the header is authenticated before being trusted. See the [rate-limit-by annotation reference](ingress-annotations.md#rate-limit-by) for details.
+
 ## Gateway API ExtensionRef
 
 Attach a rate limit to a single `HTTPRoute` rule by referencing a `RateLimit` custom resource from an `ExtensionRef` filter:

@@ -456,11 +456,13 @@ impl IngressAnnotations {
         let session_affinity = parse_session_affinity(ann, route_id, &mut diag);
 
         // ── Rate limiting (#25) ───────────────────────────────────────────────
+        let has_auth = get(ann, AUTH_URL).is_some() || get(ann, AUTH_BASIC_SECRET).is_some();
         let rate_limit = parse_rate_limit(
             get(ann, RATE_LIMIT_RPS),
             get(ann, RATE_LIMIT_BURST),
             get(ann, RATE_LIMIT_BY),
             route_id,
+            has_auth,
             &mut diag,
         );
 

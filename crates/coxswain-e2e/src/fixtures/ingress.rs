@@ -144,6 +144,11 @@ pub const ANNOTATION_RATE_LIMIT_BURST: &str = fixture!("annotation_rate_limit_bu
 /// Used to verify fail-open when the keying header is absent — all requests pass even
 /// at high rates.
 pub const ANNOTATION_RATE_LIMIT_BY_HEADER: &str = fixture!("annotation_rate_limit_by_header.yaml");
+/// Ingress with `rate-limit-by: header:X-Api-Key` **and** `auth-url` (#411 negative).
+/// Used to verify that header keying paired with an auth annotation emits no
+/// `InvalidAnnotation` Warning Event (the auth layer prevents the bypass).
+pub const ANNOTATION_RATE_LIMIT_BY_HEADER_WITH_AUTH: &str =
+    fixture!("annotation_rate_limit_by_header_with_auth.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/rate-limit-rps: "notanumber"` (#25).
 /// Used to verify that an invalid annotation value is ignored (warn + fail-open) and
 /// traffic flows unthrottled.

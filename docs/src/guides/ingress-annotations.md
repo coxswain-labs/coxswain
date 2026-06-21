@@ -731,6 +731,16 @@ When the keying dimension is not available for a request (undeterminable IP, or 
 
 An unrecognised `rate-limit-by` value emits a controller warning and falls back to `"ip"`.
 
+!!! warning "Header keying allows rate-limit bypass"
+    `header:Name` allocates one bucket per **unique value** of the named header. A client that rotates the header value (e.g. sends a different `X-Api-Key` on each request) starts with a full bucket every time, bypassing the per-key limit entirely.
+
+    Mitigate by:
+
+    - combining with `auth-url` or `auth-basic-secret` so the header value is authenticated before being trusted as a rate-limit key, or
+    - using `rate-limit-by: ip` as the primary limit and treating header keying as an optional secondary signal only.
+
+    The controller emits a `Warning` Event on the Ingress when `header:*` keying is configured without an auth annotation, so operators are notified at reconcile time.
+
 ## Authentication
 
 Coxswain supports two authentication modes on Ingresses: **external auth** (HTTP sub-request) and **basic auth** (htpasswd Secret). Both are enforced at the proxy before any upstream connection; a failure never reaches the backend.
