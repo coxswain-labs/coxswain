@@ -654,7 +654,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "coxswain-admin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "coxswain-bin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "coxswain-cache"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pingora-cache",
  "prometheus 0.14.0",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "coxswain-controller"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "coxswain-core",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "coxswain-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "coxswain-e2e"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "coxswain-health"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "coxswain-core",
@@ -794,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "coxswain-proxy"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "coxswain-reflector"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "async-trait",
