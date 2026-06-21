@@ -179,6 +179,13 @@ pub const ANNOTATION_AUTH_ALWAYS_SET_COOKIE: &str =
 /// Carries `ingress.coxswain-labs.dev/auth-basic: "true"` so the reflector picks it up.
 /// Contains: `alice` (bcrypt, password `secret`) + `bob` (SHA1, password `secret`).
 pub const AUTH_BASIC_SECRET: &str = fixture!("auth_basic_secret.yaml");
+/// Labeled htpasswd Secret with bcrypt-only credentials (#412 negative).
+/// Contains `alice` (bcrypt only) — no SHA1 entries; used to verify that a bcrypt-only
+/// secret emits no `InvalidAnnotation` Warning Event.
+pub const AUTH_BASIC_SECRET_BCRYPT_ONLY: &str = fixture!("auth_basic_secret_bcrypt_only.yaml");
+/// Ingress using `auth-basic-secret` pointing at the bcrypt-only Secret (#412 negative).
+pub const ANNOTATION_AUTH_BASIC_BCRYPT_ONLY: &str =
+    fixture!("annotation_auth_basic_bcrypt_only.yaml");
 /// Unlabeled htpasswd Secret — the reflector ignores it, causing the proxy to return 503
 /// (fail-closed) when an Ingress references it via `auth-basic-secret` (#24 sad path).
 pub const AUTH_BASIC_SECRET_UNLABELED: &str = fixture!("auth_basic_secret_unlabeled.yaml");

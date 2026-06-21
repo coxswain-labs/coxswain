@@ -22,6 +22,12 @@
 //! - `invalid_annotation_emits_warning_event` — annotation parse failure (`#401`): the
 //!   misconfigured Ingress receives a `Warning InvalidAnnotation` Event; a valid
 //!   Ingress receives none.
+//! - `rate_limit_by_header_without_auth_emits_warning_event` — header keying without auth
+//!   (`#411`): the controller emits `InvalidAnnotation` Warning Event; when auth IS paired
+//!   no event is emitted.
+//! - `sha1_htpasswd_credential_emits_warning_event` — weak htpasswd hash (`#412`): a `{SHA}`
+//!   credential triggers an `InvalidAnnotation` Warning Event naming the username; a
+//!   bcrypt-only secret emits none.
 
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, Harness, IngressClassGuard, NamespaceGuard,
@@ -1036,6 +1042,149 @@ async fn invalid_annotation_emits_warning_event() -> anyhow::Result<()> {
         "valid Ingress 'echo-ingress' must have no InvalidAnnotation Warning Events; \
          got {} event(s)",
         valid_invalid_events.len()
+    );
+
+    Ok(())
+}
+
+/// An Ingress with `rate-limit-by: header:*` but no auth annotation must receive a
+/// `Warning InvalidAnnotation` Event with a note mentioning `rate-limit-by` and bypass
+/// risk. An Ingress that pairs the same header-keying with an auth annotation must
+/// receive no such Event (#411).
+#[tokio::test]
+async fn rate_limit_by_header_without_auth_emits_warning_event() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-rl-header-warn").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Positive: rate-limit-by header without auth — bypass-risk advisory fires.
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_RATE_LIMIT_BY_HEADER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let rl_host = format!("ratelimitheader.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &rl_host, "/", 200, Duration::from_secs(60)).await?;
+
+    let event = wait::wait_for_ingress_warning_event(
+        &h.client,
+        &ns.name,
+        "rate-limit-by-header-ingress",
+        "InvalidAnnotation",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let note = event.note.as_deref().unwrap_or("");
+    assert!(
+        note.contains("rate-limit-by") || note.contains("rate-limit"),
+        "InvalidAnnotation Event note must mention the annotation; got {note:?}"
+    );
+    assert!(
+        note.contains("bypass") || note.contains("rotation"),
+        "InvalidAnnotation Event note must mention the bypass risk; got {note:?}"
+    );
+
+    // Negative: rate-limit-by header + auth-url — advisory must not fire.
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_RATE_LIMIT_BY_HEADER_WITH_AUTH,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    // Allow one full reconcile cycle to propagate after the positive event appeared.
+    let auth_host = format!("ratelimitheaderauth.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &auth_host, "/", 401, Duration::from_secs(60)).await?;
+
+    let all_events = Api::<K8sEvent>::namespaced(h.client.clone(), &ns.name)
+        .list(&kube::api::ListParams::default())
+        .await?;
+    let auth_bypass_events: Vec<_> = all_events
+        .items
+        .iter()
+        .filter(|e| {
+            e.type_.as_deref() == Some("Warning")
+                && e.reason.as_deref() == Some("InvalidAnnotation")
+                && e.regarding.as_ref().and_then(|r| r.name.as_deref())
+                    == Some("rate-limit-by-header-auth-ingress")
+        })
+        .collect();
+    assert!(
+        auth_bypass_events.is_empty(),
+        "Ingress with auth must have no rate-limit bypass Warning Events; \
+         got {} event(s)",
+        auth_bypass_events.len()
+    );
+
+    Ok(())
+}
+
+/// An Ingress whose `auth-basic-secret` points at a Secret with a `{SHA}` htpasswd entry
+/// must receive a `Warning InvalidAnnotation` Event naming the affected username. An Ingress
+/// whose secret contains only bcrypt entries must receive no such Event (#412).
+#[tokio::test]
+async fn sha1_htpasswd_credential_emits_warning_event() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-sha1-htpasswd-warn").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Positive: secret with SHA1 entry (bob) + Ingress using it — advisory fires.
+    fixtures::apply_fixture(ingress::AUTH_BASIC_SECRET, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_BASIC, FixtureVars::new(&ns.name)).await?;
+    let sha1_host = format!("authbasic.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &sha1_host, "/", 401, Duration::from_secs(60)).await?;
+
+    let event = wait::wait_for_ingress_warning_event(
+        &h.client,
+        &ns.name,
+        "auth-basic-ingress",
+        "InvalidAnnotation",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let note = event.note.as_deref().unwrap_or("");
+    assert!(
+        note.contains("bob"),
+        "InvalidAnnotation Event note must name the SHA1 user; got {note:?}"
+    );
+    assert!(
+        note.contains("SHA1"),
+        "InvalidAnnotation Event note must mention SHA1; got {note:?}"
+    );
+
+    // Negative: bcrypt-only secret — no advisory Event.
+    fixtures::apply_fixture(
+        ingress::AUTH_BASIC_SECRET_BCRYPT_ONLY,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_BASIC_BCRYPT_ONLY,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let bcrypt_host = format!("authbasicbcrypt.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &bcrypt_host, "/", 401, Duration::from_secs(60)).await?;
+
+    let all_events = Api::<K8sEvent>::namespaced(h.client.clone(), &ns.name)
+        .list(&kube::api::ListParams::default())
+        .await?;
+    let bcrypt_events: Vec<_> = all_events
+        .items
+        .iter()
+        .filter(|e| {
+            e.type_.as_deref() == Some("Warning")
+                && e.reason.as_deref() == Some("InvalidAnnotation")
+                && e.regarding.as_ref().and_then(|r| r.name.as_deref())
+                    == Some("auth-basic-bcrypt-only-ingress")
+        })
+        .collect();
+    assert!(
+        bcrypt_events.is_empty(),
+        "bcrypt-only Ingress must have no SHA1 Warning Events; got {} event(s)",
+        bcrypt_events.len()
     );
 
     Ok(())

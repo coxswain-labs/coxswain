@@ -877,9 +877,15 @@ fn parse_secret_ref(s: &str) -> Option<SecretRef> {
 /// # Supported formats
 ///
 /// - bcrypt: hash prefix `$2a$`, `$2b$`, or `$2y$`
-/// - Apache SHA1: hash prefix `{SHA}` (base64-encoded SHA1 of the password)
+/// - Apache SHA1: hash prefix `{SHA}` (base64-encoded SHA1 of the password); accepted for
+///   compatibility but emits a `WARN` log and an `AnnotationIssue` per affected entry —
+///   SHA1 is unsalted and unsuitable for password storage; regenerate with `htpasswd -B`.
 #[must_use]
-pub(crate) fn parse_htpasswd(data: &[u8]) -> Vec<coxswain_core::routing::BasicCredential> {
+pub(crate) fn parse_htpasswd(
+    data: &[u8],
+    route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
+) -> Vec<coxswain_core::routing::BasicCredential> {
     use coxswain_core::routing::{BasicCredential, PasswordHash};
 
     let Ok(text) = std::str::from_utf8(data) else {
@@ -913,6 +919,19 @@ pub(crate) fn parse_htpasswd(data: &[u8]) -> Vec<coxswain_core::routing::BasicCr
             {
                 PasswordHash::Bcrypt(hash.into())
             } else if hash.starts_with("{SHA}") {
+                tracing::warn!(
+                    ingress = %route_id,
+                    user = username,
+                    "htpasswd entry uses SHA1 which is not suitable for password storage; \
+                     regenerate with bcrypt (htpasswd -B)"
+                );
+                diag.push(AnnotationIssue {
+                    annotation: AUTH_BASIC_SECRET,
+                    message: format!(
+                        "htpasswd entry for user '{username}' uses SHA1 which is not suitable \
+                         for password storage; regenerate with bcrypt (htpasswd -B)"
+                    ),
+                });
                 PasswordHash::Sha1(hash.into())
             } else {
                 tracing::warn!(
@@ -1095,22 +1114,22 @@ mod auth_tests {
     #[test]
     fn parse_htpasswd_bcrypt_entry() {
         let data = b"alice:$2y$12$abcdefghijklmnopqrstuuVGKkqzuSFPb0h.d.XRjRijkFvxONxfy\n";
-        let creds = parse_htpasswd(data);
+        let creds = parse_htpasswd(data, "ns/test", &mut vec![]);
         assert_eq!(creds.len(), 1);
     }
 
     #[test]
     fn parse_htpasswd_sha1_entry() {
-        // {SHA} + base64-encoded SHA1 of "password"
+        // {SHA} + base64-encoded SHA1 of "password"; accepted but emits a diag.
         let data = b"bob:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\n";
-        let creds = parse_htpasswd(data);
+        let creds = parse_htpasswd(data, "ns/test", &mut vec![]);
         assert_eq!(creds.len(), 1);
     }
 
     #[test]
     fn parse_htpasswd_skips_comments_and_blank_lines() {
         let data = b"# comment\nalice:$2y$12$abc\n\n# another\n";
-        let creds = parse_htpasswd(data);
+        let creds = parse_htpasswd(data, "ns/test", &mut vec![]);
         assert_eq!(creds.len(), 1);
     }
 
@@ -1118,7 +1137,7 @@ mod auth_tests {
     #[tracing_test::traced_test]
     fn parse_htpasswd_unsupported_algorithm_warns_and_skips() {
         let data = b"alice:$apr1$salt$hash\n";
-        let creds = parse_htpasswd(data);
+        let creds = parse_htpasswd(data, "ns/test", &mut vec![]);
         assert!(creds.is_empty());
         assert!(logs_contain("unsupported htpasswd hash algorithm"));
     }
@@ -1127,15 +1146,38 @@ mod auth_tests {
     #[tracing_test::traced_test]
     fn parse_htpasswd_malformed_line_warns_and_skips() {
         let data = b"no-colon-here\n";
-        let creds = parse_htpasswd(data);
+        let creds = parse_htpasswd(data, "ns/test", &mut vec![]);
         assert!(creds.is_empty());
         assert!(logs_contain("no ':' separator"));
     }
 
     #[test]
     fn parse_htpasswd_empty_input_is_empty() {
-        assert!(parse_htpasswd(b"").is_empty());
-        assert!(parse_htpasswd(b"# only comments\n").is_empty());
+        assert!(parse_htpasswd(b"", "ns/test", &mut vec![]).is_empty());
+        assert!(parse_htpasswd(b"# only comments\n", "ns/test", &mut vec![]).is_empty());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_htpasswd_sha1_entry_warns() {
+        let data = b"bob:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\nalice:$2y$12$abcdefghijklmnopqrstuuVGKkqzuSFPb0h.d.XRjRijkFvxONxfy\n";
+        let mut diag = vec![];
+        let creds = parse_htpasswd(data, "ns/test", &mut diag);
+        assert_eq!(creds.len(), 2);
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, AUTH_BASIC_SECRET);
+        assert!(diag[0].message.contains("bob"));
+        assert!(diag[0].message.contains("SHA1"));
+        assert!(logs_contain("SHA1 which is not suitable"));
+    }
+
+    #[test]
+    fn parse_htpasswd_bcrypt_only_no_diag() {
+        let data = b"alice:$2y$12$abcdefghijklmnopqrstuuVGKkqzuSFPb0h.d.XRjRijkFvxONxfy\n";
+        let mut diag = vec![];
+        let creds = parse_htpasswd(data, "ns/test", &mut diag);
+        assert_eq!(creds.len(), 1);
+        assert!(diag.is_empty());
     }
 }
 

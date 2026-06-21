@@ -781,7 +781,7 @@ Enables **HTTP Basic Authentication** backed by an htpasswd Secret. Value is `na
 - **Type**: `Opaque`
 - **Key**: `auth`
 - **Value**: standard htpasswd content (one `username:hash` line per credential)
-- **Supported hash algorithms**: `bcrypt` (`$2a$`, `$2b$`, `$2y$`) and `SHA1` (`{SHA}base64`). Lines using other schemes are skipped with a controller warning.
+- **Supported hash algorithms**: **bcrypt** (`$2a$`, `$2b$`, `$2y$`) is the required minimum — use `htpasswd -B` to generate bcrypt hashes. `SHA1` (`{SHA}base64`) is accepted for compatibility with existing files but is **not recommended**: SHA1 is unsalted and trivially crackable offline. The controller emits a `Warning` Event naming each affected username. Lines using other schemes (MD5, crypt) are skipped with a controller warning.
 
 **The Secret must carry the `ingress.coxswain-labs.dev/auth-basic: "true"` label.** The proxy watches only labeled Secrets (the data-plane read-only invariant — the proxy never holds cluster-wide Secret access). A referenced Secret that is absent or unlabeled causes the proxy to return **503** for every request to that Ingress (**fail-closed**). This is intentional: misconfigured auth silences traffic rather than silently bypassing it.
 
@@ -824,6 +824,8 @@ spec:
 Requests without credentials receive **401** with a `WWW-Authenticate: Basic realm="coxswain"` header. Invalid credentials also receive **401**.
 
 !!! tip "Hardening"
+    Always generate credentials with `htpasswd -B` (bcrypt). Avoid `htpasswd -s` (`{SHA}`) — SHA1 is unsalted and can be cracked offline in seconds with commodity hardware.
+
     Credential hashes are zeroed from memory when the credential list is replaced at reconcile time (`zeroize`). The Helm chart already ships `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`, and `capabilities.drop: ALL` by default. For the remaining defense-in-depth, configure nodes with `vm.swappiness=0` so hashes can't be paged to disk — this is a node-level kernel parameter that Kubernetes cannot enforce per-pod.
 
 ## Client certificate mTLS
