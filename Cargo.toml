@@ -65,7 +65,7 @@ http               = { version = "1" }
 humantime          = { version = "2" }
 ipnet              = { version = "2" }
 itoa               = { version = "1" }
-dashmap            = { version = "5.5" }
+dashmap            = { version = "6.2.1" }
 # Enable the "experimental" feature to expose alpha Gateway API resources
 # (GRPCRoute, TCPRoute, BackendTLSPolicy, etc.) and experimental fields on
 # stable CRDs. This feature is for contributor/CI/preview builds ONLY —
@@ -91,6 +91,7 @@ pingora-proxy      = { version = "0.8", default-features = false }
 prometheus         = { version = "0.14" }
 prost              = { version = "0.14" }
 protox             = { version = "0.9" }
+rand               = { version = "0.10.1" }
 rcgen              = { version = "0.14" }
 regex              = { version = "1.12" }
 reqwest            = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }

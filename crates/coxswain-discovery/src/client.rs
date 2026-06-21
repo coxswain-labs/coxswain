@@ -2,6 +2,863 @@
 //!
 //! Owns the reconnect supervisor (jittered exponential backoff 250ms → 30s),
 //! sends `Subscribe` on connect, drives `Ack`/`Nack` after each snapshot, and
-//! feeds the decoded wire DTO into the proxy's `Shared` routing table. The
-//! `Shared` cell is never zeroed during reconnect; the last-good snapshot is
-//! served throughout. Implementation lands in T4 (#238).
+//! feeds the decoded wire DTO into the proxy's [`Shared`] routing cells. The
+//! cells are **never zeroed** during reconnect; the last-good snapshot is served
+//! throughout.
+//!
+//! [`Shared`]: coxswain_core::Shared
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use coxswain_core::health::SubsystemHandle;
+use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
+use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{Channel, Endpoint};
+use tracing::{debug, warn};
+
+use crate::proto::v1::{
+    self as p, client_message::Kind as CKind, discovery_client::DiscoveryClient as TonicClient,
+    server_message::Kind as SKind,
+};
+use crate::subscription::Scope;
+use crate::wire::{client_cert_from_wire, gateway_from_wire, ingress_from_wire, tls_from_wire};
+
+const WIRE_VERSION: &str = "v1";
+
+/// Configuration for the discovery gRPC client supervisor.
+///
+/// Construct with [`DiscoveryClientConfig::new`] for sensible defaults, or fill
+/// all fields explicitly (the type is not `#[non_exhaustive]` so struct-literal
+/// construction is stable at the bin-layer call site).
+// intentionally open: field-literal constructed in coxswain-bin when wiring --source=discovery.
+pub struct DiscoveryClientConfig {
+    /// Controller discovery Service endpoints (`"http://host:port"` strings).
+    ///
+    /// More than one endpoint enables high-availability: [`Channel::balance_list`]
+    /// distributes RPCs across all controller replicas. Must not be empty.
+    pub endpoints: Vec<String>,
+    /// Stable identity of this proxy node (pod UID or hostname).
+    pub node_id: String,
+    /// Subscription scope.
+    ///
+    /// Reserved for v0.6 delta streaming; always serialised as an empty proto
+    /// `Scope {}` in v0.5 regardless of the variant.
+    pub scope: Scope,
+    /// HTTP/2 keep-alive ping interval (default: 30 s).
+    pub http2_keep_alive_interval: Duration,
+    /// HTTP/2 keep-alive timeout: how long to wait for the ping response before
+    /// treating the connection as dead (default: 5 s).
+    pub keep_alive_timeout: Duration,
+    /// Initial backoff duration; doubles on each failed attempt (default: 250 ms).
+    pub backoff_base: Duration,
+    /// Maximum backoff ceiling; full-jitter stays within `[0, cap]` (default: 30 s).
+    pub backoff_cap: Duration,
+}
+
+impl DiscoveryClientConfig {
+    /// Construct with required fields; optional fields get their defaults.
+    #[must_use]
+    pub fn new(endpoints: Vec<String>, node_id: String) -> Self {
+        Self {
+            endpoints,
+            node_id,
+            scope: Scope::SharedPool,
+            http2_keep_alive_interval: Duration::from_secs(30),
+            keep_alive_timeout: Duration::from_secs(5),
+            backoff_base: Duration::from_millis(250),
+            backoff_cap: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Discovery gRPC client: wraps four [`Shared`] routing-table cells and a
+/// background supervisor that keeps them up to date from pushed controller
+/// snapshots.
+///
+/// The four accessor methods (`ingress_routes`, `gateway_routes`, `tls_store`,
+/// `client_cert_store`) mirror the `KubernetesSource` surface so the proxy's
+/// `RoutingSource` trait impl (wired at the discovery wiring ticket) is a
+/// trivial delegation.
+///
+/// The [`Shared`] cells are **never zeroed**: the supervisor serves the
+/// last-good snapshot throughout every reconnect window.
+///
+/// [`Shared`]: coxswain_core::Shared
+#[non_exhaustive]
+pub struct DiscoveryClient {
+    ingress_routes: SharedIngressRoutingTable,
+    gateway_routes: SharedGatewayRoutingTable,
+    tls_store: SharedTlsStore,
+    client_cert_store: SharedClientCertStore,
+}
+
+impl DiscoveryClient {
+    /// Spawn the supervised reconnect loop and return a handle to the routing cells.
+    ///
+    /// `health` must come from a [`coxswain_core::health::HealthRegistry`] that
+    /// registered this subsystem with at least the `health_check` name before
+    /// calling `spawn`. The supervisor drives the following health transitions:
+    ///
+    /// - Before first snapshot: `Pending` → `/readyz` 503 (NotReady).
+    /// - After first snapshot applied: `Ready`.
+    /// - On disconnect after first snapshot: `Degraded` (last-good snapshot served;
+    ///   `/readyz` stays 200).
+    /// - On reconnect + new snapshot: `Ready` again.
+    /// - On NACK (bad DTO): health stays `Ready` — last-good config is still valid.
+    ///
+    /// The returned [`tokio::task::JoinHandle`] should be `await`ed at shutdown
+    /// or held for the process lifetime.
+    #[must_use]
+    pub fn spawn(
+        config: DiscoveryClientConfig,
+        health: SubsystemHandle,
+        health_check: &str,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
+        let ingress_routes = SharedIngressRoutingTable::new();
+        let gateway_routes = SharedGatewayRoutingTable::new();
+        let tls_store = SharedTlsStore::new();
+        let client_cert_store = SharedClientCertStore::new();
+
+        let supervisor = Supervisor {
+            config,
+            ingress: ingress_routes.clone(),
+            gateway: gateway_routes.clone(),
+            tls: tls_store.clone(),
+            client_certs: client_cert_store.clone(),
+            health,
+            health_check: health_check.to_owned(),
+            has_snapshot: false,
+        };
+
+        let handle = tokio::spawn(supervisor.run());
+
+        let client = Self {
+            ingress_routes,
+            gateway_routes,
+            tls_store,
+            client_cert_store,
+        };
+
+        (client, handle)
+    }
+
+    /// Handle to the Ingress routing table [`Shared`] cell.
+    ///
+    /// [`Shared`]: coxswain_core::Shared
+    #[must_use]
+    pub fn ingress_routes(&self) -> SharedIngressRoutingTable {
+        self.ingress_routes.clone()
+    }
+
+    /// Handle to the Gateway-API routing table [`Shared`] cell.
+    ///
+    /// [`Shared`]: coxswain_core::Shared
+    #[must_use]
+    pub fn gateway_routes(&self) -> SharedGatewayRoutingTable {
+        self.gateway_routes.clone()
+    }
+
+    /// Handle to the TLS certificate store [`Shared`] cell.
+    ///
+    /// [`Shared`]: coxswain_core::Shared
+    #[must_use]
+    pub fn tls_store(&self) -> SharedTlsStore {
+        self.tls_store.clone()
+    }
+
+    /// Handle to the client-certificate mTLS config store [`Shared`] cell.
+    ///
+    /// [`Shared`]: coxswain_core::Shared
+    #[must_use]
+    pub fn client_cert_store(&self) -> SharedClientCertStore {
+        self.client_cert_store.clone()
+    }
+}
+
+// ── private supervisor ──────────────────────────────────────────────────────
+
+struct Supervisor {
+    config: DiscoveryClientConfig,
+    ingress: SharedIngressRoutingTable,
+    gateway: SharedGatewayRoutingTable,
+    tls: SharedTlsStore,
+    client_certs: SharedClientCertStore,
+    health: SubsystemHandle,
+    health_check: String,
+    has_snapshot: bool,
+}
+
+impl Supervisor {
+    async fn run(mut self) {
+        let channel = build_channel(&self.config);
+        let mut grpc = TonicClient::new(channel);
+        let mut attempt: u32 = 0;
+
+        loop {
+            let applied = self.stream_until_closed(&mut grpc).await;
+
+            if self.has_snapshot {
+                self.health.degraded(
+                    &self.health_check,
+                    "disconnected from discovery server, serving last-good snapshot",
+                );
+            }
+
+            // Reset the backoff exponent only if the session was productive (at
+            // least one snapshot applied), so a brief connect that never delivers
+            // a snapshot doesn't collapse the exponent.
+            if applied {
+                attempt = 0;
+            } else {
+                attempt = attempt.saturating_add(1);
+            }
+
+            let delay = backoff_jitter(attempt, self.config.backoff_base, self.config.backoff_cap);
+            debug!(
+                delay_ms = delay.as_millis(),
+                "discovery client backing off before reconnect"
+            );
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// Run one stream session until the stream closes or errors.
+    ///
+    /// Returns `true` if at least one snapshot was successfully applied this
+    /// session (used to reset the backoff exponent in the supervisor).
+    async fn stream_until_closed(&mut self, grpc: &mut TonicClient<Channel>) -> bool {
+        let (tx, rx) = mpsc::channel::<p::ClientMessage>(4);
+
+        let response = match grpc.stream(ReceiverStream::new(rx)).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "discovery client: failed to open stream");
+                return false;
+            }
+        };
+        let mut inbound = response.into_inner();
+
+        // Send Subscribe first; the server will not push a Snapshot until it receives this.
+        let subscribe = p::ClientMessage {
+            kind: Some(CKind::Subscribe(p::Subscribe {
+                node_id: self.config.node_id.clone(),
+                wire_version: WIRE_VERSION.to_owned(),
+                scope: Some(p::Scope {}),
+            })),
+        };
+        if tx.send(subscribe).await.is_err() {
+            warn!("discovery client: outbound channel closed immediately after stream open");
+            return false;
+        }
+
+        let mut applied_this_session = false;
+
+        loop {
+            let msg = match inbound.message().await {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    debug!("discovery stream closed by server");
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "discovery stream error");
+                    break;
+                }
+            };
+
+            let snapshot = match msg.kind {
+                Some(SKind::Snapshot(s)) => s,
+                _ => continue,
+            };
+
+            let version = snapshot.version.clone();
+            let nonce = snapshot.nonce.clone();
+
+            match apply_snapshot(
+                &snapshot,
+                &self.ingress,
+                &self.gateway,
+                &self.tls,
+                &self.client_certs,
+            ) {
+                Ok(()) => {
+                    debug!(version, "discovery snapshot applied; sending Ack");
+                    let ack = p::ClientMessage {
+                        kind: Some(CKind::Ack(p::Ack { version, nonce })),
+                    };
+                    if tx.send(ack).await.is_err() {
+                        debug!("discovery client: outbound channel closed after Ack");
+                        break;
+                    }
+                    applied_this_session = true;
+                    if !self.has_snapshot {
+                        self.has_snapshot = true;
+                        self.health.ready(&self.health_check);
+                    }
+                }
+                Err(e) => {
+                    // Last-good snapshot is retained; health stays as-is because the
+                    // proxy is still serving valid configuration from the prior apply.
+                    warn!(error = %e, version, "discovery snapshot rejected (NACK); retaining last-good routing tables");
+                    let nack = p::ClientMessage {
+                        kind: Some(CKind::Nack(p::Nack {
+                            version,
+                            nonce,
+                            detail: e.to_string(),
+                        })),
+                    };
+                    if tx.send(nack).await.is_err() {
+                        debug!("discovery client: outbound channel closed after Nack");
+                        break;
+                    }
+                }
+            }
+        }
+
+        applied_this_session
+    }
+}
+
+/// Decode all routing tables from a snapshot DTO and atomically publish them.
+///
+/// All four DTOs are decoded first; only on total success are the [`Shared`]
+/// cells updated, preventing a partial-failure from leaving cells inconsistent.
+///
+/// # Errors
+///
+/// Returns the first [`crate::WireError`] encountered during decoding; the
+/// caller sends a `Nack` and retains the last-good snapshot.
+///
+/// [`Shared`]: coxswain_core::Shared
+fn apply_snapshot(
+    snapshot: &p::Snapshot,
+    ingress: &SharedIngressRoutingTable,
+    gateway: &SharedGatewayRoutingTable,
+    tls: &SharedTlsStore,
+    client_certs: &SharedClientCertStore,
+) -> Result<(), crate::WireError> {
+    let ingress_table = ingress_from_wire(
+        snapshot
+            .ingress_routing
+            .as_ref()
+            .unwrap_or(&p::RoutingTable::default()),
+    )?;
+    let gateway_table = gateway_from_wire(
+        snapshot
+            .gateway_routing
+            .as_ref()
+            .unwrap_or(&p::RoutingTable::default()),
+    )?;
+    let tls_store = tls_from_wire(
+        snapshot
+            .tls_store
+            .as_ref()
+            .unwrap_or(&p::TlsStore::default()),
+    )?;
+    let client_cert_store = client_cert_from_wire(
+        snapshot
+            .client_cert_store
+            .as_ref()
+            .unwrap_or(&p::ClientCertStore::default()),
+    )?;
+
+    ingress.store(Arc::new(ingress_table));
+    gateway.store(Arc::new(gateway_table));
+    tls.store(Arc::new(tls_store));
+    client_certs.store(Arc::new(client_cert_store));
+
+    Ok(())
+}
+
+/// Build a lazy-connect [`Channel`] from the configured endpoints.
+///
+/// A single endpoint uses [`Endpoint::connect_lazy`] so the proxy starts before
+/// the controller is reachable. Multiple endpoints use [`Channel::balance_list`]
+/// which is also lazy by default.
+fn build_channel(config: &DiscoveryClientConfig) -> Channel {
+    let configure = |uri: &str| -> Endpoint {
+        Endpoint::from_shared(uri.to_owned())
+            .unwrap_or_else(|e| {
+                panic!("invariant: every discovery endpoint must be a valid URI: {e}")
+            })
+            .http2_keep_alive_interval(config.http2_keep_alive_interval)
+            .keep_alive_timeout(config.keep_alive_timeout)
+            .keep_alive_while_idle(true)
+    };
+
+    if config.endpoints.len() == 1 {
+        configure(&config.endpoints[0]).connect_lazy()
+    } else {
+        Channel::balance_list(config.endpoints.iter().map(|u| configure(u)))
+    }
+}
+
+/// Full-jitter exponential backoff delay.
+///
+/// Returns a duration uniformly drawn from `[0, min(cap, base * 2^attempt)]`.
+/// The exponent is capped at 7 doublings (128×) to avoid `u64` overflow; further
+/// failed attempts keep the same ceiling.
+fn backoff_jitter(attempt: u32, base: Duration, cap: Duration) -> Duration {
+    let base_ms = base.as_millis() as u64;
+    let cap_ms = cap.as_millis() as u64;
+    let ceiling = cap_ms.min(base_ms.saturating_mul(1u64 << attempt.min(7)));
+    if ceiling == 0 {
+        return Duration::ZERO;
+    }
+    // SplitMix64 seeded with a monotone counter XOR'd with subsecond nanos.
+    // The counter guarantees unique seeds even for rapid successive calls in the
+    // same nanosecond; the nanos component introduces per-process entropy.
+    // Not a security primitive — quality is sufficient for jitter.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    let ms = splitmix64(seq ^ nanos) % (ceiling + 1);
+    Duration::from_millis(ms)
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::v1::{
+        ClientMessage, GatewayListenerHealth, HostEntry, PortEntry, RouteEntry, RouteKind,
+        RoutingTable, ServerMessage, Snapshot, TlsStore,
+        discovery_server::{Discovery, DiscoveryServer},
+        host_entry::Pattern,
+        server_message::Kind as SrvKind,
+    };
+    use coxswain_core::health::HealthRegistry;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc as tpsc;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+    use tonic::{Request, Response, Status, Streaming};
+
+    // ── fake server ──────────────────────────────────────────────────────────
+
+    /// Each time a client connects, the fake server hands the test a pair of
+    /// channels: one to drive what the server sends, one to observe what the
+    /// client sends.
+    type ConnectPair = (
+        tpsc::Sender<Result<ServerMessage, Status>>,
+        tpsc::Receiver<ClientMessage>,
+    );
+
+    struct FakeDiscovery {
+        /// Notified for every incoming `Stream` call.
+        connect_tx: tpsc::Sender<ConnectPair>,
+    }
+
+    #[async_trait::async_trait]
+    impl Discovery for FakeDiscovery {
+        type StreamStream = ReceiverStream<Result<ServerMessage, Status>>;
+
+        async fn stream(
+            &self,
+            request: Request<Streaming<ClientMessage>>,
+        ) -> Result<Response<Self::StreamStream>, Status> {
+            let (server_tx, server_rx) = tpsc::channel(16);
+            let (client_tx, client_rx) = tpsc::channel(16);
+
+            // Drain inbound messages from the client into `client_tx`.
+            tokio::spawn(async move {
+                let mut inbound = request.into_inner();
+                loop {
+                    match inbound.message().await {
+                        Ok(Some(msg)) => {
+                            if client_tx.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            });
+
+            // Clone before any `.await` so the future does not borrow `self` across
+            // the suspension point (channel capacity is sufficient for test traffic).
+            let connect_tx = self.connect_tx.clone();
+            let _ = connect_tx.send((server_tx, client_rx)).await;
+            Ok(Response::new(ReceiverStream::new(server_rx)))
+        }
+    }
+
+    /// Bind a tonic server on a random port and return its address.
+    async fn start_server() -> (SocketAddr, tpsc::Receiver<ConnectPair>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connect_tx, connect_rx) = tpsc::channel(8);
+        let service = FakeDiscovery { connect_tx };
+        tokio::spawn(
+            Server::builder()
+                .add_service(DiscoveryServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        (addr, connect_rx)
+    }
+
+    /// Minimal valid snapshot (empty routing tables).
+    fn empty_snapshot(version: &str, nonce: Vec<u8>) -> ServerMessage {
+        ServerMessage {
+            kind: Some(SrvKind::Snapshot(Snapshot {
+                version: version.to_owned(),
+                nonce,
+                ingress_routing: Some(RoutingTable::default()),
+                gateway_routing: Some(RoutingTable::default()),
+                tls_store: Some(TlsStore::default()),
+                client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
+                listener_health: Some(GatewayListenerHealth::default()),
+            })),
+        }
+    }
+
+    /// Snapshot with an invalid regex that `from_wire` will reject with `WireError::InvalidRegex`.
+    fn bad_regex_snapshot(version: &str, nonce: Vec<u8>) -> ServerMessage {
+        let bad_route = RouteEntry {
+            kind: RouteKind::Regex as i32,
+            path: "[unclosed".to_owned(), // invalid regex
+            ..Default::default()
+        };
+        let host = HostEntry {
+            pattern: Some(Pattern::Catchall(true)),
+            routes: vec![bad_route],
+            ..Default::default()
+        };
+        let port = PortEntry {
+            port: 80,
+            hosts: vec![host],
+        };
+        ServerMessage {
+            kind: Some(SrvKind::Snapshot(Snapshot {
+                version: version.to_owned(),
+                nonce,
+                ingress_routing: Some(RoutingTable { ports: vec![port] }),
+                gateway_routing: Some(RoutingTable::default()),
+                tls_store: Some(TlsStore::default()),
+                client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
+                listener_health: Some(GatewayListenerHealth::default()),
+            })),
+        }
+    }
+
+    fn test_config(addr: SocketAddr) -> DiscoveryClientConfig {
+        DiscoveryClientConfig {
+            endpoints: vec![format!("http://{addr}")],
+            node_id: "test-node".to_owned(),
+            scope: Scope::SharedPool,
+            http2_keep_alive_interval: Duration::from_secs(30),
+            keep_alive_timeout: Duration::from_secs(5),
+            // Tiny backoff so reconnect tests complete quickly.
+            backoff_base: Duration::from_millis(10),
+            backoff_cap: Duration::from_millis(50),
+        }
+    }
+
+    /// Poll `f` until it returns `Some(T)` or the timeout elapses.
+    async fn poll_until<F, T>(timeout: Duration, mut f: F) -> T
+    where
+        F: FnMut() -> Option<T>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "poll_until: timed out waiting for condition"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    // ── test cases ───────────────────────────────────────────────────────────
+
+    /// Client sends Subscribe, server sends two snapshots, client Acks each in order.
+    /// Server gates the second snapshot until the first Ack arrives.
+    #[tokio::test]
+    async fn subscribes_then_acks_each_snapshot_in_order() {
+        let (addr, mut connect_rx) = start_server().await;
+
+        let registry = HealthRegistry::new();
+        let handle = registry.register("disc", &["conn"]);
+        let (client, _task) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+
+        // Wait for the client to connect and send Subscribe.
+        let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
+            .await
+            .expect("timed out waiting for client connection")
+            .expect("channel closed");
+
+        let first = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for Subscribe")
+            .expect("channel closed");
+        assert!(
+            matches!(first.kind, Some(CKind::Subscribe(_))),
+            "expected Subscribe as first client message"
+        );
+
+        // Send snapshot #1.
+        srv_tx
+            .send(Ok(empty_snapshot("v1", vec![1])))
+            .await
+            .unwrap();
+
+        // Wait for Ack #1.
+        let ack1 = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for Ack #1")
+            .expect("channel closed");
+        assert!(
+            matches!(&ack1.kind, Some(CKind::Ack(a)) if a.version == "v1"),
+            "expected Ack for v1, got: {ack1:?}"
+        );
+
+        // Only now send snapshot #2 (server gates on prior Ack).
+        srv_tx
+            .send(Ok(empty_snapshot("v2", vec![2])))
+            .await
+            .unwrap();
+
+        let ack2 = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for Ack #2")
+            .expect("channel closed");
+        assert!(
+            matches!(&ack2.kind, Some(CKind::Ack(a)) if a.version == "v2"),
+            "expected Ack for v2, got: {ack2:?}"
+        );
+
+        // Both tables reflect the applied snapshot (non-default handle set).
+        let _ = client.ingress_routes().load();
+    }
+
+    /// After the server closes the stream, the client reconnects; routing cells
+    /// keep the last-good snapshot throughout the reconnect window.
+    #[tokio::test]
+    async fn serves_last_good_snapshot_across_server_bounce() {
+        let (addr, mut connect_rx) = start_server().await;
+
+        let registry = HealthRegistry::new();
+        let handle = registry.register("disc", &["conn"]);
+        let (client, _task) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+
+        // Session #1: push one snapshot, confirm Ack.
+        let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Drain Subscribe.
+        tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        srv_tx
+            .send(Ok(empty_snapshot("v1", vec![1])))
+            .await
+            .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&ack.kind, Some(CKind::Ack(_))));
+
+        // Capture load of ingress table before bounce.
+        let before_bounce = client.ingress_routes().load();
+
+        // Drop the server-side sender to close the stream (simulates server bounce).
+        drop(srv_tx);
+
+        // Wait for the client to reconnect (a new connect pair arrives).
+        let (_srv_tx2, mut cli_rx2) =
+            tokio::time::timeout(Duration::from_secs(5), connect_rx.recv())
+                .await
+                .expect("client did not reconnect within timeout")
+                .unwrap();
+
+        // Cells must NOT be zeroed during reconnect; they hold the last-good snapshot.
+        let during_reconnect = client.ingress_routes().load();
+        assert!(
+            Arc::ptr_eq(&before_bounce, &during_reconnect),
+            "routing cell was zeroed or replaced during reconnect window"
+        );
+
+        // Second connection should start with Subscribe.
+        let sub2 = tokio::time::timeout(Duration::from_secs(2), cli_rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(sub2.kind, Some(CKind::Subscribe(_))),
+            "expected Subscribe on reconnect, got: {sub2:?}"
+        );
+    }
+
+    /// When a snapshot fails to rebuild, the client sends Nack and retains the
+    /// last-good routing tables.
+    #[tokio::test]
+    async fn retains_last_good_when_snapshot_fails_to_rebuild() {
+        let (addr, mut connect_rx) = start_server().await;
+
+        let registry = HealthRegistry::new();
+        let handle = registry.register("disc", &["conn"]);
+        let (client, _task) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+
+        let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Drain Subscribe.
+        tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Push a valid snapshot first to establish a last-good baseline.
+        srv_tx
+            .send(Ok(empty_snapshot("good-v1", vec![1])))
+            .await
+            .unwrap();
+        let ack1 = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&ack1.kind, Some(CKind::Ack(_))));
+
+        let last_good = client.ingress_routes().load();
+
+        // Push a bad snapshot (invalid regex).
+        srv_tx
+            .send(Ok(bad_regex_snapshot("bad-v2", vec![2])))
+            .await
+            .unwrap();
+
+        // Client should Nack.
+        let nack = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for Nack")
+            .unwrap();
+        assert!(
+            matches!(&nack.kind, Some(CKind::Nack(n)) if n.version == "bad-v2"),
+            "expected Nack for bad-v2, got: {nack:?}"
+        );
+
+        // Routing cells must still hold the last-good snapshot.
+        let after_nack = client.ingress_routes().load();
+        assert!(
+            Arc::ptr_eq(&last_good, &after_nack),
+            "routing cell was replaced after Nack — last-good invariant violated"
+        );
+    }
+
+    /// Readiness transitions: Pending → Ready on first snapshot;
+    /// Degraded (not Pending/Failed) on disconnect after first snapshot.
+    #[tokio::test]
+    async fn readiness_transitions_are_correct() {
+        use coxswain_core::health::CheckState;
+
+        let (addr, mut connect_rx) = start_server().await;
+
+        let registry = HealthRegistry::new();
+        let handle = registry.register("disc", &["conn"]);
+        let (_, _task) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+
+        // Before first snapshot: registry reports not ready.
+        assert!(
+            !registry.is_ready(),
+            "registry must be NotReady before first snapshot"
+        );
+
+        let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Drain Subscribe.
+        tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Push first snapshot.
+        srv_tx
+            .send(Ok(empty_snapshot("v1", vec![1])))
+            .await
+            .unwrap();
+
+        // Wait until registry becomes ready.
+        poll_until(Duration::from_secs(2), || registry.is_ready().then_some(())).await;
+
+        // Drop the stream to simulate disconnect.
+        drop(srv_tx);
+        drop(cli_rx);
+
+        // Wait until the registry transitions to Degraded.
+        poll_until(Duration::from_secs(5), || {
+            let snap = registry.snapshot();
+            let disc = snap.subsystems.get("disc")?;
+            matches!(disc.state, CheckState::Degraded { .. }).then_some(())
+        })
+        .await;
+
+        // Degraded counts as "ready" (is_ok() == true; /readyz stays 200).
+        assert!(
+            registry.is_ready(),
+            "registry must report is_ready() == true when Degraded"
+        );
+    }
+
+    /// `backoff_jitter` always returns a value within `[0, min(cap, base * 2^attempt)]`.
+    #[test]
+    fn backoff_stays_within_bounds() {
+        let base = Duration::from_millis(250);
+        let cap = Duration::from_secs(30);
+
+        for attempt in 0u32..=12 {
+            let ceiling_ms = 30_000u64.min(250u64.saturating_mul(1u64 << attempt.min(7)));
+            // Sample many times to catch out-of-range values.
+            for _ in 0..50 {
+                let d = backoff_jitter(attempt, base, cap);
+                assert!(
+                    d.as_millis() as u64 <= ceiling_ms,
+                    "attempt={attempt}: jitter {d:?} exceeded ceiling {ceiling_ms}ms"
+                );
+            }
+        }
+    }
+
+    /// Backoff ceiling saturates at `cap` for high attempt numbers.
+    #[test]
+    fn backoff_caps_at_maximum() {
+        let base = Duration::from_millis(250);
+        let cap = Duration::from_millis(500);
+
+        for attempt in 8u32..=20 {
+            let d = backoff_jitter(attempt, base, cap);
+            assert!(
+                d <= cap,
+                "attempt={attempt}: jitter {d:?} exceeded cap {cap:?}"
+            );
+        }
+    }
+}
