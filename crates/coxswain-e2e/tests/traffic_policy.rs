@@ -652,21 +652,32 @@ async fn session_affinity_header_pins_same_header_value_to_same_backend() -> any
     }
 
     // Distinct header values spread across more than one pod.
-    let mut pods = std::collections::HashSet::new();
-    for k in 0..50 {
-        let value = format!("user-{k}");
-        let (_, _, body) = h
-            .http
-            .get_full_with_headers(&host, "/", &[("X-Session-Id", value.as_str())])
-            .await?;
-        if let Some(p) = body.and_then(|b| b.pod) {
-            pods.insert(p);
-        }
-    }
-    assert!(
-        pods.len() >= 2,
-        "distinct session ids must spread across multiple pods, saw {pods:?}"
-    );
+    // Poll until ≥2 pods are visible: EndpointSlice propagation to the proxy can
+    // lag behind the Deployment Available condition under load, so a single pass
+    // may see only one endpoint. Retry until all endpoints are visible or time out.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async { "≥2 of 3 echo-aff pods to appear in the proxy routing table".to_string() },
+        || async {
+            let mut seen = std::collections::HashSet::new();
+            for k in 0..50u32 {
+                let value = format!("user-{k}");
+                if let Ok((_, _, Some(body))) = h
+                    .http
+                    .get_full_with_headers(&host, "/", &[("X-Session-Id", value.as_str())])
+                    .await
+                {
+                    if let Some(p) = body.pod {
+                        seen.insert(p);
+                    }
+                }
+            }
+            (seen.len() >= 2).then_some(seen)
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e} — distinct session ids must spread across multiple pods"))?;
     Ok(())
 }
 
