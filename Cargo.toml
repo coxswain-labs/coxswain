@@ -5,6 +5,7 @@ members = [
     "crates/coxswain-cache",
     "crates/coxswain-core",
     "crates/coxswain-controller",
+    "crates/coxswain-discovery",
     "crates/coxswain-proxy",
     "crates/coxswain-reflector",
     "crates/coxswain-health",
@@ -16,6 +17,7 @@ default-members = [
     "crates/coxswain-cache",
     "crates/coxswain-core",
     "crates/coxswain-controller",
+    "crates/coxswain-discovery",
     "crates/coxswain-proxy",
     "crates/coxswain-reflector",
     "crates/coxswain-health",
@@ -39,6 +41,7 @@ coxswain-admin      = { path = "./crates/coxswain-admin" }
 coxswain-cache      = { path = "./crates/coxswain-cache" }
 coxswain-core       = { path = "./crates/coxswain-core" }
 coxswain-controller = { path = "./crates/coxswain-controller" }
+coxswain-discovery  = { path = "./crates/coxswain-discovery" }
 coxswain-health     = { path = "./crates/coxswain-health" }
 coxswain-proxy      = { path = "./crates/coxswain-proxy" }
 coxswain-reflector  = { path = "./crates/coxswain-reflector" }
@@ -86,6 +89,8 @@ pingora-core       = { version = "0.8", default-features = false }
 pingora-http       = { version = "0.8" }
 pingora-proxy      = { version = "0.8", default-features = false }
 prometheus         = { version = "0.14" }
+prost              = { version = "0.14" }
+protox             = { version = "0.9" }
 rcgen              = { version = "0.14" }
 regex              = { version = "1.12" }
 reqwest            = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
@@ -105,6 +110,9 @@ tokio-rustls       = { version = "0.26", default-features = false, features = ["
 tokio-stream       = { version = "0.1", features = ["sync"] }
 tokio-util         = { version = "0.7", features = ["rt"] }
 tokio-tungstenite  = { version = "0.29" }
+tonic              = { version = "0.14" }
+tonic-prost        = { version = "0.14" }
+tonic-prost-build  = { version = "0.14" }
 tracing            = { version = "0.1" }
 x509-parser        = { version = "0.18" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }

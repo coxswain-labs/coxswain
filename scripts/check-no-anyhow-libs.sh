@@ -9,6 +9,7 @@ set -euo pipefail
 
 LIB_CRATES=(
   coxswain-core
+  coxswain-discovery
   coxswain-reflector
   coxswain-proxy
   coxswain-controller
