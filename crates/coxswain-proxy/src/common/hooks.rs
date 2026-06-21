@@ -1521,6 +1521,49 @@ pub(crate) fn error_while_proxy(
     e
 }
 
+/// Select the HTTP status for a failed proxy attempt from the Pingora error and
+/// the per-request timeout-attribution flags.
+///
+/// Extracted from [`fail_to_proxy`] so the mapping is unit-testable without
+/// constructing a live [`Session`].
+///
+/// # Status rules
+///
+/// - `HTTPStatus(code)` — passthrough (Pingora-level overrides).
+/// - `ReadTimedout | WriteTimedout` while a request or backend-request budget is
+///   controlling → 504 (Gateway API spec, GEP-1742).
+/// - `ConnectTimedout` while a backend-request budget is active → 502.
+/// - Everything else: 502 for upstream sources, 0 (no response written) for
+///   downstream connection-level errors, 400 for other downstream errors, 500
+///   for internal faults.
+fn select_failure_status(
+    etype: &pingora_core::ErrorType,
+    esource: &ErrorSource,
+    request_timeout_is_controlling: bool,
+    backend_request_timeout_active: bool,
+) -> u16 {
+    match etype {
+        HTTPStatus(code) => *code,
+        // request/backendRequest read/write timeouts → 504 (Gateway API spec, GEP-1742).
+        // Connect failure while backendRequest active → 502 (upstream unreachable).
+        // Flags set in upstream_peer avoid races with OS timer granularity.
+        ReadTimedout | WriteTimedout
+            if request_timeout_is_controlling || backend_request_timeout_active =>
+        {
+            504
+        }
+        ConnectTimedout if backend_request_timeout_active => 502,
+        _ => match esource {
+            ErrorSource::Upstream => 502,
+            ErrorSource::Downstream => match etype {
+                ConnectionClosed | ReadError | WriteError => 0,
+                _ => 400,
+            },
+            _ => 500,
+        },
+    }
+}
+
 /// Pingora `fail_to_proxy` body: map upstream/downstream errors to HTTP
 /// status codes and write a short plain-text body.
 ///
@@ -1532,26 +1575,12 @@ pub(crate) async fn fail_to_proxy(
     e: &pingora_core::Error,
     ctx: &mut ProxyCtx,
 ) -> FailToProxy {
-    let code = match e.etype() {
-        HTTPStatus(code) => *code,
-        // request/backendRequest read timeouts → 504 (Gateway API spec, GEP-1742).
-        // Connect failure while backendRequest active → 502 (upstream unreachable).
-        // Flags set in upstream_peer avoid races with OS timer granularity.
-        ReadTimedout | WriteTimedout
-            if ctx.request_timeout_is_controlling || ctx.backend_request_timeout_active =>
-        {
-            504
-        }
-        ConnectTimedout if ctx.backend_request_timeout_active => 502,
-        _ => match e.esource() {
-            ErrorSource::Upstream => 502,
-            ErrorSource::Downstream => match e.etype() {
-                ConnectionClosed | ReadError | WriteError => 0,
-                _ => 400,
-            },
-            _ => 500,
-        },
-    };
+    let code = select_failure_status(
+        e.etype(),
+        e.esource(),
+        ctx.request_timeout_is_controlling,
+        ctx.backend_request_timeout_active,
+    );
     let error_type = classify_upstream_error(e);
     inc_upstream_error(ctx, error_type);
     if code > 0 {
@@ -2107,6 +2136,170 @@ mod tests {
         assert!(
             vary.to_ascii_lowercase().contains("accept-encoding"),
             "Accept-Encoding must be appended to Vary"
+        );
+    }
+
+    // ── select_failure_status / classify_upstream_error ──────────────────────
+    //
+    // `fail_to_proxy` is async and writes to a live Session, so the status-
+    // selection logic is extracted into `select_failure_status` and tested here.
+
+    use super::{classify_upstream_error, select_failure_status};
+    use pingora_core::{
+        ConnectTimedout, ConnectionClosed, ErrorSource, HTTPStatus, ReadError, ReadTimedout,
+        WriteError, WriteTimedout,
+    };
+
+    // ── WriteTimedout (the `send-timeout` annotation, #341) ───────────────────
+
+    #[test]
+    fn write_timeout_maps_to_502_upstream() {
+        // `ingress.coxswain-labs.dev/send-timeout` fires a WriteTimedout with
+        // ErrorSource::Upstream.  No request/backend budget is active, so the
+        // generic upstream arm applies: 502.
+        assert_eq!(
+            select_failure_status(&WriteTimedout, &ErrorSource::Upstream, false, false),
+            502,
+            "WriteTimedout from upstream without an active budget must map to 502"
+        );
+    }
+
+    #[test]
+    fn write_timeout_with_request_budget_maps_to_504() {
+        // When the *request* timeout (GEP-1742) is the controlling deadline a
+        // WriteTimedout is reclassified to 504.
+        assert_eq!(
+            select_failure_status(&WriteTimedout, &ErrorSource::Upstream, true, false),
+            504,
+            "WriteTimedout while request timeout is controlling must map to 504"
+        );
+    }
+
+    #[test]
+    fn write_timeout_with_backend_budget_maps_to_504() {
+        // Same reclassification when the *backendRequest* budget is active.
+        assert_eq!(
+            select_failure_status(&WriteTimedout, &ErrorSource::Upstream, false, true),
+            504,
+            "WriteTimedout while backend-request budget active must map to 504"
+        );
+    }
+
+    // ── ReadTimedout (`read-timeout` annotation) ──────────────────────────────
+
+    #[test]
+    fn read_timeout_maps_to_502_upstream() {
+        assert_eq!(
+            select_failure_status(&ReadTimedout, &ErrorSource::Upstream, false, false),
+            502,
+            "ReadTimedout from upstream without an active budget must map to 502"
+        );
+    }
+
+    #[test]
+    fn read_timeout_with_request_budget_maps_to_504() {
+        assert_eq!(
+            select_failure_status(&ReadTimedout, &ErrorSource::Upstream, true, false),
+            504,
+        );
+    }
+
+    // ── ConnectTimedout (`connect-timeout` annotation) ────────────────────────
+
+    #[test]
+    fn connect_timeout_without_backend_budget_maps_to_502_via_upstream_source() {
+        // ConnectTimedout without a backend budget falls through to the
+        // ErrorSource::Upstream => 502 arm (connect is always upstream-sourced).
+        assert_eq!(
+            select_failure_status(&ConnectTimedout, &ErrorSource::Upstream, false, false),
+            502,
+        );
+    }
+
+    #[test]
+    fn connect_timeout_with_backend_budget_maps_to_502() {
+        assert_eq!(
+            select_failure_status(&ConnectTimedout, &ErrorSource::Upstream, false, true),
+            502,
+        );
+    }
+
+    // ── HTTPStatus passthrough ────────────────────────────────────────────────
+
+    #[test]
+    fn http_status_passthrough() {
+        // A Pingora-level HTTPStatus override is forwarded verbatim regardless of
+        // source or budget flags.
+        assert_eq!(
+            select_failure_status(&HTTPStatus(503), &ErrorSource::Upstream, false, false),
+            503,
+        );
+        assert_eq!(
+            select_failure_status(&HTTPStatus(429), &ErrorSource::Internal, true, true),
+            429,
+        );
+    }
+
+    // ── Downstream errors ─────────────────────────────────────────────────────
+
+    #[test]
+    fn downstream_connection_closed_maps_to_zero() {
+        // 0 means "don't write a response" (client already gone).
+        assert_eq!(
+            select_failure_status(&ConnectionClosed, &ErrorSource::Downstream, false, false),
+            0,
+        );
+    }
+
+    #[test]
+    fn downstream_read_write_error_maps_to_zero() {
+        assert_eq!(
+            select_failure_status(&ReadError, &ErrorSource::Downstream, false, false),
+            0,
+        );
+        assert_eq!(
+            select_failure_status(&WriteError, &ErrorSource::Downstream, false, false),
+            0,
+        );
+    }
+
+    #[test]
+    fn downstream_other_error_maps_to_400() {
+        // Any downstream error that isn't a connection-level close maps to 400.
+        assert_eq!(
+            select_failure_status(&ConnectTimedout, &ErrorSource::Downstream, false, false),
+            400,
+        );
+    }
+
+    #[test]
+    fn internal_error_maps_to_500() {
+        assert_eq!(
+            select_failure_status(&ReadTimedout, &ErrorSource::Internal, false, false),
+            500,
+        );
+    }
+
+    // ── classify_upstream_error ───────────────────────────────────────────────
+
+    #[test]
+    fn classify_upstream_error_timeout_bucket() {
+        // ConnectTimedout, ReadTimedout, and WriteTimedout all map to "timeout"
+        // for the upstream-error Prometheus label.
+        assert_eq!(
+            classify_upstream_error(pingora_core::Error::new(ConnectTimedout).as_ref()),
+            "timeout",
+            "ConnectTimedout must bucket as 'timeout'"
+        );
+        assert_eq!(
+            classify_upstream_error(pingora_core::Error::new(ReadTimedout).as_ref()),
+            "timeout",
+            "ReadTimedout must bucket as 'timeout'"
+        );
+        assert_eq!(
+            classify_upstream_error(pingora_core::Error::new(WriteTimedout).as_ref()),
+            "timeout",
+            "WriteTimedout must bucket as 'timeout'"
         );
     }
 }
