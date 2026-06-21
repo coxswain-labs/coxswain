@@ -1075,5 +1075,18 @@ spec:
 
 The merge is per-key: an Ingress that sets only `connect-timeout` still inherits the class's `retry-on` and `max-retries`. The keys and value formats in `defaultAnnotations` are exactly the per-Ingress ones; an invalid value emits a warning and falls back to the built-in default, the same as if it were set directly on an Ingress (an empty string `""` is **not** an "unset" override — it parses, warns, and falls back).
 
+### `spec.accessLog` — per-class access-log control
+
+In addition to `spec.defaultAnnotations`, `CoxswainIngressClassParameters` exposes a typed field for access-log control:
+
+```yaml
+spec:
+  accessLog: false   # suppress access-log lines for this class's routes
+```
+
+Unlike `defaultAnnotations`, `accessLog` is **not** a per-Ingress override — it is class-scoped only. All Ingresses claiming the class share the same setting; individual Ingresses cannot override it per-resource. Set `accessLog: false` when you want to suppress noisy health-check or synthetic-monitor traffic without affecting the rest of the log stream.
+
+Error logs and Prometheus metrics are never suppressed by `accessLog: false`. `accessLog: false` is a downward-only override — it never force-enables logging when `--access-log` is already off globally. See [Observability → Per-class suppression](../reference/observability.md#per-class-suppression) for the full usage example.
+
 !!! note
     `CoxswainIngressClassParameters` is namespaced, so `spec.parameters` must set `scope: Namespace` and a `namespace`. A reference that is missing, names a different kind, or omits its namespace is logged as a warning and ignored — affected Ingresses still route with built-in defaults rather than being rejected. Because `IngressClass` has no status subresource, this condition is surfaced in the controller log, not on the object.

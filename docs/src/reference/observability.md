@@ -168,6 +168,24 @@ The `--access-log-path-mode` flag (or `COXSWAIN_ACCESS_LOG_PATH_MODE`) controls 
 !!! tip "Prefer pipeline-side redaction"
     Redacting at the log-collection pipeline is the architecturally correct default — it keeps the proxy emitting ground truth while centralising PII policy. Use `pattern` or `none` only when the pipeline genuinely cannot filter.
 
+### Per-class suppression
+
+Operators who want to silence access logs for a specific traffic segment (for example, health-check noise) without turning off logging globally can configure it on the `CoxswainIngressClassParameters` CR:
+
+```yaml
+apiVersion: ingress.coxswain-labs.dev/v1alpha1
+kind: CoxswainIngressClassParameters
+metadata:
+  name: health-check-class
+  namespace: coxswain
+spec:
+  accessLog: false   # suppress access-log lines for this class's routes
+```
+
+Set the matching IngressClass to reference this CR via `spec.parameters`, then route your health-check traffic through Ingresses claiming that class. Only the `coxswain_proxy::access` log lines are suppressed — error logs and Prometheus metrics continue unaffected.
+
+`accessLog: false` is a downward-only override: it never force-enables logging when `--access-log` is already off globally. This mirrors Istio's `Telemetry.spec.accessLogging[].disabled` + `spec.selector` model, where suppression is workload-scoped rather than per-route.
+
 ### Filtering access logs
 
 Access logs are emitted on the `coxswain_proxy::access` target, so they can be silenced independently of other logs:

@@ -33,9 +33,7 @@ use crate::tls::{
 };
 use crate::{
     endpoints,
-    ingress::{
-        IngressClassContext, IngressPorts, IngressReconciler, resolve_class_default_annotations,
-    },
+    ingress::{IngressClassContext, IngressPorts, IngressReconciler, resolve_class_params},
 };
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
@@ -1342,11 +1340,12 @@ fn build_ingress_routes(
     ingress_ports: IngressPorts,
     shared: &SharedIngressRoutingTable,
 ) -> bool {
-    // Resolve per-class annotation defaults once for this rebuild (#190):
-    // each owned IngressClass's spec.parameters → CoxswainIngressClassParameters
-    // → defaultAnnotations. Reconcile layers these under each Ingress's own
-    // annotations (per-Ingress keys win).
-    let class_defaults = resolve_class_default_annotations(
+    // Resolve per-class parameters once for this rebuild: each owned IngressClass's
+    // spec.parameters → CoxswainIngressClassParameters → defaultAnnotations +
+    // accessLog. Reconcile layers annotation defaults under each Ingress's own
+    // annotations (per-Ingress keys win); accessLog is class-scoped and has no
+    // per-Ingress override (#279).
+    let class_params = resolve_class_params(
         stores.ingress_classes,
         ownership.ingress_classes,
         stores.ingress_class_parameters,
@@ -1354,7 +1353,7 @@ fn build_ingress_routes(
     let class_ctx = IngressClassContext::new(
         ownership.ingress_classes,
         ownership.default_ingress_class,
-        &class_defaults,
+        &class_params,
     );
 
     let mut builder = IngressRoutingTableBuilder::new();

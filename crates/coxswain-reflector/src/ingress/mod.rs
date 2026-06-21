@@ -7,7 +7,10 @@ mod ports;
 mod reconcile;
 mod tls;
 
-pub(crate) use class::resolve_class_default_annotations;
+pub(crate) use class::resolve_class_params;
+// Re-exported for test helpers in `tests/mod.rs` that build `IngressClassContext`.
+#[cfg(test)]
+pub(crate) use class::ResolvedClassParams;
 pub use class::{claimed_ingress_class, is_default_ingress_class};
 pub use ports::IngressPorts;
 pub use reconcile::IngressClassContext;

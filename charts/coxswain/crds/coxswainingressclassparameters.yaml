@@ -27,6 +27,23 @@ spec:
               Presence of such a reference enables class-level defaults; the fields
               below supply the default values for every Ingress claiming that class.
             properties:
+              accessLog:
+                description: |-
+                  Suppress proxy access-log lines for every request matched through an
+                  Ingress claiming this class.
+
+                  `None` (the default) inherits the proxy-wide `--access-log` flag;
+                  `Some(true)` is equivalent to the default; `Some(false)` suppresses the
+                  access log for this class's routes. Error logs and metrics are
+                  unaffected. Downward-only: this never force-enables logging when the
+                  proxy-wide flag is already off — it only adds suppression on top.
+
+                  Unlike `defaultAnnotations`, this has no per-Ingress override: access-log
+                  control is intentionally class-scoped (workload-scoped), mirroring
+                  Istio's `Telemetry.spec.accessLogging[].disabled` + `spec.selector`
+                  rather than nginx's per-`location` `access_log off`.
+                nullable: true
+                type: boolean
               defaultAnnotations:
                 additionalProperties:
                   type: string

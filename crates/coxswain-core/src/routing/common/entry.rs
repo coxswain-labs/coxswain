@@ -536,6 +536,15 @@ pub struct RouteEntry {
     /// `Authorization`/`Cookie` bypass). `false` (the default, and the value for
     /// all Gateway-API routes until the ExtensionRef binding lands) disables it.
     pub cache_enabled: bool,
+    /// Per-class access-log override from `CoxswainIngressClassParameters.spec.accessLog`.
+    ///
+    /// `None` (the default, and the value for all Gateway-API routes) means the
+    /// proxy's global `--access-log` flag governs. `Some(false)` suppresses
+    /// the `coxswain_proxy::access` log line for every request on this route
+    /// while leaving error logs and metrics unaffected. `Some(true)` is
+    /// equivalent to `None` (the per-class field can only suppress, never
+    /// force-enable logging when the proxy-wide flag is already off).
+    pub access_log_enabled: Option<bool>,
     /// Per-route rate-limiting configuration, from the
     /// `ingress.coxswain-labs.dev/rate-limit-*` annotations or a `RateLimit`
     /// CRD `ExtensionRef` filter.
@@ -636,6 +645,7 @@ impl RouteEntry {
             allow_source_range: None,
             deny_source_range: None,
             cache_enabled: false,
+            access_log_enabled: None,
             rate_limit: None,
             auth: None,
             compression: None,
@@ -665,6 +675,7 @@ impl RouteEntry {
             allow_source_range: None,
             deny_source_range: None,
             cache_enabled: false,
+            access_log_enabled: None,
             rate_limit: None,
             auth: None,
             compression: None,
@@ -699,6 +710,7 @@ impl RouteEntry {
             allow_source_range: None,
             deny_source_range: None,
             cache_enabled: false,
+            access_log_enabled: None,
             rate_limit: None,
             auth: None,
             compression: None,
@@ -736,6 +748,7 @@ impl RouteEntry {
             allow_source_range: None,
             deny_source_range: None,
             cache_enabled: false,
+            access_log_enabled: None,
             rate_limit: None,
             auth: None,
             compression: None,
@@ -845,6 +858,20 @@ impl RouteEntry {
         self
     }
 
+    /// Set the per-class access-log enabled override for this route (builder-style).
+    ///
+    /// Used by the Ingress reconciler to propagate the
+    /// `CoxswainIngressClassParameters.spec.accessLog` value. `None` (the
+    /// default) means the proxy-wide `--access-log` flag governs.
+    /// `Some(false)` suppresses the access log for this route; `Some(true)` is
+    /// equivalent to `None` (the per-class field can only suppress, never
+    /// force-enable when the proxy-wide flag is already off).
+    #[must_use]
+    pub fn with_access_log_enabled(mut self, access_log_enabled: Option<bool>) -> Self {
+        self.access_log_enabled = access_log_enabled;
+        self
+    }
+
     /// Set per-route rate-limiting config for this route (builder-style).
     ///
     /// Used by the Ingress reconciler to attach the config parsed from the
@@ -924,6 +951,8 @@ impl RouteEntry {
 // Bumped 256→272 by adding max_body_size: Option<u64> (16 bytes) for the ingress.coxswain-labs.dev/max-body-size request-body limit.
 // Bumped 272→280 by adding allow_source_range: Option<Arc<Vec<IpNet>>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/allow-source-range IP allow-list.
 // cache_enabled: bool (#40) added without a bump — it occupies existing struct padding.
+// access_log_enabled: Option<bool> (#279) added without a bump — 1 byte; fits in
+//   padding alongside cache_enabled.
 // Bumped 280→288 by adding rate_limit: Option<Arc<RateLimitConfig>> (8 bytes, niche pointer) for per-route rate limiting (#25).
 // Bumped 288→296 by adding auth: Option<Arc<IngressAuthConfig>> (8 bytes, niche pointer) for ingress.coxswain-labs.dev/auth-* (#24).
 // Bumped 296→304 by adding deny_source_range: Option<Arc<Vec<IpNet>>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/deny-source-range IP block-list (#268).

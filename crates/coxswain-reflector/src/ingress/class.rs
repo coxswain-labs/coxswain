@@ -45,24 +45,43 @@ pub fn claimed_ingress_class(ingress: &Ingress) -> Option<&str> {
         })
 }
 
-/// Resolve per-class default annotation maps for every owned `IngressClass`
-/// that references a `CoxswainIngressClassParameters` CR via `spec.parameters`.
+/// Resolved class-level parameters for a single `IngressClass`, derived from
+/// the linked `CoxswainIngressClassParameters` CR.
 ///
-/// The returned map is keyed by IngressClass name; the value is that class's
-/// `spec.defaultAnnotations`. A class is absent from the map (degrade
-/// gracefully — its Ingresses still route with built-in defaults) when it has
-/// no `spec.parameters`, the ref names a non-Coxswain apiGroup/kind, the ref
-/// omits its namespace (the CR is namespaced), the target CR is missing from
-/// the store, or the CR carries no `defaultAnnotations`. Every broken-reference
-/// case logs a `WARN` — mirroring how an invalid per-Ingress annotation value
-/// WARNs and falls back rather than dropping the Ingress.
+/// Groups all per-class knobs so the class store is walked once and every
+/// caller gets a consistent view without duplicate WARN logging.
+#[non_exhaustive]
+pub(crate) struct ResolvedClassParams {
+    /// Default `ingress.coxswain-labs.dev/*` annotation values applied to
+    /// every Ingress claiming this class. Empty when the CR carries no (or an
+    /// empty) `spec.defaultAnnotations`.
+    pub default_annotations: BTreeMap<String, String>,
+    /// Per-class access-log enabled state, from `spec.accessLog`.
+    ///
+    /// `Some(false)` → suppress access-log lines for this class's routes.
+    /// `Some(true)` or `None` → proxy-wide `--access-log` flag governs.
+    pub access_log_enabled: Option<bool>,
+}
+
+/// Resolve per-class parameters for every owned `IngressClass` that references
+/// a `CoxswainIngressClassParameters` CR via `spec.parameters`.
+///
+/// The returned map is keyed by IngressClass name. A class is absent from the
+/// map (degrade gracefully — its Ingresses still route with built-in defaults)
+/// when it has no `spec.parameters`, the ref names a non-Coxswain
+/// apiGroup/kind, the ref omits its namespace (the CR is namespaced), or the
+/// target CR is missing from the store. A class with an empty
+/// `defaultAnnotations` **and** no `accessLog` override is also omitted (the
+/// reconciler fast-paths classes with no resolved params). Every
+/// broken-reference case logs a `WARN` — mirroring how an invalid per-Ingress
+/// annotation value WARNs and falls back rather than dropping the Ingress.
 ///
 /// Reads only from the supplied stores; never queries the API server.
-pub(crate) fn resolve_class_default_annotations(
+pub(crate) fn resolve_class_params(
     class_store: &reflector::Store<IngressClass>,
     owned: &HashSet<String>,
     params_store: &reflector::Store<CoxswainIngressClassParameters>,
-) -> HashMap<String, BTreeMap<String, String>> {
+) -> HashMap<String, ResolvedClassParams> {
     let mut out = HashMap::new();
     for ic in class_store.state() {
         let Some(name) = ic.metadata.name.as_deref() else {
@@ -105,12 +124,25 @@ pub(crate) fn resolve_class_default_annotations(
             );
             continue;
         };
-        // An empty or absent map contributes nothing; keep it out so the merge
-        // step can take its zero-allocation fast path.
-        if let Some(defaults) = cr.spec.default_annotations.as_ref()
-            && !defaults.is_empty()
-        {
-            out.insert(name.to_string(), defaults.clone());
+        let default_annotations = cr
+            .spec
+            .default_annotations
+            .as_ref()
+            .filter(|m| !m.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        let access_log_enabled = cr.spec.access_log;
+        // Only insert when the CR contributes something (either non-empty
+        // default annotations or an access-log override). Classes with no
+        // configured params are kept out so reconcile can fast-path them.
+        if !default_annotations.is_empty() || access_log_enabled.is_some() {
+            out.insert(
+                name.to_string(),
+                ResolvedClassParams {
+                    default_annotations,
+                    access_log_enabled,
+                },
+            );
         }
     }
     out
@@ -239,7 +271,7 @@ mod tests {
         assert_eq!(claimed_ingress_class(&ingress_with_neither()), None);
     }
 
-    // ── resolve_class_default_annotations ─────────────────────────────────────────
+    // ── resolve_class_params ─────────────────────────────────────────
 
     use coxswain_core::crd::CoxswainIngressClassParametersSpec;
     use k8s_openapi::api::networking::v1::IngressClassParametersReference;
@@ -319,10 +351,10 @@ mod tests {
             Some(params_ref(Some(GROUP), KIND, "p", Some("ns"))),
         )]);
         let params = params_store(vec![make_params_cr("ns", "p", &[(CONNECT, "5s")])]);
-        let got = resolve_class_default_annotations(&classes, &owned(&["coxswain"]), &params);
+        let got = resolve_class_params(&classes, &owned(&["coxswain"]), &params);
         assert_eq!(
             got.get("coxswain")
-                .and_then(|m| m.get(CONNECT))
+                .and_then(|p| p.default_annotations.get(CONNECT))
                 .map(String::as_str),
             Some("5s")
         );
@@ -335,21 +367,14 @@ mod tests {
             Some(params_ref(Some(GROUP), KIND, "p", Some("ns"))),
         )]);
         let params = params_store(vec![make_params_cr("ns", "p", &[(CONNECT, "5s")])]);
-        assert!(
-            resolve_class_default_annotations(&classes, &owned(&["coxswain"]), &params).is_empty()
-        );
+        assert!(resolve_class_params(&classes, &owned(&["coxswain"]), &params).is_empty());
     }
 
     #[test]
     fn absent_when_no_parameters() {
         let classes = class_store(vec![ic_with_params("coxswain", None)]);
         assert!(
-            resolve_class_default_annotations(
-                &classes,
-                &owned(&["coxswain"]),
-                &params_store(vec![])
-            )
-            .is_empty()
+            resolve_class_params(&classes, &owned(&["coxswain"]), &params_store(vec![])).is_empty()
         );
     }
 
@@ -361,9 +386,7 @@ mod tests {
             Some(params_ref(Some("other.example.com"), KIND, "p", Some("ns"))),
         )]);
         let params = params_store(vec![make_params_cr("ns", "p", &[(CONNECT, "5s")])]);
-        assert!(
-            resolve_class_default_annotations(&classes, &owned(&["coxswain"]), &params).is_empty()
-        );
+        assert!(resolve_class_params(&classes, &owned(&["coxswain"]), &params).is_empty());
         assert!(logs_contain(
             "does not reference a CoxswainIngressClassParameters"
         ));
@@ -377,9 +400,7 @@ mod tests {
             Some(params_ref(Some(GROUP), KIND, "p", None)),
         )]);
         let params = params_store(vec![make_params_cr("ns", "p", &[(CONNECT, "5s")])]);
-        assert!(
-            resolve_class_default_annotations(&classes, &owned(&["coxswain"]), &params).is_empty()
-        );
+        assert!(resolve_class_params(&classes, &owned(&["coxswain"]), &params).is_empty());
         assert!(logs_contain("omits namespace"));
     }
 
@@ -391,12 +412,7 @@ mod tests {
             Some(params_ref(Some(GROUP), KIND, "missing", Some("ns"))),
         )]);
         assert!(
-            resolve_class_default_annotations(
-                &classes,
-                &owned(&["coxswain"]),
-                &params_store(vec![])
-            )
-            .is_empty()
+            resolve_class_params(&classes, &owned(&["coxswain"]), &params_store(vec![])).is_empty()
         );
         assert!(logs_contain("not found"));
     }
@@ -408,9 +424,7 @@ mod tests {
             Some(params_ref(Some(GROUP), KIND, "p", Some("ns"))),
         )]);
         let params = params_store(vec![make_params_cr("ns", "p", &[])]);
-        assert!(
-            resolve_class_default_annotations(&classes, &owned(&["coxswain"]), &params).is_empty()
-        );
+        assert!(resolve_class_params(&classes, &owned(&["coxswain"]), &params).is_empty());
     }
 
     #[test]
@@ -429,19 +443,105 @@ mod tests {
             make_params_cr("ns", "public-p", &[(CONNECT, "10s")]),
             make_params_cr("ns", "internal-p", &[(CONNECT, "1s")]),
         ]);
-        let got =
-            resolve_class_default_annotations(&classes, &owned(&["public", "internal"]), &params);
+        let got = resolve_class_params(&classes, &owned(&["public", "internal"]), &params);
         assert_eq!(
             got.get("public")
-                .and_then(|m| m.get(CONNECT))
+                .and_then(|p| p.default_annotations.get(CONNECT))
                 .map(String::as_str),
             Some("10s")
         );
         assert_eq!(
             got.get("internal")
-                .and_then(|m| m.get(CONNECT))
+                .and_then(|p| p.default_annotations.get(CONNECT))
                 .map(String::as_str),
             Some("1s")
+        );
+    }
+
+    // ── accessLog field (#279) ────────────────────────────────────────────────
+
+    fn make_params_cr_with_access_log(
+        ns: &str,
+        name: &str,
+        access_log: Option<bool>,
+    ) -> CoxswainIngressClassParameters {
+        let mut spec = CoxswainIngressClassParametersSpec::default();
+        spec.access_log = access_log;
+        let mut cr = CoxswainIngressClassParameters::new(name, spec);
+        cr.metadata.namespace = Some(ns.to_string());
+        cr
+    }
+
+    #[test]
+    fn resolves_access_log_false() {
+        let classes = class_store(vec![ic_with_params(
+            "coxswain",
+            Some(params_ref(Some(GROUP), KIND, "p", Some("ns"))),
+        )]);
+        let params = params_store(vec![make_params_cr_with_access_log("ns", "p", Some(false))]);
+        let got = resolve_class_params(&classes, &owned(&["coxswain"]), &params);
+        assert_eq!(
+            got.get("coxswain").and_then(|p| p.access_log_enabled),
+            Some(false),
+            "accessLog: false must be resolved and present"
+        );
+    }
+
+    #[test]
+    fn resolves_access_log_true() {
+        let classes = class_store(vec![ic_with_params(
+            "coxswain",
+            Some(params_ref(Some(GROUP), KIND, "p", Some("ns"))),
+        )]);
+        let params = params_store(vec![make_params_cr_with_access_log("ns", "p", Some(true))]);
+        let got = resolve_class_params(&classes, &owned(&["coxswain"]), &params);
+        assert_eq!(
+            got.get("coxswain").and_then(|p| p.access_log_enabled),
+            Some(true),
+        );
+    }
+
+    #[test]
+    fn class_with_only_access_log_is_present_in_map() {
+        // A class that sets accessLog but no defaultAnnotations must still appear
+        // in the resolved map so the reconciler can propagate the override.
+        let classes = class_store(vec![ic_with_params(
+            "coxswain",
+            Some(params_ref(Some(GROUP), KIND, "p", Some("ns"))),
+        )]);
+        let params = params_store(vec![make_params_cr_with_access_log("ns", "p", Some(false))]);
+        let got = resolve_class_params(&classes, &owned(&["coxswain"]), &params);
+        assert!(
+            got.contains_key("coxswain"),
+            "class with only accessLog override must appear in the resolved params map"
+        );
+        assert!(
+            got.get("coxswain")
+                .is_some_and(|p| p.default_annotations.is_empty()),
+            "default_annotations must be empty when the CR has none"
+        );
+    }
+
+    #[test]
+    fn absent_when_cr_has_neither_annotations_nor_access_log() {
+        // A CR with an empty spec contributes nothing; the class is omitted so
+        // the reconciler can fast-path it with zero-allocation semantics.
+        let classes = class_store(vec![ic_with_params(
+            "coxswain",
+            Some(params_ref(Some(GROUP), KIND, "p", Some("ns"))),
+        )]);
+        let params = params_store(vec![{
+            let mut cr = CoxswainIngressClassParameters::new(
+                "p",
+                CoxswainIngressClassParametersSpec::default(),
+            );
+            cr.metadata.namespace = Some("ns".to_string());
+            cr
+        }]);
+        let got = resolve_class_params(&classes, &owned(&["coxswain"]), &params);
+        assert!(
+            got.is_empty(),
+            "class whose CR has neither defaultAnnotations nor accessLog must be absent"
         );
     }
 }

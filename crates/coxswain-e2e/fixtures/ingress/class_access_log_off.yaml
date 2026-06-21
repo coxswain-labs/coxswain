@@ -1,0 +1,51 @@
+# Per-class access-log suppression via CoxswainIngressClassParameters.spec.accessLog (#279).
+#
+# A CoxswainIngressClassParameters CR sets accessLog: false. An Ingress claiming
+# the class must produce no access-log lines, while an Ingress on the default class
+# (used as a negative control) must still produce access-log rows.
+#
+# The IngressClass is cluster-scoped and uniquely named per test run — the test
+# wraps it in an IngressClassGuard so it does not leak. The namespace
+# placeholder is substituted with the test namespace at apply time.
+#
+# Routes:
+#   clsalog-off.${TESTNS}.local   -> echo-a  (class has accessLog: false)
+---
+apiVersion: ingress.coxswain-labs.dev/v1alpha1
+kind: CoxswainIngressClassParameters
+metadata:
+  name: class-access-log-off
+  namespace: ${TESTNS}
+spec:
+  accessLog: false
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: coxswain-clsalogoff-${TESTNS}
+spec:
+  controller: coxswain-labs.dev/gateway-controller
+  parameters:
+    apiGroup: ingress.coxswain-labs.dev
+    kind: CoxswainIngressClassParameters
+    name: class-access-log-off
+    namespace: ${TESTNS}
+    scope: Namespace
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: access-log-off-ingress
+spec:
+  ingressClassName: coxswain-clsalogoff-${TESTNS}
+  rules:
+    - host: clsalog-off.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

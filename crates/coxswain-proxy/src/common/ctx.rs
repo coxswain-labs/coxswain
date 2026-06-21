@@ -62,6 +62,14 @@ pub struct ResolvedRoute {
     /// response cache for this request. `false` for every Gateway-API route and
     /// for Ingress routes without the `cache-enabled` annotation.
     pub cache_enabled: bool,
+    /// Per-class access-log enabled override for the matched route.
+    ///
+    /// Populated from `RouteMatch::access_log_enabled`. `Some(false)` suppresses
+    /// the access-log line in the `logging` hook while leaving metrics unaffected.
+    /// `None` or `Some(true)` means the proxy-wide `--access-log` flag governs.
+    /// Only ever `Some(false)` for Ingress routes whose class has
+    /// `CoxswainIngressClassParameters.spec.accessLog: false` (#279).
+    pub access_log_enabled: Option<bool>,
     /// Per-route response-compression configuration (`None` = no compression).
     ///
     /// Populated from `RouteMatch::compression`; `Some` only for Ingress routes
@@ -252,6 +260,8 @@ pub struct ProxyCtx {
 // ResolvedRoute: +8 (alignment) for cache_enabled: bool (#40) (168→176).
 // ResolvedRoute: +8 for compression: Option<Arc<CompressionConfig>> (niche pointer) (#270) (176→184).
 // ResolvedRoute: +8 for circuit_breaker: Option<Arc<CircuitBreakerConfig>> (niche pointer) (#282) (184→192).
+// ResolvedRoute: +0 for access_log_enabled: Option<bool> (#279) — 1 byte, fits in
+//   alignment padding alongside cache_enabled; no size change.
 const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 192);
 // ProxyCtx: +16 for start: Option<Instant>, +48 for upstream_addr: Option<SocketAddr>
 // with alignment padding (176→240).

@@ -198,6 +198,12 @@ pub const CLASS_DEFAULT_TIMEOUT: &str = fixture!("class_default_timeout.yaml");
 /// built-in defaults (graceful degrade). Cluster-scoped IngressClass — wrap it in
 /// an `IngressClassGuard`.
 pub const CLASS_DEFAULT_DANGLING: &str = fixture!("class_default_dangling.yaml");
+/// Per-class access-log suppression via `CoxswainIngressClassParameters.spec.accessLog: false`
+/// (#279). A single Ingress on a suppression-class. Used to verify that access-log
+/// lines are absent for that class's routes while a normal-class Ingress in the same
+/// test namespace still emits rows. Cluster-scoped IngressClass — wrap it in an
+/// `IngressClassGuard`.
+pub const CLASS_ACCESS_LOG_OFF: &str = fixture!("class_access_log_off.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/mirror-target: "echo-b.TESTNS.svc:3000"`
 /// and `max-body-size: 1k` (#283). Primary traffic routes to echo-a; every request
 /// is mirrored fire-and-forget to echo-b. Used to verify the access-log

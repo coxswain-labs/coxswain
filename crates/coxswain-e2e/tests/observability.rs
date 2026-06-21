@@ -18,7 +18,7 @@
 //!   relay (#285): controller serves it, proxy 404s, unknown pod 404s.
 
 use coxswain_e2e::{
-    ControllerOptions, FixtureVars, Harness, NamespaceGuard,
+    ControllerOptions, FixtureVars, Harness, IngressClassGuard, NamespaceGuard,
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::wait,
 };
@@ -373,6 +373,78 @@ async fn access_log_disabled_emits_nothing() -> anyhow::Result<()> {
         metrics.contains("coxswain_proxy_requests_total{"),
         "metrics must still emit even with access logging disabled"
     );
+    Ok(())
+}
+
+/// `CoxswainIngressClassParameters.spec.accessLog: false` suppresses access-log
+/// lines for every request matched through Ingresses claiming that class, while
+/// a normal-class Ingress in the same namespace continues to emit rows (#279).
+///
+/// The test applies:
+///  - a suppressed-class Ingress (host A, bound to a class with `accessLog: false`);
+///  - a default-class Ingress (host B, no class params) as the negative control.
+///
+/// After several GETs to each host, the assertion verifies zero rows for host A and
+/// at least one row for host B (proving the proxy is logging at all and suppression is
+/// class-scoped, not global). Metrics still flow for both hosts; the per-class field
+/// never silences them.
+///
+/// Uses the default harness (no `helm upgrade`) so the test stays in the parallel
+/// pass — only the class CR is mutated, not the proxy-wide `--access-log` flag.
+#[tokio::test]
+async fn access_log_suppressed_for_class_with_access_log_false() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-cls-alog-off").await?;
+
+    // Cluster-scoped IngressClass — guard deletes it on drop.
+    // Name matches the fixture's `coxswain-clsalogoff-${TESTNS}`.
+    let ic_name = format!("coxswain-clsalogoff-{}", ns.name);
+    let _ic_guard = IngressClassGuard::new(&ic_name);
+
+    // Suppressed-class Ingress (host A).
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::CLASS_ACCESS_LOG_OFF, FixtureVars::new(&ns.name)).await?;
+
+    // Normal-class Ingress (host B) — negative control; uses PATH_MATCHING which
+    // does NOT set a class params CR, so the global flag governs (logging on).
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    let host_a = format!("clsalog-off.{}.local", ns.name);
+    let host_b = format!("ingress.{}.local", ns.name);
+
+    // Wait for both routes to be ready.
+    wait::wait_for_route(&h.http, &host_a, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&h.http, &host_b, "/a", Duration::from_secs(60)).await?;
+
+    // Drive traffic to both hosts.
+    for _ in 0..5 {
+        h.http.get(&host_a, "/").await?;
+        h.http.get(&host_b, "/a").await?;
+    }
+
+    let logs = h.controller.shared_proxy_access_logs().await?;
+
+    let rows_a: Vec<_> = logs
+        .iter()
+        .filter(|line| line.get("host").and_then(|v| v.as_str()) == Some(host_a.as_str()))
+        .collect();
+    assert!(
+        rows_a.is_empty(),
+        "class with accessLog: false must produce zero access-log rows for host A, got {}",
+        rows_a.len()
+    );
+
+    let rows_b: Vec<_> = logs
+        .iter()
+        .filter(|line| line.get("host").and_then(|v| v.as_str()) == Some(host_b.as_str()))
+        .collect();
+    assert!(
+        !rows_b.is_empty(),
+        "normal-class Ingress (host B) must still produce access-log rows; \
+         got 0 — is the proxy logging at all?"
+    );
+
     Ok(())
 }
 
