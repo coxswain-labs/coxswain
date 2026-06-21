@@ -71,6 +71,22 @@ pub struct CoxswainIngressClassParametersSpec {
     /// key; unmentioned keys still inherit the class default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_annotations: Option<BTreeMap<String, String>>,
+
+    /// Suppress proxy access-log lines for every request matched through an
+    /// Ingress claiming this class.
+    ///
+    /// `None` (the default) inherits the proxy-wide `--access-log` flag;
+    /// `Some(true)` is equivalent to the default; `Some(false)` suppresses the
+    /// access log for this class's routes. Error logs and metrics are
+    /// unaffected. Downward-only: this never force-enables logging when the
+    /// proxy-wide flag is already off — it only adds suppression on top.
+    ///
+    /// Unlike `defaultAnnotations`, this has no per-Ingress override: access-log
+    /// control is intentionally class-scoped (workload-scoped), mirroring
+    /// Istio's `Telemetry.spec.accessLogging[].disabled` + `spec.selector`
+    /// rather than nginx's per-`location` `access_log off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_log: Option<bool>,
 }
 
 #[cfg(test)]
@@ -164,6 +180,30 @@ mod tests {
         let reparsed: CoxswainIngressClassParametersSpec =
             serde_json::from_value(reserialized).expect("reserialized spec must round-trip");
         assert_eq!(cr.spec, reparsed);
+    }
+
+    #[test]
+    fn empty_spec_leaves_access_log_unset() {
+        let cr = parse_cr("{}");
+        assert!(cr.spec.access_log.is_none());
+    }
+
+    #[test]
+    fn access_log_false_round_trips() {
+        let cr = parse_cr("accessLog: false");
+        assert_eq!(cr.spec.access_log, Some(false));
+
+        // Re-serialize and re-parse: round-trip must be lossless.
+        let reserialized = serde_json::to_value(&cr.spec).expect("spec must serialize to JSON");
+        let reparsed: CoxswainIngressClassParametersSpec =
+            serde_json::from_value(reserialized).expect("reserialized spec must round-trip");
+        assert_eq!(cr.spec, reparsed);
+    }
+
+    #[test]
+    fn access_log_true_round_trips() {
+        let cr = parse_cr("accessLog: true");
+        assert_eq!(cr.spec.access_log, Some(true));
     }
 
     #[test]

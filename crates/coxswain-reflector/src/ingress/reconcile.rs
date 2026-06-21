@@ -4,7 +4,7 @@ use super::IngressReconciler;
 use super::annotations::IngressAnnotations;
 use super::annotations::security::{AuthAnnotation, parse_htpasswd};
 use super::backend::resolve_backend_port;
-use super::class::claimed_ingress_class;
+use super::class::{ResolvedClassParams, claimed_ingress_class};
 use super::ports::IngressPorts;
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
@@ -17,36 +17,36 @@ use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::runtime::reflector;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// The IngressClass-ownership context threaded into [`IngressReconciler::reconcile`].
 ///
 /// Groups the three class-derived inputs a reconcile pass needs — the owned
-/// class names, the owned default class (if any), and per-class annotation
-/// defaults resolved from `IngressClass.spec.parameters` (#190) — so the
+/// class names, the owned default class (if any), and per-class parameters
+/// resolved from `IngressClass.spec.parameters` (#190, #279) — so the
 /// reconcile entry point stays under the workspace argument-count limit and so
 /// callers thread one borrow instead of three.
 #[non_exhaustive]
 pub struct IngressClassContext<'a> {
     owned: &'a HashSet<String>,
     default: Option<&'a str>,
-    defaults: &'a HashMap<String, BTreeMap<String, String>>,
+    params: &'a HashMap<String, ResolvedClassParams>,
 }
 
 impl<'a> IngressClassContext<'a> {
     /// Bundle the owned class names, owned default class, and per-class
-    /// annotation defaults for a single reconcile pass.
+    /// parameters for a single reconcile pass.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         owned: &'a HashSet<String>,
         default: Option<&'a str>,
-        defaults: &'a HashMap<String, BTreeMap<String, String>>,
+        params: &'a HashMap<String, ResolvedClassParams>,
     ) -> Self {
         Self {
             owned,
             default,
-            defaults,
+            params,
         }
     }
 }
@@ -111,13 +111,15 @@ impl IngressReconciler {
         let spec = ingress.spec.as_ref();
         let rules = spec.and_then(|s| s.rules.as_deref()).unwrap_or(&[]);
 
-        // Layer class-level defaults (#190) under the Ingress's own
+        // Resolve the per-class params for this Ingress's effective class (#190, #279).
+        let resolved_params = classes.params.get(effective_class);
+
+        // Layer class-level annotation defaults (#190) under the Ingress's own
         // annotations: a key set on the Ingress wins per-key; unset keys inherit
         // the class default. No (or empty) class default → keep the existing
         // zero-allocation path on the Ingress's own annotation map.
-        let merged_annotations = classes
-            .defaults
-            .get(effective_class)
+        let merged_annotations = resolved_params
+            .map(|p| &p.default_annotations)
             .filter(|defaults| !defaults.is_empty())
             .map(|defaults| {
                 let mut effective = defaults.clone();
@@ -126,6 +128,11 @@ impl IngressReconciler {
                 }
                 effective
             });
+
+        // Per-class access-log override (#279): propagated directly from
+        // CoxswainIngressClassParameters.spec.accessLog. Class-scoped only,
+        // mirroring Istio's Telemetry granularity.
+        let class_access_log_enabled = resolved_params.and_then(|p| p.access_log_enabled);
 
         // Parse ingress.coxswain-labs.dev/* annotations once per Ingress.
         // Invalid values WARN + use default; the Ingress is never dropped.
@@ -247,6 +254,7 @@ impl IngressReconciler {
                 .with_allow_source_range(allow_source_range.clone())
                 .with_deny_source_range(deny_source_range.clone())
                 .with_cache_enabled(ann.cache_enabled)
+                .with_access_log_enabled(class_access_log_enabled)
                 .with_rate_limit(rate_limit.clone())
                 .with_auth(auth.clone())
                 .with_compression(compression.clone())
@@ -2546,17 +2554,24 @@ mod tests {
 
     // ── Class-level annotation defaults (#190) ────────────────────────────────
 
-    /// `defaults` keyed by IngressClass name, with one annotation each.
+    /// Per-class params map keyed by IngressClass name, with one annotation each.
     fn class_defaults(
         class: &str,
         anns: &[(&str, &str)],
-    ) -> HashMap<String, BTreeMap<String, String>> {
+    ) -> HashMap<String, crate::ingress::ResolvedClassParams> {
+        use crate::ingress::ResolvedClassParams;
         let mut map = BTreeMap::new();
         for (k, v) in anns {
             map.insert((*k).to_string(), (*v).to_string());
         }
         let mut out = HashMap::new();
-        out.insert(class.to_string(), map);
+        out.insert(
+            class.to_string(),
+            ResolvedClassParams {
+                default_annotations: map,
+                access_log_enabled: None,
+            },
+        );
         out
     }
 

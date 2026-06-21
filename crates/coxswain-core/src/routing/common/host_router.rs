@@ -46,6 +46,13 @@ pub struct RouteMatch {
     pub deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
     /// RFC 7234 response-cache opt-in for the matched rule (`false` = no caching).
     pub cache_enabled: bool,
+    /// Per-class access-log enabled override (`None` = inherit proxy-wide flag).
+    ///
+    /// Populated from `RouteEntry::access_log_enabled`. `Some(false)` suppresses
+    /// the `coxswain_proxy::access` log line for this matched route while leaving
+    /// metrics unaffected. Only set for Ingress routes whose
+    /// `CoxswainIngressClassParameters.spec.accessLog` is `false`.
+    pub access_log_enabled: Option<bool>,
     /// Per-route rate-limiting configuration (`None` = no rate limiting).
     pub rate_limit: Option<Arc<RateLimitConfig>>,
     /// Authentication configuration for this route (`None` = no auth required).
@@ -106,6 +113,7 @@ impl RouteMatch {
             allow_source_range: entry.allow_source_range.clone(),
             deny_source_range: entry.deny_source_range.clone(),
             cache_enabled: entry.cache_enabled,
+            access_log_enabled: entry.access_log_enabled,
             rate_limit: entry.rate_limit.clone(),
             auth: entry.auth.clone(),
             compression: entry.compression.clone(),

@@ -38,14 +38,14 @@ pub(super) fn reconcile_no_default(
     );
 }
 
-/// Like [`reconcile_no_default`] but with per-class annotation defaults keyed by
+/// Like [`reconcile_no_default`] but with per-class params keyed by
 /// IngressClass name — used to exercise the #190 class-defaults merge.
 pub(super) fn reconcile_with_class_defaults(
     ing: &Ingress,
     slices: &reflector::Store<EndpointSlice>,
     svcs: &reflector::Store<Service>,
     owned: &HashSet<String>,
-    defaults: &HashMap<String, BTreeMap<String, String>>,
+    defaults: &HashMap<String, crate::ingress::ResolvedClassParams>,
     b: &mut IngressRoutingTableBuilder,
 ) {
     IngressReconciler::reconcile(

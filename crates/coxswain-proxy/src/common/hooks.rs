@@ -359,6 +359,7 @@ pub(crate) async fn request_filter<K>(
         path_pattern: m.path_pattern,
         metric_route_id: m.metric_route_id,
         cache_enabled: m.cache_enabled,
+        access_log_enabled: m.access_log_enabled,
         compression: m.compression,
         circuit_breaker: m.circuit_breaker,
     });
@@ -1686,7 +1687,13 @@ pub(crate) async fn logging(
         .with_label_values(&[listener_label, route_label])
         .observe(duration.unwrap_or_default().as_secs_f64());
 
-    if !access_log_enabled {
+    // Suppress when the global flag is off, or when the matched class suppresses (#279).
+    // Metrics above are always emitted; only the access-log line is gated here.
+    let class_suppressed = ctx
+        .resolved
+        .as_ref()
+        .is_some_and(|r| r.access_log_enabled == Some(false));
+    if !access_log_enabled || class_suppressed {
         return;
     }
 
