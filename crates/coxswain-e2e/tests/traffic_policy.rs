@@ -1276,41 +1276,21 @@ async fn ip_hash_pins_a_client_to_one_upstream() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sad path (#275): an unknown `load-balance` value must warn and fall back to
-/// `round_robin`, never blocking routing. All requests must succeed (200) and
-/// both pods of the two-replica Service must be reachable, proving the fallback
-/// distributes traffic normally.
+/// Sad path (#275, #29 VAP): an unknown `load-balance` value must be rejected
+/// by the VAP at admission time with a message naming the offending annotation.
 #[tokio::test]
-async fn unknown_load_balance_value_falls_back_to_round_robin() -> anyhow::Result<()> {
+async fn unknown_load_balance_value_rejected_by_vap() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "lb-unknown").await?;
 
-    fixtures::apply_fixture(backends::ECHO_TWO_REPLICAS, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_deployments(&ns.name, &["echo-two-replicas"]).await?;
-    fixtures::apply_fixture(
+    let msg = fixtures::apply_fixture_expect_rejected(
         ingress::ANNOTATION_LOAD_BALANCE_UNKNOWN,
         FixtureVars::new(&ns.name),
     )
     .await?;
-
-    let host = format!("lb.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
-
-    let mut pods = std::collections::HashSet::new();
-    for i in 0..30u32 {
-        let (status, _, body) = h.http.get_full(&host, "/").await?;
-        assert_eq!(
-            status, 200,
-            "unknown load-balance value must not break routing (request {i} returned {status})"
-        );
-        if let Some(p) = body.and_then(|b| b.pod) {
-            pods.insert(p);
-        }
-    }
-    assert!(
-        pods.len() >= 2,
-        "unknown load-balance value must fall back to round_robin and spread across \
-         both pods; saw only {pods:?}"
+    anyhow::ensure!(
+        msg.contains("load-balance"),
+        "VAP rejection message must name the offending annotation, got: {msg}"
     );
 
     Ok(())

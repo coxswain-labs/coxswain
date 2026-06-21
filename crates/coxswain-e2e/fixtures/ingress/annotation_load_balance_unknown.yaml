@@ -1,7 +1,5 @@
-# Ingress with an unknown load-balance value, routing to the two-replica echo Service (#275).
-# An unknown value must warn and fall back to round_robin; traffic must still flow (200)
-# and both pods must be reachable, proving the annotation never blocks routing.
-# Apply backends::ECHO_TWO_REPLICAS before this fixture.
+# Ingress with an unknown load-balance value (#275, #29 VAP).
+# The VAP must reject this at admission time; no backend setup needed.
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
