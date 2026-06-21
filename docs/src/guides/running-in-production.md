@@ -150,6 +150,10 @@ On Kubernetes ≥ 1.30, the Helm chart installs a `ValidatingAdmissionPolicy` th
 - **`spec.defaultAnnotations`** — default `ingress.coxswain-labs.dev/*` values; per-Ingress annotations override these per key.
 - **`spec.accessLog`** — set `false` to suppress proxy access-log lines for all routes in the class (never force-enables — a `false` class setting cannot be overridden per Ingress). See the [Observability reference](../reference/observability.md#access-logs) for the full access-log configuration model.
 
+## Security
+
+Coxswain unconditionally strips `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Real-IP` from every upstream request before any route filter runs. The proxy owns these headers; client-supplied values are never forwarded. When `--proxy-accept-proxy-protocol` is active, Coxswain injects a proxy-generated `Forwarded` header derived from the real PROXY-protocol client address.
+
 ## RBAC
 
 The default `ClusterRole` grants Coxswain cluster-wide:

@@ -1127,6 +1127,130 @@ async fn request_forwarded_without_auth_when_no_annotation() -> anyhow::Result<(
     Ok(())
 }
 
+// ── Header ownership (#409) ───────────────────────────────────────────────────
+
+/// Client-injected `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, and
+/// `X-Real-IP` headers are stripped before reaching the backend (#409 happy path
+/// — no PROXY protocol, plain HTTP).
+///
+/// Any backend that trusts these headers for access-control or audit decisions
+/// can be spoofed if the proxy passes them through. Coxswain must own these
+/// headers and strip whatever the client sent.
+#[tokio::test]
+async fn client_injected_forwarding_headers_are_stripped() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "fwd-strip").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    let host = format!("ingress.{}.local", ns.name);
+
+    // Wait until the route is live.
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+
+    // Send all four spoofed forwarding headers and confirm none reach the backend.
+    let (status, _resp_headers, body) = h
+        .http
+        .get_full_with_headers(
+            &host,
+            "/a",
+            &[
+                ("Forwarded", "for=1.2.3.4;by=evil"),
+                ("X-Forwarded-For", "1.2.3.4"),
+                ("X-Forwarded-Proto", "https"),
+                ("X-Real-IP", "1.2.3.4"),
+            ],
+        )
+        .await?;
+    anyhow::ensure!(status == 200, "expected 200 from backend, got {status}");
+    let echo = body.ok_or_else(|| anyhow::anyhow!("expected echo JSON body"))?;
+
+    // echo-basic returns headers as Title-Case keys (Go net/http canonical form).
+    for header in &[
+        "Forwarded",
+        "X-Forwarded-For",
+        "X-Forwarded-Proto",
+        "X-Real-Ip",
+    ] {
+        anyhow::ensure!(
+            !echo.headers.contains_key(*header),
+            "spoofed header {header:?} leaked through to the backend — \
+             proxy must strip all client-supplied forwarding headers (issue #409)"
+        );
+    }
+    Ok(())
+}
+
+/// Proxy-generated `Forwarded` header (derived from PROXY-protocol data) reaches
+/// the backend and overrides any client-supplied spoof (#409 — strip-then-replace
+/// path). Verifies the strip and the proxy-generated replacement in one assertion.
+#[tokio::test]
+async fn proxy_generated_forwarded_reaches_backend_and_overrides_spoof() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "fwd-override").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("ingress.{}.local", ns.name);
+    // PROXY line carries the real client IP 203.0.113.10.
+    // The HTTP request also sends a spoofed Forwarded header; the proxy must strip
+    // it and replace with its own value derived from the PROXY-protocol address.
+    let proxy_line = "PROXY TCP4 203.0.113.10 10.0.0.1 12345 80\r\n";
+    let http_req = format!(
+        "GET /a HTTP/1.1\r\nHost: {host}\r\nForwarded: for=1.2.3.4;by=spoof\r\nConnection: close\r\n\r\n"
+    );
+
+    let body = wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        proxy_line,
+        &http_req,
+        200,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let echo: EchoResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+    echo.assert_backend("echo-a");
+
+    // The backend must see the proxy-generated Forwarded (from PROXY-protocol data),
+    // not the spoofed client value.
+    // echo-basic returns headers as Title-Case keys with array values (Go net/http canonical form).
+    let forwarded = echo
+        .headers
+        .get("Forwarded")
+        .and_then(|v| v[0].as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "backend did not receive a `Forwarded` header — \
+                 proxy must inject one on the PROXY-protocol path (issue #409)"
+            )
+        })?;
+    anyhow::ensure!(
+        forwarded.contains("203.0.113.10"),
+        "expected proxy-generated Forwarded to contain the real client IP 203.0.113.10, \
+         got {forwarded:?} — wrong value injected or PROXY-protocol data not used"
+    );
+    anyhow::ensure!(
+        !forwarded.contains("1.2.3.4"),
+        "spoofed IP 1.2.3.4 found in Forwarded header {forwarded:?} — \
+         client spoof was not stripped before proxy-generated value was inserted (issue #409)"
+    );
+
+    Ok(())
+}
+
 /// Make one raw TCP request (write `preamble` then the HTTP request) and return the
 /// response `(status_code, body)`.
 async fn raw_http_status(

@@ -1098,6 +1098,14 @@ pub(crate) async fn upstream_request_filter(
         .map(|r| (r.filters.as_ref(), &*r.original_host, &*r.original_path))
         .unwrap_or((&[], "", ""));
 
+    // Strip client-supplied forwarding headers before any operator filter or
+    // proxy-generated header insertion runs (#409).  The proxy owns Forwarded,
+    // X-Forwarded-For, X-Forwarded-Proto, and X-Real-IP: client-injected values
+    // must never reach the backend.  When PROXY protocol is active,
+    // apply_request_filters below re-inserts a proxy-generated Forwarded value
+    // derived from the real client address.
+    TrafficFilter::strip_client_forwarding_headers(upstream_request);
+
     // Forward the normalized path (#280): if path normalization changed the
     // downstream path (e.g. `merge-slashes` collapsed `//`), `original_path`
     // carries the normalized form while `upstream_request` still holds the raw
