@@ -1,0 +1,21 @@
+# Minimal HTTPRoute with an invalid path-match `type` value.
+# Used to assert that the gateway-api CRD openAPIV3Schema rejects the resource
+# at admission — before the controller ever sees it (#335).
+#
+# `Glob` is not in the enum {Exact, PathPrefix, RegularExpression}.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: reject-test
+spec:
+  parentRefs:
+    - name: nonexistent-gw
+  rules:
+    - matches:
+        - path:
+            type: Glob
+            value: /bad
+      backendRefs:
+        - name: nonexistent
+          port: 80

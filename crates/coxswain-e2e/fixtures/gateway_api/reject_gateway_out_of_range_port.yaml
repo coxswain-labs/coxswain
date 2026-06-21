@@ -1,0 +1,16 @@
+# Minimal Gateway with a listener port that exceeds the CRD maximum (65535).
+# Used to assert that the gateway-api CRD openAPIV3Schema rejects the resource
+# at admission — before the controller ever sees it (#335).
+#
+# Port 99999 violates `maximum: 65535` in the structural schema.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: reject-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: 99999
+      protocol: HTTP

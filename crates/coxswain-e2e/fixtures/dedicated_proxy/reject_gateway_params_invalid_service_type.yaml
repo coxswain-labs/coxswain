@@ -1,0 +1,12 @@
+# Minimal CoxswainGatewayParameters CR with an invalid `serviceType` value.
+# Used to assert that the coxswain-owned CRD openAPIV3Schema rejects the
+# resource at admission — before the controller ever sees it (#335).
+#
+# `FooBar` is not in the enum {LoadBalancer, NodePort, ClusterIP}.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: reject-test
+spec:
+  serviceType: FooBar
