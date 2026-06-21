@@ -465,6 +465,10 @@ pub struct RouteConflict {
     /// group holds several distinct routes, this is the representative
     /// (highest-precedence) one — see `HostRouterBuilder::build`.
     pub rejected_route_id: String,
+    /// Source resource identity `"{namespace}/{name}"` of the winning route that
+    /// claimed this slot. Surfaces in controller Warning Events so operators know
+    /// which Ingress took precedence over theirs.
+    pub winner_route_id: String,
 }
 
 /// A single routing candidate: a backend group plus the predicates that must hold

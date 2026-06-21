@@ -24,6 +24,7 @@ use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
+use crate::ingress::annotations::AnnotationIssue;
 use crate::k8s_utils::scoped_api;
 use crate::keys::ListenerKey;
 use crate::reference_grants::{GrantSet, flatten_grants};
@@ -126,6 +127,44 @@ impl std::str::FromStr for IngressDefaultBackend {
     }
 }
 
+/// Diagnostic events emitted from the Ingress-rebuild path and forwarded to
+/// the controller's event recorder task.
+///
+/// The channel sender is wired only in the controller role (via
+/// [`ReconcilerOptions::ingress_event_tx`]). The proxy role passes `None`,
+/// so no events are emitted and no `events` RBAC is required on the proxy
+/// `ServiceAccount`.
+#[non_exhaustive]
+pub enum IngressEvent {
+    /// Two Ingresses claimed the same `(port, host, path)` slot; the loser is
+    /// silently ignored. The controller emits a `Warning` Event on the losing
+    /// Ingress naming the winner.
+    Conflict {
+        /// Namespace of the losing (shadowed) Ingress.
+        namespace: String,
+        /// Name of the losing (shadowed) Ingress.
+        name: String,
+        /// Source identity `"{ns}/{name}"` of the winning Ingress.
+        winner_route_id: String,
+        /// Host on which the conflict occurred.
+        host: String,
+        /// Path on which the conflict occurred.
+        path: String,
+    },
+    /// An `ingress.coxswain-labs.dev/*` annotation carried an invalid value;
+    /// the feature is disabled and a `Warning` Event is emitted on the Ingress.
+    InvalidAnnotation {
+        /// Namespace of the affected Ingress.
+        namespace: String,
+        /// Name of the affected Ingress.
+        name: String,
+        /// Annotation key that failed to parse (e.g. `"ingress.coxswain-labs.dev/circuit-breaker-threshold"`).
+        annotation: &'static str,
+        /// Human-readable diagnostic (same text as the `tracing::warn!` that already fired).
+        message: String,
+    },
+}
+
 /// Optional configuration for a [`SharedProxyReconciler`].
 #[non_exhaustive]
 pub struct ReconcilerOptions {
@@ -150,6 +189,12 @@ pub struct ReconcilerOptions {
     /// stores without duplicating watches (#347). Controller role only — the
     /// proxy role never writes status and leaves this `false`.
     pub status_subscriptions: bool,
+    /// When `Some`, the reconciler forwards Ingress diagnostic events
+    /// (route conflicts, annotation parse failures) to the controller's event
+    /// recorder task via this sender. Set only for the controller role; the
+    /// proxy role leaves this `None` so no `events` RBAC is needed on the
+    /// proxy `ServiceAccount`.
+    pub ingress_event_tx: Option<tokio::sync::mpsc::Sender<IngressEvent>>,
 }
 
 impl Default for ReconcilerOptions {
@@ -161,6 +206,7 @@ impl Default for ReconcilerOptions {
             metrics_prefix: crate::MetricsPrefix::Proxy,
             watch_fleet: false,
             status_subscriptions: false,
+            ingress_event_tx: None,
         }
     }
 }
@@ -448,6 +494,8 @@ struct ReconcilerConfig {
     metrics: crate::ReflectorMetrics,
     /// See [`ReconcilerOptions::watch_fleet`].
     watch_fleet: bool,
+    /// See [`ReconcilerOptions::ingress_event_tx`].
+    ingress_event_tx: Option<tokio::sync::mpsc::Sender<IngressEvent>>,
 }
 
 pub(super) struct ReflectorStores<'a> {
@@ -494,6 +542,7 @@ struct SharedOutputs<'a> {
     cluster_summary: &'a SharedClusterSummary,
     route_health: &'a SharedHttpRouteHealth,
     policy_health: &'a SharedBackendTlsPolicyHealth,
+    ingress_event_tx: Option<&'a tokio::sync::mpsc::Sender<IngressEvent>>,
 }
 
 pub(super) struct Ownership<'a> {
@@ -610,6 +659,7 @@ impl BackgroundService for SharedProxyReconciler {
             ingress_ports: self.opts.ingress_ports,
             metrics: crate::ReflectorMetrics::new(self.opts.metrics_prefix),
             watch_fleet: self.opts.watch_fleet,
+            ingress_event_tx: self.opts.ingress_event_tx.clone(),
         };
         let handles = SharedHandles {
             ingress_routes: self.ingress_routes.clone(),
@@ -716,6 +766,7 @@ async fn spawn_tasks(
         ingress_ports,
         metrics,
         watch_fleet,
+        ingress_event_tx,
     } = config;
     // Status-relevant stores reuse the shared writers pre-created in `new` (so
     // the status-writer's subscriptions observe the same synced stores); the
@@ -971,6 +1022,7 @@ async fn spawn_tasks(
                 cluster_summary: &cluster_summary,
                 route_health: &route_health,
                 policy_health: &policy_health,
+                ingress_event_tx: ingress_event_tx.as_ref(),
             };
             let rebuild_start = std::time::Instant::now();
             let published = rebuild(
@@ -1259,6 +1311,7 @@ fn build_routes(
         ingress_default_backend,
         ingress_ports,
         outputs.ingress_routes,
+        outputs.ingress_event_tx,
     );
     gateway_published && ingress_published
 }
@@ -1326,6 +1379,7 @@ pub(super) fn build_gateway_routes(
         "gateway",
         routes.len(),
         ownership.gateways.len(),
+        None,
     )
 }
 
@@ -1339,6 +1393,7 @@ fn build_ingress_routes(
     ingress_default_backend: Option<&IngressDefaultBackend>,
     ingress_ports: IngressPorts,
     shared: &SharedIngressRoutingTable,
+    event_tx: Option<&tokio::sync::mpsc::Sender<IngressEvent>>,
 ) -> bool {
     // Resolve per-class parameters once for this rebuild: each owned IngressClass's
     // spec.parameters → CoxswainIngressClassParameters → defaultAnnotations +
@@ -1357,8 +1412,9 @@ fn build_ingress_routes(
     );
 
     let mut builder = IngressRoutingTableBuilder::new();
+    let mut pending_annotation_events: Vec<(String, String, Vec<AnnotationIssue>)> = Vec::new();
     for ingress in ingresses {
-        IngressReconciler::reconcile(
+        let issues = IngressReconciler::reconcile(
             ingress,
             stores.slices,
             stores.services,
@@ -1367,6 +1423,21 @@ fn build_ingress_routes(
             &mut builder,
             stores.auth_secrets,
         );
+        if !issues.is_empty() && event_tx.is_some() {
+            let ns = ingress
+                .metadata
+                .namespace
+                .as_deref()
+                .unwrap_or("default")
+                .to_string();
+            let name = ingress
+                .metadata
+                .name
+                .as_deref()
+                .unwrap_or("unknown")
+                .to_string();
+            pending_annotation_events.push((ns, name, issues));
+        }
     }
 
     // Install the controller-wide default backend on the catchall for each configured
@@ -1413,25 +1484,49 @@ fn build_ingress_routes(
         }
     }
 
-    publish_routes(
+    let published = publish_routes(
         shared,
         builder,
         "ingress",
         ingresses.len(),
         ownership.ingress_classes.len(),
-    )
+        event_tx,
+    );
+
+    // Send annotation-failure events after the table is published.
+    // Non-blocking: if the channel is full the event is dropped rather than
+    // stalling the rebuild loop.
+    if let Some(tx) = event_tx {
+        for (ns, name, issues) in pending_annotation_events {
+            for issue in issues {
+                let _ = tx.try_send(IngressEvent::InvalidAnnotation {
+                    namespace: ns.clone(),
+                    name: name.clone(),
+                    annotation: issue.annotation,
+                    message: issue.message,
+                });
+            }
+        }
+    }
+
+    published
 }
 
 /// Generic publish step: compile a builder, log conflicts, swap the snapshot.
 ///
 /// Returns `true` if the build succeeded; `false` leaves the previous snapshot
 /// in place and lets the failure surface in logs without taking the proxy down.
+///
+/// When `event_tx` is `Some`, a non-blocking [`IngressEvent::Conflict`] is sent
+/// for each conflict in addition to the existing `tracing::warn!`. Dropped
+/// events (full channel) are silently ignored — the warn log still fires.
 fn publish_routes<K>(
     shared: &Shared<RoutingTable<K>>,
     builder: RoutingTableBuilder<K>,
     table_label: &'static str,
     source_count: usize,
     owned_owner_count: usize,
+    event_tx: Option<&tokio::sync::mpsc::Sender<IngressEvent>>,
 ) -> bool {
     match builder.build() {
         Ok(table) => {
@@ -1445,6 +1540,20 @@ fn publish_routes<K>(
                     table = table_label,
                     "Route conflict: path already claimed by an earlier rule — ignoring"
                 );
+                if let Some(tx) = event_tx {
+                    let (namespace, name) = c
+                        .rejected_route_id
+                        .split_once('/')
+                        .map(|(ns, n)| (ns.to_string(), n.to_string()))
+                        .unwrap_or_default();
+                    let _ = tx.try_send(IngressEvent::Conflict {
+                        namespace,
+                        name,
+                        winner_route_id: c.winner_route_id.clone(),
+                        host: c.host.clone(),
+                        path: c.path.clone(),
+                    });
+                }
             }
             shared.store(Arc::new(table));
             tracing::info!(

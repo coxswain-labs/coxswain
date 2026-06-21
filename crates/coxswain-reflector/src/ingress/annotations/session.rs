@@ -6,7 +6,7 @@
 //! `WARN` and is treated as absent (no affinity → plain round-robin) so a typo never
 //! rejects the Ingress.
 
-use super::get;
+use super::{AnnotationIssue, get};
 use coxswain_core::routing::SessionAffinity;
 use http::HeaderName;
 use std::collections::BTreeMap;
@@ -37,6 +37,7 @@ pub const DEFAULT_SESSION_COOKIE_NAME: &str = "__coxswain_session";
 pub fn parse_session_affinity(
     ann: &BTreeMap<String, String>,
     route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
 ) -> Option<SessionAffinity> {
     let mode = get(ann, SESSION_AFFINITY)?;
     match mode.trim().to_ascii_lowercase().as_str() {
@@ -51,6 +52,10 @@ pub fn parse_session_affinity(
                         default = DEFAULT_SESSION_COOKIE_NAME,
                         "invalid cookie name (not an RFC 6265 token) — using default"
                     );
+                    diag.push(AnnotationIssue {
+                        annotation: SESSION_COOKIE_NAME,
+                        message: format!("invalid cookie name '{bad}' (not an RFC 6265 token) — using default {DEFAULT_SESSION_COOKIE_NAME}"),
+                    });
                     Arc::from(DEFAULT_SESSION_COOKIE_NAME)
                 }
                 None => Arc::from(DEFAULT_SESSION_COOKIE_NAME),
@@ -64,6 +69,10 @@ pub fn parse_session_affinity(
                     annotation = SESSION_AFFINITY,
                     "header mode requires session-header — affinity disabled"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: SESSION_AFFINITY,
+                    message: "header mode requires session-header — affinity disabled".into(),
+                });
                 return None;
             };
             match HeaderName::from_bytes(raw.as_bytes()) {
@@ -75,6 +84,10 @@ pub fn parse_session_affinity(
                         value = raw,
                         "invalid header name — affinity disabled"
                     );
+                    diag.push(AnnotationIssue {
+                        annotation: SESSION_HEADER,
+                        message: format!("invalid header name '{raw}' — affinity disabled"),
+                    });
                     None
                 }
             }
@@ -86,6 +99,10 @@ pub fn parse_session_affinity(
                 value = other,
                 "unknown session-affinity mode (expected cookie|header) — affinity disabled"
             );
+            diag.push(AnnotationIssue {
+                annotation: SESSION_AFFINITY,
+                message: format!("unknown session-affinity mode '{other}' (expected cookie|header) — affinity disabled"),
+            });
             None
         }
     }
@@ -132,7 +149,7 @@ mod tests {
     fn parse_cookie_mode_uses_default_name_when_unset() {
         // References SESSION_AFFINITY to satisfy the annotation-coverage gate.
         let m = ann(&[(SESSION_AFFINITY, "cookie")]);
-        match parse_session_affinity(&m, "default/test") {
+        match parse_session_affinity(&m, "default/test", &mut vec![]) {
             Some(SessionAffinity::Cookie { cookie_name }) => {
                 assert_eq!(&*cookie_name, DEFAULT_SESSION_COOKIE_NAME);
             }
@@ -147,7 +164,7 @@ mod tests {
             (SESSION_AFFINITY, "cookie"),
             (SESSION_COOKIE_NAME, "SESSIONID"),
         ]);
-        match parse_session_affinity(&m, "default/test") {
+        match parse_session_affinity(&m, "default/test", &mut vec![]) {
             Some(SessionAffinity::Cookie { cookie_name }) => assert_eq!(&*cookie_name, "SESSIONID"),
             other => panic!("expected cookie mode, got {other:?}"),
         }
@@ -160,7 +177,7 @@ mod tests {
             (SESSION_AFFINITY, "cookie"),
             (SESSION_COOKIE_NAME, "bad name;"),
         ]);
-        match parse_session_affinity(&m, "default/test") {
+        match parse_session_affinity(&m, "default/test", &mut vec![]) {
             Some(SessionAffinity::Cookie { cookie_name }) => {
                 assert_eq!(&*cookie_name, DEFAULT_SESSION_COOKIE_NAME);
             }
@@ -176,7 +193,7 @@ mod tests {
             (SESSION_AFFINITY, "header"),
             (SESSION_HEADER, "X-Session-Id"),
         ]);
-        match parse_session_affinity(&m, "default/test") {
+        match parse_session_affinity(&m, "default/test", &mut vec![]) {
             Some(SessionAffinity::Header { header }) => assert_eq!(header.as_str(), "x-session-id"),
             other => panic!("expected header mode, got {other:?}"),
         }
@@ -186,7 +203,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_header_mode_without_header_disables_affinity() {
         let m = ann(&[(SESSION_AFFINITY, "header")]);
-        assert!(parse_session_affinity(&m, "default/test").is_none());
+        assert!(parse_session_affinity(&m, "default/test", &mut vec![]).is_none());
         assert!(logs_contain("requires session-header"));
     }
 
@@ -194,13 +211,13 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_unknown_mode_disables_affinity() {
         let m = ann(&[(SESSION_AFFINITY, "sourceip")]);
-        assert!(parse_session_affinity(&m, "default/test").is_none());
+        assert!(parse_session_affinity(&m, "default/test", &mut vec![]).is_none());
         assert!(logs_contain("unknown session-affinity mode"));
     }
 
     #[test]
     fn parse_absent_affinity_is_none() {
         let m = ann(&[]);
-        assert!(parse_session_affinity(&m, "default/test").is_none());
+        assert!(parse_session_affinity(&m, "default/test", &mut vec![]).is_none());
     }
 }

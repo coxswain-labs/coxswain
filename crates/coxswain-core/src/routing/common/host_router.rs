@@ -324,6 +324,7 @@ fn dup_conflicts(path: &str, kind: RouteKind, frozen: &[Arc<RouteEntry>]) -> Vec
                     kind,
                     rejected_group: e.backend_group.name().to_string(),
                     rejected_route_id: e.route_id.clone(),
+                    winner_route_id: win.to_string(),
                 });
             }
             Some(_) => {}

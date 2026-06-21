@@ -122,6 +122,14 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  # Emit `Warning` Events on Ingress objects when a route conflict or invalid
+  # annotation is detected (#390, #401). The kube `Recorder` writes to
+  # `events.k8s.io/v1`; `patch` is needed so the Recorder can update existing
+  # Events (its built-in dedup re-uses the same Event object). Proxy SA has no
+  # Events verb — diagnostics are controller-only.
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

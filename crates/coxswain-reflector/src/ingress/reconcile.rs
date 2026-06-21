@@ -1,8 +1,8 @@
 //! Core Ingress reconciliation: maps rules to routing-table entries.
 
 use super::IngressReconciler;
-use super::annotations::IngressAnnotations;
 use super::annotations::security::{AuthAnnotation, parse_htpasswd};
+use super::annotations::{AnnotationIssue, IngressAnnotations};
 use super::backend::resolve_backend_port;
 use super::class::{ResolvedClassParams, claimed_ingress_class};
 use super::ports::IngressPorts;
@@ -63,6 +63,10 @@ impl IngressReconciler {
     /// `auth_secrets` is the label-scoped Secret store
     /// (`ingress.coxswain-labs.dev/auth-basic=true`).  It is used to resolve
     /// the `auth-basic-secret` annotation into an htpasswd credential list.
+    /// Returns the annotation diagnostics collected during parsing so the caller
+    /// can forward them as Kubernetes Warning Events on the Ingress object.
+    /// An empty vec means all annotations were valid (or no annotations were set).
+    #[must_use = "caller should forward annotation issues as Kubernetes Events"]
     pub fn reconcile(
         ingress: &Ingress,
         slices: &reflector::Store<EndpointSlice>,
@@ -71,7 +75,7 @@ impl IngressReconciler {
         ports: IngressPorts,
         builder: &mut IngressRoutingTableBuilder,
         auth_secrets: &reflector::Store<Secret>,
-    ) {
+    ) -> Vec<AnnotationIssue> {
         let claimed_class = claimed_ingress_class(ingress);
 
         // The class this Ingress is served under: its explicit class, or the
@@ -82,12 +86,12 @@ impl IngressReconciler {
                 Some(default) => default,
                 None => {
                     tracing::debug!(name = ?ingress.metadata.name, "Skipping Ingress — no ingressClassName or annotation");
-                    return;
+                    return vec![];
                 }
             },
             Some(class) if !classes.owned.contains(class) => {
                 tracing::debug!(name = ?ingress.metadata.name, %class, "Skipping Ingress — class not owned by this controller");
-                return;
+                return vec![];
             }
             Some(class) => class,
         };
@@ -101,7 +105,7 @@ impl IngressReconciler {
                 name = ?ingress.metadata.name,
                 "No HTTP or HTTPS listener port configured — skipping Ingress routes"
             );
-            return;
+            return vec![];
         }
 
         let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
@@ -136,7 +140,7 @@ impl IngressReconciler {
 
         // Parse ingress.coxswain-labs.dev/* annotations once per Ingress.
         // Invalid values WARN + use default; the Ingress is never dropped.
-        let ann = IngressAnnotations::parse(
+        let (ann, annotation_issues) = IngressAnnotations::parse(
             merged_annotations
                 .as_ref()
                 .or(ingress.metadata.annotations.as_ref()),
@@ -537,6 +541,7 @@ impl IngressReconciler {
                 );
             }
         }
+        annotation_issues
     }
 }
 

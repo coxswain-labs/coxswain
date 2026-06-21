@@ -18,7 +18,6 @@
 use async_trait::async_trait;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
-use coxswain_reflector::StatusSubscriptions;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::gw_types::{BackendTlsPolicy, HttpRoute};
@@ -26,6 +25,7 @@ use coxswain_reflector::tls::{
     GatewayListenerHealth, SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth,
     SharedHttpRouteHealth,
 };
+use coxswain_reflector::{IngressEvent, StatusSubscriptions};
 use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedSender};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
@@ -53,6 +53,7 @@ mod gateway_class_events;
 mod gateway_class_status;
 mod gateway_events;
 mod gateway_status;
+mod ingress_event_recorder;
 mod ingress_events;
 mod ingress_status;
 mod route_events;
@@ -112,6 +113,10 @@ pub struct Controller {
     /// in `start` (the handles are independent broadcast subscribers and must
     /// not be left undrained, which would back-pressure the stores).
     subscriptions: std::sync::Mutex<Option<StatusSubscriptions>>,
+    /// Ingress diagnostic event channel. Taken once in `start` and driven by
+    /// [`ingress_event_recorder::run`]. `None` in test / dev configurations
+    /// that do not wire up an `ingress_event_tx` on the reconciler.
+    ingress_event_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<IngressEvent>>>,
 }
 
 impl Controller {
@@ -123,6 +128,7 @@ impl Controller {
         channels: StatusHealthChannels,
         subscriptions: StatusSubscriptions,
         config: ControllerConfig,
+        ingress_event_rx: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
     ) -> Self {
         Self {
             health,
@@ -131,6 +137,7 @@ impl Controller {
             channels,
             config,
             subscriptions: std::sync::Mutex::new(Some(subscriptions)),
+            ingress_event_rx: std::sync::Mutex::new(ingress_event_rx),
         }
     }
 
@@ -222,6 +229,26 @@ impl Controller {
         ];
 
         let mut tasks = JoinSet::new();
+
+        // Ingress diagnostic event recorder: receives route-conflict and
+        // annotation-parse-failure events from the reconciler and emits
+        // Kubernetes Warning Events on the affected Ingress objects.
+        if let Some(rx) = self
+            .ingress_event_rx
+            .lock()
+            .unwrap_or_else(|e| panic!("invariant: ingress_event_rx mutex poisoned: {e}"))
+            .take()
+        {
+            let reporter = kube::runtime::events::Reporter {
+                controller: self.config.controller_name.clone(),
+                instance: Some(self.config.pod_name.clone()),
+            };
+            tasks.spawn(ingress_event_recorder::run(
+                ctx.client.clone(),
+                reporter,
+                rx,
+            ));
+        }
 
         // Health → work-queue forwarders. Each bridges a `watch::Receiver<u64>`
         // (Send, !Sync) onto the `mpsc::Unbounded` stream `reconcile_all_on`
