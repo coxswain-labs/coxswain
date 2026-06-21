@@ -32,12 +32,12 @@ message Subscribe {
   // Wire protocol version string spoken by this client (e.g. "v1").
   string wire_version = 2;
   // Requested scope; currently unused (controller sends everything).
-  ScopeDto scope = 3;
+  Scope scope = 3;
 }
 
 // Scope filter for future per-port / per-namespace narrowing.
 // Empty in v0.5; reserved for v0.6 delta streaming.
-message ScopeDto {}
+message Scope {}
 
 // Positive acknowledgement: client has applied the snapshot at `version`.
 message Ack {
@@ -75,11 +75,11 @@ message Snapshot {
   string version = 1;  // content hash of this scope's DTO (sha256 hex)
   bytes  nonce   = 2;
 
-  RoutingTableDto            ingress_routing  = 3;
-  RoutingTableDto            gateway_routing  = 4;
-  TlsStoreDto                tls_store        = 5;
-  ClientCertStoreDto         client_cert_store = 6;
-  GatewayListenerHealthDto   listener_health  = 7;
+  RoutingTable            ingress_routing  = 3;
+  RoutingTable            gateway_routing  = 4;
+  TlsStore                tls_store        = 5;
+  ClientCertStore         client_cert_store = 6;
+  GatewayListenerHealth   listener_health  = 7;
 
   // reserved 8: repeated string removed_resources — for v0.6 delta streaming.
   reserved 8;
@@ -90,7 +90,7 @@ message Snapshot {
 // 2a  Routing table DTO
 // ────────────────────────────────────────────────────────────────────────────
 
-message RoutingTableDto {
+message RoutingTable {
   // Sorted by port ascending.
   repeated PortEntry ports = 1;
 }
@@ -105,16 +105,16 @@ message PortEntry {
 message HostEntry {
   oneof pattern {
     string         exact    = 1;  // exact hostname
-    WildcardHostDto wildcard = 2;  // *.suffix entry
+    WildcardHost wildcard = 2;  // *.suffix entry
     bool           catchall  = 3;  // true = catch-all bucket
   }
   NormalizeLevel     normalize_level = 4;
   // Routes in insertion order (preserves wire_entries() traversal order).
-  repeated RouteEntryDto routes = 5;
+  repeated RouteEntry routes = 5;
 }
 
 // Wildcard host bucket discriminated by suffix and matching semantics.
-message WildcardHostDto {
+message WildcardHost {
   string       suffix = 1;  // e.g. "example.com" (no "*." prefix)
   WildcardKind kind   = 2;
 }
@@ -144,14 +144,14 @@ enum RouteKind {
 
 // Serialised form of a RouteEntry + the path/kind that registers it.
 // `from_wire` replays the appropriate `add_*_route` builder call.
-message RouteEntryDto {
+message RouteEntry {
   RouteKind      kind  = 1;  // which add_*_route method to replay
   string         path  = 2;  // path string, normalised prefix, or regex pattern
 
-  BackendGroupDto backend_group = 3;
-  MatchPredicatesDto predicates = 4;
-  repeated FilterActionDto filters = 5;
-  RouteTimeoutsDto timeouts = 6;
+  BackendGroup backend_group = 3;
+  MatchPredicates predicates = 4;
+  repeated FilterAction filters = 5;
+  RouteTimeouts timeouts = 6;
 
   string route_id        = 7;   // "{namespace}/{name}"
   string metric_route_id = 8;   // prometheus route label
@@ -162,11 +162,11 @@ message RouteEntryDto {
   repeated string deny_source_range  = 13;      // CIDR strings, sorted
   bool cache_enabled = 14;
   optional bool access_log_enabled = 15;
-  RateLimitConfigDto rate_limit = 16;
-  IngressAuthConfigDto auth = 17;
-  CompressionConfigDto compression = 18;
-  ForwardedForConfigDto forwarded_for = 19;
-  CircuitBreakerConfigDto circuit_breaker = 20;
+  RateLimitConfig rate_limit = 16;
+  IngressAuthConfig auth = 17;
+  CompressionConfig compression = 18;
+  ForwardedForConfig forwarded_for = 19;
+  CircuitBreakerConfig circuit_breaker = 20;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -175,30 +175,30 @@ message RouteEntryDto {
 
 // Mirrors BackendGroup + BackendGroupSpec.
 // `from_wire` calls BackendGroup::weighted() with the spec then applies setters.
-message BackendGroupDto {
+message BackendGroup {
   string                          name             = 1;
-  repeated WeightedBackendDto     weighted         = 2;  // BackendGroupSpec; construction order
+  repeated WeightedBackend     weighted         = 2;  // BackendGroupSpec; construction order
   BackendProtocol                 protocol         = 3;
-  UpstreamTlsDto                  tls              = 4;
-  RetryPolicyDto                  retry            = 5;
+  UpstreamTls                  tls              = 4;
+  RetryPolicy                  retry            = 5;
   optional uint64                 keepalive_millis = 6;  // absent = Pingora default
   repeated PerBackendFiltersEntry per_backend_filters = 7;  // index-aligned with `weighted`; sorted by index
-  LoadBalanceDto                  load_balance     = 8;
-  SessionAffinityDto              session_affinity = 9;
+  LoadBalance                  load_balance     = 8;
+  SessionAffinity              session_affinity = 9;
 }
 
 // One weighted backend: its pod addresses and its weight before GCD reduction.
-message WeightedBackendDto {
+message WeightedBackend {
   repeated string addrs  = 1;  // "ip:port" strings, sorted
   uint32          weight = 2;  // original pre-GCD weight
 }
 
-// Per-backend filter list slot.  Index identifies which WeightedBackendDto
+// Per-backend filter list slot.  Index identifies which WeightedBackend
 // it belongs to so the flat index alignment can be reconstructed.
 // Only entries with non-empty `filters` are emitted (sparse).
 message PerBackendFiltersEntry {
   uint32                   backend_index = 1;
-  repeated FilterActionDto filters       = 2;
+  repeated FilterAction filters       = 2;
 }
 
 // Mirrors BackendProtocol.
@@ -212,7 +212,7 @@ enum BackendProtocol {
 }
 
 // Mirrors UpstreamTls.
-message UpstreamTlsDto {
+message UpstreamTls {
   string sni = 1;
   oneof ca {
     bool   system = 2;  // true = use OS trust store
@@ -222,7 +222,7 @@ message UpstreamTlsDto {
 }
 
 // Mirrors RetryPolicy.
-message RetryPolicyDto {
+message RetryPolicy {
   uint32 max_retries        = 1;
   bool   on_connect_failure = 2;
   bool   on_timeout         = 3;
@@ -230,17 +230,17 @@ message RetryPolicyDto {
 }
 
 // Mirrors LoadBalance + HashSource.
-message LoadBalanceDto {
+message LoadBalance {
   oneof algorithm {
     bool          round_robin  = 1;  // present = RoundRobin
     bool          least_conn   = 2;  // present = LeastConn
     bool          ewma         = 3;  // present = Ewma
-    HashSourceDto hash         = 4;  // Hash(source)
+    HashSource hash         = 4;  // Hash(source)
   }
 }
 
 // Mirrors HashSource.
-message HashSourceDto {
+message HashSource {
   oneof source {
     bool   uri       = 1;  // Uri
     bool   source_ip = 2;  // SourceIp
@@ -250,7 +250,7 @@ message HashSourceDto {
 }
 
 // Mirrors SessionAffinity.
-message SessionAffinityDto {
+message SessionAffinity {
   oneof mode {
     string cookie_name = 1;  // Cookie { cookie_name }
     string header      = 2;  // Header { header }
@@ -262,59 +262,59 @@ message SessionAffinityDto {
 // ────────────────────────────────────────────────────────────────────────────
 
 // Mirrors FilterAction.
-message FilterActionDto {
+message FilterAction {
   oneof action {
-    HeaderModDto        request_header_modifier  = 1;
-    HeaderModDto        response_header_modifier = 2;
-    RequestRedirectDto  request_redirect         = 3;
-    UrlRewriteDto       url_rewrite              = 4;
-    BackendGroupDto     mirror                   = 5;  // Mirror { backend }
+    HeaderMod        request_header_modifier  = 1;
+    HeaderMod        response_header_modifier = 2;
+    RequestRedirect  request_redirect         = 3;
+    UrlRewrite       url_rewrite              = 4;
+    BackendGroup     mirror                   = 5;  // Mirror { backend }
   }
 }
 
 // Mirrors HeaderMod — raw strings; from_wire calls HeaderMod::parse.
-message HeaderModDto {
-  repeated HeaderPairDto add    = 1;
-  repeated HeaderPairDto set    = 2;
+message HeaderMod {
+  repeated HeaderPair add    = 1;
+  repeated HeaderPair set    = 2;
   repeated string        remove = 3;
 }
 
-message HeaderPairDto {
+message HeaderPair {
   string name  = 1;
   string value = 2;
 }
 
 // Mirrors FilterAction::RequestRedirect.
-message RequestRedirectDto {
+message RequestRedirect {
   optional string       scheme      = 1;
   optional string       hostname    = 2;
   optional uint32       port        = 3;  // u16
   uint32                status_code = 4;  // default 302
-  PathModifierDto       path        = 5;
+  PathModifier       path        = 5;
 }
 
 // Mirrors FilterAction::UrlRewrite.
-message UrlRewriteDto {
+message UrlRewrite {
   optional string  hostname = 1;
-  PathModifierDto  path     = 2;
+  PathModifier  path     = 2;
 }
 
 // Mirrors PathModifier.
-message PathModifierDto {
+message PathModifier {
   oneof modifier {
     string               replace_full_path   = 1;
-    ReplacePrefixDto     replace_prefix      = 2;
-    RegexReplaceDto      regex_replace       = 3;
+    ReplacePrefix     replace_prefix      = 2;
+    RegexReplace      regex_replace       = 3;
   }
 }
 
-message ReplacePrefixDto {
+message ReplacePrefix {
   string prefix      = 1;
   string replacement = 2;
 }
 
 // Regex pattern stored as a string; from_wire recompiles with Regex::new.
-message RegexReplaceDto {
+message RegexReplace {
   string pattern     = 1;  // Regex::as_str() — the source string, not flags
   string replacement = 2;
 }
@@ -324,26 +324,26 @@ message RegexReplaceDto {
 // ────────────────────────────────────────────────────────────────────────────
 
 // Mirrors MatchPredicates.
-message MatchPredicatesDto {
+message MatchPredicates {
   optional string             method  = 1;   // HTTP method string
-  repeated HeaderPredicateDto headers = 2;
-  repeated QueryPredicateDto  query   = 3;
+  repeated HeaderPredicate headers = 2;
+  repeated QueryPredicate  query   = 3;
 }
 
 // Mirrors HeaderPredicate.
-message HeaderPredicateDto {
+message HeaderPredicate {
   string        name    = 1;
-  ValueMatchDto matcher = 2;
+  ValueMatch matcher = 2;
 }
 
 // Mirrors QueryPredicate.
-message QueryPredicateDto {
+message QueryPredicate {
   string        name    = 1;
-  ValueMatchDto matcher = 2;
+  ValueMatch matcher = 2;
 }
 
 // Mirrors ValueMatch (Exact and Regex only; Prefix/Present are not supported).
-message ValueMatchDto {
+message ValueMatch {
   oneof match {
     string exact  = 1;  // Exact(value)
     string regex  = 3;  // Regex(pattern string); from_wire recompiles
@@ -357,17 +357,17 @@ message ValueMatchDto {
 // ────────────────────────────────────────────────────────────────────────────
 
 // Mirrors RouteTimeouts.  All fields optional; absent = disabled.
-message RouteTimeoutsDto {
-  DurationDto request         = 1;
-  DurationDto backend_request = 2;
-  DurationDto connect         = 3;
-  DurationDto read            = 4;
-  DurationDto send            = 5;
+message RouteTimeouts {
+  Duration request         = 1;
+  Duration backend_request = 2;
+  Duration connect         = 3;
+  Duration read            = 4;
+  Duration send            = 5;
 }
 
 // A Duration encoded as (secs, nanos) — avoids float and the protobuf well-known
 // Duration type (which requires google/protobuf/duration.proto).
-message DurationDto {
+message Duration {
   uint64 secs  = 1;
   uint32 nanos = 2;
 }
@@ -377,14 +377,14 @@ message DurationDto {
 // ────────────────────────────────────────────────────────────────────────────
 
 // Mirrors RateLimitConfig.
-message RateLimitConfigDto {
+message RateLimitConfig {
   uint32         requests_per_second = 1;  // NonZeroU32; 0 absent → field not set
   uint32         burst               = 2;
-  RateLimitKeyDto key                = 3;
+  RateLimitKey key                = 3;
 }
 
 // Mirrors RateLimitKey.
-message RateLimitKeyDto {
+message RateLimitKey {
   oneof key {
     bool   client_ip = 1;  // true = ClientIp
     string header    = 2;  // Header(name)
@@ -392,35 +392,35 @@ message RateLimitKeyDto {
 }
 
 // Mirrors IngressAuthConfig.
-message IngressAuthConfigDto {
+message IngressAuthConfig {
   oneof auth {
-    ExtAuthConfigDto  external    = 1;
-    BasicCredListDto  basic       = 2;  // wrapped in a message to allow repeated inside oneof
+    ExtAuthConfig  external    = 1;
+    BasicCredList  basic       = 2;  // wrapped in a message to allow repeated inside oneof
     bool              unavailable = 3;
   }
 }
 
 // Wrapper for the repeated basic credentials list (proto oneof cannot hold repeated directly).
-message BasicCredListDto {
-  repeated BasicCredDto credentials = 1;
+message BasicCredList {
+  repeated BasicCred credentials = 1;
 }
 
 // Mirrors ExtAuthConfig.
 // ExtAuthTransport has one variant (Http) so the HttpExtAuthConfig is embedded directly.
-message ExtAuthConfigDto {
-  DurationDto          timeout   = 1;
-  HttpExtAuthConfigDto http      = 2;  // always Http for now; field number reserved for future variants
+message ExtAuthConfig {
+  Duration          timeout   = 1;
+  HttpExtAuthConfig http      = 2;  // always Http for now; field number reserved for future variants
 }
 
 // Mirrors HttpExtAuthConfig.
-message HttpExtAuthConfigDto {
+message HttpExtAuthConfig {
   string          url              = 1;
   repeated string response_headers = 2;
   bool            always_set_cookie = 3;
 }
 
 // BasicCredential with the password hash.
-message BasicCredDto {
+message BasicCred {
   string        username  = 1;
   PasswordHash  hash_kind = 2;
   string        hash      = 3;   // bcrypt hash string or SHA1 base64 digest
@@ -433,7 +433,7 @@ enum PasswordHash {
 }
 
 // Mirrors CompressionConfig.
-message CompressionConfigDto {
+message CompressionConfig {
   bool            gzip     = 1;
   bool            brotli   = 2;
   uint32          level    = 3;
@@ -442,18 +442,18 @@ message CompressionConfigDto {
 }
 
 // Mirrors ForwardedForConfig.
-message ForwardedForConfigDto {
+message ForwardedForConfig {
   string          header        = 1;
   repeated string trusted_cidrs = 2;  // CIDR strings, sorted
 }
 
 // Mirrors CircuitBreakerConfig.
-message CircuitBreakerConfigDto {
+message CircuitBreakerConfig {
   uint32      threshold_pct      = 1;  // 1–100
   uint32      min_requests       = 2;
-  DurationDto window             = 3;
-  DurationDto open_duration      = 4;
-  DurationDto max_open_duration  = 5;  // absent = constant backoff (None)
+  Duration window             = 3;
+  Duration open_duration      = 4;
+  Duration max_open_duration  = 5;  // absent = constant backoff (None)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -461,18 +461,18 @@ message CircuitBreakerConfigDto {
 // ────────────────────────────────────────────────────────────────────────────
 
 // Mirrors TlsStore.  Sorted by host pattern ascending.
-message TlsStoreDto {
+message TlsStore {
   repeated TlsCertEntry exact    = 1;
   repeated TlsCertEntry wildcard = 2;  // suffix without "*." prefix; sorted
-  TlsCertDto            default  = 3;  // absent = no default cert
+  TlsCert            default  = 3;  // absent = no default cert
 }
 
 message TlsCertEntry {
   string     host_pattern = 1;  // exact hostname or bare suffix
-  TlsCertDto cert         = 2;
+  TlsCert cert         = 2;
 }
 
-message TlsCertDto {
+message TlsCert {
   bytes  cert_pem  = 1;
   bytes  key_pem   = 2;
   string source    = 3;
@@ -484,25 +484,25 @@ message TlsCertDto {
 // ────────────────────────────────────────────────────────────────────────────
 
 // Mirrors ClientCertStore.  Sorted by host pattern ascending.
-message ClientCertStoreDto {
+message ClientCertStore {
   repeated ClientCertEntry exact    = 1;
   repeated ClientCertEntry wildcard = 2;
-  ClientCertConfigStateDto default  = 3;
+  ClientCertConfigState default  = 3;
 }
 
 message ClientCertEntry {
   string                   host_pattern = 1;
-  ClientCertConfigStateDto state        = 2;
+  ClientCertConfigState state        = 2;
 }
 
-message ClientCertConfigStateDto {
+message ClientCertConfigState {
   oneof state {
-    ClientCertConfigDto config      = 1;  // Config(cfg)
+    ClientCertConfig config      = 1;  // Config(cfg)
     bool                unavailable = 2;  // Unavailable
   }
 }
 
-message ClientCertConfigDto {
+message ClientCertConfig {
   bytes  ca_pem           = 1;
   uint32 verify_depth     = 2;
   bool   pass_to_upstream = 3;
@@ -514,28 +514,28 @@ message ClientCertConfigDto {
 
 // Mirrors the HashMap<ObjectKey, GatewayListenerHealth>.
 // Sorted by object key ascending for determinism.
-message GatewayListenerHealthDto {
+message GatewayListenerHealth {
   repeated GatewayHealthEntry entries = 1;
 }
 
 message GatewayHealthEntry {
   string              object_key = 1;  // "{namespace}/{name}"
-  ListenerHealthDto   health     = 2;
+  ListenerHealth   health     = 2;
 }
 
 // Mirrors GatewayListenerHealth.
 // BTreeMap<String, ListenerInfo> → already sorted by listener name.
-message ListenerHealthDto {
+message ListenerHealth {
   repeated ListenerInfoEntry listeners = 1;
 }
 
 message ListenerInfoEntry {
   string          name = 1;
-  ListenerInfoDto info = 2;
+  ListenerInfo info = 2;
 }
 
 // Mirrors ListenerInfo.
-message ListenerInfoDto {
+message ListenerInfo {
   ListenerTlsOutcome tls_outcome           = 1;
   // Human-readable message from ListenerTlsOutcome failure variants.
   // Empty for NotApplicable and Resolved.

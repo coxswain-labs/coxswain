@@ -3,7 +3,7 @@
 //! # Overview
 //!
 //! The controller calls `to_wire` to serialise a compiled [`RoutingTable`] into
-//! a [`RoutingTableDto`] and then embeds that DTO in a [`Snapshot`].  The proxy
+//! a proto message and then embeds it in a [`Snapshot`].  The proxy
 //! calls `from_wire` on arrival and replays the builder API — exactly the same
 //! public constructors the reflector uses — to produce a freshly-compiled table
 //! without ever touching the Kubernetes API.
@@ -35,7 +35,6 @@
 //! recursion through Mirror backends to [`MAX_MIRROR_DEPTH`].
 //!
 //! [`RoutingTable`]: coxswain_core::routing::RoutingTable
-//! [`RoutingTableDto`]: crate::proto::v1::RoutingTableDto
 //! [`Snapshot`]: crate::proto::v1::Snapshot
 
 use std::net::SocketAddr;
@@ -79,23 +78,21 @@ pub const MAX_MIRROR_DEPTH: usize = 4;
 
 /// Serialise an [`IngressRoutingTable`] to its wire DTO.
 #[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn ingress_to_wire(t: &IngressRoutingTable) -> p::RoutingTableDto {
+pub fn ingress_to_wire(t: &IngressRoutingTable) -> p::RoutingTable {
     routing_table_to_wire(t)
 }
 
 /// Serialise a [`GatewayRoutingTable`] to its wire DTO.
 #[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn gateway_to_wire(t: &GatewayRoutingTable) -> p::RoutingTableDto {
+pub fn gateway_to_wire(t: &GatewayRoutingTable) -> p::RoutingTable {
     routing_table_to_wire(t)
 }
 
-fn routing_table_to_wire<Kind>(
-    t: &coxswain_core::routing::RoutingTable<Kind>,
-) -> p::RoutingTableDto {
+fn routing_table_to_wire<Kind>(t: &coxswain_core::routing::RoutingTable<Kind>) -> p::RoutingTable {
     let mut ports: Vec<(u16, &PortRoutingTable)> = t.ports().collect();
     ports.sort_by_key(|(p, _)| *p);
 
-    p::RoutingTableDto {
+    p::RoutingTable {
         ports: ports
             .into_iter()
             .map(|(port, pt)| port_entry_to_wire(port, pt))
@@ -129,7 +126,7 @@ fn port_entry_to_wire(port: u16, pt: &PortRoutingTable) -> p::PortEntry {
     }
     for (suffix, kind, router) in wildcard_entries {
         hosts.push(host_entry_to_wire(
-            p::host_entry::Pattern::Wildcard(p::WildcardHostDto {
+            p::host_entry::Pattern::Wildcard(p::WildcardHost {
                 suffix: suffix.to_string(),
                 kind: wildcard_kind_to_wire(kind) as i32,
             }),
@@ -150,7 +147,7 @@ fn port_entry_to_wire(port: u16, pt: &PortRoutingTable) -> p::PortEntry {
 }
 
 fn host_entry_to_wire(pattern: p::host_entry::Pattern, router: &HostRouter) -> p::HostEntry {
-    let routes: Vec<p::RouteEntryDto> = router
+    let routes: Vec<p::RouteEntry> = router
         .wire_entries()
         .map(|(path, kind, entry)| route_entry_to_wire(path, kind, entry))
         .collect();
@@ -162,7 +159,7 @@ fn host_entry_to_wire(pattern: p::host_entry::Pattern, router: &HostRouter) -> p
     }
 }
 
-fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteEntryDto {
+fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteEntry {
     let mut allow_source_range: Vec<String> = e
         .allow_source_range
         .as_deref()
@@ -177,7 +174,7 @@ fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteE
         .unwrap_or_default();
     deny_source_range.sort_unstable();
 
-    p::RouteEntryDto {
+    p::RouteEntry {
         kind: route_kind_to_wire(kind) as i32,
         path: path.to_string(),
         backend_group: Some(backend_group_to_wire(&e.backend_group, 0)),
@@ -209,15 +206,15 @@ fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteE
 // BackendGroup
 // ────────────────────────────────────────────────────────────────────────────
 
-fn backend_group_to_wire(bg: &BackendGroup, depth: usize) -> p::BackendGroupDto {
+fn backend_group_to_wire(bg: &BackendGroup, depth: usize) -> p::BackendGroup {
     let spec = bg.spec();
-    let weighted: Vec<p::WeightedBackendDto> = spec
+    let weighted: Vec<p::WeightedBackend> = spec
         .weighted
         .iter()
         .map(|(addrs, weight)| {
             let mut addr_strs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
             addr_strs.sort_unstable();
-            p::WeightedBackendDto {
+            p::WeightedBackend {
                 addrs: addr_strs,
                 weight: u32::from(*weight),
             }
@@ -240,7 +237,7 @@ fn backend_group_to_wire(bg: &BackendGroup, depth: usize) -> p::BackendGroupDto 
 
     let keepalive_millis = bg.keepalive_timeout().map(|d| d.as_millis() as u64);
 
-    p::BackendGroupDto {
+    p::BackendGroup {
         name: bg.name().to_string(),
         weighted,
         protocol: protocol_to_wire(bg.protocol()) as i32,
@@ -253,24 +250,24 @@ fn backend_group_to_wire(bg: &BackendGroup, depth: usize) -> p::BackendGroupDto 
     }
 }
 
-fn upstream_tls_to_wire(tls: &UpstreamTls) -> p::UpstreamTlsDto {
+fn upstream_tls_to_wire(tls: &UpstreamTls) -> p::UpstreamTls {
     let ca = match &tls.ca {
-        UpstreamCa::System => p::upstream_tls_dto::Ca::System(true),
-        UpstreamCa::Bundle(pem) => p::upstream_tls_dto::Ca::Bundle(pem.to_vec()),
+        UpstreamCa::System => p::upstream_tls::Ca::System(true),
+        UpstreamCa::Bundle(pem) => p::upstream_tls::Ca::Bundle(pem.to_vec()),
         _ => unreachable!(
             "invariant: all UpstreamCa variants handled; update wire.rs when adding new variants"
         ),
     };
-    p::UpstreamTlsDto {
+    p::UpstreamTls {
         sni: tls.sni.to_string(),
         ca: Some(ca),
         group_key: tls.group_key,
     }
 }
 
-fn retry_to_wire(retry: &coxswain_core::routing::RetryPolicy) -> p::RetryPolicyDto {
+fn retry_to_wire(retry: &coxswain_core::routing::RetryPolicy) -> p::RetryPolicy {
     use coxswain_core::routing::RetryOn;
-    p::RetryPolicyDto {
+    p::RetryPolicy {
         max_retries: retry.max_retries,
         on_connect_failure: retry.on.contains(RetryOn::CONNECT_FAILURE),
         on_timeout: retry.on.contains(RetryOn::TIMEOUT),
@@ -278,62 +275,62 @@ fn retry_to_wire(retry: &coxswain_core::routing::RetryPolicy) -> p::RetryPolicyD
     }
 }
 
-fn load_balance_to_wire(lb: &LoadBalance) -> p::LoadBalanceDto {
+fn load_balance_to_wire(lb: &LoadBalance) -> p::LoadBalance {
     let algorithm = match lb {
-        LoadBalance::RoundRobin => p::load_balance_dto::Algorithm::RoundRobin(true),
-        LoadBalance::LeastConn => p::load_balance_dto::Algorithm::LeastConn(true),
-        LoadBalance::Ewma => p::load_balance_dto::Algorithm::Ewma(true),
-        LoadBalance::Hash(src) => p::load_balance_dto::Algorithm::Hash(hash_source_to_wire(src)),
+        LoadBalance::RoundRobin => p::load_balance::Algorithm::RoundRobin(true),
+        LoadBalance::LeastConn => p::load_balance::Algorithm::LeastConn(true),
+        LoadBalance::Ewma => p::load_balance::Algorithm::Ewma(true),
+        LoadBalance::Hash(src) => p::load_balance::Algorithm::Hash(hash_source_to_wire(src)),
         _ => unreachable!(
             "invariant: all LoadBalance variants handled; update wire.rs when adding new variants"
         ),
     };
-    p::LoadBalanceDto {
+    p::LoadBalance {
         algorithm: Some(algorithm),
     }
 }
 
-fn hash_source_to_wire(src: &HashSource) -> p::HashSourceDto {
+fn hash_source_to_wire(src: &HashSource) -> p::HashSource {
     let source = match src {
-        HashSource::Uri => p::hash_source_dto::Source::Uri(true),
-        HashSource::SourceIp => p::hash_source_dto::Source::SourceIp(true),
-        HashSource::Header(name) => p::hash_source_dto::Source::Header(name.as_str().to_string()),
-        HashSource::Cookie(name) => p::hash_source_dto::Source::Cookie(name.to_string()),
+        HashSource::Uri => p::hash_source::Source::Uri(true),
+        HashSource::SourceIp => p::hash_source::Source::SourceIp(true),
+        HashSource::Header(name) => p::hash_source::Source::Header(name.as_str().to_string()),
+        HashSource::Cookie(name) => p::hash_source::Source::Cookie(name.to_string()),
         _ => unreachable!(
             "invariant: all HashSource variants handled; update wire.rs when adding new variants"
         ),
     };
-    p::HashSourceDto {
+    p::HashSource {
         source: Some(source),
     }
 }
 
-fn session_affinity_to_wire(sa: &SessionAffinity) -> p::SessionAffinityDto {
+fn session_affinity_to_wire(sa: &SessionAffinity) -> p::SessionAffinity {
     let mode = match sa {
         SessionAffinity::Cookie { cookie_name } => {
-            p::session_affinity_dto::Mode::CookieName(cookie_name.to_string())
+            p::session_affinity::Mode::CookieName(cookie_name.to_string())
         }
         SessionAffinity::Header { header } => {
-            p::session_affinity_dto::Mode::Header(header.as_str().to_string())
+            p::session_affinity::Mode::Header(header.as_str().to_string())
         }
         _ => unreachable!(
             "invariant: all SessionAffinity variants handled; update wire.rs when adding new variants"
         ),
     };
-    p::SessionAffinityDto { mode: Some(mode) }
+    p::SessionAffinity { mode: Some(mode) }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Filters
 // ────────────────────────────────────────────────────────────────────────────
 
-fn filter_to_wire(f: &FilterAction, depth: usize) -> p::FilterActionDto {
+fn filter_to_wire(f: &FilterAction, depth: usize) -> p::FilterAction {
     let action = match f {
         FilterAction::RequestHeaderModifier(hm) => {
-            p::filter_action_dto::Action::RequestHeaderModifier(header_mod_to_wire(hm))
+            p::filter_action::Action::RequestHeaderModifier(header_mod_to_wire(hm))
         }
         FilterAction::ResponseHeaderModifier(hm) => {
-            p::filter_action_dto::Action::ResponseHeaderModifier(header_mod_to_wire(hm))
+            p::filter_action::Action::ResponseHeaderModifier(header_mod_to_wire(hm))
         }
         FilterAction::RequestRedirect {
             scheme,
@@ -341,7 +338,7 @@ fn filter_to_wire(f: &FilterAction, depth: usize) -> p::FilterActionDto {
             port,
             status_code,
             path,
-        } => p::filter_action_dto::Action::RequestRedirect(p::RequestRedirectDto {
+        } => p::filter_action::Action::RequestRedirect(p::RequestRedirect {
             scheme: scheme.clone(),
             hostname: hostname.clone(),
             port: port.map(u32::from),
@@ -349,7 +346,7 @@ fn filter_to_wire(f: &FilterAction, depth: usize) -> p::FilterActionDto {
             path: path.as_ref().map(path_modifier_to_wire),
         }),
         FilterAction::UrlRewrite { hostname, path } => {
-            p::filter_action_dto::Action::UrlRewrite(p::UrlRewriteDto {
+            p::filter_action::Action::UrlRewrite(p::UrlRewrite {
                 hostname: hostname.clone(),
                 path: path.as_ref().map(path_modifier_to_wire),
             })
@@ -358,7 +355,7 @@ fn filter_to_wire(f: &FilterAction, depth: usize) -> p::FilterActionDto {
             // Saturate depth rather than panic — depth > MAX_MIRROR_DEPTH is
             // only reachable if the runtime type was built with malformed data
             // (defensive guard; from_wire is the primary enforcement site).
-            p::filter_action_dto::Action::Mirror(backend_group_to_wire(
+            p::filter_action::Action::Mirror(backend_group_to_wire(
                 backend,
                 depth.saturating_add(1),
             ))
@@ -367,17 +364,17 @@ fn filter_to_wire(f: &FilterAction, depth: usize) -> p::FilterActionDto {
             "invariant: all FilterAction variants handled; update wire.rs when adding new variants"
         ),
     };
-    p::FilterActionDto {
+    p::FilterAction {
         action: Some(action),
     }
 }
 
-fn header_mod_to_wire(hm: &HeaderMod) -> p::HeaderModDto {
-    p::HeaderModDto {
+fn header_mod_to_wire(hm: &HeaderMod) -> p::HeaderMod {
+    p::HeaderMod {
         add: hm
             .add
             .iter()
-            .map(|(n, v)| p::HeaderPairDto {
+            .map(|(n, v)| p::HeaderPair {
                 name: n.as_str().to_string(),
                 value: v.to_str().unwrap_or("").to_string(),
             })
@@ -385,7 +382,7 @@ fn header_mod_to_wire(hm: &HeaderMod) -> p::HeaderModDto {
         set: hm
             .set
             .iter()
-            .map(|(n, v)| p::HeaderPairDto {
+            .map(|(n, v)| p::HeaderPair {
                 name: n.as_str().to_string(),
                 value: v.to_str().unwrap_or("").to_string(),
             })
@@ -394,20 +391,18 @@ fn header_mod_to_wire(hm: &HeaderMod) -> p::HeaderModDto {
     }
 }
 
-fn path_modifier_to_wire(pm: &PathModifier) -> p::PathModifierDto {
+fn path_modifier_to_wire(pm: &PathModifier) -> p::PathModifier {
     let modifier = match pm {
-        PathModifier::ReplaceFullPath(p) => {
-            p::path_modifier_dto::Modifier::ReplaceFullPath(p.clone())
-        }
+        PathModifier::ReplaceFullPath(p) => p::path_modifier::Modifier::ReplaceFullPath(p.clone()),
         PathModifier::ReplacePrefixMatch {
             prefix,
             replacement,
-        } => p::path_modifier_dto::Modifier::ReplacePrefix(p::ReplacePrefixDto {
+        } => p::path_modifier::Modifier::ReplacePrefix(p::ReplacePrefix {
             prefix: prefix.clone(),
             replacement: replacement.clone(),
         }),
         PathModifier::RegexReplace { regex, replacement } => {
-            p::path_modifier_dto::Modifier::RegexReplace(p::RegexReplaceDto {
+            p::path_modifier::Modifier::RegexReplace(p::RegexReplace {
                 pattern: regex.as_str().to_string(),
                 replacement: replacement.to_string(),
             })
@@ -416,7 +411,7 @@ fn path_modifier_to_wire(pm: &PathModifier) -> p::PathModifierDto {
             "invariant: all PathModifier variants handled; update wire.rs when adding new variants"
         ),
     };
-    p::PathModifierDto {
+    p::PathModifier {
         modifier: Some(modifier),
     }
 }
@@ -425,13 +420,13 @@ fn path_modifier_to_wire(pm: &PathModifier) -> p::PathModifierDto {
 // Predicates
 // ────────────────────────────────────────────────────────────────────────────
 
-fn predicates_to_wire(mp: &MatchPredicates) -> p::MatchPredicatesDto {
-    p::MatchPredicatesDto {
+fn predicates_to_wire(mp: &MatchPredicates) -> p::MatchPredicates {
+    p::MatchPredicates {
         method: mp.method.as_ref().map(|m| m.as_str().to_string()),
         headers: mp
             .headers
             .iter()
-            .map(|hp| p::HeaderPredicateDto {
+            .map(|hp| p::HeaderPredicate {
                 name: hp.name.as_str().to_string(),
                 matcher: Some(value_match_to_wire(&hp.matcher)),
             })
@@ -439,7 +434,7 @@ fn predicates_to_wire(mp: &MatchPredicates) -> p::MatchPredicatesDto {
         query: mp
             .query
             .iter()
-            .map(|qp| p::QueryPredicateDto {
+            .map(|qp| p::QueryPredicate {
                 name: qp.name.clone(),
                 matcher: Some(value_match_to_wire(&qp.matcher)),
             })
@@ -447,23 +442,23 @@ fn predicates_to_wire(mp: &MatchPredicates) -> p::MatchPredicatesDto {
     }
 }
 
-fn value_match_to_wire(vm: &ValueMatch) -> p::ValueMatchDto {
+fn value_match_to_wire(vm: &ValueMatch) -> p::ValueMatch {
     let m = match vm {
-        ValueMatch::Exact(s) => p::value_match_dto::Match::Exact(s.clone()),
-        ValueMatch::Regex(re) => p::value_match_dto::Match::Regex(re.as_str().to_string()),
+        ValueMatch::Exact(s) => p::value_match::Match::Exact(s.clone()),
+        ValueMatch::Regex(re) => p::value_match::Match::Regex(re.as_str().to_string()),
         _ => unreachable!(
             "invariant: all ValueMatch variants handled; update wire.rs when adding new variants"
         ),
     };
-    p::ValueMatchDto { r#match: Some(m) }
+    p::ValueMatch { r#match: Some(m) }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Timeouts and Duration
 // ────────────────────────────────────────────────────────────────────────────
 
-fn timeouts_to_wire(rt: &RouteTimeouts) -> p::RouteTimeoutsDto {
-    p::RouteTimeoutsDto {
+fn timeouts_to_wire(rt: &RouteTimeouts) -> p::RouteTimeouts {
+    p::RouteTimeouts {
         request: rt.request.map(duration_to_wire),
         backend_request: rt.backend_request.map(duration_to_wire),
         connect: rt.connect.map(duration_to_wire),
@@ -472,8 +467,8 @@ fn timeouts_to_wire(rt: &RouteTimeouts) -> p::RouteTimeoutsDto {
     }
 }
 
-fn duration_to_wire(d: Duration) -> p::DurationDto {
-    p::DurationDto {
+fn duration_to_wire(d: Duration) -> p::Duration {
+    p::Duration {
         secs: d.as_secs(),
         nanos: d.subsec_nanos(),
     }
@@ -483,32 +478,32 @@ fn duration_to_wire(d: Duration) -> p::DurationDto {
 // Per-route config
 // ────────────────────────────────────────────────────────────────────────────
 
-fn rate_limit_to_wire(rl: &RateLimitConfig) -> p::RateLimitConfigDto {
+fn rate_limit_to_wire(rl: &RateLimitConfig) -> p::RateLimitConfig {
     let key = match &rl.key {
-        RateLimitKey::ClientIp => p::RateLimitKeyDto {
-            key: Some(p::rate_limit_key_dto::Key::ClientIp(true)),
+        RateLimitKey::ClientIp => p::RateLimitKey {
+            key: Some(p::rate_limit_key::Key::ClientIp(true)),
         },
-        RateLimitKey::Header(name) => p::RateLimitKeyDto {
-            key: Some(p::rate_limit_key_dto::Key::Header(name.to_string())),
+        RateLimitKey::Header(name) => p::RateLimitKey {
+            key: Some(p::rate_limit_key::Key::Header(name.to_string())),
         },
         _ => unreachable!(
             "invariant: all RateLimitKey variants handled; update wire.rs when adding new variants"
         ),
     };
-    p::RateLimitConfigDto {
+    p::RateLimitConfig {
         requests_per_second: rl.requests_per_second.get(),
         burst: rl.burst,
         key: Some(key),
     }
 }
 
-fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfigDto {
+fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfig {
     let a = match auth {
         IngressAuthConfig::External(ext) => {
-            p::ingress_auth_config_dto::Auth::External(p::ExtAuthConfigDto {
+            p::ingress_auth_config::Auth::External(p::ExtAuthConfig {
                 timeout: Some(duration_to_wire(ext.timeout)),
                 http: Some(match &ext.transport {
-                    ExtAuthTransport::Http(h) => p::HttpExtAuthConfigDto {
+                    ExtAuthTransport::Http(h) => p::HttpExtAuthConfig {
                         url: h.url.to_string(),
                         response_headers: h
                             .response_headers
@@ -522,7 +517,7 @@ fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfigDto {
             })
         }
         IngressAuthConfig::Basic(creds) => {
-            p::ingress_auth_config_dto::Auth::Basic(p::BasicCredListDto {
+            p::ingress_auth_config::Auth::Basic(p::BasicCredList {
                 credentials: creds
                     .iter()
                     .map(|c| {
@@ -535,7 +530,7 @@ fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfigDto {
                             }
                             _ => unreachable!("invariant: all PasswordHash variants handled; update wire.rs when adding new variants"),
                         };
-                        p::BasicCredDto {
+                        p::BasicCred {
                             username: c.username.to_string(),
                             hash_kind,
                             hash,
@@ -545,17 +540,17 @@ fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfigDto {
             })
         }
         IngressAuthConfig::Unavailable => {
-            p::ingress_auth_config_dto::Auth::Unavailable(true)
+            p::ingress_auth_config::Auth::Unavailable(true)
         }
         _ => unreachable!("invariant: all IngressAuthConfig variants handled; update wire.rs when adding new variants"),
     };
-    p::IngressAuthConfigDto { auth: Some(a) }
+    p::IngressAuthConfig { auth: Some(a) }
 }
 
-fn compression_to_wire(c: &CompressionConfig) -> p::CompressionConfigDto {
+fn compression_to_wire(c: &CompressionConfig) -> p::CompressionConfig {
     let mut types: Vec<String> = c.types.iter().map(|t| t.to_string()).collect();
     types.sort_unstable();
-    p::CompressionConfigDto {
+    p::CompressionConfig {
         gzip: c.gzip,
         brotli: c.brotli,
         level: c.level,
@@ -564,17 +559,17 @@ fn compression_to_wire(c: &CompressionConfig) -> p::CompressionConfigDto {
     }
 }
 
-fn forwarded_for_to_wire(ff: &ForwardedForConfig) -> p::ForwardedForConfigDto {
+fn forwarded_for_to_wire(ff: &ForwardedForConfig) -> p::ForwardedForConfig {
     let mut trusted_cidrs: Vec<String> = ff.trusted_cidrs.iter().map(|n| n.to_string()).collect();
     trusted_cidrs.sort_unstable();
-    p::ForwardedForConfigDto {
+    p::ForwardedForConfig {
         header: ff.header.to_string(),
         trusted_cidrs,
     }
 }
 
-fn circuit_breaker_to_wire(cb: &CircuitBreakerConfig) -> p::CircuitBreakerConfigDto {
-    p::CircuitBreakerConfigDto {
+fn circuit_breaker_to_wire(cb: &CircuitBreakerConfig) -> p::CircuitBreakerConfig {
+    p::CircuitBreakerConfig {
         threshold_pct: u32::from(cb.threshold_pct),
         min_requests: cb.min_requests,
         window: Some(duration_to_wire(cb.window)),
@@ -639,7 +634,7 @@ fn protocol_to_wire(proto: BackendProtocol) -> p::BackendProtocol {
 
 /// Serialise a [`TlsStore`] to its wire DTO.
 #[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn tls_to_wire(store: &TlsStore) -> p::TlsStoreDto {
+pub fn tls_to_wire(store: &TlsStore) -> p::TlsStore {
     let mut exact_entries: Vec<(&str, Arc<TlsCert>)> = store
         .iter_exact()
         .map(|(h, c)| (h, Arc::clone(c)))
@@ -652,7 +647,7 @@ pub fn tls_to_wire(store: &TlsStore) -> p::TlsStoreDto {
         .collect();
     wildcard_entries.sort_by_key(|(s, _)| *s);
 
-    p::TlsStoreDto {
+    p::TlsStore {
         exact: exact_entries
             .into_iter()
             .map(|(h, c)| p::TlsCertEntry {
@@ -671,8 +666,8 @@ pub fn tls_to_wire(store: &TlsStore) -> p::TlsStoreDto {
     }
 }
 
-fn tls_cert_to_wire(c: &TlsCert) -> p::TlsCertDto {
-    p::TlsCertDto {
+fn tls_cert_to_wire(c: &TlsCert) -> p::TlsCert {
+    p::TlsCert {
         cert_pem: c.cert_pem.clone(),
         key_pem: c.key_pem.clone(),
         source: c.source.clone(),
@@ -688,7 +683,7 @@ fn tls_cert_to_wire(c: &TlsCert) -> p::TlsCertDto {
 
 /// Serialise a [`ClientCertStore`] to its wire DTO.
 #[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn client_cert_to_wire(store: &ClientCertStore) -> p::ClientCertStoreDto {
+pub fn client_cert_to_wire(store: &ClientCertStore) -> p::ClientCertStore {
     let mut exact_entries: Vec<(&str, Arc<ClientCertConfigState>)> = store
         .iter_exact()
         .map(|(h, s)| (h, Arc::clone(s)))
@@ -701,7 +696,7 @@ pub fn client_cert_to_wire(store: &ClientCertStore) -> p::ClientCertStoreDto {
         .collect();
     wildcard_entries.sort_by_key(|(s, _)| *s);
 
-    p::ClientCertStoreDto {
+    p::ClientCertStore {
         exact: exact_entries
             .into_iter()
             .map(|(h, s)| p::ClientCertEntry {
@@ -720,24 +715,22 @@ pub fn client_cert_to_wire(store: &ClientCertStore) -> p::ClientCertStoreDto {
     }
 }
 
-fn client_cert_state_to_wire(s: &ClientCertConfigState) -> p::ClientCertConfigStateDto {
+fn client_cert_state_to_wire(s: &ClientCertConfigState) -> p::ClientCertConfigState {
     let state = match s {
         ClientCertConfigState::Config(cfg) => {
-            p::client_cert_config_state_dto::State::Config(p::ClientCertConfigDto {
+            p::client_cert_config_state::State::Config(p::ClientCertConfig {
                 ca_pem: cfg.ca_pem.clone(),
                 verify_depth: cfg.verify_depth,
                 pass_to_upstream: cfg.pass_to_upstream,
             })
         }
-        ClientCertConfigState::Unavailable => {
-            p::client_cert_config_state_dto::State::Unavailable(true)
-        }
+        ClientCertConfigState::Unavailable => p::client_cert_config_state::State::Unavailable(true),
         &_ => unreachable!(
             "invariant: all ClientCertConfigState variants handled; \
              add a new arm when the core type gains a variant"
         ),
     };
-    p::ClientCertConfigStateDto { state: Some(state) }
+    p::ClientCertConfigState { state: Some(state) }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -750,16 +743,16 @@ fn client_cert_state_to_wire(s: &ClientCertConfigState) -> p::ClientCertConfigSt
 #[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
 pub fn listener_health_to_wire(
     map: &std::collections::HashMap<ObjectKey, GatewayListenerHealth>,
-) -> p::GatewayListenerHealthDto {
+) -> p::GatewayListenerHealth {
     let mut entries: Vec<(&ObjectKey, &GatewayListenerHealth)> = map.iter().collect();
     entries.sort_by_key(|(k, _)| k.to_string());
 
-    p::GatewayListenerHealthDto {
+    p::GatewayListenerHealth {
         entries: entries
             .into_iter()
             .map(|(key, health)| p::GatewayHealthEntry {
                 object_key: key.to_string(),
-                health: Some(p::ListenerHealthDto {
+                health: Some(p::ListenerHealth {
                     // BTreeMap<String, ListenerInfo> is already sorted by key.
                     listeners: health
                         .listeners
@@ -775,7 +768,7 @@ pub fn listener_health_to_wire(
     }
 }
 
-fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfoDto {
+fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
     let (outcome, message) = match &info.tls_outcome {
         ListenerTlsOutcome::NotApplicable => (p::ListenerTlsOutcome::NotApplicable, String::new()),
         ListenerTlsOutcome::Resolved => (p::ListenerTlsOutcome::Resolved, String::new()),
@@ -794,7 +787,7 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfoDto {
              add a new arm when the core type gains a variant"
         ),
     };
-    p::ListenerInfoDto {
+    p::ListenerInfo {
         tls_outcome: outcome as i32,
         tls_message: message,
         attached_routes: info.attached_routes,
@@ -815,7 +808,7 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfoDto {
 /// Returns [`WireError`] if any field is invalid (bad regex, bad header name,
 /// unknown enum value, depth-exceeded mirror, etc.).
 #[must_use = "the rebuilt routing table must be stored for the proxy to use it"]
-pub fn ingress_from_wire(dto: &p::RoutingTableDto) -> Result<IngressRoutingTable, WireError> {
+pub fn ingress_from_wire(dto: &p::RoutingTable) -> Result<IngressRoutingTable, WireError> {
     routing_table_from_wire::<coxswain_core::routing::Ingress>(dto)
 }
 
@@ -825,12 +818,12 @@ pub fn ingress_from_wire(dto: &p::RoutingTableDto) -> Result<IngressRoutingTable
 ///
 /// Returns [`WireError`] if any field is invalid.
 #[must_use = "the rebuilt routing table must be stored for the proxy to use it"]
-pub fn gateway_from_wire(dto: &p::RoutingTableDto) -> Result<GatewayRoutingTable, WireError> {
+pub fn gateway_from_wire(dto: &p::RoutingTable) -> Result<GatewayRoutingTable, WireError> {
     routing_table_from_wire::<coxswain_core::routing::Gateway>(dto)
 }
 
 fn routing_table_from_wire<Kind>(
-    dto: &p::RoutingTableDto,
+    dto: &p::RoutingTable,
 ) -> Result<coxswain_core::routing::RoutingTable<Kind>, WireError>
 where
     coxswain_core::routing::RoutingTableBuilder<Kind>: Default,
@@ -878,7 +871,7 @@ fn host_entry_from_wire(
 }
 
 fn route_entry_from_wire(
-    dto: &p::RouteEntryDto,
+    dto: &p::RouteEntry,
     host_builder: &mut HostRouterBuilder,
 ) -> Result<(), WireError> {
     let kind = route_kind_from_wire(dto.kind)?;
@@ -902,7 +895,7 @@ fn route_entry_from_wire(
     Ok(())
 }
 
-fn build_route_entry(dto: &p::RouteEntryDto) -> Result<RouteEntry, WireError> {
+fn build_route_entry(dto: &p::RouteEntry) -> Result<RouteEntry, WireError> {
     let bg_dto = dto
         .backend_group
         .as_ref()
@@ -996,7 +989,7 @@ fn build_route_entry(dto: &p::RouteEntryDto) -> Result<RouteEntry, WireError> {
 // BackendGroup: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-fn bg_from_wire(dto: &p::BackendGroupDto, depth: usize) -> Result<BackendGroup, WireError> {
+fn bg_from_wire(dto: &p::BackendGroup, depth: usize) -> Result<BackendGroup, WireError> {
     if depth > MAX_MIRROR_DEPTH {
         return Err(WireError::MirrorTooDeep {
             limit: MAX_MIRROR_DEPTH,
@@ -1072,12 +1065,12 @@ fn bg_from_wire(dto: &p::BackendGroupDto, depth: usize) -> Result<BackendGroup, 
     Ok(bg)
 }
 
-fn upstream_tls_from_wire(dto: &p::UpstreamTlsDto) -> Result<UpstreamTls, WireError> {
+fn upstream_tls_from_wire(dto: &p::UpstreamTls) -> Result<UpstreamTls, WireError> {
     let ca = match dto.ca.as_ref().ok_or(WireError::MissingRequiredField {
         field: "upstream_tls.ca",
     })? {
-        p::upstream_tls_dto::Ca::System(_) => UpstreamCa::System,
-        p::upstream_tls_dto::Ca::Bundle(pem) => UpstreamCa::Bundle(Arc::from(pem.clone())),
+        p::upstream_tls::Ca::System(_) => UpstreamCa::System,
+        p::upstream_tls::Ca::Bundle(pem) => UpstreamCa::Bundle(Arc::from(pem.clone())),
     };
     Ok(UpstreamTls::new(
         Arc::from(dto.sni.as_str()),
@@ -1086,7 +1079,7 @@ fn upstream_tls_from_wire(dto: &p::UpstreamTlsDto) -> Result<UpstreamTls, WireEr
     ))
 }
 
-fn retry_from_wire(dto: &p::RetryPolicyDto) -> coxswain_core::routing::RetryPolicy {
+fn retry_from_wire(dto: &p::RetryPolicy) -> coxswain_core::routing::RetryPolicy {
     use coxswain_core::routing::{RetryOn, RetryPolicy};
     let mut on = RetryOn::empty();
     if dto.on_connect_failure {
@@ -1101,42 +1094,38 @@ fn retry_from_wire(dto: &p::RetryPolicyDto) -> coxswain_core::routing::RetryPoli
     RetryPolicy::new(dto.max_retries, on)
 }
 
-fn load_balance_from_wire(dto: &p::LoadBalanceDto) -> Result<LoadBalance, WireError> {
+fn load_balance_from_wire(dto: &p::LoadBalance) -> Result<LoadBalance, WireError> {
     match dto
         .algorithm
         .as_ref()
         .ok_or(WireError::InvalidLoadBalance)?
     {
-        p::load_balance_dto::Algorithm::RoundRobin(_) => Ok(LoadBalance::RoundRobin),
-        p::load_balance_dto::Algorithm::LeastConn(_) => Ok(LoadBalance::LeastConn),
-        p::load_balance_dto::Algorithm::Ewma(_) => Ok(LoadBalance::Ewma),
-        p::load_balance_dto::Algorithm::Hash(src) => {
-            Ok(LoadBalance::Hash(hash_source_from_wire(src)?))
-        }
+        p::load_balance::Algorithm::RoundRobin(_) => Ok(LoadBalance::RoundRobin),
+        p::load_balance::Algorithm::LeastConn(_) => Ok(LoadBalance::LeastConn),
+        p::load_balance::Algorithm::Ewma(_) => Ok(LoadBalance::Ewma),
+        p::load_balance::Algorithm::Hash(src) => Ok(LoadBalance::Hash(hash_source_from_wire(src)?)),
     }
 }
 
-fn hash_source_from_wire(dto: &p::HashSourceDto) -> Result<HashSource, WireError> {
+fn hash_source_from_wire(dto: &p::HashSource) -> Result<HashSource, WireError> {
     match dto.source.as_ref().ok_or(WireError::InvalidLoadBalance)? {
-        p::hash_source_dto::Source::Uri(_) => Ok(HashSource::Uri),
-        p::hash_source_dto::Source::SourceIp(_) => Ok(HashSource::SourceIp),
-        p::hash_source_dto::Source::Header(name) => Ok(HashSource::Header(
+        p::hash_source::Source::Uri(_) => Ok(HashSource::Uri),
+        p::hash_source::Source::SourceIp(_) => Ok(HashSource::SourceIp),
+        p::hash_source::Source::Header(name) => Ok(HashSource::Header(
             http::HeaderName::from_bytes(name.as_bytes())?,
         )),
-        p::hash_source_dto::Source::Cookie(name) => {
-            Ok(HashSource::Cookie(Arc::from(name.as_str())))
-        }
+        p::hash_source::Source::Cookie(name) => Ok(HashSource::Cookie(Arc::from(name.as_str()))),
     }
 }
 
-fn session_affinity_from_wire(dto: &p::SessionAffinityDto) -> Result<SessionAffinity, WireError> {
+fn session_affinity_from_wire(dto: &p::SessionAffinity) -> Result<SessionAffinity, WireError> {
     match dto.mode.as_ref().ok_or(WireError::MissingRequiredField {
         field: "session_affinity.mode",
     })? {
-        p::session_affinity_dto::Mode::CookieName(name) => Ok(SessionAffinity::Cookie {
+        p::session_affinity::Mode::CookieName(name) => Ok(SessionAffinity::Cookie {
             cookie_name: Arc::from(name.as_str()),
         }),
-        p::session_affinity_dto::Mode::Header(name) => Ok(SessionAffinity::Header {
+        p::session_affinity::Mode::Header(name) => Ok(SessionAffinity::Header {
             header: http::HeaderName::from_bytes(name.as_bytes())?,
         }),
     }
@@ -1146,7 +1135,7 @@ fn session_affinity_from_wire(dto: &p::SessionAffinityDto) -> Result<SessionAffi
 // Filters: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-fn filter_from_wire(dto: &p::FilterActionDto, depth: usize) -> Result<FilterAction, WireError> {
+fn filter_from_wire(dto: &p::FilterAction, depth: usize) -> Result<FilterAction, WireError> {
     if depth > MAX_MIRROR_DEPTH {
         return Err(WireError::MirrorTooDeep {
             limit: MAX_MIRROR_DEPTH,
@@ -1156,31 +1145,31 @@ fn filter_from_wire(dto: &p::FilterActionDto, depth: usize) -> Result<FilterActi
         field: "filter_action.action",
     })?;
     match action {
-        p::filter_action_dto::Action::RequestHeaderModifier(hm) => Ok(
+        p::filter_action::Action::RequestHeaderModifier(hm) => Ok(
             FilterAction::RequestHeaderModifier(header_mod_from_wire(hm)?),
         ),
-        p::filter_action_dto::Action::ResponseHeaderModifier(hm) => Ok(
+        p::filter_action::Action::ResponseHeaderModifier(hm) => Ok(
             FilterAction::ResponseHeaderModifier(header_mod_from_wire(hm)?),
         ),
-        p::filter_action_dto::Action::RequestRedirect(rd) => Ok(FilterAction::RequestRedirect {
+        p::filter_action::Action::RequestRedirect(rd) => Ok(FilterAction::RequestRedirect {
             scheme: rd.scheme.clone(),
             hostname: rd.hostname.clone(),
             port: rd.port.map(|p| p as u16),
             status_code: rd.status_code as u16,
             path: rd.path.as_ref().map(path_modifier_from_wire).transpose()?,
         }),
-        p::filter_action_dto::Action::UrlRewrite(uw) => Ok(FilterAction::UrlRewrite {
+        p::filter_action::Action::UrlRewrite(uw) => Ok(FilterAction::UrlRewrite {
             hostname: uw.hostname.clone(),
             path: uw.path.as_ref().map(path_modifier_from_wire).transpose()?,
         }),
-        p::filter_action_dto::Action::Mirror(bg_dto) => {
+        p::filter_action::Action::Mirror(bg_dto) => {
             let backend = Arc::new(bg_from_wire(bg_dto, depth + 1)?);
             Ok(FilterAction::Mirror { backend })
         }
     }
 }
 
-fn header_mod_from_wire(dto: &p::HeaderModDto) -> Result<HeaderMod, WireError> {
+fn header_mod_from_wire(dto: &p::HeaderMod) -> Result<HeaderMod, WireError> {
     let add: Vec<(&str, &str)> = dto
         .add
         .iter()
@@ -1206,21 +1195,21 @@ fn header_mod_from_wire(dto: &p::HeaderModDto) -> Result<HeaderMod, WireError> {
     })
 }
 
-fn path_modifier_from_wire(dto: &p::PathModifierDto) -> Result<PathModifier, WireError> {
+fn path_modifier_from_wire(dto: &p::PathModifier) -> Result<PathModifier, WireError> {
     match dto
         .modifier
         .as_ref()
         .ok_or(WireError::MissingRequiredField {
             field: "path_modifier.modifier",
         })? {
-        p::path_modifier_dto::Modifier::ReplaceFullPath(p) => {
+        p::path_modifier::Modifier::ReplaceFullPath(p) => {
             Ok(PathModifier::ReplaceFullPath(p.clone()))
         }
-        p::path_modifier_dto::Modifier::ReplacePrefix(rp) => Ok(PathModifier::ReplacePrefixMatch {
+        p::path_modifier::Modifier::ReplacePrefix(rp) => Ok(PathModifier::ReplacePrefixMatch {
             prefix: rp.prefix.clone(),
             replacement: rp.replacement.clone(),
         }),
-        p::path_modifier_dto::Modifier::RegexReplace(rr) => {
+        p::path_modifier::Modifier::RegexReplace(rr) => {
             let regex = Arc::new(regex::Regex::new(&rr.pattern)?);
             Ok(PathModifier::RegexReplace {
                 regex,
@@ -1234,7 +1223,7 @@ fn path_modifier_from_wire(dto: &p::PathModifierDto) -> Result<PathModifier, Wir
 // Predicates: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-fn predicates_from_wire(dto: &p::MatchPredicatesDto) -> Result<MatchPredicates, WireError> {
+fn predicates_from_wire(dto: &p::MatchPredicates) -> Result<MatchPredicates, WireError> {
     let method = dto
         .method
         .as_deref()
@@ -1276,15 +1265,15 @@ fn predicates_from_wire(dto: &p::MatchPredicatesDto) -> Result<MatchPredicates, 
     })
 }
 
-fn value_match_from_wire(dto: &p::ValueMatchDto) -> Result<ValueMatch, WireError> {
+fn value_match_from_wire(dto: &p::ValueMatch) -> Result<ValueMatch, WireError> {
     match dto
         .r#match
         .as_ref()
         .ok_or(WireError::MissingRequiredField {
             field: "value_match.match",
         })? {
-        p::value_match_dto::Match::Exact(s) => Ok(ValueMatch::Exact(s.clone())),
-        p::value_match_dto::Match::Regex(pat) => Ok(ValueMatch::Regex(regex::Regex::new(pat)?)),
+        p::value_match::Match::Exact(s) => Ok(ValueMatch::Exact(s.clone())),
+        p::value_match::Match::Regex(pat) => Ok(ValueMatch::Regex(regex::Regex::new(pat)?)),
     }
 }
 
@@ -1292,7 +1281,7 @@ fn value_match_from_wire(dto: &p::ValueMatchDto) -> Result<ValueMatch, WireError
 // Timeouts: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-fn timeouts_from_wire(dto: &p::RouteTimeoutsDto) -> RouteTimeouts {
+fn timeouts_from_wire(dto: &p::RouteTimeouts) -> RouteTimeouts {
     RouteTimeouts {
         request: dto.request.as_ref().map(duration_from_wire),
         backend_request: dto.backend_request.as_ref().map(duration_from_wire),
@@ -1302,7 +1291,7 @@ fn timeouts_from_wire(dto: &p::RouteTimeoutsDto) -> RouteTimeouts {
     }
 }
 
-fn duration_from_wire(dto: &p::DurationDto) -> Duration {
+fn duration_from_wire(dto: &p::Duration) -> Duration {
     Duration::new(dto.secs, dto.nanos)
 }
 
@@ -1310,7 +1299,7 @@ fn duration_from_wire(dto: &p::DurationDto) -> Duration {
 // Per-route config: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-fn rate_limit_from_wire(dto: &p::RateLimitConfigDto) -> Result<RateLimitConfig, WireError> {
+fn rate_limit_from_wire(dto: &p::RateLimitConfig) -> Result<RateLimitConfig, WireError> {
     let rps = NonZeroU32::new(dto.requests_per_second).ok_or(WireError::ZeroRps)?;
     let key = dto
         .key
@@ -1322,8 +1311,8 @@ fn rate_limit_from_wire(dto: &p::RateLimitConfigDto) -> Result<RateLimitConfig, 
             match k.key.as_ref().ok_or(WireError::MissingRequiredField {
                 field: "rate_limit_key.key",
             })? {
-                p::rate_limit_key_dto::Key::ClientIp(_) => Ok(RateLimitKey::ClientIp),
-                p::rate_limit_key_dto::Key::Header(name) => {
+                p::rate_limit_key::Key::ClientIp(_) => Ok(RateLimitKey::ClientIp),
+                p::rate_limit_key::Key::Header(name) => {
                     Ok(RateLimitKey::Header(Arc::from(name.as_str())))
                 }
             }
@@ -1331,11 +1320,11 @@ fn rate_limit_from_wire(dto: &p::RateLimitConfigDto) -> Result<RateLimitConfig, 
     Ok(RateLimitConfig::new(rps, dto.burst, key))
 }
 
-fn auth_from_wire(dto: &p::IngressAuthConfigDto) -> Result<IngressAuthConfig, WireError> {
+fn auth_from_wire(dto: &p::IngressAuthConfig) -> Result<IngressAuthConfig, WireError> {
     match dto.auth.as_ref().ok_or(WireError::MissingRequiredField {
         field: "ingress_auth_config.auth",
     })? {
-        p::ingress_auth_config_dto::Auth::External(ext) => {
+        p::ingress_auth_config::Auth::External(ext) => {
             let http = ext.http.as_ref().ok_or(WireError::MissingRequiredField {
                 field: "ext_auth.http",
             })?;
@@ -1354,7 +1343,7 @@ fn auth_from_wire(dto: &p::IngressAuthConfigDto) -> Result<IngressAuthConfig, Wi
                 )),
             )))
         }
-        p::ingress_auth_config_dto::Auth::Basic(list) => {
+        p::ingress_auth_config::Auth::Basic(list) => {
             let creds: Arc<[BasicCredential]> = list
                 .credentials
                 .iter()
@@ -1378,11 +1367,11 @@ fn auth_from_wire(dto: &p::IngressAuthConfigDto) -> Result<IngressAuthConfig, Wi
                 .collect::<Result<_, _>>()?;
             Ok(IngressAuthConfig::Basic(creds))
         }
-        p::ingress_auth_config_dto::Auth::Unavailable(_) => Ok(IngressAuthConfig::Unavailable),
+        p::ingress_auth_config::Auth::Unavailable(_) => Ok(IngressAuthConfig::Unavailable),
     }
 }
 
-fn compression_from_wire(dto: &p::CompressionConfigDto) -> CompressionConfig {
+fn compression_from_wire(dto: &p::CompressionConfig) -> CompressionConfig {
     CompressionConfig::new(
         dto.gzip,
         dto.brotli,
@@ -1392,9 +1381,7 @@ fn compression_from_wire(dto: &p::CompressionConfigDto) -> CompressionConfig {
     )
 }
 
-fn forwarded_for_from_wire(
-    dto: &p::ForwardedForConfigDto,
-) -> Result<ForwardedForConfig, WireError> {
+fn forwarded_for_from_wire(dto: &p::ForwardedForConfig) -> Result<ForwardedForConfig, WireError> {
     let trusted_cidrs: Box<[ipnet::IpNet]> = dto
         .trusted_cidrs
         .iter()
@@ -1406,7 +1393,7 @@ fn forwarded_for_from_wire(
     ))
 }
 
-fn circuit_breaker_from_wire(dto: &p::CircuitBreakerConfigDto) -> CircuitBreakerConfig {
+fn circuit_breaker_from_wire(dto: &p::CircuitBreakerConfig) -> CircuitBreakerConfig {
     CircuitBreakerConfig::new(
         dto.threshold_pct as u8,
         dto.min_requests,
@@ -1478,7 +1465,7 @@ fn protocol_from_wire(v: i32) -> Result<BackendProtocol, WireError> {
 ///
 /// Returns [`WireError`] if any required field is missing.
 #[must_use = "the rebuilt TLS store must be stored for the proxy to use it"]
-pub fn tls_from_wire(dto: &p::TlsStoreDto) -> Result<TlsStore, WireError> {
+pub fn tls_from_wire(dto: &p::TlsStore) -> Result<TlsStore, WireError> {
     let mut builder = TlsStoreBuilder::new();
     for entry in &dto.exact {
         let cert = cert_from_wire(entry.cert.as_ref().ok_or(WireError::MissingRequiredField {
@@ -1502,7 +1489,7 @@ pub fn tls_from_wire(dto: &p::TlsStoreDto) -> Result<TlsStore, WireError> {
     Ok(builder.build())
 }
 
-fn cert_from_wire(dto: &p::TlsCertDto) -> TlsCert {
+fn cert_from_wire(dto: &p::TlsCert) -> TlsCert {
     let not_after = dto
         .not_after_unix_secs
         .map(|s| UNIX_EPOCH + Duration::from_secs(s));
@@ -1524,7 +1511,7 @@ fn cert_from_wire(dto: &p::TlsCertDto) -> TlsCert {
 ///
 /// Returns [`WireError`] if any required field is missing.
 #[must_use = "the rebuilt client-cert store must be stored for the proxy to use it"]
-pub fn client_cert_from_wire(dto: &p::ClientCertStoreDto) -> Result<ClientCertStore, WireError> {
+pub fn client_cert_from_wire(dto: &p::ClientCertStore) -> Result<ClientCertStore, WireError> {
     let mut builder = ClientCertStoreBuilder::new();
     for entry in &dto.exact {
         let state = client_cert_state_from_wire(entry.state.as_ref().ok_or(
@@ -1550,12 +1537,12 @@ pub fn client_cert_from_wire(dto: &p::ClientCertStoreDto) -> Result<ClientCertSt
     Ok(builder.build())
 }
 
-fn client_cert_state_from_wire(dto: &p::ClientCertConfigStateDto) -> ClientCertConfigState {
+fn client_cert_state_from_wire(dto: &p::ClientCertConfigState) -> ClientCertConfigState {
     match &dto.state {
-        Some(p::client_cert_config_state_dto::State::Config(cfg)) => ClientCertConfigState::Config(
+        Some(p::client_cert_config_state::State::Config(cfg)) => ClientCertConfigState::Config(
             ClientCertConfig::new(cfg.ca_pem.clone(), cfg.verify_depth, cfg.pass_to_upstream),
         ),
-        Some(p::client_cert_config_state_dto::State::Unavailable(_)) | None => {
+        Some(p::client_cert_config_state::State::Unavailable(_)) | None => {
             ClientCertConfigState::Unavailable
         }
     }
@@ -1572,7 +1559,7 @@ fn client_cert_state_from_wire(dto: &p::ClientCertConfigStateDto) -> ClientCertC
 /// Returns [`WireError`] if any required field is missing.
 #[must_use = "the rebuilt listener-health map must be stored for the proxy to use it"]
 pub fn listener_health_from_wire(
-    dto: &p::GatewayListenerHealthDto,
+    dto: &p::GatewayListenerHealth,
 ) -> Result<std::collections::HashMap<ObjectKey, GatewayListenerHealth>, WireError> {
     dto.entries
         .iter()
@@ -1592,9 +1579,7 @@ pub fn listener_health_from_wire(
         .collect()
 }
 
-fn listener_health_from_dto(
-    dto: &p::ListenerHealthDto,
-) -> Result<GatewayListenerHealth, WireError> {
+fn listener_health_from_dto(dto: &p::ListenerHealth) -> Result<GatewayListenerHealth, WireError> {
     let mut glh = GatewayListenerHealth::default();
     for entry in &dto.listeners {
         let info = entry.info.as_ref().ok_or(WireError::MissingRequiredField {
@@ -1606,7 +1591,7 @@ fn listener_health_from_dto(
     Ok(glh)
 }
 
-fn listener_info_from_wire(dto: &p::ListenerInfoDto) -> Result<ListenerInfo, WireError> {
+fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerInfo, WireError> {
     let tls_outcome = match p::ListenerTlsOutcome::try_from(dto.tls_outcome)
         .unwrap_or(p::ListenerTlsOutcome::Unspecified)
     {
@@ -1945,11 +1930,11 @@ mod tests {
 
     #[test]
     fn zero_rps_from_wire_returns_error() {
-        let rl_dto = p::RateLimitConfigDto {
+        let rl_dto = p::RateLimitConfig {
             requests_per_second: 0, // invalid
             burst: 0,
-            key: Some(p::RateLimitKeyDto {
-                key: Some(p::rate_limit_key_dto::Key::ClientIp(true)),
+            key: Some(p::RateLimitKey {
+                key: Some(p::rate_limit_key::Key::ClientIp(true)),
             }),
         };
         let err = rate_limit_from_wire(&rl_dto).unwrap_err();
@@ -2059,16 +2044,16 @@ mod tests {
 
     #[test]
     fn mirror_too_deep_returns_error() {
-        fn nested_bg(depth: usize) -> p::BackendGroupDto {
-            let addr_dto = p::WeightedBackendDto {
+        fn nested_bg(depth: usize) -> p::BackendGroup {
+            let addr_dto = p::WeightedBackend {
                 addrs: vec!["10.0.0.1:80".to_string()],
                 weight: 1,
             };
-            let lb = p::LoadBalanceDto {
-                algorithm: Some(p::load_balance_dto::Algorithm::RoundRobin(true)),
+            let lb = p::LoadBalance {
+                algorithm: Some(p::load_balance::Algorithm::RoundRobin(true)),
             };
             if depth == 0 {
-                p::BackendGroupDto {
+                p::BackendGroup {
                     name: "leaf".to_string(),
                     weighted: vec![addr_dto],
                     load_balance: Some(lb),
@@ -2076,10 +2061,10 @@ mod tests {
                     ..Default::default()
                 }
             } else {
-                let filter = p::FilterActionDto {
-                    action: Some(p::filter_action_dto::Action::Mirror(nested_bg(depth - 1))),
+                let filter = p::FilterAction {
+                    action: Some(p::filter_action::Action::Mirror(nested_bg(depth - 1))),
                 };
-                p::BackendGroupDto {
+                p::BackendGroup {
                     name: format!("depth-{depth}"),
                     weighted: vec![addr_dto],
                     load_balance: Some(lb),
