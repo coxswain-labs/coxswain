@@ -1037,3 +1037,77 @@ async fn vap_ignores_ingress_without_coxswain_annotations() -> anyhow::Result<()
     fixtures::apply_fixture(ingress::DEFAULT_BACKEND, FixtureVars::new(&ns.name)).await?;
     Ok(())
 }
+
+// ── CRD openAPIV3Schema validation (#335) ────────────────────────────────────
+
+/// Gateway with `port: 99999` is rejected by the gateway-api CRD structural
+/// schema (`port` has `maximum: 65535`) — before the controller sees it (#335).
+#[tokio::test]
+async fn gateway_with_out_of_range_port_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "crd-gw-port").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        gwa::REJECT_GATEWAY_OUT_OF_RANGE_PORT,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("65535"),
+        "CRD rejection message must mention the maximum port, got: {msg}"
+    );
+    Ok(())
+}
+
+/// HTTPRoute with an invalid path-match `type` value is rejected by the
+/// gateway-api CRD structural schema — before the controller sees it (#335).
+#[tokio::test]
+async fn httproute_with_invalid_path_match_type_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "crd-ht-path").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        gwa::REJECT_HTTPROUTE_INVALID_PATH_TYPE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("Glob"),
+        "CRD rejection message must name the invalid value, got: {msg}"
+    );
+    Ok(())
+}
+
+/// `RateLimit` CR with the required `requestsPerSecond` field omitted is
+/// rejected by the coxswain-owned CRD structural schema (#335).
+#[tokio::test]
+async fn ratelimit_missing_required_field_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "crd-rl-req").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        gwa::REJECT_RATELIMIT_MISSING_RPS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("requestsPerSecond"),
+        "CRD rejection message must name the missing required field, got: {msg}"
+    );
+    Ok(())
+}
+
+/// `CoxswainGatewayParameters` with an invalid `serviceType` value is rejected
+/// by the coxswain-owned CRD structural schema (#335).
+#[tokio::test]
+async fn coxswain_gateway_parameters_invalid_service_type_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "crd-cgp-svc").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        dedicated::REJECT_GATEWAY_PARAMS_INVALID_SERVICE_TYPE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("serviceType"),
+        "CRD rejection message must name the offending field, got: {msg}"
+    );
+    Ok(())
+}

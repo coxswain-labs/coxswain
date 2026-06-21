@@ -1,0 +1,12 @@
+# Minimal RateLimit CR with the required `requestsPerSecond` field omitted.
+# Used to assert that the coxswain-owned CRD openAPIV3Schema rejects the
+# resource at admission — before the controller ever sees it (#335).
+#
+# The generated CRD marks `requestsPerSecond` as `required`.
+---
+apiVersion: coxswain-labs.dev/v1alpha1
+kind: RateLimit
+metadata:
+  name: reject-test
+spec:
+  burst: 5

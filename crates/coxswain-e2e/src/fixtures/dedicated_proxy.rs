@@ -84,3 +84,11 @@ pub const MODE_MIGRATION_SHARED: &str = fixture!("mode_migration_shared.yaml");
 /// Dedicated-mode starting point for the dedicated→shared migration test:
 /// Gateway with `infrastructure.parametersRef` set, HTTPRoute attached.
 pub const MODE_MIGRATION_DEDICATED: &str = fixture!("mode_migration_dedicated.yaml");
+
+// ── CRD openAPIV3Schema rejection (#335) ─────────────────────────────────────
+
+/// `CoxswainGatewayParameters` with `serviceType: FooBar` — rejected by the
+/// coxswain-owned CRD schema (`FooBar` is not in the enum
+/// `{LoadBalancer, NodePort, ClusterIP}`).
+pub const REJECT_GATEWAY_PARAMS_INVALID_SERVICE_TYPE: &str =
+    fixture!("reject_gateway_params_invalid_service_type.yaml");

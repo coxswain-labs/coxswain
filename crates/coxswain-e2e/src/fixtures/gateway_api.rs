@@ -111,3 +111,19 @@ pub const BACKEND_TLS_POLICY_CROSS_NAMESPACE_TENANT: &str =
 /// per-route annotation. Used to verify that `%2E%2E` encoded dot-dot segments
 /// are decoded and removed so the route `/v1` is reachable via `/api/%2E%2E/v1`.
 pub const PATH_NORMALIZE_DEFAULT: &str = fixture!("path_normalize_default.yaml");
+
+// ── CRD openAPIV3Schema rejection (#335) ─────────────────────────────────────
+
+/// Gateway with `port: 99999` — rejected by the gateway-api CRD schema
+/// (`port` has `maximum: 65535` in the structural schema).
+pub const REJECT_GATEWAY_OUT_OF_RANGE_PORT: &str =
+    fixture!("reject_gateway_out_of_range_port.yaml");
+
+/// HTTPRoute with `path.type: Glob` — rejected by the gateway-api CRD schema
+/// (`Glob` is not in the enum `{Exact, PathPrefix, RegularExpression}`).
+pub const REJECT_HTTPROUTE_INVALID_PATH_TYPE: &str =
+    fixture!("reject_httproute_invalid_path_type.yaml");
+
+/// `RateLimit` CR with `requestsPerSecond` omitted — rejected by the
+/// coxswain-owned CRD schema (`requestsPerSecond` is a required field).
+pub const REJECT_RATELIMIT_MISSING_RPS: &str = fixture!("reject_ratelimit_missing_rps.yaml");
