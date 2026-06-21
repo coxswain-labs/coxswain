@@ -425,13 +425,18 @@ async fn access_log_suppressed_for_class_with_access_log_false() -> anyhow::Resu
 
     let logs = h.controller.shared_proxy_access_logs().await?;
 
+    // Exclude status=404 rows: during wait_for_route polling, requests reach
+    // the proxy before the route is programmed and return "no route for host"
+    // 404s. Those have no IngressClass context, so class-level suppression
+    // cannot apply. Only routed (non-404) requests are in scope.
     let rows_a: Vec<_> = logs
         .iter()
         .filter(|line| line.get("host").and_then(|v| v.as_str()) == Some(host_a.as_str()))
+        .filter(|line| line.get("status").and_then(|v| v.as_u64()) != Some(404))
         .collect();
     assert!(
         rows_a.is_empty(),
-        "class with accessLog: false must produce zero access-log rows for host A, got {}",
+        "class with accessLog: false must produce zero routed access-log rows for host A, got {}",
         rows_a.len()
     );
 
