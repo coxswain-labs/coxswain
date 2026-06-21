@@ -126,9 +126,29 @@ TLS Secrets must be in the correct namespace — for `Ingress`, the same namespa
 
 ## Observability
 
-Configure a Prometheus scrape against the admin port (`8082`) — see the [Observability reference](../reference/observability.md) for the ServiceMonitor and scrape_config examples. Alert on `/readyz` returning non-200 for more than one scrape interval.
+Configure a Prometheus scrape against the admin port (`8082`) — see the [Observability reference](../reference/observability.md) for the PodMonitor and scrape_config examples. Alert on `/readyz` returning non-200 for more than one scrape interval.
+
+The controller emits Kubernetes `Warning` Events on `Ingress` objects when a route conflict is detected (`reason: RouteConflict`) or an annotation value is invalid (`reason: InvalidAnnotation`). Set up an alerting rule or regularly query these events:
+
+```bash
+kubectl get events --field-selector reason=RouteConflict,type=Warning -A
+kubectl get events --field-selector reason=InvalidAnnotation,type=Warning -A
+```
+
+See [Troubleshooting — route conflicts](troubleshooting.md#ingress-route-is-shadowed-by-a-conflict) and [annotation diagnostics](troubleshooting.md#ingress-annotation-has-no-effect) for remediation steps.
 
 Set `--log-format=json` for structured log ingestion and `--log=warn` in production to reduce noise.
+
+## Annotation validation
+
+On Kubernetes ≥ 1.30, the Helm chart installs a `ValidatingAdmissionPolicy` that rejects `Ingress` objects carrying malformed `ingress.coxswain-labs.dev/*` annotation values at apply time, surfacing errors immediately rather than silently falling back to defaults. It is enabled by default; disable with `--set vap.enabled=false` if your cluster does not support the `admissionregistration.k8s.io/v1` API. See [Helm install — ValidatingAdmissionPolicy](../installation/helm.md#validatingadmissionpolicy).
+
+## Per-class configuration
+
+`CoxswainIngressClassParameters` lets you set class-level defaults that apply to every `Ingress` claiming the class. Useful for cluster-wide policies:
+
+- **`spec.defaultAnnotations`** — default `ingress.coxswain-labs.dev/*` values; per-Ingress annotations override these per key.
+- **`spec.accessLog`** — set `false` to suppress proxy access-log lines for all routes in the class (never force-enables — a `false` class setting cannot be overridden per Ingress). See the [Observability reference](../reference/observability.md#access-logs) for the full access-log configuration model.
 
 ## RBAC
 

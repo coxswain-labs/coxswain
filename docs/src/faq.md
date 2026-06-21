@@ -26,7 +26,7 @@ See [Architecture](architecture.md#deployment-models) for the two macro deployme
 
 ### How does Ingress fit?
 
-Classic `Ingress` resources are always served by the shared proxy pool — `Ingress` has no equivalent of `parametersRef`. Gateway API users can opt a `Gateway` into a dedicated proxy (per Gateway) via `parametersRef` on the `GatewayClass` (cluster-wide default) or on the `Gateway` itself; the controller provisions and manages that dedicated proxy automatically. See [Dedicated proxy pools](guides/dedicated-mode.md) for the full walkthrough.
+Classic `Ingress` resources are always served by the shared proxy pool — `Ingress` has no equivalent of `parametersRef`. Gateway API users can opt a `Gateway` into a dedicated proxy (per Gateway) via `spec.infrastructure.parametersRef` on the `Gateway` or via `spec.parametersRef` on its `GatewayClass` (cluster-wide default); the controller provisions and manages that dedicated proxy automatically. See [Dedicated proxy pools](guides/dedicated-mode.md) for the full walkthrough.
 
 ## Comparison
 

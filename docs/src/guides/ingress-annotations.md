@@ -65,6 +65,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/circuit-breaker-open-duration` | duration | `5s` | `"10s"` |
 | `ingress.coxswain-labs.dev/circuit-breaker-min-requests` | integer | `10` | `"5"` |
 | `ingress.coxswain-labs.dev/circuit-breaker-max-open-duration` | duration | _none_ (constant) | `"60s"` |
+| `ingress.coxswain-labs.dev/upstream-keepalive-timeout` | duration | _none_ (LRU eviction) | `"60s"` |
 
 ```yaml
 metadata:
@@ -424,7 +425,7 @@ metadata:
 `max-body-size` already rejects requests exceeding the cap with 413, so the mirror buffer is inherently bounded — no additional memory risk is introduced.
 
 !!! note "Body-mirroring for large payloads"
-    Stream-concurrent mirroring (mirror body as it arrives, no buffering) is planned (#360). Until then, mirror with a body cap is the recommended pattern for production use.
+    Stream-concurrent mirroring (mirror body as it arrives, no buffering) is planned. Until then, mirror with a body cap is the recommended pattern for production use.
 
 ### Observability
 
@@ -617,7 +618,7 @@ metadata:
 - An unknown `session-affinity` value (anything other than `cookie`/`header`) warns and disables affinity — the Ingress still serves.
 
 !!! note
-    The Gateway API binding for session persistence is tracked in [#355](https://github.com/coxswain-labs/coxswain/issues/355). It is deferred because the only Gateway API surface for session persistence in our pinned crate is experimental-only (which Coxswain never compiles into release images), and the `BackendLBPolicy` resource originally proposed is not an upstream Gateway API type. Today the `session-*` annotations are the Ingress-only entry point.
+    The Gateway API binding for session persistence is not yet implemented: the only Gateway API surface for session persistence in the pinned crate is experimental-only (which Coxswain never compiles into release images), and the `BackendLBPolicy` resource originally proposed is not an upstream Gateway API type. Today the `session-*` annotations are the Ingress-only entry point.
 
 ## Circuit breaker
 

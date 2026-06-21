@@ -38,17 +38,17 @@ helm show values oci://ghcr.io/coxswain-labs/charts/coxswain
 
 | Value | Default | Description |
 |-------|---------|-------------|
-| `replicaCount` | `1` | Number of controller replicas (run `≥ 2` in production) |
+| `controller.replicas` | `1` | Number of controller replicas (run `≥ 2` in production) |
 | `image.tag` | _(chart appVersion)_ | Image tag to deploy |
-| `controller.name` | `coxswain-labs.dev/gateway-controller` | GatewayClass `controllerName` to claim |
-| `controller.watchNamespace` | `""` | Restrict watch to a single namespace; empty = cluster-wide |
+| `controllerName` | `coxswain-labs.dev/gateway-controller` | GatewayClass `controllerName` to claim |
+| `watchNamespace` | `""` | Restrict watch to a single namespace; empty = cluster-wide |
 | `proxy.http.port` | `80` | HTTP proxy listener port |
 | `proxy.https.port` | `443` | HTTPS proxy listener port |
-| `proxy.threads` | `2` | Worker threads per proxy service |
-| `resources.requests.cpu` | `100m` | CPU request |
-| `resources.requests.memory` | `128Mi` | Memory request |
-| `resources.limits.cpu` | `500m` | CPU limit |
-| `resources.limits.memory` | `256Mi` | Memory limit |
+| `proxy.shared.threads` | `2` | Worker threads per shared-proxy service |
+| `proxy.shared.resources.requests.cpu` | `100m` | Shared-proxy CPU request |
+| `proxy.shared.resources.requests.memory` | `128Mi` | Shared-proxy memory request |
+| `proxy.shared.resources.limits.cpu` | `500m` | Shared-proxy CPU limit |
+| `proxy.shared.resources.limits.memory` | `256Mi` | Shared-proxy memory limit |
 
 See the [Helm chart README](https://github.com/coxswain-labs/coxswain/blob/main/charts/coxswain/README.md) for the full values reference.
 
@@ -59,11 +59,11 @@ By default Coxswain watches the entire cluster. To restrict to a single namespac
 ```bash
 helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --namespace coxswain-system --create-namespace \
-  --set controller.watchNamespace=my-namespace
+  --set watchNamespace=my-namespace
 ```
 
 !!! note
-    `controller.watchNamespace` only narrows what the controller reads — the chart still installs the cluster-wide `ClusterRole`/`ClusterRoleBinding`. To scope RBAC as well, render the manifests with `helm template` and edit them by hand before applying.
+    `watchNamespace` only narrows what the controller reads — the chart still installs the cluster-wide `ClusterRole`/`ClusterRoleBinding`. To scope RBAC as well, render the manifests with `helm template` and edit them by hand before applying.
 
 ## ValidatingAdmissionPolicy
 

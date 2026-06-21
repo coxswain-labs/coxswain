@@ -113,7 +113,7 @@ Only Service backends are supported; Resource backends are ignored.
 |------------|-----------|
 | `Prefix` | Matches any request path with the given prefix. `/foo` matches `/foo`, `/foo/`, `/foo/bar`. |
 | `Exact` | Matches only the exact path. `/foo` does not match `/foo/`. |
-| `ImplementationSpecific` | Treated as `Prefix` by Coxswain. |
+| `ImplementationSpecific` | Treated as `Prefix` by default; becomes regex matching when [`use-regex: "true"`](ingress-annotations.md#use-regex) is set on the Ingress. |
 
 ```yaml
 rules:

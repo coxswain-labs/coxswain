@@ -15,9 +15,11 @@ Choose the one that fits your workflow:
 
 | Method | When to use |
 |--------|-------------|
-| [Helm](helm.md) | Production; values-driven configuration, easy upgrades |
+| [Helm](helm.md) | Production; values-driven configuration, easy upgrades, includes Services and PodDisruptionBudgets |
 | [Kustomize](kustomize.md) | GitOps without Helm; customise with overlays |
 | [Raw manifests](manifests.md) | Quick evaluations; no tooling beyond `kubectl` |
+
+All three methods install the Coxswain CRDs and a `ValidatingAdmissionPolicy` for Ingress annotation validation (silently skipped on Kubernetes < 1.30). Services and `PodDisruptionBudget` are Helm-only.
 
 ## Kubernetes distributions
 

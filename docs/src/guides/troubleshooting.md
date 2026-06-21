@@ -166,12 +166,53 @@ Symptoms: no `GatewayClass`, `Gateway`, or `HTTPRoute` conditions are written; `
 Fix: install the Gateway API CRDs and restart the controller.
 
 ```bash
-# Install the standard-channel CRDs (adjust the version to match your cluster)
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+# Install the standard-channel CRDs
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/download/standard-install.yaml
 
 # Restart the controller so it re-probes
 kubectl -n coxswain-system rollout restart deployment/coxswain-controller
 ```
+
+## Ingress route is shadowed by a conflict
+
+When two `Ingress` objects claim the same host and path combination, only one wins (see [Multi-Ingress merging and conflict precedence](ingress.md#multiple-ingresses-on-the-same-host)). The losing Ingress's route is silently dropped from the routing table. The controller emits a `Warning` Event on the shadowed Ingress to make the conflict visible:
+
+```bash
+kubectl describe ingress <shadowed-ingress>
+# ...
+# Events:
+#   Type     Reason         Age  From               Message
+#   ----     ------         ---  ----               -------
+#   Warning  RouteConflict  1m   coxswain           Route on host app.example.com path /api is shadowed by default/winning-ingress
+```
+
+You can also query events directly:
+
+```bash
+kubectl get events --field-selector reason=RouteConflict -A
+```
+
+To resolve: ensure only one Ingress claims a given `(host, path)` slot, or migrate the conflicting rules into a single Ingress object.
+
+## Ingress annotation has no effect
+
+If an `ingress.coxswain-labs.dev/*` annotation value is invalid, the controller ignores it (fail-open) and emits a `Warning` Event on the Ingress:
+
+```bash
+kubectl describe ingress <name>
+# Events:
+#   Type     Reason            Age  From               Message
+#   ----     ------            ---  ----               -------
+#   Warning  InvalidAnnotation  1m  coxswain           connect-timeout: invalid duration "5 seconds" — expected a Go duration string (e.g. "5s", "1m30s")
+```
+
+Query all annotation-parse warnings in the cluster:
+
+```bash
+kubectl get events --field-selector reason=InvalidAnnotation -A
+```
+
+On Kubernetes ≥ 1.30 with the Helm chart, the `ValidatingAdmissionPolicy` catches most invalid values at `kubectl apply` time — the admission rejection message matches the Event message format above.
 
 ## High memory usage
 

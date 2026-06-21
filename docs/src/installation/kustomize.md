@@ -1,6 +1,6 @@
 # Kustomize install
 
-Coxswain's deployment manifests are structured as a Kustomize base under `deploy/manifests/`. Use this method when you need to apply overlays — custom resource limits, additional labels, namespace changes, or image overrides.
+Coxswain's deployment manifests are structured as a Kustomize base under `deploy/manifests/`. Use this method when you need to apply overlays — custom resource limits, additional labels, namespace changes, or image overrides. The base includes the `CoxswainGatewayParameters` and `RateLimit` CRDs and a `ValidatingAdmissionPolicy` for Ingress annotation validation (silently skipped on Kubernetes < 1.30).
 
 ## Install from main
 

@@ -5,7 +5,7 @@ This guide installs Coxswain into an existing cluster, creates a `GatewayClass`,
 ## Prerequisites
 
 - Kubernetes 1.30 or later
-- Gateway API CRDs v1.5.1 or later (installed in Step 1)
+- Gateway API CRDs v1.5.x or later (installed in Step 1)
 - `kubectl` configured against your target cluster
 - `helm` 3.x installed
 
