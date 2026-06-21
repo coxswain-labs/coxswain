@@ -1,0 +1,27 @@
+[package]
+name = "coxswain-discovery"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+coxswain-core = { workspace = true }
+prost         = { workspace = true }
+thiserror     = { workspace = true }
+tonic         = { workspace = true }
+tonic-prost   = { workspace = true }
+
+[build-dependencies]
+protox            = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[package.metadata.cargo-machete]
+# prost + tonic-prost: used only by the generated code included via
+# `tonic::include_proto!` in src/proto.rs — machete cannot see into OUT_DIR.
+# coxswain-core: scaffold dep; used by T2+ tickets that add wire-DTO types.
+ignored = ["coxswain-core", "prost", "tonic-prost"]

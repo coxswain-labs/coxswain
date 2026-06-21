@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package coxswain.discovery.v1;
+
+/// Bidirectional gRPC stream between a discovery client and the controller.
+///
+/// The client sends a `Subscribe` once to declare scope, then `Ack`/`Nack` after
+/// each snapshot. The server sends `Snapshot` messages as the routing world
+/// changes. Envelopes are extensible `oneof`s — future message types (relay
+/// telemetry, drain commands) can be added without a wire break.
+service Discovery {
+  rpc Stream(stream ClientMessage) returns (stream ServerMessage);
+}
+
+// --- client → server ---------------------------------------------------------
+
+message ClientMessage {
+  oneof kind {
+    Subscribe subscribe = 1;
+    Ack       ack       = 2;
+    Nack      nack      = 3;
+    // reserved 4..: NodeStatus (relay telemetry) — DEFERRED
+  }
+}
+
+// Declares the scope and protocol version this client speaks.
+// Fields are stubs; fleshed out in T2 (#238).
+message Subscribe {}
+
+// Positive acknowledgement: client has applied the snapshot at `version`.
+message Ack {
+  string version = 1;
+  bytes  nonce   = 2;
+}
+
+// Negative acknowledgement: client rejected the snapshot at `version`.
+message Nack {
+  string version = 1;
+  bytes  nonce   = 2;
+  string detail  = 3;
+}
+
+// --- server → client ---------------------------------------------------------
+
+message ServerMessage {
+  oneof kind {
+    Snapshot snapshot = 1;
+    // reserved 2..: Command (drain / dump-config) — DEFERRED
+  }
+}
+
+// Full state-of-the-world snapshot for the subscribed scope.
+// DTO fields are stubs; fleshed out in T2 (#238).
+message Snapshot {
+  string version = 1;  // content hash of this scope's DTO
+  bytes  nonce   = 2;
+}

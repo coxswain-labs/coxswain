@@ -17,6 +17,7 @@ set -euo pipefail
 
 CRATES=(
   coxswain-core
+  coxswain-discovery
   coxswain-reflector
   coxswain-proxy
   coxswain-controller
