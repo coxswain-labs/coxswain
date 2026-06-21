@@ -432,7 +432,7 @@ fn wire_gateway_only_proxy_services(
     server: &mut Server,
     common: &CommonArgs,
     proxy: &ProxyArgs,
-    source: &KubernetesSource,
+    source: &dyn RoutingSource,
     tls_health: &SharedGatewayListenerHealth,
     cache: Option<ResponseCache>,
 ) -> Result<()> {
@@ -561,7 +561,7 @@ fn wire_proxy_services(
     server: &mut Server,
     common: &CommonArgs,
     proxy: &ProxyArgs,
-    source: &KubernetesSource,
+    source: &dyn RoutingSource,
     tls_health: &SharedGatewayListenerHealth,
     cache: Option<ResponseCache>,
 ) -> Result<()> {
