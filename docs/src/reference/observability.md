@@ -161,12 +161,17 @@ The `--access-log-path-mode` flag (or `COXSWAIN_ACCESS_LOG_PATH_MODE`) controls 
 
 | Value | `path` field content | Use case |
 |-------|----------------------|----------|
-| `full` (default) | The concrete request path, e.g. `/users/42/orders/7` | Standard traffic analysis |
-| `pattern` | The matched rule's registered path pattern, e.g. `/users/` | Cardinality reduction; the proxy holds this without config duplication |
-| `none` | Field omitted entirely | Strict path redaction |
+| `full` (default) | The concrete normalised request path, e.g. `/users/42/orders/7` | Standard traffic analysis; required for security log analysis |
+| `pattern` | The matched rule's registered path pattern, e.g. `/users/` | Cardinality reduction — see security note below |
+| `none` | Field omitted entirely | Strict path redaction — see security note below |
+
+!!! warning "Security impact of `pattern` and `none`"
+    Both `pattern` and `none` suppress the actual request path in the access log. Any WAF, SIEM, or log-based alerting that scans the `path` field for path-traversal attempts (`..`, `%2e`, `%2f`), encoded payloads, or other abnormal input will miss those requests entirely when either mode is active.
+
+    **Deployments where access logs feed a security pipeline must use `full`.**
 
 !!! tip "Prefer pipeline-side redaction"
-    Redacting at the log-collection pipeline is the architecturally correct default — it keeps the proxy emitting ground truth while centralising PII policy. Use `pattern` or `none` only when the pipeline genuinely cannot filter.
+    Redacting at the log-collection pipeline is the architecturally correct default — it keeps the proxy emitting ground truth while centralising PII policy. Use `pattern` or `none` only when the pipeline genuinely cannot handle high-cardinality path fields.
 
 ### Per-class suppression
 

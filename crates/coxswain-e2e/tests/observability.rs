@@ -232,9 +232,15 @@ async fn access_log_emits_required_fields_on_success() -> anyhow::Result<()> {
 /// `--access-log-path-mode=pattern` replaces the concrete request path with
 /// the matched rule's `path_pattern`. Same Ingress, same backend, just a
 /// redacted `path` field.
+///
+/// Note: `pattern` is used here intentionally to exercise the mode under test.
+/// The chart default is `full`; production deployments feeding a security
+/// pipeline must retain `full` to keep path-traversal attempts visible.
 #[tokio::test]
 async fn access_log_path_mode_pattern_uses_rule_pattern() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
+        // pattern is intentional here — this test exercises the mode; it is NOT
+        // a production recommendation (chart default is full).
         access_log_path_mode: Some("pattern".to_string()),
         ..Default::default()
     })
