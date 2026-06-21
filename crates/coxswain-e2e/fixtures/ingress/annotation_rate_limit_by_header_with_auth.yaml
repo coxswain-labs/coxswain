@@ -15,7 +15,7 @@ metadata:
   annotations:
     ingress.coxswain-labs.dev/rate-limit-rps: "1"
     ingress.coxswain-labs.dev/rate-limit-by: "header:X-Api-Key"
-    ingress.coxswain-labs.dev/auth-basic-secret: "auth-htpasswd-bcrypt-only"
+    ingress.coxswain-labs.dev/auth-basic-secret: "${TESTNS}/auth-htpasswd-bcrypt-only"
 spec:
   ingressClassName: coxswain
   rules:
