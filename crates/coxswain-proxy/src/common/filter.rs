@@ -11,6 +11,26 @@ static X_PROXY_ENGINE: LazyLock<HeaderValue> =
 use pingora_core::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 
+/// Headers the proxy unconditionally strips from every upstream request.
+///
+/// The proxy **owns** these headers: it strips whatever the downstream client
+/// sent and, when PROXY-protocol is active, replaces `Forwarded` with a
+/// proxy-generated value derived from the real client address.  Passing
+/// client-supplied values through would allow any external client to spoof the
+/// IP / protocol seen by the backend, undermining access-control and audit
+/// decisions.  Never extend this list with headers the proxy does not itself
+/// set; strip-without-replace is the safe default for unknown infrastructure
+/// headers.
+static CLIENT_FORWARDING_HEADERS: std::sync::LazyLock<[http::HeaderName; 4]> =
+    std::sync::LazyLock::new(|| {
+        [
+            http::HeaderName::from_static("forwarded"),
+            http::HeaderName::from_static("x-forwarded-for"),
+            http::HeaderName::from_static("x-forwarded-proto"),
+            http::HeaderName::from_static("x-real-ip"),
+        ]
+    });
+
 /// Applies Gateway-API and Ingress filter actions to the in-flight request
 /// and response headers, plus the fixed `X-Proxy-Engine` and RFC-7239
 /// `Forwarded` infrastructure headers.
@@ -18,6 +38,21 @@ use pingora_http::{RequestHeader, ResponseHeader};
 pub struct TrafficFilter;
 
 impl TrafficFilter {
+    /// Strip client-supplied forwarding headers from the upstream request.
+    ///
+    /// Called unconditionally in [`super::hooks::upstream_request_filter`]
+    /// **before** any operator filter or proxy-generated header insertion runs.
+    /// This ensures client-injected values for `Forwarded`, `X-Forwarded-For`,
+    /// `X-Forwarded-Proto`, and `X-Real-IP` never reach the backend regardless
+    /// of whether PROXY protocol is enabled.
+    ///
+    /// Zero allocations — `remove_header` is an in-place map removal.
+    pub(crate) fn strip_client_forwarding_headers(upstream_request: &mut RequestHeader) {
+        for name in CLIENT_FORWARDING_HEADERS.iter() {
+            upstream_request.remove_header(name);
+        }
+    }
+
     /// Apply request-side filters (header modifiers and URL rewrites), then
     /// stamp the fixed infrastructure headers.
     ///
@@ -162,9 +197,44 @@ pub(crate) fn rewrite_path(req: &mut RequestHeader, modifier: &PathModifier, ori
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_header_mod, rewrite_path};
+    use super::{TrafficFilter, apply_header_mod, rewrite_path};
     use coxswain_core::routing::HeaderMod;
     use pingora_http::{RequestHeader, ResponseHeader};
+
+    #[test]
+    fn strip_removes_all_client_forwarding_headers() {
+        let mut r = RequestHeader::build("GET", b"/", None).unwrap();
+        r.insert_header("forwarded", "for=1.2.3.4;by=evil").unwrap();
+        r.insert_header("x-forwarded-for", "1.2.3.4").unwrap();
+        r.insert_header("x-forwarded-proto", "https").unwrap();
+        r.insert_header("x-real-ip", "1.2.3.4").unwrap();
+        // Unrelated header must survive the strip.
+        r.insert_header("x-custom-app", "keep-me").unwrap();
+
+        TrafficFilter::strip_client_forwarding_headers(&mut r);
+
+        assert!(
+            r.headers.get("forwarded").is_none(),
+            "forwarded must be stripped"
+        );
+        assert!(
+            r.headers.get("x-forwarded-for").is_none(),
+            "x-forwarded-for must be stripped"
+        );
+        assert!(
+            r.headers.get("x-forwarded-proto").is_none(),
+            "x-forwarded-proto must be stripped"
+        );
+        assert!(
+            r.headers.get("x-real-ip").is_none(),
+            "x-real-ip must be stripped"
+        );
+        assert_eq!(
+            r.headers.get("x-custom-app").map(|v| v.as_bytes()),
+            Some(b"keep-me".as_ref()),
+            "unrelated header must survive"
+        );
+    }
 
     fn req() -> RequestHeader {
         let mut r = RequestHeader::build("GET", b"/original/path?q=1", None).unwrap();
