@@ -17,8 +17,15 @@ prost         = { workspace = true }
 regex         = { workspace = true }
 sha2          = { workspace = true }
 thiserror     = { workspace = true }
+tokio         = { workspace = true }
+tokio-stream  = { workspace = true }
 tonic         = { workspace = true }
 tonic-prost   = { workspace = true }
+tracing       = { workspace = true }
+
+[dev-dependencies]
+async-trait   = { workspace = true }
+tokio         = { workspace = true }
 
 [build-dependencies]
 protox            = { workspace = true }
