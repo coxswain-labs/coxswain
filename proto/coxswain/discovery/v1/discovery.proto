@@ -2,17 +2,19 @@ syntax = "proto3";
 
 package coxswain.discovery.v1;
 
-/// Bidirectional gRPC stream between a discovery client and the controller.
-///
-/// The client sends a `Subscribe` once to declare scope, then `Ack`/`Nack` after
-/// each snapshot. The server sends `Snapshot` messages as the routing world
-/// changes. Envelopes are extensible `oneof`s — future message types (relay
-/// telemetry, drain commands) can be added without a wire break.
+// Bidirectional gRPC stream between a discovery client and the controller.
+//
+// The client sends a Subscribe once to declare scope, then Ack/Nack after each
+// snapshot.  The server sends Snapshot messages as the routing world changes.
+// Envelopes are extensible oneofs — future message types (relay telemetry,
+// drain commands) can be added without a wire break.
 service Discovery {
   rpc Stream(stream ClientMessage) returns (stream ServerMessage);
 }
 
-// --- client → server ---------------------------------------------------------
+// ────────────────────────────────────────────────────────────────────────────
+// Client → server
+// ────────────────────────────────────────────────────────────────────────────
 
 message ClientMessage {
   oneof kind {
@@ -24,8 +26,18 @@ message ClientMessage {
 }
 
 // Declares the scope and protocol version this client speaks.
-// Fields are stubs; fleshed out in T2 (#238).
-message Subscribe {}
+message Subscribe {
+  // Stable identity of the subscribing proxy (pod UID or hostname).
+  string node_id = 1;
+  // Wire protocol version string spoken by this client (e.g. "v1").
+  string wire_version = 2;
+  // Requested scope; currently unused (controller sends everything).
+  Scope scope = 3;
+}
+
+// Scope filter for future per-port / per-namespace narrowing.
+// Empty in v0.5; reserved for v0.6 delta streaming.
+message Scope {}
 
 // Positive acknowledgement: client has applied the snapshot at `version`.
 message Ack {
@@ -40,7 +52,9 @@ message Nack {
   string detail  = 3;
 }
 
-// --- server → client ---------------------------------------------------------
+// ────────────────────────────────────────────────────────────────────────────
+// Server → client
+// ────────────────────────────────────────────────────────────────────────────
 
 message ServerMessage {
   oneof kind {
@@ -50,8 +64,494 @@ message ServerMessage {
 }
 
 // Full state-of-the-world snapshot for the subscribed scope.
-// DTO fields are stubs; fleshed out in T2 (#238).
+//
+// Fields 3–7: per-resource DTOs.  Field 8 is reserved for the removes set
+// that the v0.6 delta streaming layer will populate.
+//
+// Determinism discipline: every `repeated` field that was a map in the runtime
+// type is emitted sorted by key in `to_wire`.  No `map<>` anywhere — proto map
+// encoding order is not guaranteed and would break the content-hash oracle.
 message Snapshot {
-  string version = 1;  // content hash of this scope's DTO
+  string version = 1;  // content hash of this scope's DTO (sha256 hex)
   bytes  nonce   = 2;
+
+  RoutingTable            ingress_routing  = 3;
+  RoutingTable            gateway_routing  = 4;
+  TlsStore                tls_store        = 5;
+  ClientCertStore         client_cert_store = 6;
+  GatewayListenerHealth   listener_health  = 7;
+
+  // reserved 8: repeated string removed_resources — for v0.6 delta streaming.
+  reserved 8;
+  reserved "removed_resources";
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 2a  Routing table DTO
+// ────────────────────────────────────────────────────────────────────────────
+
+message RoutingTable {
+  // Sorted by port ascending.
+  repeated PortEntry ports = 1;
+}
+
+message PortEntry {
+  uint32           port  = 1;  // u16 stored as uint32
+  repeated HostEntry hosts = 2;  // exact hosts, then wildcard, then catchall
+}
+
+// Per-host routing bucket.  Exactly one of `exact`, `wildcard`, or `catchall`
+// is set; the oneof also encodes which PortTableBuilder method to replay.
+message HostEntry {
+  oneof pattern {
+    string         exact    = 1;  // exact hostname
+    WildcardHost wildcard = 2;  // *.suffix entry
+    bool           catchall  = 3;  // true = catch-all bucket
+  }
+  NormalizeLevel     normalize_level = 4;
+  // Routes in insertion order (preserves wire_entries() traversal order).
+  repeated RouteEntry routes = 5;
+}
+
+// Wildcard host bucket discriminated by suffix and matching semantics.
+message WildcardHost {
+  string       suffix = 1;  // e.g. "example.com" (no "*." prefix)
+  WildcardKind kind   = 2;
+}
+
+enum WildcardKind {
+  WILDCARD_KIND_UNSPECIFIED   = 0;
+  WILDCARD_KIND_SINGLE_LABEL  = 1;  // Ingress: only one label before suffix
+  WILDCARD_KIND_MULTI_LABEL   = 2;  // Gateway API: any number of labels
+}
+
+// Mirrors coxswain_core::routing::NormalizeLevel.
+enum NormalizeLevel {
+  NORMALIZE_LEVEL_UNSPECIFIED             = 0;
+  NORMALIZE_LEVEL_NONE                    = 1;  // passthrough
+  NORMALIZE_LEVEL_BASE                    = 2;  // percent-normalise only (default)
+  NORMALIZE_LEVEL_MERGE_SLASHES           = 3;  // collapse repeated /
+  NORMALIZE_LEVEL_DECODE_AND_MERGE_SLASHES = 4; // decode + collapse
+}
+
+// Mirrors coxswain_core::routing::RouteKind.
+enum RouteKind {
+  ROUTE_KIND_UNSPECIFIED = 0;
+  ROUTE_KIND_EXACT       = 1;
+  ROUTE_KIND_PREFIX      = 2;
+  ROUTE_KIND_REGEX       = 3;
+}
+
+// Serialised form of a RouteEntry + the path/kind that registers it.
+// `from_wire` replays the appropriate `add_*_route` builder call.
+message RouteEntry {
+  RouteKind      kind  = 1;  // which add_*_route method to replay
+  string         path  = 2;  // path string, normalised prefix, or regex pattern
+
+  BackendGroup backend_group = 3;
+  MatchPredicates predicates = 4;
+  repeated FilterAction filters = 5;
+  RouteTimeouts timeouts = 6;
+
+  string route_id        = 7;   // "{namespace}/{name}"
+  string metric_route_id = 8;   // prometheus route label
+  optional uint64 created_at_unix_millis = 9;   // SystemTime as ms since epoch
+  optional uint32 error_status = 10;            // non-zero → return this HTTP status
+  optional uint64 max_body_size = 11;           // bytes; absent = no limit
+  repeated string allow_source_range = 12;      // CIDR strings, sorted
+  repeated string deny_source_range  = 13;      // CIDR strings, sorted
+  bool cache_enabled = 14;
+  optional bool access_log_enabled = 15;
+  RateLimitConfig rate_limit = 16;
+  IngressAuthConfig auth = 17;
+  CompressionConfig compression = 18;
+  ForwardedForConfig forwarded_for = 19;
+  CircuitBreakerConfig circuit_breaker = 20;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// BackendGroup DTO
+// ────────────────────────────────────────────────────────────────────────────
+
+// Mirrors BackendGroup + BackendGroupSpec.
+// `from_wire` calls BackendGroup::weighted() with the spec then applies setters.
+message BackendGroup {
+  string                          name             = 1;
+  repeated WeightedBackend     weighted         = 2;  // BackendGroupSpec; construction order
+  BackendProtocol                 protocol         = 3;
+  UpstreamTls                  tls              = 4;
+  RetryPolicy                  retry            = 5;
+  optional uint64                 keepalive_millis = 6;  // absent = Pingora default
+  repeated PerBackendFiltersEntry per_backend_filters = 7;  // index-aligned with `weighted`; sorted by index
+  LoadBalance                  load_balance     = 8;
+  SessionAffinity              session_affinity = 9;
+}
+
+// One weighted backend: its pod addresses and its weight before GCD reduction.
+message WeightedBackend {
+  repeated string addrs  = 1;  // "ip:port" strings, sorted
+  uint32          weight = 2;  // original pre-GCD weight
+}
+
+// Per-backend filter list slot.  Index identifies which WeightedBackend
+// it belongs to so the flat index alignment can be reconstructed.
+// Only entries with non-empty `filters` are emitted (sparse).
+message PerBackendFiltersEntry {
+  uint32                   backend_index = 1;
+  repeated FilterAction filters       = 2;
+}
+
+// Mirrors BackendProtocol.
+enum BackendProtocol {
+  BACKEND_PROTOCOL_UNSPECIFIED  = 0;
+  BACKEND_PROTOCOL_HTTP1        = 1;
+  BACKEND_PROTOCOL_H2C          = 2;
+  BACKEND_PROTOCOL_WEB_SOCKET   = 3;
+  BACKEND_PROTOCOL_HTTPS        = 4;
+  BACKEND_PROTOCOL_WEB_SOCKET_TLS = 5;
+}
+
+// Mirrors UpstreamTls.
+message UpstreamTls {
+  string sni = 1;
+  oneof ca {
+    bool   system = 2;  // true = use OS trust store
+    bytes  bundle = 3;  // PEM bytes
+  }
+  uint64 group_key = 4;
+}
+
+// Mirrors RetryPolicy.
+message RetryPolicy {
+  uint32 max_retries        = 1;
+  bool   on_connect_failure = 2;
+  bool   on_timeout         = 3;
+  bool   on_http_5xx        = 4;
+}
+
+// Mirrors LoadBalance + HashSource.
+message LoadBalance {
+  oneof algorithm {
+    bool          round_robin  = 1;  // present = RoundRobin
+    bool          least_conn   = 2;  // present = LeastConn
+    bool          ewma         = 3;  // present = Ewma
+    HashSource hash         = 4;  // Hash(source)
+  }
+}
+
+// Mirrors HashSource.
+message HashSource {
+  oneof source {
+    bool   uri       = 1;  // Uri
+    bool   source_ip = 2;  // SourceIp
+    string header    = 3;  // Header(name)
+    string cookie    = 4;  // Cookie(name)
+  }
+}
+
+// Mirrors SessionAffinity.
+message SessionAffinity {
+  oneof mode {
+    string cookie_name = 1;  // Cookie { cookie_name }
+    string header      = 2;  // Header { header }
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Filter actions
+// ────────────────────────────────────────────────────────────────────────────
+
+// Mirrors FilterAction.
+message FilterAction {
+  oneof action {
+    HeaderMod        request_header_modifier  = 1;
+    HeaderMod        response_header_modifier = 2;
+    RequestRedirect  request_redirect         = 3;
+    UrlRewrite       url_rewrite              = 4;
+    BackendGroup     mirror                   = 5;  // Mirror { backend }
+  }
+}
+
+// Mirrors HeaderMod — raw strings; from_wire calls HeaderMod::parse.
+message HeaderMod {
+  repeated HeaderPair add    = 1;
+  repeated HeaderPair set    = 2;
+  repeated string        remove = 3;
+}
+
+message HeaderPair {
+  string name  = 1;
+  string value = 2;
+}
+
+// Mirrors FilterAction::RequestRedirect.
+message RequestRedirect {
+  optional string       scheme      = 1;
+  optional string       hostname    = 2;
+  optional uint32       port        = 3;  // u16
+  uint32                status_code = 4;  // default 302
+  PathModifier       path        = 5;
+}
+
+// Mirrors FilterAction::UrlRewrite.
+message UrlRewrite {
+  optional string  hostname = 1;
+  PathModifier  path     = 2;
+}
+
+// Mirrors PathModifier.
+message PathModifier {
+  oneof modifier {
+    string               replace_full_path   = 1;
+    ReplacePrefix     replace_prefix      = 2;
+    RegexReplace      regex_replace       = 3;
+  }
+}
+
+message ReplacePrefix {
+  string prefix      = 1;
+  string replacement = 2;
+}
+
+// Regex pattern stored as a string; from_wire recompiles with Regex::new.
+message RegexReplace {
+  string pattern     = 1;  // Regex::as_str() — the source string, not flags
+  string replacement = 2;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Predicates
+// ────────────────────────────────────────────────────────────────────────────
+
+// Mirrors MatchPredicates.
+message MatchPredicates {
+  optional string             method  = 1;   // HTTP method string
+  repeated HeaderPredicate headers = 2;
+  repeated QueryPredicate  query   = 3;
+}
+
+// Mirrors HeaderPredicate.
+message HeaderPredicate {
+  string        name    = 1;
+  ValueMatch matcher = 2;
+}
+
+// Mirrors QueryPredicate.
+message QueryPredicate {
+  string        name    = 1;
+  ValueMatch matcher = 2;
+}
+
+// Mirrors ValueMatch (Exact and Regex only; Prefix/Present are not supported).
+message ValueMatch {
+  oneof match {
+    string exact  = 1;  // Exact(value)
+    string regex  = 3;  // Regex(pattern string); from_wire recompiles
+  }
+  reserved 2, 4;
+  reserved "prefix", "present";
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Timeouts
+// ────────────────────────────────────────────────────────────────────────────
+
+// Mirrors RouteTimeouts.  All fields optional; absent = disabled.
+message RouteTimeouts {
+  Duration request         = 1;
+  Duration backend_request = 2;
+  Duration connect         = 3;
+  Duration read            = 4;
+  Duration send            = 5;
+}
+
+// A Duration encoded as (secs, nanos) — avoids float and the protobuf well-known
+// Duration type (which requires google/protobuf/duration.proto).
+message Duration {
+  uint64 secs  = 1;
+  uint32 nanos = 2;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Per-route config DTOs
+// ────────────────────────────────────────────────────────────────────────────
+
+// Mirrors RateLimitConfig.
+message RateLimitConfig {
+  uint32         requests_per_second = 1;  // NonZeroU32; 0 absent → field not set
+  uint32         burst               = 2;
+  RateLimitKey key                = 3;
+}
+
+// Mirrors RateLimitKey.
+message RateLimitKey {
+  oneof key {
+    bool   client_ip = 1;  // true = ClientIp
+    string header    = 2;  // Header(name)
+  }
+}
+
+// Mirrors IngressAuthConfig.
+message IngressAuthConfig {
+  oneof auth {
+    ExtAuthConfig  external    = 1;
+    BasicCredList  basic       = 2;  // wrapped in a message to allow repeated inside oneof
+    bool              unavailable = 3;
+  }
+}
+
+// Wrapper for the repeated basic credentials list (proto oneof cannot hold repeated directly).
+message BasicCredList {
+  repeated BasicCred credentials = 1;
+}
+
+// Mirrors ExtAuthConfig.
+// ExtAuthTransport has one variant (Http) so the HttpExtAuthConfig is embedded directly.
+message ExtAuthConfig {
+  Duration          timeout   = 1;
+  HttpExtAuthConfig http      = 2;  // always Http for now; field number reserved for future variants
+}
+
+// Mirrors HttpExtAuthConfig.
+message HttpExtAuthConfig {
+  string          url              = 1;
+  repeated string response_headers = 2;
+  bool            always_set_cookie = 3;
+}
+
+// BasicCredential with the password hash.
+message BasicCred {
+  string        username  = 1;
+  PasswordHash  hash_kind = 2;
+  string        hash      = 3;   // bcrypt hash string or SHA1 base64 digest
+}
+
+enum PasswordHash {
+  PASSWORD_HASH_UNSPECIFIED = 0;
+  PASSWORD_HASH_BCRYPT      = 1;
+  PASSWORD_HASH_SHA1        = 2;
+}
+
+// Mirrors CompressionConfig.
+message CompressionConfig {
+  bool            gzip     = 1;
+  bool            brotli   = 2;
+  uint32          level    = 3;
+  uint64          min_size = 4;
+  repeated string types    = 5;  // sorted for determinism
+}
+
+// Mirrors ForwardedForConfig.
+message ForwardedForConfig {
+  string          header        = 1;
+  repeated string trusted_cidrs = 2;  // CIDR strings, sorted
+}
+
+// Mirrors CircuitBreakerConfig.
+message CircuitBreakerConfig {
+  uint32      threshold_pct      = 1;  // 1–100
+  uint32      min_requests       = 2;
+  Duration window             = 3;
+  Duration open_duration      = 4;
+  Duration max_open_duration  = 5;  // absent = constant backoff (None)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 2b  TLS store DTO
+// ────────────────────────────────────────────────────────────────────────────
+
+// Mirrors TlsStore.  Sorted by host pattern ascending.
+message TlsStore {
+  repeated TlsCertEntry exact    = 1;
+  repeated TlsCertEntry wildcard = 2;  // suffix without "*." prefix; sorted
+  TlsCert            default  = 3;  // absent = no default cert
+}
+
+message TlsCertEntry {
+  string     host_pattern = 1;  // exact hostname or bare suffix
+  TlsCert cert         = 2;
+}
+
+message TlsCert {
+  bytes  cert_pem  = 1;
+  bytes  key_pem   = 2;
+  string source    = 3;
+  optional uint64 not_after_unix_secs = 4;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 2b  Client-cert (mTLS) store DTO
+// ────────────────────────────────────────────────────────────────────────────
+
+// Mirrors ClientCertStore.  Sorted by host pattern ascending.
+message ClientCertStore {
+  repeated ClientCertEntry exact    = 1;
+  repeated ClientCertEntry wildcard = 2;
+  ClientCertConfigState default  = 3;
+}
+
+message ClientCertEntry {
+  string                   host_pattern = 1;
+  ClientCertConfigState state        = 2;
+}
+
+message ClientCertConfigState {
+  oneof state {
+    ClientCertConfig config      = 1;  // Config(cfg)
+    bool                unavailable = 2;  // Unavailable
+  }
+}
+
+message ClientCertConfig {
+  bytes  ca_pem           = 1;
+  uint32 verify_depth     = 2;
+  bool   pass_to_upstream = 3;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 2b  Gateway listener health DTO
+// ────────────────────────────────────────────────────────────────────────────
+
+// Mirrors the HashMap<ObjectKey, GatewayListenerHealth>.
+// Sorted by object key ascending for determinism.
+message GatewayListenerHealth {
+  repeated GatewayHealthEntry entries = 1;
+}
+
+message GatewayHealthEntry {
+  string              object_key = 1;  // "{namespace}/{name}"
+  ListenerHealth   health     = 2;
+}
+
+// Mirrors GatewayListenerHealth.
+// BTreeMap<String, ListenerInfo> → already sorted by listener name.
+message ListenerHealth {
+  repeated ListenerInfoEntry listeners = 1;
+}
+
+message ListenerInfoEntry {
+  string          name = 1;
+  ListenerInfo info = 2;
+}
+
+// Mirrors ListenerInfo.
+message ListenerInfo {
+  ListenerTlsOutcome tls_outcome           = 1;
+  // Human-readable message from ListenerTlsOutcome failure variants.
+  // Empty for NotApplicable and Resolved.
+  string             tls_message           = 2;
+  int32              attached_routes       = 3;
+  string             hostname              = 4;
+  bool               allows_all_namespaces = 5;
+  uint32             port                  = 6;  // u16
+}
+
+// Mirrors ListenerTlsOutcome.
+enum ListenerTlsOutcome {
+  LISTENER_TLS_OUTCOME_UNSPECIFIED            = 0;
+  LISTENER_TLS_OUTCOME_NOT_APPLICABLE         = 1;
+  LISTENER_TLS_OUTCOME_RESOLVED               = 2;
+  LISTENER_TLS_OUTCOME_REF_NOT_PERMITTED      = 3;
+  LISTENER_TLS_OUTCOME_INVALID_CERTIFICATE_REF = 4;
+  LISTENER_TLS_OUTCOME_INVALID                = 5;
 }

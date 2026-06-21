@@ -18,8 +18,8 @@ pub use common::auth::{
     PasswordHash,
 };
 pub use common::backend::{
-    BackendGroup, HashSource, LoadBalance, Selected, SessionAffinity, affinity_hash,
-    affinity_hash_parts, affinity_token,
+    BackendGroup, BackendGroupSpec, HashSource, LoadBalance, Selected, SessionAffinity,
+    affinity_hash, affinity_hash_parts, affinity_token,
 };
 pub use common::circuit_breaker::CircuitBreakerConfig;
 pub use common::compression::CompressionConfig;
@@ -32,7 +32,7 @@ pub use common::host_router::{
     HostRouter, HostRouterBuilder, RouteMatch, WildcardKind, compile_path_regex,
 };
 pub use common::path_normalize::NormalizeLevel;
-pub use common::port::PortTableBuilder;
+pub use common::port::{HostPattern, PortRoutingTable, PortTableBuilder};
 pub use common::predicate::{
     HeaderPredicate, MatchPredicates, QueryPredicate, RequestContext, ValueMatch,
 };

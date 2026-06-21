@@ -505,17 +505,15 @@ mod tests {
 
     fn listener_health_with_routes(routes: i32) -> GatewayListenerHealth {
         let mut listeners = BTreeMap::new();
-        listeners.insert(
-            "default".to_string(),
-            ListenerInfo {
-                attached_routes: routes,
-                hostname: String::new(),
-                allows_all_namespaces: true,
-                port: 80,
-                ..Default::default()
-            },
-        );
-        GatewayListenerHealth { listeners }
+        let mut li = ListenerInfo::default();
+        li.attached_routes = routes;
+        li.hostname = String::new();
+        li.allows_all_namespaces = true;
+        li.port = 80;
+        listeners.insert("default".to_string(), li);
+        let mut glh = GatewayListenerHealth::default();
+        glh.listeners = listeners;
+        glh
     }
 
     fn ingress(
@@ -919,19 +917,15 @@ mod tests {
     use coxswain_core::cluster::Severity;
 
     fn listener(name: &str, outcome: ListenerTlsOutcome) -> (String, ListenerInfo) {
-        (
-            name.to_string(),
-            ListenerInfo {
-                tls_outcome: outcome,
-                ..Default::default()
-            },
-        )
+        let mut li = ListenerInfo::default();
+        li.tls_outcome = outcome;
+        (name.to_string(), li)
     }
 
     fn health_with(listeners: Vec<(String, ListenerInfo)>) -> GatewayListenerHealth {
-        GatewayListenerHealth {
-            listeners: listeners.into_iter().collect(),
-        }
+        let mut glh = GatewayListenerHealth::default();
+        glh.listeners = listeners.into_iter().collect();
+        glh
     }
 
     #[test]

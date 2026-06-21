@@ -146,6 +146,12 @@ pub fn compile_path_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
     regex::Regex::new(pattern)
 }
 
+/// One entry in the cold wire side-table: `(path_pattern, kind, entry)`.
+///
+/// A type alias keeps the `HostRouter.wire_table` field from tripping
+/// `clippy::type_complexity` while remaining self-documenting at use sites.
+pub(crate) type WireTableEntry = (Box<str>, RouteKind, Arc<RouteEntry>);
+
 /// Compiled path router for a single hostname, supporting exact, prefix, and regex patterns.
 #[non_exhaustive]
 pub struct HostRouter {
@@ -156,6 +162,15 @@ pub struct HostRouter {
     /// Path normalization level applied before every routing lookup and retained
     /// as the forwarded path.  Defaults to [`NormalizeLevel::Base`].
     normalize: NormalizeLevel,
+    /// Cold side-table of every registered route entry, in insertion order.
+    ///
+    /// Retained so the discovery wire layer can enumerate `(path, kind, entry)` tuples
+    /// for serialisation — the primary `matchit::Router` and `regex_routes` are sealed
+    /// behind compiled automata and cannot be iterated.  Never read on the request hot
+    /// path.  Prefix entries store the **normalised** prefix (trailing slash stripped),
+    /// identical to what `add_prefix_route` passes to matchit.  Replaying
+    /// `add_prefix_route` with the same normalised value is a fixpoint.
+    wire_table: Box<[WireTableEntry]>,
 }
 
 impl HostRouter {
@@ -166,10 +181,27 @@ impl HostRouter {
 
     /// Path normalization level in effect for this host.
     ///
-    /// Read by [`super::port::PortRoutingTable::find`] to normalize the request
-    /// path once, before the routing lookup.
-    pub(super) fn normalize_level(&self) -> NormalizeLevel {
+    /// Exposed for the discovery wire layer so `to_wire` can serialise the
+    /// `set_path_normalize` setting and `from_wire` can replay it via
+    /// [`HostRouterBuilder::set_path_normalize`].
+    pub fn normalize(&self) -> NormalizeLevel {
         self.normalize
+    }
+
+    /// Iterate every registered route entry in insertion order.
+    ///
+    /// Each item is `(path_or_pattern, kind, entry)` where:
+    /// - `Exact` — exact path string as registered.
+    /// - `Prefix` — normalised prefix (trailing slash stripped, root `"/"` preserved).
+    ///   Replaying `add_prefix_route` with this value is idempotent.
+    /// - `Regex` — pattern string, recoverable via [`regex::Regex::as_str`].
+    ///
+    /// Used exclusively by the discovery wire layer (`to_wire`).  Never called on the
+    /// request hot path.
+    pub fn wire_entries(&self) -> impl Iterator<Item = (&str, RouteKind, &Arc<RouteEntry>)> {
+        self.wire_table
+            .iter()
+            .map(|(path, kind, entry)| (path.as_ref(), *kind, entry))
     }
 
     /// Resolves `path` to an upstream, filters, and timeouts, applying predicates from `ctx`.
@@ -417,6 +449,9 @@ impl HostRouterBuilder {
     ) -> Result<(HostRouter, Vec<RouteConflict>), super::table::RouterError> {
         let mut router: Router<Box<[Arc<RouteEntry>]>> = Router::new();
         let mut route_info: Vec<RouteInfo> = Vec::new();
+        // Cold side-table for the wire layer — accumulates (path, kind, entry) in
+        // the same insertion order as `route_info`.
+        let mut wire_table: Vec<(Box<str>, RouteKind, Arc<RouteEntry>)> = Vec::new();
         let mut conflicts: Vec<RouteConflict> = Vec::new();
         let mut has_query_predicates = false;
 
@@ -438,6 +473,11 @@ impl HostRouterBuilder {
                     backend_group: Arc::clone(&e.backend_group),
                     route_id: e.route_id.clone(),
                 });
+                wire_table.push((
+                    path.clone().into_boxed_str(),
+                    RouteKind::Exact,
+                    Arc::clone(e),
+                ));
             }
             let frozen = sort_and_freeze(entries);
             conflicts.extend(dup_conflicts(&path, RouteKind::Exact, &frozen));
@@ -482,6 +522,12 @@ impl HostRouterBuilder {
                     backend_group: Arc::clone(&e.backend_group),
                     route_id: e.route_id.clone(),
                 });
+                // Store normalised prefix so replaying add_prefix_route is a fixpoint.
+                wire_table.push((
+                    path.clone().into_boxed_str(),
+                    RouteKind::Prefix,
+                    Arc::clone(e),
+                ));
             }
             let frozen = sort_and_freeze(entries);
             conflicts.extend(dup_conflicts(&path, RouteKind::Prefix, &frozen));
@@ -530,6 +576,13 @@ impl HostRouterBuilder {
                     backend_group: Arc::clone(&e.backend_group),
                     route_id: e.route_id.clone(),
                 });
+                // Regex pattern string is preserved verbatim; from_wire calls
+                // Regex::new(pattern) to recompile it.
+                wire_table.push((
+                    pattern.clone().into_boxed_str(),
+                    RouteKind::Regex,
+                    Arc::clone(e),
+                ));
             }
             // RegexSet::new already validates the pattern; the second compile is redundant.
             let set = RegexSet::new([&pattern])?;
@@ -544,6 +597,7 @@ impl HostRouterBuilder {
                 has_query_predicates,
                 route_info,
                 normalize: self.normalize.unwrap_or_default(),
+                wire_table: wire_table.into_boxed_slice(),
             },
             conflicts,
         ))

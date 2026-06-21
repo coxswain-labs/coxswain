@@ -15,12 +15,29 @@ use std::sync::Arc;
 
 use super::backend::BackendGroup;
 
+/// How a host selector is represented in the wire view of a routing table.
+///
+/// Mirrors the three host-bucket kinds in [`PortTableBuilder`] so the discovery
+/// wire layer can round-trip hostname class through `to_wire` / `from_wire`
+/// without losing the wildcard kind.
+#[non_exhaustive]
+pub enum HostPattern<'a> {
+    /// An exact hostname, e.g. `"api.example.com"`.
+    Exact(&'a str),
+    /// A wildcard pattern, e.g. `"*.example.com"` (suffix stored without `*.` prefix),
+    /// along with the label-matching semantics.
+    Wildcard(&'a str, WildcardKind),
+    /// The catch-all `"*"` host bucket.
+    Catchall,
+}
+
 /// Per-port routing bucket: the host+path+predicate logic for one listener port.
 ///
 /// Shared between Ingress and Gateway-API top-level routing tables — the per-rule
 /// matching machinery is identical; only the top-level container distinguishes
 /// the two specs at the type level.
-pub(crate) struct PortRoutingTable {
+#[non_exhaustive]
+pub struct PortRoutingTable {
     pub(crate) exact_hosts: HashMap<String, HostRouter>,
     /// Sorted most-specific (longest suffix) first; `SingleLabel` before `MultiLabel` on ties.
     pub(crate) wildcard_hosts: Vec<(String, WildcardKind, HostRouter)>,
@@ -47,7 +64,7 @@ impl PortRoutingTable {
         // `Borrowed` on the common (already-canonical) path costs one linear
         // scan and zero allocation; `Owned` allocates exactly one `String` only
         // when the path actually changes.
-        let normalized: Cow<str> = router.normalize_level().apply(path);
+        let normalized: Cow<str> = router.normalize().apply(path);
 
         match router.route(&normalized, ctx) {
             Some(mut m) => {
@@ -104,6 +121,26 @@ impl PortRoutingTable {
             result.push(("*".to_string(), router));
         }
         result
+    }
+
+    /// Iterate every host bucket with its [`HostPattern`] discriminator, in
+    /// canonical order: exact hosts (unspecified), wildcard hosts (sorted
+    /// longest-suffix first), catchall last.
+    ///
+    /// Used by the discovery wire layer to enumerate the full routing table for
+    /// serialisation (`to_wire`).  The `from_wire` counterpart replays the same
+    /// ordering via [`PortTableBuilder::host_for`].
+    pub fn host_views(&self) -> impl Iterator<Item = (HostPattern<'_>, &HostRouter)> {
+        let exact = self
+            .exact_hosts
+            .iter()
+            .map(|(h, r)| (HostPattern::Exact(h.as_str()), r));
+        let wildcard = self
+            .wildcard_hosts
+            .iter()
+            .map(|(suffix, kind, r)| (HostPattern::Wildcard(suffix.as_str(), *kind), r));
+        let catchall = self.catchall.iter().map(|r| (HostPattern::Catchall, r));
+        exact.chain(wildcard).chain(catchall)
     }
 }
 

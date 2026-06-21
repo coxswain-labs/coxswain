@@ -903,6 +903,21 @@ impl RouteEntry {
         self
     }
 
+    /// Set the error status code for this route (builder-style).
+    ///
+    /// When `Some(code)`, the proxy returns `code` immediately without contacting the
+    /// upstream — used for routes with invalid/missing/forbidden backend refs
+    /// (Gateway API §4.3.4) and for redirect-only entries that need a non-default code.
+    /// `None` (the default from every constructor) means normal forwarding.
+    ///
+    /// The discovery wire layer uses this setter to round-trip routes that have an
+    /// `error_status` set at reconcile time.
+    #[must_use]
+    pub fn with_error_status(mut self, status: Option<u16>) -> Self {
+        self.error_status = status;
+        self
+    }
+
     /// Set per-route response-compression config for this route (builder-style).
     ///
     /// Used by the Ingress reconciler to attach the config parsed from the

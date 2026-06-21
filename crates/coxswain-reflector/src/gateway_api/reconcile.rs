@@ -636,19 +636,18 @@ impl GatewayApiReconciler {
                 .and_then(|ns| ns.from.as_ref())
                 .map(|f| !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same))
                 .unwrap_or(false); // default per spec is Same
-            listeners.insert(
-                listener.name.clone(),
-                ListenerInfo {
-                    tls_outcome,
-                    attached_routes: 0,
-                    hostname,
-                    allows_all_namespaces,
-                    port: listener.port as u16,
-                },
-            );
+            let mut li = ListenerInfo::default();
+            li.tls_outcome = tls_outcome;
+            li.attached_routes = 0;
+            li.hostname = hostname;
+            li.allows_all_namespaces = allows_all_namespaces;
+            li.port = listener.port as u16;
+            listeners.insert(listener.name.clone(), li);
         }
 
-        GatewayListenerHealth { listeners }
+        let mut glh = GatewayListenerHealth::default();
+        glh.listeners = listeners;
+        glh
     }
 }
 

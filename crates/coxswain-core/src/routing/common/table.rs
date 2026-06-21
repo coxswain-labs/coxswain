@@ -140,6 +140,15 @@ impl<Kind> RoutingTable<Kind> {
             .map(|pt| pt.exact_hosts.len() + pt.wildcard_hosts.len())
             .sum()
     }
+
+    /// Iterate every `(port, PortRoutingTable)` pair, in unspecified port order.
+    ///
+    /// Used by the discovery wire layer (`to_wire`) to enumerate the full routing
+    /// table for serialisation — the proto DTO sorts by port, so callers may sort
+    /// the iterator output by key before encoding.
+    pub fn ports(&self) -> impl Iterator<Item = (u16, &PortRoutingTable)> {
+        self.by_port.iter().map(|(p, t)| (*p, t))
+    }
 }
 
 /// Builds an immutable [`RoutingTable`] keyed by listener port.
