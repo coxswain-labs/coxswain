@@ -1251,6 +1251,57 @@ async fn proxy_generated_forwarded_reaches_backend_and_overrides_spoof() -> anyh
     Ok(())
 }
 
+/// A `RequestHeaderModifier` that attempts to `set` a proxy-owned forwarding header
+/// must be silently ignored (#410). The strip-before-filters step (#409) removes any
+/// client-supplied value; the modifier must not re-add it.
+///
+/// Also asserts no over-blocking: a custom header (`X-Team-Header`) in the same
+/// modifier reaches the backend unchanged.
+#[tokio::test]
+async fn request_header_modifier_cannot_inject_blocked_forwarding_header() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sec-hdr-deny").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::FILTERS, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("echo.{}.local", ns.name);
+    wait::wait_for_route(
+        &h.gateway_http,
+        &host,
+        "/filter/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // `get` fails on non-2xx, so receiving an EchoResponse confirms the backend replied 200.
+    let echo = h.gateway_http.get(&host, "/filter/blocked-header").await?;
+
+    // X-Forwarded-For injected by the RequestHeaderModifier must be absent —
+    // the proxy denies operator-set forwarding headers to prevent trust-signal spoofing.
+    anyhow::ensure!(
+        !echo.headers.contains_key("X-Forwarded-For"),
+        "X-Forwarded-For (value 10.0.0.1) leaked through to the backend — \
+         RequestHeaderModifier must not be able to inject proxy-owned headers (#410)"
+    );
+
+    // X-Team-Header is a non-blocked custom header set in the same modifier;
+    // it must reach the backend to prove the deny-list does not over-block.
+    let team = echo
+        .headers
+        .get("X-Team-Header")
+        .and_then(|v| v[0].as_str())
+        .unwrap_or("");
+    anyhow::ensure!(
+        team == "keep-me",
+        "X-Team-Header must survive RequestHeaderModifier (no over-blocking): \
+         expected \"keep-me\", got {team:?} (#410)"
+    );
+
+    Ok(())
+}
+
 /// Make one raw TCP request (write `preamble` then the HTTP request) and return the
 /// response `(status_code, body)`.
 async fn raw_http_status(

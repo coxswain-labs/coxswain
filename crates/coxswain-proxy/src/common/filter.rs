@@ -11,16 +11,16 @@ static X_PROXY_ENGINE: LazyLock<HeaderValue> =
 use pingora_core::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 
-/// Headers the proxy unconditionally strips from every upstream request.
+/// Headers the proxy unconditionally owns on every upstream request.
 ///
-/// The proxy **owns** these headers: it strips whatever the downstream client
-/// sent and, when PROXY-protocol is active, replaces `Forwarded` with a
-/// proxy-generated value derived from the real client address.  Passing
-/// client-supplied values through would allow any external client to spoof the
-/// IP / protocol seen by the backend, undermining access-control and audit
-/// decisions.  Never extend this list with headers the proxy does not itself
-/// set; strip-without-replace is the safe default for unknown infrastructure
-/// headers.
+/// The proxy strips whatever the downstream client sent and, when PROXY-protocol
+/// is active, replaces `Forwarded` with a proxy-generated value derived from the
+/// real client address.  Route operators must also not re-inject these headers via
+/// `RequestHeaderModifier` filters — `apply_header_mod` skips `set`/`add` operations
+/// for any name in this list when called on the request path (#409, #410).
+///
+/// Never extend this list with headers the proxy does not itself set;
+/// strip-without-replace is the safe default for unknown infrastructure headers.
 static CLIENT_FORWARDING_HEADERS: std::sync::LazyLock<[http::HeaderName; 4]> =
     std::sync::LazyLock::new(|| {
         [
@@ -30,6 +30,15 @@ static CLIENT_FORWARDING_HEADERS: std::sync::LazyLock<[http::HeaderName; 4]> =
             http::HeaderName::from_static("x-real-ip"),
         ]
     });
+
+/// Returns `true` when `name` is a proxy-owned forwarding header that neither
+/// clients nor route operators may inject.
+///
+/// Used by [`apply_header_mod`] to gate `set`/`add` operations on the request
+/// path — the `remove` operation is always allowed.
+pub(crate) fn is_owned_forwarding_header(name: &http::HeaderName) -> bool {
+    CLIENT_FORWARDING_HEADERS.iter().any(|h| h == name)
+}
 
 /// Applies Gateway-API and Ingress filter actions to the in-flight request
 /// and response headers, plus the fixed `X-Proxy-Engine` and RFC-7239
@@ -73,7 +82,7 @@ impl TrafficFilter {
         for filter in filters {
             match filter {
                 FilterAction::RequestHeaderModifier(m) => {
-                    apply_header_mod(upstream_request, m, "RequestHeaderModifier");
+                    apply_header_mod(upstream_request, m, is_owned_forwarding_header);
                 }
                 FilterAction::UrlRewrite { hostname, path } => {
                     if let Some(h) = hostname {
@@ -125,7 +134,7 @@ impl TrafficFilter {
     ) {
         for filter in filters {
             if let FilterAction::ResponseHeaderModifier(m) = filter {
-                apply_header_mod(upstream_response, m, "ResponseHeaderModifier");
+                apply_header_mod(upstream_response, m, |_| false);
             }
         }
     }
@@ -161,16 +170,29 @@ impl HeaderTarget for ResponseHeader {
     }
 }
 
+/// Apply a [`HeaderMod`] to `target`, skipping `set`/`add` entries for which
+/// `skip` returns `true`.
+///
+/// On the **request path** pass [`is_owned_forwarding_header`] as `skip` so that
+/// route operators cannot re-inject proxy-owned forwarding headers after the
+/// client-strip step (#409, #410).  On the **response path** pass `|_| false`.
+///
+/// The `remove` loop is never gated — silently removing a blocked header is
+/// harmless and prevents stale values reaching the backend.
 pub(crate) fn apply_header_mod<H: HeaderTarget>(
     target: &mut H,
     m: &HeaderMod,
-    _kind: &'static str,
+    skip: impl Fn(&http::HeaderName) -> bool,
 ) {
     for (name, value) in &m.set {
-        target.hdr_set(name.clone(), value.clone());
+        if !skip(name) {
+            target.hdr_set(name.clone(), value.clone());
+        }
     }
     for (name, value) in &m.add {
-        target.hdr_add(name.clone(), value.clone());
+        if !skip(name) {
+            target.hdr_add(name.clone(), value.clone());
+        }
     }
     for name in &m.remove {
         target.hdr_remove(name);
@@ -197,9 +219,11 @@ pub(crate) fn rewrite_path(req: &mut RequestHeader, modifier: &PathModifier, ori
 
 #[cfg(test)]
 mod tests {
-    use super::{TrafficFilter, apply_header_mod, rewrite_path};
-    use coxswain_core::routing::HeaderMod;
+    use super::{TrafficFilter, apply_header_mod, is_owned_forwarding_header, rewrite_path};
+    use coxswain_core::routing::{FilterAction, HeaderMod};
     use pingora_http::{RequestHeader, ResponseHeader};
+
+    use crate::common::ctx::ProxyCtx;
 
     #[test]
     fn strip_removes_all_client_forwarding_headers() {
@@ -254,7 +278,7 @@ mod tests {
     fn request_header_set_overwrites() {
         let mut r = req();
         let m = hmod(&[], &[("x-keep", "overwritten")], &[]);
-        apply_header_mod(&mut r, &m, "RequestHeaderModifier");
+        apply_header_mod(&mut r, &m, |_| false);
         assert_eq!(r.headers.get("x-keep").unwrap(), "overwritten");
     }
 
@@ -262,7 +286,7 @@ mod tests {
     fn request_header_add_appends() {
         let mut r = req();
         let m = hmod(&[("x-keep", "extra")], &[], &[]);
-        apply_header_mod(&mut r, &m, "RequestHeaderModifier");
+        apply_header_mod(&mut r, &m, |_| false);
         let vals: Vec<_> = r.headers.get_all("x-keep").iter().collect();
         assert_eq!(vals.len(), 2);
     }
@@ -271,7 +295,7 @@ mod tests {
     fn request_header_remove() {
         let mut r = req();
         let m = hmod(&[], &[], &["x-keep"]);
-        apply_header_mod(&mut r, &m, "RequestHeaderModifier");
+        apply_header_mod(&mut r, &m, |_| false);
         assert!(r.headers.get("x-keep").is_none());
     }
 
@@ -280,7 +304,7 @@ mod tests {
         let mut r = resp();
         r.insert_header("x-old", "old").unwrap();
         let m = hmod(&[], &[("x-old", "new")], &[]);
-        apply_header_mod(&mut r, &m, "ResponseHeaderModifier");
+        apply_header_mod(&mut r, &m, |_| false);
         assert_eq!(r.headers.get("x-old").unwrap(), "new");
     }
 
@@ -289,9 +313,138 @@ mod tests {
         let mut r = resp();
         r.insert_header("x-multi", "a").unwrap();
         let m = hmod(&[("x-multi", "b")], &[], &[]);
-        apply_header_mod(&mut r, &m, "ResponseHeaderModifier");
+        apply_header_mod(&mut r, &m, |_| false);
         let vals: Vec<_> = r.headers.get_all("x-multi").iter().collect();
         assert_eq!(vals.len(), 2);
+    }
+
+    // ── Operator deny-list (#410) ──────────────────────────────────────────────
+
+    fn request_filters_with(m: HeaderMod) -> RequestHeader {
+        let ctx = ProxyCtx::default();
+        let mut r = RequestHeader::build("GET", b"/", None).unwrap();
+        let filters = vec![FilterAction::RequestHeaderModifier(m)];
+        TrafficFilter::apply_request_filters(&mut r, &filters, "host.local", "/", &ctx).unwrap();
+        r
+    }
+
+    #[test]
+    fn request_filter_drops_set_of_blocked_forwarding_header() {
+        let m = hmod(&[], &[("x-forwarded-for", "10.0.0.1")], &[]);
+        let r = request_filters_with(m);
+        assert!(
+            r.headers.get("x-forwarded-for").is_none(),
+            "operator RequestHeaderModifier must not inject x-forwarded-for (#410)"
+        );
+    }
+
+    #[test]
+    fn request_filter_drops_add_of_blocked_forwarding_header() {
+        let m = hmod(&[("x-real-ip", "10.0.0.1")], &[], &[]);
+        let r = request_filters_with(m);
+        assert!(
+            r.headers.get("x-real-ip").is_none(),
+            "operator RequestHeaderModifier must not add x-real-ip (#410)"
+        );
+    }
+
+    #[test]
+    fn request_filter_drops_all_four_blocked_headers() {
+        let m = hmod(
+            &[],
+            &[
+                ("forwarded", "for=evil"),
+                ("x-forwarded-for", "1.2.3.4"),
+                ("x-forwarded-proto", "https"),
+                ("x-real-ip", "1.2.3.4"),
+            ],
+            &[],
+        );
+        let r = request_filters_with(m);
+        for h in &[
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-real-ip",
+        ] {
+            assert!(
+                r.headers.get(*h).is_none(),
+                "operator must not inject {h} via RequestHeaderModifier (#410)"
+            );
+        }
+    }
+
+    #[test]
+    fn request_filter_keeps_custom_header_alongside_blocked() {
+        let m = hmod(
+            &[],
+            &[
+                ("x-forwarded-for", "10.0.0.1"),
+                ("x-team-header", "keep-me"),
+            ],
+            &[],
+        );
+        let r = request_filters_with(m);
+        assert!(
+            r.headers.get("x-forwarded-for").is_none(),
+            "blocked header must be dropped (#410)"
+        );
+        assert_eq!(
+            r.headers.get("x-team-header").map(|v| v.as_bytes()),
+            Some(b"keep-me".as_ref()),
+            "custom header must survive alongside the blocked one (#410)"
+        );
+    }
+
+    #[test]
+    fn request_filter_still_stamps_proxy_engine() {
+        let m = hmod(&[], &[("x-forwarded-for", "1.2.3.4")], &[]);
+        let r = request_filters_with(m);
+        assert!(
+            r.headers.get("X-Proxy-Engine").is_some() || r.headers.get("x-proxy-engine").is_some(),
+            "X-Proxy-Engine must be present after a blocked-header modifier (#410)"
+        );
+    }
+
+    #[test]
+    fn response_filter_allows_forwarding_header_name() {
+        // Response modifiers are NOT gated — the deny-list is request-path only.
+        let mut r = resp();
+        let m = hmod(&[], &[("x-forwarded-for", "10.0.0.1")], &[]);
+        let filters = vec![FilterAction::ResponseHeaderModifier(m)];
+        TrafficFilter::apply_response_filters(&mut r, &filters);
+        assert_eq!(
+            r.headers.get("x-forwarded-for").map(|v| v.as_bytes()),
+            Some(b"10.0.0.1".as_ref()),
+            "response-side modifier must be allowed to set forwarding header names (#410)"
+        );
+    }
+
+    #[test]
+    fn is_owned_forwarding_header_recognises_all_four() {
+        for name in &[
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-real-ip",
+        ] {
+            let h = http::HeaderName::from_bytes(name.as_bytes()).unwrap();
+            assert!(
+                is_owned_forwarding_header(&h),
+                "{name} must be recognised as a proxy-owned header (#410)"
+            );
+        }
+    }
+
+    #[test]
+    fn is_owned_forwarding_header_allows_custom_headers() {
+        for name in &["x-team-id", "x-request-id", "x-proxy-engine"] {
+            let h = http::HeaderName::from_bytes(name.as_bytes()).unwrap();
+            assert!(
+                !is_owned_forwarding_header(&h),
+                "{name} must NOT be treated as a proxy-owned header (#410)"
+            );
+        }
     }
 
     #[test]

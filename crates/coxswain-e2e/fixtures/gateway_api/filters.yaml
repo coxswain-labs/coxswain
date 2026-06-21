@@ -90,6 +90,25 @@ spec:
         - name: echo-a
           port: 3000
 
+    # Rule 5: RequestHeaderModifier with a deny-listed header — used by security.rs
+    # to assert that blocked forwarding headers are silently dropped (#410).
+    # X-Team-Header is an allowed custom header included to prove no over-blocking.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /filter/blocked-header
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Forwarded-For
+                value: "10.0.0.1"
+              - name: X-Team-Header
+                value: keep-me
+      backendRefs:
+        - name: echo-a
+          port: 3000
+
     # Probe rule — used by wait_for_route to detect when the HTTPRoute is live.
     - matches:
         - path:
