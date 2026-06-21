@@ -26,6 +26,27 @@ impl ObjectKey {
     }
 }
 
+/// Formats as `"namespace/name"` for use in wire-protocol object keys and log messages.
+impl std::fmt::Display for ObjectKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.ns, self.name)
+    }
+}
+
+/// Parses `"namespace/name"` from a wire-protocol object key.
+///
+/// # Errors
+///
+/// Returns an error if the string does not contain exactly one `/`.
+impl std::str::FromStr for ObjectKey {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (ns, name) = s.split_once('/').ok_or(())?;
+        Ok(Self::new(ns, name))
+    }
+}
+
 /// Shared snapshot of Gateway objects managed by Coxswain.
 pub type OwnedGateways = Shared<HashSet<ObjectKey>>;
 

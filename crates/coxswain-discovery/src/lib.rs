@@ -22,6 +22,6 @@ pub mod subscription;
 pub mod version;
 pub mod wire;
 
-pub use error::DiscoveryError;
+pub use error::{DiscoveryError, WireError};
 pub use subscription::Scope;
 pub use version::ContentHash;

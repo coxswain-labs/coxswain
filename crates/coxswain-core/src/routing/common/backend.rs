@@ -61,6 +61,23 @@ pub enum HashSource {
     Cookie(Arc<str>),
 }
 
+/// The original construction inputs to a [`BackendGroup`], retained for wire serialisation.
+///
+/// Preserved behind an `Arc` on [`BackendGroup`] so the discovery wire layer can
+/// faithfully reconstruct the exact per-backend (addresses, weight) grouping that was
+/// passed to [`BackendGroup::new`] or [`BackendGroup::weighted`].  The spec is never
+/// read on the request hot path — it exists only for `to_wire` and admin introspection.
+#[non_exhaustive]
+pub struct BackendGroupSpec {
+    /// Per-backend (endpoint-addresses, weight) groups, in construction order.
+    ///
+    /// Empty when the group was constructed with all-zero or all-empty backends.
+    /// For [`BackendGroup::new`] this is always `[(all_endpoints, 1)]` (one backend,
+    /// uniform weight). For [`BackendGroup::weighted`] this mirrors the filtered
+    /// (non-zero weight, non-empty addrs) input list with the original pre-GCD weights.
+    pub weighted: Box<[(Box<[SocketAddr]>, u16)]>,
+}
+
 /// Per-route upstream load-balancing algorithm from the
 /// `ingress.coxswain-labs.dev/load-balance` annotation.
 ///
@@ -242,6 +259,12 @@ type PerBackendFilterSlot = Option<Arc<[FilterAction]>>;
 pub struct BackendGroup {
     /// Service identity — used for logging only.
     name: String,
+    /// Original construction inputs — retained for wire-DTO serialisation.
+    ///
+    /// Preserved behind an `Arc` so the discovery wire layer can round-trip the
+    /// per-backend (addresses, weight) grouping, which is otherwise flattened and
+    /// GCD-reduced during construction. Never read on the request hot path.
+    spec: Arc<BackendGroupSpec>,
     /// One entry per non-zero-weight backend ref.
     backends: Box<[BackendPool]>,
     /// Slot array: each entry is an index into `backends`.
@@ -324,11 +347,15 @@ impl BackendGroup {
         if endpoints.is_empty() {
             return Self::empty(name);
         }
+        let spec = Arc::new(BackendGroupSpec {
+            weighted: Box::new([(endpoints.clone().into_boxed_slice(), 1u16)]),
+        });
         let addrs_snapshot = endpoints.clone().into_boxed_slice();
         let slots = vec![0u16].into_boxed_slice();
         let backends = Box::new([BackendPool::new(endpoints)]);
         Self {
             name,
+            spec,
             backends,
             slots,
             slot_counter: AtomicUsize::new(0),
@@ -360,6 +387,14 @@ impl BackendGroup {
             return Self::empty(name);
         }
 
+        // Capture spec BEFORE GCD reduction so original weights are preserved.
+        let spec = Arc::new(BackendGroupSpec {
+            weighted: pools
+                .iter()
+                .map(|(addrs, w)| (addrs.clone().into_boxed_slice(), *w))
+                .collect(),
+        });
+
         let weights: Vec<u16> = pools.iter().map(|(_, w)| *w).collect();
         let reduced = gcd_reduce(&weights);
 
@@ -382,6 +417,7 @@ impl BackendGroup {
 
         Self {
             name,
+            spec,
             backends,
             slots: slots.into_boxed_slice(),
             slot_counter: AtomicUsize::new(0),
@@ -401,6 +437,9 @@ impl BackendGroup {
     fn empty(name: String) -> Self {
         Self {
             name,
+            spec: Arc::new(BackendGroupSpec {
+                weighted: Box::new([]),
+            }),
             backends: Box::new([]),
             slots: Box::new([]),
             slot_counter: AtomicUsize::new(0),
@@ -687,6 +726,43 @@ impl BackendGroup {
     /// `HttpPeer.options.idle_timeout` in `upstream_peer`.
     pub fn keepalive_timeout(&self) -> Option<std::time::Duration> {
         self.keepalive_timeout
+    }
+
+    /// The original construction inputs to this group, for wire-DTO serialisation.
+    ///
+    /// Contains the per-backend (endpoint-addresses, weight) list as passed to
+    /// [`Self::new`] or [`Self::weighted`] (with zero-weight and empty backends
+    /// already filtered out).  The discovery wire layer uses this to faithfully
+    /// round-trip the backend configuration, since weights are GCD-reduced and
+    /// per-backend grouping is flattened in the runtime selection structures.
+    pub fn spec(&self) -> &BackendGroupSpec {
+        &self.spec
+    }
+
+    /// The upstream load-balancing algorithm for this group.
+    ///
+    /// Used by the discovery wire layer to serialise and reconstruct the
+    /// `ingress.coxswain-labs.dev/load-balance` annotation value. Only
+    /// [`LoadBalance::Hash`]'s [`HashSource`] was previously exposed via
+    /// [`Self::hash_by`]; this getter surfaces the full discriminant.
+    pub fn load_balance(&self) -> &LoadBalance {
+        &self.load_balance
+    }
+
+    /// Per-backend request filters attached to this group, if any.
+    ///
+    /// Returns `None` when no per-backend filters were configured (the common case).
+    /// When `Some`, the slice is index-aligned with [`BackendGroupSpec::weighted`] —
+    /// `None` slots are backends without filters; `Some(arc)` shares the filter list
+    /// cheaply with each selection. Used by the discovery wire layer to serialise
+    /// `HTTPRoute.spec.rules[].backendRefs[].filters`.
+    ///
+    /// # Errors (construction)
+    ///
+    /// Empty is normalised to `None` in [`Self::with_per_backend_filters`]; if all
+    /// backends had empty filter lists this returns `None`, not `Some([None, None, …])`.
+    pub fn per_backend_filters(&self) -> Option<&[Option<Arc<[FilterAction]>>]> {
+        self.per_backend_filters.as_deref()
     }
 
     /// Flat list of all pod addresses — used by the admin `/api/v1/routes` endpoint.

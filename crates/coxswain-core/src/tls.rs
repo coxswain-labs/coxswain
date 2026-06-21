@@ -101,6 +101,28 @@ impl TlsStore {
         )
     }
 
+    /// Iterate over all exact-hostname → cert mappings, in unspecified order.
+    ///
+    /// Used by the discovery wire layer to serialise the TLS store.
+    pub fn iter_exact(&self) -> impl Iterator<Item = (&str, &Arc<TlsCert>)> {
+        self.exact.iter().map(|(h, c)| (h.as_str(), c))
+    }
+
+    /// Iterate over all wildcard-suffix → cert mappings (suffix without the `*.` prefix),
+    /// in longest-suffix-first order (the same precedence order as [`Self::find_cert`]).
+    ///
+    /// Used by the discovery wire layer to serialise the TLS store.
+    pub fn iter_wildcard(&self) -> impl Iterator<Item = (&str, &Arc<TlsCert>)> {
+        self.wildcard.iter().map(|(s, c)| (s.as_str(), c))
+    }
+
+    /// The default (catch-all) certificate, if one is configured.
+    ///
+    /// Used by the discovery wire layer to serialise the TLS store.
+    pub fn default_cert(&self) -> Option<&Arc<TlsCert>> {
+        self.default.as_ref()
+    }
+
     /// `(sni, not_after)` pairs for every cert with a parsed expiry. Used by
     /// the proxy-pod `*_tls_cert_expiry_seconds{sni}` gauge. Certs whose
     /// `not_after` is `None` (PEM parse failure) are omitted.
@@ -301,6 +323,28 @@ impl ClientCertStore {
     pub fn host_count(&self) -> usize {
         self.exact.len() + self.wildcard.len() + self.default.is_some() as usize
     }
+
+    /// Iterate over all exact-hostname → config mappings, in unspecified order.
+    ///
+    /// Used by the discovery wire layer to serialise the client-cert store.
+    pub fn iter_exact(&self) -> impl Iterator<Item = (&str, &Arc<ClientCertConfigState>)> {
+        self.exact.iter().map(|(h, s)| (h.as_str(), s))
+    }
+
+    /// Iterate over all wildcard-suffix → config mappings (suffix without the `*.` prefix),
+    /// in longest-suffix-first order.
+    ///
+    /// Used by the discovery wire layer to serialise the client-cert store.
+    pub fn iter_wildcard(&self) -> impl Iterator<Item = (&str, &Arc<ClientCertConfigState>)> {
+        self.wildcard.iter().map(|(s, cfg)| (s.as_str(), cfg))
+    }
+
+    /// The default (catch-all) client-cert config, if one is configured.
+    ///
+    /// Used by the discovery wire layer to serialise the client-cert store.
+    pub fn default_state(&self) -> Option<&Arc<ClientCertConfigState>> {
+        self.default.as_ref()
+    }
 }
 
 /// Builder for [`ClientCertStore`]. Not thread-safe; used only inside the
@@ -318,6 +362,18 @@ impl ClientCertStoreBuilder {
     /// Construct an empty builder.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register client-cert config for `host_pattern`.
+    ///
+    /// - `*.suffix` → wildcard bucket (suffix stored without the `*.` prefix).
+    /// - Exact hostname → exact bucket.
+    /// - `""` or `"*"` → default fallback.
+    /// - Duplicate host → last-writer-wins with a `WARN` log.
+    ///
+    /// Alias of [`Self::add_client_cert`] for use in generic wire-codec callers.
+    pub fn add_config(&mut self, host_pattern: &str, cfg: Arc<ClientCertConfigState>) {
+        self.add_client_cert(host_pattern, cfg);
     }
 
     /// Register client-cert config for `host_pattern`.
