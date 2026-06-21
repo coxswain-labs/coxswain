@@ -1165,11 +1165,12 @@ async fn client_injected_forwarding_headers_are_stripped() -> anyhow::Result<()>
     anyhow::ensure!(status == 200, "expected 200 from backend, got {status}");
     let echo = body.ok_or_else(|| anyhow::anyhow!("expected echo JSON body"))?;
 
+    // echo-basic returns headers as Title-Case keys (Go net/http canonical form).
     for header in &[
-        "forwarded",
-        "x-forwarded-for",
-        "x-forwarded-proto",
-        "x-real-ip",
+        "Forwarded",
+        "X-Forwarded-For",
+        "X-Forwarded-Proto",
+        "X-Real-Ip",
     ] {
         anyhow::ensure!(
             !echo.headers.contains_key(*header),
@@ -1225,13 +1226,14 @@ async fn proxy_generated_forwarded_reaches_backend_and_overrides_spoof() -> anyh
 
     // The backend must see the proxy-generated Forwarded (from PROXY-protocol data),
     // not the spoofed client value.
+    // echo-basic returns headers as Title-Case keys with array values (Go net/http canonical form).
     let forwarded = echo
         .headers
-        .get("forwarded")
-        .and_then(|v| v.as_str())
+        .get("Forwarded")
+        .and_then(|v| v[0].as_str())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "backend did not receive a `forwarded` header — \
+                "backend did not receive a `Forwarded` header — \
                  proxy must inject one on the PROXY-protocol path (issue #409)"
             )
         })?;
