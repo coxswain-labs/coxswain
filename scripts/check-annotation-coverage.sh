@@ -27,9 +27,18 @@ ANNOTATIONS_FILE="crates/coxswain-reflector/src/ingress/annotations.rs"
 ANNOTATIONS_DIR="crates/coxswain-reflector/src/ingress/annotations"
 E2E_DIR="crates/coxswain-e2e"
 
-# Annotation keys whose e2e effect test is tracked, not yet landed.
+# Permanent e2e exemptions.  An entry here means a deterministic e2e effect test
+# is not feasible; the gap must be compensated by unit tests and documented here.
 E2E_ALLOWLIST=(
-  "ingress.coxswain-labs.dev/send-timeout"      # #341 — kernel recv-buffer approach not deterministic on CI nodes with tcp_rmem > 16 MiB
+  # send-timeout: triggering Pingora's upstream write_timeout requires overflowing
+  # node-dependent kernel socket buffers (tcp_rmem autotuning).  Two spikes were
+  # reverted because the test passed locally but timed out on CI nodes with larger
+  # tcp_rmem settings (see #341).  Compensated by:
+  #   - parse test in crates/coxswain-reflector/src/ingress/annotations/mod.rs
+  #   - WriteTimedout→502 unit tests in crates/coxswain-proxy/src/common/hooks.rs
+  #   - wiring (write_timeout on HttpPeer) is structurally identical to the
+  #     connect/read siblings, which have passing e2e tests.
+  "ingress.coxswain-labs.dev/send-timeout"
 )
 
 is_allowlisted() {

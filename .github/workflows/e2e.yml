@@ -16,10 +16,10 @@ concurrency:
 # Non-matrix jobs (e2e-conformance) with an explicit `if: false` DO report
 # `skipped`, satisfying branch-protection. Matrix jobs do NOT — GitHub skips
 # the whole matrix without creating individual check statuses, leaving them
-# pending forever. The `e2e-noop` job below is a mirror of `e2e` that runs
+# pending forever. The `e2e-skip` job below is a mirror of `e2e` that runs
 # only when there are no code changes; its `name:` matches the matrix so the
 # required check statuses are created as `success`. The conditions are
-# mutually exclusive: exactly one of `e2e` / `e2e-noop` runs per PR.
+# mutually exclusive: exactly one of `e2e` / `e2e-skip` runs per PR.
 jobs:
   changes:
     name: changes
@@ -266,8 +266,8 @@ jobs:
   # `name:` resolves to the same `e2e-<suite>` strings as the real matrix, so
   # the required status checks are satisfied without running the full suite.
   # The two jobs are mutually exclusive: `e2e` runs when code changed,
-  # `e2e-noop` runs when it did not.
-  e2e-noop:
+  # `e2e-skip` runs when it did not.
+  e2e-skip:
     name: e2e-${{ matrix.suite }}
     needs: [changes]
     if: needs.changes.outputs.code != 'true'
