@@ -1092,13 +1092,19 @@ async fn rate_limit_by_header_without_auth_emits_warning_event() -> anyhow::Resu
         "InvalidAnnotation Event note must mention the bypass risk; got {note:?}"
     );
 
-    // Negative: rate-limit-by header + auth-url — advisory must not fire.
+    // Negative: rate-limit-by header + auth-basic-secret — advisory must not fire.
+    // Apply the bcrypt-only secret first (proxy fails closed to 503 on unlabelled
+    // secrets; the secret must be visible before the Ingress is reconciled).
+    fixtures::apply_fixture(
+        ingress::AUTH_BASIC_SECRET_BCRYPT_ONLY,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
     fixtures::apply_fixture(
         ingress::ANNOTATION_RATE_LIMIT_BY_HEADER_WITH_AUTH,
         FixtureVars::new(&ns.name),
     )
     .await?;
-    // Allow one full reconcile cycle to propagate after the positive event appeared.
     let auth_host = format!("ratelimitheaderauth.{}.local", ns.name);
     wait::wait_for_route_status(&h.http, &auth_host, "/", 401, Duration::from_secs(60)).await?;
 

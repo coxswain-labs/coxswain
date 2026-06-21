@@ -1,10 +1,10 @@
-# rate-limit-by header fixture that also sets auth-url (#411 negative case).
+# rate-limit-by header fixture that also sets auth-basic-secret (#411 negative case).
 #
 # When rate-limit-by: header:* is paired with an auth annotation, the controller
 # must NOT emit a Warning InvalidAnnotation Event (the auth layer prevents bypass).
 #
-# Points auth-url at a non-existent service — this fixture tests event behaviour,
-# not proxy traffic; the route is never exercised for traffic assertions.
+# Uses auth-htpasswd-bcrypt-only (bcrypt credentials only) so no SHA1 advisory fires
+# on top of the rate-limit check. Expects 401 on unauthenticated requests.
 #
 # Host: ratelimitheaderauth.TESTNS.local -> echo-a:3000.
 ---
@@ -15,7 +15,7 @@ metadata:
   annotations:
     ingress.coxswain-labs.dev/rate-limit-rps: "1"
     ingress.coxswain-labs.dev/rate-limit-by: "header:X-Api-Key"
-    ingress.coxswain-labs.dev/auth-url: "http://auth-stub.${TESTNS}.svc.cluster.local/allow"
+    ingress.coxswain-labs.dev/auth-basic-secret: "auth-htpasswd-bcrypt-only"
 spec:
   ingressClassName: coxswain
   rules:
