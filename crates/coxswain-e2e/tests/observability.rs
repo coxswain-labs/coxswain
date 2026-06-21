@@ -16,12 +16,20 @@
 //!   error-path emission, and disabled-mode silence.
 //! - `pod_logs_stream_from_controller_not_proxy` — the `/api/v1/pods/{name}/logs`
 //!   relay (#285): controller serves it, proxy 404s, unknown pod 404s.
+//! - `conflict_emits_warning_event_on_loser` — route conflict (`#390`): the losing
+//!   Ingress receives a `Warning RouteConflict` Event naming the winner; the winner
+//!   does not.
+//! - `invalid_annotation_emits_warning_event` — annotation parse failure (`#401`): the
+//!   misconfigured Ingress receives a `Warning InvalidAnnotation` Event; a valid
+//!   Ingress receives none.
 
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, Harness, IngressClassGuard, NamespaceGuard,
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::wait,
 };
+use k8s_openapi::api::events::v1::Event as K8sEvent;
+use kube::Api;
 use std::time::Duration;
 
 mod common;
@@ -879,6 +887,155 @@ async fn cache_hit_and_miss_counters_increment_when_caching() -> anyhow::Result<
         hits.is_some_and(|v| v >= 1.0),
         "coxswain_cache_hits_total must record at least one hit for {route_label}; \
          got {hits:?}"
+    );
+
+    Ok(())
+}
+
+/// A routing conflict must emit a `Warning RouteConflict` Kubernetes Event on the losing
+/// Ingress, naming the winner, host, and path. The winning Ingress must have no such Events
+/// (#390).
+#[tokio::test]
+async fn conflict_emits_warning_event_on_loser() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-conflict-event").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::PROBLEMS_CONFLICT, FixtureVars::new(&ns.name)).await?;
+
+    // Winner serves 200 once the table is built.
+    let host = format!("conflict.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &host, "/", 200, Duration::from_secs(60)).await?;
+
+    // Resolve winner/loser from the problems API so we don't hard-code precedence order.
+    let problem_row = wait_for_problem(
+        &h,
+        "conflicts",
+        |r| r["host"] == host,
+        Duration::from_secs(30),
+    )
+    .await?;
+    let loser_name = problem_row["route"]["name"]
+        .as_str()
+        .expect("conflict row must carry rejected route name")
+        .to_owned();
+    let winner_name = if loser_name == "conflict-a" {
+        "conflict-b"
+    } else {
+        "conflict-a"
+    };
+
+    // Assert Warning RouteConflict Event on the loser.
+    let event = wait::wait_for_ingress_warning_event(
+        &h.client,
+        &ns.name,
+        &loser_name,
+        "RouteConflict",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let note = event.note.as_deref().unwrap_or("");
+    assert!(
+        note.contains(winner_name),
+        "RouteConflict Event note must name the winner {winner_name:?}; got {note:?}"
+    );
+    assert!(
+        note.contains(&host),
+        "RouteConflict Event note must name the conflict host {host:?}; got {note:?}"
+    );
+
+    // Negative: winner must have no RouteConflict Warning Events.
+    // By this point the reconciler has run and the controller has emitted the loser's
+    // event — at least one full event-processing cycle has completed.
+    let all_events = Api::<K8sEvent>::namespaced(h.client.clone(), &ns.name)
+        .list(&kube::api::ListParams::default())
+        .await?;
+    let winner_conflict_events: Vec<_> = all_events
+        .items
+        .iter()
+        .filter(|e| {
+            e.type_.as_deref() == Some("Warning")
+                && e.reason.as_deref() == Some("RouteConflict")
+                && e.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some(winner_name)
+        })
+        .collect();
+    assert!(
+        winner_conflict_events.is_empty(),
+        "winning Ingress {winner_name:?} must have no RouteConflict Warning Events; \
+         got {} event(s)",
+        winner_conflict_events.len()
+    );
+
+    Ok(())
+}
+
+/// An Ingress with an invalid `ingress.coxswain-labs.dev/*` annotation value that slips past
+/// the VAP must receive a `Warning InvalidAnnotation` Kubernetes Event naming the annotation.
+/// A valid Ingress in the same namespace must receive no such Events (#401).
+///
+/// Uses `session-cookie-name: "bad;name"` — not VAP-validated, so it reaches the controller
+/// parse path and generates a `Warning` Event while the route continues to serve (fail-open).
+#[tokio::test]
+async fn invalid_annotation_emits_warning_event() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-invalid-ann-event").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Ingress with `session-cookie-name: "bad;name"` — a semicolon is not a valid
+    // RFC 6265 cookie token. This annotation is NOT in the VAP so the apply succeeds.
+    // The controller falls back to the default cookie name (fail-open) and emits a
+    // Warning InvalidAnnotation Event on the Ingress.
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_SESSION_COOKIE_NAME_INVALID,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let bad_host = format!("affinity-bad.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &bad_host, "/", 200, Duration::from_secs(60)).await?;
+
+    // Also apply a valid Ingress in the same namespace (no annotation → no event).
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    let valid_host = format!("ingress.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &valid_host, "/a", 200, Duration::from_secs(60)).await?;
+
+    // Assert Warning InvalidAnnotation Event on the misconfigured Ingress.
+    let event = wait::wait_for_ingress_warning_event(
+        &h.client,
+        &ns.name,
+        "session-cookie-invalid-ingress",
+        "InvalidAnnotation",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let note = event.note.as_deref().unwrap_or("");
+    assert!(
+        note.contains("session-cookie-name"),
+        "InvalidAnnotation Event note must mention the annotation name; got {note:?}"
+    );
+
+    // Negative: valid Ingress must have no InvalidAnnotation Events. By the time the
+    // invalid-annotation event appeared, the controller has processed at least one full
+    // reconcile round that also covered the valid Ingress — so absence now is conclusive.
+    let all_events = Api::<K8sEvent>::namespaced(h.client.clone(), &ns.name)
+        .list(&kube::api::ListParams::default())
+        .await?;
+    let valid_invalid_events: Vec<_> = all_events
+        .items
+        .iter()
+        .filter(|e| {
+            e.type_.as_deref() == Some("Warning")
+                && e.reason.as_deref() == Some("InvalidAnnotation")
+                && e.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some("echo-ingress")
+        })
+        .collect();
+    assert!(
+        valid_invalid_events.is_empty(),
+        "valid Ingress 'echo-ingress' must have no InvalidAnnotation Warning Events; \
+         got {} event(s)",
+        valid_invalid_events.len()
     );
 
     Ok(())

@@ -27,7 +27,7 @@ pub(super) fn reconcile_no_default(
     b: &mut IngressRoutingTableBuilder,
 ) {
     let no_class_defaults = HashMap::new();
-    IngressReconciler::reconcile(
+    let _ = IngressReconciler::reconcile(
         ing,
         slices,
         svcs,
@@ -48,7 +48,7 @@ pub(super) fn reconcile_with_class_defaults(
     defaults: &HashMap<String, crate::ingress::ResolvedClassParams>,
     b: &mut IngressRoutingTableBuilder,
 ) {
-    IngressReconciler::reconcile(
+    let _ = IngressReconciler::reconcile(
         ing,
         slices,
         svcs,

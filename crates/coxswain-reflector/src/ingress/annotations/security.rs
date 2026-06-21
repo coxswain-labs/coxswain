@@ -6,6 +6,8 @@
 //! `WARN` on invalid input and skips the offending token so a single typo never
 //! rejects the whole Ingress.
 
+use super::AnnotationIssue;
+
 /// Source-IP allow-list — comma-separated IPv4/IPv6 CIDR blocks (e.g.
 /// `"10.0.0.0/8,192.168.1.0/24"`). Bare addresses without a prefix (`10.0.0.1`,
 /// `2001:db8::1`) are accepted as host routes (`/32` / `/128`) for parity with
@@ -66,9 +68,14 @@ pub const RATE_LIMIT_BY: &str = "ingress.coxswain-labs.dev/rate-limit-by";
 /// Returns `None` when the value is empty or every token is unparseable, so the
 /// caller treats the annotation as absent (admit all) rather than locking out
 /// all traffic on a typo. `route_id` names the Ingress in skipped-token WARNs.
+/// `diag` collects machine-readable issues alongside the warn log.
 #[must_use]
-pub fn parse_allow_source_range(s: &str, route_id: &str) -> Option<Vec<ipnet::IpNet>> {
-    parse_cidr_list(s, "allow-source-range", route_id)
+pub fn parse_allow_source_range(
+    s: &str,
+    route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
+) -> Option<Vec<ipnet::IpNet>> {
+    parse_cidr_list(s, ALLOW_SOURCE_RANGE, route_id, diag)
 }
 
 /// Parse the `deny-source-range` value into a CIDR set.
@@ -80,8 +87,12 @@ pub fn parse_allow_source_range(s: &str, route_id: &str) -> Option<Vec<ipnet::Ip
 /// nothing), so a typo never silently blocks all traffic. `route_id` names the
 /// Ingress in skipped-token WARNs.
 #[must_use]
-pub fn parse_deny_source_range(s: &str, route_id: &str) -> Option<Vec<ipnet::IpNet>> {
-    parse_cidr_list(s, "deny-source-range", route_id)
+pub fn parse_deny_source_range(
+    s: &str,
+    route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
+) -> Option<Vec<ipnet::IpNet>> {
+    parse_cidr_list(s, DENY_SOURCE_RANGE, route_id, diag)
 }
 
 /// Parse the `trust-forwarded-for` annotation cluster into a [`ForwardedForConfig`].
@@ -96,10 +107,12 @@ pub fn parse_deny_source_range(s: &str, route_id: &str) -> Option<Vec<ipnet::IpN
 /// # Arguments
 /// * `annotations` — raw annotation map for the Ingress.
 /// * `route_id` — human-readable identifier used in `WARN` log messages.
+/// * `diag` — collects machine-readable issues alongside the warn log.
 #[must_use]
 pub fn parse_forwarded_for(
     annotations: &std::collections::BTreeMap<String, String>,
     route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
 ) -> Option<coxswain_core::routing::ForwardedForConfig> {
     use coxswain_core::routing::ForwardedForConfig;
 
@@ -112,6 +125,12 @@ pub fn parse_forwarded_for(
                 value = trust,
                 "invalid trust-forwarded-for — expected \"true\" or \"false\"; treating as false"
             );
+            diag.push(AnnotationIssue {
+                annotation: TRUST_FORWARDED_FOR,
+                message: format!(
+                    "invalid trust-forwarded-for value '{trust}' — expected \"true\" or \"false\"; treating as false"
+                ),
+            });
         }
         return None;
     }
@@ -122,17 +141,23 @@ pub fn parse_forwarded_for(
         .unwrap_or_else(|| Box::from("X-Forwarded-For"));
 
     let trusted_cidrs: Box<[ipnet::IpNet]> = super::get(annotations, FORWARDED_FOR_TRUSTED_CIDRS)
-        .and_then(|s| parse_cidr_list(s, "forwarded-for-trusted-cidrs", route_id))
+        .and_then(|s| parse_cidr_list(s, FORWARDED_FOR_TRUSTED_CIDRS, route_id, diag))
         .unwrap_or_default()
         .into_boxed_slice();
 
     Some(ForwardedForConfig::new(header, trusted_cidrs))
 }
 
-/// Shared CIDR-list parser used by both `parse_allow_source_range` and
-/// `parse_deny_source_range`. `annotation` is the bare annotation suffix (e.g.
-/// `"allow-source-range"`) used in the WARN message to name the source.
-fn parse_cidr_list(s: &str, annotation: &str, route_id: &str) -> Option<Vec<ipnet::IpNet>> {
+/// Shared CIDR-list parser used by `parse_allow_source_range`,
+/// `parse_deny_source_range`, and `parse_forwarded_for`. `annotation_key` is the
+/// full annotation key constant (e.g. `ALLOW_SOURCE_RANGE`) used in WARN messages
+/// and diagnostic issues.
+fn parse_cidr_list(
+    s: &str,
+    annotation_key: &'static str,
+    route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
+) -> Option<Vec<ipnet::IpNet>> {
     let nets: Vec<ipnet::IpNet> = s
         .split(',')
         .map(str::trim)
@@ -143,9 +168,13 @@ fn parse_cidr_list(s: &str, annotation: &str, route_id: &str) -> Option<Vec<ipne
                 tracing::warn!(
                     ingress = %route_id,
                     token = token,
-                    annotation = annotation,
+                    annotation = annotation_key,
                     "invalid CIDR — skipping token"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: annotation_key,
+                    message: format!("invalid CIDR token '{token}' — skipping"),
+                });
                 None
             }
         })
@@ -174,12 +203,14 @@ fn parse_cidr_or_host(token: &str) -> Option<ipnet::IpNet> {
 /// * `burst_val` — raw value of `rate-limit-burst`.
 /// * `by_val` — raw value of `rate-limit-by`.
 /// * `route_id` — forwarded from the parent `IngressAnnotations::parse` for log context.
+/// * `diag` — collects machine-readable issues alongside the warn log.
 #[must_use]
 pub fn parse_rate_limit(
     rps_val: Option<&str>,
     burst_val: Option<&str>,
     by_val: Option<&str>,
     route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
 ) -> Option<coxswain_core::routing::RateLimitConfig> {
     use coxswain_core::routing::{RateLimitConfig, RateLimitKey};
     use std::num::NonZeroU32;
@@ -194,6 +225,12 @@ pub fn parse_rate_limit(
                 value = rps_str,
                 "invalid or zero rate-limit-rps — rate limiting disabled for route"
             );
+            diag.push(AnnotationIssue {
+                annotation: RATE_LIMIT_RPS,
+                message: format!(
+                    "invalid or zero rate-limit-rps '{rps_str}' — rate limiting disabled"
+                ),
+            });
             return None;
         }
     };
@@ -210,6 +247,10 @@ pub fn parse_rate_limit(
                     value = s,
                     "invalid rate-limit-burst — using 0 (no burst)"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: RATE_LIMIT_BURST,
+                    message: "invalid rate-limit-burst — using 0 (no burst)".into(),
+                });
                 0
             }
         }
@@ -227,6 +268,11 @@ pub fn parse_rate_limit(
                     value = s,
                     "invalid rate-limit-by — expected \"ip\" or \"header:Name\"; using ip"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: RATE_LIMIT_BY,
+                    message: "invalid rate-limit-by — expected \"ip\" or \"header:Name\"; using ip"
+                        .into(),
+                });
                 RateLimitKey::ClientIp
             }
         }
@@ -268,21 +314,25 @@ mod tests {
     fn parse_single_cidr() {
         // References ALLOW_SOURCE_RANGE to satisfy the annotation-coverage gate.
         let _ = ALLOW_SOURCE_RANGE;
-        let nets = parse_allow_source_range("10.0.0.0/8", "test-ingress").expect("one CIDR");
+        let nets =
+            parse_allow_source_range("10.0.0.0/8", "test-ingress", &mut vec![]).expect("one CIDR");
         assert_eq!(nets, vec!["10.0.0.0/8".parse().expect("valid")]);
     }
 
     #[test]
     fn parse_multiple_cidrs_trimmed() {
-        let nets =
-            parse_allow_source_range("10.0.0.0/8, 192.168.1.0/24 ,2001:db8::/32", "test-ingress")
-                .expect("three");
+        let nets = parse_allow_source_range(
+            "10.0.0.0/8, 192.168.1.0/24 ,2001:db8::/32",
+            "test-ingress",
+            &mut vec![],
+        )
+        .expect("three");
         assert_eq!(nets.len(), 3);
     }
 
     #[test]
     fn parse_bare_ip_becomes_host_route() {
-        let nets = parse_allow_source_range("10.0.0.1,2001:db8::1", "test-ingress")
+        let nets = parse_allow_source_range("10.0.0.1,2001:db8::1", "test-ingress", &mut vec![])
             .expect("two host routes");
         assert_eq!(nets[0], "10.0.0.1/32".parse().expect("valid"));
         assert_eq!(nets[1], "2001:db8::1/128".parse().expect("valid"));
@@ -291,21 +341,25 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn parse_skips_invalid_keeps_valid() {
-        let nets = parse_allow_source_range("10.0.0.0/8,not-a-cidr,192.168.0.0/16", "test-ingress")
-            .expect("two");
+        let nets = parse_allow_source_range(
+            "10.0.0.0/8,not-a-cidr,192.168.0.0/16",
+            "test-ingress",
+            &mut vec![],
+        )
+        .expect("two");
         assert_eq!(nets.len(), 2);
         assert!(logs_contain("invalid CIDR"));
     }
 
     #[test]
     fn parse_all_invalid_is_none() {
-        assert!(parse_allow_source_range("nope,also-nope", "test-ingress").is_none());
+        assert!(parse_allow_source_range("nope,also-nope", "test-ingress", &mut vec![]).is_none());
     }
 
     #[test]
     fn parse_empty_is_none() {
-        assert!(parse_allow_source_range("", "test-ingress").is_none());
-        assert!(parse_allow_source_range("  ,  ", "test-ingress").is_none());
+        assert!(parse_allow_source_range("", "test-ingress", &mut vec![]).is_none());
+        assert!(parse_allow_source_range("  ,  ", "test-ingress", &mut vec![]).is_none());
     }
 
     // ── deny-source-range ─────────────────────────────────────────────────────
@@ -314,7 +368,8 @@ mod tests {
     fn deny_parse_single_cidr() {
         // References DENY_SOURCE_RANGE to satisfy the annotation-coverage gate.
         let _ = DENY_SOURCE_RANGE;
-        let nets = parse_deny_source_range("10.0.0.0/8", "test-ingress").expect("one CIDR");
+        let nets =
+            parse_deny_source_range("10.0.0.0/8", "test-ingress", &mut vec![]).expect("one CIDR");
         assert_eq!(
             nets,
             vec!["10.0.0.0/8".parse::<ipnet::IpNet>().expect("valid")]
@@ -323,15 +378,18 @@ mod tests {
 
     #[test]
     fn deny_parse_multiple_cidrs_trimmed() {
-        let nets =
-            parse_deny_source_range("10.0.0.0/8, 192.168.1.0/24 ,2001:db8::/32", "test-ingress")
-                .expect("three");
+        let nets = parse_deny_source_range(
+            "10.0.0.0/8, 192.168.1.0/24 ,2001:db8::/32",
+            "test-ingress",
+            &mut vec![],
+        )
+        .expect("three");
         assert_eq!(nets.len(), 3);
     }
 
     #[test]
     fn deny_parse_bare_ip_becomes_host_route() {
-        let nets = parse_deny_source_range("10.0.0.1,2001:db8::1", "test-ingress")
+        let nets = parse_deny_source_range("10.0.0.1,2001:db8::1", "test-ingress", &mut vec![])
             .expect("two host routes");
         assert_eq!(
             nets[0],
@@ -346,21 +404,25 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn deny_parse_skips_invalid_keeps_valid() {
-        let nets = parse_deny_source_range("10.0.0.0/8,not-a-cidr,192.168.0.0/16", "test-ingress")
-            .expect("two");
+        let nets = parse_deny_source_range(
+            "10.0.0.0/8,not-a-cidr,192.168.0.0/16",
+            "test-ingress",
+            &mut vec![],
+        )
+        .expect("two");
         assert_eq!(nets.len(), 2);
         assert!(logs_contain("invalid CIDR"));
     }
 
     #[test]
     fn deny_parse_all_invalid_is_none() {
-        assert!(parse_deny_source_range("nope,also-nope", "test-ingress").is_none());
+        assert!(parse_deny_source_range("nope,also-nope", "test-ingress", &mut vec![]).is_none());
     }
 
     #[test]
     fn deny_parse_empty_is_none() {
-        assert!(parse_deny_source_range("", "test-ingress").is_none());
-        assert!(parse_deny_source_range("  ,  ", "test-ingress").is_none());
+        assert!(parse_deny_source_range("", "test-ingress", &mut vec![]).is_none());
+        assert!(parse_deny_source_range("  ,  ", "test-ingress", &mut vec![]).is_none());
     }
 
     // ── trust-forwarded-for ───────────────────────────────────────────────────
@@ -378,19 +440,19 @@ mod tests {
         let _ = TRUST_FORWARDED_FOR;
         let _ = FORWARDED_FOR_HEADER;
         let _ = FORWARDED_FOR_TRUSTED_CIDRS;
-        assert!(parse_forwarded_for(&ann(&[]), "ns/test").is_none());
+        assert!(parse_forwarded_for(&ann(&[]), "ns/test", &mut vec![]).is_none());
     }
 
     #[test]
     fn forwarded_for_false_is_none() {
         let m = ann(&[(TRUST_FORWARDED_FOR, "false")]);
-        assert!(parse_forwarded_for(&m, "ns/test").is_none());
+        assert!(parse_forwarded_for(&m, "ns/test", &mut vec![]).is_none());
     }
 
     #[test]
     fn forwarded_for_true_defaults_to_x_forwarded_for() {
         let m = ann(&[(TRUST_FORWARDED_FOR, "true")]);
-        let cfg = parse_forwarded_for(&m, "ns/test").expect("Some");
+        let cfg = parse_forwarded_for(&m, "ns/test", &mut vec![]).expect("Some");
         assert_eq!(&*cfg.header, "X-Forwarded-For");
         assert!(cfg.trusted_cidrs.is_empty());
     }
@@ -401,7 +463,7 @@ mod tests {
             (TRUST_FORWARDED_FOR, "true"),
             (FORWARDED_FOR_HEADER, "CF-Connecting-IP"),
         ]);
-        let cfg = parse_forwarded_for(&m, "ns/test").expect("Some");
+        let cfg = parse_forwarded_for(&m, "ns/test", &mut vec![]).expect("Some");
         assert_eq!(&*cfg.header, "CF-Connecting-IP");
     }
 
@@ -411,7 +473,7 @@ mod tests {
             (TRUST_FORWARDED_FOR, "true"),
             (FORWARDED_FOR_TRUSTED_CIDRS, "10.0.0.0/8,192.168.0.0/16"),
         ]);
-        let cfg = parse_forwarded_for(&m, "ns/test").expect("Some");
+        let cfg = parse_forwarded_for(&m, "ns/test", &mut vec![]).expect("Some");
         assert_eq!(cfg.trusted_cidrs.len(), 2);
     }
 
@@ -422,7 +484,7 @@ mod tests {
             (TRUST_FORWARDED_FOR, "true"),
             (FORWARDED_FOR_TRUSTED_CIDRS, "10.0.0.0/8,not-a-cidr"),
         ]);
-        let cfg = parse_forwarded_for(&m, "ns/test").expect("Some");
+        let cfg = parse_forwarded_for(&m, "ns/test", &mut vec![]).expect("Some");
         assert_eq!(cfg.trusted_cidrs.len(), 1);
         assert!(logs_contain("invalid CIDR"));
     }
@@ -431,7 +493,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn forwarded_for_invalid_bool_warns_and_is_none() {
         let m = ann(&[(TRUST_FORWARDED_FOR, "yes")]);
-        assert!(parse_forwarded_for(&m, "ns/test").is_none());
+        assert!(parse_forwarded_for(&m, "ns/test", &mut vec![]).is_none());
         assert!(logs_contain("invalid trust-forwarded-for"));
     }
 
@@ -443,24 +505,24 @@ mod tests {
         let _ = RATE_LIMIT_RPS;
         let _ = RATE_LIMIT_BURST;
         let _ = RATE_LIMIT_BY;
-        assert!(parse_rate_limit(None, None, None, "ns/test").is_none());
+        assert!(parse_rate_limit(None, None, None, "ns/test", &mut vec![]).is_none());
     }
 
     #[test]
     fn rate_limit_rps_zero_is_none() {
-        assert!(parse_rate_limit(Some("0"), None, None, "ns/test").is_none());
+        assert!(parse_rate_limit(Some("0"), None, None, "ns/test", &mut vec![]).is_none());
     }
 
     #[test]
     #[tracing_test::traced_test]
     fn rate_limit_invalid_rps_warns_and_is_none() {
-        assert!(parse_rate_limit(Some("nope"), None, None, "ns/test").is_none());
+        assert!(parse_rate_limit(Some("nope"), None, None, "ns/test", &mut vec![]).is_none());
         assert!(logs_contain("invalid or zero rate-limit-rps"));
     }
 
     #[test]
     fn rate_limit_basic_ip_config() {
-        let cfg = parse_rate_limit(Some("10"), None, None, "ns/test").expect("valid");
+        let cfg = parse_rate_limit(Some("10"), None, None, "ns/test", &mut vec![]).expect("valid");
         assert_eq!(cfg.requests_per_second.get(), 10);
         assert_eq!(cfg.burst, 0);
         assert_eq!(cfg.key, RateLimitKey::ClientIp);
@@ -468,7 +530,8 @@ mod tests {
 
     #[test]
     fn rate_limit_with_burst() {
-        let cfg = parse_rate_limit(Some("5"), Some("20"), None, "ns/test").expect("valid");
+        let cfg =
+            parse_rate_limit(Some("5"), Some("20"), None, "ns/test", &mut vec![]).expect("valid");
         assert_eq!(cfg.requests_per_second.get(), 5);
         assert_eq!(cfg.burst, 20);
     }
@@ -476,21 +539,29 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn rate_limit_invalid_burst_defaults_to_zero() {
-        let cfg = parse_rate_limit(Some("5"), Some("bad"), None, "ns/test").expect("valid");
+        let cfg =
+            parse_rate_limit(Some("5"), Some("bad"), None, "ns/test", &mut vec![]).expect("valid");
         assert_eq!(cfg.burst, 0);
         assert!(logs_contain("invalid rate-limit-burst"));
     }
 
     #[test]
     fn rate_limit_by_ip_explicit() {
-        let cfg = parse_rate_limit(Some("10"), None, Some("ip"), "ns/test").expect("valid");
+        let cfg =
+            parse_rate_limit(Some("10"), None, Some("ip"), "ns/test", &mut vec![]).expect("valid");
         assert_eq!(cfg.key, RateLimitKey::ClientIp);
     }
 
     #[test]
     fn rate_limit_by_header() {
-        let cfg =
-            parse_rate_limit(Some("10"), None, Some("header:X-Api-Key"), "ns/test").expect("valid");
+        let cfg = parse_rate_limit(
+            Some("10"),
+            None,
+            Some("header:X-Api-Key"),
+            "ns/test",
+            &mut vec![],
+        )
+        .expect("valid");
         assert_eq!(
             cfg.key,
             RateLimitKey::Header(std::sync::Arc::from("x-api-key"))
@@ -499,8 +570,14 @@ mod tests {
 
     #[test]
     fn rate_limit_by_header_name_is_lowercased() {
-        let cfg = parse_rate_limit(Some("10"), None, Some("header:Authorization"), "ns/test")
-            .expect("valid");
+        let cfg = parse_rate_limit(
+            Some("10"),
+            None,
+            Some("header:Authorization"),
+            "ns/test",
+            &mut vec![],
+        )
+        .expect("valid");
         assert_eq!(
             cfg.key,
             RateLimitKey::Header(std::sync::Arc::from("authorization"))
@@ -510,8 +587,14 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn rate_limit_invalid_by_warns_defaults_to_ip() {
-        let cfg =
-            parse_rate_limit(Some("10"), None, Some("bad-selector"), "ns/test").expect("valid");
+        let cfg = parse_rate_limit(
+            Some("10"),
+            None,
+            Some("bad-selector"),
+            "ns/test",
+            &mut vec![],
+        )
+        .expect("valid");
         assert_eq!(cfg.key, RateLimitKey::ClientIp);
         assert!(logs_contain("invalid rate-limit-by"));
     }
@@ -597,6 +680,7 @@ pub(crate) enum AuthAnnotation {
 pub(crate) fn parse_auth(
     annotations: &std::collections::BTreeMap<String, String>,
     route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
 ) -> Option<AuthAnnotation> {
     use super::get;
 
@@ -608,6 +692,11 @@ pub(crate) fn parse_auth(
             ingress = %route_id,
             "auth-url and auth-basic-secret are mutually exclusive — using auth-url"
         );
+        diag.push(AnnotationIssue {
+            annotation: AUTH_URL,
+            message: "auth-url and auth-basic-secret are mutually exclusive — using auth-url"
+                .into(),
+        });
     }
 
     if let Some(u) = url {
@@ -621,6 +710,10 @@ pub(crate) fn parse_auth(
                         value = v,
                         "invalid auth-timeout — using default 2s"
                     );
+                    diag.push(AnnotationIssue {
+                        annotation: AUTH_TIMEOUT,
+                        message: "invalid auth-timeout — using default 2s".into(),
+                    });
                 }
                 d
             })
@@ -640,6 +733,10 @@ pub(crate) fn parse_auth(
                         value = v,
                         "invalid auth-always-set-cookie — treating as false"
                     );
+                    diag.push(AnnotationIssue {
+                        annotation: AUTH_ALWAYS_SET_COOKIE,
+                        message: "invalid auth-always-set-cookie — treating as false".into(),
+                    });
                 }
                 b
             })
@@ -663,6 +760,12 @@ pub(crate) fn parse_auth(
                     value = ref_str,
                     "invalid auth-basic-secret — expected \"namespace/name\" format; auth disabled"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: AUTH_BASIC_SECRET,
+                    message: format!(
+                        "invalid auth-basic-secret '{ref_str}' — expected \"namespace/name\" format; auth disabled"
+                    ),
+                });
             }
         }
     }
@@ -804,13 +907,13 @@ mod auth_tests {
     #[test]
     fn parse_auth_absent_is_none() {
         let m = ann(&[]);
-        assert!(parse_auth(&m, "ns/test").is_none());
+        assert!(parse_auth(&m, "ns/test", &mut vec![]).is_none());
     }
 
     #[test]
     fn parse_auth_url_produces_external() {
         let m = ann(&[(AUTH_URL, "http://authsvc/check")]);
-        match parse_auth(&m, "ns/test") {
+        match parse_auth(&m, "ns/test", &mut vec![]) {
             Some(AuthAnnotation::External { url, timeout, .. }) => {
                 assert_eq!(url, "http://authsvc/check");
                 assert_eq!(timeout, std::time::Duration::from_secs(2));
@@ -822,7 +925,7 @@ mod auth_tests {
     #[test]
     fn parse_auth_timeout_custom() {
         let m = ann(&[(AUTH_URL, "http://svc/"), (AUTH_TIMEOUT, "500ms")]);
-        match parse_auth(&m, "ns/test") {
+        match parse_auth(&m, "ns/test", &mut vec![]) {
             Some(AuthAnnotation::External { timeout, .. }) => {
                 assert_eq!(timeout, std::time::Duration::from_millis(500));
             }
@@ -834,7 +937,7 @@ mod auth_tests {
     #[tracing_test::traced_test]
     fn parse_auth_invalid_timeout_warns_and_defaults_2s() {
         let m = ann(&[(AUTH_URL, "http://svc/"), (AUTH_TIMEOUT, "bad")]);
-        match parse_auth(&m, "ns/test") {
+        match parse_auth(&m, "ns/test", &mut vec![]) {
             Some(AuthAnnotation::External { timeout, .. }) => {
                 assert_eq!(timeout, std::time::Duration::from_secs(2));
                 assert!(logs_contain("invalid auth-timeout"));
@@ -849,7 +952,7 @@ mod auth_tests {
             (AUTH_URL, "http://svc/"),
             (AUTH_RESPONSE_HEADERS, "X-User, X-Role ,x-tenant"),
         ]);
-        match parse_auth(&m, "ns/test") {
+        match parse_auth(&m, "ns/test", &mut vec![]) {
             Some(AuthAnnotation::External {
                 response_headers, ..
             }) => {
@@ -862,7 +965,7 @@ mod auth_tests {
     #[test]
     fn parse_auth_always_set_cookie_true() {
         let m = ann(&[(AUTH_URL, "http://svc/"), (AUTH_ALWAYS_SET_COOKIE, "true")]);
-        match parse_auth(&m, "ns/test") {
+        match parse_auth(&m, "ns/test", &mut vec![]) {
             Some(AuthAnnotation::External {
                 always_set_cookie, ..
             }) => assert!(always_set_cookie),
@@ -874,7 +977,7 @@ mod auth_tests {
     #[tracing_test::traced_test]
     fn parse_auth_invalid_always_set_cookie_warns_and_defaults_false() {
         let m = ann(&[(AUTH_URL, "http://svc/"), (AUTH_ALWAYS_SET_COOKIE, "yes")]);
-        match parse_auth(&m, "ns/test") {
+        match parse_auth(&m, "ns/test", &mut vec![]) {
             Some(AuthAnnotation::External {
                 always_set_cookie, ..
             }) => {
@@ -892,7 +995,7 @@ mod auth_tests {
             (AUTH_URL, "http://svc/"),
             (AUTH_BASIC_SECRET, "default/my-htpasswd"),
         ]);
-        match parse_auth(&m, "ns/test") {
+        match parse_auth(&m, "ns/test", &mut vec![]) {
             Some(AuthAnnotation::External { .. }) => {
                 assert!(logs_contain("mutually exclusive"));
             }
@@ -905,7 +1008,7 @@ mod auth_tests {
     #[test]
     fn parse_auth_basic_valid_ref() {
         let m = ann(&[(AUTH_BASIC_SECRET, "default/my-htpasswd")]);
-        match parse_auth(&m, "ns/test") {
+        match parse_auth(&m, "ns/test", &mut vec![]) {
             Some(AuthAnnotation::Basic(ref_)) => {
                 assert_eq!(ref_.namespace, "default");
                 assert_eq!(ref_.name, "my-htpasswd");
@@ -918,7 +1021,7 @@ mod auth_tests {
     #[tracing_test::traced_test]
     fn parse_auth_basic_invalid_ref_warns_and_is_none() {
         let m = ann(&[(AUTH_BASIC_SECRET, "just-a-name-no-slash")]);
-        assert!(parse_auth(&m, "ns/test").is_none());
+        assert!(parse_auth(&m, "ns/test", &mut vec![]).is_none());
         assert!(logs_contain("invalid auth-basic-secret"));
     }
 

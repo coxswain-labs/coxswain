@@ -27,6 +27,6 @@ pub mod shared_proxy;
 pub use controller::ControllerReconciler;
 pub use dedicated_proxy::{DedicatedConfig, DedicatedOutputs, DedicatedProxyReconciler};
 pub use shared_proxy::{
-    IngressDefaultBackend, IngressDefaultBackendParseError, ReconcilerHealth, ReconcilerOptions,
-    ReconcilerOutputs, SharedProxyReconciler, StatusSubscriptions,
+    IngressDefaultBackend, IngressDefaultBackendParseError, IngressEvent, ReconcilerHealth,
+    ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusSubscriptions,
 };

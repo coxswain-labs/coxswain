@@ -358,4 +358,12 @@ pub const VAP_REJECT_PORT: &str = fixture!("vap_reject_port.yaml");
 /// Ingress with one valid annotation per validated format category — accepted by the VAP.
 pub const VAP_VALID_ANNOTATIONS: &str = fixture!("vap_valid_annotations.yaml");
 
+/// Ingress with `session-affinity: cookie` and an invalid `session-cookie-name: "bad;name"`
+/// (semicolon is not a valid RFC 6265 cookie token; not in the VAP so the apply succeeds).
+/// Used to verify that the controller emits a `Warning InvalidAnnotation` Kubernetes Event
+/// on the Ingress while still serving traffic on the route (fail-open fallback to default
+/// cookie name). Requires `backends::ECHO` (#401).
+pub const ANNOTATION_SESSION_COOKIE_NAME_INVALID: &str =
+    fixture!("annotation_session_cookie_name_invalid.yaml");
+
 // ── satisfy any/all (#273) ────────────────────────────────────────────────────

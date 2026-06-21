@@ -4,6 +4,8 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 
 **Admission-time validation.** On Kubernetes ≥ 1.30, Coxswain installs a `ValidatingAdmissionPolicy` that rejects Ingresses with invalid annotation values at `kubectl apply` time, surfacing the error immediately. On older clusters, or when `vap.enabled=false` is set in the Helm values, invalid values are handled fail-open: the controller emits a warning and treats the annotation as absent, so traffic is never blocked. Disable the VAP only if your cluster does not support `admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy`.
 
+**Runtime diagnostics.** When the VAP is absent or an annotation slips through, the controller emits a Kubernetes `Warning` Event (`reason: InvalidAnnotation`) directly on the Ingress. Run `kubectl describe ingress <name>` to see it inline. See the [Observability reference — Kubernetes Events](../reference/observability.md#kubernetes-events) for details on deduplication and querying.
+
 ## Quick reference
 
 | Annotation | Type | Default | Example |

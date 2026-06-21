@@ -1212,6 +1212,61 @@ pub async fn wait_for_backend_tls_policy_condition_with_reason(
     .await
 }
 
+/// Poll `events.k8s.io/v1` Events until a `Warning` Event matching `reason` and
+/// `ingress_name` appears in `namespace`, or `timeout` elapses.
+///
+/// The kube `Recorder` deduplicates Events in-process, so the first reconcile
+/// after an issue appears will emit the Event; subsequent resyncs update the
+/// count rather than creating a new object. This helper therefore only needs to
+/// find **one** matching Event.
+///
+/// Returns the matching Event.
+///
+/// # Errors
+///
+/// Returns an error if no matching Event is found before `timeout` elapses.
+pub async fn wait_for_ingress_warning_event(
+    client: &kube::Client,
+    namespace: &str,
+    ingress_name: &str,
+    reason: &str,
+    timeout: Duration,
+) -> anyhow::Result<k8s_openapi::api::events::v1::Event> {
+    use k8s_openapi::api::events::v1::Event;
+    let api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    let ingress_name = ingress_name.to_owned();
+    let reason = reason.to_owned();
+    poll_until(
+        timeout,
+        POLL,
+        || {
+            let ingress_name = ingress_name.clone();
+            let reason = reason.clone();
+            async move {
+                format!(
+                    "Warning Event reason={reason} on Ingress {ingress_name}/{namespace} to appear"
+                )
+            }
+        },
+        || {
+            let api = api.clone();
+            let ingress_name = ingress_name.clone();
+            let reason = reason.clone();
+            async move {
+                let list = api.list(&kube::api::ListParams::default()).await.ok()?;
+                list.items.into_iter().find(|e| {
+                    e.type_.as_deref() == Some("Warning")
+                        && e.reason.as_deref() == Some(&reason)
+                        && e.regarding.as_ref().and_then(|r| r.name.as_deref())
+                            == Some(&ingress_name)
+                        && e.regarding.as_ref().and_then(|r| r.kind.as_deref()) == Some("Ingress")
+                })
+            }
+        },
+    )
+    .await
+}
+
 /// Fetch and summarize a `BackendTLSPolicy`'s ancestor conditions for a timeout dump.
 async fn backend_tls_policy_state(api: &Api<BackendTLSPolicy>, name: &str) -> String {
     match api.get(name).await {

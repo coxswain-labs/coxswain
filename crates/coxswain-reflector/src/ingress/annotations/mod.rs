@@ -12,11 +12,14 @@
 //! The top-level [`IngressAnnotations::parse`] function is called once per Ingress in
 //! [`super::reconcile`] and threads the results into every rule/path entry.
 //!
-//! ## WARN + default on bad values
+//! ## Structured diagnostics
 //!
-//! Every parse helper emits a structured `WARN` tracing event on invalid input and
-//! returns `None` so the annotation is treated as absent — the whole Ingress keeps
-//! its routes; only that annotation's effect is suppressed.
+//! Parse helpers return `None` on invalid input so the annotation is treated as
+//! absent — the whole Ingress keeps its routes; only that annotation's effect is
+//! suppressed.  Callers that have the annotation-key context push an
+//! [`AnnotationIssue`] into the collector returned by [`IngressAnnotations::parse`].
+//! The controller consumer converts those into `tracing::warn!` log lines and
+//! `Warning` Kubernetes Events; the proxy discards them silently.
 
 mod caching;
 mod filters;
@@ -40,6 +43,22 @@ use coxswain_core::routing::{
 use security::AuthAnnotation;
 use std::collections::BTreeMap;
 
+// ── Structured annotation diagnostic ─────────────────────────────────────────
+
+/// A structured annotation parse failure collected by [`IngressAnnotations::parse`].
+///
+/// The controller consumer converts these into `Warning` Kubernetes Events on the
+/// owning Ingress; the proxy discards them silently.  The `tracing::warn!` is emitted
+/// by the parse helper itself (both roles); the K8s Event is controller-only.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct AnnotationIssue {
+    /// Full annotation key string (e.g. `"ingress.coxswain-labs.dev/connect-timeout"`).
+    pub annotation: &'static str,
+    /// Operator-facing message reusing today's warn message text.
+    pub message: String,
+}
+
 // ── Annotation-namespace prefix ──────────────────────────────────────────────
 
 /// The shared prefix for all Coxswain Ingress annotations.
@@ -57,18 +76,16 @@ pub fn get<'a>(annotations: &'a BTreeMap<String, String>, key: &str) -> Option<&
 
 /// Parse a boolean annotation value: `"true"`/`"false"` (ASCII-case-insensitive).
 ///
-/// Emits a structured `WARN` on any other value and returns `None` so the caller
-/// falls back to the default (annotation treated as absent).
+/// Returns `None` on any other value so the caller falls back to the default.
+/// Emits a `WARN` on invalid input (without annotation-key context — the caller
+/// is expected to also push an [`AnnotationIssue`] with the annotation key).
 #[must_use]
 pub fn parse_bool(s: &str) -> Option<bool> {
     match s.trim() {
         v if v.eq_ignore_ascii_case("true") => Some(true),
         v if v.eq_ignore_ascii_case("false") => Some(false),
         _ => {
-            tracing::warn!(
-                value = s,
-                "invalid boolean annotation value (expected true/false)"
-            );
+            tracing::warn!(value = s, "invalid boolean annotation value");
             None
         }
     }
@@ -176,50 +193,54 @@ pub(super) struct IngressAnnotations {
 impl IngressAnnotations {
     /// Parse all `ingress.coxswain-labs.dev/*` annotations from the Ingress metadata map.
     ///
-    /// `route_id` is used as context in WARN messages so operators can trace the
-    /// offending Ingress without digging into log correlations.
+    /// Returns the parsed annotation set together with a list of [`AnnotationIssue`]s
+    /// for every value that was invalid and fell back to a default.  The caller is
+    /// responsible for forwarding the issues to the controller consumer (which emits
+    /// `tracing::warn!` and `Warning` Kubernetes Events); the proxy discards them.
     ///
-    /// Invalid values emit a `WARN` and fall back to the absent / default behaviour;
-    /// the Ingress is never rejected.
-    pub(super) fn parse(annotations: Option<&BTreeMap<String, String>>, route_id: &str) -> Self {
+    /// The Ingress is never rejected — invalid values produce an issue and use the
+    /// absent / default behaviour.
+    pub(super) fn parse(
+        annotations: Option<&BTreeMap<String, String>>,
+        route_id: &str,
+    ) -> (Self, Vec<AnnotationIssue>) {
         let Some(ann) = annotations else {
-            return Self::default();
+            return (Self::default(), Vec::new());
         };
+
+        let mut diag: Vec<AnnotationIssue> = Vec::new();
+        // Alias for pushing a diagnostic at the call site that has the annotation key.
+        macro_rules! issue {
+            ($key:expr, $msg:expr) => {
+                diag.push(AnnotationIssue {
+                    annotation: $key,
+                    message: $msg.into(),
+                })
+            };
+        }
 
         // ── Timeouts ──────────────────────────────────────────────────────────
         let connect = get(ann, CONNECT_TIMEOUT).and_then(|v| {
             let d = parse_duration(v);
             if d.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = CONNECT_TIMEOUT,
-                    value = v,
-                    "invalid duration — using default"
-                );
+                tracing::warn!(ingress = %route_id, annotation = CONNECT_TIMEOUT, value = v, "invalid duration — using default");
+                issue!(CONNECT_TIMEOUT, "invalid duration — using default");
             }
             d
         });
         let read = get(ann, READ_TIMEOUT).and_then(|v| {
             let d = parse_duration(v);
             if d.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = READ_TIMEOUT,
-                    value = v,
-                    "invalid duration — using default"
-                );
+                tracing::warn!(ingress = %route_id, annotation = READ_TIMEOUT, value = v, "invalid duration — using default");
+                issue!(READ_TIMEOUT, "invalid duration — using default");
             }
             d
         });
         let send = get(ann, SEND_TIMEOUT).and_then(|v| {
             let d = parse_duration(v);
             if d.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = SEND_TIMEOUT,
-                    value = v,
-                    "invalid duration — using default"
-                );
+                tracing::warn!(ingress = %route_id, annotation = SEND_TIMEOUT, value = v, "invalid duration — using default");
+                issue!(SEND_TIMEOUT, "invalid duration — using default");
             }
             d
         });
@@ -228,12 +249,7 @@ impl IngressAnnotations {
         let max_retries = get(ann, MAX_RETRIES).and_then(|v| {
             let n = parse_u32(v);
             if n.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = MAX_RETRIES,
-                    value = v,
-                    "invalid integer — using default (no retries)"
-                );
+                issue!(MAX_RETRIES, "invalid integer — using default (no retries)");
             }
             n
         });
@@ -246,11 +262,21 @@ impl IngressAnnotations {
                     max_retries = n,
                     "max-retries set but retry-on is absent — retries disabled"
                 );
+                issue!(
+                    MAX_RETRIES,
+                    format!(
+                        "max-retries set but retry-on is absent — retries disabled (max-retries={n})"
+                    )
+                );
                 RetryPolicy::default()
             }
             (None, Some(_)) => {
                 tracing::warn!(
                     ingress = %route_id,
+                    "retry-on set but max-retries is absent — retries disabled"
+                );
+                issue!(
+                    RETRY_ON,
                     "retry-on set but max-retries is absent — retries disabled"
                 );
                 RetryPolicy::default()
@@ -267,12 +293,8 @@ impl IngressAnnotations {
             .and_then(|v| {
                 let b = parse_bool(v);
                 if b.is_none() {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        annotation = USE_REGEX,
-                        value = v,
-                        "invalid boolean — treating use-regex as false"
-                    );
+                    tracing::warn!(ingress = %route_id, annotation = USE_REGEX, value = v, "treating use-regex as false");
+                    issue!(USE_REGEX, "invalid boolean — treating use-regex as false");
                 }
                 b
             })
@@ -282,10 +304,8 @@ impl IngressAnnotations {
         let backend_protocol = get(ann, BACKEND_PROTOCOL).and_then(|v| {
             let p = parse_backend_protocol(v);
             if p.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = BACKEND_PROTOCOL,
-                    value = v,
+                issue!(
+                    BACKEND_PROTOCOL,
                     "unknown protocol — using appProtocol-derived default"
                 );
             }
@@ -300,6 +320,7 @@ impl IngressAnnotations {
             REQUEST_HEADER_SET,
             REQUEST_HEADER_REMOVE,
             "request-header",
+            &mut diag,
         );
 
         // ── Response header modifier (#79) ────────────────────────────────────
@@ -310,6 +331,7 @@ impl IngressAnnotations {
             RESPONSE_HEADER_SET,
             RESPONSE_HEADER_REMOVE,
             "response-header",
+            &mut diag,
         );
 
         // ── Request redirect (#79) ────────────────────────────────────────────
@@ -327,10 +349,9 @@ impl IngressAnnotations {
             let scheme = get(ann, REDIRECT_SCHEME).and_then(|v| {
                 let s = parse_redirect_scheme(v);
                 if s.is_none() {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        annotation = REDIRECT_SCHEME,
-                        value = v,
+                    tracing::warn!(ingress = %route_id, annotation = REDIRECT_SCHEME, value = v, "invalid redirect-scheme — field omitted (original request scheme preserved)");
+                    issue!(
+                        REDIRECT_SCHEME,
                         "invalid redirect-scheme — field omitted (original request scheme preserved)"
                     );
                 }
@@ -346,6 +367,10 @@ impl IngressAnnotations {
                         value = v,
                         "invalid redirect-port (expected 0–65535) — field omitted"
                     );
+                    issue!(
+                        REDIRECT_PORT,
+                        "invalid redirect-port (expected 0–65535) — field omitted"
+                    );
                     None
                 }
             });
@@ -355,10 +380,9 @@ impl IngressAnnotations {
                 .and_then(|v| {
                     let c = parse_redirect_status_code(v);
                     if c.is_none() {
-                        tracing::warn!(
-                            ingress = %route_id,
-                            annotation = REDIRECT_STATUS_CODE,
-                            value = v,
+                        tracing::warn!(ingress = %route_id, annotation = REDIRECT_STATUS_CODE, value = v, "invalid redirect-status-code — using default 302");
+                        issue!(
+                            REDIRECT_STATUS_CODE,
                             "invalid redirect-status-code — using default 302"
                         );
                     }
@@ -381,12 +405,8 @@ impl IngressAnnotations {
             .and_then(|v| {
                 let b = parse_bool(v);
                 if b.is_none() {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        annotation = SSL_REDIRECT,
-                        value = v,
-                        "invalid boolean — treating ssl-redirect as false"
-                    );
+                    tracing::warn!(ingress = %route_id, annotation = SSL_REDIRECT, value = v, "treating ssl-redirect as false");
+                    issue!(SSL_REDIRECT, "invalid boolean — treating ssl-redirect as false");
                 }
                 b
             })
@@ -395,12 +415,8 @@ impl IngressAnnotations {
         let ssl_redirect_code = get(ann, SSL_REDIRECT_CODE).and_then(|v| {
             let c = parse_redirect_status_code(v);
             if c.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = SSL_REDIRECT_CODE,
-                    value = v,
-                    "invalid ssl-redirect-code — using default 308"
-                );
+                tracing::warn!(ingress = %route_id, annotation = SSL_REDIRECT_CODE, value = v, "invalid ssl-redirect-code — using default 308");
+                issue!(SSL_REDIRECT_CODE, "invalid ssl-redirect-code — using default 308");
             }
             c
         });
@@ -409,31 +425,35 @@ impl IngressAnnotations {
         let max_body_size = get(ann, MAX_BODY_SIZE).and_then(|v| {
             let n = parse_byte_size(v);
             if n.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = MAX_BODY_SIZE,
-                    value = v,
-                    "invalid max-body-size — no limit applied"
-                );
+                issue!(MAX_BODY_SIZE, "invalid max-body-size — no limit applied");
             }
             n
         });
 
         // ── Allow-source-range (#264) ─────────────────────────────────────────
-        let allow_source_range =
-            get(ann, ALLOW_SOURCE_RANGE).and_then(|s| parse_allow_source_range(s, route_id));
+        let allow_source_range = get(ann, ALLOW_SOURCE_RANGE)
+            .and_then(|s| parse_allow_source_range(s, route_id, &mut diag));
 
         // ── Deny-source-range (#268) ──────────────────────────────────────────
-        let deny_source_range =
-            get(ann, DENY_SOURCE_RANGE).and_then(|s| parse_deny_source_range(s, route_id));
+        let deny_source_range = get(ann, DENY_SOURCE_RANGE)
+            .and_then(|s| parse_deny_source_range(s, route_id, &mut diag));
 
         // ── Response caching (#40) ────────────────────────────────────────────
         let cache_enabled = get(ann, CACHE_ENABLED)
-            .and_then(parse_cache_enabled)
+            .and_then(|v| {
+                let b = parse_cache_enabled(v);
+                if b.is_none() {
+                    issue!(
+                        CACHE_ENABLED,
+                        "invalid boolean — treating cache-enabled as false"
+                    );
+                }
+                b
+            })
             .unwrap_or(false);
 
         // ── Session affinity (#15) ────────────────────────────────────────────
-        let session_affinity = parse_session_affinity(ann, route_id);
+        let session_affinity = parse_session_affinity(ann, route_id, &mut diag);
 
         // ── Rate limiting (#25) ───────────────────────────────────────────────
         let rate_limit = parse_rate_limit(
@@ -441,21 +461,17 @@ impl IngressAnnotations {
             get(ann, RATE_LIMIT_BURST),
             get(ann, RATE_LIMIT_BY),
             route_id,
+            &mut diag,
         );
 
         // ── External / basic auth (#24) ───────────────────────────────────────
-        let auth = security::parse_auth(ann, route_id);
+        let auth = security::parse_auth(ann, route_id, &mut diag);
 
         // ── Mirror target (#283) ──────────────────────────────────────────────
         let mirror_target = get(ann, MIRROR_TARGET).and_then(|v| {
             let r = traffic_policy::parse_mirror_target(v);
             if r.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = MIRROR_TARGET,
-                    value = v,
-                    "invalid mirror-target — mirror disabled"
-                );
+                issue!(MIRROR_TARGET, "invalid mirror-target — mirror disabled");
             }
             r
         });
@@ -464,10 +480,8 @@ impl IngressAnnotations {
         let keepalive_timeout = get(ann, UPSTREAM_KEEPALIVE_TIMEOUT).and_then(|v| {
             let d = parse_duration(v);
             if d.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = UPSTREAM_KEEPALIVE_TIMEOUT,
-                    value = v,
+                issue!(
+                    UPSTREAM_KEEPALIVE_TIMEOUT,
                     "invalid duration — using Pingora default keepalive timeout"
                 );
             }
@@ -475,14 +489,14 @@ impl IngressAnnotations {
         });
 
         // ── Response compression (#270) ───────────────────────────────────────
-        let compression = traffic_policy::parse_compression(ann, route_id);
+        let compression = traffic_policy::parse_compression(ann, route_id, &mut diag);
 
         // ── Trusted-proxy forwarded-IP headers (#271) ─────────────────────────
-        let forwarded_for = security::parse_forwarded_for(ann, route_id);
+        let forwarded_for = security::parse_forwarded_for(ann, route_id, &mut diag);
 
         // ── Load-balance algorithm (#275, #276) ───────────────────────────────
         let load_balance = get(ann, LOAD_BALANCE)
-            .map(|s| traffic_policy::parse_load_balance(s, route_id))
+            .map(|s| traffic_policy::parse_load_balance(s, route_id, &mut diag))
             .unwrap_or_default();
 
         // ── Path normalization level (#280) ───────────────────────────────────
@@ -494,45 +508,52 @@ impl IngressAnnotations {
                     value = v,
                     "unknown path-normalize value — falling back to base"
                 );
+                issue!(
+                    PATH_NORMALIZE,
+                    "unknown path-normalize value — falling back to base"
+                );
                 NormalizeLevel::Base
             })
         });
 
         // ── Circuit breaker (#282) ────────────────────────────────────────────
-        let circuit_breaker = traffic_policy::parse_circuit_breaker(ann, route_id);
+        let circuit_breaker = traffic_policy::parse_circuit_breaker(ann, route_id, &mut diag);
 
-        Self {
-            timeouts: RouteTimeouts {
-                request: None,
-                backend_request: None,
-                connect,
-                read,
-                send,
+        (
+            Self {
+                timeouts: RouteTimeouts {
+                    request: None,
+                    backend_request: None,
+                    connect,
+                    read,
+                    send,
+                },
+                retries,
+                rewrite,
+                backend_protocol,
+                use_regex,
+                request_headers,
+                response_headers,
+                redirect,
+                ssl_redirect,
+                ssl_redirect_code,
+                max_body_size,
+                allow_source_range,
+                deny_source_range,
+                cache_enabled,
+                session_affinity,
+                rate_limit,
+                auth,
+                mirror_target,
+                keepalive_timeout,
+                compression,
+                forwarded_for,
+                load_balance,
+                path_normalize,
+                circuit_breaker,
             },
-            retries,
-            rewrite,
-            backend_protocol,
-            use_regex,
-            request_headers,
-            response_headers,
-            redirect,
-            ssl_redirect,
-            ssl_redirect_code,
-            max_body_size,
-            allow_source_range,
-            deny_source_range,
-            cache_enabled,
-            session_affinity,
-            rate_limit,
-            auth,
-            mirror_target,
-            keepalive_timeout,
-            compression,
-            forwarded_for,
-            load_balance,
-            path_normalize,
-            circuit_breaker,
-        }
+            diag,
+        )
     }
 }
 
@@ -555,14 +576,16 @@ pub fn parse_normalize_level(s: &str) -> Option<NormalizeLevel> {
 /// Build a [`HeaderMod`] from the three `add`/`set`/`remove` annotation keys for one
 /// modifier group (request or response).  Returns `None` when none of the three keys
 /// are present, or when [`HeaderMod::parse`] rejects the collected values (emits a
-/// contextual `WARN` and drops the entire modifier so the Ingress keeps serving).
+/// contextual `WARN`, pushes an [`AnnotationIssue`], and drops the entire modifier so
+/// the Ingress keeps serving).
 fn build_header_mod(
     ann: &BTreeMap<String, String>,
     route_id: &str,
-    add_key: &str,
-    set_key: &str,
-    remove_key: &str,
+    add_key: &'static str,
+    set_key: &'static str,
+    remove_key: &'static str,
     label: &str,
+    diag: &mut Vec<AnnotationIssue>,
 ) -> Option<HeaderMod> {
     let has_any = [add_key, set_key, remove_key]
         .iter()
@@ -597,6 +620,19 @@ fn build_header_mod(
                 label,
                 "invalid header annotation — skipping header modifier"
             );
+            // Use the set key as the representative annotation key for the issue
+            // (the annotation group is named by the most specific key the user set).
+            let rep_key = if get(ann, set_key).is_some() {
+                set_key
+            } else if get(ann, add_key).is_some() {
+                add_key
+            } else {
+                remove_key
+            };
+            diag.push(AnnotationIssue {
+                annotation: rep_key,
+                message: format!("invalid header annotation — skipping header modifier: {e}"),
+            });
             None
         }
     }
@@ -651,7 +687,7 @@ mod tests {
 
     #[test]
     fn parse_returns_defaults_when_no_annotations() {
-        let a = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, "default/test");
         assert!(a.timeouts.connect.is_none());
         assert!(a.retries.is_disabled());
         assert!(a.rewrite.is_none());
@@ -665,7 +701,7 @@ mod tests {
             (READ_TIMEOUT, "30s"),
             (SEND_TIMEOUT, "10s"),
         ]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(a.timeouts.connect, Some(Duration::from_secs(5)));
         assert_eq!(a.timeouts.read, Some(Duration::from_secs(30)));
         assert_eq!(a.timeouts.send, Some(Duration::from_secs(10)));
@@ -677,7 +713,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_invalid_timeout_warns_and_uses_default() {
         let m = ann(&[(CONNECT_TIMEOUT, "not-a-duration")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.timeouts.connect.is_none());
         assert!(logs_contain("invalid duration — using default"));
     }
@@ -686,7 +722,7 @@ mod tests {
     fn parse_retries_full() {
         use coxswain_core::routing::RetryOn;
         let m = ann(&[(MAX_RETRIES, "3"), (RETRY_ON, "connect-failure,timeout")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(a.retries.max_retries, 3);
         assert!(a.retries.on.contains(RetryOn::CONNECT_FAILURE));
         assert!(a.retries.on.contains(RetryOn::TIMEOUT));
@@ -697,7 +733,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_retries_max_without_on_warns_and_disables() {
         let m = ann(&[(MAX_RETRIES, "3")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.retries.is_disabled());
         assert!(logs_contain("retry-on is absent"));
     }
@@ -706,7 +742,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_retries_on_without_max_warns_and_disables() {
         let m = ann(&[(RETRY_ON, "5xx")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.retries.is_disabled());
         assert!(logs_contain("max-retries is absent"));
     }
@@ -714,20 +750,20 @@ mod tests {
     #[test]
     fn parse_use_regex_true() {
         let m = ann(&[(USE_REGEX, "true")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.use_regex);
     }
 
     #[test]
     fn parse_use_regex_false() {
         let m = ann(&[(USE_REGEX, "false")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(!a.use_regex);
     }
 
     #[test]
     fn parse_use_regex_absent_defaults_false() {
-        let a = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, "default/test");
         assert!(!a.use_regex);
     }
 
@@ -735,7 +771,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_use_regex_invalid_warns_and_defaults_false() {
         let m = ann(&[(USE_REGEX, "1")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(!a.use_regex);
         assert!(logs_contain("treating use-regex as false"));
     }
@@ -743,7 +779,7 @@ mod tests {
     #[test]
     fn parse_rewrite_target() {
         let m = ann(&[(REWRITE_TARGET, "/api")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         match a.rewrite {
             Some(PathModifier::ReplaceFullPath(s)) => assert_eq!(s, "/api"),
             _ => panic!("expected ReplaceFullPath"),
@@ -753,17 +789,17 @@ mod tests {
     #[test]
     fn parse_backend_protocol_https() {
         let m = ann(&[(BACKEND_PROTOCOL, "HTTPS")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(a.backend_protocol, Some(BackendProtocol::Https));
     }
 
     #[test]
     fn parse_backend_protocol_lowercase_accepted() {
         let m = ann(&[(BACKEND_PROTOCOL, "https")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(a.backend_protocol, Some(BackendProtocol::Https));
         let m = ann(&[(BACKEND_PROTOCOL, "grpc")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(a.backend_protocol, Some(BackendProtocol::H2c));
     }
 
@@ -771,7 +807,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_backend_protocol_unknown_annotation_warns() {
         let m = ann(&[(BACKEND_PROTOCOL, "h2c")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.backend_protocol.is_none());
         assert!(logs_contain("unknown backend-protocol value"));
     }
@@ -783,7 +819,7 @@ mod tests {
             (REQUEST_HEADER_ADD, "X-Add: add-value"),
             (REQUEST_HEADER_REMOVE, "X-Remove"),
         ]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         let hm = a
             .request_headers
             .as_ref()
@@ -801,7 +837,7 @@ mod tests {
             (RESPONSE_HEADER_ADD, "X-Resp-Add: v2"),
             (RESPONSE_HEADER_REMOVE, "X-Resp-Remove"),
         ]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         let hm = a
             .response_headers
             .as_ref()
@@ -813,7 +849,7 @@ mod tests {
 
     #[test]
     fn parse_request_header_absent_when_no_keys() {
-        let a = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, "default/test");
         assert!(a.request_headers.is_none());
         assert!(a.response_headers.is_none());
     }
@@ -822,7 +858,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_request_header_invalid_name_warns_and_drops_modifier() {
         let m = ann(&[(REQUEST_HEADER_SET, "X-Bad\x01Name: value")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.request_headers.is_none());
         assert!(logs_contain("invalid header annotation"));
     }
@@ -833,7 +869,7 @@ mod tests {
             REQUEST_HEADER_SET,
             "Cache-Control: no-cache, no-store\nX-Foo: bar",
         )]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         let hm = a
             .request_headers
             .as_ref()
@@ -844,13 +880,13 @@ mod tests {
     #[test]
     fn parse_redirect_any_key_activates_action() {
         let m = ann(&[(REDIRECT_SCHEME, "https")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.redirect.is_some());
     }
 
     #[test]
     fn parse_redirect_no_keys_is_none() {
-        let a = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, "default/test");
         assert!(a.redirect.is_none());
     }
 
@@ -863,7 +899,7 @@ mod tests {
             (REDIRECT_PATH, "/new-path"),
             (REDIRECT_STATUS_CODE, "301"),
         ]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         match a.redirect {
             Some(FilterAction::RequestRedirect {
                 scheme,
@@ -885,7 +921,7 @@ mod tests {
     #[test]
     fn parse_redirect_absent_fields_default_to_none() {
         let m = ann(&[(REDIRECT_STATUS_CODE, "307")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         match a.redirect {
             Some(FilterAction::RequestRedirect {
                 scheme,
@@ -907,7 +943,7 @@ mod tests {
     #[test]
     fn parse_redirect_missing_status_code_defaults_to_302() {
         let m = ann(&[(REDIRECT_HOSTNAME, "example.com")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         match a.redirect {
             Some(FilterAction::RequestRedirect { status_code, .. }) => {
                 assert_eq!(status_code, 302);
@@ -920,7 +956,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_redirect_invalid_scheme_warns_and_uses_none() {
         let m = ann(&[(REDIRECT_SCHEME, "ftp")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         match a.redirect {
             Some(FilterAction::RequestRedirect { scheme, .. }) => {
                 assert!(scheme.is_none());
@@ -934,7 +970,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_redirect_invalid_port_warns_and_uses_none() {
         let m = ann(&[(REDIRECT_PORT, "99999")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         match a.redirect {
             Some(FilterAction::RequestRedirect { port, .. }) => {
                 assert!(port.is_none());
@@ -948,7 +984,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_redirect_invalid_status_code_warns_and_defaults_302() {
         let m = ann(&[(REDIRECT_STATUS_CODE, "200")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         match a.redirect {
             Some(FilterAction::RequestRedirect { status_code, .. }) => {
                 assert_eq!(status_code, 302);
@@ -961,20 +997,20 @@ mod tests {
     #[test]
     fn parse_ssl_redirect_true() {
         let m = ann(&[(SSL_REDIRECT, "true")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.ssl_redirect);
     }
 
     #[test]
     fn parse_ssl_redirect_false() {
         let m = ann(&[(SSL_REDIRECT, "false")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(!a.ssl_redirect);
     }
 
     #[test]
     fn parse_ssl_redirect_absent_defaults_false() {
-        let a = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, "default/test");
         assert!(!a.ssl_redirect);
     }
 
@@ -982,7 +1018,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_ssl_redirect_invalid_warns_and_defaults_false() {
         let m = ann(&[(SSL_REDIRECT, "yes")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(!a.ssl_redirect);
         assert!(logs_contain("treating ssl-redirect as false"));
     }
@@ -990,13 +1026,13 @@ mod tests {
     #[test]
     fn parse_ssl_redirect_code_valid() {
         let m = ann(&[(SSL_REDIRECT_CODE, "301")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(a.ssl_redirect_code, Some(301));
     }
 
     #[test]
     fn parse_ssl_redirect_code_absent_is_none() {
-        let a = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, "default/test");
         assert!(a.ssl_redirect_code.is_none());
     }
 
@@ -1004,7 +1040,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_ssl_redirect_code_invalid_warns_and_is_none() {
         let m = ann(&[(SSL_REDIRECT_CODE, "500")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.ssl_redirect_code.is_none());
         assert!(logs_contain("invalid ssl-redirect-code"));
     }
@@ -1012,13 +1048,13 @@ mod tests {
     #[test]
     fn parse_max_body_size_valid() {
         let m = ann(&[(MAX_BODY_SIZE, "8m")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(a.max_body_size, Some(8 * 1024 * 1024));
     }
 
     #[test]
     fn parse_max_body_size_absent_is_none() {
-        let a = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, "default/test");
         assert!(a.max_body_size.is_none());
     }
 
@@ -1026,7 +1062,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_max_body_size_invalid_warns_and_fails_open() {
         let m = ann(&[(MAX_BODY_SIZE, "garbage")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.max_body_size.is_none());
         assert!(logs_contain("invalid max-body-size"));
     }
@@ -1034,22 +1070,30 @@ mod tests {
     #[test]
     fn parse_cache_enabled_true() {
         let m = ann(&[(CACHE_ENABLED, "true")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.cache_enabled);
     }
 
     #[test]
     fn parse_cache_enabled_false_and_absent_default_off() {
         let m = ann(&[(CACHE_ENABLED, "false")]);
-        assert!(!IngressAnnotations::parse(Some(&m), "default/test").cache_enabled);
-        assert!(!IngressAnnotations::parse(None, "default/test").cache_enabled);
+        assert!(
+            !IngressAnnotations::parse(Some(&m), "default/test")
+                .0
+                .cache_enabled
+        );
+        assert!(
+            !IngressAnnotations::parse(None, "default/test")
+                .0
+                .cache_enabled
+        );
     }
 
     #[test]
     #[tracing_test::traced_test]
     fn parse_cache_enabled_invalid_warns_and_defaults_off() {
         let m = ann(&[(CACHE_ENABLED, "1")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(!a.cache_enabled);
         assert!(logs_contain("treating cache-enabled as false"));
     }
@@ -1088,35 +1132,35 @@ mod tests {
 
     #[test]
     fn parse_annotation_path_normalize_absent_is_none() {
-        let a = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, "default/test");
         assert!(a.path_normalize.is_none());
     }
 
     #[test]
     fn parse_annotation_path_normalize_base() {
         let m = ann(&[(PATH_NORMALIZE, "base")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(a.path_normalize, Some(NormalizeLevel::Base));
     }
 
     #[test]
     fn parse_annotation_path_normalize_none_disables() {
         let m = ann(&[(PATH_NORMALIZE, "none")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(a.path_normalize, Some(NormalizeLevel::None));
     }
 
     #[test]
     fn parse_annotation_path_normalize_merge_slashes() {
         let m = ann(&[(PATH_NORMALIZE, "merge-slashes")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(a.path_normalize, Some(NormalizeLevel::MergeSlashes));
     }
 
     #[test]
     fn parse_annotation_path_normalize_decode_and_merge() {
         let m = ann(&[(PATH_NORMALIZE, "decode-and-merge-slashes")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert_eq!(
             a.path_normalize,
             Some(NormalizeLevel::DecodeAndMergeSlashes)
@@ -1127,7 +1171,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_annotation_path_normalize_unknown_warns_and_falls_back_to_base() {
         let m = ann(&[(PATH_NORMALIZE, "aggressive")]);
-        let a = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         // Unknown value → explicit Base (not absent)
         assert_eq!(a.path_normalize, Some(NormalizeLevel::Base));
         assert!(logs_contain("unknown path-normalize value"));

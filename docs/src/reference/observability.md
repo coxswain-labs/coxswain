@@ -198,6 +198,60 @@ Access logs are emitted on the `coxswain_proxy::access` target, so they can be s
 COXSWAIN_LOG=info,coxswain_proxy::access=off
 ```
 
+## Kubernetes Events
+
+The controller emits Kubernetes `Warning` Events on affected `Ingress` objects for two
+diagnostic conditions. Events appear in `kubectl describe ingress <name>` and
+`kubectl get events` — no log-aggregation pipeline needed.
+
+### RouteConflict
+
+Triggered when two or more Ingresses claim the same `(host, path)` combination. The
+earliest-applied rule wins; every losing Ingress receives one `Warning` Event:
+
+```
+Type     Reason         Age   From                 Message
+----     ------         ---   ----                 -------
+Warning  RouteConflict  12s   coxswain-controller  Route on host api.example.com path /v1 is shadowed by default/primary-ingress
+```
+
+The `Message` field names the winning Ingress as `<namespace>/<name>`. No Event is emitted
+on the winning Ingress. See [Ingress annotation reference](../guides/ingress-annotations.md)
+for how to resolve conflicts (e.g. deduplicate rules or adjust `IngressClass` assignments).
+
+### InvalidAnnotation
+
+Triggered when an `ingress.coxswain-labs.dev/*` annotation value cannot be parsed. The
+affected feature is disabled or falls back to its default; the Ingress itself continues to
+serve traffic from its valid rules.
+
+```
+Type     Reason             Age   From                 Message
+----     ------             ---   ----                 -------
+Warning  InvalidAnnotation  5s    coxswain-controller  ingress.coxswain-labs.dev/connect-timeout: invalid duration — using default
+```
+
+### Deduplication
+
+Both event types are deduplicated by the kube `Recorder`'s built-in per-process cache. A
+resync storm does not produce duplicate Events in `kubectl describe` output — the
+controller updates the existing Event's count rather than creating a new one. If the
+condition is corrected and then reintroduced (e.g. the annotation is fixed and then broken
+again), the Event re-appears.
+
+### Operator queries
+
+```bash
+# All Warning events on Ingresses in the default namespace
+kubectl get events -n default --field-selector reason=RouteConflict,type=Warning
+
+# All Invalid annotation events cluster-wide (requires cluster-admin)
+kubectl get events -A --field-selector reason=InvalidAnnotation,type=Warning
+
+# Describe a specific Ingress to see its Events inline
+kubectl describe ingress <name> -n <namespace>
+```
+
 ## Logging
 
 Coxswain uses structured logging via `tracing`. Configure the level with `--log` (or `COXSWAIN_LOG`):

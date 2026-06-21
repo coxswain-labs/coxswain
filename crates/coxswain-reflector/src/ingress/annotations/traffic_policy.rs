@@ -120,6 +120,8 @@ pub const MIRROR_TARGET: &str = "ingress.coxswain-labs.dev/mirror-target";
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────
 
+use super::AnnotationIssue;
+
 /// Parse a duration annotation value.
 ///
 /// Delegates to [`crate::duration::parse_duration`] and WARNs on invalid input.
@@ -235,6 +237,7 @@ const DEFAULT_COMPRESSION_MIN_SIZE: u64 = 1024;
 pub(crate) fn parse_compression(
     ann: &std::collections::BTreeMap<String, String>,
     route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
 ) -> Option<CompressionConfig> {
     use super::{get, parse_bool};
 
@@ -248,6 +251,10 @@ pub(crate) fn parse_compression(
                     value = v,
                     "invalid boolean — treating compression-gzip as false"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: COMPRESSION_GZIP,
+                    message: "invalid boolean — treating compression-gzip as false".into(),
+                });
             }
             b
         })
@@ -263,6 +270,10 @@ pub(crate) fn parse_compression(
                     value = v,
                     "invalid boolean — treating compression-brotli as false"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: COMPRESSION_BROTLI,
+                    message: "invalid boolean — treating compression-brotli as false".into(),
+                });
             }
             b
         })
@@ -286,6 +297,10 @@ pub(crate) fn parse_compression(
                         level = l,
                         "compression-level must be 1–9 — using default 6"
                     );
+                    diag.push(AnnotationIssue {
+                        annotation: COMPRESSION_LEVEL,
+                        message: "compression-level must be 1–9 — using default 6".into(),
+                    });
                     None
                 }
                 None => {
@@ -295,6 +310,10 @@ pub(crate) fn parse_compression(
                         value = v,
                         "invalid compression-level — using default 6"
                     );
+                    diag.push(AnnotationIssue {
+                        annotation: COMPRESSION_LEVEL,
+                        message: "invalid compression-level — using default 6".into(),
+                    });
                     None
                 }
             }
@@ -311,6 +330,10 @@ pub(crate) fn parse_compression(
                     value = v,
                     "invalid compression-min-size — using default 1024"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: COMPRESSION_MIN_SIZE,
+                    message: "invalid compression-min-size — using default 1024".into(),
+                });
             }
             n
         })
@@ -331,6 +354,10 @@ pub(crate) fn parse_compression(
                     value = v,
                     "compression-types parsed to empty list — using defaults"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: COMPRESSION_TYPES,
+                    message: "compression-types parsed to empty list — using defaults".into(),
+                });
                 default_compression_types()
             } else {
                 parsed.into_boxed_slice()
@@ -371,14 +398,18 @@ pub const LOAD_BALANCE: &str = "ingress.coxswain-labs.dev/load-balance";
 /// Unknown values emit a structured `WARN` (naming the Ingress via `route_id`) and
 /// return `RoundRobin`.
 #[must_use]
-pub(crate) fn parse_load_balance(s: &str, route_id: &str) -> LoadBalance {
+pub(crate) fn parse_load_balance(
+    s: &str,
+    route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
+) -> LoadBalance {
     match s {
         "round_robin" => LoadBalance::RoundRobin,
         "least_conn" => LoadBalance::LeastConn,
         "ewma" => LoadBalance::Ewma,
         // Backward-compatible alias: ip_hash → hash:source-ip
         "ip_hash" => LoadBalance::Hash(HashSource::SourceIp),
-        _ if s.starts_with("hash:") => parse_hash_attribute(&s["hash:".len()..], s, route_id),
+        _ if s.starts_with("hash:") => parse_hash_attribute(&s["hash:".len()..], s, route_id, diag),
         _ => {
             tracing::warn!(
                 ingress = %route_id,
@@ -387,13 +418,22 @@ pub(crate) fn parse_load_balance(s: &str, route_id: &str) -> LoadBalance {
                  hash:uri, hash:source-ip, hash:header=<name>, hash:cookie=<name>, ip_hash; \
                  falling back to round_robin"
             );
+            diag.push(AnnotationIssue {
+                annotation: LOAD_BALANCE,
+                message: format!("unknown load-balance value '{s}' — falling back to round_robin"),
+            });
             LoadBalance::RoundRobin
         }
     }
 }
 
 /// Parse the attribute portion of a `hash:<attr>` load-balance value.
-fn parse_hash_attribute(attr: &str, full: &str, route_id: &str) -> LoadBalance {
+fn parse_hash_attribute(
+    attr: &str,
+    full: &str,
+    route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
+) -> LoadBalance {
     match attr {
         "uri" => LoadBalance::Hash(HashSource::Uri),
         "source-ip" => LoadBalance::Hash(HashSource::SourceIp),
@@ -405,6 +445,10 @@ fn parse_hash_attribute(attr: &str, full: &str, route_id: &str) -> LoadBalance {
                     value = full,
                     "empty header name in load-balance hash expression; falling back to round_robin"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: LOAD_BALANCE,
+                    message: "empty header name in load-balance hash expression — falling back to round_robin".into(),
+                });
                 return LoadBalance::RoundRobin;
             }
             match HeaderName::from_bytes(name.as_bytes()) {
@@ -415,6 +459,12 @@ fn parse_hash_attribute(attr: &str, full: &str, route_id: &str) -> LoadBalance {
                         value = full,
                         "invalid header name in load-balance hash expression; falling back to round_robin"
                     );
+                    diag.push(AnnotationIssue {
+                        annotation: LOAD_BALANCE,
+                        message: format!(
+                            "invalid header name in load-balance hash expression: {full}"
+                        ),
+                    });
                     LoadBalance::RoundRobin
                 }
             }
@@ -427,6 +477,10 @@ fn parse_hash_attribute(attr: &str, full: &str, route_id: &str) -> LoadBalance {
                     value = full,
                     "empty cookie name in load-balance hash expression; falling back to round_robin"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: LOAD_BALANCE,
+                    message: "empty cookie name in load-balance hash expression — falling back to round_robin".into(),
+                });
                 return LoadBalance::RoundRobin;
             }
             LoadBalance::Hash(HashSource::Cookie(Arc::from(name)))
@@ -438,6 +492,10 @@ fn parse_hash_attribute(attr: &str, full: &str, route_id: &str) -> LoadBalance {
                 "unknown hash attribute in load-balance; valid forms: hash:uri, hash:source-ip, \
                  hash:header=<name>, hash:cookie=<name>; falling back to round_robin"
             );
+            diag.push(AnnotationIssue {
+                annotation: LOAD_BALANCE,
+                message: format!("unknown hash attribute in load-balance: {full}"),
+            });
             LoadBalance::RoundRobin
         }
     }
@@ -462,6 +520,7 @@ fn parse_hash_attribute(attr: &str, full: &str, route_id: &str) -> LoadBalance {
 pub(crate) fn parse_circuit_breaker(
     ann: &std::collections::BTreeMap<String, String>,
     route_id: &str,
+    diag: &mut Vec<AnnotationIssue>,
 ) -> Option<coxswain_core::routing::CircuitBreakerConfig> {
     use super::get;
     use coxswain_core::routing::CircuitBreakerConfig;
@@ -475,6 +534,12 @@ pub(crate) fn parse_circuit_breaker(
             value = threshold_str,
             "invalid circuit-breaker-threshold (expected 1–100) — circuit breaker disabled"
         );
+        diag.push(AnnotationIssue {
+            annotation: CIRCUIT_BREAKER_THRESHOLD,
+            message: format!(
+                "invalid circuit-breaker-threshold '{threshold_str}' (expected 1–100) — circuit breaker disabled"
+            ),
+        });
         None
     })?;
 
@@ -488,6 +553,10 @@ pub(crate) fn parse_circuit_breaker(
                     value = v,
                     "invalid duration — using default 10s"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: CIRCUIT_BREAKER_WINDOW,
+                    message: "invalid duration — using default 10s".into(),
+                });
             }
             d
         })
@@ -503,6 +572,10 @@ pub(crate) fn parse_circuit_breaker(
                     value = v,
                     "invalid duration — using default 5s"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: CIRCUIT_BREAKER_OPEN_DURATION,
+                    message: "invalid duration — using default 5s".into(),
+                });
             }
             d
         })
@@ -518,6 +591,10 @@ pub(crate) fn parse_circuit_breaker(
                     value = v,
                     "invalid integer — using default 10"
                 );
+                diag.push(AnnotationIssue {
+                    annotation: CIRCUIT_BREAKER_MIN_REQUESTS,
+                    message: "invalid integer — using default 10".into(),
+                });
             }
             n
         })
@@ -532,6 +609,12 @@ pub(crate) fn parse_circuit_breaker(
                 value = v,
                 "invalid duration — treating max-open-duration as absent (constant backoff)"
             );
+            diag.push(AnnotationIssue {
+                annotation: CIRCUIT_BREAKER_MAX_OPEN_DURATION,
+                message:
+                    "invalid duration — treating max-open-duration as absent (constant backoff)"
+                        .into(),
+            });
         }
         d
     });
@@ -547,6 +630,10 @@ pub(crate) fn parse_circuit_breaker(
              is set (failsafe exponential backoff requires start ≥ 1 s) — \
              treating max-open-duration as absent (constant backoff)"
         );
+        diag.push(AnnotationIssue {
+            annotation: CIRCUIT_BREAKER_OPEN_DURATION,
+            message: "circuit-breaker-open-duration must be ≥ 1s when max-open-duration is set — treating max-open-duration as absent (constant backoff)".into(),
+        });
         None
     } else {
         max_open_duration
@@ -844,15 +931,15 @@ mod tests {
         // References LOAD_BALANCE to satisfy the annotation-coverage gate.
         let _ = LOAD_BALANCE;
         assert_eq!(
-            parse_load_balance("round_robin", "test-ingress"),
+            parse_load_balance("round_robin", "test-ingress", &mut vec![]),
             LoadBalance::RoundRobin
         );
         assert_eq!(
-            parse_load_balance("least_conn", "test-ingress"),
+            parse_load_balance("least_conn", "test-ingress", &mut vec![]),
             LoadBalance::LeastConn
         );
         assert_eq!(
-            parse_load_balance("ewma", "test-ingress"),
+            parse_load_balance("ewma", "test-ingress", &mut vec![]),
             LoadBalance::Ewma
         );
     }
@@ -860,7 +947,7 @@ mod tests {
     #[test]
     fn parse_load_balance_ip_hash_backward_compat_alias() {
         assert_eq!(
-            parse_load_balance("ip_hash", "test-ingress"),
+            parse_load_balance("ip_hash", "test-ingress", &mut vec![]),
             LoadBalance::Hash(HashSource::SourceIp),
             "ip_hash must remain a valid alias for hash:source-ip"
         );
@@ -869,7 +956,7 @@ mod tests {
     #[test]
     fn parse_load_balance_hash_uri() {
         assert_eq!(
-            parse_load_balance("hash:uri", "test-ingress"),
+            parse_load_balance("hash:uri", "test-ingress", &mut vec![]),
             LoadBalance::Hash(HashSource::Uri)
         );
     }
@@ -877,7 +964,7 @@ mod tests {
     #[test]
     fn parse_load_balance_hash_source_ip() {
         assert_eq!(
-            parse_load_balance("hash:source-ip", "test-ingress"),
+            parse_load_balance("hash:source-ip", "test-ingress", &mut vec![]),
             LoadBalance::Hash(HashSource::SourceIp)
         );
     }
@@ -885,7 +972,7 @@ mod tests {
     #[test]
     fn parse_load_balance_hash_header() {
         assert_eq!(
-            parse_load_balance("hash:header=x-api-key", "test-ingress"),
+            parse_load_balance("hash:header=x-api-key", "test-ingress", &mut vec![]),
             LoadBalance::Hash(HashSource::Header(HeaderName::from_static("x-api-key")))
         );
     }
@@ -893,7 +980,7 @@ mod tests {
     #[test]
     fn parse_load_balance_hash_cookie() {
         assert_eq!(
-            parse_load_balance("hash:cookie=session", "test-ingress"),
+            parse_load_balance("hash:cookie=session", "test-ingress", &mut vec![]),
             LoadBalance::Hash(HashSource::Cookie(Arc::from("session")))
         );
     }
@@ -902,7 +989,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_load_balance_hash_empty_header_warns() {
         assert_eq!(
-            parse_load_balance("hash:header=", "test-ingress"),
+            parse_load_balance("hash:header=", "test-ingress", &mut vec![]),
             LoadBalance::RoundRobin
         );
         assert!(logs_contain("empty header name"));
@@ -912,7 +999,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_load_balance_hash_empty_cookie_warns() {
         assert_eq!(
-            parse_load_balance("hash:cookie=", "test-ingress"),
+            parse_load_balance("hash:cookie=", "test-ingress", &mut vec![]),
             LoadBalance::RoundRobin
         );
         assert!(logs_contain("empty cookie name"));
@@ -922,7 +1009,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_load_balance_hash_unknown_attr_warns() {
         assert_eq!(
-            parse_load_balance("hash:unknown", "test-ingress"),
+            parse_load_balance("hash:unknown", "test-ingress", &mut vec![]),
             LoadBalance::RoundRobin
         );
         assert!(logs_contain("unknown hash attribute"));
@@ -932,7 +1019,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_load_balance_unknown_value_warns_and_returns_round_robin() {
         assert_eq!(
-            parse_load_balance("bogus", "test-ingress"),
+            parse_load_balance("bogus", "test-ingress", &mut vec![]),
             LoadBalance::RoundRobin
         );
         assert!(logs_contain("unknown load-balance value"));
@@ -956,18 +1043,18 @@ mod tests {
         let _ = COMPRESSION_TYPES;
         let _ = COMPRESSION_MIN_SIZE;
         let a = ann(&[(COMPRESSION_GZIP, "false"), (COMPRESSION_BROTLI, "false")]);
-        assert!(parse_compression(&a, "test").is_none());
+        assert!(parse_compression(&a, "test", &mut vec![]).is_none());
     }
 
     #[test]
     fn parse_compression_absent_returns_none() {
-        assert!(parse_compression(&ann(&[]), "test").is_none());
+        assert!(parse_compression(&ann(&[]), "test", &mut vec![]).is_none());
     }
 
     #[test]
     fn parse_compression_gzip_only_defaults() {
         let a = ann(&[(COMPRESSION_GZIP, "true")]);
-        let cfg = parse_compression(&a, "test").expect("Some when gzip enabled");
+        let cfg = parse_compression(&a, "test", &mut vec![]).expect("Some when gzip enabled");
         assert!(cfg.gzip);
         assert!(!cfg.brotli);
         assert_eq!(cfg.level, 6);
@@ -979,7 +1066,7 @@ mod tests {
     #[test]
     fn parse_compression_brotli_only() {
         let a = ann(&[(COMPRESSION_BROTLI, "true")]);
-        let cfg = parse_compression(&a, "test").expect("Some when brotli enabled");
+        let cfg = parse_compression(&a, "test", &mut vec![]).expect("Some when brotli enabled");
         assert!(!cfg.gzip);
         assert!(cfg.brotli);
     }
@@ -987,7 +1074,7 @@ mod tests {
     #[test]
     fn parse_compression_custom_level() {
         let a = ann(&[(COMPRESSION_GZIP, "true"), (COMPRESSION_LEVEL, "3")]);
-        let cfg = parse_compression(&a, "test").unwrap();
+        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
         assert_eq!(cfg.level, 3);
     }
 
@@ -995,7 +1082,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_compression_level_out_of_range_warns_and_defaults() {
         let a = ann(&[(COMPRESSION_GZIP, "true"), (COMPRESSION_LEVEL, "0")]);
-        let cfg = parse_compression(&a, "test").unwrap();
+        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
         assert_eq!(cfg.level, 6, "should fall back to default");
         assert!(logs_contain("compression-level must be 1–9"));
     }
@@ -1003,7 +1090,7 @@ mod tests {
     #[test]
     fn parse_compression_custom_min_size() {
         let a = ann(&[(COMPRESSION_GZIP, "true"), (COMPRESSION_MIN_SIZE, "512")]);
-        let cfg = parse_compression(&a, "test").unwrap();
+        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
         assert_eq!(cfg.min_size, 512);
     }
 
@@ -1013,7 +1100,7 @@ mod tests {
             (COMPRESSION_GZIP, "true"),
             (COMPRESSION_TYPES, "text/plain,application/json"),
         ]);
-        let cfg = parse_compression(&a, "test").unwrap();
+        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
         assert_eq!(cfg.types.len(), 2);
         assert!(cfg.types.iter().any(|t| t.as_ref() == "text/plain"));
         assert!(cfg.types.iter().any(|t| t.as_ref() == "application/json"));
@@ -1026,7 +1113,7 @@ mod tests {
             (COMPRESSION_GZIP, "true"),
             (COMPRESSION_TYPES, "Text/HTML,Application/JSON"),
         ]);
-        let cfg = parse_compression(&a, "test").unwrap();
+        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
         assert!(cfg.types.iter().any(|t| t.as_ref() == "text/html"));
         assert!(cfg.types.iter().any(|t| t.as_ref() == "application/json"));
     }
@@ -1035,7 +1122,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_compression_empty_types_warns_and_defaults() {
         let a = ann(&[(COMPRESSION_GZIP, "true"), (COMPRESSION_TYPES, ",,,")]);
-        let cfg = parse_compression(&a, "test").unwrap();
+        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
         assert!(logs_contain("compression-types parsed to empty list"));
         // Falls back to the five-type default.
         assert_eq!(cfg.types.len(), 5);
@@ -1052,13 +1139,14 @@ mod tests {
         let _ = CIRCUIT_BREAKER_MIN_REQUESTS;
         let _ = CIRCUIT_BREAKER_MAX_OPEN_DURATION;
         // Without circuit-breaker-threshold the breaker is disabled.
-        assert!(parse_circuit_breaker(&ann(&[]), "test").is_none());
+        assert!(parse_circuit_breaker(&ann(&[]), "test", &mut vec![]).is_none());
     }
 
     #[test]
     fn parse_circuit_breaker_threshold_only_uses_defaults() {
         let a = ann(&[(CIRCUIT_BREAKER_THRESHOLD, "50")]);
-        let cfg = parse_circuit_breaker(&a, "test").expect("Some when threshold is present");
+        let cfg =
+            parse_circuit_breaker(&a, "test", &mut vec![]).expect("Some when threshold is present");
         assert_eq!(cfg.threshold_pct, 50);
         assert_eq!(cfg.window, std::time::Duration::from_secs(10));
         assert_eq!(cfg.open_duration, std::time::Duration::from_secs(5));
@@ -1075,7 +1163,8 @@ mod tests {
             (CIRCUIT_BREAKER_MIN_REQUESTS, "5"),
             (CIRCUIT_BREAKER_MAX_OPEN_DURATION, "60s"),
         ]);
-        let cfg = parse_circuit_breaker(&a, "test").expect("Some when threshold is present");
+        let cfg =
+            parse_circuit_breaker(&a, "test", &mut vec![]).expect("Some when threshold is present");
         assert_eq!(cfg.threshold_pct, 75);
         assert_eq!(cfg.window, std::time::Duration::from_secs(30));
         assert_eq!(cfg.open_duration, std::time::Duration::from_secs(10));
@@ -1090,7 +1179,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_circuit_breaker_threshold_zero_warns_and_returns_none() {
         let a = ann(&[(CIRCUIT_BREAKER_THRESHOLD, "0")]);
-        assert!(parse_circuit_breaker(&a, "test").is_none());
+        assert!(parse_circuit_breaker(&a, "test", &mut vec![]).is_none());
         assert!(logs_contain("invalid circuit-breaker-threshold"));
     }
 
@@ -1098,7 +1187,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_circuit_breaker_threshold_above_100_warns_and_returns_none() {
         let a = ann(&[(CIRCUIT_BREAKER_THRESHOLD, "101")]);
-        assert!(parse_circuit_breaker(&a, "test").is_none());
+        assert!(parse_circuit_breaker(&a, "test", &mut vec![]).is_none());
         assert!(logs_contain("invalid circuit-breaker-threshold"));
     }
 
@@ -1109,7 +1198,8 @@ mod tests {
             (CIRCUIT_BREAKER_THRESHOLD, "50"),
             (CIRCUIT_BREAKER_WINDOW, "bad"),
         ]);
-        let cfg = parse_circuit_breaker(&a, "test").expect("breaker enabled despite bad window");
+        let cfg = parse_circuit_breaker(&a, "test", &mut vec![])
+            .expect("breaker enabled despite bad window");
         assert_eq!(cfg.window, std::time::Duration::from_secs(10));
         assert!(logs_contain("invalid duration — using default 10s"));
     }
@@ -1121,8 +1211,8 @@ mod tests {
             (CIRCUIT_BREAKER_THRESHOLD, "50"),
             (CIRCUIT_BREAKER_OPEN_DURATION, "bad"),
         ]);
-        let cfg =
-            parse_circuit_breaker(&a, "test").expect("breaker enabled despite bad open-duration");
+        let cfg = parse_circuit_breaker(&a, "test", &mut vec![])
+            .expect("breaker enabled despite bad open-duration");
         assert_eq!(cfg.open_duration, std::time::Duration::from_secs(5));
         assert!(logs_contain("invalid duration — using default 5s"));
     }
@@ -1134,8 +1224,8 @@ mod tests {
             (CIRCUIT_BREAKER_THRESHOLD, "50"),
             (CIRCUIT_BREAKER_MIN_REQUESTS, "bad"),
         ]);
-        let cfg =
-            parse_circuit_breaker(&a, "test").expect("breaker enabled despite bad min-requests");
+        let cfg = parse_circuit_breaker(&a, "test", &mut vec![])
+            .expect("breaker enabled despite bad min-requests");
         assert_eq!(cfg.min_requests, 10);
         assert!(logs_contain("invalid integer — using default 10"));
     }
@@ -1147,7 +1237,7 @@ mod tests {
             (CIRCUIT_BREAKER_THRESHOLD, "50"),
             (CIRCUIT_BREAKER_MAX_OPEN_DURATION, "bad"),
         ]);
-        let cfg = parse_circuit_breaker(&a, "test")
+        let cfg = parse_circuit_breaker(&a, "test", &mut vec![])
             .expect("breaker enabled despite bad max-open-duration");
         assert!(cfg.max_open_duration.is_none());
         assert!(logs_contain("treating max-open-duration as absent"));

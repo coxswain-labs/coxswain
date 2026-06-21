@@ -20,7 +20,7 @@ use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::tls::SharedClientCertStore;
 use coxswain_reflector::{
-    ControllerReconciler, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
+    ControllerReconciler, IngressEvent, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
     SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
 };
 use std::sync::Arc;
@@ -151,6 +151,12 @@ pub fn spawn_status_writer(
         cluster_summary,
     );
 
+    // Create the ingress-event channel before the reconciler, so the sender can
+    // be moved into `ReconcilerOptions` and the receiver into `Controller`.
+    // Bounded at 256: the reconciler uses `try_send`, so a slow consumer causes
+    // events to be dropped rather than back-pressuring the rebuild loop.
+    let (ingress_event_tx, ingress_event_rx) = tokio::sync::mpsc::channel::<IngressEvent>(256);
+
     let reconciler = ControllerReconciler::new(
         ReconcilerOutputs::new(
             outputs.ingress_routes.clone(),
@@ -175,6 +181,7 @@ pub fn spawn_status_writer(
             // status-writer's work-queues reuse them instead of duplicating
             // watches (#347).
             opts.status_subscriptions = true;
+            opts.ingress_event_tx = Some(ingress_event_tx);
             opts
         },
     );
@@ -199,6 +206,7 @@ pub fn spawn_status_writer(
         },
         subscriptions,
         controller,
+        Some(ingress_event_rx),
     );
 
     Ok(SpawnedStatusWriter {
