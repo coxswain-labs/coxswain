@@ -140,7 +140,7 @@ impl IngressReconciler {
 
         // Parse ingress.coxswain-labs.dev/* annotations once per Ingress.
         // Invalid values WARN + use default; the Ingress is never dropped.
-        let (ann, annotation_issues) = IngressAnnotations::parse(
+        let (ann, mut annotation_issues) = IngressAnnotations::parse(
             merged_annotations
                 .as_ref()
                 .or(ingress.metadata.annotations.as_ref()),
@@ -229,8 +229,14 @@ impl IngressReconciler {
         // entry of this Ingress — same refcount-bump sharing pattern as above.
         let rate_limit = ann.rate_limit.clone().map(Arc::new);
         // Resolve auth annotation once per Ingress; share one Arc across every path.
-        let auth =
-            resolve_auth_config(ann.auth.as_ref(), auth_secrets, &route_id, ns).map(Arc::new);
+        let auth = resolve_auth_config(
+            ann.auth.as_ref(),
+            auth_secrets,
+            &route_id,
+            ns,
+            &mut annotation_issues,
+        )
+        .map(Arc::new);
         // Build the compression config once and share one Arc across every route entry.
         let compression = ann.compression.clone().map(Arc::new);
         // Build the trusted-proxy forwarded-IP config once and share one Arc across every path.
@@ -562,6 +568,7 @@ fn resolve_auth_config(
     auth_secrets: &reflector::Store<Secret>,
     route_id: &str,
     ingress_ns: &str,
+    diag: &mut Vec<AnnotationIssue>,
 ) -> Option<IngressAuthConfig> {
     let ann = annotation?;
     match ann {
@@ -639,7 +646,7 @@ fn resolve_auth_config(
                 );
                 return Some(IngressAuthConfig::Unavailable);
             };
-            let creds: Vec<BasicCredential> = parse_htpasswd(data);
+            let creds: Vec<BasicCredential> = parse_htpasswd(data, route_id, diag);
             if creds.is_empty() {
                 tracing::warn!(
                     ingress = %route_id,

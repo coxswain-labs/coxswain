@@ -291,9 +291,20 @@ proxy:
     # COXSWAIN_ACCESS_LOG — enable per-request access logging.
     # Set to false to disable entirely (useful for high-traffic benchmarking).
     accessLog: true
-    # COXSWAIN_ACCESS_LOG_PATH_MODE — what the access log emits for the path field.
-    # full: concrete request path (default); pattern: matched rule's path pattern;
-    # none: field omitted entirely. Prefer pipeline-side redaction when possible.
+    # COXSWAIN_ACCESS_LOG_PATH_MODE — what the access log emits for the `path`
+    # field. Three modes:
+    #   full    (default) The concrete normalised request path, e.g. /users/42.
+    #             Required for security log analysis: the only mode that exposes
+    #             path-traversal attempts, encoded payloads (%2f, %2e, ..), and
+    #             other abnormal characters to WAF / SIEM pipelines. Higher
+    #             cardinality than pattern.
+    #   pattern The matched route pattern, e.g. /users/. Reduces cardinality
+    #             but hides the actual request path from log analysis. Any
+    #             security scanning on the path field will miss attacks when
+    #             this mode is active. Use only when the log pipeline genuinely
+    #             cannot handle high-cardinality path fields.
+    #   none    Path field omitted entirely. Same security caveat as pattern.
+    # Prefer pipeline-side path redaction over changing this value away from full.
     accessLogPathMode: full
 
   # Dedicated-mode proxy provisioning. The pods themselves are not rendered

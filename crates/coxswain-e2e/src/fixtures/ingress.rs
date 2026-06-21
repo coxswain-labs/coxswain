@@ -144,6 +144,11 @@ pub const ANNOTATION_RATE_LIMIT_BURST: &str = fixture!("annotation_rate_limit_bu
 /// Used to verify fail-open when the keying header is absent — all requests pass even
 /// at high rates.
 pub const ANNOTATION_RATE_LIMIT_BY_HEADER: &str = fixture!("annotation_rate_limit_by_header.yaml");
+/// Ingress with `rate-limit-by: header:X-Api-Key` **and** `auth-url` (#411 negative).
+/// Used to verify that header keying paired with an auth annotation emits no
+/// `InvalidAnnotation` Warning Event (the auth layer prevents the bypass).
+pub const ANNOTATION_RATE_LIMIT_BY_HEADER_WITH_AUTH: &str =
+    fixture!("annotation_rate_limit_by_header_with_auth.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/rate-limit-rps: "notanumber"` (#25).
 /// Used to verify that an invalid annotation value is ignored (warn + fail-open) and
 /// traffic flows unthrottled.
@@ -174,6 +179,13 @@ pub const ANNOTATION_AUTH_ALWAYS_SET_COOKIE: &str =
 /// Carries `ingress.coxswain-labs.dev/auth-basic: "true"` so the reflector picks it up.
 /// Contains: `alice` (bcrypt, password `secret`) + `bob` (SHA1, password `secret`).
 pub const AUTH_BASIC_SECRET: &str = fixture!("auth_basic_secret.yaml");
+/// Labeled htpasswd Secret with bcrypt-only credentials (#412 negative).
+/// Contains `alice` (bcrypt only) — no SHA1 entries; used to verify that a bcrypt-only
+/// secret emits no `InvalidAnnotation` Warning Event.
+pub const AUTH_BASIC_SECRET_BCRYPT_ONLY: &str = fixture!("auth_basic_secret_bcrypt_only.yaml");
+/// Ingress using `auth-basic-secret` pointing at the bcrypt-only Secret (#412 negative).
+pub const ANNOTATION_AUTH_BASIC_BCRYPT_ONLY: &str =
+    fixture!("annotation_auth_basic_bcrypt_only.yaml");
 /// Unlabeled htpasswd Secret — the reflector ignores it, causing the proxy to return 503
 /// (fail-closed) when an Ingress references it via `auth-basic-secret` (#24 sad path).
 pub const AUTH_BASIC_SECRET_UNLABELED: &str = fixture!("auth_basic_secret_unlabeled.yaml");
