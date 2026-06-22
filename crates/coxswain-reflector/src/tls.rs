@@ -11,8 +11,9 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::watch;
 
-// Pure data types live in coxswain-core so the discovery wire layer can import
-// them without pulling in reflector (which depends on kube, arc_swap, tokio).
+// Pure data types and the shared wrapper live in coxswain-core so the
+// discovery wire layer can import them without pulling in the reflector crate.
+pub use coxswain_core::listener_health::SharedGatewayListenerHealth;
 pub use coxswain_core::listener_health::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome};
 
 #[derive(Debug, Error)]
@@ -27,64 +28,6 @@ pub(crate) enum TlsLoadError {
     MissingKey,
     #[error("secret TLS data is not valid PEM")]
     InvalidPem,
-}
-
-struct GatewayListenerHealthInner {
-    map: ArcSwap<HashMap<ObjectKey, GatewayListenerHealth>>,
-    tx: watch::Sender<u64>,
-}
-
-/// Shared handle to the per-Gateway listener health map produced after each rebuild.
-/// Written by `SharedProxyReconciler::rebuild` (via `store_and_notify`); read by `Controller`
-/// and `HotReloader`.
-///
-/// Backed by a `tokio::sync::watch` channel carrying a monotonic generation counter:
-/// each consumer holds its own `Receiver` and awaits `changed()`. This is robust to
-/// `select!` cancellation (a missed wake is recovered by the next `changed()` call,
-/// which compares the receiver's last-seen generation to the sender's current one)
-/// and supports any number of consumers without starving — both requirements that
-/// `tokio::sync::Notify` cannot meet simultaneously.
-#[non_exhaustive]
-#[derive(Clone)]
-pub struct SharedGatewayListenerHealth(Arc<GatewayListenerHealthInner>);
-
-impl Default for SharedGatewayListenerHealth {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SharedGatewayListenerHealth {
-    /// Construct a new shared health map (initially empty, generation 0).
-    pub fn new() -> Self {
-        let (tx, _) = watch::channel(0u64);
-        Self(Arc::new(GatewayListenerHealthInner {
-            map: ArcSwap::from_pointee(HashMap::new()),
-            tx,
-        }))
-    }
-
-    /// Load the current health map snapshot.
-    pub fn load(&self) -> arc_swap::Guard<Arc<HashMap<ObjectKey, GatewayListenerHealth>>> {
-        self.0.map.load()
-    }
-
-    /// Store a new health map and notify every subscribed `Receiver` that the
-    /// generation has advanced.
-    pub fn store_and_notify(&self, map: HashMap<ObjectKey, GatewayListenerHealth>) {
-        self.0.map.store(Arc::new(map));
-        self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
-    }
-
-    /// Returns a `watch::Receiver` over the generation counter. The caller polls
-    /// `rx.changed().await` to await the next `store_and_notify` call.
-    ///
-    /// Subscribing returns a receiver whose "seen" generation equals the current
-    /// sender generation. Call `rx.mark_changed()` immediately after if you want
-    /// the first `changed()` to fire even when no publish has happened yet.
-    pub fn subscribe(&self) -> watch::Receiver<u64> {
-        self.0.tx.subscribe()
-    }
 }
 
 /// Health status for one (HTTPRoute, parent Gateway) pair.

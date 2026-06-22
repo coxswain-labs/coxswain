@@ -26,7 +26,6 @@ sha1 = { workspace = true }
 zeroize = { workspace = true }
 coxswain-cache = { workspace = true }
 coxswain-core = { workspace = true }
-coxswain-reflector = { workspace = true }
 pingora-cache = { workspace = true, features = ["boringssl"] }
 pingora-core = { workspace = true, features = ["boringssl"] }
 pingora-http = { workspace = true }

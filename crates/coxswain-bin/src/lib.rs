@@ -13,14 +13,13 @@ use coxswain_controller::{
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{RouteTimeouts, SharedGatewayRoutingTable, SharedIngressRoutingTable};
+use coxswain_discovery::{DiscoveryClient, DiscoveryClientConfig, Scope};
 use coxswain_proxy::{
-    DedicatedProxyReflector, DedicatedProxyReflectorConfig, GatewayProxy, IngressProxy,
-    KubernetesSource, ListenerProtocol, ListenerSpec, ProxyAcceptor, ProxyReflector,
-    ProxyReflectorConfig, RateLimiterRegistry, RoutingEngine, RoutingSource, SharedProxyConfig,
-    SniCertSelector, TrustedSources, UpstreamCaCache, spawn_dedicated_routing_table_builder,
-    spawn_routing_table_builder,
+    GatewayProxy, IngressProxy, KubernetesSource, ListenerProtocol, ListenerSpec, ProxyAcceptor,
+    RateLimiterRegistry, RoutingEngine, RoutingSource, SharedProxyConfig, SniCertSelector,
+    TrustedSources, UpstreamCaCache,
 };
-use coxswain_reflector::{GatewayListenerHealth, ListenerTlsOutcome, ReconcilerHealth};
+use coxswain_reflector::{GatewayListenerHealth, ListenerTlsOutcome};
 use pingora_core::server::Server;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::server::configuration::{Opt, ServerConf};
@@ -145,6 +144,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         gateway: status_writer.outputs.gateway_routes.clone(),
         tls: status_writer.outputs.tls.clone(),
         client_certs: status_writer.outputs.client_certs.clone(),
+        tls_health: tls_health.clone(),
     };
     let discovery_service = coxswain_discovery::DiscoveryService::new(
         discovery_source,
@@ -179,6 +179,10 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
                 args.common.ingress_https_port,
             ),
             admin_port: args.common.admin_port,
+            discovery_endpoint: format!(
+                "http://coxswain-controller-discovery.{}.svc:{}",
+                args.common.pod_namespace, args.controller.discovery_port
+            ),
         }),
     ));
 
@@ -246,54 +250,22 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
     let mut server = build_server(&args.proxy);
 
     let health = HealthRegistry::new();
-    let controller_handle = health.register(
-        "controller",
-        &[
-            "httproute",
-            "ingress",
-            "ingress_class",
-            "ingress_class_parameters",
-            "gateway",
-            "gateway_class",
-            "endpoint_slice",
-            "reference_grant",
-            "secret",
-            "auth_secret",
-            "auth_tls_secret",
-            "service",
-            "backend_tls_policy",
-            "config_map",
-            "rate_limit",
-            "routing_table_built",
-        ],
-    );
     let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
-    let reflector = spawn_routing_table_builder(ProxyReflectorConfig {
-        controller_name: args.common.controller_name.clone(),
-        watch_namespace: args.common.watch_namespace.clone(),
-        ingress_ports: IngressPorts::new(
-            args.common.ingress_http_port,
-            args.common.ingress_https_port,
-        ),
-        ingress_default_backend: args.proxy.ingress_default_backend.clone(),
-        health: ReconcilerHealth::new(controller_handle, proxy_handle),
-    });
-
-    let ProxyReflector {
-        source,
-        reconciler,
-        tls_health,
-    } = reflector;
-
-    server.add_service(background_service("reconciler", reconciler));
+    let discovery_config = DiscoveryClientConfig::new(
+        args.discovery_endpoint.clone(),
+        args.common.pod_name.clone(),
+    );
+    let (client, _supervisor) =
+        DiscoveryClient::spawn(discovery_config, proxy_handle, "routing_table_loaded");
+    let tls_health = client.listener_health();
 
     let cache = build_response_cache(&args.proxy);
     wire_proxy_services(
         &mut server,
         &args.common,
         &args.proxy,
-        &source,
+        &client,
         &tls_health,
         cache,
     )?;
@@ -305,8 +277,8 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
         ManagementServerConfig {
             health,
             leader,
-            ingress_routes: source.ingress_routes(),
-            gateway_routes: source.gateway_routes(),
+            ingress_routes: client.ingress_routes(),
+            gateway_routes: client.gateway_routes(),
             aggregator: None,
             events: None,
             serve_ui: false,
@@ -334,26 +306,8 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
 fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
     init_logger(args.common.log_format, &args.common.log_filter)?;
 
-    let (
-        gateway_name,
-        gateway_namespace,
-        allow_cluster_wide_route_read,
-        allow_cluster_wide_namespace_read,
-        watch_namespaces,
-    ) = match args.scope() {
-        ProxyScope::Gateway {
-            name,
-            namespace,
-            allow_cluster_wide_route_read,
-            allow_cluster_wide_namespace_read,
-            watch_namespaces,
-        } => (
-            name,
-            namespace,
-            allow_cluster_wide_route_read,
-            allow_cluster_wide_namespace_read,
-            watch_namespaces,
-        ),
+    let (gateway_name, gateway_namespace) = match args.scope() {
+        ProxyScope::Gateway { name, namespace } => (name, namespace),
         ProxyScope::Shared => {
             panic!("invariant: run_proxy_gateway must be invoked with ProxyScope::Gateway");
         }
@@ -365,59 +319,39 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
         scope = "gateway",
         gateway = %format!("{gateway_namespace}/{gateway_name}"),
         controller_name = %args.common.controller_name,
-        allow_cluster_wide_route_read,
-        allow_cluster_wide_namespace_read,
         "Starting"
     );
 
     let mut server = build_server(&args.proxy);
 
     let health = HealthRegistry::new();
-    let controller_handle = health.register(
-        "controller",
-        &[
-            "httproute",
-            "ingress",
-            "ingress_class",
-            "ingress_class_parameters",
-            "gateway",
-            "gateway_class",
-            "endpoint_slice",
-            "reference_grant",
-            "secret",
-            "service",
-            "backend_tls_policy",
-            "config_map",
-            "rate_limit",
-            "routing_table_built",
-        ],
-    );
     let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
-    let reflector = spawn_dedicated_routing_table_builder(DedicatedProxyReflectorConfig {
-        controller_name: args.common.controller_name.clone(),
-        gateway_name: gateway_name.clone(),
-        gateway_namespace: gateway_namespace.clone(),
-        allow_cluster_wide_route_read,
-        allow_cluster_wide_namespace_read,
-        watch_namespaces,
-        health: ReconcilerHealth::new(controller_handle, proxy_handle),
-    });
-
-    let DedicatedProxyReflector {
-        source,
-        reconciler,
-        tls_health,
-    } = reflector;
-
-    server.add_service(background_service("reconciler", reconciler));
+    // NOTE(T7): the discovery server currently sends the full routing snapshot to
+    // every subscriber regardless of scope. This dedicated proxy subscribes with
+    // Scope::Gateway{name, namespace} but the server ignores the scope and
+    // delivers all routes. Per-gateway snapshot filtering is a tracked follow-up
+    // precondition for dedicated-proxy GA (v0.6).
+    let discovery_config = DiscoveryClientConfig::new(
+        args.discovery_endpoint.clone(),
+        args.common.pod_name.clone(),
+    );
+    let scope = Scope::Gateway {
+        name: gateway_name.clone(),
+        namespace: gateway_namespace.clone(),
+    };
+    let mut config_with_scope = discovery_config;
+    config_with_scope.scope = scope;
+    let (client, _supervisor) =
+        DiscoveryClient::spawn(config_with_scope, proxy_handle, "routing_table_loaded");
+    let tls_health = client.listener_health();
 
     let cache = build_response_cache(&args.proxy);
     wire_gateway_only_proxy_services(
         &mut server,
         &args.common,
         &args.proxy,
-        &source,
+        &client,
         &tls_health,
         cache,
     )?;
@@ -429,8 +363,8 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
         ManagementServerConfig {
             health,
             leader,
-            ingress_routes: source.ingress_routes(),
-            gateway_routes: source.gateway_routes(),
+            ingress_routes: client.ingress_routes(),
+            gateway_routes: client.gateway_routes(),
             aggregator: None,
             events: None,
             serve_ui: false,
@@ -952,6 +886,10 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
                 args.common.ingress_https_port,
             ),
             admin_port: args.common.admin_port,
+            discovery_endpoint: format!(
+                "http://coxswain-controller-discovery.{}.svc:{}",
+                args.common.pod_namespace, args.controller.discovery_port
+            ),
         }),
     ));
 

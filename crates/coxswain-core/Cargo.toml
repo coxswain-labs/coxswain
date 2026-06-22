@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 arc-swap             = { workspace = true }
+tokio                = { workspace = true, features = ["sync"] }
 form_urlencoded      = { workspace = true }
 http                 = { workspace = true }
 ipnet                = { workspace = true }
