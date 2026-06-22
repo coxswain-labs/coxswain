@@ -92,7 +92,7 @@ prometheus         = { version = "0.14" }
 prost              = { version = "0.14" }
 protox             = { version = "0.9" }
 rand               = { version = "0.10.1" }
-rcgen              = { version = "0.14" }
+rcgen              = { version = "0.14", features = ["x509-parser"] }
 regex              = { version = "1.12" }
 reqwest            = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 sha1               = { version = "0.11", default-features = false }
@@ -107,6 +107,7 @@ smallvec           = { version = "1.13", features = ["union"] }
 static_assertions  = { version = "1.1" }
 tempfile           = { version = "3" }
 thiserror          = { version = "2.0" }
+time               = { version = "0.3" }
 tokio              = { version = "1", features = ["full"] }
 tokio-rustls       = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-stream       = { version = "0.1", features = ["sync"] }

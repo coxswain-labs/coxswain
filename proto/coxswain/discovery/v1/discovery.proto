@@ -8,8 +8,37 @@ package coxswain.discovery.v1;
 // snapshot.  The server sends Snapshot messages as the routing world changes.
 // Envelopes are extensible oneofs — future message types (relay telemetry,
 // drain commands) can be added without a wire break.
+//
+// Bootstrap is a separate unary RPC served on its own listener (server-auth-only
+// TLS, no client cert required).  A fresh proxy with no SVID sends its
+// ServiceAccount token + a CSR and receives a signed SVID + the trust bundle.
+// After bootstrapping the proxy connects to Stream using its new SVID.
 service Discovery {
   rpc Stream(stream ClientMessage) returns (stream ServerMessage);
+  rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Bootstrap RPC messages
+// ────────────────────────────────────────────────────────────────────────────
+
+// Sent by a proxy that has no SVID yet (or is rotating its SVID).
+// The SA token authenticates the proxy; the CSR carries the proxy's public key
+// only — the private key never leaves the proxy process.
+message BootstrapRequest {
+  string sa_token = 1;      // Kubernetes projected ServiceAccount token
+  bytes csr_pem = 2;        // PEM-encoded PKCS#10 CSR with SPIFFE URI-SAN
+  uint32 wire_version = 3;  // wire protocol version (WIRE_VERSION constant)
+}
+
+// Returned on success.  The proxy uses svid_cert_pem + its local private key
+// to open the mTLS Stream connection.  trust_bundle_pem should be persisted
+// and fed to DiscoveryClientTls so subsequent Stream connections can verify
+// the controller's server cert.
+message BootstrapResponse {
+  bytes svid_cert_pem = 1;      // PEM-encoded SVID cert signed by the controller CA
+  bytes trust_bundle_pem = 2;   // PEM-encoded CA bundle (one or more roots for overlap during rotation)
+  int64 not_after_unix = 3;     // SVID expiry as Unix seconds (UTC)
 }
 
 // ────────────────────────────────────────────────────────────────────────────

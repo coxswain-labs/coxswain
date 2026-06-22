@@ -534,6 +534,13 @@ mod tests {
     impl Discovery for FakeDiscovery {
         type StreamStream = ReceiverStream<Result<ServerMessage, Status>>;
 
+        async fn bootstrap(
+            &self,
+            _req: Request<crate::proto::v1::BootstrapRequest>,
+        ) -> Result<Response<crate::proto::v1::BootstrapResponse>, Status> {
+            Err(Status::unimplemented("test stub"))
+        }
+
         async fn stream(
             &self,
             request: Request<Streaming<ClientMessage>>,
