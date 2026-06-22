@@ -22,8 +22,9 @@ pub mod subscription;
 pub mod version;
 pub mod wire;
 
+pub use auth::{DiscoveryClientTls, DiscoveryServerTls, SpiffeMatcher};
 pub use client::{DiscoveryClient, DiscoveryClientConfig};
-pub use error::{DiscoveryError, WireError};
+pub use error::{AuthError, DiscoveryError, WireError};
 pub use server::{DiscoveryService, SnapshotSource};
 pub use subscription::Scope;
-pub use version::ContentHash;
+pub use version::{ContentHash, WIRE_VERSION};

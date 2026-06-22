@@ -16,11 +16,42 @@ pub enum DiscoveryError {
     /// upgrade) is required to resolve the mismatch.
     #[error("discovery wire version mismatch: server={server}, client={client}")]
     WireVersionMismatch {
-        /// Wire version advertised by the server (e.g. `"v1"`).
-        server: String,
-        /// Wire version this client speaks (e.g. `"v1"`).
-        client: String,
+        /// Wire version advertised by the server.
+        server: u32,
+        /// Wire version this client speaks (see [`crate::version::WIRE_VERSION`]).
+        client: u32,
     },
+}
+
+/// Errors produced by the mTLS authentication layer during TLS config
+/// construction.
+///
+/// These errors indicate misconfigured certificate material (bad PEM, wrong
+/// SPIFFE URI pattern, etc.).  They surface at start-up time when building
+/// the TLS acceptor or channel; runtime handshake rejections are signalled via
+/// [`rustls::Error`] directly through the TLS stack.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum AuthError {
+    /// PEM-encoded certificate or key material could not be parsed.
+    #[error("invalid PEM: {0}")]
+    InvalidPem(String),
+
+    /// DER-encoded certificate could not be parsed by x509-parser.
+    #[error("invalid certificate: {0}")]
+    InvalidCert(String),
+
+    /// A required private key was absent from the PEM input.
+    #[error("no private key found in PEM input")]
+    MissingKey,
+
+    /// rustls rejected the certificate or configuration.
+    #[error("TLS error: {0}")]
+    Rustls(#[from] rustls::Error),
+
+    /// The rustls verifier builder returned an error.
+    #[error("TLS verifier build failed: {0}")]
+    VerifierBuild(String),
 }
 
 /// Errors produced by the wire codec when converting between proto DTOs and
