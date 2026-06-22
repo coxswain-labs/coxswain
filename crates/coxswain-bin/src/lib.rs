@@ -151,11 +151,15 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         node_registry,
         discovery_rebuild_rx,
     );
+    let discovery_addr = SocketAddr::new(
+        args.common.management_bind_address,
+        args.controller.discovery_port,
+    );
     server.add_service(background_service(
         "discovery",
         DiscoveryBackgroundService {
             service: discovery_service,
-            bind_addr: args.controller.discovery_bind,
+            bind_addr: discovery_addr,
         },
     ));
 
@@ -207,7 +211,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         management_bind_address = %args.common.management_bind_address,
         health_port = args.common.health_port,
         admin_port = args.common.admin_port,
-        discovery_bind = %args.controller.discovery_bind,
+        discovery_addr = %discovery_addr,
         "Listening"
     );
     server.run_forever();
