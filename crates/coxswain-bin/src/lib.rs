@@ -135,6 +135,30 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         args.common.pod_name.clone(),
     );
 
+    // Discovery gRPC server: capture a rebuild-generation receiver before
+    // `route_health` is moved into the Operator. Every controller replica
+    // runs the discovery server independently (no leader gate).
+    let discovery_rebuild_rx = route_health.subscribe();
+    let node_registry = coxswain_core::node_registry::SharedNodeRegistry::new();
+    let discovery_source = coxswain_discovery::SnapshotSource {
+        ingress: status_writer.outputs.ingress_routes.clone(),
+        gateway: status_writer.outputs.gateway_routes.clone(),
+        tls: status_writer.outputs.tls.clone(),
+        client_certs: status_writer.outputs.client_certs.clone(),
+    };
+    let discovery_service = coxswain_discovery::DiscoveryService::new(
+        discovery_source,
+        node_registry,
+        discovery_rebuild_rx,
+    );
+    server.add_service(background_service(
+        "discovery",
+        DiscoveryBackgroundService {
+            service: discovery_service,
+            bind_addr: args.controller.discovery_bind,
+        },
+    ));
+
     server.add_service(background_service("controller", status_writer.controller));
     server.add_service(background_service("reconciler", status_writer.reconciler));
 
@@ -183,6 +207,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         management_bind_address = %args.common.management_bind_address,
         health_port = args.common.health_port,
         admin_port = args.common.admin_port,
+        discovery_bind = %args.controller.discovery_bind,
         "Listening"
     );
     server.run_forever();
@@ -760,6 +785,39 @@ impl pingora_core::services::background::BackgroundService for ListenerSpecsAdap
                     }
                 }
             }
+        }
+    }
+}
+
+// ── Discovery gRPC background service ────────────────────────────────────────
+
+/// Background service that runs the discovery gRPC server for one controller replica.
+///
+/// Shuts down when the Pingora [`ShutdownWatch`] fires, giving tonic a graceful
+/// drain signal via `serve_with_shutdown`.
+struct DiscoveryBackgroundService {
+    service: coxswain_discovery::DiscoveryService,
+    bind_addr: std::net::SocketAddr,
+}
+
+#[async_trait]
+impl pingora_core::services::background::BackgroundService for DiscoveryBackgroundService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        use coxswain_discovery::proto::v1::discovery_server::DiscoveryServer;
+
+        tracing::info!(bind_addr = %self.bind_addr, "Discovery gRPC server starting");
+
+        let result = tonic::transport::Server::builder()
+            .add_service(DiscoveryServer::new(self.service.clone()))
+            .serve_with_shutdown(self.bind_addr, async move {
+                let _ = shutdown.changed().await;
+            })
+            .await;
+
+        if let Err(e) = result {
+            tracing::error!(error = %e, "Discovery gRPC server exited with error");
+        } else {
+            tracing::info!("Discovery gRPC server shut down");
         }
     }
 }

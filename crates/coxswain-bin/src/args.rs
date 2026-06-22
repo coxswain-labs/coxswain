@@ -21,7 +21,7 @@
 //! through v0.2.0; Step 5 removes the fallback once the chart sets the role
 //! explicitly.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
@@ -445,6 +445,14 @@ pub(crate) struct ControllerArgs {
     /// not patched (backward-compatible default).
     #[arg(long, env = "COXSWAIN_STATUS_ADDRESS")]
     pub status_address: Option<String>,
+
+    /// Address the discovery gRPC server binds to.
+    ///
+    /// The proxy's `--source=discovery` mode connects here to receive pushed
+    /// routing snapshots. Every controller replica serves discovery independently;
+    /// no leader election gate applies to this listener.
+    #[arg(long, env = "COXSWAIN_DISCOVERY_BIND", default_value = "0.0.0.0:50051")]
+    pub discovery_bind: SocketAddr,
 }
 
 /// Arguments accepted by the hidden `dev` role.
@@ -1042,5 +1050,74 @@ mod tests {
             panic!("expected Role::Proxy");
         };
         assert_eq!(args.proxy.proxy_upstream_keepalive_pool_size, 256);
+    }
+
+    /// `--discovery-bind` defaults to `0.0.0.0:50051` on the `controller` role.
+    #[test]
+    fn discovery_bind_defaults_to_50051() {
+        let cli =
+            Cli::try_parse_from(["coxswain", "serve", "controller"]).expect("controller parses");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Controller(args)) = serve.role else {
+            panic!("expected controller role");
+        };
+        assert_eq!(
+            args.controller.discovery_bind,
+            "0.0.0.0:50051".parse::<SocketAddr>().unwrap(),
+        );
+    }
+
+    /// `--discovery-bind` accepts a custom address on the `controller` role.
+    #[test]
+    fn discovery_bind_accepts_custom_address() {
+        let cli = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "controller",
+            "--discovery-bind=127.0.0.1:9090",
+        ])
+        .expect("controller parses with custom discovery bind");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Controller(args)) = serve.role else {
+            panic!("expected controller role");
+        };
+        assert_eq!(
+            args.controller.discovery_bind,
+            "127.0.0.1:9090".parse::<SocketAddr>().unwrap(),
+        );
+    }
+
+    /// `--discovery-bind` is available on `serve dev` (controller flags are flattened in).
+    #[test]
+    fn discovery_bind_available_on_dev_role() {
+        let cli = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "dev",
+            "--discovery-bind=127.0.0.1:50052",
+        ])
+        .expect("dev parses with custom discovery bind");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Dev(args)) = serve.role else {
+            panic!("expected dev role");
+        };
+        assert_eq!(
+            args.controller.discovery_bind,
+            "127.0.0.1:50052".parse::<SocketAddr>().unwrap(),
+        );
+    }
+
+    /// `--discovery-bind` does not exist on the `proxy` role.
+    #[test]
+    fn proxy_rejects_discovery_bind() {
+        let err = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "proxy",
+            "--shared",
+            "--discovery-bind=0.0.0.0:50051",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }

@@ -737,6 +737,7 @@ dependencies = [
  "coxswain-cache",
  "coxswain-controller",
  "coxswain-core",
+ "coxswain-discovery",
  "coxswain-health",
  "coxswain-proxy",
  "coxswain-reflector",
@@ -747,6 +748,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

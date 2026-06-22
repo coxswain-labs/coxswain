@@ -27,6 +27,7 @@ ipnet = { workspace = true }
 coxswain-admin = { workspace = true }
 coxswain-cache = { workspace = true }
 coxswain-controller = { workspace = true }
+coxswain-discovery = { workspace = true }
 coxswain-health = { workspace = true }
 coxswain-proxy = { workspace = true }
 clap = { workspace = true }
@@ -36,5 +37,6 @@ pingora-proxy = { workspace = true, features = ["boringssl"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
