@@ -16,15 +16,19 @@ http          = { workspace = true }
 ipnet         = { workspace = true }
 prost         = { workspace = true }
 regex         = { workspace = true }
+rustls        = { workspace = true }
 sha2          = { workspace = true }
 thiserror     = { workspace = true }
 tokio         = { workspace = true }
+tokio-rustls  = { workspace = true }
 tokio-stream  = { workspace = true }
-tonic         = { workspace = true }
+tonic         = { workspace = true, features = ["tls-ring"] }
 tonic-prost   = { workspace = true }
 tracing       = { workspace = true }
+x509-parser   = { workspace = true }
 
 [dev-dependencies]
+rcgen         = { workspace = true }
 tokio         = { workspace = true }
 
 [build-dependencies]

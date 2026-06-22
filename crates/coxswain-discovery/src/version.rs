@@ -1,6 +1,17 @@
-//! Content-hash versioning for discovery snapshots.
+//! Content-hash versioning and wire-protocol versioning for discovery.
+//!
+//! The [`WIRE_VERSION`] constant identifies the binary protocol revision; both
+//! the server and the client must agree on it or the stream is rejected with
+//! `FAILED_PRECONDITION` before any snapshot is sent.
 
 use sha2::{Digest, Sha256};
+
+/// Wire protocol version spoken by this build.
+///
+/// Encoded as [`proto::v1::Subscribe::wire_version`] on every stream open.
+/// The server rejects any client that presents a different value with
+/// `FAILED_PRECONDITION`; the client backs off permanently on that status.
+pub const WIRE_VERSION: u32 = 1;
 
 /// Content hash of a per-scope snapshot DTO.
 ///

@@ -19,14 +19,14 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, warn};
 
+use crate::auth::DiscoveryClientTls;
 use crate::proto::v1::{
     self as p, client_message::Kind as CKind, discovery_client::DiscoveryClient as TonicClient,
     server_message::Kind as SKind,
 };
 use crate::subscription::Scope;
+use crate::version::WIRE_VERSION;
 use crate::wire::{client_cert_from_wire, gateway_from_wire, ingress_from_wire, tls_from_wire};
-
-const WIRE_VERSION: &str = "v1";
 
 /// Configuration for the discovery gRPC client supervisor.
 ///
@@ -56,6 +56,13 @@ pub struct DiscoveryClientConfig {
     pub backoff_base: Duration,
     /// Maximum backoff ceiling; full-jitter stays within `[0, cap]` (default: 30 s).
     pub backoff_cap: Duration,
+    /// mTLS configuration for the discovery channel.
+    ///
+    /// When `Some`, the channel is established with mutual TLS and both sides'
+    /// certificates are verified against the configured CA bundle and SPIFFE
+    /// URI SAN pattern. When `None` (default), the channel runs plaintext h2c;
+    /// this should only be used in test environments.
+    pub tls: Option<DiscoveryClientTls>,
 }
 
 impl DiscoveryClientConfig {
@@ -70,6 +77,7 @@ impl DiscoveryClientConfig {
             keep_alive_timeout: Duration::from_secs(5),
             backoff_base: Duration::from_millis(250),
             backoff_cap: Duration::from_secs(30),
+            tls: None,
         }
     }
 }
@@ -245,7 +253,7 @@ impl Supervisor {
         let subscribe = p::ClientMessage {
             kind: Some(CKind::Subscribe(p::Subscribe {
                 node_id: self.config.node_id.clone(),
-                wire_version: WIRE_VERSION.to_owned(),
+                wire_version: WIRE_VERSION,
                 scope: Some(p::Scope {}),
             })),
         };
@@ -376,17 +384,28 @@ fn apply_snapshot(
 /// Build a lazy-connect [`Channel`] from the configured endpoints.
 ///
 /// A single endpoint uses [`Endpoint::connect_lazy`] so the proxy starts before
-/// the controller is reachable. Multiple endpoints use [`Channel::balance_list`]
+/// the controller is reachable.  Multiple endpoints use [`Channel::balance_list`]
 /// which is also lazy by default.
+///
+/// When `config.tls` is `Some`, the channel is wrapped with mTLS using the
+/// configured SPIFFE verifier.  An `AuthError` building the TLS config is
+/// treated as a hard invariant violation (misconfigured certificate material is
+/// not recoverable at runtime) and panics with a descriptive message.
 fn build_channel(config: &DiscoveryClientConfig) -> Channel {
     let configure = |uri: &str| -> Endpoint {
-        Endpoint::from_shared(uri.to_owned())
+        let ep = Endpoint::from_shared(uri.to_owned())
             .unwrap_or_else(|e| {
                 panic!("invariant: every discovery endpoint must be a valid URI: {e}")
             })
             .http2_keep_alive_interval(config.http2_keep_alive_interval)
             .keep_alive_timeout(config.keep_alive_timeout)
-            .keep_alive_while_idle(true)
+            .keep_alive_while_idle(true);
+        match &config.tls {
+            Some(tls) => tls
+                .apply(ep)
+                .unwrap_or_else(|e| panic!("invariant: discovery TLS config must be valid: {e}")),
+            None => ep,
+        }
     };
 
     if config.endpoints.len() == 1 {
@@ -567,6 +586,7 @@ mod tests {
             // Tiny backoff so reconnect tests complete quickly.
             backoff_base: Duration::from_millis(10),
             backoff_cap: Duration::from_millis(50),
+            tls: None,
         }
     }
 

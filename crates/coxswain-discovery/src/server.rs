@@ -39,10 +39,8 @@ use crate::proto::v1::{
     self as p, client_message::Kind as CKind, discovery_server::Discovery,
     server_message::Kind as SKind,
 };
-use crate::version::ContentHash;
+use crate::version::{ContentHash, WIRE_VERSION};
 use crate::wire::{client_cert_to_wire, gateway_to_wire, ingress_to_wire, tls_to_wire};
-
-const WIRE_VERSION: &str = "v1";
 
 // ── SnapshotSource ────────────────────────────────────────────────────────────
 
@@ -536,7 +534,7 @@ mod tests {
         tx.send(ClientMessage {
             kind: Some(CKind::Subscribe(p::Subscribe {
                 node_id: node_id.to_owned(),
-                wire_version: WIRE_VERSION.to_owned(),
+                wire_version: WIRE_VERSION,
                 scope: Some(p::Scope {}),
             })),
         })
@@ -705,7 +703,7 @@ mod tests {
         tx.send(ClientMessage {
             kind: Some(CKind::Subscribe(p::Subscribe {
                 node_id: "bad-node".to_owned(),
-                wire_version: "v0".to_owned(),
+                wire_version: 99, // intentionally wrong; server should reject
                 scope: Some(p::Scope {}),
             })),
         })

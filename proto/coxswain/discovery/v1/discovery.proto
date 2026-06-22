@@ -28,7 +28,7 @@ message ClientMessage {
 // Declares the scope and protocol version this client speaks.
 message Subscribe {
   string node_id = 1; // stable identity of the subscribing proxy (pod UID or hostname)
-  string wire_version = 2; // wire protocol version string spoken by this client (e.g. "v1")
+  uint32 wire_version = 2; // wire protocol version integer spoken by this client (WIRE_VERSION = 1)
   Scope scope = 3; // requested scope; currently unused (controller sends everything)
 }
 

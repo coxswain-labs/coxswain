@@ -819,15 +819,19 @@ dependencies = [
  "ipnet",
  "prost",
  "protox",
+ "rcgen",
  "regex",
+ "rustls",
  "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
@@ -4420,6 +4424,7 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",
