@@ -444,13 +444,13 @@ fn predicates_to_wire(mp: &MatchPredicates) -> p::MatchPredicates {
 
 fn value_match_to_wire(vm: &ValueMatch) -> p::ValueMatch {
     let m = match vm {
-        ValueMatch::Exact(s) => p::value_match::Match::Exact(s.clone()),
-        ValueMatch::Regex(re) => p::value_match::Match::Regex(re.as_str().to_string()),
+        ValueMatch::Exact(s) => p::value_match::Value::Exact(s.clone()),
+        ValueMatch::Regex(re) => p::value_match::Value::Regex(re.as_str().to_string()),
         _ => unreachable!(
             "invariant: all ValueMatch variants handled; update wire.rs when adding new variants"
         ),
     };
-    p::ValueMatch { r#match: Some(m) }
+    p::ValueMatch { value: Some(m) }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -481,10 +481,10 @@ fn duration_to_wire(d: Duration) -> p::Duration {
 fn rate_limit_to_wire(rl: &RateLimitConfig) -> p::RateLimitConfig {
     let key = match &rl.key {
         RateLimitKey::ClientIp => p::RateLimitKey {
-            key: Some(p::rate_limit_key::Key::ClientIp(true)),
+            dimension: Some(p::rate_limit_key::Dimension::ClientIp(true)),
         },
         RateLimitKey::Header(name) => p::RateLimitKey {
-            key: Some(p::rate_limit_key::Key::Header(name.to_string())),
+            dimension: Some(p::rate_limit_key::Dimension::Header(name.to_string())),
         },
         _ => unreachable!(
             "invariant: all RateLimitKey variants handled; update wire.rs when adding new variants"
@@ -716,21 +716,21 @@ pub fn client_cert_to_wire(store: &ClientCertStore) -> p::ClientCertStore {
 }
 
 fn client_cert_state_to_wire(s: &ClientCertConfigState) -> p::ClientCertConfigState {
-    let state = match s {
+    let kind = match s {
         ClientCertConfigState::Config(cfg) => {
-            p::client_cert_config_state::State::Config(p::ClientCertConfig {
+            p::client_cert_config_state::Kind::Config(p::ClientCertConfig {
                 ca_pem: cfg.ca_pem.clone(),
                 verify_depth: cfg.verify_depth,
                 pass_to_upstream: cfg.pass_to_upstream,
             })
         }
-        ClientCertConfigState::Unavailable => p::client_cert_config_state::State::Unavailable(true),
+        ClientCertConfigState::Unavailable => p::client_cert_config_state::Kind::Unavailable(true),
         &_ => unreachable!(
             "invariant: all ClientCertConfigState variants handled; \
              add a new arm when the core type gains a variant"
         ),
     };
-    p::ClientCertConfigState { state: Some(state) }
+    p::ClientCertConfigState { kind: Some(kind) }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1266,14 +1266,11 @@ fn predicates_from_wire(dto: &p::MatchPredicates) -> Result<MatchPredicates, Wir
 }
 
 fn value_match_from_wire(dto: &p::ValueMatch) -> Result<ValueMatch, WireError> {
-    match dto
-        .r#match
-        .as_ref()
-        .ok_or(WireError::MissingRequiredField {
-            field: "value_match.match",
-        })? {
-        p::value_match::Match::Exact(s) => Ok(ValueMatch::Exact(s.clone())),
-        p::value_match::Match::Regex(pat) => Ok(ValueMatch::Regex(regex::Regex::new(pat)?)),
+    match dto.value.as_ref().ok_or(WireError::MissingRequiredField {
+        field: "value_match.value",
+    })? {
+        p::value_match::Value::Exact(s) => Ok(ValueMatch::Exact(s.clone())),
+        p::value_match::Value::Regex(pat) => Ok(ValueMatch::Regex(regex::Regex::new(pat)?)),
     }
 }
 
@@ -1308,11 +1305,14 @@ fn rate_limit_from_wire(dto: &p::RateLimitConfig) -> Result<RateLimitConfig, Wir
             field: "rate_limit.key",
         })
         .and_then(|k| {
-            match k.key.as_ref().ok_or(WireError::MissingRequiredField {
-                field: "rate_limit_key.key",
-            })? {
-                p::rate_limit_key::Key::ClientIp(_) => Ok(RateLimitKey::ClientIp),
-                p::rate_limit_key::Key::Header(name) => {
+            match k
+                .dimension
+                .as_ref()
+                .ok_or(WireError::MissingRequiredField {
+                    field: "rate_limit_key.dimension",
+                })? {
+                p::rate_limit_key::Dimension::ClientIp(_) => Ok(RateLimitKey::ClientIp),
+                p::rate_limit_key::Dimension::Header(name) => {
                     Ok(RateLimitKey::Header(Arc::from(name.as_str())))
                 }
             }
@@ -1538,11 +1538,11 @@ pub fn client_cert_from_wire(dto: &p::ClientCertStore) -> Result<ClientCertStore
 }
 
 fn client_cert_state_from_wire(dto: &p::ClientCertConfigState) -> ClientCertConfigState {
-    match &dto.state {
-        Some(p::client_cert_config_state::State::Config(cfg)) => ClientCertConfigState::Config(
+    match &dto.kind {
+        Some(p::client_cert_config_state::Kind::Config(cfg)) => ClientCertConfigState::Config(
             ClientCertConfig::new(cfg.ca_pem.clone(), cfg.verify_depth, cfg.pass_to_upstream),
         ),
-        Some(p::client_cert_config_state::State::Unavailable(_)) | None => {
+        Some(p::client_cert_config_state::Kind::Unavailable(_)) | None => {
             ClientCertConfigState::Unavailable
         }
     }
@@ -1934,7 +1934,7 @@ mod tests {
             requests_per_second: 0, // invalid
             burst: 0,
             key: Some(p::RateLimitKey {
-                key: Some(p::rate_limit_key::Key::ClientIp(true)),
+                dimension: Some(p::rate_limit_key::Dimension::ClientIp(true)),
             }),
         };
         let err = rate_limit_from_wire(&rl_dto).unwrap_err();
