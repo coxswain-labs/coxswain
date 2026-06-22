@@ -27,12 +27,9 @@ message ClientMessage {
 
 // Declares the scope and protocol version this client speaks.
 message Subscribe {
-  // Stable identity of the subscribing proxy (pod UID or hostname).
-  string node_id = 1;
-  // Wire protocol version string spoken by this client (e.g. "v1").
-  string wire_version = 2;
-  // Requested scope; currently unused (controller sends everything).
-  Scope scope = 3;
+  string node_id = 1; // stable identity of the subscribing proxy (pod UID or hostname)
+  string wire_version = 2; // wire protocol version string spoken by this client (e.g. "v1")
+  Scope scope = 3; // requested scope; currently unused (controller sends everything)
 }
 
 // Scope filter for future per-port / per-namespace narrowing.
@@ -65,24 +62,26 @@ message ServerMessage {
 
 // Full state-of-the-world snapshot for the subscribed scope.
 //
-// Fields 3–7: per-resource DTOs.  Field 8 is reserved for the removes set
-// that the v0.6 delta streaming layer will populate.
-//
 // Determinism discipline: every `repeated` field that was a map in the runtime
 // type is emitted sorted by key in `to_wire`.  No `map<>` anywhere — proto map
 // encoding order is not guaranteed and would break the content-hash oracle.
+//
+// Field layout:
+//   identity  1–9   : version, nonce
+//   extensions 10–29: per-resource DTOs
+//   repeated  40+   : reserved for v0.6 delta streaming removes set
 message Snapshot {
+  // identity
   string version = 1; // content hash of this scope's DTO (sha256 hex)
   bytes nonce = 2;
-
-  RoutingTable ingress_routing = 3;
-  RoutingTable gateway_routing = 4;
-  TlsStore tls_store = 5;
-  ClientCertStore client_cert_store = 6;
-  GatewayListenerHealth listener_health = 7;
-
-  // reserved 8: repeated string removed_resources — for v0.6 delta streaming.
-  reserved 8;
+  // nested DTO extensions
+  RoutingTable ingress_routing = 10;
+  RoutingTable gateway_routing = 11;
+  TlsStore tls_store = 12;
+  ClientCertStore client_cert_store = 13;
+  GatewayListenerHealth listener_health = 14;
+  // repeated (reserved for v0.6 delta streaming)
+  reserved 40;
   reserved "removed_resources";
 }
 
@@ -91,8 +90,7 @@ message Snapshot {
 // ────────────────────────────────────────────────────────────────────────────
 
 message RoutingTable {
-  // Sorted by port ascending.
-  repeated PortEntry ports = 1;
+  repeated PortEntry ports = 1; // sorted by port ascending
 }
 
 message PortEntry {
@@ -109,8 +107,7 @@ message HostEntry {
     bool catchall = 3; // true = catch-all bucket
   }
   NormalizeLevel normalize_level = 4;
-  // Routes in insertion order (preserves wire_entries() traversal order).
-  repeated RouteEntry routes = 5;
+  repeated RouteEntry routes = 5; // in insertion order (preserves wire_entries() traversal order)
 }
 
 // Wildcard host bucket discriminated by suffix and matching semantics.
@@ -144,27 +141,37 @@ enum RouteKind {
 
 // Serialised form of a RouteEntry + the path/kind that registers it.
 // `from_wire` replays the appropriate `add_*_route` builder call.
+//
+// Field layout:
+//   identity   1–9 : kind, path, route_id, metric_route_id, cache_enabled
+//   extensions 10–29: per-route config DTOs
+//   optional   30–39: presence-tracked scalars
+//   repeated   40+ : filter lists, CIDR ranges
 message RouteEntry {
+  // identity
   RouteKind kind = 1; // which add_*_route method to replay
   string path = 2; // path string, normalised prefix, or regex pattern
-  BackendGroup backend_group = 3;
-  MatchPredicates predicates = 4;
-  repeated FilterAction filters = 5;
-  RouteTimeouts timeouts = 6;
-  string route_id = 7; // "{namespace}/{name}"
-  string metric_route_id = 8; // prometheus route label
-  optional uint64 created_at_unix_millis = 9; // SystemTime as ms since epoch
-  optional uint32 error_status = 10; // non-zero → return this HTTP status
-  optional uint64 max_body_size = 11; // bytes; absent = no limit
-  repeated string allow_source_range = 12; // CIDR strings, sorted
-  repeated string deny_source_range = 13; // CIDR strings, sorted
-  bool cache_enabled = 14;
-  optional bool access_log_enabled = 15;
-  RateLimitConfig rate_limit = 16;
-  IngressAuthConfig auth = 17;
-  CompressionConfig compression = 18;
-  ForwardedForConfig forwarded_for = 19;
-  CircuitBreakerConfig circuit_breaker = 20;
+  string route_id = 3; // "{namespace}/{name}"
+  string metric_route_id = 4; // prometheus route label
+  bool cache_enabled = 5;
+  // nested config extensions
+  BackendGroup backend_group = 10;
+  MatchPredicates predicates = 11;
+  RouteTimeouts timeouts = 12;
+  RateLimitConfig rate_limit = 13;
+  IngressAuthConfig auth = 14;
+  CompressionConfig compression = 15;
+  ForwardedForConfig forwarded_for = 16;
+  CircuitBreakerConfig circuit_breaker = 17;
+  // optional scalars
+  optional uint64 created_at_unix_millis = 30; // SystemTime as ms since epoch
+  optional uint32 error_status = 31; // non-zero → return this HTTP status
+  optional uint64 max_body_size = 32; // bytes; absent = no limit
+  optional bool access_log_enabled = 33;
+  // repeated
+  repeated FilterAction filters = 40;
+  repeated string allow_source_range = 41; // CIDR strings, sorted
+  repeated string deny_source_range = 42; // CIDR strings, sorted
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -173,16 +180,26 @@ message RouteEntry {
 
 // Mirrors BackendGroup + BackendGroupSpec.
 // `from_wire` calls BackendGroup::weighted() with the spec then applies setters.
+//
+// Field layout:
+//   identity   1–9 : name, protocol
+//   extensions 10–29: tls, retry, load balancing, session affinity
+//   optional   30–39: keepalive
+//   repeated   40+ : weighted backends, per-backend filters
 message BackendGroup {
+  // identity
   string name = 1;
-  repeated WeightedBackend weighted = 2; // BackendGroupSpec; construction order
-  BackendProtocol protocol = 3;
-  UpstreamTls tls = 4;
-  RetryPolicy retry = 5;
-  optional uint64 keepalive_millis = 6; // absent = Pingora default
-  repeated PerBackendFiltersEntry per_backend_filters = 7; // index-aligned with `weighted`; sorted by index
-  LoadBalance load_balance = 8;
-  SessionAffinity session_affinity = 9;
+  BackendProtocol protocol = 2;
+  // nested config extensions
+  UpstreamTls tls = 10;
+  RetryPolicy retry = 11;
+  LoadBalance load_balance = 12;
+  SessionAffinity session_affinity = 13;
+  // optional scalars
+  optional uint64 keepalive_millis = 30; // absent = Pingora default
+  // repeated
+  repeated WeightedBackend weighted = 40; // BackendGroupSpec; construction order
+  repeated PerBackendFiltersEntry per_backend_filters = 41; // index-aligned with `weighted`; sorted by index
 }
 
 // One weighted backend: its pod addresses and its weight before GCD reduction.
@@ -272,9 +289,9 @@ message FilterAction {
 
 // Mirrors HeaderMod — raw strings; from_wire calls HeaderMod::parse.
 message HeaderMod {
-  repeated HeaderPair add = 1;
-  repeated HeaderPair set = 2;
-  repeated string remove = 3;
+  repeated string remove = 1;
+  repeated HeaderPair add = 2;
+  repeated HeaderPair set = 3;
 }
 
 message HeaderPair {
@@ -284,17 +301,17 @@ message HeaderPair {
 
 // Mirrors FilterAction::RequestRedirect.
 message RequestRedirect {
-  optional string scheme = 1;
-  optional string hostname = 2;
-  optional uint32 port = 3; // u16
-  uint32 status_code = 4; // default 302
-  PathModifier path = 5;
+  uint32 status_code = 1; // default 302
+  PathModifier path = 2;
+  optional string scheme = 3;
+  optional string hostname = 4;
+  optional uint32 port = 5; // u16
 }
 
 // Mirrors FilterAction::UrlRewrite.
 message UrlRewrite {
-  optional string hostname = 1;
-  PathModifier path = 2;
+  PathModifier path = 1;
+  optional string hostname = 2;
 }
 
 // Mirrors PathModifier.
@@ -342,11 +359,11 @@ message QueryPredicate {
 
 // Mirrors ValueMatch (Exact and Regex only; Prefix/Present are not supported).
 message ValueMatch {
-  oneof match {
+  oneof value {
     string exact = 1; // Exact(value)
-    string regex = 3; // Regex(pattern string); from_wire recompiles
+    string regex = 2; // Regex(pattern string); from_wire recompiles
   }
-  reserved 2, 4;
+  reserved 3, 4;
   reserved "prefix", "present";
 }
 
@@ -383,7 +400,7 @@ message RateLimitConfig {
 
 // Mirrors RateLimitKey.
 message RateLimitKey {
-  oneof key {
+  oneof dimension {
     bool client_ip = 1; // true = ClientIp
     string header = 2; // Header(name)
   }
@@ -413,8 +430,8 @@ message ExtAuthConfig {
 // Mirrors HttpExtAuthConfig.
 message HttpExtAuthConfig {
   string url = 1;
-  repeated string response_headers = 2;
-  bool always_set_cookie = 3;
+  bool always_set_cookie = 2;
+  repeated string response_headers = 3;
 }
 
 // BasicCredential with the password hash.
@@ -460,9 +477,9 @@ message CircuitBreakerConfig {
 
 // Mirrors TlsStore.  Sorted by host pattern ascending.
 message TlsStore {
-  repeated TlsCertEntry exact = 1;
-  repeated TlsCertEntry wildcard = 2; // suffix without "*." prefix; sorted
-  TlsCert default = 3; // absent = no default cert
+  TlsCert default = 1; // absent = no default cert
+  repeated TlsCertEntry exact = 2;
+  repeated TlsCertEntry wildcard = 3; // suffix without "*." prefix; sorted
 }
 
 message TlsCertEntry {
@@ -471,9 +488,9 @@ message TlsCertEntry {
 }
 
 message TlsCert {
-  bytes cert_pem = 1;
-  bytes key_pem = 2;
-  string source = 3;
+  string source = 1;
+  bytes cert_pem = 2;
+  bytes key_pem = 3;
   optional uint64 not_after_unix_secs = 4;
 }
 
@@ -483,9 +500,9 @@ message TlsCert {
 
 // Mirrors ClientCertStore.  Sorted by host pattern ascending.
 message ClientCertStore {
-  repeated ClientCertEntry exact = 1;
-  repeated ClientCertEntry wildcard = 2;
-  ClientCertConfigState default = 3;
+  ClientCertConfigState default = 1;
+  repeated ClientCertEntry exact = 2;
+  repeated ClientCertEntry wildcard = 3;
 }
 
 message ClientCertEntry {
@@ -494,7 +511,7 @@ message ClientCertEntry {
 }
 
 message ClientCertConfigState {
-  oneof state {
+  oneof kind {
     ClientCertConfig config = 1; // Config(cfg)
     bool unavailable = 2; // Unavailable
   }
@@ -535,12 +552,10 @@ message ListenerInfoEntry {
 // Mirrors ListenerInfo.
 message ListenerInfo {
   ListenerTlsOutcome tls_outcome = 1;
-  // Human-readable message from ListenerTlsOutcome failure variants.
-  // Empty for NotApplicable and Resolved.
-  string tls_message = 2;
-  int32 attached_routes = 3;
-  string hostname = 4;
-  bool allows_all_namespaces = 5;
+  string tls_message = 2; // human-readable message from ListenerTlsOutcome failure variants; empty for NotApplicable and Resolved
+  string hostname = 3;
+  bool allows_all_namespaces = 4;
+  int32 attached_routes = 5;
   uint32 port = 6; // u16
 }
 

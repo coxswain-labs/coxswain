@@ -24,5 +24,6 @@ pub mod wire;
 
 pub use client::{DiscoveryClient, DiscoveryClientConfig};
 pub use error::{DiscoveryError, WireError};
+pub use server::{DiscoveryService, SnapshotSource};
 pub use subscription::Scope;
 pub use version::ContentHash;
