@@ -1,41 +1,17 @@
 //! Abstraction over how routing data reaches the proxy.
 //!
-//! Today, every proxy embeds its own Kubernetes reflectors and builds its
-//! routing tables directly from watch events. [`KubernetesSource`] is the
-//! `RoutingSource` implementation that exposes those reflector-backed
-//! snapshots to the proxy.
+//! [`KubernetesSource`] wraps the `Shared` handles that the controller's
+//! reconciler writes into, exposing them via the [`RoutingSource`] trait so
+//! the proxy stays agnostic to where its routing snapshots come from.
 //!
-//! Future impl: `XdsSource` — connect to a controller xDS endpoint when
-//! `--source=xds` is implemented. The trait is the seam that lets the proxy
-//! crate stay agnostic to "where does the routing table come from".
+//! The [`RoutingSource`] trait itself lives in `coxswain-core` so that
+//! `coxswain-discovery` can implement it for `DiscoveryClient` without a
+//! circular dependency. It is re-exported here for backwards compatibility.
 
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
 
-/// Source of routing snapshots for the proxy data plane.
-///
-/// Implementations expose `Shared` handles to the Ingress routing table, the
-/// Gateway-API routing table, the TLS cert store, and the per-Ingress
-/// client-certificate mTLS config store. The proxy holds these handles and
-/// consults them on the hot path; `Shared` is cheap to clone and the `load()`
-/// call is a single atomic pointer read.
-pub trait RoutingSource: Send + Sync {
-    /// Handle to the Ingress-flavored routing table snapshot.
-    #[must_use]
-    fn ingress_routes(&self) -> SharedIngressRoutingTable;
-
-    /// Handle to the Gateway-API-flavored routing table snapshot.
-    #[must_use]
-    fn gateway_routes(&self) -> SharedGatewayRoutingTable;
-
-    /// Handle to the TLS certificate store snapshot.
-    #[must_use]
-    fn tls_store(&self) -> SharedTlsStore;
-
-    /// Handle to the per-Ingress client-certificate mTLS config store (#267).
-    #[must_use]
-    fn client_cert_store(&self) -> SharedClientCertStore;
-}
+pub use coxswain_core::RoutingSource;
 
 /// Routing source backed by in-process Kubernetes reflectors.
 ///

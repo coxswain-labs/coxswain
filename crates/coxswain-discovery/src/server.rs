@@ -31,6 +31,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, warn};
 
+use coxswain_core::listener_health::SharedGatewayListenerHealth;
 use coxswain_core::node_registry::SharedNodeRegistry;
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
@@ -40,11 +41,13 @@ use crate::proto::v1::{
     server_message::Kind as SKind,
 };
 use crate::version::{ContentHash, WIRE_VERSION};
-use crate::wire::{client_cert_to_wire, gateway_to_wire, ingress_to_wire, tls_to_wire};
+use crate::wire::{
+    client_cert_to_wire, gateway_to_wire, ingress_to_wire, listener_health_to_wire, tls_to_wire,
+};
 
 // ── SnapshotSource ────────────────────────────────────────────────────────────
 
-/// The four routing-table [`Shared`] cells the server reads to build snapshots.
+/// The five routing-table [`Shared`] cells the server reads to build snapshots.
 ///
 /// Populated in `coxswain-bin` from `StatusWriter::outputs`; no K8s API access
 /// happens at serve time.
@@ -60,6 +63,10 @@ pub struct SnapshotSource {
     pub tls: SharedTlsStore,
     /// Client-certificate mTLS config store shared cell.
     pub client_certs: SharedClientCertStore,
+    /// Per-Gateway listener TLS-health map. Serialised into the
+    /// `listener_health` wire field so proxy nodes can drive dynamic
+    /// Gateway listener port bind/unbind without Kubernetes API access.
+    pub tls_health: SharedGatewayListenerHealth,
 }
 
 impl Clone for SnapshotSource {
@@ -69,6 +76,7 @@ impl Clone for SnapshotSource {
             gateway: self.gateway.clone(),
             tls: self.tls.clone(),
             client_certs: self.client_certs.clone(),
+            tls_health: self.tls_health.clone(),
         }
     }
 }
@@ -139,6 +147,7 @@ struct SnapshotContent {
     gateway_routing: p::RoutingTable,
     tls_store: p::TlsStore,
     client_cert_store: p::ClientCertStore,
+    listener_health: p::GatewayListenerHealth,
 }
 
 impl SnapshotContent {
@@ -151,27 +160,28 @@ impl SnapshotContent {
             gateway_routing: Some(self.gateway_routing),
             tls_store: Some(self.tls_store),
             client_cert_store: Some(self.client_cert_store),
-            // listener_health: deferred to proxy-consumption ticket (T5 scope)
-            listener_health: None,
+            listener_health: Some(self.listener_health),
         }
     }
 }
 
 /// Build a [`SnapshotContent`] from the current routing world.
 ///
-/// Loads all four data-plane cells (ArcSwap load_full, no lock), serialises them
-/// to wire DTOs, and derives the global content hash from the sorted per-resource
+/// Loads all five data-plane cells (ArcSwap load, no lock), serialises them to
+/// wire DTOs, and derives the global content hash from the sorted per-resource
 /// hashes. Identical routing worlds produce identical version strings.
 fn build_snapshot(source: &SnapshotSource) -> SnapshotContent {
     let ingress = source.ingress.load();
     let gateway = source.gateway.load();
     let tls = source.tls.load();
     let client_certs = source.client_certs.load();
+    let tls_health = source.tls_health.load();
 
     let ingress_dto = ingress_to_wire(&ingress);
     let gateway_dto = gateway_to_wire(&gateway);
     let tls_dto = tls_to_wire(&tls);
     let client_certs_dto = client_cert_to_wire(&client_certs);
+    let listener_health_dto = listener_health_to_wire(&tls_health);
 
     let hashes = vec![
         ContentHash::compute(&ingress_dto.encode_to_vec())
@@ -186,6 +196,9 @@ fn build_snapshot(source: &SnapshotSource) -> SnapshotContent {
         ContentHash::compute(&client_certs_dto.encode_to_vec())
             .as_str()
             .to_owned(),
+        ContentHash::compute(&listener_health_dto.encode_to_vec())
+            .as_str()
+            .to_owned(),
     ];
     let version = ContentHash::from_per_resource(hashes).as_str().to_owned();
 
@@ -195,6 +208,7 @@ fn build_snapshot(source: &SnapshotSource) -> SnapshotContent {
         gateway_routing: gateway_dto,
         tls_store: tls_dto,
         client_cert_store: client_certs_dto,
+        listener_health: listener_health_dto,
     }
 }
 
@@ -484,6 +498,7 @@ mod tests {
             gateway: SharedGatewayRoutingTable::new(),
             tls: SharedTlsStore::new(),
             client_certs: SharedClientCertStore::new(),
+            tls_health: SharedGatewayListenerHealth::new(),
         }
     }
 

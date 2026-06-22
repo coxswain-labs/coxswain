@@ -155,6 +155,10 @@ pub struct OperatorConfig {
     /// annotation on every dedicated-proxy pod. Propagated from the
     /// `--admin-port` / `COXSWAIN_ADMIN_PORT` CLI argument.
     pub admin_port: u16,
+    /// gRPC discovery endpoint the dedicated proxy connects to for routing
+    /// snapshots. Rendered as `--discovery-endpoint=<endpoint>`. In T7 this
+    /// is a plaintext `http://` URL; mTLS provisioning lands in T10/#423.
+    pub discovery_endpoint: String,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -206,6 +210,9 @@ struct ReconcileContext {
     /// Admin server port injected as `gateway.coxswain-labs.dev/admin-port` on
     /// every rendered dedicated-proxy pod.
     admin_port: u16,
+    /// gRPC discovery endpoint rendered as `--discovery-endpoint=<endpoint>`
+    /// in every dedicated-proxy Deployment.
+    discovery_endpoint: String,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
 
@@ -405,6 +412,7 @@ impl BackgroundService for Operator {
             tls_health: self.config.tls_health.clone(),
             ingress_ports: self.config.ingress_ports,
             admin_port: self.config.admin_port,
+            discovery_endpoint: self.config.discovery_endpoint.clone(),
             last_hashes: Mutex::new(HashMap::new()),
         });
 
@@ -837,10 +845,9 @@ async fn reconcile_inner(
     // Derive RBAC scope from the Gateway's listener specs. Pure, no I/O.
     let derived = rbac::derive_proxy_rbac(&gw);
 
-    // Compute the desired namespace set once and share between rbac.rs and
-    // the rendered `--proxy-watch-namespaces` arg. Cross-namespace routes
-    // contribute their backend namespaces when any listener has from: All
-    // or from: Selector.
+    // Compute the desired namespace set for per-namespace RoleBindings (#209).
+    // Cross-namespace routes contribute their backend namespaces when any
+    // listener has from: All or from: Selector.
     let allow_cross_ns = derived.allow_cluster_wide_route_read;
     let desired = rbac::desired_namespaces_for_gateway(
         &gw,
@@ -854,9 +861,7 @@ async fn reconcile_inner(
         params: &effective,
         controller_image: &ctx.controller_image,
         gateway_class_name: class_name,
-        watch_namespaces: &desired,
-        allow_cluster_wide_route_read: derived.allow_cluster_wide_route_read,
-        allow_cluster_wide_namespace_read: derived.allow_cluster_wide_namespace_read,
+        discovery_endpoint: &ctx.discovery_endpoint,
         admin_port: ctx.admin_port,
     });
 
@@ -1391,9 +1396,7 @@ mod tests {
             params: &params_a,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: &std::collections::BTreeSet::new(),
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         let r_b = render::render(&render::RenderInputs {
@@ -1401,9 +1404,7 @@ mod tests {
             params: &params_b,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: &std::collections::BTreeSet::new(),
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         assert_ne!(
@@ -1434,15 +1435,12 @@ mod tests {
             status: None,
         };
         let params = EffectiveParams::default();
-        let empty_ns = std::collections::BTreeSet::new();
         let inputs = render::RenderInputs {
             gateway: &gw,
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: &empty_ns,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         };
         let r1 = render::render(&inputs);

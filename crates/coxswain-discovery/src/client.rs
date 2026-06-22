@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coxswain_core::health::SubsystemHandle;
+use coxswain_core::listener_health::SharedGatewayListenerHealth;
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
 use tokio::sync::mpsc;
@@ -26,7 +27,10 @@ use crate::proto::v1::{
 };
 use crate::subscription::Scope;
 use crate::version::WIRE_VERSION;
-use crate::wire::{client_cert_from_wire, gateway_from_wire, ingress_from_wire, tls_from_wire};
+use crate::wire::{
+    client_cert_from_wire, gateway_from_wire, ingress_from_wire, listener_health_from_wire,
+    tls_from_wire,
+};
 
 /// Configuration for the discovery gRPC client supervisor.
 ///
@@ -82,25 +86,27 @@ impl DiscoveryClientConfig {
     }
 }
 
-/// Discovery gRPC client: wraps four [`Shared`] routing-table cells and a
+/// Discovery gRPC client: wraps five [`Shared`] routing-table cells and a
 /// background supervisor that keeps them up to date from pushed controller
 /// snapshots.
 ///
-/// The four accessor methods (`ingress_routes`, `gateway_routes`, `tls_store`,
-/// `client_cert_store`) mirror the `KubernetesSource` surface so the proxy's
-/// `RoutingSource` trait impl (wired at the discovery wiring ticket) is a
-/// trivial delegation.
+/// Implements [`coxswain_core::RoutingSource`] so it can be passed directly to
+/// `wire_proxy_services` / `wire_gateway_only_proxy_services` in place of
+/// `KubernetesSource`. The [`listener_health`] accessor provides the fifth cell
+/// that drives the proxy's dynamic Gateway listener port bind/unbind.
 ///
 /// The [`Shared`] cells are **never zeroed**: the supervisor serves the
 /// last-good snapshot throughout every reconnect window.
 ///
 /// [`Shared`]: coxswain_core::Shared
+/// [`listener_health`]: DiscoveryClient::listener_health
 #[non_exhaustive]
 pub struct DiscoveryClient {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
     tls_store: SharedTlsStore,
     client_cert_store: SharedClientCertStore,
+    listener_health: SharedGatewayListenerHealth,
 }
 
 impl DiscoveryClient {
@@ -129,6 +135,7 @@ impl DiscoveryClient {
         let gateway_routes = SharedGatewayRoutingTable::new();
         let tls_store = SharedTlsStore::new();
         let client_cert_store = SharedClientCertStore::new();
+        let listener_health = SharedGatewayListenerHealth::new();
 
         let supervisor = Supervisor {
             config,
@@ -136,6 +143,7 @@ impl DiscoveryClient {
             gateway: gateway_routes.clone(),
             tls: tls_store.clone(),
             client_certs: client_cert_store.clone(),
+            listener_health: listener_health.clone(),
             health,
             health_check: health_check.to_owned(),
             has_snapshot: false,
@@ -148,6 +156,7 @@ impl DiscoveryClient {
             gateway_routes,
             tls_store,
             client_cert_store,
+            listener_health,
         };
 
         (client, handle)
@@ -184,6 +193,33 @@ impl DiscoveryClient {
     pub fn client_cert_store(&self) -> SharedClientCertStore {
         self.client_cert_store.clone()
     }
+
+    /// Handle to the Gateway listener health map.
+    ///
+    /// Used by the proxy's `ListenerSpecsAdapter` to drive dynamic Gateway
+    /// listener port bind/unbind without any Kubernetes API access.
+    #[must_use]
+    pub fn listener_health(&self) -> SharedGatewayListenerHealth {
+        self.listener_health.clone()
+    }
+}
+
+impl coxswain_core::RoutingSource for DiscoveryClient {
+    fn ingress_routes(&self) -> SharedIngressRoutingTable {
+        self.ingress_routes.clone()
+    }
+
+    fn gateway_routes(&self) -> SharedGatewayRoutingTable {
+        self.gateway_routes.clone()
+    }
+
+    fn tls_store(&self) -> SharedTlsStore {
+        self.tls_store.clone()
+    }
+
+    fn client_cert_store(&self) -> SharedClientCertStore {
+        self.client_cert_store.clone()
+    }
 }
 
 // ── private supervisor ──────────────────────────────────────────────────────
@@ -194,6 +230,7 @@ struct Supervisor {
     gateway: SharedGatewayRoutingTable,
     tls: SharedTlsStore,
     client_certs: SharedClientCertStore,
+    listener_health: SharedGatewayListenerHealth,
     health: SubsystemHandle,
     health_check: String,
     has_snapshot: bool,
@@ -291,6 +328,7 @@ impl Supervisor {
                 &self.gateway,
                 &self.tls,
                 &self.client_certs,
+                &self.listener_health,
             ) {
                 Ok(()) => {
                     debug!(version, "discovery snapshot applied; sending Ack");
@@ -330,9 +368,9 @@ impl Supervisor {
     }
 }
 
-/// Decode all routing tables from a snapshot DTO and atomically publish them.
+/// Decode all routing cells from a snapshot DTO and atomically publish them.
 ///
-/// All four DTOs are decoded first; only on total success are the [`Shared`]
+/// All five DTOs are decoded first; only on total success are the [`Shared`]
 /// cells updated, preventing a partial-failure from leaving cells inconsistent.
 ///
 /// # Errors
@@ -347,6 +385,7 @@ fn apply_snapshot(
     gateway: &SharedGatewayRoutingTable,
     tls: &SharedTlsStore,
     client_certs: &SharedClientCertStore,
+    health: &SharedGatewayListenerHealth,
 ) -> Result<(), crate::WireError> {
     let ingress_table = ingress_from_wire(
         snapshot
@@ -372,11 +411,18 @@ fn apply_snapshot(
             .as_ref()
             .unwrap_or(&p::ClientCertStore::default()),
     )?;
+    let listener_health_map = listener_health_from_wire(
+        snapshot
+            .listener_health
+            .as_ref()
+            .unwrap_or(&p::GatewayListenerHealth::default()),
+    )?;
 
     ingress.store(Arc::new(ingress_table));
     gateway.store(Arc::new(gateway_table));
     tls.store(Arc::new(tls_store));
     client_certs.store(Arc::new(client_cert_store));
+    health.store_and_notify(listener_health_map);
 
     Ok(())
 }

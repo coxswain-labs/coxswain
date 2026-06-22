@@ -5,16 +5,16 @@
 //! the argument groups they semantically need so clap rejects flag/role
 //! mismatches at parse time, before any runtime code runs.
 //!
-//! Roles (issue #202 — Step 3 of the architecture plan):
+//! Roles:
 //!
 //! - `controller`: reconciler and status writer pod. Reads K8s, writes status.
-//!   Not yet implemented — exits with "not yet implemented".
-//! - `proxy --shared`: read-only data plane for Ingress + non-dedicated Gateways.
-//!   Not yet implemented.
+//! - `proxy --shared`: read-only data plane for Ingress + non-dedicated
+//!   Gateways. Connects to the controller discovery gRPC server.
 //! - `proxy --dedicated --gateway-name=NAME --gateway-namespace=NS`: read-only
-//!   data plane scoped to a single Gateway. Not yet implemented.
+//!   data plane scoped to a single Gateway. Connects to the controller
+//!   discovery gRPC server.
 //! - `dev` (hidden from `--help`): monolithic single-process pod for local
-//!   development. Equivalent to today's behaviour.
+//!   development.
 //!
 //! Bare `coxswain serve` (no role) currently falls back to `dev` with a
 //! deprecation warning so the existing Helm chart and Dockerfile keep working
@@ -536,66 +536,25 @@ pub(crate) struct ProxyRoleArgs {
     )]
     pub gateway_namespace: Option<String>,
 
-    /// Permit cluster-wide HTTPRoute reads — required when the target Gateway
-    /// has any listener with `allowedRoutes.namespaces.from: All`.
+    /// Comma-separated list of controller discovery endpoints.
     ///
-    /// Defaults to `false` (precise least-privilege opt-in). When the target
-    /// Gateway has such a listener and this flag is `false`, the reconciler
-    /// logs a warning today (Step 7); Step 10 will add an `Accepted=false`
-    /// listener condition.
+    /// Each entry is an `http://host:port` (plaintext) or `https://host:port`
+    /// (mTLS) URI for a controller replica's discovery gRPC server. Providing
+    /// more than one endpoint enables high-availability: the client load-balances
+    /// RPCs across all listed replicas. Must not be empty.
     ///
-    /// Only meaningful with `--dedicated`; rejected with `--shared`.
+    /// In production the controller operator renders this from the conventional
+    /// `coxswain-controller-discovery.<namespace>.svc:<discovery-port>` DNS
+    /// name; the value is inert until the discovery Service exists (T10).
+    ///
+    /// Example: `http://coxswain-controller-discovery.coxswain-system.svc:50051`
     #[arg(
         long,
-        env = "COXSWAIN_ALLOW_CLUSTER_WIDE_ROUTE_READ",
-        default_value_t = false,
-        conflicts_with = "shared"
-    )]
-    pub allow_cluster_wide_route_read: bool,
-
-    /// Permit cluster-wide Namespace reads — required when the target Gateway
-    /// has any listener with `allowedRoutes.namespaces.from: Selector`.
-    ///
-    /// Defaults to `false`. Same semantics as `--allow-cluster-wide-route-read`
-    /// but for the Namespace resource (selector-based attachment uses
-    /// `Namespace` labels).
-    ///
-    /// Only meaningful with `--dedicated`; rejected with `--shared`.
-    #[arg(
-        long,
-        env = "COXSWAIN_ALLOW_CLUSTER_WIDE_NAMESPACE_READ",
-        default_value_t = false,
-        conflicts_with = "shared"
-    )]
-    pub allow_cluster_wide_namespace_read: bool,
-
-    /// Comma-separated list of namespaces the dedicated proxy is permitted to
-    /// watch backend resources in (Services, EndpointSlices, Secrets,
-    /// ConfigMaps, HTTPRoutes, ReferenceGrants, BackendTLSPolicies, Gateways).
-    ///
-    /// The controller renders this list from the desired-namespace set
-    /// computed for the Gateway: the Gateway's own namespace plus every
-    /// namespace its HTTPRoutes route backends into (gated by `ReferenceGrant`
-    /// for cross-namespace refs). The list mirrors the `RoleBinding`s the
-    /// controller has provisioned for this proxy's `ServiceAccount` — every
-    /// listed namespace must have a matching binding, or the proxy's watches
-    /// hard-fail with a permission denied.
-    ///
-    /// When the list changes, the controller updates the rendered Deployment
-    /// spec and K8s rolls the proxy pod; the proxy itself never re-discovers
-    /// the namespace set at runtime.
-    ///
-    /// Required with `--dedicated`; rejected with `--shared`. Empty list is
-    /// rejected (every dedicated proxy must at least watch its Gateway's own
-    /// namespace).
-    #[arg(
-        long,
-        env = "COXSWAIN_PROXY_WATCH_NAMESPACES",
+        env = "COXSWAIN_DISCOVERY_ENDPOINT",
         value_delimiter = ',',
-        required_if_eq("dedicated", "true"),
-        conflicts_with = "shared"
+        required = true
     )]
-    pub proxy_watch_namespaces: Vec<String>,
+    pub discovery_endpoint: Vec<String>,
 }
 
 /// Resolved scope for a `proxy` role invocation.
@@ -609,14 +568,6 @@ pub(crate) enum ProxyScope {
         name: String,
         /// Gateway namespace.
         namespace: String,
-        /// Whether the operator opted into cluster-wide HTTPRoute reads.
-        allow_cluster_wide_route_read: bool,
-        /// Whether the operator opted into cluster-wide Namespace reads.
-        allow_cluster_wide_namespace_read: bool,
-        /// Namespaces the proxy is permitted to watch backend resources in.
-        /// Set by the controller from the Gateway's resolved
-        /// desired-namespace set.
-        watch_namespaces: Vec<String>,
     },
 }
 
@@ -641,9 +592,6 @@ impl ProxyRoleArgs {
                 (Some(name), Some(namespace)) => ProxyScope::Gateway {
                     name: name.clone(),
                     namespace: namespace.clone(),
-                    allow_cluster_wide_route_read: self.allow_cluster_wide_route_read,
-                    allow_cluster_wide_namespace_read: self.allow_cluster_wide_namespace_read,
-                    watch_namespaces: self.proxy_watch_namespaces.clone(),
                 },
                 _ => panic!(
                     "invariant: --gateway-name and --gateway-namespace required by clap scope group when --dedicated is set"
@@ -692,12 +640,20 @@ mod tests {
     /// `coxswain serve proxy --shared` resolves to `ProxyScope::Shared`.
     #[test]
     fn serve_proxy_shared_parses() {
-        let cli = Cli::try_parse_from(["coxswain", "serve", "proxy", "--shared"]).expect("parses");
+        let cli = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "proxy",
+            "--shared",
+            "--discovery-endpoint=http://ctrl:50051",
+        ])
+        .expect("parses");
         let Commands::Serve(serve) = cli.command;
         let Some(Role::Proxy(args)) = serve.role else {
             panic!("expected Role::Proxy");
         };
         assert_eq!(args.scope(), ProxyScope::Shared);
+        assert_eq!(args.discovery_endpoint, vec!["http://ctrl:50051"]);
     }
 
     /// `coxswain serve proxy --dedicated --gateway-name=NAME
@@ -711,7 +667,7 @@ mod tests {
             "--dedicated",
             "--gateway-name=my-gw",
             "--gateway-namespace=tenant-a",
-            "--proxy-watch-namespaces=tenant-a",
+            "--discovery-endpoint=http://ctrl:50051",
         ])
         .expect("parses");
         let Commands::Serve(serve) = cli.command;
@@ -723,26 +679,26 @@ mod tests {
             ProxyScope::Gateway {
                 name: "my-gw".to_string(),
                 namespace: "tenant-a".to_string(),
-                allow_cluster_wide_route_read: false,
-                allow_cluster_wide_namespace_read: false,
-                watch_namespaces: vec!["tenant-a".to_string()],
             }
         );
     }
 
-    /// Both opt-in flags parse and propagate through to the resolved scope.
+    /// `--discovery-endpoint` is required for the proxy role.
     #[test]
-    fn serve_proxy_gateway_opt_in_flags_parse() {
+    fn serve_proxy_requires_discovery_endpoint() {
+        let err = Cli::try_parse_from(["coxswain", "serve", "proxy", "--shared"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    /// `--discovery-endpoint` accepts a comma-separated list of multiple endpoints.
+    #[test]
+    fn discovery_endpoint_parses_multi_value() {
         let cli = Cli::try_parse_from([
             "coxswain",
             "serve",
             "proxy",
-            "--dedicated",
-            "--gateway-name=my-gw",
-            "--gateway-namespace=tenant-a",
-            "--proxy-watch-namespaces=tenant-a,shared",
-            "--allow-cluster-wide-route-read",
-            "--allow-cluster-wide-namespace-read",
+            "--shared",
+            "--discovery-endpoint=http://ctrl-1:50051,http://ctrl-2:50051",
         ])
         .expect("parses");
         let Commands::Serve(serve) = cli.command;
@@ -750,60 +706,9 @@ mod tests {
             panic!("expected Role::Proxy");
         };
         assert_eq!(
-            args.scope(),
-            ProxyScope::Gateway {
-                name: "my-gw".to_string(),
-                namespace: "tenant-a".to_string(),
-                allow_cluster_wide_route_read: true,
-                allow_cluster_wide_namespace_read: true,
-                watch_namespaces: vec!["tenant-a".to_string(), "shared".to_string()],
-            }
+            args.discovery_endpoint,
+            vec!["http://ctrl-1:50051", "http://ctrl-2:50051"]
         );
-    }
-
-    /// `--dedicated` without `--proxy-watch-namespaces` fails the
-    /// `required_if_eq` rule — the proxy needs to know which namespaces it can
-    /// watch, derived by the controller from the desired-namespace set.
-    #[test]
-    fn serve_proxy_dedicated_requires_watch_namespaces() {
-        let err = Cli::try_parse_from([
-            "coxswain",
-            "serve",
-            "proxy",
-            "--dedicated",
-            "--gateway-name=my-gw",
-            "--gateway-namespace=tenant-a",
-        ])
-        .unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    }
-
-    /// `--proxy-watch-namespaces` conflicts with `--shared`.
-    #[test]
-    fn shared_rejects_proxy_watch_namespaces() {
-        let err = Cli::try_parse_from([
-            "coxswain",
-            "serve",
-            "proxy",
-            "--shared",
-            "--proxy-watch-namespaces=tenant-a",
-        ])
-        .unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    /// The opt-in flags conflict with `--shared`.
-    #[test]
-    fn shared_rejects_opt_in_flags() {
-        let err = Cli::try_parse_from([
-            "coxswain",
-            "serve",
-            "proxy",
-            "--shared",
-            "--allow-cluster-wide-route-read",
-        ])
-        .unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     /// `serve proxy` with no scope flag fails the ArgGroup `required` rule.
@@ -1031,7 +936,14 @@ mod tests {
     #[test]
     fn proxy_upstream_keepalive_pool_size_parses() {
         // Default
-        let cli = Cli::try_parse_from(["coxswain", "serve", "proxy", "--shared"]).expect("parses");
+        let cli = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "proxy",
+            "--shared",
+            "--discovery-endpoint=http://ctrl:50051",
+        ])
+        .expect("parses");
         let Commands::Serve(serve) = cli.command;
         let Some(Role::Proxy(args)) = serve.role else {
             panic!("expected Role::Proxy");
@@ -1044,6 +956,7 @@ mod tests {
             "serve",
             "proxy",
             "--shared",
+            "--discovery-endpoint=http://ctrl:50051",
             "--proxy-upstream-keepalive-pool-size=256",
         ])
         .expect("parses with explicit value");

@@ -35,14 +35,11 @@
 //! ## Container args
 //!
 //! `serve proxy --dedicated --gateway-name=<name> --gateway-namespace=<ns>
-//! --proxy-watch-namespaces=<ns1>,<ns2>,... [--allow-cluster-wide-route-read]
-//! [--allow-cluster-wide-namespace-read] --log-format=json`. The
-//! `--proxy-watch-namespaces` list mirrors the per-namespace `RoleBinding`s
-//! the controller manages for this proxy's `ServiceAccount` (#209); both are
-//! derived from [`super::rbac::desired_namespaces_for_gateway`] so they
-//! cannot drift. The two cluster-wide flags are derived from the Gateway's
-//! listener `allowedRoutes.namespaces.from` field via
-//! [`super::rbac::derive_proxy_rbac`] (#229).
+//! --discovery-endpoint=<endpoint> --log-format=json`. The discovery endpoint
+//! is the controller's gRPC discovery service (`http://…:50051` in T7;
+//! mTLS in T10/#423). The proxy subscribes with `Scope::Gateway { name,
+//! namespace }` and receives the full routing snapshot — server-side
+//! per-gateway scope filtering is a tracked follow-up (v0.6).
 //!
 //! ## Service ports
 //!
@@ -66,12 +63,6 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReferen
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::{BTreeMap, BTreeSet};
-
-/// Empty placeholder used by render tests that don't exercise the
-/// per-namespace narrowing arg list. Declared here so tests don't have to
-/// re-spell the empty literal at every call site.
-#[cfg(test)]
-const EMPTY_WATCH_NS: &BTreeSet<String> = &BTreeSet::new();
 
 /// Label keys that the controller owns unconditionally. User-supplied
 /// `Gateway.spec.infrastructure.labels` collisions on any of these keys are
@@ -103,20 +94,10 @@ pub(super) struct RenderInputs<'a> {
     /// Name of the Gateway's GatewayClass (i.e. `gateway.spec.gatewayClassName`).
     /// Used in the GEP-1762 `<NAME>-<GATEWAY CLASS>` resource naming.
     pub(super) gateway_class_name: &'a str,
-    /// Sorted set of namespaces the proxy is permitted to watch backend
-    /// resources in. Rendered into the container args as
-    /// `--proxy-watch-namespaces=ns1,ns2,...` so it mirrors the per-namespace
-    /// `RoleBinding`s the controller has provisioned (#209). Sorted so
-    /// reorderings don't produce hash churn or unnecessary Deployment rolls.
-    pub(super) watch_namespaces: &'a BTreeSet<String>,
-    /// Render `--allow-cluster-wide-route-read` when true. Derived from the
-    /// Gateway's listener specs via [`super::rbac::derive_proxy_rbac`] — not
-    /// a user-supplied value. Set when any listener has
-    /// `allowedRoutes.namespaces.from: All` or `from: Selector`.
-    pub(super) allow_cluster_wide_route_read: bool,
-    /// Render `--allow-cluster-wide-namespace-read` when true. Same
-    /// derivation — set when any listener has `from: Selector`.
-    pub(super) allow_cluster_wide_namespace_read: bool,
+    /// gRPC endpoint the dedicated proxy connects to for routing snapshots.
+    /// Rendered as `--discovery-endpoint=<endpoint>`. In T7 this is a
+    /// plaintext `http://` URL; mTLS is wired in T10/#423.
+    pub(super) discovery_endpoint: &'a str,
     /// Admin server port rendered as the `gateway.coxswain-labs.dev/admin-port`
     /// annotation on the pod template so fleet discovery can reach this pod.
     pub(super) admin_port: u16,
@@ -423,27 +404,8 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         "--dedicated".to_string(),
         format!("--gateway-name={gw_name}"),
         format!("--gateway-namespace={}", common.namespace),
+        format!("--discovery-endpoint={}", inputs.discovery_endpoint),
     ];
-    // BTreeSet iterates in sorted order — the resulting `--proxy-watch-namespaces`
-    // value is deterministic, so the rendered Deployment hash only changes
-    // when the namespace SET changes (not when its iteration order would).
-    // Omit the arg entirely when the set is empty so the proxy falls back to
-    // cluster-wide watches for tests and the legacy half-functional state.
-    if !inputs.watch_namespaces.is_empty() {
-        let joined = inputs
-            .watch_namespaces
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(",");
-        args.push(format!("--proxy-watch-namespaces={joined}"));
-    }
-    if inputs.allow_cluster_wide_route_read {
-        args.push("--allow-cluster-wide-route-read".to_string());
-    }
-    if inputs.allow_cluster_wide_namespace_read {
-        args.push("--allow-cluster-wide-namespace-read".to_string());
-    }
     args.push("--log-format=json".to_string());
     // Keepalive pool size: pass through to dedicated proxies so their pools
     // are governed by the same operator-configured default (inherited from the
@@ -605,9 +567,7 @@ mod tests {
             params: &params,
             controller_image: "ghcr.io/coxswain-labs/coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
 
@@ -656,9 +616,7 @@ mod tests {
             params: &params,
             controller_image: "irrelevant",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         assert_eq!(result.deployment.spec.unwrap().replicas, Some(5));
@@ -669,8 +627,7 @@ mod tests {
     }
 
     /// Container args carry the dedicated-mode invocation, gateway name +
-    /// namespace, and JSON log format. Empty `watch_namespaces` omits the
-    /// `--proxy-watch-namespaces` arg entirely (legacy/test fallback).
+    /// namespace, discovery endpoint, and JSON log format.
     #[test]
     fn container_args_carry_dedicated_invocation() {
         let gw = make_gateway("tenant-a", "team-gw", vec![("http", 80, "HTTP")]);
@@ -680,9 +637,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.tenant-a.svc:50051",
             admin_port: 8082,
         });
         let container = &result
@@ -702,60 +657,10 @@ mod tests {
                 "--dedicated".to_string(),
                 "--gateway-name=team-gw".to_string(),
                 "--gateway-namespace=tenant-a".to_string(),
+                "--discovery-endpoint=http://coxswain-controller-discovery.tenant-a.svc:50051"
+                    .to_string(),
                 "--log-format=json".to_string(),
             ]
-        );
-    }
-
-    /// `--proxy-watch-namespaces` is rendered when the set is non-empty, in
-    /// sorted order (BTreeSet iteration). The arg appears before
-    /// `--log-format` so a human reading the spec sees scope before output
-    /// format.
-    #[test]
-    fn container_args_carry_sorted_watch_namespaces() {
-        let gw = make_gateway("tenant-a", "team-gw", vec![("http", 80, "HTTP")]);
-        let params = EffectiveParams::default();
-        let mut watch_ns = BTreeSet::new();
-        watch_ns.insert("shared-services".to_string());
-        watch_ns.insert("tenant-a".to_string());
-        watch_ns.insert("certs".to_string());
-        let result = render(&RenderInputs {
-            gateway: &gw,
-            params: &params,
-            controller_image: "coxswain:v0.2",
-            gateway_class_name: "coxswain",
-            watch_namespaces: &watch_ns,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
-            admin_port: 8082,
-        });
-        let container = &result
-            .deployment
-            .spec
-            .unwrap()
-            .template
-            .spec
-            .unwrap()
-            .containers[0];
-        let args = container.args.as_ref().expect("args set");
-        // BTreeSet iterates lexicographically — certs, shared-services,
-        // tenant-a.
-        let expected_ns_arg = "--proxy-watch-namespaces=certs,shared-services,tenant-a";
-        assert!(
-            args.iter().any(|a| a == expected_ns_arg),
-            "expected sorted --proxy-watch-namespaces arg; got: {args:?}"
-        );
-        let pos_ns = args
-            .iter()
-            .position(|a| a == expected_ns_arg)
-            .expect("found");
-        let pos_log = args
-            .iter()
-            .position(|a| a == "--log-format=json")
-            .expect("found");
-        assert!(
-            pos_ns < pos_log,
-            "namespace scoping arg should precede --log-format"
         );
     }
 
@@ -773,9 +678,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
@@ -805,9 +708,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
@@ -835,9 +736,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
@@ -879,9 +778,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         for labels in [
@@ -919,9 +816,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
@@ -947,9 +842,7 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         for meta in [
@@ -990,9 +883,7 @@ mod tests {
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         for meta in [
@@ -1032,9 +923,7 @@ mod tests {
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         let labels = result.deployment.metadata.labels.as_ref().expect("labels");
@@ -1070,9 +959,7 @@ mod tests {
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            watch_namespaces: EMPTY_WATCH_NS,
-            allow_cluster_wide_route_read: false,
-            allow_cluster_wide_namespace_read: false,
+            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             admin_port: 8082,
         });
         for meta in [
