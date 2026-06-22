@@ -16,10 +16,10 @@ pub enum DiscoveryError {
     /// upgrade) is required to resolve the mismatch.
     #[error("discovery wire version mismatch: server={server}, client={client}")]
     WireVersionMismatch {
-        /// Wire version advertised by the server.
-        server: u32,
-        /// Wire version this client speaks.
-        client: u32,
+        /// Wire version advertised by the server (e.g. `"v1"`).
+        server: String,
+        /// Wire version this client speaks (e.g. `"v1"`).
+        client: String,
     },
 }
 
