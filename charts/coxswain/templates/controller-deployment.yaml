@@ -66,6 +66,12 @@ spec:
             - name: admin
               containerPort: {{ .Values.admin.port }}
               protocol: TCP
+            - name: discovery
+              containerPort: {{ .Values.discovery.port }}
+              protocol: TCP
+            - name: bootstrap
+              containerPort: {{ .Values.discovery.bootstrapPort }}
+              protocol: TCP
           env:
             - name: POD_NAME
               valueFrom:
@@ -111,6 +117,19 @@ spec:
             - name: COXSWAIN_IMAGE
               value: {{ .Values.controller.coxswainImage | quote }}
             {{- end }}
+            # Discovery control-plane / CA (#423).
+            - name: COXSWAIN_DISCOVERY_PORT
+              value: {{ .Values.discovery.port | quote }}
+            - name: COXSWAIN_DISCOVERY_BOOTSTRAP_PORT
+              value: {{ .Values.discovery.bootstrapPort | quote }}
+            - name: COXSWAIN_DISCOVERY_CA_SECRET
+              value: {{ .Values.discovery.ca.secretName | quote }}
+            - name: COXSWAIN_DISCOVERY_CA_MODE
+              value: {{ .Values.discovery.ca.mode | quote }}
+            - name: COXSWAIN_DISCOVERY_SVID_TTL
+              value: {{ .Values.discovery.svidTtl | quote }}
+            - name: COXSWAIN_DISCOVERY_TRUST_DOMAIN
+              value: {{ .Values.discovery.trustDomain | quote }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:

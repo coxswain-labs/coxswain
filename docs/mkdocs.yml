@@ -87,6 +87,7 @@ nav:
       - Dedicated proxy pools: guides/dedicated-mode.md
     - Operations:
       - Running in production: guides/running-in-production.md
+      - Control-plane security: guides/control-plane-security.md
       - TLS: guides/tls.md
       - Rate limiting: guides/rate-limiting.md
       - Verifying releases: guides/verifying-releases.md

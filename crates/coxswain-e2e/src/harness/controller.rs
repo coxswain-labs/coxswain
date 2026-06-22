@@ -44,6 +44,9 @@ pub struct ControllerOptions {
     /// Sets `proxy.shared.accessLogPathMode` (`"full"` / `"pattern"` / `"none"`).
     /// `None` leaves the chart default.
     pub access_log_path_mode: Option<String>,
+    /// Sets `discovery.svidTtl` (#423). Short values (e.g. `"10s"`) drive rapid
+    /// SVID rotation for resilience tests. `None` leaves the chart default (24h).
+    pub discovery_svid_ttl: Option<String>,
 }
 
 /// Handle to the in-cluster coxswain installation for one test.
@@ -105,6 +108,7 @@ impl ControllerProcess {
             trusted_sources: opts.trusted_sources,
             access_log: opts.access_log,
             access_log_path_mode: opts.access_log_path_mode,
+            discovery_svid_ttl: opts.discovery_svid_ttl,
         };
         if overrides != HelmOverrides::default() {
             let root = workspace_root().context("workspace root")?;

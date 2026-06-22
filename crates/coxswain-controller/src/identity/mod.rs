@@ -7,6 +7,7 @@
 //! concrete controller logic without creating a crate cycle.
 
 pub mod ca;
+pub mod publisher;
 pub mod reject_hook;
 pub mod store;
 pub mod token_review;

@@ -24,14 +24,16 @@
 
 use coxswain_e2e::{
     FixtureVars, Harness, NamespaceGuard,
-    fixtures::{self, backends, dedicated_proxy as dedicated},
+    fixtures::{self, backends, dedicated_proxy as dedicated, ingress},
     harness::{HttpClient, wait},
 };
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service, ServiceAccount};
+use k8s_openapi::api::events::v1::Event;
 use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
-use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams};
+use serde_json::json;
 use std::collections::HashSet;
 use std::process::Command;
 use std::time::Duration;
@@ -849,6 +851,208 @@ async fn cluster_wide_binding_deleted_on_gateway_deletion() -> anyhow::Result<()
             let crb_gone = crbs.get(&crb_name).await.is_err();
             let gw_gone = gateways.get(gw_name).await.is_err();
             (crb_gone && gw_gone).then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+// ===========================================================================
+// Discovery control-plane bootstrap (#423).
+//
+// The shared proxy ships with ZERO pre-provisioned cert material: it acquires
+// its SVID at runtime by presenting its projected ServiceAccount token to the
+// controller's bootstrap listener (server-auth-only TLS), receiving a CA-signed
+// SVID, then opening the mandatory-mTLS Stream to receive routing snapshots.
+//
+// Because the e2e harness installs via `helm --wait`, the shared-proxy pod only
+// reaches Ready once that whole bootstrap chain has succeeded — so a served
+// route is end-to-end proof that controller-as-CA + SA-token bootstrap +
+// SVID-over-channel all work. The first test asserts the CA artifacts exist and
+// that routing flows; the read-only audit below confirms the bootstrap volumes
+// added no write verbs to the proxy SA.
+// ===========================================================================
+
+/// The discovery control-plane namespace (matches the harness Helm install and
+/// `deploy/manifests`). CA Secret + trust ConfigMap live here.
+const DISCOVERY_NAMESPACE: &str = "coxswain-system";
+
+/// Happy path: a proxy with no pre-provisioned cert bootstraps its SVID, opens
+/// the mTLS Stream, and serves a route — and the controller-as-CA artifacts
+/// (CA Secret + published trust-bundle ConfigMap) exist.
+#[tokio::test]
+async fn zero_cert_proxy_bootstraps_and_serves_routes() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+
+    // The controller self-generated (mode=auto) the CA Secret and published the
+    // public trust bundle ConfigMap proxies mount. Assert both exist with the
+    // expected keys — these are the controller-as-CA artifacts the bootstrap
+    // chain depends on.
+    let secrets: Api<Secret> = Api::namespaced(h.client.clone(), DISCOVERY_NAMESPACE);
+    let ca = secrets.get("coxswain-discovery-ca").await.map_err(|e| {
+        anyhow::anyhow!("CA Secret coxswain-discovery-ca must exist in {DISCOVERY_NAMESPACE}: {e}")
+    })?;
+    let ca_data = ca.data.unwrap_or_default();
+    assert!(
+        ca_data.contains_key("tls.crt") && ca_data.contains_key("tls.key"),
+        "CA Secret must carry tls.crt + tls.key, got keys: {:?}",
+        ca_data.keys().collect::<Vec<_>>()
+    );
+
+    let cms: Api<ConfigMap> = Api::namespaced(h.client.clone(), DISCOVERY_NAMESPACE);
+    let trust = cms.get("coxswain-discovery-trust").await.map_err(|e| {
+        anyhow::anyhow!(
+            "trust-bundle ConfigMap coxswain-discovery-trust must be published in \
+             {DISCOVERY_NAMESPACE} (the controller publisher writes it): {e}"
+        )
+    })?;
+    let trust_data = trust.data.unwrap_or_default();
+    let bundle = trust_data.get("ca.crt").ok_or_else(|| {
+        anyhow::anyhow!(
+            "trust ConfigMap must carry the ca.crt key, got: {:?}",
+            trust_data.keys().collect::<Vec<_>>()
+        )
+    })?;
+    assert!(
+        bundle.contains("BEGIN CERTIFICATE"),
+        "trust bundle ca.crt must be PEM, got {} bytes without a PEM header",
+        bundle.len()
+    );
+
+    // End-to-end proof: the bootstrapped proxy serves a route over the mTLS
+    // stream it could only have opened with a valid SVID.
+    let ns = NamespaceGuard::create(&h.client, "boot-serves").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("ingress.{}.local", ns.name);
+    let resp = wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// Count `BootstrapRejected` Warning Events currently present in the discovery
+/// namespace. Used as a before/after delta so the assertion is robust against
+/// events left over from prior runs.
+async fn count_bootstrap_rejected(events: &Api<Event>) -> anyhow::Result<usize> {
+    let list = events.list(&ListParams::default()).await?;
+    Ok(list
+        .items
+        .iter()
+        .filter(|e| e.reason.as_deref() == Some("BootstrapRejected"))
+        .count())
+}
+
+/// Sad path: a proxy that presents a ServiceAccount token minted for the WRONG
+/// audience is rejected at bootstrap. TokenReview (which the controller scopes
+/// to the `coxswain-discovery` audience) fails, so no SVID is issued, the rogue
+/// proxy never reaches Ready, and the controller — the sole diagnostic emitter —
+/// records a `BootstrapRejected` Warning Event.
+#[tokio::test]
+async fn invalid_sa_token_is_rejected_with_event() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "boot-reject").await?;
+
+    // The rogue proxy must verify the controller's server cert before it can
+    // send its (bad) token, so it needs the public trust bundle. Copy the
+    // controller-published ConfigMap into the rogue namespace (cross-namespace
+    // ConfigMap mounts are not allowed).
+    let src_cms: Api<ConfigMap> = Api::namespaced(h.client.clone(), DISCOVERY_NAMESPACE);
+    let trust = src_cms.get("coxswain-discovery-trust").await.map_err(|e| {
+        anyhow::anyhow!("trust ConfigMap must exist before the sad-path test can run: {e}")
+    })?;
+    let dst_cms: Api<ConfigMap> = Api::namespaced(h.client.clone(), &ns.name);
+    dst_cms
+        .create(
+            &PostParams::default(),
+            &ConfigMap {
+                metadata: ObjectMeta {
+                    name: Some("coxswain-discovery-trust".to_owned()),
+                    namespace: Some(ns.name.clone()),
+                    ..Default::default()
+                },
+                data: trust.data.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("copy trust bundle into {}: {e}", ns.name))?;
+
+    let events: Api<Event> = Api::namespaced(h.client.clone(), DISCOVERY_NAMESPACE);
+    let before = count_bootstrap_rejected(&events).await?;
+
+    // A rogue proxy whose projected token is minted for the WRONG audience.
+    // Everything else mirrors a normal shared proxy.
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let rogue: Deployment = serde_json::from_value(json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": { "name": "rogue-proxy", "namespace": ns.name },
+        "spec": {
+            "replicas": 1,
+            "selector": { "matchLabels": { "app": "rogue-proxy" } },
+            "template": {
+                "metadata": { "labels": { "app": "rogue-proxy" } },
+                "spec": {
+                    "containers": [{
+                        "name": "coxswain",
+                        "image": "coxswain:e2e",
+                        "imagePullPolicy": "Never",
+                        "args": ["serve", "proxy", "--shared"],
+                        "env": [
+                            { "name": "POD_NAME", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } },
+                            { "name": "POD_NAMESPACE", "valueFrom": { "fieldRef": { "fieldPath": "metadata.namespace" } } },
+                            { "name": "COXSWAIN_DISCOVERY_ENDPOINT", "value": "https://coxswain-controller-discovery.coxswain-system.svc:50051" },
+                            { "name": "COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT", "value": "https://coxswain-controller-discovery.coxswain-system.svc:50052" },
+                            { "name": "COXSWAIN_DISCOVERY_SA_TOKEN_PATH", "value": "/var/run/secrets/coxswain/discovery-token/token" },
+                            { "name": "COXSWAIN_DISCOVERY_CA_BUNDLE_PATH", "value": "/var/run/secrets/coxswain/trust-bundle/ca.crt" },
+                            { "name": "COXSWAIN_DISCOVERY_TRUST_DOMAIN", "value": "cluster.local" }
+                        ],
+                        "volumeMounts": [
+                            { "name": "discovery-token", "mountPath": "/var/run/secrets/coxswain/discovery-token", "readOnly": true },
+                            { "name": "trust-bundle", "mountPath": "/var/run/secrets/coxswain/trust-bundle", "readOnly": true }
+                        ]
+                    }],
+                    "volumes": [
+                        {
+                            "name": "discovery-token",
+                            "projected": {
+                                "sources": [{
+                                    "serviceAccountToken": {
+                                        "path": "token",
+                                        // Deliberately WRONG: the controller requires `coxswain-discovery`.
+                                        "audience": "wrong-audience",
+                                        "expirationSeconds": 3600
+                                    }
+                                }]
+                            }
+                        },
+                        {
+                            "name": "trust-bundle",
+                            "configMap": { "name": "coxswain-discovery-trust", "optional": false }
+                        }
+                    ]
+                }
+            }
+        }
+    }))?;
+    deployments.create(&PostParams::default(), &rogue).await?;
+
+    // The bootstrap loop retries with backoff, so a rejection event appears
+    // shortly after the rogue pod schedules.
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async {
+            "controller to emit a BootstrapRejected Warning Event for the wrong-audience token"
+                .to_string()
+        },
+        || async {
+            let now = count_bootstrap_rejected(&events).await.unwrap_or(before);
+            (now > before).then_some(())
         },
     )
     .await?;

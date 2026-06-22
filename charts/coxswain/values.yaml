@@ -193,6 +193,35 @@ controller:
   statusAddress: ""
 
 # =============================================================================
+# Discovery control plane — controller-as-CA, SVID bootstrap, mTLS stream (#423).
+# =============================================================================
+discovery:
+  # Port the controller's mTLS Stream listener binds (routing snapshots). The
+  # shared proxy and the discovery Service both target this port.
+  port: 50051
+  # Port the controller's server-auth-only bootstrap listener binds (SVID
+  # issuance for fresh proxies presenting an SA token + CSR).
+  bootstrapPort: 50052
+  # SPIFFE trust domain written into every issued SVID. Must match across the
+  # controller and all proxies; the Kubernetes default is `cluster.local`.
+  trustDomain: cluster.local
+  # COXSWAIN_DISCOVERY_SVID_TTL — lifetime of SVIDs issued to proxies. Proxies
+  # refresh at ~50% of this. Short TTLs improve revocation responsiveness.
+  svidTtl: 24h
+  ca:
+    # CA provisioning mode:
+    #   auto     — the controller self-generates the CA Secret if absent (no
+    #              external tooling). A namespace-scoped secrets-create Role is
+    #              rendered for this.
+    #   external — the CA Secret must pre-exist (cert-manager or an operator);
+    #              the controller fails closed if it is missing and the
+    #              secrets-create Role is not rendered.
+    mode: auto
+    # Name of the Secret (type kubernetes.io/tls or Opaque, keys tls.crt/tls.key)
+    # holding the CA cert + key, in the install namespace.
+    secretName: coxswain-discovery-ca
+
+# =============================================================================
 # Proxy pod — read-only data plane.
 # =============================================================================
 proxy:

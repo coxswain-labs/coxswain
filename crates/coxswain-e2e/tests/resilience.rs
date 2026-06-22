@@ -19,7 +19,7 @@
 
 use anyhow::Context as _;
 use coxswain_e2e::{
-    FixtureVars, Harness, HttpClient, NamespaceGuard,
+    ControllerOptions, FixtureVars, Harness, HttpClient, NamespaceGuard,
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress as ing},
     harness::wait,
 };
@@ -1008,6 +1008,68 @@ async fn no_requests_reach_terminating_endpoint_during_drain() -> anyhow::Result
     )
     .await
     .context("terminating endpoint still received new requests during drain window")?;
+
+    Ok(())
+}
+
+// ── SVID rotation continuity (#423) ───────────────────────────────────────────
+
+/// A short SVID TTL drives the proxy bootstrap loop to refresh its SVID and
+/// force a clean discovery-Stream reconnect several times during the window.
+/// The proxy's routing cells are never zeroed across a reconnect (last-good is
+/// served throughout), so sustained traffic must never see a 5xx/404 gap.
+///
+/// Serial by construction: it reconfigures the shared Helm release's
+/// `discovery.svidTtl`, then restores the default before returning.
+#[tokio::test]
+async fn svid_rotation_before_expiry_keeps_routing() -> anyhow::Result<()> {
+    // 20s TTL → the bootstrap loop refreshes at ~10s; a 50s load window spans
+    // ≥4 rotation cycles with comfortable margin before any issued SVID expires.
+    let h = Harness::start_with_options(ControllerOptions {
+        discovery_svid_ttl: Some("20s".to_string()),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "res-svid-rotation").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    // Rules-less default backend serves every host+path, so the bare `GET /`
+    // the load generator issues always has a live route.
+    fixtures::apply_fixture(ing::DEFAULT_BACKEND_ONLY, FixtureVars::new(&ns.name)).await?;
+
+    let host = "rotation.example".to_string();
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    // Sustain traffic across ≥4 SVID rotation cycles; assert zero gaps.
+    let result = run_load(
+        h.controller.proxy_addr,
+        host,
+        Stop::Deadline {
+            duration: Duration::from_secs(50),
+        },
+        None,
+    )
+    .await?;
+
+    assert!(result.total > 0, "load generated no requests");
+    assert_eq!(
+        result.non_2xx, 0,
+        "SVID rotation caused {} non-2xx responses out of {} — routing gapped across a reconnect",
+        result.non_2xx, result.total
+    );
+    assert_eq!(
+        result.errors, 0,
+        "SVID rotation caused {} connection errors out of {}",
+        result.errors, result.total
+    );
+
+    // Restore the chart-default TTL so later serial tests run with stock config.
+    Harness::start_with_options(ControllerOptions {
+        discovery_svid_ttl: Some("24h".to_string()),
+        ..Default::default()
+    })
+    .await?;
 
     Ok(())
 }

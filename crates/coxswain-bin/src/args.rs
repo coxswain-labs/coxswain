@@ -455,6 +455,74 @@ pub(crate) struct ControllerArgs {
     /// The bind address is controlled by `--management-bind-address`.
     #[arg(long, env = "COXSWAIN_DISCOVERY_PORT", default_value_t = 50051)]
     pub discovery_port: u16,
+
+    /// Port the bootstrap gRPC server binds to.
+    ///
+    /// Fresh proxies with no SVID connect here to exchange a Kubernetes
+    /// ServiceAccount token + CSR for a short-lived SVID.  Uses server-auth-only
+    /// TLS (no client cert required on this port).
+    ///
+    /// The bind address is controlled by `--management-bind-address`.
+    #[arg(
+        long,
+        env = "COXSWAIN_DISCOVERY_BOOTSTRAP_PORT",
+        default_value_t = 50052
+    )]
+    pub discovery_bootstrap_port: u16,
+
+    /// Name of the Kubernetes Secret holding the CA certificate and key.
+    ///
+    /// Must be in the same namespace as the controller pod (`POD_NAMESPACE`).
+    /// With `--discovery-ca-mode=auto` (default), the controller creates this
+    /// Secret if absent.  With `--discovery-ca-mode=external`, the operator
+    /// must pre-create it (e.g. via cert-manager) before the controller starts.
+    #[arg(
+        long,
+        env = "COXSWAIN_DISCOVERY_CA_SECRET",
+        default_value = "coxswain-discovery-ca"
+    )]
+    pub discovery_ca_secret: String,
+
+    /// CA provisioning mode.
+    ///
+    /// `auto` (default): the controller self-generates a CA if the Secret is
+    /// absent.  `external`: fail closed if the Secret is absent — the operator
+    /// must supply it (e.g. via cert-manager) before deploying.
+    #[arg(long, env = "COXSWAIN_DISCOVERY_CA_MODE", default_value = "auto")]
+    pub discovery_ca_mode: CaModeArg,
+
+    /// TTL for SVIDs issued to proxy nodes.
+    ///
+    /// Proxies refresh their SVID at ~50 % of this value.  Short TTLs improve
+    /// revocation responsiveness; long TTLs reduce bootstrap RPC traffic.
+    /// Accepts human-readable durations: `24h`, `1h`, `30m`.
+    #[arg(
+        long,
+        env = "COXSWAIN_DISCOVERY_SVID_TTL",
+        default_value = "24h",
+        value_parser = humantime::parse_duration,
+    )]
+    pub discovery_svid_ttl: Duration,
+
+    /// SPIFFE trust domain written into every issued SVID.
+    ///
+    /// Must match across the controller and all proxy nodes.  The default
+    /// (`cluster.local`) matches the Kubernetes default.
+    #[arg(
+        long,
+        env = "COXSWAIN_DISCOVERY_TRUST_DOMAIN",
+        default_value = "cluster.local"
+    )]
+    pub discovery_trust_domain: String,
+}
+
+/// CA provisioning mode selector.
+#[derive(ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
+pub(crate) enum CaModeArg {
+    /// Self-generate a CA if the Secret is absent (default).
+    Auto,
+    /// Require a pre-existing Secret; fail closed if absent.
+    External,
 }
 
 /// Arguments accepted by the hidden `dev` role.
@@ -555,6 +623,54 @@ pub(crate) struct ProxyRoleArgs {
         required = true
     )]
     pub discovery_endpoint: Vec<String>,
+
+    /// Bootstrap endpoint for obtaining an SVID from the controller.
+    ///
+    /// Must be an `https://` URI pointing to the controller's bootstrap listener
+    /// (port 50052 by default).  The proxy verifies the controller's SPIFFE cert
+    /// against the CA bundle from `--discovery-ca-bundle-path` before sending
+    /// its SA token.
+    ///
+    /// Example: `https://coxswain-controller-discovery.coxswain-system.svc:50052`
+    #[arg(long, env = "COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT")]
+    pub discovery_bootstrap_endpoint: Option<String>,
+
+    /// Path to the projected ServiceAccount token file.
+    ///
+    /// The token is sent to the bootstrap listener so the controller can validate
+    /// the proxy's identity via the Kubernetes TokenReview API.
+    ///
+    /// Default: `/var/run/secrets/coxswain/discovery-token/token`
+    #[arg(
+        long,
+        env = "COXSWAIN_DISCOVERY_SA_TOKEN_PATH",
+        default_value = "/var/run/secrets/coxswain/discovery-token/token"
+    )]
+    pub discovery_sa_token_path: String,
+
+    /// Path to the CA bundle from the trust-bundle ConfigMap mount.
+    ///
+    /// The proxy uses this to verify the controller's TLS certificate during
+    /// bootstrap and to build the mTLS channel for `Stream`.
+    ///
+    /// Default: `/var/run/secrets/coxswain/trust-bundle/ca.crt`
+    #[arg(
+        long,
+        env = "COXSWAIN_DISCOVERY_CA_BUNDLE_PATH",
+        default_value = "/var/run/secrets/coxswain/trust-bundle/ca.crt"
+    )]
+    pub discovery_ca_bundle_path: String,
+
+    /// SPIFFE trust domain; must match the controller's `--discovery-trust-domain`.
+    ///
+    /// Used to verify the controller's SPIFFE URI SAN during bootstrap and
+    /// to construct the mTLS channel's expected server identity.
+    #[arg(
+        long,
+        env = "COXSWAIN_DISCOVERY_TRUST_DOMAIN",
+        default_value = "cluster.local"
+    )]
+    pub discovery_trust_domain: String,
 }
 
 /// Resolved scope for a `proxy` role invocation.

@@ -156,8 +156,10 @@ pub struct OperatorConfig {
     /// `--admin-port` / `COXSWAIN_ADMIN_PORT` CLI argument.
     pub admin_port: u16,
     /// gRPC discovery endpoint the dedicated proxy connects to for routing
-    /// snapshots. Rendered as `--discovery-endpoint=<endpoint>`. In T7 this
-    /// is a plaintext `http://` URL; mTLS provisioning lands in T10/#423.
+    /// snapshots. Rendered as `--discovery-endpoint=<endpoint>`. Since #423 the
+    /// Stream listener is mTLS-only, so this is an `https://` URL. Dedicated-proxy
+    /// SVID bootstrap (projected token + per-namespace trust mount) is a
+    /// follow-up (#381); the shared proxy is the fully-wired path today.
     pub discovery_endpoint: String,
 }
 

@@ -21,6 +21,7 @@
 //! [`Shared`]: coxswain_core::Shared
 
 pub mod auth;
+pub mod bootstrap_client;
 pub mod bootstrap_server;
 pub mod client;
 pub mod error;
@@ -28,15 +29,23 @@ pub mod proto;
 pub mod registry;
 pub mod server;
 pub mod subscription;
+pub mod svid;
+pub mod transport;
 pub mod version;
 pub mod wire;
 
 pub use auth::{
-    DiscoveryBootstrapServerTls, DiscoveryClientTls, DiscoveryServerTls, SpiffeMatcher,
+    DiscoveryBootstrapClientTls, DiscoveryBootstrapServerTls, DiscoveryClientTls,
+    DiscoveryServerTls, SpiffeMatcher,
+};
+pub use bootstrap_client::{
+    BootstrapClient, BootstrapClientConfig, BootstrapClientHandle, BootstrapRunner,
 };
 pub use bootstrap_server::{BootstrapService, NoOpRejectHook, RejectHook};
-pub use client::{DiscoveryClient, DiscoveryClientConfig};
+pub use client::{DiscoveryClient, DiscoveryClientConfig, Supervisor};
 pub use error::{AuthError, DiscoveryError, WireError};
 pub use server::{DiscoveryService, SnapshotSource};
 pub use subscription::Scope;
+pub use svid::{SharedSvid, SvidMaterial};
+pub use transport::serve_discovery_with_tls;
 pub use version::{ContentHash, WIRE_VERSION};

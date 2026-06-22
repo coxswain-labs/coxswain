@@ -77,6 +77,14 @@ helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --set vap.enabled=false
 ```
 
+## Control-plane CA
+
+The controller secures the controller↔proxy discovery channel with mandatory
+mTLS. By default (`discovery.ca.mode=auto`) it self-generates the CA and works
+out of the box — nothing to provision. To consume a cert-manager-managed or
+bring-your-own CA instead, set `discovery.ca.mode=external` and supply the
+Secret. See [Control-plane security](../guides/control-plane-security.md).
+
 ## Uninstall
 
 ```bash

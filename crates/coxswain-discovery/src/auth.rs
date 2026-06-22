@@ -453,6 +453,53 @@ impl DiscoveryBootstrapServerTls {
     }
 }
 
+// ── DiscoveryBootstrapClientTls ───────────────────────────────────────────────
+
+/// TLS configuration for the bootstrap gRPC client (proxy side, server-auth-only).
+///
+/// The proxy verifies the controller's server certificate against the CA bundle
+/// from the trust-bundle ConfigMap mount.  No client certificate is presented —
+/// the proxy has no SVID yet; that is the whole point of bootstrapping.
+///
+/// Distinct from [`DiscoveryClientTls`] (which requires a client cert for mTLS).
+// intentionally open: field-literal constructed in bootstrap_client
+pub struct DiscoveryBootstrapClientTls {
+    /// PEM-encoded CA bundle from the trust-bundle ConfigMap.
+    pub server_ca_pem: Vec<u8>,
+    /// Expected SPIFFE identity of the controller bootstrap server.
+    pub expected_server: SpiffeMatcher,
+}
+
+impl DiscoveryBootstrapClientTls {
+    /// Wrap `endpoint` with server-auth-only TLS.
+    ///
+    /// The resulting endpoint verifies the server's SPIFFE URI SAN against
+    /// `expected_server` but does **not** present a client certificate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] if the CA bundle PEM cannot be parsed or the
+    /// verifier cannot be built.
+    #[must_use = "the wrapped Endpoint must be used to open the channel"]
+    pub fn apply(&self, endpoint: Endpoint) -> Result<Endpoint, AuthError> {
+        let server_roots = Arc::new(build_root_cert_store(&self.server_ca_pem)?);
+        let inner_server_verifier = WebPkiServerVerifier::builder(server_roots.clone())
+            .build()
+            .map_err(|e| AuthError::VerifierBuild(e.to_string()))?;
+        let server_verifier = Arc::new(SpiffeServerCertVerifier {
+            inner: inner_server_verifier,
+            roots: server_roots,
+            matcher: self.expected_server.clone(),
+        });
+
+        // No identity — server-auth-only.
+        let tls_config = ClientTlsConfig::new();
+        endpoint
+            .tls_config_with_verifier(tls_config, server_verifier)
+            .map_err(|e| AuthError::VerifierBuild(e.to_string()))
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

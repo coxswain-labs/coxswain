@@ -743,12 +743,12 @@ dependencies = [
  "coxswain-reflector",
  "humantime",
  "ipnet",
+ "kube",
  "pingora-core",
  "pingora-proxy",
  "reqwest",
  "rustls",
  "tokio",
- "tonic",
  "tracing",
  "tracing-subscriber",
 ]

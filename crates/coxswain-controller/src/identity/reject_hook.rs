@@ -14,7 +14,8 @@
 //! controller.
 
 use k8s_openapi::api::core::v1::ObjectReference;
-use kube::runtime::events::{Event, EventType, Recorder};
+use kube::Client;
+use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 
 use coxswain_discovery::RejectHook;
 
@@ -37,6 +38,33 @@ impl BootstrapRejectHook {
     #[must_use]
     pub fn new(recorder: Recorder, pod_ref: ObjectReference) -> Self {
         Self { recorder, pod_ref }
+    }
+
+    /// Build a hook from a `kube::Client` and the controller's identity.
+    ///
+    /// Constructs the event [`Recorder`] (with a [`Reporter`] tagged by
+    /// `controller_name`/`pod_name`) and the controller-Pod [`ObjectReference`]
+    /// internally, so the bin layer needs no `kube::runtime::events` /
+    /// `k8s-openapi` imports of its own.
+    #[must_use]
+    pub fn from_client(
+        client: Client,
+        controller_name: impl Into<String>,
+        pod_name: String,
+        pod_namespace: String,
+    ) -> Self {
+        let reporter = Reporter {
+            controller: controller_name.into(),
+            instance: Some(pod_name.clone()),
+        };
+        let recorder = Recorder::new(client, reporter);
+        let pod_ref = ObjectReference {
+            kind: Some("Pod".to_owned()),
+            name: Some(pod_name),
+            namespace: Some(pod_namespace),
+            ..Default::default()
+        };
+        Self::new(recorder, pod_ref)
     }
 }
 

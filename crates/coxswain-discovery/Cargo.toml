@@ -15,6 +15,7 @@ coxswain-core = { workspace = true }
 http          = { workspace = true }
 ipnet         = { workspace = true }
 prost         = { workspace = true }
+rcgen         = { workspace = true }
 regex         = { workspace = true }
 rustls        = { workspace = true }
 sha2          = { workspace = true }

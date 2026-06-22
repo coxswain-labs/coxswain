@@ -212,6 +212,11 @@ pub(crate) struct HelmOverrides {
     /// Passed as `proxy.shared.accessLogPathMode`. `None` leaves the chart
     /// default (currently `"full"`).
     pub access_log_path_mode: Option<String>,
+    /// Passed as `discovery.svidTtl` (#423). A short value (e.g. `"10s"`) makes
+    /// the proxy bootstrap loop refresh its SVID quickly so a test can observe a
+    /// rotation cycle without waiting the 24 h default. `None` leaves the chart
+    /// default.
+    pub discovery_svid_ttl: Option<String>,
 }
 
 /// Install or upgrade the coxswain Helm release with e2e-specific overrides.
@@ -290,6 +295,10 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
     if let Some(mode) = &overrides.access_log_path_mode {
         args.push("--set".into());
         args.push(format!("proxy.shared.accessLogPathMode={mode}"));
+    }
+    if let Some(ttl) = &overrides.discovery_svid_ttl {
+        args.push("--set".into());
+        args.push(format!("discovery.svidTtl={ttl}"));
     }
 
     let status = Command::new("helm")
