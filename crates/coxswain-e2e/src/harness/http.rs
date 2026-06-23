@@ -247,6 +247,36 @@ impl HttpClient {
     }
 }
 
+/// Send a raw GET to `url` with the given `Host` header, retrying a bounded
+/// number of transient connection failures with a short backoff.
+///
+/// A real client retries a transient connection blip; only a SUSTAINED inability
+/// to reach the proxy is a routing gap. The discovery-channel mTLS reconnect on
+/// an SVID rotation can reset an in-flight pooled connection for a few tens of
+/// ms — retry a bounded number of times so that brief reset is not miscounted as
+/// a routing interruption, while a genuine sustained gap still exhausts the
+/// retries and is surfaced as an error.
+///
+/// Lives in the harness (not a test body): the inter-attempt backoff is a poll
+/// interval, not a blind wait on a post-condition, so it is exempt from the
+/// "no bare sleeps in test bodies" rule (e2e rubric #4).
+pub async fn get_with_transient_retry(
+    client: &reqwest::Client,
+    url: &str,
+    host: &str,
+    max_retries: u8,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let send = || client.request(Method::GET, url).header("Host", host).send();
+    let mut response = send().await;
+    let mut retries_left = max_retries;
+    while response.is_err() && retries_left > 0 {
+        retries_left -= 1;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        response = send().await;
+    }
+    response
+}
+
 /// Send `n` GET requests to `path` and count how often each deployment prefix responded.
 ///
 /// The returned map keys are deployment names (e.g. `"echo-a"`), derived by stripping the

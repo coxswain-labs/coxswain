@@ -743,12 +743,12 @@ dependencies = [
  "coxswain-reflector",
  "humantime",
  "ipnet",
+ "kube",
  "pingora-core",
  "pingora-proxy",
  "reqwest",
  "rustls",
  "tokio",
- "tonic",
  "tracing",
  "tracing-subscriber",
 ]
@@ -768,6 +768,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "coxswain-core",
+ "coxswain-discovery",
  "coxswain-reflector",
  "futures",
  "gateway-api",
@@ -776,12 +777,16 @@ dependencies = [
  "kube-leader-election",
  "pingora-core",
  "prometheus 0.14.0",
+ "rcgen",
+ "rustls",
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tracing",
  "tracing-test",
+ "x509-parser",
 ]
 
 [[package]]

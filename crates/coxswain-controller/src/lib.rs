@@ -10,6 +10,7 @@
 //! invariant is enforced structurally.
 
 mod controller;
+pub mod identity;
 mod metrics;
 mod operator;
 mod status_common;
@@ -40,3 +41,8 @@ pub use coxswain_reflector::reconciler::{
     SharedProxyReconciler,
 };
 pub use coxswain_reflector::{IngressDefaultBackend, IngressDefaultBackendParseError};
+pub use identity::ca::{CaError, CertAuthority, IssuedServerSvid};
+pub use identity::publisher::{TRUST_BUNDLE_CM_NAME, spawn_trust_publisher};
+pub use identity::reject_hook::BootstrapRejectHook;
+pub use identity::store::{CaMode, CaStoreError, load_or_generate};
+pub use identity::token_review::KubeTokenAuthenticator;

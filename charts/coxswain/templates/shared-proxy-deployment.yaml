@@ -115,6 +115,20 @@ spec:
             - name: COXSWAIN_WATCH_NAMESPACE
               value: {{ .Values.watchNamespace | quote }}
             {{- end }}
+            # Discovery control plane (#423): the proxy receives pushed routing
+            # snapshots over the mTLS stream and bootstraps its SVID over the
+            # server-auth-only bootstrap listener. Both resolve to the discovery
+            # Service in the controller's namespace.
+            - name: COXSWAIN_DISCOVERY_ENDPOINT
+              value: "https://{{ include "coxswain.discovery.serviceName" . }}.{{ include "coxswain.namespace" . }}.svc:{{ .Values.discovery.port }}"
+            - name: COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT
+              value: "https://{{ include "coxswain.discovery.serviceName" . }}.{{ include "coxswain.namespace" . }}.svc:{{ .Values.discovery.bootstrapPort }}"
+            - name: COXSWAIN_DISCOVERY_SA_TOKEN_PATH
+              value: "/var/run/secrets/coxswain/discovery-token/token"
+            - name: COXSWAIN_DISCOVERY_CA_BUNDLE_PATH
+              value: "/var/run/secrets/coxswain/trust-bundle/ca.crt"
+            - name: COXSWAIN_DISCOVERY_TRUST_DOMAIN
+              value: {{ .Values.discovery.trustDomain | quote }}
             - name: COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD
               value: {{ .Values.proxy.shared.shutdownGracePeriod | quote }}
             - name: COXSWAIN_PROXY_SHUTDOWN_TIMEOUT
@@ -161,4 +175,33 @@ spec:
               add: {{ if .Values.security.rootless }}[]{{ else }}{{ .Values.containerSecurityContext.capabilities.add | toJson }}{{ end }}
           resources:
             {{- toYaml .Values.proxy.shared.resources | nindent 12 }}
+          volumeMounts:
+            # Projected SA token for SVID bootstrap (#423). Read-only; compatible
+            # with readOnlyRootFilesystem.
+            - name: discovery-token
+              mountPath: /var/run/secrets/coxswain/discovery-token
+              readOnly: true
+            # Public CA trust bundle published by the controller. `optional` on
+            # the volume below means a pod that starts before the first publish
+            # still boots; the bootstrap loop retries until the ConfigMap appears.
+            - name: trust-bundle
+              mountPath: /var/run/secrets/coxswain/trust-bundle
+              readOnly: true
+      volumes:
+        # Audience-scoped projected SA token. The audience MUST match the value
+        # the controller passes to TokenReview (`coxswain-discovery`).
+        - name: discovery-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: coxswain-discovery
+                  expirationSeconds: 3600
+        # Controller-published trust bundle (public CA roots only — zero proxy
+        # RBAC; the kubelet mounts it). `optional` so first-boot before the
+        # publisher writes it does not block pod start.
+        - name: trust-bundle
+          configMap:
+            name: coxswain-discovery-trust
+            optional: true
 {{- end }}

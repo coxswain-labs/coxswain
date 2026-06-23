@@ -218,6 +218,19 @@ fn build_snapshot(source: &SnapshotSource) -> SnapshotContent {
 impl Discovery for DiscoveryService {
     type StreamStream = ReceiverStream<Result<p::ServerMessage, Status>>;
 
+    /// Bootstrap RPC is served by [`crate::bootstrap_server::BootstrapService`]
+    /// on the separate bootstrap listener (port 50052).  This implementation
+    /// always returns `Unimplemented` so callers connecting to the wrong port
+    /// get a clear error rather than a hang.
+    async fn bootstrap(
+        &self,
+        _request: Request<p::BootstrapRequest>,
+    ) -> Result<Response<p::BootstrapResponse>, Status> {
+        Err(Status::unimplemented(
+            "Bootstrap RPC is served on the bootstrap port (50052), not the Stream port (50051)",
+        ))
+    }
+
     async fn stream(
         &self,
         request: Request<Streaming<p::ClientMessage>>,

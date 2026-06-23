@@ -395,6 +395,111 @@ impl DiscoveryClientTls {
     }
 }
 
+// ── DiscoveryBootstrapServerTls ───────────────────────────────────────────────
+
+/// TLS configuration for the bootstrap listener (server-auth-only).
+///
+/// The bootstrap endpoint uses server-authentication-only TLS — the proxy does
+/// **not** present a client certificate (it has none yet; that's exactly why it
+/// is bootstrapping).  Instead, the proxy verifies the controller's server cert
+/// against the CA bundle it mounted from the trust-bundle ConfigMap before
+/// calling Bootstrap.
+///
+/// This is intentionally distinct from [`DiscoveryServerTls`], which builds a
+/// `ServerConfig` that mandates client certs.  Mixing optional-and-mandatory
+/// client auth on one `ServerConfig` is fragile and would weaken the hard-fail
+/// SAN guarantee on the mTLS `Stream` port.
+// intentionally open: field-literal constructed at the bin layer
+pub struct DiscoveryBootstrapServerTls {
+    /// PEM-encoded TLS certificate chain for the server (typically a controller SVID).
+    pub server_cert_pem: Vec<u8>,
+    /// PEM-encoded private key matching `server_cert_pem`.
+    pub server_key_pem: Vec<u8>,
+}
+
+impl DiscoveryBootstrapServerTls {
+    /// Build a [`TlsAcceptor`] with server-auth-only TLS (no client cert required).
+    ///
+    /// The acceptor is configured with:
+    /// - ALPN `h2` for tonic's HTTP/2 framing.
+    /// - No client certificate requested or verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] if the certificate/key PEM cannot be parsed or the
+    /// rustls configuration is invalid.
+    #[must_use = "the TlsAcceptor must be used to wrap the TCP listener"]
+    pub fn acceptor(&self) -> Result<TlsAcceptor, AuthError> {
+        let cert_chain: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(self.server_cert_pem.as_slice())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AuthError::InvalidPem(e.to_string()))?;
+        if cert_chain.is_empty() {
+            return Err(AuthError::InvalidPem(
+                "no certificates found in bootstrap server cert PEM".into(),
+            ));
+        }
+        let private_key = PrivateKeyDer::from_pem_slice(&self.server_key_pem)
+            .map_err(|e| AuthError::InvalidPem(e.to_string()))?;
+
+        // Server-auth-only: no client cert required.
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, private_key)
+            .map_err(AuthError::Rustls)?;
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+
+        Ok(TlsAcceptor::from(Arc::new(server_config)))
+    }
+}
+
+// ── DiscoveryBootstrapClientTls ───────────────────────────────────────────────
+
+/// TLS configuration for the bootstrap gRPC client (proxy side, server-auth-only).
+///
+/// The proxy verifies the controller's server certificate against the CA bundle
+/// from the trust-bundle ConfigMap mount.  No client certificate is presented —
+/// the proxy has no SVID yet; that is the whole point of bootstrapping.
+///
+/// Distinct from [`DiscoveryClientTls`] (which requires a client cert for mTLS).
+// intentionally open: field-literal constructed in bootstrap_client
+pub struct DiscoveryBootstrapClientTls {
+    /// PEM-encoded CA bundle from the trust-bundle ConfigMap.
+    pub server_ca_pem: Vec<u8>,
+    /// Expected SPIFFE identity of the controller bootstrap server.
+    pub expected_server: SpiffeMatcher,
+}
+
+impl DiscoveryBootstrapClientTls {
+    /// Wrap `endpoint` with server-auth-only TLS.
+    ///
+    /// The resulting endpoint verifies the server's SPIFFE URI SAN against
+    /// `expected_server` but does **not** present a client certificate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] if the CA bundle PEM cannot be parsed or the
+    /// verifier cannot be built.
+    #[must_use = "the wrapped Endpoint must be used to open the channel"]
+    pub fn apply(&self, endpoint: Endpoint) -> Result<Endpoint, AuthError> {
+        let server_roots = Arc::new(build_root_cert_store(&self.server_ca_pem)?);
+        let inner_server_verifier = WebPkiServerVerifier::builder(server_roots.clone())
+            .build()
+            .map_err(|e| AuthError::VerifierBuild(e.to_string()))?;
+        let server_verifier = Arc::new(SpiffeServerCertVerifier {
+            inner: inner_server_verifier,
+            roots: server_roots,
+            matcher: self.expected_server.clone(),
+        });
+
+        // No identity — server-auth-only.
+        let tls_config = ClientTlsConfig::new();
+        endpoint
+            .tls_config_with_verifier(tls_config, server_verifier)
+            .map_err(|e| AuthError::VerifierBuild(e.to_string()))
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -493,6 +598,13 @@ pub(crate) mod tests {
     #[async_trait::async_trait]
     impl Discovery for NoOpDiscovery {
         type StreamStream = tokio_stream::wrappers::ReceiverStream<Result<ServerMessage, Status>>;
+
+        async fn bootstrap(
+            &self,
+            _req: tonic::Request<p::BootstrapRequest>,
+        ) -> Result<tonic::Response<p::BootstrapResponse>, Status> {
+            Err(Status::unimplemented("test stub"))
+        }
 
         async fn stream(
             &self,

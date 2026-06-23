@@ -43,6 +43,12 @@ spec:
             - name: admin
               containerPort: 8082
               protocol: TCP
+            - name: discovery
+              containerPort: 50051
+              protocol: TCP
+            - name: bootstrap
+              containerPort: 50052
+              protocol: TCP
           env:
             - name: POD_NAME
               valueFrom:
@@ -72,6 +78,23 @@ spec:
               value: "15s"
             - name: COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL
               value: "5s"
+            # Discovery control plane / CA (#423).
+            - name: COXSWAIN_DISCOVERY_PORT
+              value: "50051"
+            - name: COXSWAIN_DISCOVERY_BOOTSTRAP_PORT
+              value: "50052"
+            - name: COXSWAIN_DISCOVERY_CA_SECRET
+              value: "coxswain-discovery-ca"
+            # auto: self-generate the CA if absent. Set to "external" and supply
+            # the Secret (e.g. via cert-manager-example.yaml) to consume an
+            # externally-managed CA; also delete the discovery-ca Role in
+            # controller-rbac.yaml in that case.
+            - name: COXSWAIN_DISCOVERY_CA_MODE
+              value: "auto"
+            - name: COXSWAIN_DISCOVERY_SVID_TTL
+              value: "24h"
+            - name: COXSWAIN_DISCOVERY_TRUST_DOMAIN
+              value: "cluster.local"
           livenessProbe:
             httpGet:
               path: /healthz
@@ -122,6 +145,32 @@ spec:
     - name: admin
       port: 8082
       targetPort: admin
+      protocol: TCP
+---
+# Discovery control-plane Service (#423). Fixed name `coxswain-controller-discovery`
+# so the controller operator's rendered dedicated-proxy endpoint and the
+# shared-proxy endpoint env both resolve to it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: coxswain-controller-discovery
+  namespace: coxswain-system
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+  ports:
+    - name: discovery
+      port: 50051
+      targetPort: discovery
+      protocol: TCP
+    - name: bootstrap
+      port: 50052
+      targetPort: bootstrap
       protocol: TCP
 ---
 apiVersion: policy/v1

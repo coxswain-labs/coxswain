@@ -78,6 +78,17 @@ Shared-proxy pod fullname: "<release>-coxswain-shared-proxy".
 {{- end }}
 
 {{/*
+Discovery Service name. Fixed (not release-prefixed) because the controller's
+operator renders this exact DNS name into dedicated-proxy `--discovery-endpoint`
+args, and the shared-proxy endpoint env is derived from the same helper so both
+agree. The Service is namespaced, so distinct installs in distinct namespaces do
+not collide.
+*/}}
+{{- define "coxswain.discovery.serviceName" -}}
+coxswain-controller-discovery
+{{- end }}
+
+{{/*
 Controller selector labels — selectorLabels + component=controller.
 */}}
 {{- define "coxswain.controller.selectorLabels" -}}

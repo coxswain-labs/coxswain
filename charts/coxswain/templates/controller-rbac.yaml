@@ -36,8 +36,21 @@ rules:
     resources: ["serviceaccounts"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
-    resources: ["secrets", "configmaps"]
+    resources: ["secrets"]
     verbs: ["get", "list", "watch"]
+  # `configmaps` carries write verbs (in addition to the read used for
+  # BackendTLSPolicy CA resolution) because the trust-bundle publisher (#423)
+  # server-side-applies the `coxswain-discovery-trust` ConfigMap so proxies can
+  # mount the public CA roots with zero API verbs of their own.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Validate proxy ServiceAccount tokens during SVID bootstrap (#423).
+  # TokenReview is a cluster-scoped, write-only (create) subjectaccess-style
+  # API; there is no namespaced form. No token is ever persisted.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
@@ -186,4 +199,40 @@ roleRef:
   kind: Role
   name: {{ include "coxswain.controller.fullname" . }}-leader-election
   apiGroup: rbac.authorization.k8s.io
+{{- if eq .Values.discovery.ca.mode "auto" }}
+---
+# Namespace-scoped Role granting the controller create/get access to the
+# discovery CA Secret in the install namespace (#423, `discovery.ca.mode=auto`).
+# Kept namespace-scoped and separate from the cluster-wide read-only `secrets`
+# rule so the controller can self-generate its CA without any cluster-wide
+# secrets-write grant. Delete this Role (set `discovery.ca.mode=external`) when
+# the CA Secret is supplied by cert-manager or an operator.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "coxswain.controller.fullname" . }}-discovery-ca
+  namespace: {{ include "coxswain.namespace" . }}
+  labels:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "coxswain.controller.fullname" . }}-discovery-ca
+  namespace: {{ include "coxswain.namespace" . }}
+  labels:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "coxswain.controller.serviceAccountName" . }}
+    namespace: {{ include "coxswain.namespace" . }}
+roleRef:
+  kind: Role
+  name: {{ include "coxswain.controller.fullname" . }}-discovery-ca
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
 {{- end }}

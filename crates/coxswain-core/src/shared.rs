@@ -26,6 +26,14 @@ impl<T: Default> Shared<T> {
 }
 
 impl<T> Shared<T> {
+    /// Construct a new handle wrapping an initial `value`.
+    ///
+    /// Unlike [`Shared::new`], this does not require `T: Default`.
+    #[must_use]
+    pub fn from_value(value: T) -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(value)))
+    }
+
     /// Atomically load the current snapshot (refcount bump, no lock).
     #[must_use]
     pub fn load(&self) -> Arc<T> {

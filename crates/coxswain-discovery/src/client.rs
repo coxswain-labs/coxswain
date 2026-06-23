@@ -20,12 +20,15 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, warn};
 
-use crate::auth::DiscoveryClientTls;
+use tokio::sync::watch;
+
+use crate::auth::{DiscoveryClientTls, SpiffeMatcher};
 use crate::proto::v1::{
     self as p, client_message::Kind as CKind, discovery_client::DiscoveryClient as TonicClient,
     server_message::Kind as SKind,
 };
 use crate::subscription::Scope;
+use crate::svid::SharedSvid;
 use crate::version::WIRE_VERSION;
 use crate::wire::{
     client_cert_from_wire, gateway_from_wire, ingress_from_wire, listener_health_from_wire,
@@ -60,13 +63,30 @@ pub struct DiscoveryClientConfig {
     pub backoff_base: Duration,
     /// Maximum backoff ceiling; full-jitter stays within `[0, cap]` (default: 30 s).
     pub backoff_cap: Duration,
-    /// mTLS configuration for the discovery channel.
+    /// Static mTLS configuration for the discovery channel.
     ///
     /// When `Some`, the channel is established with mutual TLS and both sides'
     /// certificates are verified against the configured CA bundle and SPIFFE
     /// URI SAN pattern. When `None` (default), the channel runs plaintext h2c;
     /// this should only be used in test environments.
+    ///
+    /// Mutually exclusive with `svid_cell`: prefer `svid_cell` in production
+    /// so the supervisor picks up SVID rotations automatically.
     pub tls: Option<DiscoveryClientTls>,
+    /// Dynamic SVID cell populated by the proxy-side bootstrap loop.
+    ///
+    /// When `Some`, `build_channel` reads the current SVID from this cell on
+    /// every connect attempt so SVID rotation flows automatically on reconnect.
+    /// Takes precedence over `tls` when both are set.
+    pub svid_cell: Option<SharedSvid>,
+    /// Expected SPIFFE identity of the controller, used when `svid_cell` is set
+    /// to construct [`DiscoveryClientTls`] from the raw PEM material.
+    pub expected_server: Option<SpiffeMatcher>,
+    /// Receives a new value each time the bootstrap loop issues a fresh SVID.
+    ///
+    /// When `Some`, the supervisor forces a clean reconnect (and re-reads the
+    /// SVID cell) on the next generation tick.
+    pub svid_rotated: Option<watch::Receiver<u64>>,
 }
 
 impl DiscoveryClientConfig {
@@ -82,6 +102,9 @@ impl DiscoveryClientConfig {
             backoff_base: Duration::from_millis(250),
             backoff_cap: Duration::from_secs(30),
             tls: None,
+            svid_cell: None,
+            expected_server: None,
+            svid_rotated: None,
         }
     }
 }
@@ -110,11 +133,19 @@ pub struct DiscoveryClient {
 }
 
 impl DiscoveryClient {
-    /// Spawn the supervised reconnect loop and return a handle to the routing cells.
+    /// Build the routing-table cells and the (not-yet-running) reconnect
+    /// [`Supervisor`], without spawning a task.
+    ///
+    /// Use this when the caller is **not** already inside a Tokio runtime (e.g.
+    /// the synchronous `coxswain-bin` startup path before Pingora creates its
+    /// runtimes): construct the client, wire the returned cells into the proxy
+    /// acceptors, then drive the [`Supervisor`] from a Pingora background
+    /// service via [`Supervisor::run`]. Use [`DiscoveryClient::spawn`] instead
+    /// when a runtime is already active.
     ///
     /// `health` must come from a [`coxswain_core::health::HealthRegistry`] that
-    /// registered this subsystem with at least the `health_check` name before
-    /// calling `spawn`. The supervisor drives the following health transitions:
+    /// registered this subsystem with at least the `health_check` name. The
+    /// supervisor drives the following health transitions:
     ///
     /// - Before first snapshot: `Pending` → `/readyz` 503 (NotReady).
     /// - After first snapshot applied: `Ready`.
@@ -122,15 +153,12 @@ impl DiscoveryClient {
     ///   `/readyz` stays 200).
     /// - On reconnect + new snapshot: `Ready` again.
     /// - On NACK (bad DTO): health stays `Ready` — last-good config is still valid.
-    ///
-    /// The returned [`tokio::task::JoinHandle`] should be `await`ed at shutdown
-    /// or held for the process lifetime.
     #[must_use]
-    pub fn spawn(
+    pub fn new(
         config: DiscoveryClientConfig,
         health: SubsystemHandle,
         health_check: &str,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
+    ) -> (Self, Supervisor) {
         let ingress_routes = SharedIngressRoutingTable::new();
         let gateway_routes = SharedGatewayRoutingTable::new();
         let tls_store = SharedTlsStore::new();
@@ -149,8 +177,6 @@ impl DiscoveryClient {
             has_snapshot: false,
         };
 
-        let handle = tokio::spawn(supervisor.run());
-
         let client = Self {
             ingress_routes,
             gateway_routes,
@@ -159,6 +185,23 @@ impl DiscoveryClient {
             listener_health,
         };
 
+        (client, supervisor)
+    }
+
+    /// Spawn the supervised reconnect loop and return a handle to the routing cells.
+    ///
+    /// Convenience wrapper over [`DiscoveryClient::new`] that immediately
+    /// `tokio::spawn`s the supervisor — **requires an active Tokio runtime**.
+    /// The returned [`tokio::task::JoinHandle`] should be held for the process
+    /// lifetime.
+    #[must_use]
+    pub fn spawn(
+        config: DiscoveryClientConfig,
+        health: SubsystemHandle,
+        health_check: &str,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
+        let (client, supervisor) = Self::new(config, health, health_check);
+        let handle = tokio::spawn(supervisor.run());
         (client, handle)
     }
 
@@ -222,9 +265,16 @@ impl coxswain_core::RoutingSource for DiscoveryClient {
     }
 }
 
-// ── private supervisor ──────────────────────────────────────────────────────
+// ── supervisor ──────────────────────────────────────────────────────────────
 
-struct Supervisor {
+/// The discovery reconnect supervisor returned by [`DiscoveryClient::new`].
+///
+/// Owns the reconnect/backoff loop and the routing-cell write handles. Drive it
+/// by awaiting [`Supervisor::run`] — typically from a Pingora background service
+/// so it runs on a Pingora runtime. `run` never returns under normal operation
+/// (it loops across reconnects for the process lifetime).
+#[non_exhaustive]
+pub struct Supervisor {
     config: DiscoveryClientConfig,
     ingress: SharedIngressRoutingTable,
     gateway: SharedGatewayRoutingTable,
@@ -237,13 +287,33 @@ struct Supervisor {
 }
 
 impl Supervisor {
-    async fn run(mut self) {
-        let channel = build_channel(&self.config);
-        let mut grpc = TonicClient::new(channel);
+    /// Run the reconnect/backoff loop until the process exits.
+    pub async fn run(mut self) {
+        // Pull the rotation receiver out of config so it does not conflict
+        // with the mutable borrow of `self` inside `stream_until_closed`.
+        let mut svid_rotation_rx: Option<watch::Receiver<u64>> = self.config.svid_rotated.take();
         let mut attempt: u32 = 0;
 
         loop {
-            let applied = self.stream_until_closed(&mut grpc).await;
+            // Rebuild the channel on every iteration so a fresh SVID from
+            // the bootstrap loop is picked up after a rotation-triggered
+            // reconnect.
+            let channel = build_channel(&self.config);
+            let mut grpc = TonicClient::new(channel);
+
+            // `svid_rotated` is an intentional reconnect, not a failure; track
+            // it separately so the backoff exponent is not incremented.
+            let (applied, svid_rotated) = if let Some(ref mut rx) = svid_rotation_rx {
+                tokio::select! {
+                    result = self.stream_until_closed(&mut grpc) => (result, false),
+                    Ok(()) = rx.changed() => {
+                        debug!("discovery client: SVID rotated; forcing reconnect with fresh SVID");
+                        (false, true)
+                    }
+                }
+            } else {
+                (self.stream_until_closed(&mut grpc).await, false)
+            };
 
             if self.has_snapshot {
                 self.health.degraded(
@@ -252,10 +322,11 @@ impl Supervisor {
                 );
             }
 
-            // Reset the backoff exponent only if the session was productive (at
-            // least one snapshot applied), so a brief connect that never delivers
-            // a snapshot doesn't collapse the exponent.
-            if applied {
+            // Reset the backoff exponent if the session delivered at least one
+            // snapshot, or if this was a rotation-triggered reconnect (not a
+            // failure), so kube-proxy propagation lag does not grow the backoff
+            // to the cap before the SVID arrives.
+            if applied || svid_rotated {
                 attempt = 0;
             } else {
                 attempt = attempt.saturating_add(1);
@@ -266,7 +337,19 @@ impl Supervisor {
                 delay_ms = delay.as_millis(),
                 "discovery client backing off before reconnect"
             );
-            tokio::time::sleep(delay).await;
+            // Make the backoff interruptible by SVID rotation: a fresh cert
+            // wakes the supervisor immediately instead of sleeping the full
+            // exponential delay (which at cap is 30 s).
+            if let Some(ref mut rx) = svid_rotation_rx {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    Ok(()) = rx.changed() => {
+                        debug!("discovery client: SVID arrived during backoff; reconnecting immediately");
+                    }
+                }
+            } else {
+                tokio::time::sleep(delay).await;
+            }
         }
     }
 
@@ -277,16 +360,14 @@ impl Supervisor {
     async fn stream_until_closed(&mut self, grpc: &mut TonicClient<Channel>) -> bool {
         let (tx, rx) = mpsc::channel::<p::ClientMessage>(4);
 
-        let response = match grpc.stream(ReceiverStream::new(rx)).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "discovery client: failed to open stream");
-                return false;
-            }
-        };
-        let mut inbound = response.into_inner();
-
-        // Send Subscribe first; the server will not push a Snapshot until it receives this.
+        // Pre-queue Subscribe *before* opening the stream. The server reads the
+        // Subscribe (`read_subscribe`) before it returns its response, so it does
+        // not send response headers until the first client message arrives — and
+        // `grpc.stream(..).await` does not resolve until those response headers
+        // arrive. Sending Subscribe only *after* awaiting the call therefore
+        // deadlocks: client waits for headers, server waits for Subscribe. The
+        // bounded channel has capacity, so this enqueue never blocks; the body
+        // stream flushes it as soon as the h2 request opens.
         let subscribe = p::ClientMessage {
             kind: Some(CKind::Subscribe(p::Subscribe {
                 node_id: self.config.node_id.clone(),
@@ -295,9 +376,18 @@ impl Supervisor {
             })),
         };
         if tx.send(subscribe).await.is_err() {
-            warn!("discovery client: outbound channel closed immediately after stream open");
+            warn!("discovery client: outbound channel closed before stream open");
             return false;
         }
+
+        let response = match grpc.stream(ReceiverStream::new(rx)).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "discovery client: failed to open stream");
+                return false;
+            }
+        };
+        let mut inbound = response.into_inner();
 
         let mut applied_this_session = false;
 
@@ -429,15 +519,41 @@ fn apply_snapshot(
 
 /// Build a lazy-connect [`Channel`] from the configured endpoints.
 ///
-/// A single endpoint uses [`Endpoint::connect_lazy`] so the proxy starts before
-/// the controller is reachable.  Multiple endpoints use [`Channel::balance_list`]
-/// which is also lazy by default.
+/// TLS priority: `svid_cell` (dynamic SVID) > `tls` (static config) > plaintext.
 ///
-/// When `config.tls` is `Some`, the channel is wrapped with mTLS using the
-/// configured SPIFFE verifier.  An `AuthError` building the TLS config is
-/// treated as a hard invariant violation (misconfigured certificate material is
-/// not recoverable at runtime) and panics with a descriptive message.
+/// When `svid_cell` is `Some` and contains a non-None SVID, constructs
+/// [`DiscoveryClientTls`] from the cell's cert/key/CA material and the
+/// `expected_server` matcher.  When the cell is empty (bootstrap not yet
+/// complete), falls back to plaintext — the supervisor will reconnect once the
+/// SVID rotation watch fires.
+///
+/// An `AuthError` building the TLS config is treated as a hard invariant
+/// violation and panics with a descriptive message.
 fn build_channel(config: &DiscoveryClientConfig) -> Channel {
+    // Resolve which TLS config to use for this connection attempt.
+    let resolved_tls: Option<DiscoveryClientTls> = config
+        .svid_cell
+        .as_ref()
+        .and_then(|cell| {
+            let svid = cell.load();
+            let material = svid.as_ref().as_ref()?;
+            let matcher = config.expected_server.clone()?;
+            Some(DiscoveryClientTls {
+                client_cert_pem: material.cert_pem.clone(),
+                client_key_pem: material.key_pem.clone(),
+                server_ca_pem: material.ca_bundle_pem.clone(),
+                expected_server: matcher,
+            })
+        })
+        .or_else(|| {
+            config.tls.as_ref().map(|t| DiscoveryClientTls {
+                client_cert_pem: t.client_cert_pem.clone(),
+                client_key_pem: t.client_key_pem.clone(),
+                server_ca_pem: t.server_ca_pem.clone(),
+                expected_server: t.expected_server.clone(),
+            })
+        });
+
     let configure = |uri: &str| -> Endpoint {
         let ep = Endpoint::from_shared(uri.to_owned())
             .unwrap_or_else(|e| {
@@ -446,7 +562,7 @@ fn build_channel(config: &DiscoveryClientConfig) -> Channel {
             .http2_keep_alive_interval(config.http2_keep_alive_interval)
             .keep_alive_timeout(config.keep_alive_timeout)
             .keep_alive_while_idle(true);
-        match &config.tls {
+        match &resolved_tls {
             Some(tls) => tls
                 .apply(ep)
                 .unwrap_or_else(|e| panic!("invariant: discovery TLS config must be valid: {e}")),
@@ -534,6 +650,13 @@ mod tests {
     impl Discovery for FakeDiscovery {
         type StreamStream = ReceiverStream<Result<ServerMessage, Status>>;
 
+        async fn bootstrap(
+            &self,
+            _req: Request<crate::proto::v1::BootstrapRequest>,
+        ) -> Result<Response<crate::proto::v1::BootstrapResponse>, Status> {
+            Err(Status::unimplemented("test stub"))
+        }
+
         async fn stream(
             &self,
             request: Request<Streaming<ClientMessage>>,
@@ -541,9 +664,24 @@ mod tests {
             let (server_tx, server_rx) = tpsc::channel(16);
             let (client_tx, client_rx) = tpsc::channel(16);
 
-            // Drain inbound messages from the client into `client_tx`.
+            let mut inbound = request.into_inner();
+
+            // Mirror the production server (`DiscoveryService::stream` →
+            // `read_subscribe`): read the first client message (Subscribe)
+            // *before* returning the response. The real server gates its
+            // response headers on receiving Subscribe, so a client that waits
+            // for `grpc.stream(..).await` to resolve before sending Subscribe
+            // deadlocks. Reading here makes that deadlock reproducible in tests
+            // rather than papering over it by responding immediately.
+            match inbound.message().await {
+                Ok(Some(msg)) => {
+                    let _ = client_tx.send(msg).await;
+                }
+                _ => return Err(Status::unavailable("client closed before Subscribe")),
+            }
+
+            // Drain the remaining inbound messages (Acks/Nacks) into `client_tx`.
             tokio::spawn(async move {
-                let mut inbound = request.into_inner();
                 loop {
                     match inbound.message().await {
                         Ok(Some(msg)) => {
@@ -633,6 +771,9 @@ mod tests {
             backoff_base: Duration::from_millis(10),
             backoff_cap: Duration::from_millis(50),
             tls: None,
+            svid_cell: None,
+            expected_server: None,
+            svid_rotated: None,
         }
     }
 

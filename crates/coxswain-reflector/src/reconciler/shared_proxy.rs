@@ -1193,7 +1193,23 @@ fn rebuild(
             leader,
         })));
 
-    outputs.tls_health.store_and_notify(gateway_tls_health);
+    // Merge the shared pool's (non-cut-over) listener health into the cell
+    // without clobbering the cut-over Gateways' entries, which the dedicated
+    // reconcilers own. A full replace here would transiently drop a dedicated
+    // Gateway's listener under concurrent reconciles, making its proxy unbind
+    // the listener (#423 dedicated bind→remove).
+    let cut_over_keys: HashSet<ObjectKey> = gateways
+        .iter()
+        .filter(|g| gateway_is_cut_over(g))
+        .filter_map(|g| {
+            let ns = g.metadata.namespace.clone()?;
+            let name = g.metadata.name.clone()?;
+            Some(ObjectKey::new(ns, name))
+        })
+        .collect();
+    outputs
+        .tls_health
+        .update_scoped(gateway_tls_health, |k| !cut_over_keys.contains(k));
     outputs.route_health.store_and_notify(route_health_map);
 
     // Compute per-policy ancestor lists and merge with the validity health from index build.

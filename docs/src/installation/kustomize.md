@@ -44,6 +44,15 @@ Update the `?ref=` and `newTag:` values in your overlay to the new version, then
 kubectl apply -k .
 ```
 
+## Control-plane CA
+
+The base runs the controller in `auto` CA mode: it self-generates the discovery
+CA and works out of the box. To consume an external CA instead, apply
+`deploy/manifests/cert-manager-example.yaml` (a standalone recipe, not part of
+the base), set `COXSWAIN_DISCOVERY_CA_MODE=external` on the controller, and delete
+the `coxswain-controller-discovery-ca` Role/RoleBinding. See
+[Control-plane security](../guides/control-plane-security.md).
+
 ## Uninstall
 
 ```bash

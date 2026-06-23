@@ -32,6 +32,14 @@ kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/download/vX.
 
 The rolling update strategy on each Deployment ensures zero-downtime upgrades when running ≥ 2 replicas.
 
+## Control-plane CA
+
+`install.yaml` runs the controller in `auto` CA mode — it self-generates the
+discovery CA, so the controller↔proxy mTLS works with no extra steps. To consume
+an external CA, switch the controller to `COXSWAIN_DISCOVERY_CA_MODE=external` and
+supply the `coxswain-discovery-ca` Secret. See
+[Control-plane security](../guides/control-plane-security.md).
+
 ## Uninstall
 
 ```bash

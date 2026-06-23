@@ -7,13 +7,19 @@ use async_trait::async_trait;
 use clap::Parser;
 use coxswain_admin::{AdminServer, EventSources, OperatorAggregator};
 use coxswain_controller::{
-    ControllerConfig, IngressPorts, LeaseSettings, Operator, OperatorConfig,
-    SharedGatewayListenerHealth, StatusWriterConfig, spawn_status_writer,
+    BootstrapRejectHook, CaMode, ControllerConfig, IngressPorts, KubeTokenAuthenticator,
+    LeaseSettings, Operator, OperatorConfig, SharedGatewayListenerHealth, StatusWriterConfig,
+    load_or_generate, spawn_status_writer, spawn_trust_publisher,
 };
-use coxswain_core::health::HealthRegistry;
+use coxswain_core::health::{HealthRegistry, SubsystemHandle};
+use coxswain_core::identity::{SpiffeId, SvidIssuer};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{RouteTimeouts, SharedGatewayRoutingTable, SharedIngressRoutingTable};
-use coxswain_discovery::{DiscoveryClient, DiscoveryClientConfig, Scope};
+use coxswain_discovery::{
+    BootstrapClient, BootstrapClientConfig, BootstrapRunner, BootstrapService,
+    DiscoveryBootstrapServerTls, DiscoveryClient, DiscoveryClientConfig, DiscoveryServerTls, Scope,
+    SpiffeMatcher, Supervisor, serve_discovery_with_tls,
+};
 use coxswain_proxy::{
     GatewayProxy, IngressProxy, KubernetesSource, ListenerProtocol, ListenerSpec, ProxyAcceptor,
     RateLimiterRegistry, RoutingEngine, RoutingSource, SharedProxyConfig, SniCertSelector,
@@ -35,8 +41,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::args::{
-    AccessLogPathMode as BinAccessLogPathMode, Cli, Commands, CommonArgs, ControllerArgs,
-    ControllerRoleArgs, DevRoleArgs, LogFormat, ProxyArgs, ProxyRoleArgs, ProxyScope, Role,
+    AccessLogPathMode as BinAccessLogPathMode, CaModeArg, Cli, Commands, CommonArgs,
+    ControllerArgs, ControllerRoleArgs, DevRoleArgs, LogFormat, ProxyArgs, ProxyRoleArgs,
+    ProxyScope, Role,
 };
 use coxswain_cache::ResponseCache;
 use coxswain_proxy::AccessLogPathMode;
@@ -155,11 +162,23 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         args.common.management_bind_address,
         args.controller.discovery_port,
     );
+    let bootstrap_addr = SocketAddr::new(
+        args.common.management_bind_address,
+        args.controller.discovery_bootstrap_port,
+    );
     server.add_service(background_service(
-        "discovery",
-        DiscoveryBackgroundService {
-            service: discovery_service,
-            bind_addr: discovery_addr,
+        "discovery-identity",
+        DiscoveryIdentityService {
+            discovery_service,
+            stream_addr: discovery_addr,
+            bootstrap_addr,
+            ca_secret: args.controller.discovery_ca_secret.clone(),
+            ca_mode: map_ca_mode(args.controller.discovery_ca_mode),
+            namespace: args.common.pod_namespace.clone(),
+            svid_ttl: args.controller.discovery_svid_ttl,
+            trust_domain: args.controller.discovery_trust_domain.clone(),
+            controller_name: args.common.controller_name.clone(),
+            pod_name: args.common.pod_name.clone(),
         },
     ));
 
@@ -179,10 +198,23 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
                 args.common.ingress_https_port,
             ),
             admin_port: args.common.admin_port,
+            // mTLS Stream listener (#423): the dedicated proxy connects over
+            // https for routing snapshots and bootstraps its SVID over the
+            // server-auth bootstrap listener — the same wiring the shared proxy
+            // gets from the Helm chart, rendered here into the dedicated-proxy
+            // Deployment by the operator.
             discovery_endpoint: format!(
-                "http://coxswain-controller-discovery.{}.svc:{}",
+                "https://coxswain-controller-discovery.{}.svc:{}",
                 args.common.pod_namespace, args.controller.discovery_port
             ),
+            discovery_bootstrap_endpoint: format!(
+                "https://coxswain-controller-discovery.{}.svc:{}",
+                args.common.pod_namespace, args.controller.discovery_bootstrap_port
+            ),
+            discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token".to_string(),
+            discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt".to_string(),
+            discovery_trust_domain: args.controller.discovery_trust_domain.clone(),
+            controller_namespace: args.common.pod_namespace.clone(),
         }),
     ));
 
@@ -216,6 +248,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         health_port = args.common.health_port,
         admin_port = args.common.admin_port,
         discovery_addr = %discovery_addr,
+        bootstrap_addr = %bootstrap_addr,
         "Listening"
     );
     server.run_forever();
@@ -252,12 +285,8 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
     let health = HealthRegistry::new();
     let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
-    let discovery_config = DiscoveryClientConfig::new(
-        args.discovery_endpoint.clone(),
-        args.common.pod_name.clone(),
-    );
-    let (client, _supervisor) =
-        DiscoveryClient::spawn(discovery_config, proxy_handle, "routing_table_loaded");
+    let (client, supervisor, bootstrap_runner) =
+        build_discovery_client(&args, proxy_handle, Scope::SharedPool);
     let tls_health = client.listener_health();
 
     let cache = build_response_cache(&args.proxy);
@@ -269,6 +298,8 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
         &tls_health,
         cache,
     )?;
+
+    register_discovery_background_services(&mut server, supervisor, bootstrap_runner);
 
     let leader = Arc::new(AtomicBool::new(false));
     wire_management_servers(
@@ -332,18 +363,11 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
     // Scope::Gateway{name, namespace} but the server ignores the scope and
     // delivers all routes. Per-gateway snapshot filtering is a tracked follow-up
     // precondition for dedicated-proxy GA (v0.6).
-    let discovery_config = DiscoveryClientConfig::new(
-        args.discovery_endpoint.clone(),
-        args.common.pod_name.clone(),
-    );
     let scope = Scope::Gateway {
         name: gateway_name.clone(),
         namespace: gateway_namespace.clone(),
     };
-    let mut config_with_scope = discovery_config;
-    config_with_scope.scope = scope;
-    let (client, _supervisor) =
-        DiscoveryClient::spawn(config_with_scope, proxy_handle, "routing_table_loaded");
+    let (client, supervisor, bootstrap_runner) = build_discovery_client(&args, proxy_handle, scope);
     let tls_health = client.listener_health();
 
     let cache = build_response_cache(&args.proxy);
@@ -355,6 +379,8 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
         &tls_health,
         cache,
     )?;
+
+    register_discovery_background_services(&mut server, supervisor, bootstrap_runner);
 
     let leader = Arc::new(AtomicBool::new(false));
     wire_management_servers(
@@ -727,35 +753,318 @@ impl pingora_core::services::background::BackgroundService for ListenerSpecsAdap
     }
 }
 
-// ── Discovery gRPC background service ────────────────────────────────────────
+// ── Discovery identity + gRPC background service (controller) ─────────────────
 
-/// Background service that runs the discovery gRPC server for one controller replica.
+/// Conventional SPIFFE ServiceAccount segment the controller self-issues for its
+/// own discovery/bootstrap server identity. Deliberately fixed (not the
+/// release-templated k8s SA name): the controller's server identity is verified
+/// by chain-of-trust + this stable name, and proxies match it exactly (see
+/// `coxswain_discovery::bootstrap_client`). Keep in sync with that crate.
+const CONTROLLER_SPIFFE_SA: &str = "coxswain-controller";
+
+/// Audience the controller requires on proxy SA tokens (TokenReview). Must match
+/// the `audience` of the proxy's projected SA-token volume in the chart/manifests.
+const DISCOVERY_TOKEN_AUDIENCE: &str = "coxswain-discovery";
+
+/// TTL for the controller's own server SVID. Long-lived and independent of
+/// `--discovery-svid-ttl` (which governs short, rotated *proxy* SVIDs): the
+/// server cert is refreshed when the controller pod restarts. Per-running-pod
+/// server-cert rotation is deferred (#381).
+const SERVER_SVID_TTL: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Map the CLI CA-mode flag onto the controller crate's [`CaMode`].
+fn map_ca_mode(mode: CaModeArg) -> CaMode {
+    match mode {
+        CaModeArg::Auto => CaMode::Auto,
+        CaModeArg::External => CaMode::External,
+    }
+}
+
+/// Background service that owns the controller's discovery identity and serves
+/// both gRPC listeners for one controller replica:
 ///
-/// Shuts down when the Pingora [`ShutdownWatch`] fires, giving tonic a graceful
-/// drain signal via `serve_with_shutdown`.
-struct DiscoveryBackgroundService {
-    service: coxswain_discovery::DiscoveryService,
-    bind_addr: std::net::SocketAddr,
+/// - **Stream** (`stream_addr`, mTLS mandatory): pushes routing snapshots to
+///   proxies that present a CA-signed SVID.
+/// - **Bootstrap** (`bootstrap_addr`, server-auth-only): issues SVIDs to fresh
+///   proxies that present a valid SA token + CSR.
+///
+/// On startup it loads (or, in `auto` mode, generates) the CA Secret, publishes
+/// the public trust bundle ConfigMap, and self-issues its own server SVID. Both
+/// listeners drain when the Pingora [`ShutdownWatch`] fires.
+struct DiscoveryIdentityService {
+    discovery_service: coxswain_discovery::DiscoveryService,
+    stream_addr: SocketAddr,
+    bootstrap_addr: SocketAddr,
+    ca_secret: String,
+    ca_mode: CaMode,
+    namespace: String,
+    svid_ttl: std::time::Duration,
+    trust_domain: String,
+    controller_name: String,
+    pod_name: String,
 }
 
 #[async_trait]
-impl pingora_core::services::background::BackgroundService for DiscoveryBackgroundService {
+impl pingora_core::services::background::BackgroundService for DiscoveryIdentityService {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         use coxswain_discovery::proto::v1::discovery_server::DiscoveryServer;
 
-        tracing::info!(bind_addr = %self.bind_addr, "Discovery gRPC server starting");
+        let client = match kube::Client::try_default().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "discovery identity: failed to initialise Kubernetes client; discovery will not serve");
+                return;
+            }
+        };
 
-        let result = tonic::transport::Server::builder()
-            .add_service(DiscoveryServer::new(self.service.clone()))
-            .serve_with_shutdown(self.bind_addr, async move {
+        // 1. Load or generate the CA (race-free across replicas; no leader gate).
+        let authority = match load_or_generate(
+            &client,
+            &self.ca_secret,
+            &self.namespace,
+            self.ca_mode,
+            self.svid_ttl,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "discovery identity: CA load/generate failed; discovery will not serve");
+                return;
+            }
+        };
+
+        // 2. Publish the public trust bundle so proxies can verify the controller
+        //    and mount it (zero proxy RBAC). Held for the process lifetime.
+        let _publisher = spawn_trust_publisher(
+            client.clone(),
+            Arc::clone(&authority),
+            self.ca_secret.clone(),
+            self.namespace.clone(),
+        );
+
+        // 3. Self-issue the controller's own server SVID (long-lived).
+        let controller_id =
+            SpiffeId::from_parts(&self.trust_domain, &self.namespace, CONTROLLER_SPIFFE_SA);
+        let server_svid = match authority.self_issue_server(&controller_id, SERVER_SVID_TTL) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "discovery identity: self-issuing server SVID failed; discovery will not serve");
+                return;
+            }
+        };
+
+        // Public CA roots double as the client-CA bundle the Stream listener
+        // verifies connecting proxies against.
+        let trust_bundle = authority.trust_bundle();
+
+        // 4. Build the mTLS Stream acceptor. Any proxy with a CA-signed SVID is
+        //    accepted (the CA only ever signs TokenReview-validated SAs).
+        let stream_tls = DiscoveryServerTls {
+            server_cert_pem: server_svid.cert_pem.clone(),
+            server_key_pem: server_svid.key_pem.clone(),
+            client_ca_pem: trust_bundle,
+            allowed_client: SpiffeMatcher::Prefix(format!("spiffe://{}/", self.trust_domain)),
+        };
+        let stream_acceptor = match stream_tls.acceptor() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "discovery identity: building Stream TLS acceptor failed");
+                return;
+            }
+        };
+
+        // 5. Build the bootstrap (server-auth-only) acceptor.
+        let bootstrap_tls = DiscoveryBootstrapServerTls {
+            server_cert_pem: server_svid.cert_pem,
+            server_key_pem: server_svid.key_pem,
+        };
+        let bootstrap_acceptor = match bootstrap_tls.acceptor() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "discovery identity: building bootstrap TLS acceptor failed");
+                return;
+            }
+        };
+
+        // 6. Assemble the bootstrap service: CA issuer + TokenReview authenticator
+        //    + reject-event hook (the controller is the sole diagnostic emitter).
+        let authenticator = Arc::new(KubeTokenAuthenticator::new(
+            client.clone(),
+            DISCOVERY_TOKEN_AUDIENCE,
+            self.trust_domain.clone(),
+        ));
+        let reject_hook = Arc::new(BootstrapRejectHook::from_client(
+            client,
+            self.controller_name.clone(),
+            self.pod_name.clone(),
+            self.namespace.clone(),
+        ));
+        let bootstrap_service =
+            BootstrapService::with_reject_hook(authority, authenticator, reject_hook);
+
+        tracing::info!(
+            stream_addr = %self.stream_addr,
+            bootstrap_addr = %self.bootstrap_addr,
+            "discovery identity: serving mTLS Stream + bootstrap listeners"
+        );
+
+        // 7. Serve both listeners concurrently; both drain on shutdown.
+        let mut stream_shutdown = shutdown.clone();
+        let stream_fut = serve_discovery_with_tls(
+            self.stream_addr,
+            stream_acceptor,
+            DiscoveryServer::new(self.discovery_service.clone()),
+            async move {
+                let _ = stream_shutdown.changed().await;
+            },
+        );
+        let bootstrap_fut = serve_discovery_with_tls(
+            self.bootstrap_addr,
+            bootstrap_acceptor,
+            DiscoveryServer::new(bootstrap_service),
+            async move {
                 let _ = shutdown.changed().await;
-            })
-            .await;
+            },
+        );
 
-        if let Err(e) = result {
-            tracing::error!(error = %e, "Discovery gRPC server exited with error");
-        } else {
-            tracing::info!("Discovery gRPC server shut down");
+        let (stream_res, bootstrap_res) = tokio::join!(stream_fut, bootstrap_fut);
+        if let Err(e) = stream_res {
+            tracing::error!(error = %e, "discovery identity: Stream listener exited with error");
+        }
+        if let Err(e) = bootstrap_res {
+            tracing::error!(error = %e, "discovery identity: bootstrap listener exited with error");
+        }
+    }
+}
+
+// ── Proxy discovery client wiring ─────────────────────────────────────────────
+
+/// Build the proxy-side discovery client and (when a bootstrap endpoint is
+/// configured) the SVID bootstrap loop, wiring the shared SVID cell + rotation
+/// signal into the discovery client config.
+///
+/// Returns the client (routing-cell read handles, consumed by the proxy
+/// acceptors), the not-yet-running reconnect supervisor, and an optional
+/// not-yet-running bootstrap loop. Both runnables are driven by Pingora
+/// background services via [`register_discovery_background_services`] so they run
+/// on a Pingora runtime (the caller is still on the synchronous startup path).
+/// Extract the controller's namespace from an in-cluster discovery endpoint.
+///
+/// Kubernetes service DNS is `<service>.<namespace>.svc[.cluster.local]`, so the
+/// controller's namespace is the second label of the host. Returns `None` for
+/// anything that isn't a recognizable `…svc…` service DNS (IP literals, test
+/// loopback addresses), letting the caller fall back to the proxy's own
+/// namespace. This keeps the controller-identity check correct for proxies that
+/// do not share the controller's namespace (dedicated proxies; any non-default
+/// install namespace) instead of assuming co-location.
+fn controller_namespace_from_endpoint(endpoint: &str) -> Option<String> {
+    let after_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
+    let mut labels = host.split('.');
+    let _service = labels.next()?;
+    let namespace = labels.next().filter(|ns| !ns.is_empty())?;
+    // Only trust the parse when the third label is `svc` — i.e. it really is
+    // cluster service DNS, not an arbitrary host like `localhost:50051`.
+    (labels.next() == Some("svc")).then(|| namespace.to_owned())
+}
+
+fn build_discovery_client(
+    args: &ProxyRoleArgs,
+    proxy_handle: SubsystemHandle,
+    scope: Scope,
+) -> (DiscoveryClient, Supervisor, Option<BootstrapRunner>) {
+    let mut config = DiscoveryClientConfig::new(
+        args.discovery_endpoint.clone(),
+        args.common.pod_name.clone(),
+    );
+    config.scope = scope;
+
+    let bootstrap_runner = args.discovery_bootstrap_endpoint.as_ref().map(|endpoint| {
+        // The controller's SPIFFE identity lives in the CONTROLLER's namespace,
+        // not the proxy's. Derive it from the discovery service DNS
+        // (`coxswain-controller-discovery.<ns>.svc…`) so a proxy in ANY
+        // namespace (co-located shared, cross-namespace dedicated) targets the
+        // right controller. Fall back to the proxy's own namespace only when the
+        // endpoint isn't a recognizable in-cluster service DNS (test loopback).
+        let controller_namespace = controller_namespace_from_endpoint(endpoint)
+            .unwrap_or_else(|| args.common.pod_namespace.clone());
+        let boot_config = BootstrapClientConfig::new(
+            endpoint.clone(),
+            args.discovery_sa_token_path.clone(),
+            args.discovery_ca_bundle_path.clone(),
+            args.discovery_trust_domain.clone(),
+            controller_namespace.clone(),
+        );
+        let (handle, runner) = BootstrapClient::build(boot_config);
+        config.svid_cell = Some(handle.svid);
+        config.svid_rotated = Some(handle.rotation_rx);
+        // The controller self-issues a fixed conventional server identity; match
+        // it exactly (mirrors the bootstrap client's own server-cert check).
+        config.expected_server = Some(SpiffeMatcher::Exact(format!(
+            "spiffe://{}/ns/{controller_namespace}/sa/{CONTROLLER_SPIFFE_SA}",
+            args.discovery_trust_domain
+        )));
+        runner
+    });
+
+    let (client, supervisor) = DiscoveryClient::new(config, proxy_handle, "routing_table_loaded");
+    (client, supervisor, bootstrap_runner)
+}
+
+/// Register the discovery supervisor (and optional bootstrap loop) as Pingora
+/// background services so they run on a Pingora runtime.
+fn register_discovery_background_services(
+    server: &mut Server,
+    supervisor: Supervisor,
+    bootstrap_runner: Option<BootstrapRunner>,
+) {
+    if let Some(runner) = bootstrap_runner {
+        server.add_service(background_service(
+            "discovery-bootstrap",
+            FutureService::new(runner.run()),
+        ));
+    }
+    server.add_service(background_service(
+        "discovery-supervisor",
+        FutureService::new(supervisor.run()),
+    ));
+}
+
+// ── FutureService adapter ─────────────────────────────────────────────────────
+
+/// Adapts an owned, long-running future into a Pingora [`BackgroundService`].
+///
+/// The future is built synchronously (no runtime needed to *construct* an
+/// `async fn` future) and stored; Pingora awaits it inside one of its runtimes
+/// when `start` fires. This is how the proxy's discovery supervisor and bootstrap
+/// loop — which internally `tokio::spawn` and so need an active runtime — are
+/// started from the otherwise-synchronous bin startup path.
+struct FutureService {
+    fut: std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
+}
+
+impl FutureService {
+    fn new(fut: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
+        Self {
+            fut: std::sync::Mutex::new(Some(Box::pin(fut))),
+        }
+    }
+}
+
+#[async_trait]
+impl pingora_core::services::background::BackgroundService for FutureService {
+    async fn start(&self, _shutdown: ShutdownWatch) {
+        let fut = self
+            .fut
+            .lock()
+            .unwrap_or_else(|e| panic!("invariant: FutureService mutex poisoned: {e}"))
+            .take();
+        if let Some(fut) = fut {
+            fut.await;
         }
     }
 }
@@ -886,10 +1195,23 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
                 args.common.ingress_https_port,
             ),
             admin_port: args.common.admin_port,
+            // mTLS Stream listener (#423): the dedicated proxy connects over
+            // https for routing snapshots and bootstraps its SVID over the
+            // server-auth bootstrap listener — the same wiring the shared proxy
+            // gets from the Helm chart, rendered here into the dedicated-proxy
+            // Deployment by the operator.
             discovery_endpoint: format!(
-                "http://coxswain-controller-discovery.{}.svc:{}",
+                "https://coxswain-controller-discovery.{}.svc:{}",
                 args.common.pod_namespace, args.controller.discovery_port
             ),
+            discovery_bootstrap_endpoint: format!(
+                "https://coxswain-controller-discovery.{}.svc:{}",
+                args.common.pod_namespace, args.controller.discovery_bootstrap_port
+            ),
+            discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token".to_string(),
+            discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt".to_string(),
+            discovery_trust_domain: args.controller.discovery_trust_domain.clone(),
+            controller_namespace: args.common.pod_namespace.clone(),
         }),
     ));
 
@@ -1072,4 +1394,43 @@ fn init_logger(format: LogFormat, log_filter: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_namespace_parsed_from_service_dns() {
+        assert_eq!(
+            controller_namespace_from_endpoint(
+                "https://coxswain-controller-discovery.coxswain-system.svc:50052"
+            ),
+            Some("coxswain-system".to_owned())
+        );
+        assert_eq!(
+            controller_namespace_from_endpoint(
+                "https://coxswain-controller-discovery.tenant-a.svc.cluster.local:50051"
+            ),
+            Some("tenant-a".to_owned())
+        );
+    }
+
+    #[test]
+    fn controller_namespace_none_for_non_service_dns() {
+        // Loopback / IP / bare host: not cluster service DNS → caller falls back
+        // to the proxy's own namespace.
+        assert_eq!(
+            controller_namespace_from_endpoint("http://127.0.0.1:50051"),
+            None
+        );
+        assert_eq!(
+            controller_namespace_from_endpoint("https://localhost:50052"),
+            None
+        );
+        assert_eq!(
+            controller_namespace_from_endpoint("https://example.com:443"),
+            None
+        );
+    }
 }

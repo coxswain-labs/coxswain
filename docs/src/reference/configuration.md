@@ -51,6 +51,16 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL` | `--controller-lease-renew-interval` | `5s` | How often the leader renews its lease; must be ≤ 1/3 of the TTL |
 | `COXSWAIN_CONTROLLER_LEASE_TTL` | `--controller-lease-ttl` | `15s` | How long a lease stays valid without renewal; must be ≥ 3× the renew interval |
 | `COXSWAIN_CONTROLLER_NAME` | `--controller-name` | `coxswain-labs.dev/gateway-controller` | GatewayClass `spec.controllerName` to claim |
+| `COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT` | `--discovery-bootstrap-endpoint` | _(none)_ | _(proxy)_ `https://` URI of the controller bootstrap listener; where the proxy exchanges its SA token + CSR for an SVID. See [Control-plane security](../guides/control-plane-security.md) |
+| `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | `--discovery-bootstrap-port` | `50052` | _(controller)_ Port for the server-auth-only bootstrap gRPC listener |
+| `COXSWAIN_DISCOVERY_CA_BUNDLE_PATH` | `--discovery-ca-bundle-path` | `/var/run/secrets/coxswain/trust-bundle/ca.crt` | _(proxy)_ Path to the mounted trust-bundle ConfigMap used to verify the controller |
+| `COXSWAIN_DISCOVERY_CA_MODE` | `--discovery-ca-mode` | `auto` | _(controller)_ `auto` self-generates the CA Secret if absent; `external` requires a pre-existing Secret (fail closed) |
+| `COXSWAIN_DISCOVERY_CA_SECRET` | `--discovery-ca-secret` | `coxswain-discovery-ca` | _(controller)_ Name of the CA Secret (`tls.crt`/`tls.key`) in the controller namespace |
+| `COXSWAIN_DISCOVERY_ENDPOINT` | `--discovery-endpoint` | _(none; required for proxy)_ | _(proxy)_ Comma-separated controller discovery (Stream) endpoints; `https://host:port` for mTLS |
+| `COXSWAIN_DISCOVERY_PORT` | `--discovery-port` | `50051` | _(controller)_ Port for the mTLS Stream gRPC listener (routing snapshots) |
+| `COXSWAIN_DISCOVERY_SA_TOKEN_PATH` | `--discovery-sa-token-path` | `/var/run/secrets/coxswain/discovery-token/token` | _(proxy)_ Path to the projected ServiceAccount token presented at bootstrap |
+| `COXSWAIN_DISCOVERY_SVID_TTL` | `--discovery-svid-ttl` | `24h` | _(controller)_ Lifetime of SVIDs issued to proxies; proxies refresh at ~50 % |
+| `COXSWAIN_DISCOVERY_TRUST_DOMAIN` | `--discovery-trust-domain` | `cluster.local` | SPIFFE trust domain; must match across the controller and all proxies |
 | `COXSWAIN_HEALTH_PORT` | `--health-port` | `8081` | Port for liveness and readiness health endpoints |
 | `COXSWAIN_INGRESS_DEFAULT_BACKEND` | `--ingress-default-backend` | _(none)_ | Cluster-wide fallback backend for `Ingress` requests that match no rule, expressed as `<namespace>/<service>:<port>` |
 | `COXSWAIN_INGRESS_HTTP_PORT` | `--ingress-http-port` | _(none)_ | Port for inbound HTTP traffic; unset to bind no static Ingress HTTP listener |
@@ -84,8 +94,19 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | HTTPS proxy | _(none)_ | `COXSWAIN_INGRESS_HTTPS_PORT` | Inbound HTTPS data plane (SNI TLS) |
 | Health | `8081` | `COXSWAIN_HEALTH_PORT` | `/healthz`, `/readyz` |
 | Admin | `8082` | `COXSWAIN_ADMIN_PORT` | `/metrics`, `/api/v1/routes`, `/api/v1/health` |
+| Discovery (Stream) | `50051` | `COXSWAIN_DISCOVERY_PORT` | _(controller)_ mTLS gRPC routing-snapshot stream |
+| Bootstrap | `50052` | `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | _(controller)_ server-auth gRPC SVID issuance |
 
 The proxy listeners are disabled unless their port is explicitly set. The Helm chart defaults `proxy.http.port` to `80` and `proxy.https.port` to `443`.
+
+## Discovery control plane
+
+The controller and proxy communicate over a secured gRPC discovery channel:
+the controller acts as a CA, proxies bootstrap an SVID with their ServiceAccount
+token, and routing snapshots flow over mandatory mTLS. The `COXSWAIN_DISCOVERY_*`
+settings above configure it; see [Control-plane security](../guides/control-plane-security.md)
+for the model, CA provisioning modes (`auto` / `external` + cert-manager / BYO),
+SVID rotation, and troubleshooting.
 
 !!! note
     The data plane and the management surface bind independently: `COXSWAIN_PROXY_BIND_ADDRESS` for the HTTP/HTTPS proxy listeners, and `COXSWAIN_MANAGEMENT_BIND_ADDRESS` for the health and admin servers. Both default to `0.0.0.0`; set the management address to a management-network IP to keep `/metrics`, `/api/v1/routes`, and the health endpoints off the data-plane interface.

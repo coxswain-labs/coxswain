@@ -10,6 +10,7 @@ pub mod cluster;
 pub mod crd;
 pub mod fleet;
 pub mod health;
+pub mod identity;
 pub mod listener_health;
 pub mod node_registry;
 pub mod ownership;
@@ -21,6 +22,10 @@ pub mod tls;
 
 pub use fleet::{Component, FleetEntry, FleetSnapshot, SharedFleet};
 pub use health::{CheckState, HealthRegistry, HealthSnapshot, SubsystemHandle, SubsystemSnapshot};
+pub use identity::{
+    AuthnError, CsrPem, IssuedSvid, IssuerError, SpiffeId, SpiffeIdError, SvidIssuer,
+    TokenAuthenticator,
+};
 pub use listener_health::SharedGatewayListenerHealth;
 pub use node_registry::{NodeEntry, NodeRegistry, SharedNodeRegistry};
 pub use shared::Shared;

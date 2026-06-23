@@ -1,0 +1,56 @@
+# cert-manager integration example for the discovery control-plane CA (#423).
+#
+# This file is NOT part of the kustomize base (it is intentionally absent from
+# kustomization.yaml). It is a copy-pasteable recipe for running the controller
+# in CA mode=external, consuming a cert-manager-managed CA Secret instead of the
+# controller self-generating one.
+#
+# Coxswain only *consumes* the resulting Secret and hot-reloads it on rotation —
+# it never creates or owns the Certificate. This mirrors how Envoy Gateway and
+# kgateway integrate with cert-manager (operator authors the cert; the control
+# plane consumes the Secret). The controller programmatically managing
+# Certificate CRs (istio-csr style) is deferred to #381.
+#
+# Prerequisites:
+#   - cert-manager installed in the cluster.
+#
+# To use:
+#   1. kubectl apply -f cert-manager-example.yaml
+#   2. Set the controller to external mode and remove the self-gen RBAC:
+#        - COXSWAIN_DISCOVERY_CA_MODE=external  (controller-deployment.yaml)
+#        - delete the coxswain-controller-discovery-ca Role + RoleBinding
+#          (controller-rbac.yaml)
+#   3. Roll out the controller.
+---
+# A self-signed Issuer used only to mint the CA below. Replace with a
+# ClusterIssuer backed by your real PKI (Vault, ACME, etc.) in production.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: coxswain-discovery-selfsigned
+  namespace: coxswain-system
+spec:
+  selfSigned: {}
+---
+# The discovery CA. cert-manager writes the cert+key into the Secret named below
+# (keys tls.crt / tls.key) — exactly what COXSWAIN_DISCOVERY_CA_SECRET points at.
+# cert-manager rotates it per `renewBefore`; the controller's trust-bundle
+# publisher detects the change and hot-reloads without a restart.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: coxswain-discovery-ca
+  namespace: coxswain-system
+spec:
+  isCA: true
+  commonName: coxswain-discovery-ca
+  secretName: coxswain-discovery-ca
+  duration: 8760h    # 1 year
+  renewBefore: 720h  # 30 days
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: coxswain-discovery-selfsigned
+    kind: Issuer
+    group: cert-manager.io
