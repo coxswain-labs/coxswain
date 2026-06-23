@@ -232,16 +232,16 @@ discovery:
 proxy:
   # Shared-pool proxy (serves Ingress + non-dedicated Gateway traffic).
   shared:
-    # Render the shared-proxy Deployment + RBAC + Services + PDB. Set to false
+    # Render the shared-proxy Deployment + Services + PDB. Set to false
     # for a strict-multi-tenant install where every Gateway runs a dedicated
-    # proxy provisioned by the controller. The shared-proxy ServiceAccount has
-    # zero write verbs whether enabled or not.
+    # proxy provisioned by the controller.
     enabled: true
 
     # Number of shared-proxy replicas. Read-only data plane; scaling is
-    # horizontal and stateless (each replica independently builds its routing
-    # table from the same K8s watch). Set to 0 to keep the Deployment around
-    # but run no pods (cheaper "off" toggle than enabled: false).
+    # horizontal and stateless (each replica independently receives routing
+    # snapshots from the controller via gRPC discovery). Set to 0 to keep
+    # the Deployment around but run no pods (cheaper "off" toggle than
+    # enabled: false).
     replicas: 1
 
     # CPU / memory resource requests and limits.
@@ -259,11 +259,6 @@ proxy:
       # Defaults to "<release>-coxswain-shared-proxy" when empty.
       name: ""
       annotations: {}
-
-    # Whether to render the read-only ClusterRole + ClusterRoleBinding. There
-    # is no Lease Role for the proxy — the proxy doesn't leader-elect.
-    rbac:
-      create: true
 
     # PodDisruptionBudget.
     podDisruptionBudget:

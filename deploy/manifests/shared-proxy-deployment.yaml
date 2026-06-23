@@ -19,7 +19,7 @@ spec:
         app.kubernetes.io/component: shared-proxy
     spec:
       serviceAccountName: coxswain-shared-proxy
-      automountServiceAccountToken: true
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         seccompProfile:

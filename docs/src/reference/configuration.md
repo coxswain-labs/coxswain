@@ -84,7 +84,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `POD_NAMESPACE` | `--pod-namespace` | `coxswain-system` | Pod namespace used to scope the leader-election Lease |
 
 !!! note
-    The dedicated proxy provisioning flags (`--gateway-name`, `--gateway-namespace`, `--allow-cluster-wide-route-read`, `--allow-cluster-wide-namespace-read`, `--proxy-watch-namespaces`) are set by the controller on the proxy Deployments it provisions, or passed by hand only when running a dedicated proxy manually. See [Dedicated proxy pools](../guides/dedicated-mode.md).
+    The dedicated proxy scope flags (`--dedicated`, `--gateway-name`, `--gateway-namespace`) are set by the controller on the proxy Deployments it provisions, or passed by hand when running a dedicated proxy manually. The discovery flags (`--discovery-endpoint`, `--discovery-bootstrap-endpoint`) are also set by the controller on provisioned Deployments. See [Dedicated proxy pools](../guides/dedicated-mode.md).
 
 ## Ports summary
 

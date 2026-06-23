@@ -76,7 +76,7 @@ Subsystems have four states:
 Readiness gates differ by mode:
 
 - **Controller pod** — all Kubernetes reflectors must complete their initial list and the controller must have acquired (or be in standby for) the Lease.
-- **Shared proxy and dedicated proxy pods** — all Kubernetes reflectors must complete their initial list and the routing table must be built at least once. Proxy pods do not participate in leader election and do not wait for the controller.
+- **Shared proxy and dedicated proxy pods** — the discovery client must connect to the controller, bootstrap an SVID, and receive the first routing snapshot. Proxy pods do not participate in leader election; they will stay `NotReady` until the controller is reachable and the first snapshot lands.
 
 Verify the probes are present on the deployed pod:
 
@@ -163,9 +163,9 @@ The default `ClusterRole` grants Coxswain cluster-wide:
 - Read on `gatewayclasses`, `gateways`, `httproutes`, `referencegrants`, `backendtlspolicies` (`gateway.networking.k8s.io`).
 - Status writes (`*/status`) on `ingresses`, `gateways`, `httproutes`, `backendtlspolicies`, and `gatewayclasses`.
 
-A separate namespaced `Role` (in `coxswain-system`) grants `get`, `create`, `patch` on `coordination.k8s.io/leases` — used only by the controller pod for leader election. Review the rendered manifests with `helm template` or read `deploy/manifests/controller-rbac.yaml` and `deploy/manifests/shared-proxy-rbac.yaml` before deploying. The shared-proxy ServiceAccount has zero write verbs; verify with `kubectl auth can-i --list --as=system:serviceaccount:coxswain-system:coxswain-shared-proxy`.
+A separate namespaced `Role` (in `coxswain-system`) grants `get`, `create`, `patch` on `coordination.k8s.io/leases` — used only by the controller pod for leader election. Review the rendered manifests with `helm template` or read `deploy/manifests/controller-rbac.yaml` before deploying. The shared-proxy and dedicated-proxy ServiceAccounts hold **no Kubernetes RBAC** — they are identity-only SAs whose projected tokens are used solely for mTLS bootstrap with the controller; verify with `kubectl auth can-i --list --as=system:serviceaccount:coxswain-system:coxswain-shared-proxy` (output should show only Kubernetes baseline grants).
 
-If Coxswain should only manage resources in a single namespace, set `watchNamespace`. Note that this only restricts what the controller reads; the chart still installs the cluster-wide `ClusterRole`/`ClusterRoleBinding`. To scope RBAC as well, edit the rendered manifests by hand.
+If Coxswain should only manage resources in a single namespace, set `watchNamespace`. This restricts only the controller's reflectors; the proxy's discovery client is unaffected (it receives routing from the controller, not from K8s directly). The controller's `ClusterRole`/`ClusterRoleBinding` still ships cluster-wide; to scope it to a namespace, edit the rendered manifests by hand.
 
 ## Signed image verification
 

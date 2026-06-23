@@ -10,10 +10,10 @@ kubectl -n coxswain-system port-forward svc/coxswain-shared-proxy-internal 8082:
 
 ## `/readyz` returns 503 on startup
 
-The readiness endpoint gates on every registered subsystem reaching `Ready` or `Degraded`. During startup it stays `503` until:
+The readiness endpoint gates on every registered subsystem reaching `Ready` or `Degraded`. During startup it stays `503` until each subsystem reports at least one successful completion:
 
-1. All Kubernetes reflectors emit their first `InitDone` (requires CRDs to be installed and RBAC to be correct)
-2. The routing table is built at least once
+- **Controller**: all Kubernetes reflectors emit their first `InitDone` (requires CRDs to be installed and controller RBAC to be correct), and the routing table is built at least once.
+- **Proxy**: the discovery client connects to the controller, bootstraps an SVID, and receives its first routing snapshot.
 
 Inspect which subsystem is blocking:
 
@@ -21,7 +21,7 @@ Inspect which subsystem is blocking:
 curl -s http://localhost:8082/api/v1/health | jq .subsystems
 ```
 
-A subsystem stuck in `Pending` looks like this — `httproute` hasn't seen its first list complete, typically because the CRD is missing:
+Controller subsystem stuck in `Pending` (CRD missing or controller RBAC wrong):
 
 ```json
 {
@@ -33,7 +33,14 @@ A subsystem stuck in `Pending` looks like this — `httproute` hasn't seen its f
       "gateway": "Pending",
       "routing_table_built": "Pending"
     }
-  },
+  }
+}
+```
+
+Proxy subsystem stuck in `Pending` (discovery not yet connected or first snapshot not received):
+
+```json
+{
   "proxy": {
     "status": "Pending",
     "checks": {
@@ -43,9 +50,15 @@ A subsystem stuck in `Pending` looks like this — `httproute` hasn't seen its f
 }
 ```
 
-Common causes:
+Common causes for the **controller** being `Pending`:
 - Gateway API CRDs not installed — install with `kubectl apply -f .../standard-install.yaml`
-- RBAC is missing a permission — check `kubectl -n coxswain-system logs -l app.kubernetes.io/name=coxswain` for `forbidden` errors
+- Controller RBAC missing a permission — check `kubectl -n coxswain-system logs -l app.kubernetes.io/name=coxswain` for `forbidden` errors
+
+Common causes for the **proxy** being `Pending`:
+- Discovery endpoint unreachable — verify `COXSWAIN_DISCOVERY_ENDPOINT` points at the controller's discovery `Service`
+- Trust bundle not yet published — `kubectl -n coxswain-system get configmap coxswain-discovery-trust` must exist; the controller publishes it at startup
+- Bootstrap rejected — check for `BootstrapRejected` events: `kubectl -n coxswain-system get events --field-selector reason=BootstrapRejected`
+- Wire-version mismatch — proxy logs `FAILED_PRECONDITION` and backs off permanently; see [Wire-version skew](control-plane-security.md#wire-version-skew)
 
 ## Routes are not being picked up
 
@@ -123,24 +136,29 @@ Common causes:
 
 - **`Accepted=False, reason=InvalidParameters` on the Gateway** — the `parametersRef` points at a `CoxswainGatewayParameters` object that doesn't exist or is in the wrong namespace. Create the object or fix the reference; the controller will reconcile and provision the pod.
 - **Image pull error** — the dedicated proxy uses the same image as the controller; verify `imagePullSecrets` and registry credentials in the Gateway's target namespace.
-- **RBAC missing** — the controller `ServiceAccount` needs permission to create `Deployment`, `Service`, `ServiceAccount`, and `RoleBinding` objects in the Gateway's namespace. If the Helm chart was upgraded without running `helm upgrade`, re-run it to restore the latest ClusterRole.
+- **Controller RBAC missing** — the controller `ServiceAccount` needs permission to create `Deployment`, `Service`, and `ServiceAccount` objects in the Gateway's namespace. If the Helm chart was upgraded without running `helm upgrade`, re-run it to restore the latest ClusterRole.
 
-## RBAC denials in dedicated proxy logs
+## Dedicated proxy stuck `NotReady` or `Degraded`
 
-The dedicated proxy runs with per-namespace narrowed RBAC: its `ServiceAccount` holds read permissions only in the namespaces the Gateway's HTTPRoutes route backends into. A `forbidden` error in the proxy logs means the proxy is trying to read a resource outside its provisioned namespace set.
+The dedicated proxy is a discovery client: it bootstraps an SVID from the controller and then opens a mTLS stream to receive its Gateway's routing snapshot. The proxy stays `NotReady` until the first snapshot arrives; it transitions to `Degraded` on any subsequent reconnect window.
 
 ```bash
-kubectl -n <gateway-namespace> logs deployment/<gateway-name>-coxswain | grep forbidden
+# Check proxy logs for discovery errors
+kubectl -n <gateway-namespace> logs deployment/<gateway-name>-coxswain | tail -50
+
+# Check for bootstrap rejections (controller is the sole event emitter)
+kubectl -n coxswain-system get events --field-selector reason=BootstrapRejected
 ```
 
 Common causes:
 
-- **Route backend in a namespace not covered by a `RoleBinding`** — the controller derives `--proxy-watch-namespaces` from the same set of namespaces it has provisioned `RoleBinding`s for. If a route refers to a backend in namespace `B` and no `RoleBinding` exists there, the proxy can't read `Service`/`EndpointSlice` objects in `B`. Check whether a `ReferenceGrant` exists from `B` allowing the route's parent namespace to reference it; without the grant, the backend is rejected by the controller before the proxy sees it.
-- **Cross-namespace route attachment** — `allowedRoutes.namespaces.from: All` or `from: Selector` requires a `ClusterRoleBinding` for cluster-wide `HTTPRoute` reads. The controller creates these automatically when the listener mode is set. If the `ClusterRoleBinding` is missing, verify the controller is running and not in an error loop (`kubectl -n coxswain-system logs -l app.kubernetes.io/component=controller`).
+- **Discovery endpoint unreachable** — the dedicated proxy's `COXSWAIN_DISCOVERY_ENDPOINT` is rendered by the controller; verify the controller's discovery `Service` exists and the proxy pod can reach it.
+- **SVID scope mismatch** — the stream server logs `PERMISSION_DENIED` if the proxy's SVID does not match the expected ServiceAccount for the Gateway. Check that the SA name follows the GEP-1762 pattern (`{gateway-name}-{gatewayclass-name}`) and that the controller's registry entry is current. Reconciling the Gateway again (e.g. by adding/removing an annotation) forces a registry refresh.
+- **Wire-version mismatch** — proxy logs `FAILED_PRECONDITION`; see [Wire-version skew](control-plane-security.md#wire-version-skew).
 
 ## Provisioned resources not garbage-collected after Gateway deletion
 
-When a `Gateway` is deleted, Kubernetes owner-reference GC removes the provisioned `Deployment`, `Service`, and `ServiceAccount` (all owner-referenced to the Gateway). Cross-namespace `RoleBinding`s are not owner-referenced (Kubernetes does not support cross-namespace owner references for namespaced resources), so they are cleaned up by the controller via the `gateway.coxswain-labs.dev/dedicated-cleanup` finalizer.
+When a `Gateway` is deleted, Kubernetes owner-reference GC removes the provisioned `Deployment`, `Service`, and `ServiceAccount` (all owner-referenced to the Gateway). The `gateway.coxswain-labs.dev/dedicated-cleanup` finalizer ensures the controller completes any remaining cleanup before Kubernetes finalizes the Gateway.
 
 If resources are not disappearing after a `kubectl delete gateway`:
 
@@ -152,10 +170,7 @@ kubectl get gateway <name> -n <ns> -o jsonpath='{.metadata.finalizers}'
 kubectl -n coxswain-system logs -l app.kubernetes.io/component=controller --tail=100 | grep dedicated-cleanup
 ```
 
-Common causes:
-
-- **Controller is not running or has lost the leader lease** — the finalizer is processed only by the active controller replica. If the controller is down or failing to elect a leader, the Gateway will be stuck in a terminating state until the controller recovers.
-- **`RoleBinding` delete permission removed** — if the controller's `ClusterRole` was modified to remove `rolebinding` delete permissions, cleanup stalls. Re-apply the Helm chart to restore the correct ClusterRole.
+Common cause: the controller is not running or has lost the leader lease — the finalizer is processed only by the active controller replica. If the controller is down or failing to elect a leader, the Gateway will be stuck in a terminating state until the controller recovers.
 
 ## Controller stuck in Ingress-only mode
 

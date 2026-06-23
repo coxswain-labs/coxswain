@@ -26,7 +26,7 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "coxswain.sharedProxy.serviceAccountName" . }}
-      automountServiceAccountToken: true
+      automountServiceAccountToken: false
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}

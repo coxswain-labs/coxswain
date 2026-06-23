@@ -59,7 +59,7 @@ kubectl -n coxswain-system scale deployment/coxswain-shared-proxy --replicas=0
 - `deploy/dev/` — local dev fixtures (echo backends, sample HTTPRoute and Ingress objects, cross-namespace scenarios).
 - `deploy/examples/` — user-facing example configurations shipped as documentation (e.g. cert-manager TLS setup).
 
-> **Namespace-scoped install.** Pass `--watch-namespace=<ns>` (or `COXSWAIN_WATCH_NAMESPACE=<ns>`) to either pod to scope its reflectors to a single namespace. Replace the cluster-scoped `ClusterRole`/`ClusterRoleBinding` in `controller-rbac.yaml` / `shared-proxy-rbac.yaml` with a namespaced `Role`/`RoleBinding` when running scoped.
+> **Namespace-scoped install.** Pass `--watch-namespace=<ns>` (or `COXSWAIN_WATCH_NAMESPACE=<ns>`) to restrict the controller's reflectors to a single namespace. Replace the cluster-scoped `ClusterRole`/`ClusterRoleBinding` in `controller-rbac.yaml` with a namespaced `Role`/`RoleBinding` when running scoped. The shared-proxy SA has no RBAC to adjust.
 
 ### 3. Run the binary
 
