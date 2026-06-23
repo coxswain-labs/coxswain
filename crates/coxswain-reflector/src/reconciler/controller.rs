@@ -8,4 +8,4 @@
 //! is tracked as a follow-up to issue #206; callers that target the
 //! [`ControllerReconciler`] name will not need to change when it lands.
 
-pub use super::shared_proxy::SharedProxyReconciler as ControllerReconciler;
+pub use super::proxy::SharedProxyReconciler as ControllerReconciler;

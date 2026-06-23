@@ -1,11 +1,8 @@
-//! `ReferenceGrant` flattening shared by the shared-proxy reconciler and the
-//! dedicated-mode controller's RBAC reconciler.
+//! `ReferenceGrant` flattening consumed by the proxy reconciler.
 //!
-//! Both consumers must derive identical permitted-reference sets from the
-//! same input: divergence means the controller grants Kubernetes RBAC for a
-//! reference the data plane refuses to honour (or vice versa), producing
-//! Gateway API ReferenceGrant conformance violations. Centralising the
-//! flatten logic here makes that divergence impossible by construction.
+//! Centralising the flatten logic here ensures the shared-pool builder and
+//! the dedicated-mode snapshot builder derive identical permitted-reference
+//! sets from the same input, so the two code paths cannot drift.
 
 use crate::gw_types::v::referencegrants::ReferenceGrant;
 use coxswain_core::reference_grants::ReferenceGrantKey;
@@ -21,9 +18,8 @@ pub type GrantSet = HashSet<ReferenceGrantKey>;
 ///
 /// - `backend_grants`: `HTTPRoute → Service` (used by the routing-table
 ///   builder when resolving HTTPRoute `backendRefs` across namespaces).
-/// - `cert_grants`: `Gateway → Secret` (used by the TLS store builder and
-///   the dedicated-mode controller when resolving listener `certificateRefs`
-///   across namespaces).
+/// - `cert_grants`: `Gateway → Secret` (used by the TLS store builder when
+///   resolving listener `certificateRefs` across namespaces).
 ///
 /// The filter rules mirror the Gateway API spec: `from.group` must be
 /// `gateway.networking.k8s.io` and `to.group` must be empty (core API group)

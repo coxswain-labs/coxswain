@@ -20,10 +20,10 @@
 //! orchestration.
 
 pub mod controller;
-pub mod shared_proxy;
+pub mod proxy;
 
 pub use controller::ControllerReconciler;
-pub use shared_proxy::{
+pub use proxy::{
     IngressDefaultBackend, IngressDefaultBackendParseError, IngressEvent, ReconcilerHealth,
     ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusSubscriptions,
 };
