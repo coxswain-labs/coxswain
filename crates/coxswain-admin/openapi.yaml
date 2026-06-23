@@ -110,6 +110,12 @@ paths:
                   controllers: { $ref: '#/components/schemas/CategorySummary' }
                   shared_proxies: { $ref: '#/components/schemas/CategorySummary' }
                   dedicated_proxies: { $ref: '#/components/schemas/CategorySummary' }
+                  all_in_sync:
+                    type: boolean
+                    description: >-
+                      Whether every connected proxy has Ack'd the controller's
+                      current snapshot. `true` vacuously when discovery is
+                      inactive (dev/proxy roles). Backs the topology lag banner (#393).
 
   /api/v1/fleet/controllers:
     get:
@@ -429,6 +435,30 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Problems' }
 
+  /api/v1/topology:
+    get:
+      tags: [cross-cutting]
+      summary: Discovery convergence topology — controller + connected proxy nodes (#379)
+      responses:
+        '200':
+          description: >-
+            Convergence snapshot. `discovery_active` is `false` on dev/proxy
+            roles (no registry); both states yield `nodes: []` when empty.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  discovery_active:
+                    type: boolean
+                    description: False in dev mode (no discovery server / registry).
+                  controller_version:
+                    type: [string, 'null']
+                    description: Current SharedPool snapshot version (content hash).
+                  nodes:
+                    type: array
+                    items: { $ref: '#/components/schemas/TopologyNode' }
+
   /api/v1/manifests/{kind}/{namespace}/{name}:
     get:
       tags: [cross-cutting]
@@ -524,6 +554,32 @@ components:
       properties:
         total: { type: integer }
         worst: { $ref: '#/components/schemas/Severity' }
+
+    NodeScope:
+      type: object
+      description: >-
+        Discovery scope a proxy node serves. SharedPool nodes carry the
+        cluster-wide table; Gateway nodes are dedicated to one Gateway.
+      properties:
+        kind: { type: string, enum: [SharedPool, Gateway] }
+        namespace: { type: string, description: Present only when kind=Gateway. }
+        name: { type: string, description: Present only when kind=Gateway. }
+      required: [kind]
+
+    TopologyNode:
+      type: object
+      description: A connected proxy node and its convergence state vs the controller.
+      properties:
+        node_id: { type: string, description: Proxy pod name (discovery node id). }
+        scope: { $ref: '#/components/schemas/NodeScope' }
+        last_acked_version:
+          type: [string, 'null']
+          description: Snapshot version the proxy last Ack'd (content hash); null until first ack.
+        connected_since: { type: string, format: date-time }
+        last_ack_at: { type: [string, 'null'], format: date-time }
+        in_sync:
+          type: boolean
+          description: True when last_acked_version equals the scope's current target version.
 
     ListEnvelope:
       type: object

@@ -10,6 +10,7 @@ import { ProxyDetail } from './screens/ProxyDetail.jsx';
 import { ControllerDetail } from './screens/ControllerDetail.jsx';
 import { GatewayDetail } from './screens/GatewayDetail.jsx';
 import { Events } from './screens/Events.jsx';
+import { Topology } from './screens/Topology.jsx';
 
 /**
  * Root application component.
@@ -26,7 +27,10 @@ export function App() {
   return (
     <div class="app">
       <Nav activeScreen={screen} />
-      <main class="content" id="main-content">
+      <main
+        class={`content${screen === 'topology' ? ' content--full' : ''}`}
+        id="main-content"
+      >
         <ActiveScreen screen={screen} params={params} query={query} />
       </main>
       <BackToTop />
@@ -61,6 +65,9 @@ function ActiveScreen({ screen, params, query }) {
 
     case 'events':
       return <Events />;
+
+    case 'topology':
+      return <Topology />;
 
     default:
       return <Dashboard />;

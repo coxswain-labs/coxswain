@@ -1,0 +1,62 @@
+{
+  "discovery_active": true,
+  "controller_version": "sha256:aabbcc112233",
+  "nodes": [
+    {
+      "node_id": "coxswain-shared-proxy-66d-ah7x2",
+      "scope": {
+        "kind": "SharedPool"
+      },
+      "last_acked_version": "sha256:aabbcc112233",
+      "connected_since": "2024-06-01T00:00:00Z",
+      "last_ack_at": "2024-06-01T00:00:00Z",
+      "in_sync": true
+    },
+    {
+      "node_id": "coxswain-shared-proxy-66d-bk9p4",
+      "scope": {
+        "kind": "SharedPool"
+      },
+      "last_acked_version": "sha256:001122334455",
+      "connected_since": "2024-06-01T00:00:00Z",
+      "last_ack_at": "2024-06-01T00:00:00Z",
+      "in_sync": false
+    },
+    {
+      "node_id": "tenant-a-gw-coxswain-7db74-j8cjt",
+      "scope": {
+        "kind": "Gateway",
+        "namespace": "tenant-a",
+        "name": "tenant-a-gw"
+      },
+      "last_acked_version": "sha256:aabbcc112233",
+      "connected_since": "2024-06-01T00:00:00Z",
+      "last_ack_at": "2024-06-01T00:00:00Z",
+      "in_sync": true
+    },
+    {
+      "node_id": "tenant-a-gw-coxswain-7db74-r5tfb",
+      "scope": {
+        "kind": "Gateway",
+        "namespace": "tenant-a",
+        "name": "tenant-a-gw"
+      },
+      "last_acked_version": "sha256:aabbcc112233",
+      "connected_since": "2024-06-01T00:00:00Z",
+      "last_ack_at": "2024-06-01T00:00:00Z",
+      "in_sync": true
+    },
+    {
+      "node_id": "tenant-b-gw-coxswain-5cc91-m2qd8",
+      "scope": {
+        "kind": "Gateway",
+        "namespace": "tenant-b",
+        "name": "tenant-b-gw"
+      },
+      "last_acked_version": "sha256:aabbcc112233",
+      "connected_since": "2024-06-01T00:00:00Z",
+      "last_ack_at": "2024-06-01T00:00:00Z",
+      "in_sync": true
+    }
+  ]
+}

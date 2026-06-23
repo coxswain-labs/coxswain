@@ -78,6 +78,7 @@ const UI_HTML: &str = include_str!(concat!(
 /// | `/api/v1/routing/{summary,gateways,httproutes,ingresses}` | | ✓ |
 /// | `/api/v1/routing/routes/{kind}/{ns}/{name}` | | ✓ |
 /// | `/api/v1/{problems,manifests/*}` | | ✓ |
+/// | `/api/v1/topology` | | ✓ |
 /// | `/api/v1/events` (SSE) | | ✓ |
 /// | `/api/v1/pods/{name}/logs` (chunked) | | ✓ |
 ///
@@ -396,6 +397,7 @@ impl AdminServer {
             // ── cross-cutting ─────────────────────────────────────────────────
             ["manifests", kind, namespace, name] => agg.get_manifest(kind, namespace, name).await,
             ["problems"] => agg.list_problems().await,
+            ["topology"] => agg.topology().await,
 
             _ => aggregator::not_found(),
         }

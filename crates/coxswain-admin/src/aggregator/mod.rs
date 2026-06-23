@@ -24,6 +24,7 @@ use std::time::Duration;
 use tokio::sync::{OnceCell, Semaphore};
 
 use coxswain_core::cluster::SharedClusterSummary;
+use coxswain_core::node_registry::SharedNodeRegistry;
 
 mod controllers;
 mod gateways;
@@ -34,6 +35,7 @@ mod problems;
 mod proxies;
 mod route_check;
 mod routing;
+mod topology;
 
 // ── OperatorAggregator ────────────────────────────────────────────────────────
 
@@ -49,6 +51,9 @@ pub struct OperatorAggregator {
     fleet: SharedFleet,
     /// Cluster-wide gateway/ingress summary published by the reconciler.
     cluster: SharedClusterSummary,
+    /// Connected proxy node registry, populated by the discovery server.
+    /// `None` in dev and proxy roles (discovery not active).
+    node_registry: Option<SharedNodeRegistry>,
     /// Kubernetes client, initialised lazily on the first K8s-backed request.
     kube: OnceCell<Client>,
     /// Apiserver GitVersion (e.g. `v1.31.2`), fetched once from the `/version`
@@ -65,13 +70,19 @@ pub struct OperatorAggregator {
 const MAX_CONCURRENT_LOG_STREAMS: usize = 8;
 
 impl OperatorAggregator {
-    /// Construct an aggregator with the given fleet and cluster handles.
+    /// Construct an aggregator with the given fleet, cluster, and node-registry
+    /// handles.
     ///
-    /// Installs the `ring` rustls crypto provider (idempotent) so the
-    /// reqwest client can be built; fan-out targets are plain HTTP and
-    /// TLS is never exercised at request time.
+    /// `node_registry` is `Some` on controller roles (discovery is active) and
+    /// `None` on dev/proxy roles.  Installs the `ring` rustls crypto provider
+    /// (idempotent) so the reqwest client can be built; fan-out targets are
+    /// plain HTTP and TLS is never exercised at request time.
     #[must_use]
-    pub fn new(fleet: SharedFleet, cluster: SharedClusterSummary) -> Self {
+    pub fn new(
+        fleet: SharedFleet,
+        cluster: SharedClusterSummary,
+        node_registry: Option<SharedNodeRegistry>,
+    ) -> Self {
         // reqwest 0.13 uses rustls-no-provider; install ring as the
         // process-default provider. The call is idempotent — the `Err`
         // returned when a provider is already registered is intentionally
@@ -87,6 +98,7 @@ impl OperatorAggregator {
             http,
             fleet,
             cluster,
+            node_registry,
             kube: OnceCell::new(),
             k8s_version: OnceCell::new(),
             log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),
@@ -381,6 +393,30 @@ pub(super) mod tests {
             http,
             fleet,
             cluster,
+            node_registry: None,
+            kube: OnceCell::new(),
+            k8s_version: OnceCell::new(),
+            log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),
+        }
+    }
+
+    /// Build an [`OperatorAggregator`] with a populated [`SharedNodeRegistry`]
+    /// for topology unit tests.
+    pub(crate) fn make_agg_with_registry(
+        fleet: SharedFleet,
+        cluster: SharedClusterSummary,
+        node_registry: SharedNodeRegistry,
+    ) -> OperatorAggregator {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap_or_else(|e| panic!("invariant: {e}"));
+        OperatorAggregator {
+            http,
+            fleet,
+            cluster,
+            node_registry: Some(node_registry),
             kube: OnceCell::new(),
             k8s_version: OnceCell::new(),
             log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),

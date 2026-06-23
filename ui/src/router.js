@@ -45,6 +45,7 @@ function parseHash(hash) {
   if (s0 === 'gateways' || s0 === 'ingresses') return { screen: 'routing', params: {}, query };
 
   if (s0 === 'events')   return { screen: 'events', params: {}, query };
+  if (s0 === 'topology') return { screen: 'topology', params: {}, query };
   // Health page retired (its job split between Fleet per-pod chips and the
   // Dashboard degraded-pod triage) and Problems merged into the Dashboard —
   // keep both old hashes working.
@@ -135,4 +136,5 @@ export const nav = {
   ingressRoute: (ns, name, query) => { location.hash = hashFor(`routes/ingress/${ns}/${name}`, query); },
   gateway: (ns, name) => { location.hash = `#/gateways/${ns}/${name}`; },
   events: () => { location.hash = '#/events'; },
+  topology: () => { location.hash = '#/topology'; },
 };

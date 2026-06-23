@@ -146,6 +146,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // runs the discovery server independently (no leader gate).
     let discovery_rebuild_rx = route_health.subscribe();
     let node_registry = coxswain_core::node_registry::SharedNodeRegistry::new();
+    let node_registry_for_agg = node_registry.clone();
     let discovery_source = coxswain_discovery::SnapshotSource {
         ingress: status_writer.outputs.ingress_routes.clone(),
         gateway: status_writer.outputs.gateway_routes.clone(),
@@ -219,7 +220,11 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         }),
     ));
 
-    let aggregator = OperatorAggregator::new(fleet, status_writer.outputs.cluster_summary);
+    let aggregator = OperatorAggregator::new(
+        fleet,
+        status_writer.outputs.cluster_summary,
+        Some(node_registry_for_agg),
+    );
 
     let health_addr = SocketAddr::new(args.common.management_bind_address, args.common.health_port);
     server.add_service({
@@ -1224,7 +1229,8 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
         cache,
     )?;
 
-    let dev_aggregator = OperatorAggregator::new(fleet, status_writer.outputs.cluster_summary);
+    let dev_aggregator =
+        OperatorAggregator::new(fleet, status_writer.outputs.cluster_summary, None);
 
     wire_management_servers(
         &mut server,

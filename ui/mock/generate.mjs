@@ -17,6 +17,7 @@
  *                  (unresolved refs) · ingress healthy · ingress dead
  *   Problems     : ingress conflict · gateway conflict · ingress/gateway dead
  *   Health       : all ready · degraded subsystem
+ *   Topology     : SharedPool in-sync · SharedPool lagging · dedicated grouped · lag banner
  *
  * Fixtures are recaptured from a real controller instead with mock/capture.sh.
  */
@@ -465,6 +466,8 @@ function emitSummaries() {
     controllers: { total: CONTROLLERS.length, worst: worst(CONTROLLERS.map(ctrlSev)) },
     shared_proxies: { total: shared.length, worst: worst(shared.map(podSev)) },
     dedicated_proxies: { total: dedicated.length, worst: worst(dedicated.map(podSev)) },
+    // One shared proxy is lagging (bk9p4) — the Topology lag banner shows.
+    all_in_sync: false,
   });
 }
 
@@ -691,6 +694,42 @@ function emitHealth() {
   });
 }
 
+// ── topology (#379) ──────────────────────────────────────────────────────────
+// discovery_active=true, one SharedPool node in-sync, one lagging,
+// two dedicated nodes (one per Gateway). Timestamps are fixed so diffs stay stable.
+const TOPO_CTRL_VERSION = 'sha256:aabbcc112233';
+const TOPO_OLD_VERSION  = 'sha256:001122334455';
+const TOPO_SINCE        = '2024-06-01T00:00:00Z';
+function emitTopology() {
+  const shared = PROXIES.filter((p) => p.kind === 'shared-proxy');
+  const dedicated = PROXIES.filter((p) => p.kind === 'dedicated-proxy' && p.reachable !== false);
+  const nodes = [
+    // SharedPool: first node in-sync, second lagging.
+    ...shared.map((p, i) => ({
+      node_id:             p.name,
+      scope:               { kind: 'SharedPool' },
+      last_acked_version:  i === 0 ? TOPO_CTRL_VERSION : TOPO_OLD_VERSION,
+      connected_since:     TOPO_SINCE,
+      last_ack_at:         TOPO_SINCE,
+      in_sync:             i === 0,
+    })),
+    // Dedicated proxies: each in-sync (fresh start), grouped by gateway.
+    ...dedicated.map((p) => ({
+      node_id:             p.name,
+      scope:               { kind: 'Gateway', namespace: p.ns, name: p.gw },
+      last_acked_version:  TOPO_CTRL_VERSION,
+      connected_since:     TOPO_SINCE,
+      last_ack_at:         TOPO_SINCE,
+      in_sync:             true,
+    })),
+  ];
+  write('/api/v1/topology', {
+    discovery_active:    true,
+    controller_version:  TOPO_CTRL_VERSION,
+    nodes,
+  });
+}
+
 // ── run ───────────────────────────────────────────────────────────────────────
 rmSync(DIR, { recursive: true, force: true });
 mkdirSync(DIR, { recursive: true });
@@ -704,4 +743,5 @@ emitCheck();
 emitSummaries();
 emitProblems();
 emitHealth();
+emitTopology();
 console.log(`generated ${readdirSync(DIR).length} fixtures → ${DIR}`);
