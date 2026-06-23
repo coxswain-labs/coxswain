@@ -319,7 +319,9 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
     // Re-create the harness for fresh port-forwards to the new controller pod,
     // then gate on the real post-condition — new leader elected + at least one
     // successful reconcile on the fresh process — before asserting proxy
-    // recovery. Without this gate the assertions below race controller startup.
+    // recovery. wait_for_controller_reconciled polls until it sees leader=1, so
+    // the port-forward is confirmed to target the new leader pod (not an old
+    // replica lingering mid-rollout), which the metric assertion below relies on.
     let h2 = Harness::start().await?;
     wait::wait_for_controller_reconciled(
         &h2.controller_admin_url("/metrics"),
@@ -327,70 +329,14 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
     )
     .await?;
 
-    // Server-side reconnect signal: the controller's discovery metric reports at
-    // least one live proxy stream again. This is the direct metric form of "the
-    // shared proxy reconnected" — scraped from the controller `/metrics` we
-    // already forward, no topology-JSON aggregation needed.
-    let controller_metrics_url = h2.controller_admin_url("/metrics");
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || {
-            let url = controller_metrics_url.clone();
-            async move {
-                let v = scrape_metric(&url, "coxswain_discovery_connected_proxies").await;
-                format!(
-                    "controller coxswain_discovery_connected_proxies >= 1 after restart; \
-                     currently: {v:?}"
-                )
-            }
-        },
-        || {
-            let url = controller_metrics_url.clone();
-            async move {
-                let v = scrape_metric(&url, "coxswain_discovery_connected_proxies").await?;
-                (v >= 1.0).then_some(())
-            }
-        },
-    )
-    .await
-    .context("controller never reported a reconnected proxy stream after restart")?;
-
-    // The proxy reconnects to the new controller and its health returns to Ready
-    // (reconnect + re-Ack of the snapshot — exercises the degraded→ready
-    // transition on the discovery client).
-    let proxy_health_url2 = h2.admin_url("/api/v1/health");
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || {
-            let url = proxy_health_url2.clone();
-            async move {
-                let state = proxy_health_state(&url).await;
-                format!(
-                    "shared proxy subsystems.proxy.state to return to 'ready'; \
-                     currently: {state:?}"
-                )
-            }
-        },
-        || {
-            let url = proxy_health_url2.clone();
-            async move {
-                let state = proxy_health_state(&url).await?;
-                (state == "ready").then_some(())
-            }
-        },
-    )
-    .await
-    .context("shared proxy did not return to Ready after controller restart")?;
-
-    // The pre-existing route still serves after the reconnect.
-    wait::wait_for_backend(&h2.http, &host, "/a", "echo-a", Duration::from_secs(60)).await?;
-
-    // Fresh-snapshot proof: a route created *after* the controller restart is
-    // compiled by the new controller and pushed to the reconnected proxy. This
-    // is the end-to-end data-plane signal that the discovery stream is live
-    // again — strictly stronger than a topology `in_sync` flag.
+    // Definitive reconnection proof — lead with the data plane. A route created
+    // *after* the restart is compiled by the new controller and only serves once
+    // the shared proxy has reconnected and applied the fresh snapshot. This
+    // single assertion subsumes "did the proxy reconnect": if `echo-b` answers on
+    // a brand-new host, the discovery stream is provably live end-to-end. The
+    // window is generous because the proxy's reconnect backoff can be at its 30 s
+    // cap when the controller returns (it climbed during the downtime); this
+    // mirrors the controller-restart catch-up assertions in `resilience.rs`.
     let fresh_host = format!("disc-restart-fresh.{}.local", ns.name);
     let fresh_ingress = json!({
         "apiVersion": "networking.k8s.io/v1",
@@ -419,9 +365,72 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
         &fresh_host,
         "/",
         "echo-b",
-        Duration::from_secs(60),
+        Duration::from_secs(120),
     )
     .await?;
+
+    // The pre-existing route still serves too.
+    wait::wait_for_backend(&h2.http, &host, "/a", "echo-a", Duration::from_secs(30)).await?;
+
+    // Proxy health has returned to Ready — corroborates the degraded→ready
+    // transition on the discovery client (serving a fresh route means a
+    // post-reconnect snapshot was applied, which clears Degraded).
+    let proxy_health_url2 = h2.admin_url("/api/v1/health");
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || {
+            let url = proxy_health_url2.clone();
+            async move {
+                let state = proxy_health_state(&url).await;
+                format!(
+                    "shared proxy subsystems.proxy.state to return to 'ready'; \
+                     currently: {state:?}"
+                )
+            }
+        },
+        || {
+            let url = proxy_health_url2.clone();
+            async move {
+                let state = proxy_health_state(&url).await?;
+                (state == "ready").then_some(())
+            }
+        },
+    )
+    .await
+    .context("shared proxy did not return to Ready after controller restart")?;
+
+    // Final confirmation of the server-side discovery metric: now that the data
+    // plane has proven the stream is live, the controller's gauge must report the
+    // reconnected proxy. This runs last (not as a gate) precisely because the
+    // gauge is lazily registered on first connect and is process-local — asserting
+    // it before reconnection is proven would race both registration and a
+    // mid-rollout port-forward. After the proof above, it is guaranteed present
+    // and >= 1 on the confirmed-leader port-forward.
+    let controller_metrics_url = h2.controller_admin_url("/metrics");
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || {
+            let url = controller_metrics_url.clone();
+            async move {
+                let v = scrape_metric(&url, "coxswain_discovery_connected_proxies").await;
+                format!(
+                    "controller coxswain_discovery_connected_proxies >= 1 after restart; \
+                     currently: {v:?}"
+                )
+            }
+        },
+        || {
+            let url = controller_metrics_url.clone();
+            async move {
+                let v = scrape_metric(&url, "coxswain_discovery_connected_proxies").await?;
+                (v >= 1.0).then_some(())
+            }
+        },
+    )
+    .await
+    .context("controller did not report the reconnected proxy stream in coxswain_discovery_connected_proxies")?;
 
     Ok(())
 }
