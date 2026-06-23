@@ -771,21 +771,15 @@ async fn invalid_sa_token_is_rejected_with_event() -> anyhow::Result<()> {
 }
 
 // ===========================================================================
-// Read-only-proxy ServiceAccount audit (from rbac_read_only_proxy.rs).
+// Shared-proxy ServiceAccount RBAC audit.
 //
-// write verbs.
-//
-// This is the load-bearing invariant of v0.2's controller/proxy split: a
-// compromised proxy must not be able to write to Kubernetes. The chart
-// enforces it by not granting any write rules in `shared-proxy-rbac.yaml`;
-// this test enforces it by asking the API server.
-//
-// Mechanism: parse `kubectl auth can-i --list --as=<sa>` and assert that
-// every verb in the right-hand column belongs to `{get, list, watch}`. The
-// check is structural — it doesn't depend on which resources show up, only
-// on which verbs are bound. Adding a `create` / `patch` / `update` /
-// `delete` / `deletecollection` rule to the proxy ClusterRole, even on an
-// unrelated resource, regresses the invariant.
+// The shared proxy is a pure gRPC discovery client (post-#424); its runtime
+// never touches the Kubernetes API. The SA exists only as a pod identity
+// for SVID bootstrap (projected coxswain-discovery-audience token); no
+// ClusterRole or RoleBinding is bound to it. This test guards that invariant:
+// the SA must hold zero coxswain-granted resource verbs — only Kubernetes
+// baseline grants (selfsubject* resources and non-resource URLs from
+// system:basic-user and system:public-info-viewer) may appear.
 //
 // Two baseline-grant carve-outs:
 // - `selfsubjectaccessreviews` / `selfsubjectrulesreviews` (api group
@@ -809,14 +803,9 @@ const PROXY_SA_CANDIDATES: &[&str] = &[
     "release-name-coxswain-shared-proxy",
 ];
 
-/// Verbs the proxy is allowed to hold. Anything outside this set is a
-/// regression of the read-only-proxy invariant.
-const ALLOWED_VERBS: &[&str] = &["get", "list", "watch"];
-
 /// Resource prefixes whose verbs come from baseline cluster grants
-/// (`system:basic-user`, `system:public-info-viewer`), not from the
-/// `coxswain-shared-proxy` ClusterRole. Excluded from the audit so the test
-/// fails only on real regressions.
+/// (`system:basic-user`, `system:public-info-viewer`), not from any
+/// coxswain-bound ClusterRole. Excluded from the audit.
 ///
 /// Every `selfsubject*` resource (under both `authorization.k8s.io` and
 /// `authentication.k8s.io`) grants `create` to every authenticated principal
@@ -824,11 +813,12 @@ const ALLOWED_VERBS: &[&str] = &["get", "list", "watch"];
 const BASELINE_RESOURCE_PREFIXES: &[&str] = &["selfsubject"];
 
 #[test]
-fn shared_proxy_sa_has_only_read_verbs() {
+fn shared_proxy_sa_has_no_kubernetes_rbac() {
     let Some(output) = try_auth_can_i_list() else {
         eprintln!(
-            "rbac_read_only_proxy: no reachable cluster — skipping. Run against a cluster \
-             with coxswain installed (helm or manifests) to enforce the invariant."
+            "shared_proxy_sa_has_no_kubernetes_rbac: no reachable cluster — skipping. \
+             Run against a cluster with coxswain installed (helm or manifests) to enforce \
+             the invariant."
         );
         return;
     };
@@ -836,27 +826,24 @@ fn shared_proxy_sa_has_only_read_verbs() {
     let rows = parse_auth_can_i(&output);
     assert!(
         !rows.is_empty(),
-        "auth can-i --list returned no rows — is the ServiceAccount actually bound? \
+        "auth can-i --list returned no rows — is the ServiceAccount present? \
          Output was:\n{output}"
     );
 
-    let allowed: HashSet<&str> = ALLOWED_VERBS.iter().copied().collect();
-    let mut violations: Vec<String> = Vec::new();
-
-    for row in &rows {
-        if is_baseline_grant(row) {
-            continue;
-        }
-        for verb in &row.verbs {
-            if !allowed.contains(verb.as_str()) {
-                violations.push(format!("resource={}, verb={}", row.resource, verb));
-            }
-        }
-    }
+    // Every non-baseline row is a coxswain-granted resource verb — there must
+    // be none. Baseline grants (selfsubject* resources and non-resource URLs)
+    // are K8s plumbing that exists for every authenticated principal and are
+    // not the proxy's RBAC.
+    let violations: Vec<String> = rows
+        .iter()
+        .filter(|r| !is_baseline_grant(r))
+        .map(|r| format!("resource={}, verbs={:?}", r.resource, r.verbs))
+        .collect();
 
     assert!(
         violations.is_empty(),
-        "shared-proxy ServiceAccount has write verbs — read-only invariant regressed!\n\
+        "shared-proxy ServiceAccount holds coxswain-granted resource rows — \
+         the SA must have zero K8s RBAC (discovery client, identity-only SA):\n\
          {}\n\
          full kubectl output:\n{output}",
         violations.join("\n")
@@ -973,6 +960,8 @@ Resources                          Non-Resource URLs   Resource Names   Verbs
 services                                        []   []   [get list watch]
 gateways/status.gateway.networking.k8s.io       []   []   [patch update]
 ";
+
+    const ALLOWED_VERBS: &[&str] = &["get", "list", "watch"];
 
     #[test]
     fn read_only_sample_passes_audit() {

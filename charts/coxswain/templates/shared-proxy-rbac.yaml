@@ -1,5 +1,4 @@
-{{- if and .Values.proxy.shared.enabled .Values.proxy.shared.rbac.create -}}
-{{- if .Values.proxy.shared.serviceAccount.create }}
+{{- if and .Values.proxy.shared.enabled .Values.proxy.shared.serviceAccount.create -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -11,61 +10,5 @@ metadata:
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-automountServiceAccountToken: true
----
-{{- end }}
-# Read-only RBAC for the shared-proxy pod.
-#
-# Load-bearing invariant for v0.2: the shared-proxy ServiceAccount has zero
-# write verbs. The e2e suite verifies this by parsing
-# `kubectl auth can-i --list --as=<sa>` and asserting every entry's verb
-# column is a subset of {get, list, watch}. Anything else would mean a
-# regression of the read-only-proxy property — do not add patch/update/delete
-# rules here.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ include "coxswain.sharedProxy.fullname" . }}
-  labels:
-    {{- include "coxswain.sharedProxy.selectorLabels" . | nindent 4 }}
-rules:
-  - apiGroups: [""]
-    resources: ["services", "secrets", "configmaps"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses", "ingressclasses"]
-    verbs: ["get", "list", "watch"]
-  # Read CoxswainIngressClassParameters so IngressClass.spec.parameters can be
-  # resolved into per-class annotation defaults (#190). Read-only — the proxy SA
-  # holds no write verb on any resource.
-  - apiGroups: ["ingress.coxswain-labs.dev"]
-    resources: ["coxswainingressclassparameters"]
-    verbs: ["get", "list", "watch"]
-  # Read RateLimit CRs so HTTPRouteRule ExtensionRef filters can be resolved
-  # into per-route rate-limiting config (#25). Read-only.
-  - apiGroups: ["coxswain-labs.dev"]
-    resources: ["ratelimits"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["gateway.networking.k8s.io"]
-    resources:
-      ["gatewayclasses", "gateways", "httproutes", "referencegrants", "backendtlspolicies"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {{ include "coxswain.sharedProxy.fullname" . }}
-  labels:
-    {{- include "coxswain.sharedProxy.selectorLabels" . | nindent 4 }}
-subjects:
-  - kind: ServiceAccount
-    name: {{ include "coxswain.sharedProxy.serviceAccountName" . }}
-    namespace: {{ include "coxswain.namespace" . }}
-roleRef:
-  kind: ClusterRole
-  name: {{ include "coxswain.sharedProxy.fullname" . }}
-  apiGroup: rbac.authorization.k8s.io
+automountServiceAccountToken: false
 {{- end }}

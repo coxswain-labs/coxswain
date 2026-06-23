@@ -8,7 +8,7 @@ Not yet. Coxswain is pre-1.0: the API surface and configuration flags may change
 
 ### Why another Ingress controller?
 
-Coxswain separates the controller (the sole Kubernetes writer) from the proxy (a read-only Pingora data plane). The routing table is built from Kubernetes watch events and exposed to the proxy as an immutable snapshot behind an atomic pointer; TLS certificates are loaded the same way. Proxies have no leader election and scale horizontally with no coordination.
+Coxswain separates the controller (the sole Kubernetes reader and writer) from the proxy (a read-only Pingora data plane). The controller compiles routing snapshots from Kubernetes watch events and pushes them to proxies over a mandatory-mTLS gRPC discovery stream; the proxy applies each snapshot via an atomic pointer swap — no locks, no restart. TLS certificates are delivered the same way. Proxies have no leader election, no Kubernetes API access, and scale horizontally with no coordination.
 
 See [Comparison](#comparison) for specific differences against other controllers.
 
@@ -20,7 +20,7 @@ Yes. Both `Ingress` and `HTTPRoute` objects contribute to the same routing table
 
 ### Why the controller/proxy split?
 
-Embedding status writes in the proxy would force leader election into the data plane: only one replica could write at a time, and horizontal scaling would require electing more leaders. Making the controller the sole Kubernetes writer keeps proxy pods stateless, eliminates inter-replica coordination, and shrinks the proxy's RBAC surface to zero write verbs — a compromised proxy pod cannot write to the API server at all. The read-only invariant is enforced by RBAC, not by convention.
+Embedding status writes in the proxy would force leader election into the data plane: only one replica could write at a time, and horizontal scaling would require electing more leaders. Making the controller the sole Kubernetes reader and writer keeps proxy pods stateless, eliminates inter-replica coordination, and gives the proxy **zero Kubernetes API access** — a compromised proxy pod cannot read from or write to the API server at all. The invariant is enforced by shipping no RBAC for the proxy SA, not by convention.
 
 See [Architecture](architecture.md#deployment-models) for the two macro deployment models (Shared and Dedicated).
 
@@ -54,8 +54,8 @@ Architectural differences only — not performance or quality. All projects belo
 
 | | Envoy Gateway | Coxswain |
 |---|---|---|
-| Process model | Control-plane Pod translates Gateway API to xDS; Envoy Pods consume xDS | Split controller + read-only Pingora proxy pods; each proxy self-watches Kubernetes rather than consuming xDS |
-| Data-plane configuration | xDS over gRPC | In-process atomic pointer swap |
+| Process model | Control-plane Pod translates Gateway API to xDS; Envoy Pods consume xDS | Split controller + read-only Pingora proxy pods; controller compiles snapshots and pushes them over a mTLS gRPC discovery stream (conceptually similar to xDS) |
+| Data-plane configuration | xDS over gRPC | Controller-pushed snapshot applied via in-process atomic pointer swap |
 | Proxy engine | Envoy (C++) | Pingora (Rust) |
 | Gateway API channel | Standard + experimental | Standard only |
 
@@ -64,6 +64,6 @@ Architectural differences only — not performance or quality. All projects belo
 See [Troubleshooting](guides/troubleshooting.md) for step-by-step diagnostic commands. Common dedicated-mode questions:
 
 - **Dedicated proxy pod not starting** — see [Dedicated proxy pod never becomes Ready](guides/troubleshooting.md#dedicated-proxy-pod-never-becomes-ready).
-- **`forbidden` errors in proxy logs** — see [RBAC denials in dedicated proxy logs](guides/troubleshooting.md#rbac-denials-in-dedicated-proxy-logs).
+- **Dedicated proxy stuck `NotReady` or `Degraded`** — see [Dedicated proxy stuck `NotReady` or `Degraded`](guides/troubleshooting.md#dedicated-proxy-stuck-notready-or-degraded).
 - **Provisioned resources left behind after Gateway deletion** — see [Provisioned resources not garbage-collected after Gateway deletion](guides/troubleshooting.md#provisioned-resources-not-garbage-collected-after-gateway-deletion).
 - **Controller not reconciling Gateway API resources** — see [Controller stuck in Ingress-only mode](guides/troubleshooting.md#controller-stuck-in-ingress-only-mode).

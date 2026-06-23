@@ -195,6 +195,23 @@ for the full flag/value list. The common knobs:
 | `discovery.port` | `COXSWAIN_DISCOVERY_PORT` | `50051` | mTLS Stream listener port. |
 | `discovery.bootstrapPort` | `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | `50052` | Server-auth bootstrap listener port. |
 
+## Reconnect and failure modes
+
+The proxy runs a jittered-exponential-backoff reconnect supervisor (250 ms → 30 s):
+
+| State | `/readyz` | Traffic |
+|---|---|---|
+| Before first snapshot | `503 NotReady` | — (no routing yet) |
+| Disconnect after first snapshot | `200 Degraded` | Served from last-good snapshot |
+| Reconnect + new snapshot | `200 Ready` | Updated routing |
+| Controller down | `200 Degraded` | Last-good snapshot served indefinitely |
+
+Routing tables are **never cleared** during a reconnect window. A controller outage does not disrupt traffic — proxies keep serving their last compiled snapshot until the controller comes back and pushes a new one.
+
+## Wire-version skew
+
+`WIRE_VERSION = 1` (current). Every `Subscribe` message includes this version. The server rejects a client with a different version immediately with `FAILED_PRECONDITION`; the client backs off **permanently** on that status (it does not retry the stream). Recovery: roll back the mismatched component (controller or proxy) to a matching version. There is no runtime negotiation — both ends must agree.
+
 ## Troubleshooting
 
 **Proxy stuck `NotReady`.** The proxy reports `NotReady` until it has bootstrapped
@@ -209,6 +226,13 @@ an SVID and received its first snapshot. Check, in order:
 - **`external` Secret absent.** In `external` mode the controller logs
   `CA Secret absent and mode=external` and does not serve discovery. Supply the
   Secret (cert-manager or `kubectl create secret tls`).
+- **Wrong `--discovery-endpoint`.** The proxy logs a connection error if it cannot
+  reach the controller's Stream listener. Verify the endpoint URI and that the
+  discovery `Service` exists in the controller namespace.
+
+**Proxy `Degraded` after restart.** Normal — the proxy starts `NotReady` until it reconnects and receives its first snapshot from the new controller. If it stays `Degraded` indefinitely, check connectivity to the discovery endpoint.
+
+**Wire-version mismatch.** The proxy logs `FAILED_PRECONDITION` and backs off permanently. Check that the controller and proxy images are from the same release. See [Wire-version skew](#wire-version-skew).
 
 **`BootstrapRejected` events.** When the controller rejects a bootstrap (invalid
 or wrong-audience token, malformed CSR), it emits a `BootstrapRejected` Warning

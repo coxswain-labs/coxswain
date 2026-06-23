@@ -1,6 +1,6 @@
 # Dedicated proxy pools
 
-A **dedicated proxy (per Gateway)** is a proxy `Deployment` the controller provisions for a single named `Gateway`, serving only that Gateway's routes in isolation from the shared pool. It is a pool in its own right — a `Deployment` scaled by `CoxswainGatewayParameters.spec.replicas` (default `1`), not a single pod — with its own `Service`, `ServiceAccount`, and narrowed RBAC.
+A **dedicated proxy (per Gateway)** is a proxy `Deployment` the controller provisions for a single named `Gateway`, serving only that Gateway's routes in isolation from the shared pool. It is a pool in its own right — a `Deployment` scaled by `CoxswainGatewayParameters.spec.replicas` (default `1`), not a single pod — with its own `Service` and `ServiceAccount`.
 
 This is a Gateway API feature. A `Gateway` opts in through `spec.infrastructure.parametersRef` (GEP-1762), or inherits the choice from its `GatewayClass`'s `spec.parametersRef`, pointing at a `CoxswainGatewayParameters` object. Classic `Ingress` has no equivalent of `parametersRef` and is always served by the [shared pool](../architecture.md#shared) — as is every Gateway that doesn't opt in.
 
@@ -85,42 +85,40 @@ If `parametersRef` targets a missing `CoxswainGatewayParameters` object, the ope
 
 ### Cross-namespace route attachment (`from: All` / `from: Selector`)
 
-When a listener declares `allowedRoutes.namespaces.from: All` or `from: Selector`, the controller automatically:
-
-1. Creates a `ClusterRoleBinding` granting the proxy SA cluster-wide `HTTPRoute` reads (`coxswain-gateway-proxy-cluster-wide-route-reader`).
-2. For `from: Selector`: also creates a `ClusterRoleBinding` for cluster-wide `Namespace` reads (`coxswain-gateway-proxy-cluster-wide-namespace-reader`).
-3. Renders `--allow-cluster-wide-route-read` (and `--allow-cluster-wide-namespace-read`) into the proxy Deployment args.
-4. The proxy spawns a single cluster-wide `HTTPRoute` reflector instead of the per-namespace one, so routes from all namespaces become visible.
-
-No `CoxswainGatewayParameters` fields or manual opt-in are needed — the Gateway spec is the single source of truth. The `ClusterRoleBinding`s are removed automatically when the listener mode changes back to `from: Same` or the Gateway is deleted.
+When a listener declares `allowedRoutes.namespaces.from: All` or `from: Selector`, no additional
+operator action is needed. The controller's cluster-wide reflector already watches routes across all
+namespaces; cross-namespace HTTPRoutes are resolved at reconcile time and compiled into the per-Gateway
+snapshot before it is pushed to the dedicated proxy. The dedicated proxy receives the complete,
+pre-scoped routing world from the controller — it has no cluster-wide reflector and no K8s RBAC of
+its own.
 
 ### RBAC
 
-The controller maintains two layers of RBAC for each dedicated proxy:
+The dedicated proxy holds **zero Kubernetes API credentials**. The provisioned `ServiceAccount` exists
+only as a pod identity — the controller stamps its name (`{gateway-name}-{gatewayclass-name}`, per
+GEP-1762) into the Gateway's discovery registry entry, and the discovery server uses it to verify the
+proxy's SVID before delivering any snapshot.
 
-**Per-namespace `RoleBinding`s** — for every namespace the Gateway's HTTPRoutes route a backend into (gated by `ReferenceGrant` for cross-namespace refs), the controller reconciles a `RoleBinding` tying the provisioned `ServiceAccount` to `coxswain-gateway-proxy-reader`. The proxy pod's `--proxy-watch-namespaces` arg mirrors this binding set so they can't drift.
-
-**`ClusterRoleBinding`s (auto-provisioned)** — when any listener declares `from: All` or `from: Selector`, the controller creates the cluster-wide bindings described above. They are deleted when the listener mode reverts to `from: Same` or the Gateway is removed.
-
-The Gateway carries a `gateway.coxswain-labs.dev/dedicated-cleanup` finalizer so both per-namespace and cluster-wide bindings are removed before Kubernetes finalizes the Gateway deletion.
+The Gateway carries a `gateway.coxswain-labs.dev/dedicated-cleanup` finalizer so the provisioned
+`Deployment`, `Service`, and `ServiceAccount` are removed before Kubernetes finalizes the Gateway
+deletion.
 
 ## Run a dedicated proxy manually
 
-For debugging or for parity testing against the shared pool, you can run a dedicated proxy directly instead of having the controller provision it. The proxy filters the routing-table build to the named Gateway via its existing `parentRef` check — no `parametersRef` is required for the manual path.
+For debugging or for parity testing against the shared pool, you can run a dedicated proxy directly
+instead of having the controller provision it. The proxy subscribes to the controller with
+`Scope::Gateway` and receives only its Gateway's compiled snapshot — no `parametersRef` is required
+for the manual path.
 
-Apply the dev Gateway fixture so there's something to attach to:
-
-```bash
-kubectl apply -f deploy/dev/echo-backends.yaml
-kubectl apply -f deploy/dev/httproute.yaml   # creates the `coxswain-test` Gateway
-```
-
-Then start the dedicated proxy in its own terminal alongside the controller:
+Start the controller first (in a separate terminal or `serve dev`), then start the dedicated proxy
+alongside it:
 
 ```bash
 cargo run --bin coxswain -- serve proxy --dedicated \
   --gateway-name coxswain-test \
   --gateway-namespace default \
+  --discovery-endpoint https://localhost:50051 \
+  --discovery-bootstrap-endpoint https://localhost:50052 \
   --log-format console
 ```
 
@@ -130,14 +128,6 @@ Verify only that Gateway's routes are loaded:
 curl -s http://localhost:8082/api/v1/routes | jq .
 ```
 
-The output lists exactly the hosts the target Gateway's HTTPRoutes serve; Ingress routes and routes attached to other Gateways do not appear.
-
-For a listener with `from: All` or `from: Selector`, pass the cluster-wide flags explicitly — the controller adds these automatically in provisioned mode:
-
-```bash
-cargo run --bin coxswain -- serve proxy --dedicated \
-  --gateway-name coxswain-test \
-  --gateway-namespace default \
-  --allow-cluster-wide-route-read \
-  --log-format console
-```
+The output lists exactly the hosts the target Gateway's HTTPRoutes serve; Ingress routes and routes
+attached to other Gateways do not appear. Cross-namespace routes are included automatically — the
+controller compiles them before pushing.
