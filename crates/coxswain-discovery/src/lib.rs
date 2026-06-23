@@ -34,6 +34,9 @@ pub mod transport;
 pub mod version;
 pub mod wire;
 
+#[cfg(test)]
+mod tests;
+
 pub use auth::{
     DiscoveryBootstrapClientTls, DiscoveryBootstrapServerTls, DiscoveryClientTls,
     DiscoveryServerTls, SpiffeMatcher,
