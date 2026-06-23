@@ -42,10 +42,11 @@ pub use bootstrap_client::{
     BootstrapClient, BootstrapClientConfig, BootstrapClientHandle, BootstrapRunner,
 };
 pub use bootstrap_server::{BootstrapService, NoOpRejectHook, RejectHook};
-pub use client::{DiscoveryClient, DiscoveryClientConfig, Supervisor};
+pub use client::{DiscoveryClient, DiscoveryClientConfig, DiscoverySupervisor, Supervisor};
 pub use error::{AuthError, DiscoveryError, WireError};
 pub use server::{DiscoveryService, SnapshotSource};
 pub use subscription::Scope;
 pub use svid::{SharedSvid, SvidMaterial};
 pub use transport::serve_discovery_with_tls;
 pub use version::{ContentHash, WIRE_VERSION};
+pub use wire::{scope_from_wire, scope_to_wire};

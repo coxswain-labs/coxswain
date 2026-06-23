@@ -128,24 +128,6 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
-  # Server-side-apply / delete of per-namespace `RoleBinding`s that scope
-  # each dedicated-proxy ServiceAccount to the namespaces its Gateway routes
-  # backends into (#209). Cluster-wide because backendRefs can target any
-  # namespace. RoleBindings the controller manages carry the
-  # `app.kubernetes.io/managed-by=coxswain` label; reconcile-driven cleanup
-  # (no owner-refs — cross-namespace ownership is unsupported by K8s GC) lists
-  # by that label.
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["rolebindings"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Create / delete `ClusterRoleBinding`s that grant dedicated-proxy SAs
-  # cluster-wide HTTPRoute / Namespace reads when a Gateway listener declares
-  # `allowedRoutes.namespaces.from: All` or `from: Selector` (#229). Bindings
-  # are removed automatically when the listener mode reverts to `from: Same`
-  # or the Gateway is deleted.
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["clusterrolebindings"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Emit `Warning` Events on Ingress objects when a route conflict or invalid
   # annotation is detected (#390, #401). The kube `Recorder` writes to
   # `events.k8s.io/v1`; `patch` is needed so the Recorder can update existing

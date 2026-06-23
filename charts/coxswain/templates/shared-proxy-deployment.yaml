@@ -111,6 +111,8 @@ spec:
             {{- end }}
             - name: COXSWAIN_CONTROLLER_NAME
               value: {{ .Values.controllerName | quote }}
+            - name: COXSWAIN_DISCOVERY_ENDPOINT
+              value: {{ include "coxswain.controller.discoveryEndpoint" . | quote }}
             {{- if .Values.watchNamespace }}
             - name: COXSWAIN_WATCH_NAMESPACE
               value: {{ .Values.watchNamespace | quote }}

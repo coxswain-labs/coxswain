@@ -15,6 +15,7 @@
 //! invariant.
 
 use crate::{Controller, ControllerConfig, StatusHealthChannels};
+use coxswain_core::DedicatedRoutingRegistry;
 use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::OwnedGateways;
@@ -117,6 +118,7 @@ pub fn spawn_status_writer(
     let cluster_summary = SharedClusterSummary::new();
     let leader = Arc::new(AtomicBool::new(false));
     let owned_gateways = OwnedGateways::new();
+    let dedicated_registry = DedicatedRoutingRegistry::new();
 
     let controller_handle = health.register(
         "controller",
@@ -149,6 +151,7 @@ pub fn spawn_status_writer(
         client_cert_store,
         gateway_tls_health.clone(),
         cluster_summary,
+        dedicated_registry,
     );
 
     // Create the ingress-event channel before the reconciler, so the sender can
@@ -165,6 +168,7 @@ pub fn spawn_status_writer(
             outputs.client_certs.clone(),
             outputs.tls_health.clone(),
             outputs.cluster_summary.clone(),
+            outputs.dedicated_registry.clone(),
         ),
         owned_gateways.clone(),
         Arc::clone(&leader),

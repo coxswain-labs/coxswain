@@ -53,9 +53,9 @@ pub use crds::gateway_api_crds_present;
 pub use ingress::IngressPorts;
 pub use metrics::{MetricsPrefix, ReflectorMetrics};
 pub use reconciler::{
-    ControllerReconciler, DedicatedConfig, DedicatedOutputs, DedicatedProxyReconciler,
-    IngressDefaultBackend, IngressDefaultBackendParseError, IngressEvent, ReconcilerHealth,
-    ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusSubscriptions,
+    ControllerReconciler, IngressDefaultBackend, IngressDefaultBackendParseError, IngressEvent,
+    ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler,
+    StatusSubscriptions,
 };
 pub use tls::{
     GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, SharedBackendTlsPolicyHealth,

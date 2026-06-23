@@ -11,6 +11,12 @@ use sha2::{Digest, Sha256};
 /// Encoded as [`proto::v1::Subscribe::wire_version`] on every stream open.
 /// The server rejects any client that presents a different value with
 /// `FAILED_PRECONDITION`; the client backs off permanently on that status.
+///
+/// ## Version history
+///
+/// - `1` (v0.5): initial SotW snapshot protocol; `Scope` carries a `oneof`
+///   discriminator (`SharedPoolScope` / `GatewayScope`) so the server
+///   dispatches per-subscriber snapshots.
 pub const WIRE_VERSION: u32 = 1;
 
 /// Content hash of a per-scope snapshot DTO.

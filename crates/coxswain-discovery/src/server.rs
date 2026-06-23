@@ -31,10 +31,14 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, warn};
 
+use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
 use coxswain_core::listener_health::SharedGatewayListenerHealth;
 use coxswain_core::node_registry::SharedNodeRegistry;
+use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
+
+use crate::subscription::Scope;
 
 use crate::proto::v1::{
     self as p, client_message::Kind as CKind, discovery_server::Discovery,
@@ -42,7 +46,8 @@ use crate::proto::v1::{
 };
 use crate::version::{ContentHash, WIRE_VERSION};
 use crate::wire::{
-    client_cert_to_wire, gateway_to_wire, ingress_to_wire, listener_health_to_wire, tls_to_wire,
+    client_cert_to_wire, gateway_to_wire, ingress_to_wire, listener_health_to_wire,
+    scope_from_wire, tls_to_wire,
 };
 
 // ── SnapshotSource ────────────────────────────────────────────────────────────
@@ -67,6 +72,11 @@ pub struct SnapshotSource {
     /// `listener_health` wire field so proxy nodes can drive dynamic
     /// Gateway listener port bind/unbind without Kubernetes API access.
     pub tls_health: SharedGatewayListenerHealth,
+    /// Per-cut-over-Gateway routing snapshots, keyed by Gateway [`ObjectKey`].
+    /// Read when a client subscribes with [`Scope::Gateway`]; the five cells
+    /// above serve [`Scope::SharedPool`] (and deliberately exclude cut-over
+    /// Gateways). The shared reconciler is the sole writer.
+    pub dedicated: DedicatedRoutingRegistry,
 }
 
 impl Clone for SnapshotSource {
@@ -77,6 +87,7 @@ impl Clone for SnapshotSource {
             tls: self.tls.clone(),
             client_certs: self.client_certs.clone(),
             tls_health: self.tls_health.clone(),
+            dedicated: self.dedicated.clone(),
         }
     }
 }
@@ -165,24 +176,69 @@ impl SnapshotContent {
     }
 }
 
-/// Build a [`SnapshotContent`] from the current routing world.
+/// Build a [`SnapshotContent`] for the routing world the `scope` subscribes to.
 ///
-/// Loads all five data-plane cells (ArcSwap load, no lock), serialises them to
-/// wire DTOs, and derives the global content hash from the sorted per-resource
-/// hashes. Identical routing worlds produce identical version strings.
-fn build_snapshot(source: &SnapshotSource) -> SnapshotContent {
-    let ingress = source.ingress.load();
-    let gateway = source.gateway.load();
-    let tls = source.tls.load();
-    let client_certs = source.client_certs.load();
-    let tls_health = source.tls_health.load();
+/// - [`Scope::SharedPool`] serialises the five shared cells verbatim (these
+///   deliberately exclude cut-over Gateways, so the shared pool never serves a
+///   migrated Gateway's routes).
+/// - [`Scope::Gateway`] looks up the Gateway's entry in the dedicated registry
+///   and serialises only that slice (empty Ingress). An absent entry yields an
+///   empty snapshot — a dedicated proxy is fail-closed and never receives
+///   another scope's routes (#426).
+fn build_snapshot(source: &SnapshotSource, scope: &Scope) -> SnapshotContent {
+    match scope {
+        Scope::SharedPool => {
+            let ingress = source.ingress.load();
+            let gateway = source.gateway.load();
+            let tls = source.tls.load();
+            let client_certs = source.client_certs.load();
+            let tls_health = source.tls_health.load();
 
-    let ingress_dto = ingress_to_wire(&ingress);
-    let gateway_dto = gateway_to_wire(&gateway);
-    let tls_dto = tls_to_wire(&tls);
-    let client_certs_dto = client_cert_to_wire(&client_certs);
-    let listener_health_dto = listener_health_to_wire(&tls_health);
+            assemble_snapshot(
+                ingress_to_wire(&ingress),
+                gateway_to_wire(&gateway),
+                tls_to_wire(&tls),
+                client_cert_to_wire(&client_certs),
+                listener_health_to_wire(&tls_health),
+            )
+        }
+        Scope::Gateway { name, namespace } => {
+            let key = ObjectKey::new(namespace.clone(), name.clone());
+            let registry = source.dedicated.load();
+            match registry.get(&key) {
+                Some(snap) => assemble_snapshot(
+                    // A dedicated proxy never serves Ingress resources.
+                    p::RoutingTable::default(),
+                    gateway_to_wire(&snap.gateway),
+                    tls_to_wire(&snap.tls),
+                    client_cert_to_wire(&snap.client_certs),
+                    listener_health_to_wire(&snap.listener_health),
+                ),
+                // Fail closed: the Gateway is not (yet) cut over, so this proxy
+                // receives an empty world rather than another scope's routes.
+                None => assemble_snapshot(
+                    p::RoutingTable::default(),
+                    p::RoutingTable::default(),
+                    p::TlsStore::default(),
+                    p::ClientCertStore::default(),
+                    p::GatewayListenerHealth::default(),
+                ),
+            }
+        }
+    }
+}
 
+/// Assemble a [`SnapshotContent`] from pre-built wire DTOs.
+///
+/// Derives the global content hash from the sorted per-resource hashes;
+/// identical DTO sets produce identical version strings.
+fn assemble_snapshot(
+    ingress_dto: p::RoutingTable,
+    gateway_dto: p::RoutingTable,
+    tls_dto: p::TlsStore,
+    client_certs_dto: p::ClientCertStore,
+    listener_health_dto: p::GatewayListenerHealth,
+) -> SnapshotContent {
     let hashes = vec![
         ContentHash::compute(&ingress_dto.encode_to_vec())
             .as_str()
@@ -247,6 +303,14 @@ impl Discovery for DiscoveryService {
             )));
         }
 
+        // Decode the subscription scope; it pins which slice of the routing
+        // world every snapshot on this stream is built from. A missing scope is
+        // treated as `SharedPool`, matching `scope_from_wire`'s own default.
+        let scope = sub
+            .scope
+            .as_ref()
+            .map_or(Scope::SharedPool, scope_from_wire);
+
         let node_id = sub.node_id.clone();
 
         // Register the node before spawning so connect() is visible
@@ -259,7 +323,7 @@ impl Discovery for DiscoveryService {
         let (tx, rx) = mpsc::channel::<Result<p::ServerMessage, Status>>(4);
 
         tokio::spawn(async move {
-            run_stream(node_id, source, registry, rebuild_rx, inbound, tx).await;
+            run_stream(node_id, scope, source, registry, rebuild_rx, inbound, tx).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -312,6 +376,7 @@ struct StreamState {
 /// on exit so the registry stays consistent.
 async fn run_stream(
     node_id: String,
+    scope: Scope,
     source: SnapshotSource,
     registry: SharedNodeRegistry,
     mut rebuild_rx: watch::Receiver<u64>,
@@ -319,7 +384,7 @@ async fn run_stream(
     tx: mpsc::Sender<Result<p::ServerMessage, Status>>,
 ) {
     // Send the initial snapshot immediately on stream open.
-    let initial = build_snapshot(&source);
+    let initial = build_snapshot(&source, &scope);
     let mut state = StreamState {
         last_acked: None,
         in_flight: Some(initial.version.clone()),
@@ -338,7 +403,7 @@ async fn run_stream(
                     Ok(Some(client_msg)) => {
                         match client_msg.kind {
                             Some(CKind::Ack(ack)) => {
-                                if handle_ack(&node_id, ack, &source, &registry, &tx, &mut state)
+                                if handle_ack(&node_id, &scope, ack, &source, &registry, &tx, &mut state)
                                     .await
                                     .is_err()
                                 {
@@ -383,7 +448,7 @@ async fn run_stream(
                     debug!(node_id, "discovery: rebuild while in-flight, coalescing");
                     continue;
                 }
-                let current = build_snapshot(&source);
+                let current = build_snapshot(&source, &scope);
                 if Some(current.version.as_str()) != state.last_acked.as_deref() {
                     state.in_flight = Some(current.version.clone());
                     state.last_sent = Some(current.clone());
@@ -412,6 +477,7 @@ async fn run_stream(
 /// Returns `Err(())` if the outbound channel is closed.
 async fn handle_ack(
     node_id: &str,
+    scope: &Scope,
     ack: p::Ack,
     source: &SnapshotSource,
     registry: &SharedNodeRegistry,
@@ -424,7 +490,7 @@ async fn handle_ack(
     state.in_flight = None;
 
     // Check current world against the just-Ack'd version.
-    let current = build_snapshot(source);
+    let current = build_snapshot(source, scope);
     if Some(current.version.as_str()) != state.last_acked.as_deref() {
         state.in_flight = Some(current.version.clone());
         state.last_sent = Some(current.clone());
@@ -487,10 +553,16 @@ mod tests {
         ClientMessage, ServerMessage, Snapshot, client_message::Kind as CKind,
         discovery_server::DiscoveryServer, server_message::Kind as SrvKind,
     };
+    use coxswain_core::dedicated_registry::DedicatedRoutingSnapshot;
+    use coxswain_core::listener_health::GatewayListenerHealth;
     use coxswain_core::node_registry::SharedNodeRegistry;
-    use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
-    use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
+    use coxswain_core::routing::{
+        GatewayRoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable,
+    };
+    use coxswain_core::tls::{ClientCertStore, SharedClientCertStore, SharedTlsStore, TlsStore};
+    use std::collections::HashMap;
     use std::net::SocketAddr;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio::sync::watch;
@@ -512,6 +584,7 @@ mod tests {
             tls: SharedTlsStore::new(),
             client_certs: SharedClientCertStore::new(),
             tls_health: SharedGatewayListenerHealth::new(),
+            dedicated: DedicatedRoutingRegistry::new(),
         }
     }
 
@@ -563,7 +636,9 @@ mod tests {
             kind: Some(CKind::Subscribe(p::Subscribe {
                 node_id: node_id.to_owned(),
                 wire_version: WIRE_VERSION,
-                scope: Some(p::Scope {}),
+                scope: Some(crate::wire::scope_to_wire(
+                    &crate::subscription::Scope::SharedPool,
+                )),
             })),
         })
         .await
@@ -732,7 +807,9 @@ mod tests {
             kind: Some(CKind::Subscribe(p::Subscribe {
                 node_id: "bad-node".to_owned(),
                 wire_version: 99, // intentionally wrong; server should reject
-                scope: Some(p::Scope {}),
+                scope: Some(crate::wire::scope_to_wire(
+                    &crate::subscription::Scope::SharedPool,
+                )),
             })),
         })
         .await
@@ -808,5 +885,94 @@ mod tests {
         // Poll until the node is removed.
         poll_until(|| (!h.registry.load().nodes.contains_key("node-disconnect")).then_some(()))
             .await;
+    }
+
+    // ── scope-aware snapshot dispatch (#426) ──────────────────────────────────
+
+    /// Build a `SnapshotSource` whose dedicated registry holds one entry for
+    /// `key`, with a listener-health map keyed by that same `ObjectKey`.  The
+    /// shared cells stay empty, so a SharedPool snapshot and a Gateway snapshot
+    /// are trivially distinguishable by their `listener_health` entry count.
+    fn source_with_dedicated_entry(key: &ObjectKey) -> SnapshotSource {
+        let source = empty_source();
+        let mut lh = HashMap::new();
+        lh.insert(key.clone(), GatewayListenerHealth::default());
+        let snap = Arc::new(DedicatedRoutingSnapshot {
+            gateway: Arc::new(GatewayRoutingTable::default()),
+            tls: Arc::new(TlsStore::default()),
+            client_certs: Arc::new(ClientCertStore::default()),
+            listener_health: lh,
+        });
+        let mut map = HashMap::new();
+        map.insert(key.clone(), snap);
+        source.dedicated.store(Arc::new(map));
+        source
+    }
+
+    #[test]
+    fn gateway_scope_serves_only_its_own_registry_entry() {
+        let key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
+        let source = source_with_dedicated_entry(&key);
+
+        let snap = build_snapshot(
+            &source,
+            &Scope::Gateway {
+                name: "gw-a".to_owned(),
+                namespace: "prod".to_owned(),
+            },
+        );
+
+        let lh = snap.listener_health;
+        assert_eq!(
+            lh.entries.len(),
+            1,
+            "Gateway scope must serve exactly its own listener-health entry"
+        );
+        assert_eq!(
+            lh.entries[0].object_key,
+            key.to_string(),
+            "the served entry must be the subscribing Gateway's"
+        );
+        assert!(
+            snap.ingress_routing.ports.is_empty(),
+            "a dedicated proxy never receives Ingress routes"
+        );
+    }
+
+    #[test]
+    fn gateway_scope_absent_entry_is_fully_empty() {
+        // Registry holds gw-a, but a proxy for gw-b subscribes.
+        let present = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
+        let source = source_with_dedicated_entry(&present);
+
+        let snap = build_snapshot(
+            &source,
+            &Scope::Gateway {
+                name: "gw-b".to_owned(),
+                namespace: "prod".to_owned(),
+            },
+        );
+
+        assert!(
+            snap.listener_health.entries.is_empty(),
+            "fail-closed: an absent Gateway receives no routes, not another scope's"
+        );
+        assert!(snap.gateway_routing.ports.is_empty());
+        assert!(snap.ingress_routing.ports.is_empty());
+    }
+
+    #[test]
+    fn shared_scope_ignores_dedicated_registry() {
+        // A cut-over Gateway sits in the dedicated registry; the shared pool
+        // must not pick it up (the shared cells deliberately exclude it).
+        let key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
+        let source = source_with_dedicated_entry(&key);
+
+        let snap = build_snapshot(&source, &Scope::SharedPool);
+
+        assert!(
+            snap.listener_health.entries.is_empty(),
+            "SharedPool reads the shared cells, never the dedicated registry"
+        );
     }
 }

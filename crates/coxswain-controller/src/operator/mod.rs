@@ -49,7 +49,6 @@
 pub(crate) mod apply;
 pub(crate) mod merge;
 pub(crate) mod params;
-pub(crate) mod rbac;
 pub(crate) mod reconciler;
 pub(crate) mod render;
 pub(crate) mod status;

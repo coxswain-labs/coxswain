@@ -153,6 +153,10 @@ impl DiscoveryClient {
     ///   `/readyz` stays 200).
     /// - On reconnect + new snapshot: `Ready` again.
     /// - On NACK (bad DTO): health stays `Ready` — last-good config is still valid.
+    ///
+    /// The returned [`Supervisor`] must be driven within a Tokio runtime.
+    /// Register it as a Pingora background service so it starts after the runtime
+    /// is up — calling [`Supervisor::run`] outside a runtime panics.
     #[must_use]
     pub fn new(
         config: DiscoveryClientConfig,
@@ -192,17 +196,15 @@ impl DiscoveryClient {
     ///
     /// Convenience wrapper over [`DiscoveryClient::new`] that immediately
     /// `tokio::spawn`s the supervisor — **requires an active Tokio runtime**.
-    /// The returned [`tokio::task::JoinHandle`] should be held for the process
-    /// lifetime.
+    /// The returned [`DiscoverySupervisor`] must have `.run()` awaited.
     #[must_use]
     pub fn spawn(
         config: DiscoveryClientConfig,
         health: SubsystemHandle,
         health_check: &str,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
+    ) -> (Self, DiscoverySupervisor) {
         let (client, supervisor) = Self::new(config, health, health_check);
-        let handle = tokio::spawn(supervisor.run());
-        (client, handle)
+        (client, DiscoverySupervisor(supervisor))
     }
 
     /// Handle to the Ingress routing table [`Shared`] cell.
@@ -284,6 +286,21 @@ pub struct Supervisor {
     health: SubsystemHandle,
     health_check: String,
     has_snapshot: bool,
+}
+
+/// Opaque reconnect supervisor returned by [`DiscoveryClient::spawn`].
+///
+/// Must be driven inside a Tokio runtime — register it as a Pingora background
+/// service so it starts after the runtime is up. Dropping it stops the reconnect
+/// loop and ceases snapshot delivery.
+#[non_exhaustive]
+pub struct DiscoverySupervisor(Supervisor);
+
+impl DiscoverySupervisor {
+    /// Run the jittered-reconnect supervisor loop until dropped.
+    pub async fn run(self) {
+        self.0.run().await
+    }
 }
 
 impl Supervisor {
@@ -372,7 +389,7 @@ impl Supervisor {
             kind: Some(CKind::Subscribe(p::Subscribe {
                 node_id: self.config.node_id.clone(),
                 wire_version: WIRE_VERSION,
-                scope: Some(p::Scope {}),
+                scope: Some(crate::wire::scope_to_wire(&self.config.scope)),
             })),
         };
         if tx.send(subscribe).await.is_err() {
@@ -805,7 +822,8 @@ mod tests {
 
         let registry = HealthRegistry::new();
         let handle = registry.register("disc", &["conn"]);
-        let (client, _task) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let (client, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let _task = tokio::spawn(supervisor.run());
 
         // Wait for the client to connect and send Subscribe.
         let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
@@ -865,7 +883,8 @@ mod tests {
 
         let registry = HealthRegistry::new();
         let handle = registry.register("disc", &["conn"]);
-        let (client, _task) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let (client, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let _task = tokio::spawn(supervisor.run());
 
         // Session #1: push one snapshot, confirm Ack.
         let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
@@ -928,7 +947,8 @@ mod tests {
 
         let registry = HealthRegistry::new();
         let handle = registry.register("disc", &["conn"]);
-        let (client, _task) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let (client, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let _task = tokio::spawn(supervisor.run());
 
         let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
             .await
@@ -988,7 +1008,8 @@ mod tests {
 
         let registry = HealthRegistry::new();
         let handle = registry.register("disc", &["conn"]);
-        let (_, _task) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let (_, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let _task = tokio::spawn(supervisor.run());
 
         // Before first snapshot: registry reports not ready.
         assert!(

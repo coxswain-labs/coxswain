@@ -66,6 +66,8 @@ spec:
               value: "8081"
             - name: COXSWAIN_ADMIN_PORT
               value: "8082"
+            - name: COXSWAIN_DISCOVERY_PORT
+              value: "50051"
             - name: COXSWAIN_MANAGEMENT_BIND_ADDRESS
               value: "0.0.0.0"
             - name: COXSWAIN_CONTROLLER_NAME
@@ -149,7 +151,9 @@ spec:
 ---
 # Discovery control-plane Service (#423). Fixed name `coxswain-controller-discovery`
 # so the controller operator's rendered dedicated-proxy endpoint and the
-# shared-proxy endpoint env both resolve to it.
+# shared-proxy endpoint env both resolve to it. The controller binary hardcodes
+# the endpoint it hands to dedicated proxies as
+# `https://coxswain-controller-discovery.<ns>.svc:<port>` (coxswain-bin/src/lib.rs).
 apiVersion: v1
 kind: Service
 metadata:

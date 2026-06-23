@@ -9,8 +9,6 @@
 //!
 //! Sibling reconcilers in this module narrow the scope:
 //!
-//! - `DedicatedProxyReconciler` (Step 7) — one Gateway, dynamic per-namespace
-//!   reflectors.
 //! - `ControllerReconciler` (Step 7) — cluster-wide watches but no routing
 //!   tables or TLS store; status-only output set.
 
@@ -39,6 +37,7 @@ use crate::{
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
 use coxswain_core::crd::{CoxswainIngressClassParameters, RateLimit};
+use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
@@ -259,6 +258,9 @@ pub struct SharedProxyReconciler {
     client_certs: SharedClientCertStore,
     tls_health: SharedGatewayListenerHealth,
     cluster_summary: SharedClusterSummary,
+    /// Per-cut-over-Gateway routing snapshots. Written by this reconciler on
+    /// every rebuild; read by the discovery server to serve `Scope::Gateway` subscribers.
+    dedicated_registry: DedicatedRoutingRegistry,
     route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
     fleet: SharedFleet,
@@ -297,6 +299,10 @@ pub struct ReconcilerOutputs {
     /// Cluster aggregate (per-Gateway / per-Ingress summary) consumed by the
     /// controller's `/cluster` admin endpoint. Updated on every rebuild.
     pub cluster_summary: SharedClusterSummary,
+    /// Per-cut-over-Gateway routing snapshots, keyed by [`ObjectKey`].  Updated
+    /// on every rebuild by the shared reconciler; read by the discovery server
+    /// when serving [`coxswain_discovery::Scope::Gateway`] subscribers (#426).
+    pub dedicated_registry: DedicatedRoutingRegistry,
 }
 
 impl ReconcilerOutputs {
@@ -309,6 +315,7 @@ impl ReconcilerOutputs {
         client_certs: SharedClientCertStore,
         tls_health: SharedGatewayListenerHealth,
         cluster_summary: SharedClusterSummary,
+        dedicated_registry: DedicatedRoutingRegistry,
     ) -> Self {
         Self {
             ingress_routes,
@@ -317,6 +324,7 @@ impl ReconcilerOutputs {
             client_certs,
             tls_health,
             cluster_summary,
+            dedicated_registry,
         }
     }
 }
@@ -383,6 +391,7 @@ impl SharedProxyReconciler {
             client_certs,
             tls_health,
             cluster_summary,
+            dedicated_registry,
         } = outputs;
         // When the controller role asks for status subscriptions, back the
         // status-relevant stores with shared informers now (sync) so the
@@ -441,6 +450,7 @@ impl SharedProxyReconciler {
             client_certs,
             tls_health,
             cluster_summary,
+            dedicated_registry,
             route_health: SharedHttpRouteHealth::new(),
             policy_health: SharedBackendTlsPolicyHealth::new(),
             fleet: SharedFleet::new(),
@@ -540,6 +550,7 @@ struct SharedOutputs<'a> {
     client_certs: &'a SharedClientCertStore,
     tls_health: &'a SharedGatewayListenerHealth,
     cluster_summary: &'a SharedClusterSummary,
+    dedicated_registry: &'a DedicatedRoutingRegistry,
     route_health: &'a SharedHttpRouteHealth,
     policy_health: &'a SharedBackendTlsPolicyHealth,
     ingress_event_tx: Option<&'a tokio::sync::mpsc::Sender<IngressEvent>>,
@@ -668,6 +679,7 @@ impl BackgroundService for SharedProxyReconciler {
             client_certs: self.client_certs.clone(),
             tls_health: self.tls_health.clone(),
             cluster_summary: self.cluster_summary.clone(),
+            dedicated_registry: self.dedicated_registry.clone(),
             route_health: self.route_health.clone(),
             policy_health: self.policy_health.clone(),
             fleet: self.fleet.clone(),
@@ -709,6 +721,7 @@ struct SharedHandles {
     client_certs: SharedClientCertStore,
     tls_health: SharedGatewayListenerHealth,
     cluster_summary: SharedClusterSummary,
+    dedicated_registry: DedicatedRoutingRegistry,
     route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
     /// Populated by the fleet task when `watch_fleet` is enabled; carried here
@@ -751,6 +764,7 @@ async fn spawn_tasks(
         client_certs,
         tls_health,
         cluster_summary,
+        dedicated_registry,
         route_health,
         policy_health,
         fleet,
@@ -1020,6 +1034,7 @@ async fn spawn_tasks(
                 client_certs: &client_certs,
                 tls_health: &tls_health,
                 cluster_summary: &cluster_summary,
+                dedicated_registry: &dedicated_registry,
                 route_health: &route_health,
                 policy_health: &policy_health,
                 ingress_event_tx: ingress_event_tx.as_ref(),
@@ -1224,6 +1239,77 @@ fn rebuild(
         entry.ancestors = ah.ancestors;
     }
     outputs.policy_health.store_and_notify(policy_health_map);
+
+    // Build per-cut-over-Gateway snapshots for the dedicated registry (#426).
+    //
+    // This is the single-writer pass: only the shared reconciler writes to
+    // `DedicatedRoutingRegistry`, so concurrent dedicated-proxy subscribes cannot
+    // clobber each other's routing cells.  A Gateway that is no longer cut-over
+    // simply does not appear in the new map — automatic teardown with no explicit
+    // delete path.
+    let empty_ingress_classes: HashSet<String> = HashSet::new();
+    let mut registry_map: HashMap<ObjectKey, Arc<DedicatedRoutingSnapshot>> = HashMap::new();
+    for gw in stores.gateways.state() {
+        if !owned_gateway_classes.contains(&gw.spec.gateway_class_name) {
+            continue;
+        }
+        if !gateway_is_cut_over(&gw) {
+            continue;
+        }
+        let ns = gw.metadata.namespace.clone().unwrap_or_default();
+        let name = gw.metadata.name.clone().unwrap_or_default();
+        let key = ObjectKey::new(ns, name);
+        let single_gw = HashSet::from([key.clone()]);
+
+        // Narrow ownership to this one Gateway so the builders produce only
+        // its routes and TLS state.  Ingress classes are empty — a dedicated
+        // proxy does not serve Ingress resources.  `gateway_classes` is kept
+        // at the full set so `build_gateway_routes` can read listener metadata
+        // from the Gateway spec; routes are scoped to `single_gw` only.
+        let dedicated_ownership = Ownership {
+            ingress_classes: &empty_ingress_classes,
+            default_ingress_class: None,
+            gateways: &single_gw,
+            gateway_classes: &owned_gateway_classes,
+            backend_grants: &backend_grants,
+            cert_grants: &cert_grants,
+            policy_index: &policy_index,
+        };
+
+        let gw_routes_cell: SharedGatewayRoutingTable = Shared::new();
+        let tls_cell: SharedTlsStore = Shared::new();
+        let client_certs_cell: SharedClientCertStore = Shared::new();
+
+        build_gateway_routes(
+            stores,
+            &routes,
+            &dedicated_ownership,
+            &gw_routes_cell,
+            false,
+        );
+        // `build_tls` with `skip_cut_over=false` includes all owned-class
+        // gateways in the TLS store; the extra certs are harmless because the
+        // dedicated proxy only binds its own listeners.
+        let gw_listener_health =
+            build_tls(stores, &ingresses, &dedicated_ownership, &tls_cell, false);
+        build_client_certs(stores, &ingresses, &dedicated_ownership, &client_certs_cell);
+
+        // Retain only the health entry for the owning Gateway.
+        let listener_health: HashMap<ObjectKey, GatewayListenerHealth> = gw_listener_health
+            .into_iter()
+            .filter(|(k, _)| k == &key)
+            .collect();
+
+        tracing::debug!(?key, "Published dedicated routing snapshot");
+        let snap = Arc::new(DedicatedRoutingSnapshot {
+            gateway: gw_routes_cell.load(),
+            tls: tls_cell.load(),
+            client_certs: client_certs_cell.load(),
+            listener_health,
+        });
+        registry_map.insert(key, snap);
+    }
+    outputs.dedicated_registry.store(Arc::new(registry_map));
 
     routes_published
 }
