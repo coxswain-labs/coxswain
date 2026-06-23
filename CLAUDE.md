@@ -135,13 +135,3 @@ Source of truth for scope and status: the [Coxswain Roadmap Project](https://git
 Milestones are plain version numbers (`v0.1`, `v0.2`, …); use `gh issue edit N --milestone vX.Y`. Never use special characters (em dashes, colons, `&`) — they break GitHub's filter URL parser.
 
 Labels: discover the live taxonomy with `gh label list --repo coxswain-labs/coxswain`. Every issue carries at least one `type:` and one `area:` or `api:`. `status: backlog` only on issues with no milestone; `priority:` is per-milestone; `type:` and `area:`/`api:` are required everywhere.
-
-## graphify
-
-This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
-
-Rules:
-- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
-- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
-- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
-- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

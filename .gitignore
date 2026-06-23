@@ -1,12 +1,7 @@
 .cargo/config.toml
-.claude/settings.json
-.claude/settings.local.json
-.claude/scheduled_tasks.lock
-.claude/memory/
-.claude/plans/
-.claude/worktrees/
+.claude/
+!.claude/skills/
 .idea/
-.serena/
 .venv/
 .wip/
 .DS_Store
