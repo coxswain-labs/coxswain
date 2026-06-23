@@ -14,6 +14,7 @@ pub mod fleet;
 pub mod health;
 pub mod identity;
 pub mod listener_health;
+pub mod naming;
 pub mod node_registry;
 pub mod ownership;
 pub mod reference_grants;

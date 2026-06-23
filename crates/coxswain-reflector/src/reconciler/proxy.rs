@@ -40,6 +40,7 @@ use coxswain_core::crd::{CoxswainIngressClassParameters, RateLimit};
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
 use coxswain_core::health::SubsystemHandle;
+use coxswain_core::naming::gep1762_resource_name;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::routing::{
     BackendGroup, GatewayRoutingTableBuilder, IngressRoutingTableBuilder, RouteEntry, RoutingTable,
@@ -1306,6 +1307,10 @@ fn rebuild(
             tls: tls_cell.load(),
             client_certs: client_certs_cell.load(),
             listener_health,
+            // GEP-1762: the dedicated proxy runs as ServiceAccount `{gw}-{class}`.
+            // Stamped here using the same formula the operator uses to provision the
+            // ServiceAccount so the discovery binding check can never disagree.
+            expected_proxy_sa: gep1762_resource_name(&key.name, &gw.spec.gateway_class_name),
         });
         registry_map.insert(key, snap);
     }
