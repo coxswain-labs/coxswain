@@ -34,6 +34,8 @@ use tokio_rustls::TlsAcceptor;
 use tonic::transport::{ClientTlsConfig, Endpoint, Identity};
 use x509_parser::prelude::*;
 
+use coxswain_core::identity::SpiffeId;
+
 use crate::error::AuthError;
 
 // ── SPIFFE matcher ────────────────────────────────────────────────────────────
@@ -69,6 +71,48 @@ impl SpiffeMatcher {
 
 // ── URI SAN extraction ─────────────────────────────────────────────────────────
 
+// ── PeerSvid ──────────────────────────────────────────────────────────────────
+
+/// URI SANs extracted from the mTLS peer certificate.
+///
+/// Injected into tonic request extensions by [`crate::transport::PeerSvidStream`]
+/// at TLS accept time.  Absent → plaintext connection (test/degraded path); the
+/// discovery server skips scope-binding checks when this is not present.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default)]
+pub struct PeerSvid {
+    /// URI SANs from the peer end-entity certificate (SPIFFE IDs).
+    ///
+    /// Always non-empty in production (every mTLS connection carries a CA-signed
+    /// SVID); empty only on the plaintext path (integration tests, degraded mode).
+    pub uri_sans: Vec<String>,
+}
+
+/// Returns `true` if any URI SAN in `uri_sans` encodes the SPIFFE identity of the
+/// dedicated proxy for `(namespace, expected_sa)`.
+///
+/// The trust domain is **not** checked here — it is already verified at TLS
+/// handshake time by [`SpiffeClientCertVerifier`]
+/// (`allowed_client: SpiffeMatcher::Prefix("spiffe://<trust-domain>/")`).
+/// Only the Kubernetes namespace and ServiceAccount name are compared.
+///
+/// The expected SA follows GEP-1762: `{gateway-name}-{gatewayclass-name}`, stamped
+/// into [`coxswain_core::dedicated_registry::DedicatedRoutingSnapshot::expected_proxy_sa`]
+/// by the reconciler.
+pub(crate) fn svid_matches_dedicated_gateway(
+    uri_sans: &[String],
+    namespace: &str,
+    expected_sa: &str,
+) -> bool {
+    uri_sans.iter().any(|uri| {
+        SpiffeId::parse(uri)
+            .ok()
+            .is_some_and(|id| id.namespace() == namespace && id.service_account() == expected_sa)
+    })
+}
+
+// ── URI SAN extraction ─────────────────────────────────────────────────────────
+
 /// Extract all URI SANs from a DER-encoded end-entity certificate.
 ///
 /// Only `GeneralName::URI` entries are returned; DNS, IP, and email SANs are
@@ -77,7 +121,7 @@ impl SpiffeMatcher {
 /// # Errors
 ///
 /// Returns [`AuthError::InvalidCert`] if the DER bytes cannot be parsed.
-fn uri_sans(cert_der: &[u8]) -> Result<Vec<String>, AuthError> {
+pub(crate) fn uri_sans(cert_der: &[u8]) -> Result<Vec<String>, AuthError> {
     let (_, cert) =
         parse_x509_certificate(cert_der).map_err(|e| AuthError::InvalidCert(e.to_string()))?;
 
@@ -576,11 +620,19 @@ pub(crate) mod tests {
 
     /// Generate a fresh CA + controller SVID + proxy SVID set.
     pub(crate) fn gen_certs() -> SpiffeTestCerts {
+        gen_certs_with_client_svid(PROXY_SPIFFE)
+    }
+
+    /// Generate a fresh CA + controller SVID + a leaf cert for `client_svid`.
+    ///
+    /// Used by scope-binding TLS integration tests that need a client cert whose
+    /// SPIFFE identity matches a specific dedicated-proxy ServiceAccount.
+    pub(crate) fn gen_certs_with_client_svid(client_svid: &str) -> SpiffeTestCerts {
         let (ca_cert, ca_key, ca_params) = gen_ca();
         let issuer = Issuer::new(ca_params, ca_key);
 
         let (server_cert, server_key) = gen_leaf(CONTROLLER_SPIFFE, &issuer);
-        let (client_cert, client_key) = gen_leaf(PROXY_SPIFFE, &issuer);
+        let (client_cert, client_key) = gen_leaf(client_svid, &issuer);
 
         SpiffeTestCerts {
             ca_cert_pem: ca_cert.pem().into_bytes(),
@@ -865,6 +917,67 @@ pub(crate) mod tests {
         assert!(
             result.is_err(),
             "stream must be rejected when server SPIFFE ID does not match expected: {result:?}"
+        );
+    }
+
+    // ── svid_matches_dedicated_gateway ────────────────────────────────────────
+
+    fn make_svid(namespace: &str, sa: &str) -> Vec<String> {
+        vec![format!("spiffe://cluster.local/ns/{namespace}/sa/{sa}")]
+    }
+
+    #[test]
+    fn svid_matches_dedicated_gateway_exact_match() {
+        let sans = make_svid("prod", "gw-a-coxswain");
+        assert!(
+            svid_matches_dedicated_gateway(&sans, "prod", "gw-a-coxswain"),
+            "matching namespace + SA must return true"
+        );
+    }
+
+    #[test]
+    fn svid_matches_dedicated_gateway_wrong_sa() {
+        let sans = make_svid("prod", "gw-a-coxswain");
+        assert!(
+            !svid_matches_dedicated_gateway(&sans, "prod", "other-gw-coxswain"),
+            "wrong SA name must return false"
+        );
+    }
+
+    #[test]
+    fn svid_matches_dedicated_gateway_wrong_namespace() {
+        let sans = make_svid("prod", "gw-a-coxswain");
+        assert!(
+            !svid_matches_dedicated_gateway(&sans, "staging", "gw-a-coxswain"),
+            "wrong namespace must return false"
+        );
+    }
+
+    #[test]
+    fn svid_matches_dedicated_gateway_shared_pool_sa_rejected() {
+        // A shared-pool proxy presents `sa/coxswain-shared-proxy`, which must
+        // not match any dedicated Gateway claim.
+        let sans = make_svid("coxswain-system", "coxswain-shared-proxy");
+        assert!(
+            !svid_matches_dedicated_gateway(&sans, "prod", "gw-a-coxswain"),
+            "shared-pool SA must not match any dedicated Gateway"
+        );
+    }
+
+    #[test]
+    fn svid_matches_dedicated_gateway_malformed_uri_rejected() {
+        let sans = vec!["not-a-spiffe-uri".to_owned()];
+        assert!(
+            !svid_matches_dedicated_gateway(&sans, "prod", "gw-a-coxswain"),
+            "malformed URI must return false (SpiffeId::parse fails, is_some_and is false)"
+        );
+    }
+
+    #[test]
+    fn svid_matches_dedicated_gateway_empty_sans_rejected() {
+        assert!(
+            !svid_matches_dedicated_gateway(&[], "prod", "gw-a-coxswain"),
+            "empty SAN list must return false"
         );
     }
 }

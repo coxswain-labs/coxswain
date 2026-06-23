@@ -1616,17 +1616,24 @@ pub fn scope_to_wire(scope: &Scope) -> p::Scope {
 
 /// Deserialise a [`p::Scope`] proto DTO into a [`Scope`].
 ///
-/// An absent or unrecognised `kind` defaults to [`Scope::SharedPool`] — safe
-/// because the shared pool is the conservative fallback (no routing data lost).
-/// This function is infallible: all wire states map to a valid [`Scope`].
-#[must_use]
-pub fn scope_from_wire(dto: &p::Scope) -> Scope {
+/// Returns `Err(WireError::MissingRequiredField)` when the `kind` discriminator
+/// is absent — a `Scope {}` with no oneof arm is malformed and must not be
+/// silently promoted to `SharedPool` (which would be a privilege escalation).
+///
+/// # Errors
+///
+/// Returns [`WireError::MissingRequiredField`] if `dto.kind` is `None`.
+#[must_use = "wire decode failure must be handled; discarding the error silently promotes to SharedPool"]
+pub fn scope_from_wire(dto: &p::Scope) -> Result<Scope, WireError> {
     match &dto.kind {
-        None | Some(p::scope::Kind::SharedPool(_)) => Scope::SharedPool,
-        Some(p::scope::Kind::Gateway(g)) => Scope::Gateway {
+        Some(p::scope::Kind::SharedPool(_)) => Ok(Scope::SharedPool),
+        Some(p::scope::Kind::Gateway(g)) => Ok(Scope::Gateway {
             name: g.name.clone(),
             namespace: g.namespace.clone(),
-        },
+        }),
+        None => Err(WireError::MissingRequiredField {
+            field: "scope.kind",
+        }),
     }
 }
 
@@ -2468,7 +2475,7 @@ mod tests {
     fn scope_shared_pool_round_trips() {
         let scope = Scope::SharedPool;
         let wire = scope_to_wire(&scope);
-        let back = scope_from_wire(&wire);
+        let back = scope_from_wire(&wire).expect("SharedPool round-trip");
         assert_eq!(scope, back, "SharedPool round-trip");
     }
 
@@ -2479,16 +2486,24 @@ mod tests {
             namespace: "production".to_owned(),
         };
         let wire = scope_to_wire(&scope);
-        let back = scope_from_wire(&wire);
+        let back = scope_from_wire(&wire).expect("Gateway round-trip");
         assert_eq!(scope, back, "Gateway round-trip");
     }
 
     #[test]
-    fn scope_absent_kind_defaults_to_shared_pool() {
-        // An empty Scope proto (no `kind` set) must default to SharedPool —
-        // safe fallback for old clients sending the v0.5 empty message.
+    fn scope_absent_kind_returns_error() {
+        // A `Scope {}` with no `kind` discriminator is malformed — promoting it to
+        // SharedPool would be a privilege escalation for a client that omits the field.
         let wire = p::Scope { kind: None };
-        let back = scope_from_wire(&wire);
-        assert_eq!(Scope::SharedPool, back, "absent kind → SharedPool");
+        let err = scope_from_wire(&wire).expect_err("absent kind must be rejected");
+        assert!(
+            matches!(
+                err,
+                WireError::MissingRequiredField {
+                    field: "scope.kind"
+                }
+            ),
+            "expected MissingRequiredField(scope.kind), got {err:?}",
+        );
     }
 }

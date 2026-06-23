@@ -38,6 +38,7 @@ use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
 
+use crate::auth::{PeerSvid, svid_matches_dedicated_gateway};
 use crate::subscription::Scope;
 
 use crate::proto::v1::{
@@ -185,7 +186,16 @@ impl SnapshotContent {
 ///   and serialises only that slice (empty Ingress). An absent entry yields an
 ///   empty snapshot — a dedicated proxy is fail-closed and never receives
 ///   another scope's routes (#426).
-fn build_snapshot(source: &SnapshotSource, scope: &Scope) -> SnapshotContent {
+///   When `peer_svid` is present (mTLS connection) and the entry's
+///   `expected_proxy_sa` does not match the peer SVID, the function also returns
+///   an empty snapshot — this is the build-time complement to the open-time
+///   `PERMISSION_DENIED` check in `stream()` and closes the race where a Gateway
+///   entry appears *after* the stream was opened (#427).
+fn build_snapshot(
+    source: &SnapshotSource,
+    scope: &Scope,
+    peer_svid: Option<&PeerSvid>,
+) -> SnapshotContent {
     match scope {
         Scope::SharedPool => {
             let ingress = source.ingress.load();
@@ -206,14 +216,35 @@ fn build_snapshot(source: &SnapshotSource, scope: &Scope) -> SnapshotContent {
             let key = ObjectKey::new(namespace.clone(), name.clone());
             let registry = source.dedicated.load();
             match registry.get(&key) {
-                Some(snap) => assemble_snapshot(
-                    // A dedicated proxy never serves Ingress resources.
-                    p::RoutingTable::default(),
-                    gateway_to_wire(&snap.gateway),
-                    tls_to_wire(&snap.tls),
-                    client_cert_to_wire(&snap.client_certs),
-                    listener_health_to_wire(&snap.listener_health),
-                ),
+                Some(snap) => {
+                    // Build-time SVID binding check: if the peer presented an SVID
+                    // but it does not match this Gateway's expected proxy SA, return
+                    // an empty snapshot. This closes the race where the Gateway entry
+                    // appears in the registry after the open-time check in stream().
+                    if let Some(peer) = peer_svid
+                        && !svid_matches_dedicated_gateway(
+                            &peer.uri_sans,
+                            namespace,
+                            &snap.expected_proxy_sa,
+                        )
+                    {
+                        return assemble_snapshot(
+                            p::RoutingTable::default(),
+                            p::RoutingTable::default(),
+                            p::TlsStore::default(),
+                            p::ClientCertStore::default(),
+                            p::GatewayListenerHealth::default(),
+                        );
+                    }
+                    assemble_snapshot(
+                        // A dedicated proxy never serves Ingress resources.
+                        p::RoutingTable::default(),
+                        gateway_to_wire(&snap.gateway),
+                        tls_to_wire(&snap.tls),
+                        client_cert_to_wire(&snap.client_certs),
+                        listener_health_to_wire(&snap.listener_health),
+                    )
+                }
                 // Fail closed: the Gateway is not (yet) cut over, so this proxy
                 // receives an empty world rather than another scope's routes.
                 None => assemble_snapshot(
@@ -291,6 +322,10 @@ impl Discovery for DiscoveryService {
         &self,
         request: Request<Streaming<p::ClientMessage>>,
     ) -> Result<Response<Self::StreamStream>, Status> {
+        // Extract peer SVID from TLS connection info BEFORE consuming the request.
+        // PeerSvid is populated by transport::PeerSvidStream::connect_info() on
+        // mTLS connections; absent on plaintext (test/degraded) connections.
+        let peer_svid = request.extensions().get::<PeerSvid>().cloned();
         let mut inbound = request.into_inner();
 
         // First message from client must be Subscribe.
@@ -303,13 +338,45 @@ impl Discovery for DiscoveryService {
             )));
         }
 
-        // Decode the subscription scope; it pins which slice of the routing
-        // world every snapshot on this stream is built from. A missing scope is
-        // treated as `SharedPool`, matching `scope_from_wire`'s own default.
-        let scope = sub
-            .scope
-            .as_ref()
-            .map_or(Scope::SharedPool, scope_from_wire);
+        // Decode the subscription scope; it pins which slice of the routing world
+        // every snapshot on this stream is built from. An absent scope (no `scope`
+        // field at all) is treated as `SharedPool` — the default subscription.
+        // A scope with an absent `kind` discriminator is rejected as malformed to
+        // prevent a zero-value message from silently escalating to SharedPool (#427).
+        let scope = match sub.scope.as_ref() {
+            None => Scope::SharedPool,
+            Some(dto) => scope_from_wire(dto)
+                .map_err(|e| Status::invalid_argument(format!("discovery: invalid scope: {e}")))?,
+        };
+
+        // Gap A — open-time scope binding (#427): verify that a Gateway scope
+        // claim matches the authenticated peer SVID identity.
+        //
+        // A dedicated proxy must present a SVID whose namespace + SA equal those
+        // of its provisioned ServiceAccount (`{gw}-{class}`). The check fires only
+        // when the Gateway's dedicated-registry entry exists — if absent, the
+        // snapshot is fail-closed empty regardless, so we let the stream open and
+        // re-check on every build_snapshot call.
+        //
+        // When no PeerSvid is present (plaintext/test path) we skip the check and
+        // fail-open — mTLS is mandatory in production, so this branch is
+        // test/degraded-mode only.
+        if let Some(peer) = peer_svid.as_ref()
+            && let Scope::Gateway { name, namespace } = &scope
+        {
+            let key = ObjectKey::new(namespace.clone(), name.clone());
+            if let Some(entry) = self.source.dedicated.load().get(&key)
+                && !svid_matches_dedicated_gateway(
+                    &peer.uri_sans,
+                    namespace,
+                    &entry.expected_proxy_sa,
+                )
+            {
+                return Err(Status::permission_denied(
+                    "scope claim does not match authenticated SVID identity",
+                ));
+            }
+        }
 
         let node_id = sub.node_id.clone();
 
@@ -322,8 +389,13 @@ impl Discovery for DiscoveryService {
         let rebuild_rx = self.rebuild_rx.clone();
         let (tx, rx) = mpsc::channel::<Result<p::ServerMessage, Status>>(4);
 
+        let subscription = StreamSubscription {
+            node_id,
+            scope,
+            peer_svid,
+        };
         tokio::spawn(async move {
-            run_stream(node_id, scope, source, registry, rebuild_rx, inbound, tx).await;
+            run_stream(subscription, source, registry, rebuild_rx, inbound, tx).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -355,6 +427,23 @@ async fn read_subscribe(inbound: &mut Streaming<p::ClientMessage>) -> Result<p::
 
 // ── per-stream state machine ──────────────────────────────────────────────────
 
+/// Immutable per-stream subscriber identity, grouped so function signatures
+/// stay under the 7-argument threshold.
+///
+/// Groups the three fields that together describe WHO is subscribing and with
+/// what credential: the node identifier, the requested scope, and the peer SVID
+/// extracted from the mTLS client certificate (absent on plaintext connections).
+struct StreamSubscription {
+    /// Unique identifier for this proxy node.
+    node_id: String,
+    /// Subscription scope (SharedPool or a specific Gateway).
+    scope: Scope,
+    /// URI SANs from the peer's mTLS client certificate; absent on plaintext
+    /// connections (test/degraded mode).  Used to bind `Scope::Gateway` claims
+    /// to the authenticated SVID identity on every snapshot build.
+    peer_svid: Option<PeerSvid>,
+}
+
 /// Mutable per-stream flow-control state, grouped to keep helper function
 /// signatures under the 7-argument threshold.
 struct StreamState {
@@ -375,8 +464,7 @@ struct StreamState {
 /// error is received. Calls [`SharedNodeRegistry::disconnect`] unconditionally
 /// on exit so the registry stays consistent.
 async fn run_stream(
-    node_id: String,
-    scope: Scope,
+    sub: StreamSubscription,
     source: SnapshotSource,
     registry: SharedNodeRegistry,
     mut rebuild_rx: watch::Receiver<u64>,
@@ -384,14 +472,14 @@ async fn run_stream(
     tx: mpsc::Sender<Result<p::ServerMessage, Status>>,
 ) {
     // Send the initial snapshot immediately on stream open.
-    let initial = build_snapshot(&source, &scope);
+    let initial = build_snapshot(&source, &sub.scope, sub.peer_svid.as_ref());
     let mut state = StreamState {
         last_acked: None,
         in_flight: Some(initial.version.clone()),
         last_sent: Some(initial.clone()),
     };
     if send_content(&tx, initial).await.is_err() {
-        registry.disconnect(&node_id);
+        registry.disconnect(&sub.node_id);
         return;
     }
 
@@ -403,7 +491,7 @@ async fn run_stream(
                     Ok(Some(client_msg)) => {
                         match client_msg.kind {
                             Some(CKind::Ack(ack)) => {
-                                if handle_ack(&node_id, &scope, ack, &source, &registry, &tx, &mut state)
+                                if handle_ack(&sub, ack, &source, &registry, &tx, &mut state)
                                     .await
                                     .is_err()
                                 {
@@ -411,7 +499,7 @@ async fn run_stream(
                                 }
                             }
                             Some(CKind::Nack(nack)) => {
-                                if handle_nack(&node_id, &nack, &state.last_sent, &tx)
+                                if handle_nack(&sub.node_id, &nack, &state.last_sent, &tx)
                                     .await
                                     .is_err()
                                 {
@@ -420,22 +508,22 @@ async fn run_stream(
                             }
                             Some(CKind::Subscribe(_)) => {
                                 // Duplicate Subscribe mid-stream; ignore (idempotent).
-                                debug!(node_id, "discovery: duplicate Subscribe ignored");
+                                debug!(node_id = %sub.node_id, "discovery: duplicate Subscribe ignored");
                             }
                             None => {
                                 debug!(
-                                    node_id,
+                                    node_id = %sub.node_id,
                                     "discovery: unrecognised ClientMessage kind, ignoring"
                                 );
                             }
                         }
                     }
                     Ok(None) => {
-                        debug!(node_id, "discovery: client disconnected (stream closed)");
+                        debug!(node_id = %sub.node_id, "discovery: client disconnected (stream closed)");
                         break;
                     }
                     Err(e) => {
-                        warn!(node_id, error = %e, "discovery: stream error from client");
+                        warn!(node_id = %sub.node_id, error = %e, "discovery: stream error from client");
                         break;
                     }
                 }
@@ -445,10 +533,10 @@ async fn run_stream(
             _ = rebuild_rx.changed() => {
                 if state.in_flight.is_some() {
                     // A snapshot is already awaiting Ack; coalesce this rebuild.
-                    debug!(node_id, "discovery: rebuild while in-flight, coalescing");
+                    debug!(node_id = %sub.node_id, "discovery: rebuild while in-flight, coalescing");
                     continue;
                 }
-                let current = build_snapshot(&source, &scope);
+                let current = build_snapshot(&source, &sub.scope, sub.peer_svid.as_ref());
                 if Some(current.version.as_str()) != state.last_acked.as_deref() {
                     state.in_flight = Some(current.version.clone());
                     state.last_sent = Some(current.clone());
@@ -457,7 +545,7 @@ async fn run_stream(
                     }
                 } else {
                     debug!(
-                        node_id,
+                        node_id = %sub.node_id,
                         "discovery: rebuild produced same version as last Ack — no push needed"
                     );
                 }
@@ -465,7 +553,7 @@ async fn run_stream(
         }
     }
 
-    registry.disconnect(&node_id);
+    registry.disconnect(&sub.node_id);
 }
 
 /// Handle an `Ack` from the client.
@@ -476,21 +564,20 @@ async fn run_stream(
 ///
 /// Returns `Err(())` if the outbound channel is closed.
 async fn handle_ack(
-    node_id: &str,
-    scope: &Scope,
+    sub: &StreamSubscription,
     ack: p::Ack,
     source: &SnapshotSource,
     registry: &SharedNodeRegistry,
     tx: &mpsc::Sender<Result<p::ServerMessage, Status>>,
     state: &mut StreamState,
 ) -> Result<(), ()> {
-    debug!(node_id, version = %ack.version, "discovery: Ack received");
-    registry.record_ack(node_id, ack.version.clone(), SystemTime::now());
+    debug!(node_id = %sub.node_id, version = %ack.version, "discovery: Ack received");
+    registry.record_ack(&sub.node_id, ack.version.clone(), SystemTime::now());
     state.last_acked = Some(ack.version);
     state.in_flight = None;
 
     // Check current world against the just-Ack'd version.
-    let current = build_snapshot(source, scope);
+    let current = build_snapshot(source, &sub.scope, sub.peer_svid.as_ref());
     if Some(current.version.as_str()) != state.last_acked.as_deref() {
         state.in_flight = Some(current.version.clone());
         state.last_sent = Some(current.clone());
@@ -887,6 +974,92 @@ mod tests {
             .await;
     }
 
+    // ── scope validation (#427) ───────────────────────────────────────────────
+
+    /// Open a stream using a custom `Subscribe` message (not the helpers).
+    ///
+    /// Returns `Err(Status)` when the server rejects the Subscribe synchronously,
+    /// `Ok((tx, inbound))` otherwise.
+    async fn open_stream_with_subscribe(
+        addr: SocketAddr,
+        subscribe: p::Subscribe,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Sender<ClientMessage>,
+            tonic::Streaming<ServerMessage>,
+        ),
+        tonic::Status,
+    > {
+        use crate::proto::v1::discovery_client::DiscoveryClient as TonicClient;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ClientMessage>(16);
+        tx.send(ClientMessage {
+            kind: Some(CKind::Subscribe(subscribe)),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("invariant: pre-send channel is open: {e}"));
+
+        let channel = Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect_lazy();
+        let mut grpc = TonicClient::new(channel);
+        let response = grpc.stream(ReceiverStream::new(rx)).await?;
+        Ok((tx, response.into_inner()))
+    }
+
+    #[tokio::test]
+    async fn empty_scope_discriminator_returns_invalid_argument() {
+        // A `Scope {}` with `kind == None` must be rejected immediately with
+        // INVALID_ARGUMENT — it must not silently promote to SharedPool.
+        let h = start_harness().await;
+        let err = open_stream_with_subscribe(
+            h.addr,
+            p::Subscribe {
+                node_id: "bad-scope-node".to_owned(),
+                wire_version: WIRE_VERSION,
+                scope: Some(p::Scope { kind: None }),
+            },
+        )
+        .await
+        .expect_err("subscribe with empty scope must be rejected");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "got: {err:?}",);
+    }
+
+    #[tokio::test]
+    async fn gateway_scope_without_peer_svid_skips_check() {
+        // On the plaintext path no PeerSvid is injected, so the binding check is
+        // skipped and the stream opens normally. This is the fail-open path for
+        // test/degraded-mode connections where mTLS is not established.
+        let h = start_harness().await;
+        let (tx, mut inbound) = open_stream_with_subscribe(
+            h.addr,
+            p::Subscribe {
+                node_id: "plaintext-gateway-node".to_owned(),
+                wire_version: WIRE_VERSION,
+                scope: Some(crate::wire::scope_to_wire(
+                    &crate::subscription::Scope::Gateway {
+                        name: "some-gw".to_owned(),
+                        namespace: "prod".to_owned(),
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("plaintext Gateway scope must be accepted when no PeerSvid is present");
+
+        // Should receive a snapshot (empty since no dedicated entry, but the
+        // stream opened — the check was skipped, not denied).
+        let snap = recv_snapshot(&mut inbound).await;
+        let gw_routing = snap.gateway_routing.unwrap_or_default();
+        assert!(
+            gw_routing.ports.is_empty(),
+            "no dedicated entry → empty gateway snapshot"
+        );
+        drop(tx);
+    }
+
     // ── scope-aware snapshot dispatch (#426) ──────────────────────────────────
 
     /// Build a `SnapshotSource` whose dedicated registry holds one entry for
@@ -902,6 +1075,9 @@ mod tests {
             tls: Arc::new(TlsStore::default()),
             client_certs: Arc::new(ClientCertStore::default()),
             listener_health: lh,
+            // Test value; scope-binding tests in tests/scope_binding.rs set the
+            // real expected_proxy_sa and exercise the matching logic end-to-end.
+            expected_proxy_sa: format!("{}-coxswain", key.name),
         });
         let mut map = HashMap::new();
         map.insert(key.clone(), snap);
@@ -920,6 +1096,9 @@ mod tests {
                 name: "gw-a".to_owned(),
                 namespace: "prod".to_owned(),
             },
+            // No peer SVID in plaintext unit tests; SVID binding is exercised in
+            // tests/scope_binding.rs over real TLS.
+            None,
         );
 
         let lh = snap.listener_health;
@@ -951,6 +1130,7 @@ mod tests {
                 name: "gw-b".to_owned(),
                 namespace: "prod".to_owned(),
             },
+            None,
         );
 
         assert!(
@@ -968,7 +1148,7 @@ mod tests {
         let key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
         let source = source_with_dedicated_entry(&key);
 
-        let snap = build_snapshot(&source, &Scope::SharedPool);
+        let snap = build_snapshot(&source, &Scope::SharedPool, None);
 
         assert!(
             snap.listener_health.entries.is_empty(),

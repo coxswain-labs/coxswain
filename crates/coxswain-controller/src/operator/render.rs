@@ -58,6 +58,7 @@
 use super::merge::strategic_merge_pod_template;
 use super::params::EffectiveParams;
 use coxswain_core::crd::ServiceType;
+use coxswain_core::naming::gep1762_resource_name;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
@@ -209,12 +210,14 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
 ///
 /// Shared with the reconciler's migration-cleanup path so the name it deletes
 /// is derived from the same single source of truth that provisioning rendered.
+/// Delegates to [`coxswain_core::naming::gep1762_resource_name`] — the same
+/// formula used by the discovery scope-binding check.
 pub(super) fn resource_name(gateway: &Gateway, class_name: &str) -> String {
     let gw_name =
         gateway.metadata.name.as_deref().unwrap_or_else(|| {
             panic!("invariant: Gateway has no name; the API server requires it")
         });
-    format!("{gw_name}-{class_name}")
+    gep1762_resource_name(gw_name, class_name)
 }
 
 /// Reserved-set GEP-1762 labels for one Gateway. Used internally by

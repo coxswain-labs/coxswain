@@ -57,6 +57,19 @@ pub struct DedicatedRoutingSnapshot {
     pub client_certs: Arc<ClientCertStore>,
     /// Listener-health map containing exactly the owning Gateway's entry.
     pub listener_health: HashMap<ObjectKey, GatewayListenerHealth>,
+    /// ServiceAccount name (GEP-1762 `{gateway-name}-{gatewayclass-name}`) of
+    /// the dedicated proxy pod for this Gateway.
+    ///
+    /// The dedicated proxy's SVID is
+    /// `spiffe://<trust-domain>/ns/<key.namespace>/sa/<expected_proxy_sa>`.
+    /// The discovery server verifies that a `Scope::Gateway` claim's SVID
+    /// matches this field — a proxy authenticating with any other SA identity
+    /// receives `PERMISSION_DENIED`.
+    ///
+    /// Stamped by the reconciler using [`crate::naming::gep1762_resource_name`],
+    /// the same formula the operator uses to provision the ServiceAccount, so
+    /// the binding check and provisioning can never disagree.
+    pub expected_proxy_sa: String,
 }
 
 /// Lock-free registry mapping each cut-over Gateway [`ObjectKey`] to its
@@ -83,6 +96,7 @@ mod tests {
             tls: Arc::new(TlsStore::default()),
             client_certs: Arc::new(ClientCertStore::default()),
             listener_health: HashMap::new(),
+            expected_proxy_sa: "gw-a-coxswain".to_owned(),
         })
     }
 

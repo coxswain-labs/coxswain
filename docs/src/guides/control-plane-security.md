@@ -139,6 +139,48 @@ causes no routing gap and no dropped requests.
 The controller's own server certificate is long-lived and refreshed when the
 controller pod restarts.
 
+## SVID identity and Gateway scope binding
+
+Every proxy's SVID is derived from its Kubernetes ServiceAccount — the identity
+that the `TokenReview` check validates at bootstrap. The table below shows the
+canonical form for each deployment model:
+
+| Proxy role | ServiceAccount | SVID |
+|---|---|---|
+| Shared-pool proxy | `coxswain-shared-proxy` | `spiffe://<trust-domain>/ns/<ns>/sa/coxswain-shared-proxy` |
+| Dedicated (per-Gateway) proxy | `<gateway-name>-<gatewayclass-name>` | `spiffe://<trust-domain>/ns/<gateway-ns>/sa/<gateway-name>-<gatewayclass-name>` |
+
+The dedicated proxy SA name follows [GEP-1762](https://gateway-api.sigs.k8s.io/geps/gep-1762/):
+it is the same name the controller uses for the provisioned Deployment, Service,
+and ServiceAccount. For example, a Gateway `prod/my-gw` of class `coxswain` runs
+as SA `my-gw-coxswain` with SVID
+`spiffe://<trust-domain>/ns/prod/sa/my-gw-coxswain`.
+
+### Scope binding enforcement
+
+A dedicated proxy subscribes with `Scope::Gateway { name, namespace }` to
+receive only its own Gateway's routing snapshot. The stream handler enforces that
+the claimed Gateway matches the peer's authenticated SVID:
+
+1. The controller stamps the expected proxy SA (`{gw}-{class}`) into the
+   Gateway's dedicated registry entry at reconcile time.
+2. When the proxy's `Subscribe` message arrives, the server extracts the URI SANs
+   from the peer's TLS client certificate (injected as request metadata by
+   `PeerSvidStream`).
+3. If the peer's SVID does not match
+   `…/ns/<claimed-namespace>/sa/<expected-sa>` the stream is closed immediately
+   with `PERMISSION_DENIED` — before any snapshot is delivered.
+
+The trust-domain prefix is validated at the TLS handshake by
+`SpiffeClientCertVerifier`, so the binding check only needs to compare the
+namespace and ServiceAccount name. A valid cert from the wrong Gateway is still
+rejected.
+
+If mTLS is not established (no peer certificate — test or degraded-mode paths
+only), the binding check is skipped and the stream is fail-open. In production
+there is no plaintext discovery server; `SpiffeClientCertVerifier` mandates
+client auth, so every accepted stream carries a peer cert.
+
 ## Configuration
 
 See [Configuration reference](../reference/configuration.md#discovery-control-plane)
