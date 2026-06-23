@@ -29,6 +29,7 @@ export function buildQuery(opts = {}) {
 export const getFleetSummary = () => fetchJson('/api/v1/fleet/summary');
 export const getRoutingSummary = () => fetchJson('/api/v1/routing/summary');
 export const getProblems = () => fetchJson('/api/v1/problems');
+export const getTopology = () => fetchJson('/api/v1/topology');
 
 // ── Fleet (all coxswain pods) ─────────────────────────────────────────────────
 

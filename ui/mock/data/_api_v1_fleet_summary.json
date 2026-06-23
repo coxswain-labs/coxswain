@@ -10,5 +10,6 @@
   "dedicated_proxies": {
     "total": 4,
     "worst": "error"
-  }
+  },
+  "all_in_sync": false
 }

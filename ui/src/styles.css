@@ -1262,3 +1262,359 @@ input[type=checkbox] { accent-color: var(--blue); }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 .error-msg { color: var(--red); }
+
+/* ── Topology canvas ─────────────────────────────────────────────────────── */
+/* Lag notice — a pill in the canvas top bar, centered horizontally across the
+   full bar (independent of the left-aligned controls). nowrap keeps it on one
+   line; the full-bleed bar has room to spare. */
+.topo-banner {
+  position: absolute;
+  top: 0;
+  bottom: 0;            /* stretch to the bar height == controls height */
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  min-width: min(560px, 70vw);
+  background: color-mix(in srgb, var(--amber) 14%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--amber) 35%, transparent);
+  border-radius: var(--r);
+  color: var(--amber);
+  font-size: 12.5px;
+  padding: 0 20px;
+  backdrop-filter: blur(4px);
+}
+
+/* The topology screen is a full-bleed visual pane: it fills the width and the
+   height below the fixed nav (see .content--full), and the canvas grows to
+   take everything inside it. */
+.topo-screen {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.content--full {
+  max-width: none;
+  padding: 0;
+}
+.content--full .topo-screen {
+  height: calc(100vh - var(--nav-h));
+}
+.content--full .topo-canvas {
+  border-radius: 0;
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+}
+
+.topo-canvas {
+  position: relative;
+  background: #0c0e18;
+  background-image: radial-gradient(circle, #252840 1px, transparent 1px);
+  background-size: 28px 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  flex: 1 1 auto;
+  min-height: 320px;
+  overflow: hidden;
+  /* flex only for the empty-state text; viewport overlays on top when present */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.topo-empty {
+  color: var(--muted);
+  font-size: 13px;
+  align-self: center;
+}
+
+/* Graph container — position:relative so the SVG overlay can fill it.
+   The large column gap is the vertical runway the push edges travel down,
+   keeping the control plane visually clear of the scope groups below. */
+.topo-graph {
+  position: relative;
+  display: inline-flex;       /* size to content, not viewport width */
+  flex-direction: column;
+  align-items: center;
+  gap: 72px;
+  padding: 36px 40px;
+}
+
+/* SVG edge overlay — z-index keeps the push edges above the group/card
+   backgrounds so they don't vanish behind tiles. pointer-events:none lets
+   clicks fall through to the cards underneath. */
+.topo-edges {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 5;
+  pointer-events: none;
+  overflow: visible;
+}
+.topo-edge-path {
+  stroke: rgba(180, 188, 208, 0.4);
+  stroke-width: 1.75;
+  fill: none;
+  stroke-dasharray: 6 5;
+}
+
+/* Namespace group container */
+.topo-ns-group {
+  background: color-mix(in srgb, var(--surface2) 60%, transparent);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.topo-ns-group--cluster {
+  border-color: color-mix(in srgb, var(--blue) 50%, var(--border));
+}
+
+.topo-ns-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--blue);
+}
+
+/* Controller card */
+.topo-ctrl-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--border);
+  border-radius: var(--r);
+  padding: 12px 16px;
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+/* Leader drives discovery — highlighted; standbys muted; degraded/gone flagged. */
+.topo-ctrl-card--leader   { border-top-color: var(--blue); }
+.topo-ctrl-card--standby  { border-top-color: var(--border); opacity: 0.82; }
+.topo-ctrl-card--degraded { border-top-color: var(--amber); }
+.topo-ctrl-card--gone     { border-top-color: var(--red); opacity: 0.7; }
+.topo-card-kind {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.topo-card-kind--ctrl { color: var(--blue); }
+.topo-card-meta {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* Scope section (Shared pool / Gateway: name) */
+.topo-scope-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.topo-scope-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Row of proxy node cards */
+.topo-nodes-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+/* Sync status dot */
+.topo-sync-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: inline-block;
+}
+.topo-sync-dot.ok   { background: var(--green); }
+.topo-sync-dot.warn { background: var(--amber); }
+.topo-sync-dot.err  { background: var(--red); }
+
+/* Proxy node card */
+.topo-proxy-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: var(--r);
+  padding: 10px 14px;
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.topo-proxy-card--ok   { border-left-color: var(--green); }
+.topo-proxy-card--warn { border-left-color: var(--amber); }
+
+/* Clickable cards deep-link to the Fleet detail. */
+.topo-card--link { cursor: pointer; transition: border-color 0.12s, background 0.12s, transform 0.12s; }
+.topo-card--link:hover {
+  border-color: color-mix(in srgb, var(--blue) 55%, var(--border));
+  background: color-mix(in srgb, var(--blue) 8%, var(--surface));
+  transform: translateY(-1px);
+}
+.topo-card--link:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.topo-proxy-id {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text);
+  font-family: ui-monospace, monospace;
+  white-space: nowrap;
+}
+.topo-proxy-status {
+  font-size: 12px;
+  font-weight: 600;
+}
+.topo-proxy-card--ok   .topo-proxy-status { color: var(--green); }
+.topo-proxy-card--warn .topo-proxy-status { color: var(--amber); }
+
+.topo-proxy-meta {
+  display: flex;
+  gap: 5px;
+  align-items: baseline;
+  font-size: 11px;
+}
+.topo-meta-label {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.topo-meta-val {
+  color: var(--text);
+  font-family: ui-monospace, monospace;
+  word-break: break-all;
+}
+
+/* Pannable / zoomable viewport — fills the canvas, clips overflow. */
+.topo-viewport {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  cursor: grab;
+  /* Dragging the background must not select card text. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+.topo-viewport:active { cursor: grabbing; }
+
+/* Inner layer the transform (translate + scale) is applied to. */
+.topo-transform {
+  position: absolute;
+  top: 0;
+  left: 0;
+  will-change: transform;
+}
+
+/* Top bar pinned to the viewport: controls on the left, lag pill on the right.
+   pointer-events:none on the bar lets drags start in the empty gap between
+   them; the children re-enable their own interactivity. */
+.topo-topbar {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  right: 12px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  pointer-events: none;
+}
+.topo-topbar > * { pointer-events: auto; }
+
+/* Floating zoom + pan controls. */
+.topo-zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 7px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  backdrop-filter: blur(4px);
+  cursor: default;
+}
+.topo-zoom-btn {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.topo-zoom-btn:hover { background: var(--border); }
+.topo-zoom-level {
+  min-width: 42px;
+  text-align: center;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.topo-ctrl-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 2px;
+  background: var(--border);
+}
+
+/* Control-plane band centers its group above the scope groups. */
+.topo-ctrl-band {
+  display: flex;
+  justify-content: center;
+}
+/* Standbys fill a horizontal top row; the leader is centered in the row below.
+   Compact, and the leader stays bottom-most so its edges don't cross standbys. */
+.topo-ctrl-standbys {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 12px;
+}
+.topo-ctrl-leader-row {
+  display: flex;
+  justify-content: center;
+}
+/* Control-plane group mirrors the cluster group's accent. */
+.topo-ns-group--ctrl {
+  border-color: color-mix(in srgb, var(--blue) 50%, var(--border));
+}
+
+/* Scope groups laid out horizontally so namespaces don't stack vertically. */
+.topo-groups-row {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 56px 64px;   /* row-gap col-gap — generous breathing room between namespaces */
+}

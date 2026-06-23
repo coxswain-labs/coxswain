@@ -31,6 +31,6 @@ pub use identity::{
     TokenAuthenticator,
 };
 pub use listener_health::SharedGatewayListenerHealth;
-pub use node_registry::{NodeEntry, NodeRegistry, SharedNodeRegistry};
+pub use node_registry::{NodeEntry, NodeRegistry, NodeScope, SharedNodeRegistry};
 pub use shared::Shared;
 pub use source::RoutingSource;

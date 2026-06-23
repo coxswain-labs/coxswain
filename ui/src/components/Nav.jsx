@@ -78,6 +78,7 @@ export function Nav({ activeScreen }) {
 
   const links = [
     { href: '#/dashboard', key: 'dashboard', label: 'Dashboard' },
+    { href: '#/topology',  key: 'topology',  label: 'Topology' },
     { href: '#/fleet',     key: 'fleet',     label: 'Fleet' },
     { href: '#/routing',   key: 'routing',   label: 'Routing' },
     { href: '#/events',    key: 'events',    label: 'Events' },

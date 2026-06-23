@@ -93,9 +93,13 @@ impl OperatorAggregator {
 
     /// `GET /api/v1/fleet/summary` — compact per-category counts + worst severity
     /// for controllers, shared proxies, and dedicated proxies (the Dashboard's
-    /// three fleet tiles). Backs the tiles without shipping the full pod lists.
-    /// Reuses the per-pod `/health` probe (a pod is `error` when unreachable,
-    /// `warn` when degraded, else `ok`).
+    /// three fleet tiles), plus `all_in_sync` for the topology convergence banner.
+    /// Backs the tiles without shipping the full pod lists. Reuses the per-pod
+    /// `/health` probe (a pod is `error` when unreachable, `warn` when degraded,
+    /// else `ok`).
+    ///
+    /// `all_in_sync` is `true` vacuously when discovery is not active (dev/proxy
+    /// roles have no registry) — the UI banner only appears when it is `false`.
     pub(crate) async fn fleet_summary(&self) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
         let controllers: Vec<FleetEntry> = snapshot.controllers.to_vec();
@@ -106,10 +110,12 @@ impl OperatorAggregator {
             self.category_health(&shared),
             self.category_health(&dedicated),
         );
+        let all_in_sync = self.node_registry.as_ref().is_none_or(|r| r.all_in_sync());
         let body = serde_json::json!({
             "controllers": controllers,
             "shared_proxies": shared_proxies,
             "dedicated_proxies": dedicated_proxies,
+            "all_in_sync": all_in_sync,
         });
         json_response(body.to_string())
     }

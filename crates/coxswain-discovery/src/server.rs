@@ -33,7 +33,7 @@ use tracing::{debug, warn};
 
 use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
 use coxswain_core::listener_health::SharedGatewayListenerHealth;
-use coxswain_core::node_registry::SharedNodeRegistry;
+use coxswain_core::node_registry::{NodeScope, SharedNodeRegistry};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
@@ -382,7 +382,8 @@ impl Discovery for DiscoveryService {
 
         // Register the node before spawning so connect() is visible
         // even if the first snapshot races with a load().
-        self.registry.connect(&node_id, SystemTime::now());
+        self.registry
+            .connect(&node_id, node_scope_from(&scope), SystemTime::now());
 
         let source = self.source.clone();
         let registry = self.registry.clone();
@@ -458,6 +459,20 @@ struct StreamState {
     last_sent: Option<SnapshotContent>,
 }
 
+/// Map a discovery [`Scope`] to the core-local [`NodeScope`] mirror.
+///
+/// `coxswain-admin` consumes [`NodeScope`] without importing `coxswain-discovery`,
+/// so the conversion lives here at the crate boundary.
+fn node_scope_from(scope: &Scope) -> NodeScope {
+    match scope {
+        Scope::SharedPool => NodeScope::SharedPool,
+        Scope::Gateway { name, namespace } => NodeScope::Gateway {
+            namespace: namespace.clone(),
+            name: name.clone(),
+        },
+    }
+}
+
 /// Drive the push-after-Ack state machine for one connected proxy node.
 ///
 /// Exits when the client disconnects, the outbound channel closes, or a stream
@@ -473,6 +488,7 @@ async fn run_stream(
 ) {
     // Send the initial snapshot immediately on stream open.
     let initial = build_snapshot(&source, &sub.scope, sub.peer_svid.as_ref());
+    registry.record_target(&sub.node_id, initial.version.clone());
     let mut state = StreamState {
         last_acked: None,
         in_flight: Some(initial.version.clone()),
@@ -537,6 +553,7 @@ async fn run_stream(
                     continue;
                 }
                 let current = build_snapshot(&source, &sub.scope, sub.peer_svid.as_ref());
+                registry.record_target(&sub.node_id, current.version.clone());
                 if Some(current.version.as_str()) != state.last_acked.as_deref() {
                     state.in_flight = Some(current.version.clone());
                     state.last_sent = Some(current.clone());
@@ -578,6 +595,7 @@ async fn handle_ack(
 
     // Check current world against the just-Ack'd version.
     let current = build_snapshot(source, &sub.scope, sub.peer_svid.as_ref());
+    registry.record_target(&sub.node_id, current.version.clone());
     if Some(current.version.as_str()) != state.last_acked.as_deref() {
         state.in_flight = Some(current.version.clone());
         state.last_sent = Some(current.clone());

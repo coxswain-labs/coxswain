@@ -1231,3 +1231,177 @@ async fn sha1_htpasswd_credential_emits_warning_event() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// After the shared proxy connects and completes its initial discovery handshake,
+/// `/api/v1/topology` must show a SharedPool node with `in_sync == true` and
+/// `/api/v1/fleet/summary` must carry `all_in_sync == true` (#379).
+///
+/// The test polls until convergence rather than doing a single fetch: the proxy
+/// may not have Ack'd the first snapshot by the time we reach this assertion.
+#[tokio::test]
+async fn topology_shows_proxy_in_sync_after_ack() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let client = reqwest::Client::new();
+
+    // Poll /api/v1/topology until a SharedPool node with in_sync=true appears.
+    let topo_url = h.controller_admin_url("/api/v1/topology");
+    let topo: serde_json::Value = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || {
+            let url = topo_url.clone();
+            let c = client.clone();
+            async move {
+                match c.get(&url).send().await {
+                    Ok(r) => match r.json::<serde_json::Value>().await {
+                        Ok(j) => format!(
+                            "a SharedPool node with in_sync=true in /api/v1/topology; \
+                             last body={j}"
+                        ),
+                        Err(e) => format!("a SharedPool node with in_sync=true; decode error: {e}"),
+                    },
+                    Err(e) => format!("a SharedPool node with in_sync=true; request error: {e}"),
+                }
+            }
+        },
+        || {
+            let url = topo_url.clone();
+            let c = client.clone();
+            async move {
+                let json: serde_json::Value = c.get(&url).send().await.ok()?.json().await.ok()?;
+                let nodes = json["nodes"].as_array()?;
+                let any_in_sync = nodes.iter().any(|n| {
+                    n["scope"]["kind"].as_str() == Some("SharedPool")
+                        && n["in_sync"].as_bool() == Some(true)
+                });
+                any_in_sync.then_some(json)
+            }
+        },
+    )
+    .await?;
+
+    // discovery_active must be true on the controller role.
+    assert_eq!(
+        topo["discovery_active"],
+        serde_json::Value::Bool(true),
+        "controller role must report discovery_active=true"
+    );
+
+    // controller_version must be populated (discovery built at least one snapshot).
+    assert!(
+        topo["controller_version"].is_string(),
+        "controller_version must be a string when nodes are connected; got: {topo}"
+    );
+
+    // Every connected SharedPool node must be in sync (steady state).
+    let nodes = topo["nodes"]
+        .as_array()
+        .expect("topology.nodes must be an array");
+    let shared: Vec<_> = nodes
+        .iter()
+        .filter(|n| n["scope"]["kind"].as_str() == Some("SharedPool"))
+        .collect();
+    assert!(
+        !shared.is_empty(),
+        "at least one SharedPool node must be connected"
+    );
+    for n in &shared {
+        assert_eq!(
+            n["in_sync"],
+            serde_json::Value::Bool(true),
+            "SharedPool node {} must be in sync; got {n}",
+            n["node_id"]
+        );
+        // last_acked_version must match controller_version.
+        assert_eq!(
+            n["last_acked_version"], topo["controller_version"],
+            "SharedPool node {} must have acked the current controller version",
+            n["node_id"]
+        );
+    }
+
+    // /api/v1/fleet/summary.all_in_sync must also be true.
+    let summary_url = h.controller_admin_url("/api/v1/fleet/summary");
+    let summary: serde_json::Value = client.get(&summary_url).send().await?.json().await?;
+    assert_eq!(
+        summary["all_in_sync"],
+        serde_json::Value::Bool(true),
+        "fleet/summary.all_in_sync must be true when all nodes are converged; got {summary}"
+    );
+
+    Ok(())
+}
+
+/// After a routing change causes the controller to build a new SharedPool snapshot,
+/// the proxy re-converges: `/api/v1/topology` transitions back to `in_sync == true`
+/// and `/api/v1/fleet/summary.all_in_sync` returns to `true` (#379).
+///
+/// We trigger the routing change by applying a new Ingress, wait for the route to
+/// be live (guarantees the snapshot advanced), then poll until re-convergence.
+/// The transient `in_sync=false` state is non-deterministic (proxy may Ack before
+/// we check), so we assert the steady-state outcome, not the transient. A core
+/// unit test covers the lag-arithmetic path deterministically.
+#[tokio::test]
+async fn topology_reconverges_after_routing_change() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-topo-reconverge").await?;
+    let client = reqwest::Client::new();
+
+    // Apply a backend + Ingress to trigger a routing-table rebuild.
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("ingress.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+
+    // Poll /api/v1/topology until the proxy has re-converged on the new version.
+    let topo_url = h.controller_admin_url("/api/v1/topology");
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || {
+            let url = topo_url.clone();
+            let c = client.clone();
+            async move {
+                match c.get(&url).send().await {
+                    Ok(r) => match r.json::<serde_json::Value>().await {
+                        Ok(j) => format!(
+                            "all SharedPool nodes to re-converge after routing change; \
+                             last body={j}"
+                        ),
+                        Err(e) => format!("re-convergence; decode error: {e}"),
+                    },
+                    Err(e) => format!("re-convergence; request error: {e}"),
+                }
+            }
+        },
+        || {
+            let url = topo_url.clone();
+            let c = client.clone();
+            async move {
+                let json: serde_json::Value = c.get(&url).send().await.ok()?.json().await.ok()?;
+                let nodes = json["nodes"].as_array()?;
+                let shared: Vec<_> = nodes
+                    .iter()
+                    .filter(|n| n["scope"]["kind"].as_str() == Some("SharedPool"))
+                    .collect();
+                let all_synced = !shared.is_empty()
+                    && shared.iter().all(|n| n["in_sync"].as_bool() == Some(true));
+                all_synced.then_some(json)
+            }
+        },
+    )
+    .await?;
+
+    // Confirm all_in_sync in the fleet summary.
+    let summary_url = h.controller_admin_url("/api/v1/fleet/summary");
+    let summary: serde_json::Value = client.get(&summary_url).send().await?.json().await?;
+    assert_eq!(
+        summary["all_in_sync"],
+        serde_json::Value::Bool(true),
+        "fleet/summary.all_in_sync must be true after re-convergence; got {summary}"
+    );
+
+    Ok(())
+}
