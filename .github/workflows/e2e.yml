@@ -176,6 +176,8 @@ jobs:
             test: resilience
           - suite: observability
             test: observability
+          - suite: discovery
+            test: discovery
     steps:
       # Checkout is required because the test binaries embed
       # CARGO_MANIFEST_DIR at compile time and read fixture YAML / Helm chart
@@ -284,6 +286,7 @@ jobs:
           - suite: provisioning-rbac
           - suite: resilience
           - suite: observability
+          - suite: discovery
     steps:
       - run: echo "No code changes — skipping suite ${{ matrix.suite }}"
 

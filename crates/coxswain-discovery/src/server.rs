@@ -332,6 +332,9 @@ impl Discovery for DiscoveryService {
         let sub = read_subscribe(&mut inbound).await?;
 
         if sub.wire_version != WIRE_VERSION {
+            crate::metrics::streams_total()
+                .with_label_values(&["rejected"])
+                .inc();
             return Err(Status::failed_precondition(format!(
                 "discovery wire version mismatch: server={WIRE_VERSION}, client={}",
                 sub.wire_version,
@@ -345,8 +348,12 @@ impl Discovery for DiscoveryService {
         // prevent a zero-value message from silently escalating to SharedPool (#427).
         let scope = match sub.scope.as_ref() {
             None => Scope::SharedPool,
-            Some(dto) => scope_from_wire(dto)
-                .map_err(|e| Status::invalid_argument(format!("discovery: invalid scope: {e}")))?,
+            Some(dto) => scope_from_wire(dto).map_err(|e| {
+                crate::metrics::streams_total()
+                    .with_label_values(&["rejected"])
+                    .inc();
+                Status::invalid_argument(format!("discovery: invalid scope: {e}"))
+            })?,
         };
 
         // Gap A — open-time scope binding (#427): verify that a Gateway scope
@@ -372,6 +379,9 @@ impl Discovery for DiscoveryService {
                     &entry.expected_proxy_sa,
                 )
             {
+                crate::metrics::streams_total()
+                    .with_label_values(&["rejected"])
+                    .inc();
                 return Err(Status::permission_denied(
                     "scope claim does not match authenticated SVID identity",
                 ));
@@ -384,6 +394,10 @@ impl Discovery for DiscoveryService {
         // even if the first snapshot races with a load().
         self.registry
             .connect(&node_id, node_scope_from(&scope), SystemTime::now());
+        crate::metrics::streams_total()
+            .with_label_values(&["accepted"])
+            .inc();
+        crate::metrics::connected_proxies().inc();
 
         let source = self.source.clone();
         let registry = self.registry.clone();
@@ -496,6 +510,7 @@ async fn run_stream(
     };
     if send_content(&tx, initial).await.is_err() {
         registry.disconnect(&sub.node_id);
+        crate::metrics::connected_proxies().dec();
         return;
     }
 
@@ -571,6 +586,7 @@ async fn run_stream(
     }
 
     registry.disconnect(&sub.node_id);
+    crate::metrics::connected_proxies().dec();
 }
 
 /// Handle an `Ack` from the client.
@@ -590,6 +606,7 @@ async fn handle_ack(
 ) -> Result<(), ()> {
     debug!(node_id = %sub.node_id, version = %ack.version, "discovery: Ack received");
     registry.record_ack(&sub.node_id, ack.version.clone(), SystemTime::now());
+    crate::metrics::acks_total().inc();
     state.last_acked = Some(ack.version);
     state.in_flight = None;
 

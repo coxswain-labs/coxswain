@@ -311,7 +311,20 @@ impl Supervisor {
         let mut svid_rotation_rx: Option<watch::Receiver<u64>> = self.config.svid_rotated.take();
         let mut attempt: u32 = 0;
 
+        // Pending until the first snapshot lands; published so the proxy
+        // `/metrics` reflects channel state from process start.
+        crate::metrics::client_state().set(crate::metrics::STATE_PENDING);
+
+        let mut first_connect = true;
         loop {
+            // Every iteration past the first is a reconnect (channel rebuild
+            // after a drop or an SVID rotation).
+            if first_connect {
+                first_connect = false;
+            } else {
+                crate::metrics::client_reconnects_total().inc();
+            }
+
             // Rebuild the channel on every iteration so a fresh SVID from
             // the bootstrap loop is picked up after a rotation-triggered
             // reconnect.
@@ -337,6 +350,7 @@ impl Supervisor {
                     &self.health_check,
                     "disconnected from discovery server, serving last-good snapshot",
                 );
+                crate::metrics::client_state().set(crate::metrics::STATE_DEGRADED);
             }
 
             // Reset the backoff exponent if the session delivered at least one
@@ -447,10 +461,14 @@ impl Supervisor {
                         break;
                     }
                     applied_this_session = true;
-                    if !self.has_snapshot {
-                        self.has_snapshot = true;
-                        self.health.ready(&self.health_check);
-                    }
+                    self.has_snapshot = true;
+                    // Mark Ready on every applied snapshot, not just the first:
+                    // after a disconnect flips the subsystem to Degraded, the
+                    // post-reconnect snapshot must clear it back to Ready (the
+                    // documented transition). `ready()` is idempotent, so
+                    // re-marking on steady-state applies is a no-op.
+                    self.health.ready(&self.health_check);
+                    crate::metrics::client_state().set(crate::metrics::STATE_READY);
                 }
                 Err(e) => {
                     // Last-good snapshot is retained; health stays as-is because the
@@ -1054,6 +1072,33 @@ mod tests {
             registry.is_ready(),
             "registry must report is_ready() == true when Degraded"
         );
+
+        // Reconnect: the supervisor retries against the still-listening server.
+        // Accept the new stream, drain its Subscribe, and push a fresh snapshot.
+        let (srv_tx2, mut cli_rx2) =
+            tokio::time::timeout(Duration::from_secs(5), connect_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli_rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        srv_tx2
+            .send(Ok(empty_snapshot("v2", vec![2])))
+            .await
+            .unwrap();
+
+        // The post-reconnect snapshot must clear Degraded back to Ready — the
+        // documented transition. Before the fix this never fired (health.ready
+        // was gated on the first snapshot only), so the subsystem stayed
+        // Degraded for the process lifetime.
+        poll_until(Duration::from_secs(5), || {
+            let snap = registry.snapshot();
+            let disc = snap.subsystems.get("disc")?;
+            matches!(disc.state, CheckState::Ready).then_some(())
+        })
+        .await;
     }
 
     /// `backoff_jitter` always returns a value within `[0, min(cap, base * 2^attempt)]`.

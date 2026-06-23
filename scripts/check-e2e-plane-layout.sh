@@ -17,6 +17,7 @@ TESTS_DIR="crates/coxswain-e2e/tests"
 # The approved set of behaviour planes. A test belongs to the plane of its
 # *primary assertion target* (see each file's header). Keep this sorted.
 ALLOWED=(
+  discovery
   observability
   provisioning_rbac
   resilience

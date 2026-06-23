@@ -8,3 +8,4 @@
 #![allow(dead_code)]
 
 pub mod dedicated;
+pub mod discovery;
