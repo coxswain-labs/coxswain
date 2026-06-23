@@ -824,6 +824,7 @@ dependencies = [
  "coxswain-core",
  "http",
  "ipnet",
+ "prometheus 0.14.0",
  "prost",
  "protox",
  "rcgen",

@@ -2,10 +2,11 @@
 
 ## Metrics
 
-Coxswain exposes the Prometheus endpoint at `http://<admin-address>:<admin-port>/metrics` (default port `8082`). Series are emitted under one of two prefixes that identify the pod role:
+Coxswain exposes the Prometheus endpoint at `http://<admin-address>:<admin-port>/metrics` (default port `8082`). Series are emitted under one of three prefixes:
 
 - `coxswain_proxy_*` — emitted by `serve proxy --shared`, `serve proxy --dedicated`, and the proxy half of `serve dev`.
 - `coxswain_controller_*` — emitted by `serve controller` and the controller half of `serve dev`.
+- `coxswain_discovery_*` — the control-plane gRPC channel. Server-side series appear on the **controller** `/metrics` (it serves the stream); client-side series appear on each **proxy** `/metrics` (it consumes the stream). In `serve dev` both halves run in one process, so both appear together.
 
 The `route` Prometheus label is a **stable rule identifier**, not a request path. Operators reading `coxswain_proxy_requests_total{route="httproute/checkout/api:0"}` see the same label value on the matching access-log line's `route_id` field, so a Grafana → Loki/Tempo pivot is an exact join (no fuzzy host/path matching). Path patterns stay on the access log for human-readable display.
 
@@ -57,6 +58,18 @@ The following listener-lifecycle metrics are also exposed: `coxswain_proxy_liste
 | `coxswain_controller_routing_table_rebuilds_total` | Counter | `result` |
 | `coxswain_controller_routing_table_rebuild_duration_seconds` | Histogram | — |
 | `coxswain_controller_tls_certs_loaded` | Gauge | `bucket` |
+
+### Discovery channel metrics (`coxswain_discovery_*`)
+
+The control-plane gRPC channel between controller (server) and proxies (clients). Server-side series are scraped from the controller `/metrics`; client-side series from each proxy `/metrics`.
+
+| Metric | Side | Type | Labels |
+|--------|------|------|--------|
+| `coxswain_discovery_connected_proxies` | Server | Gauge | — (proxy streams live now; a drop to `0` means the fleet lost its control-plane link) |
+| `coxswain_discovery_streams_total` | Server | Counter | `result` (`accepted`/`rejected`) — `rejected` covers wire-version mismatch, malformed scope, and SVID/scope-binding denial |
+| `coxswain_discovery_acks_total` | Server | Counter | — (snapshot Acks received; tracks fleet convergence throughput) |
+| `coxswain_discovery_client_reconnects_total` | Client | Counter | — (reconnect attempts; excludes the first connect — a climbing rate flags an unstable link) |
+| `coxswain_discovery_client_state` | Client | Gauge | — (`0`=pending, `1`=ready, `2`=degraded; scalar mirror of the proxy health subsystem) |
 
 ### Metric labels per Gateway
 

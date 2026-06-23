@@ -25,6 +25,7 @@ pub mod bootstrap_client;
 pub mod bootstrap_server;
 pub mod client;
 pub mod error;
+pub mod metrics;
 pub mod proto;
 pub mod registry;
 pub mod server;

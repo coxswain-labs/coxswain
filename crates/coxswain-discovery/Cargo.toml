@@ -14,6 +14,7 @@ async-trait   = { workspace = true }
 coxswain-core = { workspace = true }
 http          = { workspace = true }
 ipnet         = { workspace = true }
+prometheus    = { workspace = true }
 prost         = { workspace = true }
 rcgen         = { workspace = true }
 regex         = { workspace = true }
