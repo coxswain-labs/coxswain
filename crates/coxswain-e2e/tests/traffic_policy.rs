@@ -698,22 +698,38 @@ async fn session_affinity_header_falls_back_to_round_robin_when_header_absent() 
     let host = format!("affinity.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
 
-    let mut pods = std::collections::HashSet::new();
-    for i in 0..30 {
-        let (status, hdrs, body) = h.http.get_full(&host, "/").await?;
-        assert_eq!(status, 200, "request {i} must succeed");
-        assert!(
-            hdrs.get(reqwest::header::SET_COOKIE).is_none(),
-            "request {i}: header mode must not set a cookie even without the header"
-        );
-        if let Some(p) = body.and_then(|b| b.pod) {
-            pods.insert(p);
-        }
-    }
-    assert!(
-        pods.len() >= 2,
-        "without the affinity header, requests must round-robin across pods, saw {pods:?}"
-    );
+    // EndpointSlice propagation to the proxy can lag behind the Deployment
+    // Available condition — more so now that routing flows controller→discovery→
+    // proxy — so a single sampling pass may see only one endpoint. Poll batches of
+    // requests until ≥2 distinct pods appear, asserting the header-mode no-cookie
+    // invariant on every successful response along the way.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            "≥2 echo-aff pods to round-robin requests sent without the affinity header".to_string()
+        },
+        || async {
+            let mut pods = std::collections::HashSet::new();
+            for i in 0..30 {
+                if let Ok((status, hdrs, body)) = h.http.get_full(&host, "/").await {
+                    assert_eq!(status, 200, "request {i} must succeed");
+                    assert!(
+                        hdrs.get(reqwest::header::SET_COOKIE).is_none(),
+                        "request {i}: header mode must not set a cookie even without the header"
+                    );
+                    if let Some(p) = body.and_then(|b| b.pod) {
+                        pods.insert(p);
+                    }
+                }
+            }
+            (pods.len() >= 2).then_some(())
+        },
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!("{e} — without the affinity header, requests must round-robin across pods")
+    })?;
     Ok(())
 }
 

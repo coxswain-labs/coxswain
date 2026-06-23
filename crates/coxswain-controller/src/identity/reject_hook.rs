@@ -73,26 +73,28 @@ impl BootstrapRejectHook {
 }
 
 impl RejectHook for BootstrapRejectHook {
-    fn on_reject(&self, principal: &str, reason: &str) {
-        let recorder = self.recorder.clone();
-        let pod_ref = self.pod_ref.clone();
+    async fn on_reject(&self, principal: &str, reason: &str) {
         let note = format!("Bootstrap rejected for '{principal}': {reason}");
-        tokio::spawn(async move {
-            if let Err(e) = recorder
-                .publish(
-                    &Event {
-                        action: "BootstrapRejected".into(),
-                        reason: "BootstrapRejected".into(),
-                        note: Some(note),
-                        type_: EventType::Warning,
-                        secondary: None,
-                    },
-                    &pod_ref,
-                )
-                .await
-            {
-                tracing::warn!(error = %e, "Failed to publish BootstrapRejected Warning Event");
-            }
-        });
+        // Awaited inline by the bootstrap handler (see [`RejectHook::on_reject`]).
+        // The discovery server runs as a Pingora background service whose runtime
+        // does not reliably drive orphaned tasks, so a detached `tokio::spawn`
+        // here can silently never publish — the publish must run on the handler's
+        // own task.
+        if let Err(e) = self
+            .recorder
+            .publish(
+                &Event {
+                    action: "BootstrapRejected".into(),
+                    reason: "BootstrapRejected".into(),
+                    note: Some(note),
+                    type_: EventType::Warning,
+                    secondary: None,
+                },
+                &self.pod_ref,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to publish BootstrapRejected Warning Event");
+        }
     }
 }

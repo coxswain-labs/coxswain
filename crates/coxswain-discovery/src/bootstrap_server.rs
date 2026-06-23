@@ -48,7 +48,18 @@ pub trait RejectHook: Send + Sync {
     /// Called when a bootstrap request is rejected.  `principal` is the SA
     /// identity string extracted from the token (if authentication succeeded
     /// but something else failed), or the raw error context otherwise.
-    fn on_reject(&self, principal: &str, reason: &str);
+    ///
+    /// Awaited inline by the bootstrap handler: the controller's implementation
+    /// publishes a Kubernetes Event, and that publish must run (and surface its
+    /// failures) on the handler's own task. A detached `tokio::spawn` is unsafe
+    /// here — the discovery server runs as a Pingora background service whose
+    /// runtime does not reliably drive orphaned tasks, so a fire-and-forget
+    /// publish can silently never execute.
+    fn on_reject(
+        &self,
+        principal: &str,
+        reason: &str,
+    ) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// No-op reject hook used as the default when no event recorder is available.
@@ -56,7 +67,7 @@ pub trait RejectHook: Send + Sync {
 pub struct NoOpRejectHook;
 
 impl RejectHook for NoOpRejectHook {
-    fn on_reject(&self, _principal: &str, _reason: &str) {}
+    async fn on_reject(&self, _principal: &str, _reason: &str) {}
 }
 
 // ── BootstrapService ──────────────────────────────────────────────────────────
@@ -154,7 +165,7 @@ where
                 "wire version mismatch: server={WIRE_VERSION}, client={}",
                 req.wire_version
             );
-            self.reject_hook.on_reject("<unknown>", &reason);
+            self.reject_hook.on_reject("<unknown>", &reason).await;
             return Err(Status::failed_precondition(reason));
         }
 
@@ -163,17 +174,19 @@ where
             Ok(id) => id,
             Err(AuthnError::Unauthenticated(msg)) => {
                 warn!(reason = %msg, "bootstrap: SA token rejected");
-                self.reject_hook.on_reject("<unauthenticated>", &msg);
+                self.reject_hook.on_reject("<unauthenticated>", &msg).await;
                 return Err(Status::unauthenticated(format!("SA token rejected: {msg}")));
             }
             Err(AuthnError::ApiError(msg)) => {
                 warn!(reason = %msg, "bootstrap: TokenReview API error");
-                self.reject_hook.on_reject("<api-error>", &msg);
+                self.reject_hook.on_reject("<api-error>", &msg).await;
                 return Err(Status::internal(format!("TokenReview error: {msg}")));
             }
             Err(AuthnError::InvalidPrincipal(msg)) => {
                 warn!(reason = %msg, "bootstrap: unexpected principal format");
-                self.reject_hook.on_reject("<invalid-principal>", &msg);
+                self.reject_hook
+                    .on_reject("<invalid-principal>", &msg)
+                    .await;
                 return Err(Status::unauthenticated(format!(
                     "unexpected principal: {msg}"
                 )));
@@ -182,7 +195,7 @@ where
             Err(e) => {
                 let msg = e.to_string();
                 warn!(reason = %msg, "bootstrap: unexpected auth error");
-                self.reject_hook.on_reject("<unknown>", &msg);
+                self.reject_hook.on_reject("<unknown>", &msg).await;
                 return Err(Status::internal(format!("authentication error: {msg}")));
             }
         };
@@ -195,24 +208,24 @@ where
             Ok(s) => s,
             Err(IssuerError::NotReady) => {
                 let msg = "CA not yet initialised";
-                self.reject_hook.on_reject(spiffe_id.as_str(), msg);
+                self.reject_hook.on_reject(spiffe_id.as_str(), msg).await;
                 return Err(Status::unavailable(msg));
             }
             Err(IssuerError::MalformedCsr(msg)) => {
                 warn!(spiffe_id = %spiffe_id, reason = %msg, "bootstrap: malformed CSR");
-                self.reject_hook.on_reject(spiffe_id.as_str(), &msg);
+                self.reject_hook.on_reject(spiffe_id.as_str(), &msg).await;
                 return Err(Status::invalid_argument(format!("malformed CSR: {msg}")));
             }
             Err(IssuerError::Signing(msg)) => {
                 warn!(spiffe_id = %spiffe_id, reason = %msg, "bootstrap: signing error");
-                self.reject_hook.on_reject(spiffe_id.as_str(), &msg);
+                self.reject_hook.on_reject(spiffe_id.as_str(), &msg).await;
                 return Err(Status::internal(format!("signing error: {msg}")));
             }
             // IssuerError is #[non_exhaustive]; treat unknown variants as internal errors.
             Err(e) => {
                 let msg = e.to_string();
                 warn!(spiffe_id = %spiffe_id, reason = %msg, "bootstrap: unexpected issuer error");
-                self.reject_hook.on_reject(spiffe_id.as_str(), &msg);
+                self.reject_hook.on_reject(spiffe_id.as_str(), &msg).await;
                 return Err(Status::internal(format!("issuer error: {msg}")));
             }
         };
@@ -299,7 +312,7 @@ mod tests {
     }
 
     impl RejectHook for RecordingHook {
-        fn on_reject(&self, principal: &str, reason: &str) {
+        async fn on_reject(&self, principal: &str, reason: &str) {
             self.calls
                 .lock()
                 .unwrap_or_else(|e| panic!("invariant: hook lock not poisoned: {e}"))

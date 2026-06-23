@@ -28,7 +28,6 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
-use reqwest::Method;
 use serde_json::json;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -180,26 +179,11 @@ async fn run_load(
                 total.fetch_add(1, Ordering::Relaxed);
                 // A real client retries a transient connection blip; only a
                 // SUSTAINED inability to reach the proxy is a routing gap. The
-                // discovery-channel mTLS reconnect on an SVID rotation can reset
-                // an in-flight pooled connection for a few tens of ms — retry a
-                // bounded number of times so that brief reset is not miscounted
-                // as a routing interruption, while a genuine sustained gap still
-                // exhausts the retries and is recorded.
-                let mut response = client
-                    .request(Method::GET, &url)
-                    .header("Host", &host)
-                    .send()
-                    .await;
-                let mut retries_left = 3u8;
-                while response.is_err() && retries_left > 0 {
-                    retries_left -= 1;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    response = client
-                        .request(Method::GET, &url)
-                        .header("Host", &host)
-                        .send()
+                // bounded transient-retry (with its backoff) lives in the harness
+                // so the test body stays free of bare sleeps (e2e rubric #4).
+                let response =
+                    coxswain_e2e::harness::http::get_with_transient_retry(&client, &url, &host, 3)
                         .await;
-                }
                 match response {
                     Ok(r) => {
                         if r.status().is_success() {
