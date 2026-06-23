@@ -85,6 +85,7 @@ default-filter = '''
   )
   and not binary(resilience)
   and not binary(status_conditions)
+  and not binary(discovery)
 '''
 
 # 3 concurrent tests against the shared cluster. With per-test namespace cleanup
@@ -121,6 +122,7 @@ default-filter = '''
   | test(=proxy_generated_forwarded_reaches_backend_and_overrides_spoof)
   | binary(resilience)
   | binary(status_conditions)
+  | binary(discovery)
 '''
 
 test-threads = 1
