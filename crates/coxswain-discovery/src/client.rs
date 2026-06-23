@@ -301,16 +301,18 @@ impl Supervisor {
             let channel = build_channel(&self.config);
             let mut grpc = TonicClient::new(channel);
 
-            let applied = if let Some(ref mut rx) = svid_rotation_rx {
+            // `svid_rotated` is an intentional reconnect, not a failure; track
+            // it separately so the backoff exponent is not incremented.
+            let (applied, svid_rotated) = if let Some(ref mut rx) = svid_rotation_rx {
                 tokio::select! {
-                    result = self.stream_until_closed(&mut grpc) => result,
+                    result = self.stream_until_closed(&mut grpc) => (result, false),
                     Ok(()) = rx.changed() => {
                         debug!("discovery client: SVID rotated; forcing reconnect with fresh SVID");
-                        false
+                        (false, true)
                     }
                 }
             } else {
-                self.stream_until_closed(&mut grpc).await
+                (self.stream_until_closed(&mut grpc).await, false)
             };
 
             if self.has_snapshot {
@@ -320,10 +322,11 @@ impl Supervisor {
                 );
             }
 
-            // Reset the backoff exponent only if the session was productive (at
-            // least one snapshot applied), so a brief connect that never delivers
-            // a snapshot doesn't collapse the exponent.
-            if applied {
+            // Reset the backoff exponent if the session delivered at least one
+            // snapshot, or if this was a rotation-triggered reconnect (not a
+            // failure), so kube-proxy propagation lag does not grow the backoff
+            // to the cap before the SVID arrives.
+            if applied || svid_rotated {
                 attempt = 0;
             } else {
                 attempt = attempt.saturating_add(1);
@@ -334,7 +337,19 @@ impl Supervisor {
                 delay_ms = delay.as_millis(),
                 "discovery client backing off before reconnect"
             );
-            tokio::time::sleep(delay).await;
+            // Make the backoff interruptible by SVID rotation: a fresh cert
+            // wakes the supervisor immediately instead of sleeping the full
+            // exponential delay (which at cap is 30 s).
+            if let Some(ref mut rx) = svid_rotation_rx {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    Ok(()) = rx.changed() => {
+                        debug!("discovery client: SVID arrived during backoff; reconnecting immediately");
+                    }
+                }
+            } else {
+                tokio::time::sleep(delay).await;
+            }
         }
     }
 
@@ -345,16 +360,14 @@ impl Supervisor {
     async fn stream_until_closed(&mut self, grpc: &mut TonicClient<Channel>) -> bool {
         let (tx, rx) = mpsc::channel::<p::ClientMessage>(4);
 
-        let response = match grpc.stream(ReceiverStream::new(rx)).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "discovery client: failed to open stream");
-                return false;
-            }
-        };
-        let mut inbound = response.into_inner();
-
-        // Send Subscribe first; the server will not push a Snapshot until it receives this.
+        // Pre-queue Subscribe *before* opening the stream. The server reads the
+        // Subscribe (`read_subscribe`) before it returns its response, so it does
+        // not send response headers until the first client message arrives — and
+        // `grpc.stream(..).await` does not resolve until those response headers
+        // arrive. Sending Subscribe only *after* awaiting the call therefore
+        // deadlocks: client waits for headers, server waits for Subscribe. The
+        // bounded channel has capacity, so this enqueue never blocks; the body
+        // stream flushes it as soon as the h2 request opens.
         let subscribe = p::ClientMessage {
             kind: Some(CKind::Subscribe(p::Subscribe {
                 node_id: self.config.node_id.clone(),
@@ -363,9 +376,18 @@ impl Supervisor {
             })),
         };
         if tx.send(subscribe).await.is_err() {
-            warn!("discovery client: outbound channel closed immediately after stream open");
+            warn!("discovery client: outbound channel closed before stream open");
             return false;
         }
+
+        let response = match grpc.stream(ReceiverStream::new(rx)).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "discovery client: failed to open stream");
+                return false;
+            }
+        };
+        let mut inbound = response.into_inner();
 
         let mut applied_this_session = false;
 
@@ -642,9 +664,24 @@ mod tests {
             let (server_tx, server_rx) = tpsc::channel(16);
             let (client_tx, client_rx) = tpsc::channel(16);
 
-            // Drain inbound messages from the client into `client_tx`.
+            let mut inbound = request.into_inner();
+
+            // Mirror the production server (`DiscoveryService::stream` →
+            // `read_subscribe`): read the first client message (Subscribe)
+            // *before* returning the response. The real server gates its
+            // response headers on receiving Subscribe, so a client that waits
+            // for `grpc.stream(..).await` to resolve before sending Subscribe
+            // deadlocks. Reading here makes that deadlock reproducible in tests
+            // rather than papering over it by responding immediately.
+            match inbound.message().await {
+                Ok(Some(msg)) => {
+                    let _ = client_tx.send(msg).await;
+                }
+                _ => return Err(Status::unavailable("client closed before Subscribe")),
+            }
+
+            // Drain the remaining inbound messages (Acks/Nacks) into `client_tx`.
             tokio::spawn(async move {
-                let mut inbound = request.into_inner();
                 loop {
                     match inbound.message().await {
                         Ok(Some(msg)) => {

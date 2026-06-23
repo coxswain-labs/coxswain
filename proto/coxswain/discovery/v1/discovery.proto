@@ -183,6 +183,8 @@ message RouteEntry {
   string route_id = 3; // "{namespace}/{name}"
   string metric_route_id = 4; // prometheus route label
   bool cache_enabled = 5;
+  string path_pattern = 6; // matched rule pattern for access-log `pattern` mode
+
   // nested config extensions
   BackendGroup backend_group = 10;
   MatchPredicates predicates = 11;

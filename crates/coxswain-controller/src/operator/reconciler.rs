@@ -52,11 +52,11 @@ use coxswain_reflector::tls::{
 };
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{Node, Pod, Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{ConfigMap, Node, Pod, Service, ServiceAccount};
 use k8s_openapi::api::rbac::v1::RoleBinding;
 use kube::{
     Api, Client, Resource as _,
-    api::{DeleteParams, Patch, PatchParams},
+    api::{DeleteParams, ObjectMeta, Patch, PatchParams},
     runtime::{
         WatchStreamExt,
         controller::{Action, Controller},
@@ -157,10 +157,24 @@ pub struct OperatorConfig {
     pub admin_port: u16,
     /// gRPC discovery endpoint the dedicated proxy connects to for routing
     /// snapshots. Rendered as `--discovery-endpoint=<endpoint>`. Since #423 the
-    /// Stream listener is mTLS-only, so this is an `https://` URL. Dedicated-proxy
-    /// SVID bootstrap (projected token + per-namespace trust mount) is a
-    /// follow-up (#381); the shared proxy is the fully-wired path today.
+    /// Stream listener is mTLS-only, so this is an `https://` URL.
     pub discovery_endpoint: String,
+    /// Server-auth-only bootstrap endpoint rendered as
+    /// `--discovery-bootstrap-endpoint=<endpoint>` so the dedicated proxy can
+    /// obtain its SVID (projected token + trust mount, #423).
+    pub discovery_bootstrap_endpoint: String,
+    /// Projected SA-token path rendered as `--discovery-sa-token-path`.
+    pub discovery_sa_token_path: String,
+    /// CA trust-bundle path rendered as `--discovery-ca-bundle-path`.
+    pub discovery_ca_bundle_path: String,
+    /// SPIFFE trust domain rendered as `--discovery-trust-domain`.
+    pub discovery_trust_domain: String,
+    /// Namespace the controller (and its trust-bundle publisher) runs in. The
+    /// operator copies the published `coxswain-discovery-trust` ConfigMap from
+    /// here into each dedicated proxy's namespace; when a Gateway lives in the
+    /// controller namespace the publisher's own ConfigMap is reused and no copy
+    /// is made (the publisher is its sole writer).
+    pub controller_namespace: String,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -215,6 +229,15 @@ struct ReconcileContext {
     /// gRPC discovery endpoint rendered as `--discovery-endpoint=<endpoint>`
     /// in every dedicated-proxy Deployment.
     discovery_endpoint: String,
+    /// Bootstrap endpoint + token/bundle paths + trust domain rendered into the
+    /// dedicated-proxy Deployment so it can obtain an SVID (#423).
+    discovery_bootstrap_endpoint: String,
+    discovery_sa_token_path: String,
+    discovery_ca_bundle_path: String,
+    discovery_trust_domain: String,
+    /// Controller namespace; source of the trust-bundle ConfigMap copied into
+    /// out-of-namespace dedicated proxies.
+    controller_namespace: String,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
 
@@ -415,6 +438,11 @@ impl BackgroundService for Operator {
             ingress_ports: self.config.ingress_ports,
             admin_port: self.config.admin_port,
             discovery_endpoint: self.config.discovery_endpoint.clone(),
+            discovery_bootstrap_endpoint: self.config.discovery_bootstrap_endpoint.clone(),
+            discovery_sa_token_path: self.config.discovery_sa_token_path.clone(),
+            discovery_ca_bundle_path: self.config.discovery_ca_bundle_path.clone(),
+            discovery_trust_domain: self.config.discovery_trust_domain.clone(),
+            controller_namespace: self.config.controller_namespace.clone(),
             last_hashes: Mutex::new(HashMap::new()),
         });
 
@@ -864,10 +892,27 @@ async fn reconcile_inner(
         controller_image: &ctx.controller_image,
         gateway_class_name: class_name,
         discovery_endpoint: &ctx.discovery_endpoint,
+        discovery_bootstrap_endpoint: &ctx.discovery_bootstrap_endpoint,
+        discovery_sa_token_path: &ctx.discovery_sa_token_path,
+        discovery_ca_bundle_path: &ctx.discovery_ca_bundle_path,
+        discovery_trust_domain: &ctx.discovery_trust_domain,
         admin_port: ctx.admin_port,
     });
 
-    // Stage 1 — provisioning (Deployment/Service/SA). SSA with force=true
+    // Stage 1a — make the controller's CA trust bundle reachable from the
+    // dedicated proxy's namespace so its `trust-bundle` volume has content and
+    // it can verify the controller during SVID bootstrap (#423). No-op when the
+    // Gateway shares the controller namespace (the publisher already owns the
+    // ConfigMap there).
+    //
+    // Ordered BEFORE the Deployment: the trust volume is `optional`, so a pod
+    // that starts before the ConfigMap exists boots with an empty mount and
+    // only sees the bundle after kubelet's next ConfigMap sync (up to ~1 min) —
+    // long enough to blow a 60 s route-liveness budget. Creating the ConfigMap
+    // first means the pod mounts it populated from the start.
+    copy_trust_bundle(&ctx.client, &gw, &ctx.controller_namespace).await?;
+
+    // Stage 1b — provisioning (Deployment/Service/SA). SSA with force=true
     // re-asserts ownership on every reconcile; the apply order is SA →
     // Service → Deployment so the ServiceAccount exists before any
     // RoleBinding references it.
@@ -964,6 +1009,60 @@ fn has_our_finalizer(gw: &Gateway) -> bool {
 /// Patch the Gateway to add our finalizer to `metadata.finalizers`.
 /// Idempotent server-side: if the finalizer is already present, the patched
 /// state matches and the apiserver accepts the no-op.
+/// Copy the controller-published trust-bundle ConfigMap into a dedicated
+/// proxy's namespace so its `trust-bundle` volume has content for SVID
+/// bootstrap.
+///
+/// A ConfigMap is namespace-scoped — a proxy can only mount one from its own
+/// namespace. The publisher writes the bundle to the controller namespace; this
+/// mirrors it into any *other* namespace hosting a dedicated proxy. The copy is
+/// owned by the Gateway so it garbage-collects with it. No-op when the Gateway
+/// shares the controller namespace: the publisher is the sole writer there and
+/// a copy would fight it for SSA field ownership.
+///
+/// # Errors
+///
+/// Returns the [`kube::Error`] from the source read or destination SSA patch. A
+/// missing source ConfigMap (publisher hasn't published yet) is not an error —
+/// the proxy's trust volume is `optional` and its bootstrap loop retries until
+/// a later reconcile lands the copy.
+async fn copy_trust_bundle(
+    client: &Client,
+    gw: &Gateway,
+    controller_namespace: &str,
+) -> Result<(), kube::Error> {
+    let gw_namespace = gw.metadata.namespace.as_deref().unwrap_or_else(|| {
+        panic!("invariant: Gateway has no namespace; the API server requires it")
+    });
+    if gw_namespace == controller_namespace {
+        return Ok(());
+    }
+    let cm_name = crate::identity::publisher::TRUST_BUNDLE_CM_NAME;
+    let src: Api<ConfigMap> = Api::namespaced(client.clone(), controller_namespace);
+    let Some(source) = src.get_opt(cm_name).await? else {
+        tracing::warn!(
+            namespace = %gw_namespace,
+            "trust bundle ConfigMap not yet published; dedicated proxy bootstraps once it lands"
+        );
+        return Ok(());
+    };
+    let copy = ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(cm_name.to_string()),
+            namespace: Some(gw_namespace.to_string()),
+            owner_references: Some(vec![render::gateway_owner_reference(gw)]),
+            ..Default::default()
+        },
+        data: source.data.clone(),
+        binary_data: source.binary_data.clone(),
+        ..Default::default()
+    };
+    let dst: Api<ConfigMap> = Api::namespaced(client.clone(), gw_namespace);
+    let params = PatchParams::apply(apply::FIELD_MANAGER).force();
+    dst.patch(cm_name, &params, &Patch::Apply(&copy)).await?;
+    Ok(())
+}
+
 async fn add_finalizer(client: &Client, gw: &Gateway) -> Result<(), kube::Error> {
     let namespace = gw.metadata.namespace.as_deref().unwrap_or_else(|| {
         panic!("invariant: Gateway has no namespace; the API server requires it")
@@ -1399,6 +1498,10 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
+            discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
+            discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
+            discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
+            discovery_trust_domain: "cluster.local",
             admin_port: 8082,
         });
         let r_b = render::render(&render::RenderInputs {
@@ -1407,6 +1510,10 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
+            discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
+            discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
+            discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
+            discovery_trust_domain: "cluster.local",
             admin_port: 8082,
         });
         assert_ne!(
@@ -1443,6 +1550,10 @@ mod tests {
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
             discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
+            discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
+            discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
+            discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
+            discovery_trust_domain: "cluster.local",
             admin_port: 8082,
         };
         let r1 = render::render(&inputs);

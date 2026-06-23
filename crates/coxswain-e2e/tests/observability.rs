@@ -75,7 +75,12 @@ const CONTROLLER_CHECKS: &[&str] = &[
 async fn status_exposes_per_subsystem_checks() -> anyhow::Result<()> {
     let h = Harness::start().await?;
 
-    let health: serde_json::Value = reqwest::get(h.admin_url("/api/v1/health"))
+    // The controller admin endpoint aggregates both subsystems: the controller
+    // registers its own checks AND the proxy-readiness gate. Each pod owns its
+    // own HealthRegistry post-discovery-rearchitecture, so the proxy pod's admin
+    // endpoint exposes only "proxy" — this must target the controller endpoint
+    // to observe the "controller" subsystem.
+    let health: serde_json::Value = reqwest::get(h.controller_admin_url("/api/v1/health"))
         .await?
         .json()
         .await?;
@@ -135,10 +140,10 @@ async fn proxy_pod_emits_proxy_prefix_metrics() -> anyhow::Result<()> {
         metrics.contains("coxswain_proxy_request_duration_seconds_count"),
         "proxy /metrics must expose request_duration_seconds histogram"
     );
-    assert!(
-        metrics.contains("coxswain_proxy_routing_table_rebuilds_total"),
-        "proxy /metrics must expose routing_table_rebuilds_total"
-    );
+    // NOTE: `routing_table_rebuilds_total` is a controller-only metric since the
+    // discovery rearchitecture — the proxy receives pre-built snapshots and no
+    // longer rebuilds routing tables. It is asserted on the controller scrape in
+    // `controller_pod_emits_controller_prefix_metrics`.
     assert!(
         metrics.contains("status_code=\"200\""),
         "requests_total must carry the status_code=200 sample after the 10 requests"
@@ -255,23 +260,33 @@ async fn access_log_path_mode_pattern_uses_rule_pattern() -> anyhow::Result<()> 
     wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
     h.http.get(&host, "/a/deep/path").await?;
 
-    let logs = h.controller.shared_proxy_access_logs().await?;
-    let row = logs
-        .iter()
-        .rev()
-        .find(|line| {
-            line.get("host").and_then(|h| h.as_str()) == Some(host.as_str())
-                && line.get("status").and_then(|s| s.as_u64()) == Some(200)
-        })
-        .expect("at least one matching access-log row");
-    let path = row.get("path").and_then(|p| p.as_str());
+    // Poll the access log rather than read once: this test reached here via a
+    // `helm upgrade` (access-log-path-mode flip) that rolled the proxy pod, so
+    // the freshly-driven request's log line can lag the first read.
+    let path = wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async { format!("an access-log row for {host} with status 200 and a path") },
+        || async {
+            let logs = h.controller.shared_proxy_access_logs().await.ok()?;
+            logs.iter()
+                .rev()
+                .find(|line| {
+                    line.get("host").and_then(|h| h.as_str()) == Some(host.as_str())
+                        && line.get("status").and_then(|s| s.as_u64()) == Some(200)
+                })?
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(str::to_owned)
+        },
+    )
+    .await?;
     assert!(
-        path.unwrap_or("").starts_with("/a"),
+        path.starts_with("/a"),
         "pattern mode must emit the matched rule pattern, got {path:?}"
     );
     assert_ne!(
-        path,
-        Some("/a/deep/path"),
+        path, "/a/deep/path",
         "pattern mode must NOT emit the concrete request path"
     );
     Ok(())

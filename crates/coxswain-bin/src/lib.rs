@@ -199,13 +199,22 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             ),
             admin_port: args.common.admin_port,
             // mTLS Stream listener (#423): the dedicated proxy connects over
-            // https. NOTE: dedicated-proxy SVID bootstrap (projected token +
-            // per-namespace trust mount) is a follow-up (#381); until then the
-            // shared proxy is the fully-wired path.
+            // https for routing snapshots and bootstraps its SVID over the
+            // server-auth bootstrap listener — the same wiring the shared proxy
+            // gets from the Helm chart, rendered here into the dedicated-proxy
+            // Deployment by the operator.
             discovery_endpoint: format!(
                 "https://coxswain-controller-discovery.{}.svc:{}",
                 args.common.pod_namespace, args.controller.discovery_port
             ),
+            discovery_bootstrap_endpoint: format!(
+                "https://coxswain-controller-discovery.{}.svc:{}",
+                args.common.pod_namespace, args.controller.discovery_bootstrap_port
+            ),
+            discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token".to_string(),
+            discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt".to_string(),
+            discovery_trust_domain: args.controller.discovery_trust_domain.clone(),
+            controller_namespace: args.common.pod_namespace.clone(),
         }),
     ));
 
@@ -940,6 +949,29 @@ impl pingora_core::services::background::BackgroundService for DiscoveryIdentity
 /// not-yet-running bootstrap loop. Both runnables are driven by Pingora
 /// background services via [`register_discovery_background_services`] so they run
 /// on a Pingora runtime (the caller is still on the synchronous startup path).
+/// Extract the controller's namespace from an in-cluster discovery endpoint.
+///
+/// Kubernetes service DNS is `<service>.<namespace>.svc[.cluster.local]`, so the
+/// controller's namespace is the second label of the host. Returns `None` for
+/// anything that isn't a recognizable `…svc…` service DNS (IP literals, test
+/// loopback addresses), letting the caller fall back to the proxy's own
+/// namespace. This keeps the controller-identity check correct for proxies that
+/// do not share the controller's namespace (dedicated proxies; any non-default
+/// install namespace) instead of assuming co-location.
+fn controller_namespace_from_endpoint(endpoint: &str) -> Option<String> {
+    let after_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
+    let mut labels = host.split('.');
+    let _service = labels.next()?;
+    let namespace = labels.next().filter(|ns| !ns.is_empty())?;
+    // Only trust the parse when the third label is `svc` — i.e. it really is
+    // cluster service DNS, not an arbitrary host like `localhost:50051`.
+    (labels.next() == Some("svc")).then(|| namespace.to_owned())
+}
+
 fn build_discovery_client(
     args: &ProxyRoleArgs,
     proxy_handle: SubsystemHandle,
@@ -952,12 +984,20 @@ fn build_discovery_client(
     config.scope = scope;
 
     let bootstrap_runner = args.discovery_bootstrap_endpoint.as_ref().map(|endpoint| {
+        // The controller's SPIFFE identity lives in the CONTROLLER's namespace,
+        // not the proxy's. Derive it from the discovery service DNS
+        // (`coxswain-controller-discovery.<ns>.svc…`) so a proxy in ANY
+        // namespace (co-located shared, cross-namespace dedicated) targets the
+        // right controller. Fall back to the proxy's own namespace only when the
+        // endpoint isn't a recognizable in-cluster service DNS (test loopback).
+        let controller_namespace = controller_namespace_from_endpoint(endpoint)
+            .unwrap_or_else(|| args.common.pod_namespace.clone());
         let boot_config = BootstrapClientConfig::new(
             endpoint.clone(),
             args.discovery_sa_token_path.clone(),
             args.discovery_ca_bundle_path.clone(),
             args.discovery_trust_domain.clone(),
-            args.common.pod_namespace.clone(),
+            controller_namespace.clone(),
         );
         let (handle, runner) = BootstrapClient::build(boot_config);
         config.svid_cell = Some(handle.svid);
@@ -965,8 +1005,8 @@ fn build_discovery_client(
         // The controller self-issues a fixed conventional server identity; match
         // it exactly (mirrors the bootstrap client's own server-cert check).
         config.expected_server = Some(SpiffeMatcher::Exact(format!(
-            "spiffe://{}/ns/{}/sa/{CONTROLLER_SPIFFE_SA}",
-            args.discovery_trust_domain, args.common.pod_namespace
+            "spiffe://{}/ns/{controller_namespace}/sa/{CONTROLLER_SPIFFE_SA}",
+            args.discovery_trust_domain
         )));
         runner
     });
@@ -1156,13 +1196,22 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
             ),
             admin_port: args.common.admin_port,
             // mTLS Stream listener (#423): the dedicated proxy connects over
-            // https. NOTE: dedicated-proxy SVID bootstrap (projected token +
-            // per-namespace trust mount) is a follow-up (#381); until then the
-            // shared proxy is the fully-wired path.
+            // https for routing snapshots and bootstraps its SVID over the
+            // server-auth bootstrap listener — the same wiring the shared proxy
+            // gets from the Helm chart, rendered here into the dedicated-proxy
+            // Deployment by the operator.
             discovery_endpoint: format!(
                 "https://coxswain-controller-discovery.{}.svc:{}",
                 args.common.pod_namespace, args.controller.discovery_port
             ),
+            discovery_bootstrap_endpoint: format!(
+                "https://coxswain-controller-discovery.{}.svc:{}",
+                args.common.pod_namespace, args.controller.discovery_bootstrap_port
+            ),
+            discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token".to_string(),
+            discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt".to_string(),
+            discovery_trust_domain: args.controller.discovery_trust_domain.clone(),
+            controller_namespace: args.common.pod_namespace.clone(),
         }),
     ));
 
@@ -1345,4 +1394,43 @@ fn init_logger(format: LogFormat, log_filter: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_namespace_parsed_from_service_dns() {
+        assert_eq!(
+            controller_namespace_from_endpoint(
+                "https://coxswain-controller-discovery.coxswain-system.svc:50052"
+            ),
+            Some("coxswain-system".to_owned())
+        );
+        assert_eq!(
+            controller_namespace_from_endpoint(
+                "https://coxswain-controller-discovery.tenant-a.svc.cluster.local:50051"
+            ),
+            Some("tenant-a".to_owned())
+        );
+    }
+
+    #[test]
+    fn controller_namespace_none_for_non_service_dns() {
+        // Loopback / IP / bare host: not cluster service DNS → caller falls back
+        // to the proxy's own namespace.
+        assert_eq!(
+            controller_namespace_from_endpoint("http://127.0.0.1:50051"),
+            None
+        );
+        assert_eq!(
+            controller_namespace_from_endpoint("https://localhost:50052"),
+            None
+        );
+        assert_eq!(
+            controller_namespace_from_endpoint("https://example.com:443"),
+            None
+        );
+    }
 }

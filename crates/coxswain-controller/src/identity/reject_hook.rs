@@ -59,6 +59,10 @@ impl BootstrapRejectHook {
         };
         let recorder = Recorder::new(client, reporter);
         let pod_ref = ObjectReference {
+            // `regarding` must carry apiVersion + kind or the events.k8s.io/v1
+            // API rejects the Event as invalid and `Recorder::publish` fails —
+            // the Warning never appears. Pods are core/v1.
+            api_version: Some("v1".to_owned()),
             kind: Some("Pod".to_owned()),
             name: Some(pod_name),
             namespace: Some(pod_namespace),

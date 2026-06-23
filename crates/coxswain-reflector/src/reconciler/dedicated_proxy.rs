@@ -572,7 +572,11 @@ fn rebuild_dedicated(
     // cut-over Gateway. The shared-pool filter would drop our listener.
     let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, tls, false);
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
-    tls_health.store_and_notify(gateway_tls_health);
+    // Merge only THIS Gateway's listener health into the shared cell: the
+    // shared-pool reconciler and the other dedicated reconcilers publish into
+    // the same cell, so a full replace would transiently drop their entries and
+    // make their proxies unbind their listeners (#423 dedicated bind→remove).
+    tls_health.update_scoped(gateway_tls_health, |k| k == target);
 
     let gateways = stores.gateways.state();
     let route_health_map = crate::gateway_api::GatewayApiReconciler::compute_route_health(
@@ -985,7 +989,11 @@ fn rebuild_dedicated_narrow(
     // cut-over Gateway. The shared-pool filter would drop our listener.
     let mut gateway_tls_health = build_tls(stores, &ingresses, &ownership, tls, false);
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
-    tls_health.store_and_notify(gateway_tls_health);
+    // Merge only THIS Gateway's listener health into the shared cell: the
+    // shared-pool reconciler and the other dedicated reconcilers publish into
+    // the same cell, so a full replace would transiently drop their entries and
+    // make their proxies unbind their listeners (#423 dedicated bind→remove).
+    tls_health.update_scoped(gateway_tls_health, |k| k == target);
 
     let route_health_map = crate::gateway_api::GatewayApiReconciler::compute_route_health(
         &routes,

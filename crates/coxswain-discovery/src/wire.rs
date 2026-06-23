@@ -183,6 +183,7 @@ fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteE
         timeouts: Some(timeouts_to_wire(&e.timeouts)),
         route_id: e.route_id.clone(),
         metric_route_id: e.metric_route_id.to_string(),
+        path_pattern: e.path_pattern.to_string(),
         created_at_unix_millis: e.created_at.and_then(|t| {
             t.duration_since(UNIX_EPOCH)
                 .ok()
@@ -935,6 +936,7 @@ fn build_route_entry(dto: &p::RouteEntry) -> Result<RouteEntry, WireError> {
         created_at,
     );
     entry = entry.with_metric_route_id(dto.metric_route_id.clone().into());
+    entry = entry.with_path_pattern(dto.path_pattern.clone().into());
     entry = entry.with_error_status(dto.error_status.map(|s| s as u16));
 
     if let Some(max) = dto.max_body_size {

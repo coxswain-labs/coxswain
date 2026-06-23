@@ -157,6 +157,39 @@ impl SharedGatewayListenerHealth {
         self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
     }
 
+    /// Atomically merge a single writer's `updates` into the shared map without
+    /// clobbering entries owned by OTHER writers.
+    ///
+    /// Several reconcilers publish into one cell — the shared-pool reconciler
+    /// (all non-cut-over Gateways) and each dedicated-proxy reconciler (its one
+    /// cut-over Gateway) — but each only computes a SUBSET of Gateways. A plain
+    /// [`Self::store_and_notify`] replaces the whole map with that subset,
+    /// transiently dropping the others' entries; under concurrent reconciles a
+    /// dedicated proxy then briefly loses (and unbinds) its own listener. This
+    /// instead, atomically via `rcu`:
+    ///   - keeps every entry this writer does **not** own (`owns(k) == false`)
+    ///     exactly as-is, and
+    ///   - replaces the entries it **does** own with `updates` — so an owned
+    ///     Gateway that vanished from `updates` (deleted/migrated) is removed.
+    ///
+    /// Consumers are notified after the swap.
+    pub fn update_scoped(
+        &self,
+        updates: HashMap<ObjectKey, GatewayListenerHealth>,
+        owns: impl Fn(&ObjectKey) -> bool,
+    ) {
+        self.0.map.rcu(|current| {
+            let mut next: HashMap<ObjectKey, GatewayListenerHealth> = current
+                .iter()
+                .filter(|(k, _)| !owns(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            next.extend(updates.iter().map(|(k, v)| (k.clone(), v.clone())));
+            Arc::new(next)
+        });
+        self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
     /// Returns a `watch::Receiver` over the generation counter. The caller polls
     /// `rx.changed().await` to await the next `store_and_notify` call.
     ///
