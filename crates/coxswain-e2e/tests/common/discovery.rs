@@ -329,3 +329,19 @@ pub async fn proxy_health_state(health_url: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned)
 }
+
+// ── Metrics helpers ───────────────────────────────────────────────────────────
+
+/// Scrape `GET <metrics_url>` (an admin `/metrics` endpoint) and return the
+/// value of a bare, label-less Prometheus series named `metric`, or `None` if
+/// the request fails or the series is absent.
+///
+/// Mirrors the bare-series parse in `harness::wait` (`name <value>`); only
+/// matches the unlabelled form, never `metric{labels}` or `metric_suffix`.
+pub async fn scrape_metric(metrics_url: &str, metric: &str) -> Option<f64> {
+    let body = reqwest::get(metrics_url).await.ok()?.text().await.ok()?;
+    body.lines().filter(|l| !l.starts_with('#')).find_map(|l| {
+        let rest = l.strip_prefix(metric)?;
+        rest.strip_prefix(' ')?.trim().parse::<f64>().ok()
+    })
+}

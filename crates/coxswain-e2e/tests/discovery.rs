@@ -38,7 +38,9 @@
 
 use anyhow::Context as _;
 use k8s_openapi::api::apps::v1::Deployment;
-use kube::api::{Api, PostParams};
+use k8s_openapi::api::networking::v1::Ingress;
+use kube::api::{Api, Patch, PatchParams, PostParams};
+use serde_json::json;
 use std::time::Duration;
 
 use coxswain_e2e::{
@@ -51,7 +53,7 @@ mod common;
 use common::dedicated::scale_controller;
 use common::discovery::{
     assert_pod_stays_not_ready, copy_trust_bundle, fetch_topology, find_node, proxy_health_state,
-    shared_proxy_deployment, wait_for_pod_ready,
+    scrape_metric, shared_proxy_deployment, wait_for_pod_ready,
 };
 
 // ── Group 1 — Auth rejection (SPIFFE trust-domain mismatch) ──────────────────
@@ -236,21 +238,33 @@ async fn fresh_proxy_converges_and_registers_in_node_registry() -> anyhow::Resul
 // ── Group 3 — Reconnect after controller restart ──────────────────────────────
 
 /// Stop the controller, observe the shared proxy transition to `Degraded`
-/// (still serving traffic from last-good snapshot), then bring the controller
-/// back and assert the proxy returns to `Ready` with the NodeRegistry
-/// `in_sync=true`.
+/// (still serving traffic from its last-good snapshot), then bring the
+/// controller back and assert the proxy reconnects and reconverges.
+///
+/// Recovery is asserted from the **proxy and data plane**, not the controller's
+/// NodeRegistry: the proxy health returns to `Ready`, the pre-existing route
+/// keeps serving, and — the strongest signal — a route created *after* the
+/// restart is compiled by the new controller and pushed to the reconnected
+/// proxy. That fresh-snapshot delivery proves the discovery stream is live again
+/// end-to-end; the controller-side `in_sync` view is already covered in
+/// [`fresh_proxy_converges_and_registers_in_node_registry`], so re-asserting it
+/// here would only duplicate that and couple this test to registry repopulation
+/// timing.
 ///
 /// Serial: this test scales the shared controller to zero, which affects every
 /// test that relies on the controller being up. The `discovery` binary is
 /// serialised in the nextest config.
 ///
 /// The controller-SSA idempotency side of a restart is covered by
-/// `lifecycle_controller_restart_is_idempotent` in `resilience.rs`.
-/// This test covers the proxy-health and NodeRegistry convergence side.
+/// `restart_controller_does_not_bump_generation` in `resilience.rs`. This test
+/// covers the proxy-health + data-plane recovery side.
 #[tokio::test]
 async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "disc-restart").await?;
+    // Persistent namespace: the second Harness::start() below runs bootstrap(),
+    // which purges coxswain-e2e=true namespaces. Persistent skips that label so
+    // the route we assert on after the restart survives the purge.
+    let ns = NamespaceGuard::create_persistent(&h.client, "disc-restart").await?;
 
     // Establish a live route so we can assert traffic continuity during
     // controller downtime.
@@ -261,7 +275,7 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
     let host = format!("ingress.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
 
-    // ── Phase 1: take the controller down ────────────────────────────────────
+    // ── Phase 1: take the controller down → proxy degrades, keeps serving ─────
 
     scale_controller(0).await?;
 
@@ -298,55 +312,56 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
     let continuity = h.http.get(&host, "/a").await?;
     continuity.assert_backend("echo-a");
 
-    // ── Phase 2: bring the controller back ───────────────────────────────────
+    // ── Phase 2: bring the controller back → proxy reconnects, reconverges ────
 
     scale_controller(1).await?;
 
-    // Re-create the harness to get fresh port-forwards to the new controller
-    // pod. The proxy is unchanged so its port-forward stays implicitly valid,
-    // but Harness::start() re-establishes it correctly.
+    // Re-create the harness for fresh port-forwards to the new controller pod,
+    // then gate on the real post-condition — new leader elected + at least one
+    // successful reconcile on the fresh process — before asserting proxy
+    // recovery. Without this gate the assertions below race controller startup.
     let h2 = Harness::start().await?;
+    wait::wait_for_controller_reconciled(
+        &h2.controller_admin_url("/metrics"),
+        Duration::from_secs(60),
+    )
+    .await?;
 
-    // Poll until the topology shows the shared proxy (any SharedPool node)
-    // back in_sync — proves reconnect + re-Ack completed.
-    let topology_url = h2.controller_admin_url("/api/v1/topology");
+    // Server-side reconnect signal: the controller's discovery metric reports at
+    // least one live proxy stream again. This is the direct metric form of "the
+    // shared proxy reconnected" — scraped from the controller `/metrics` we
+    // already forward, no topology-JSON aggregation needed.
+    let controller_metrics_url = h2.controller_admin_url("/metrics");
     wait::poll_until(
         Duration::from_secs(60),
         wait::POLL,
         || {
-            let url = topology_url.clone();
+            let url = controller_metrics_url.clone();
             async move {
+                let v = scrape_metric(&url, "coxswain_discovery_connected_proxies").await;
                 format!(
-                    "topology at '{url}' to contain a SharedPool node with in_sync=true \
-                     after controller restart"
+                    "controller coxswain_discovery_connected_proxies >= 1 after restart; \
+                     currently: {v:?}"
                 )
             }
         },
         || {
-            let url = topology_url.clone();
+            let url = controller_metrics_url.clone();
             async move {
-                let topology = fetch_topology(&url).await.ok()?;
-                topology
-                    .get("nodes")?
-                    .as_array()?
-                    .iter()
-                    .find(|n| {
-                        n.pointer("/scope/kind").and_then(|v| v.as_str()) == Some("SharedPool")
-                            && n.get("in_sync").and_then(|v| v.as_bool()).unwrap_or(false)
-                    })
-                    .map(|_| ())
+                let v = scrape_metric(&url, "coxswain_discovery_connected_proxies").await?;
+                (v >= 1.0).then_some(())
             }
         },
     )
     .await
-    .context(
-        "shared proxy did not re-register as in_sync in the NodeRegistry after controller restart",
-    )?;
+    .context("controller never reported a reconnected proxy stream after restart")?;
 
-    // After reconnect the proxy health must return to Ready.
+    // The proxy reconnects to the new controller and its health returns to Ready
+    // (reconnect + re-Ack of the snapshot — exercises the degraded→ready
+    // transition on the discovery client).
     let proxy_health_url2 = h2.admin_url("/api/v1/health");
     wait::poll_until(
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         wait::POLL,
         || {
             let url = proxy_health_url2.clone();
@@ -369,9 +384,44 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
     .await
     .context("shared proxy did not return to Ready after controller restart")?;
 
-    // Traffic must still serve after the reconnect.
-    let post = h2.http.get(&host, "/a").await?;
-    post.assert_backend("echo-a");
+    // The pre-existing route still serves after the reconnect.
+    wait::wait_for_backend(&h2.http, &host, "/a", "echo-a", Duration::from_secs(60)).await?;
+
+    // Fresh-snapshot proof: a route created *after* the controller restart is
+    // compiled by the new controller and pushed to the reconnected proxy. This
+    // is the end-to-end data-plane signal that the discovery stream is live
+    // again — strictly stronger than a topology `in_sync` flag.
+    let fresh_host = format!("disc-restart-fresh.{}.local", ns.name);
+    let fresh_ingress = json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": { "name": "disc-restart-fresh", "namespace": &ns.name },
+        "spec": {
+            "ingressClassName": "coxswain",
+            "rules": [{ "host": &fresh_host, "http": { "paths": [{
+                "path": "/", "pathType": "Prefix",
+                "backend": { "service": { "name": "echo-b", "port": { "number": 3000 } } }
+            }] } }]
+        }
+    });
+    let ingresses: Api<Ingress> = Api::namespaced(h2.client.clone(), &ns.name);
+    ingresses
+        .patch(
+            "disc-restart-fresh",
+            &PatchParams::apply("e2e-test"),
+            &Patch::Apply(&fresh_ingress),
+        )
+        .await
+        .context("apply post-restart route")?;
+
+    wait::wait_for_backend(
+        &h2.http,
+        &fresh_host,
+        "/",
+        "echo-b",
+        Duration::from_secs(60),
+    )
+    .await?;
 
     Ok(())
 }
