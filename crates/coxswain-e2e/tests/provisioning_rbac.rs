@@ -946,16 +946,38 @@ async fn zero_cert_proxy_bootstraps_and_serves_routes() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Count `BootstrapRejected` Warning Events currently present in the discovery
-/// namespace. Used as a before/after delta so the assertion is robust against
-/// events left over from prior runs.
+/// Sum the *occurrences* of `BootstrapRejected` Warning Events in the discovery
+/// namespace.
+///
+/// The kube `Recorder` coalesces every same-key event into ONE Event object: its
+/// key is `(type, action, reason, reportingController, reportingInstance,
+/// regarding)` — the note is NOT part of the key. Every bootstrap rejection
+/// shares that key (regarding is always the controller Pod, reason is always
+/// `BootstrapRejected`), so the first rejection in the controller's lifetime
+/// creates the object and every later one only PATCHes its `series.count`.
+/// Counting event *objects* therefore stays pinned at 1 no matter how many
+/// proxies are rejected — and in a shared suite another test's dedicated proxy
+/// routinely emits the first `BootstrapRejected` before this test runs, so an
+/// object-count delta never moves.
+///
+/// Summing `series.count` (an Event with no series == 1 occurrence) yields a
+/// total that increments on EVERY rejection, so the before/after delta reliably
+/// captures the rogue proxy's reject regardless of coalescing. Coalescing is the
+/// correct production behaviour (it prevents event spam from a proxy retrying on
+/// a backoff loop), so the robustness lives here in the test, not the controller.
 async fn count_bootstrap_rejected(events: &Api<Event>) -> anyhow::Result<usize> {
     let list = events.list(&ListParams::default()).await?;
     Ok(list
         .items
         .iter()
         .filter(|e| e.reason.as_deref() == Some("BootstrapRejected"))
-        .count())
+        .map(|e| {
+            e.series
+                .as_ref()
+                .and_then(|s| usize::try_from(s.count).ok())
+                .unwrap_or(1)
+        })
+        .sum())
 }
 
 /// Sad path: a proxy that presents a ServiceAccount token minted for the WRONG
