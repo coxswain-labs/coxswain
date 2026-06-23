@@ -127,6 +127,16 @@ Shared-proxy ServiceAccount name.
 {{- end }}
 
 {{/*
+Discovery gRPC endpoint the shared and dedicated proxies connect to.
+Must match the endpoint the controller binary hardcodes for dedicated proxies:
+`http://coxswain-controller-discovery.<namespace>.svc:<discovery-port>`
+(coxswain-bin/src/lib.rs). Plaintext in T7; mTLS is future work (T10/#423).
+*/}}
+{{- define "coxswain.controller.discoveryEndpoint" -}}
+{{- printf "http://coxswain-controller-discovery.%s.svc:%d" (include "coxswain.namespace" .) (.Values.discovery.port | int) }}
+{{- end }}
+
+{{/*
 Actual container port for HTTP.
 In rootless mode the container binds 8080 instead of the service port (default 80).
 The gateway Service references this by name so the mapping is automatic.

@@ -60,6 +60,7 @@ use coxswain_core::tls::{
 
 use crate::error::WireError;
 use crate::proto::v1 as p;
+use crate::subscription::Scope;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -1593,6 +1594,42 @@ fn listener_health_from_dto(dto: &p::ListenerHealth) -> Result<GatewayListenerHe
     Ok(glh)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Scope: to_wire / from_wire
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Serialise a [`Scope`] to its wire DTO.
+///
+/// `SharedPool` → `shared_pool` oneof arm; `Gateway` → `gateway` arm.
+/// Infallible: every variant has a canonical encoding.
+#[must_use = "wire DTO must be embedded in a Subscribe to reach the server"]
+pub fn scope_to_wire(scope: &Scope) -> p::Scope {
+    let kind = match scope {
+        Scope::SharedPool => p::scope::Kind::SharedPool(p::SharedPoolScope {}),
+        Scope::Gateway { name, namespace } => p::scope::Kind::Gateway(p::GatewayScope {
+            namespace: namespace.clone(),
+            name: name.clone(),
+        }),
+    };
+    p::Scope { kind: Some(kind) }
+}
+
+/// Deserialise a [`p::Scope`] proto DTO into a [`Scope`].
+///
+/// An absent or unrecognised `kind` defaults to [`Scope::SharedPool`] — safe
+/// because the shared pool is the conservative fallback (no routing data lost).
+/// This function is infallible: all wire states map to a valid [`Scope`].
+#[must_use]
+pub fn scope_from_wire(dto: &p::Scope) -> Scope {
+    match &dto.kind {
+        None | Some(p::scope::Kind::SharedPool(_)) => Scope::SharedPool,
+        Some(p::scope::Kind::Gateway(g)) => Scope::Gateway {
+            name: g.name.clone(),
+            namespace: g.namespace.clone(),
+        },
+    }
+}
+
 fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerInfo, WireError> {
     let tls_outcome = match p::ListenerTlsOutcome::try_from(dto.tls_outcome)
         .unwrap_or(p::ListenerTlsOutcome::Unspecified)
@@ -2423,5 +2460,35 @@ mod tests {
             ),
             "tls_outcome preserved"
         );
+    }
+
+    // ── scope round-trips ────────────────────────────────────────────────────
+
+    #[test]
+    fn scope_shared_pool_round_trips() {
+        let scope = Scope::SharedPool;
+        let wire = scope_to_wire(&scope);
+        let back = scope_from_wire(&wire);
+        assert_eq!(scope, back, "SharedPool round-trip");
+    }
+
+    #[test]
+    fn scope_gateway_round_trips() {
+        let scope = Scope::Gateway {
+            name: "my-gateway".to_owned(),
+            namespace: "production".to_owned(),
+        };
+        let wire = scope_to_wire(&scope);
+        let back = scope_from_wire(&wire);
+        assert_eq!(scope, back, "Gateway round-trip");
+    }
+
+    #[test]
+    fn scope_absent_kind_defaults_to_shared_pool() {
+        // An empty Scope proto (no `kind` set) must default to SharedPool —
+        // safe fallback for old clients sending the v0.5 empty message.
+        let wire = p::Scope { kind: None };
+        let back = scope_from_wire(&wire);
+        assert_eq!(Scope::SharedPool, back, "absent kind → SharedPool");
     }
 }

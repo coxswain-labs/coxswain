@@ -75,15 +75,29 @@ const CONTROLLER_CHECKS: &[&str] = &[
 async fn status_exposes_per_subsystem_checks() -> anyhow::Result<()> {
     let h = Harness::start().await?;
 
-    // The controller admin endpoint aggregates both subsystems: the controller
-    // registers its own checks AND the proxy-readiness gate. Each pod owns its
-    // own HealthRegistry post-discovery-rearchitecture, so the proxy pod's admin
-    // endpoint exposes only "proxy" — this must target the controller endpoint
-    // to observe the "controller" subsystem.
-    let health: serde_json::Value = reqwest::get(h.controller_admin_url("/api/v1/health"))
-        .await?
-        .json()
-        .await?;
+    // The aggregated fleet health (controller + proxy subsystems) is served by
+    // the CONTROLLER admin port — the proxy's own /api/v1/health reports only
+    // its local `proxy` subsystem. The controller aggregates the proxy's health
+    // via the discovery NodeRegistry, which populates shortly after the proxy's
+    // discovery handshake completes, so poll rather than racing a single fetch.
+    let url = h.controller_admin_url("/api/v1/health");
+    let health: serde_json::Value = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { "controller + proxy subsystems to report ready".to_string() },
+        || {
+            let url = url.clone();
+            async move {
+                let h: serde_json::Value = reqwest::get(&url).await.ok()?.json().await.ok()?;
+                let subs = h.get("subsystems")?.as_object()?;
+                let ready = |name: &str| {
+                    subs.get(name).and_then(|s| s["state"]["state"].as_str()) == Some("ready")
+                };
+                (ready("controller") && ready("proxy")).then_some(h)
+            }
+        },
+    )
+    .await?;
 
     let subsystems = health["subsystems"]
         .as_object()
@@ -140,10 +154,11 @@ async fn proxy_pod_emits_proxy_prefix_metrics() -> anyhow::Result<()> {
         metrics.contains("coxswain_proxy_request_duration_seconds_count"),
         "proxy /metrics must expose request_duration_seconds histogram"
     );
-    // NOTE: `routing_table_rebuilds_total` is a controller-only metric since the
-    // discovery rearchitecture — the proxy receives pre-built snapshots and no
-    // longer rebuilds routing tables. It is asserted on the controller scrape in
-    // `controller_pod_emits_controller_prefix_metrics`.
+    // Note: `coxswain_proxy_routing_table_rebuilds_total` is intentionally NOT
+    // asserted here — post-#424 the proxy is a pure discovery client that
+    // applies pushed snapshots rather than rebuilding routing tables, so the
+    // rebuild counter is emitted only by the controller (with the
+    // `coxswain_controller_` prefix), never the proxy.
     assert!(
         metrics.contains("status_code=\"200\""),
         "requests_total must carry the status_code=200 sample after the 10 requests"

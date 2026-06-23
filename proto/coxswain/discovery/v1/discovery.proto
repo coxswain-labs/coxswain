@@ -58,12 +58,33 @@ message ClientMessage {
 message Subscribe {
   string node_id = 1; // stable identity of the subscribing proxy (pod UID or hostname)
   uint32 wire_version = 2; // wire protocol version integer spoken by this client (WIRE_VERSION = 1)
-  Scope scope = 3; // requested scope; currently unused (controller sends everything)
+  Scope scope = 3; // requested scope; server dispatches snapshot by scope (WIRE_VERSION 2+)
 }
 
-// Scope filter for future per-port / per-namespace narrowing.
-// Empty in v0.5; reserved for v0.6 delta streaming.
-message Scope {}
+// The slice of the routing world this client subscribes to.
+//
+// Added in WIRE_VERSION 2. A shared-pool proxy sends `shared_pool`; a
+// dedicated proxy sends `gateway` with the Gateway namespace+name it owns.
+// The server uses the scope to build a per-subscriber snapshot: shared_pool
+// receives all non-cut-over Gateways + Ingress; gateway receives only the
+// routing table for that one Gateway.
+//
+// Absent or unrecognised `kind` → server treats as SharedPool (safe default).
+message Scope {
+  oneof kind {
+    SharedPoolScope shared_pool = 1;
+    GatewayScope gateway = 2;
+  }
+}
+
+// Shared proxy pool: full routing world (all non-cut-over Gateways + Ingress).
+message SharedPoolScope {}
+
+// A single dedicated Gateway's routing world.
+message GatewayScope {
+  string namespace = 1;
+  string name = 2;
+}
 
 // Positive acknowledgement: client has applied the snapshot at `version`.
 message Ack {

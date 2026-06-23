@@ -7,13 +7,15 @@
 //! audit reads cluster-scoped RBAC.
 //!
 //! Classification rule: a test belongs to the plane of its *primary assertion
-//! target*. "A resource is provisioned / GC'd / a binding exists" is
-//! control-plane even if it sends a probe. Covers dedicated-proxy resource
-//! provisioning (GEP-1762 labels, owner refs, SSA), garbage collection,
-//! per-namespace + cluster-wide RBAC RoleBinding lifecycle + drift recovery,
-//! `--proxy-watch-namespaces` rendering, ReferenceGrant-gated cross-namespace
-//! backends, the dedicated proxy serving traffic end-to-end, and the structural
-//! read-only-proxy ServiceAccount audit (zero write verbs).
+//! target*. "A resource is provisioned / GC'd" is control-plane even if it
+//! sends a probe. Covers dedicated-proxy resource provisioning (GEP-1762
+//! labels, owner refs, SSA), garbage collection, ReferenceGrant-gated
+//! cross-namespace backends, the dedicated proxy serving traffic end-to-end,
+//! and the structural read-only-proxy ServiceAccount audit (zero write verbs).
+//!
+//! The dedicated proxy is a pure discovery client (post-#424) with zero
+//! Kubernetes API access, so it carries no RoleBindings — there is no
+//! dedicated-proxy RBAC-binding lifecycle to cover here.
 //!
 //! Note: `lifecycle_dedicated_proxy_routes_traffic` and
 //! `lifecycle_cross_namespace_backend` assert traffic, but are kept here with the
@@ -31,8 +33,7 @@ use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service, ServiceAccount};
 use k8s_openapi::api::events::v1::Event;
-use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
-use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
 use serde_json::json;
 use std::collections::HashSet;
 use std::process::Command;
@@ -40,8 +41,7 @@ use std::time::Duration;
 
 mod common;
 use common::dedicated::{
-    GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, assert_provisioning_contract, binding_name,
-    cluster_route_binding_name, wait_for_cut_over,
+    GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, assert_provisioning_contract, wait_for_cut_over,
 };
 
 /// 1. Apply a dedicated-mode Gateway → assert all three resources are created
@@ -118,238 +118,6 @@ async fn gateway_deletion_garbage_collects_resources() -> anyhow::Result<()> {
         },
     )
     .await?;
-
-    Ok(())
-}
-
-/// 4. Apply a dedicated-mode Gateway with a same-namespace HTTPRoute → assert
-///    the controller creates a `RoleBinding` `coxswain-<ns>-<gw-name>` in the
-///    Gateway's own namespace, with the discovery labels set and bound to the
-///    `coxswain-gateway-proxy-reader` ClusterRole.
-#[tokio::test]
-async fn provisions_role_binding_in_gateway_namespace() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-rbac-own").await?;
-
-    fixtures::apply_fixture(
-        dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &ns.name);
-    let want_name = binding_name(&ns.name);
-    let rb = wait::wait_for_resource(&bindings, &want_name, Duration::from_secs(15)).await?;
-
-    // RoleRef points at the static permission-template ClusterRole.
-    assert_eq!(rb.role_ref.kind, "ClusterRole");
-    assert_eq!(rb.role_ref.name, "coxswain-gateway-proxy-reader");
-
-    // Subject is the rendered proxy ServiceAccount in the Gateway's own ns.
-    let subjects = rb.subjects.as_ref().expect("subjects set");
-    assert_eq!(subjects.len(), 1);
-    assert_eq!(subjects[0].kind, "ServiceAccount");
-    assert_eq!(subjects[0].name, RESOURCE_NAME);
-    assert_eq!(subjects[0].namespace.as_deref(), Some(ns.name.as_str()));
-
-    // Discovery labels — reconcile lists by these to compute drift.
-    let labels = rb
-        .metadata
-        .labels
-        .as_ref()
-        .expect("RoleBinding labels missing");
-    assert_eq!(
-        labels
-            .get("app.kubernetes.io/managed-by")
-            .map(String::as_str),
-        Some("coxswain")
-    );
-    assert_eq!(
-        labels
-            .get("gateway.networking.k8s.io/gateway-name")
-            .map(String::as_str),
-        Some(GATEWAY_NAME)
-    );
-    assert_eq!(
-        labels
-            .get("gateway.coxswain-labs.dev/gateway-namespace")
-            .map(String::as_str),
-        Some(ns.name.as_str())
-    );
-
-    // No owner references — cleanup is reconcile-driven via the labels above
-    // (cross-namespace owner refs are unsupported by K8s GC).
-    assert!(
-        rb.metadata.owner_references.is_none()
-            || rb.metadata.owner_references.as_ref().unwrap().is_empty(),
-        "RoleBinding must not carry owner references; cleanup is reconcile-driven"
-    );
-
-    Ok(())
-}
-
-/// 5. Delete the Gateway → finalizer drives synchronous cleanup of every
-///    managed `RoleBinding` for that Gateway. Verifies the binding list (by
-///    the managed-by label selector) is empty within 30 s, and the Gateway
-///    itself disappears (finalizer is removed).
-#[tokio::test]
-async fn gateway_deletion_drives_role_binding_cleanup() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-rbac-gc").await?;
-
-    fixtures::apply_fixture(
-        dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &ns.name);
-    let want_name = binding_name(&ns.name);
-
-    // Wait for the binding to be present before we delete the Gateway, so the
-    // subsequent "binding gone" assertion is meaningful.
-    wait::wait_for_resource(&bindings, &want_name, Duration::from_secs(15)).await?;
-
-    // Delete the Gateway. The finalizer keeps it alive until the controller
-    // clears bindings + removes the finalizer.
-    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
-    gateways
-        .delete(GATEWAY_NAME, &DeleteParams::default())
-        .await?;
-
-    wait::poll_until(
-        Duration::from_secs(30),
-        wait::POLL,
-        || async {
-            format!(
-                "RoleBinding {want_name} + all managed bindings + Gateway {GATEWAY_NAME} to be cleaned up"
-            )
-        },
-        || async {
-            // The binding must be gone, and listing by the managed-by selector
-            // for this Gateway must return zero objects.
-            let binding_gone = bindings.get(&want_name).await.is_err();
-            let selector = format!(
-                "app.kubernetes.io/managed-by=coxswain,\
-                 gateway.networking.k8s.io/gateway-name={GATEWAY_NAME},\
-                 gateway.coxswain-labs.dev/gateway-namespace={}",
-                ns.name
-            );
-            let leftover = bindings
-                .list(&ListParams::default().labels(&selector))
-                .await
-                .map(|l| l.items.len())
-                .unwrap_or(usize::MAX);
-            let gateway_gone = gateways.get(GATEWAY_NAME).await.is_err();
-            (binding_gone && leftover == 0 && gateway_gone).then_some(())
-        },
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// 6. Drift detection: out-of-band delete of a managed `RoleBinding` triggers
-///    the controller to re-create it within ~5 s via the RoleBinding
-///    cross-watch (`watches(... managed-by=coxswain ...)`).
-#[tokio::test]
-async fn out_of_band_binding_deletion_is_recreated() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-rbac-drift").await?;
-
-    fixtures::apply_fixture(
-        dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &ns.name);
-    let want_name = binding_name(&ns.name);
-    let original = wait::wait_for_resource(&bindings, &want_name, Duration::from_secs(15)).await?;
-    let original_rv = original
-        .metadata
-        .resource_version
-        .clone()
-        .expect("RoleBinding resourceVersion");
-
-    bindings
-        .delete(&want_name, &DeleteParams::default())
-        .await?;
-
-    // Wait for the controller to observe the deletion via the cross-watch and
-    // SSA the binding back. `resourceVersion` strictly increases on K8s
-    // writes; a new binding with the same name will have a higher one.
-    let recreated = wait::wait_for_resource(&bindings, &want_name, Duration::from_secs(15)).await?;
-    let new_rv = recreated
-        .metadata
-        .resource_version
-        .expect("recreated RoleBinding resourceVersion");
-    assert_ne!(
-        new_rv, original_rv,
-        "drift detection should produce a new binding (resourceVersion bumped)"
-    );
-    Ok(())
-}
-
-/// 7. Container-args rendering: the Deployment the controller provisions
-///    carries the discovery SVID-bootstrap wiring (#423) — bootstrap endpoint,
-///    projected-token path, CA-bundle path, trust domain — so the dedicated
-///    proxy can authenticate to the controller and open the mTLS Stream.
-///
-/// (`--proxy-watch-namespaces` was retired in #424 when the proxy became a pure
-/// discovery client: it no longer watches namespaces, the controller pushes
-/// pre-scoped routing snapshots, and namespace-read RBAC is provisioned
-/// controller-side as RoleBindings — covered by the lifecycle tests below.)
-#[tokio::test]
-async fn deployment_container_carries_discovery_bootstrap_args() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-rbac-args").await?;
-
-    fixtures::apply_fixture(
-        dedicated::DEDICATED_GATEWAY_WITH_ROUTE,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    let deploy =
-        wait::wait_for_resource(&deployments, RESOURCE_NAME, Duration::from_secs(15)).await?;
-
-    let pod_spec = deploy
-        .spec
-        .as_ref()
-        .and_then(|s| s.template.spec.as_ref())
-        .expect("dedicated proxy pod spec present");
-    let coxswain = pod_spec
-        .containers
-        .iter()
-        .find(|c| c.name == "coxswain")
-        .expect("coxswain container present");
-    let args = coxswain.args.as_ref().expect("args set");
-    for needle in [
-        "--discovery-bootstrap-endpoint=",
-        "--discovery-sa-token-path=",
-        "--discovery-ca-bundle-path=",
-        "--discovery-trust-domain=",
-    ] {
-        assert!(
-            args.iter().any(|a| a.starts_with(needle)),
-            "dedicated proxy must render {needle} for SVID bootstrap; got {args:?}"
-        );
-    }
-
-    // The projected SA-token and trust-bundle volumes must be mounted, else the
-    // bootstrap args point at empty paths and the proxy can never get an SVID.
-    let mounts = coxswain
-        .volume_mounts
-        .as_ref()
-        .expect("coxswain container must mount the discovery token + trust volumes");
-    for vol in ["discovery-token", "trust-bundle"] {
-        assert!(
-            mounts.iter().any(|m| m.name == vol),
-            "dedicated proxy must mount the '{vol}' volume; got {mounts:?}"
-        );
-    }
 
     Ok(())
 }
@@ -605,10 +373,52 @@ async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 12b — Scope isolation (#426): two cut-over dedicated Gateways A and B exist
+/// concurrently. A's dedicated proxy must serve only A's host and return `404`
+/// for B's host — proving the discovery server filters each subscriber's
+/// snapshot to its own Gateway's routing world via the dedicated registry, and
+/// never leaks another scope's routes. This is the direct regression guard for
+/// the per-proxy scope-filtering behaviour; the other dedicated tests assert it
+/// only indirectly via the shared-pool relinquish.
+#[tokio::test]
+async fn dedicated_proxy_does_not_serve_foreign_gateway_routes() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns_a = NamespaceGuard::create(&h.client, "prov-ded-scope-a").await?;
+    let ns_b = NamespaceGuard::create(&h.client, "prov-ded-scope-b").await?;
+
+    // Provision two independent cut-over dedicated Gateways, one per namespace.
+    for ns in [&ns_a, &ns_b] {
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(dedicated::TRAFFIC, FixtureVars::new(&ns.name)).await?;
+        let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+        wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+    }
+
+    let host_a = format!("dedicated.{}.local", ns_a.name);
+    let host_b = format!("dedicated.{}.local", ns_b.name);
+
+    let addr_a =
+        wait::wait_for_dedicated_proxy_endpoint(&ns_a.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http_a = HttpClient::new(addr_a)?;
+
+    // Positive: A serves its own Gateway's route — proves A's subscription
+    // (Scope::Gateway{ns_a}) received its own slice from the dedicated registry.
+    let resp = wait::wait_for_route(&http_a, &host_a, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    // Negative: A must NOT serve B's host. B is a *real* cut-over Gateway whose
+    // routes exist in the dedicated registry under B's own key, so this 404
+    // proves scope filtering — A never receives B's routes, not merely that the
+    // host is unknown cluster-wide.
+    wait::wait_for_route_status(&http_a, &host_b, "/", 404, Duration::from_secs(30)).await?;
+
+    Ok(())
+}
+
 /// 13 — An HTTPRoute with a backend Service in a different namespace resolves
-/// via `ReferenceGrant`. The per-tenant `RoleBinding` is provisioned for the
-/// dedicated proxy ServiceAccount, and traffic flows through the dedicated
-/// subprocess.
+/// via `ReferenceGrant`, and traffic flows through the dedicated subprocess.
 #[tokio::test]
 #[ignore = "dedicated-over-discovery clobbers shared routing cells under concurrent provisioning; unignore when per-proxy scope filtering lands (#426)"]
 async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
@@ -632,10 +442,6 @@ async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
 
-    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &tenant.name);
-    let want_binding = binding_name(&ns.name);
-    wait::wait_for_resource(&bindings, &want_binding, Duration::from_secs(30)).await?;
-
     let dedicated_addr =
         wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
             .await?;
@@ -649,8 +455,7 @@ async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
 }
 
 /// 14 — Delete the `ReferenceGrant` → the cross-namespace backend is dropped
-/// from the dedicated proxy's routing table (requests 503) and the per-tenant
-/// `RoleBinding` is reconciled away.
+/// from the dedicated proxy's routing table (requests 500).
 #[tokio::test]
 #[ignore = "dedicated-over-discovery clobbers shared routing cells under concurrent provisioning; unignore when per-proxy scope filtering lands (#426)"]
 async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<()> {
@@ -693,18 +498,6 @@ async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<
     // installing error route (500)"; see `gateway_api::reconcile`).
     wait::wait_for_route_status(&http, &host, "/", 500, Duration::from_secs(30)).await?;
 
-    // Tenant ns is no longer in the desired-namespace set → the per-tenant
-    // RoleBinding is reconciled away.
-    let bindings: Api<RoleBinding> = Api::namespaced(h.client.clone(), &tenant.name);
-    let want_binding = binding_name(&ns.name);
-    wait::poll_until(
-        Duration::from_secs(30),
-        wait::POLL,
-        || async { format!("per-tenant RoleBinding {want_binding} to be reconciled away") },
-        || async { bindings.get(&want_binding).await.err().map(|_| ()) },
-    )
-    .await?;
-
     Ok(())
 }
 
@@ -746,123 +539,6 @@ async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
                 && sas.get(RESOURCE_NAME).await.is_err()
                 && gateways.get(GATEWAY_NAME).await.is_err();
             gone.then_some(())
-        },
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// 21. `from: All` listener → controller auto-provisions a `ClusterRoleBinding`
-///     for cluster-wide `HTTPRoute` reads. Flipping the listener back to
-///     `from: Same` removes the binding on the next reconcile.
-///
-/// The cluster-wide-read decision moved controller-side in #424 (the proxy is a
-/// pure discovery client and no longer reads routes, so `--allow-cluster-wide-
-/// route-read` was retired); the controller still derives the flag and
-/// provisions/removes the `ClusterRoleBinding` — which is what this verifies.
-#[tokio::test]
-async fn cluster_wide_binding_created_and_removed_with_listener_mode() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-clusterwide-toggle").await?;
-
-    // Gateway fixture with from: All.
-    fixtures::apply_fixture(
-        dedicated::DEDICATED_GATEWAY_FROM_ALL,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let gw_name = "dedicated-gw-from-all";
-    let crb_name = cluster_route_binding_name(&ns.name, gw_name);
-
-    let crbs: Api<ClusterRoleBinding> = Api::all(h.client.clone());
-
-    // 1. ClusterRoleBinding appears within 15 s.
-    wait::wait_for_resource(&crbs, &crb_name, Duration::from_secs(15)).await?;
-
-    // 2. Patch the listener to from: Same — the binding must disappear.
-    // SSA requires apiVersion + kind in the payload.
-    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
-    let patch = serde_json::json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "Gateway",
-        "metadata": { "name": gw_name, "namespace": &ns.name },
-        "spec": {
-            "gatewayClassName": "coxswain",
-            "infrastructure": {
-                "parametersRef": {
-                    "group": "gateway.coxswain-labs.dev",
-                    "kind": "CoxswainGatewayParameters",
-                    "name": "dedicated-params-from-all"
-                }
-            },
-            "listeners": [{
-                "name": "http",
-                "port": 8200,
-                "protocol": "HTTP",
-                "allowedRoutes": { "namespaces": { "from": "Same" } }
-            }]
-        }
-    });
-    gateways
-        .patch(
-            gw_name,
-            &PatchParams::apply("e2e-test").force(),
-            &Patch::Apply(patch),
-        )
-        .await?;
-
-    wait::poll_until(
-        Duration::from_secs(30),
-        wait::POLL,
-        || async {
-            format!("ClusterRoleBinding {crb_name} to be removed after reverting the listener to from: Same")
-        },
-        || async { crbs.get(&crb_name).await.is_err().then_some(()) },
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// 22. Gateway deletion drives `ClusterRoleBinding` cleanup: the finalizer
-///     keeps the Gateway alive until the controller removes both per-namespace
-///     `RoleBinding`s and any cluster-wide `ClusterRoleBinding`s, then removes
-///     the finalizer.
-#[tokio::test]
-async fn cluster_wide_binding_deleted_on_gateway_deletion() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-clusterwide-gc").await?;
-
-    fixtures::apply_fixture(
-        dedicated::DEDICATED_GATEWAY_FROM_ALL,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let gw_name = "dedicated-gw-from-all";
-    let crb_name = cluster_route_binding_name(&ns.name, gw_name);
-
-    let crbs: Api<ClusterRoleBinding> = Api::all(h.client.clone());
-    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
-
-    // Wait for the binding to exist before deleting — makes the "binding gone"
-    // assertion below meaningful.
-    wait::wait_for_resource(&crbs, &crb_name, Duration::from_secs(15)).await?;
-
-    gateways.delete(gw_name, &DeleteParams::default()).await?;
-
-    wait::poll_until(
-        Duration::from_secs(30),
-        wait::POLL,
-        || async {
-            format!("ClusterRoleBinding {crb_name} and Gateway {gw_name} to be cleaned up after deletion")
-        },
-        || async {
-            let crb_gone = crbs.get(&crb_name).await.is_err();
-            let gw_gone = gateways.get(gw_name).await.is_err();
-            (crb_gone && gw_gone).then_some(())
         },
     )
     .await?;

@@ -30,20 +30,6 @@ pub const RESOURCE_NAME: &str = "dedicated-gw-coxswain";
 /// shared pool must stop serving the Gateway (#210).
 pub const CUT_OVER_CONDITION: &str = "gateway.coxswain-labs.dev/DedicatedProxyReady";
 
-/// `RoleBinding` name pattern: `coxswain-<gateway-namespace>-<gateway-name>`
-/// (see `coxswain_controller::operator::rbac`). Constructed at runtime from
-/// the test namespace.
-pub fn binding_name(ns: &str) -> String {
-    format!("coxswain-{ns}-{GATEWAY_NAME}")
-}
-
-/// Returns the ClusterRoleBinding name the controller creates for a
-/// `from: All` listener — mirrors `cluster_binding_name` in
-/// `coxswain_controller::operator::rbac`.
-pub fn cluster_route_binding_name(gw_ns: &str, gw_name: &str) -> String {
-    format!("coxswain-{gw_ns}-{gw_name}-cluster-wide-routes")
-}
-
 /// Apply the dedicated-mode Gateway fixture, then wait for the controller's
 /// provisioning operator to land the three resources. Returns the apis
 /// scoped to `ns` for follow-up assertions.

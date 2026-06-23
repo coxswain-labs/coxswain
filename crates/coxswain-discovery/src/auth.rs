@@ -690,7 +690,9 @@ pub(crate) mod tests {
             kind: Some(CKind::Subscribe(p::Subscribe {
                 node_id: "test-proxy".into(),
                 wire_version: WIRE_VERSION,
-                scope: Some(p::Scope {}),
+                scope: Some(crate::wire::scope_to_wire(
+                    &crate::subscription::Scope::SharedPool,
+                )),
             })),
         })
         .await

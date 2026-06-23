@@ -110,6 +110,11 @@ health:
 admin:
   port: 8082
 
+# -- Discovery gRPC server port (COXSWAIN_DISCOVERY_PORT).
+# The controller binds this port; shared and dedicated proxies connect to it.
+discovery:
+  port: 50051
+
 # -- GatewayClass resource. Set create: false if you manage it externally.
 gatewayClass:
   create: true
@@ -339,15 +344,10 @@ proxy:
   # Dedicated-mode proxy provisioning. The pods themselves are not rendered
   # by Helm — the controller provisions one Deployment / Service /
   # ServiceAccount per Gateway with `parametersRef`, in the Gateway's own
-  # namespace. This block only governs the cluster-wide objects the
-  # provisioning relies on.
-  dedicated:
-    # Render the ClusterRole `coxswain-gateway-proxy-reader` (the permission
-    # template the controller binds via per-namespace RoleBindings — issue
-    # #209). Disable only if you manage this object externally; the
-    # controller's binding logic still expects a ClusterRole by that name.
-    rbac:
-      create: true
+  # namespace. The dedicated proxy is a pure discovery client (it receives its
+  # routing world over the discovery gRPC stream) and makes zero Kubernetes API
+  # calls, so its ServiceAccount carries no RoleBindings — there are no
+  # cluster-wide RBAC objects to render here.
 
   # HTTP listener. Clients always connect on `port`; the container binds on
   # `port` normally, or 8080 when security.rootless is true. Both pods take

@@ -89,6 +89,8 @@ spec:
               value: {{ .Values.health.port | quote }}
             - name: COXSWAIN_ADMIN_PORT
               value: {{ .Values.admin.port | quote }}
+            - name: COXSWAIN_DISCOVERY_PORT
+              value: {{ .Values.discovery.port | quote }}
             - name: COXSWAIN_MANAGEMENT_BIND_ADDRESS
               value: {{ .Values.management.bindAddress | quote }}
             - name: COXSWAIN_CONTROLLER_NAME

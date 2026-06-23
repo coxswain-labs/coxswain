@@ -25,7 +25,7 @@
 //!
 //! ## Status writing (Step 12, #211)
 //!
-//! Every reconcile that completes its SSA + RBAC stages also calls
+//! Every reconcile that completes its SSA provisioning stage also calls
 //! [`super::status::patch_dedicated_gateway_status`] with the latest snapshot
 //! of provisioned Service, Node fleet, listener TLS health, and Ready Pod
 //! count. The `NotFound` branch writes `Accepted=False,
@@ -38,14 +38,12 @@
 //! cert-ref or route-resolution flip kicks every owned Gateway through the
 //! patch path within watch latency.
 
-use super::{apply, params, rbac, render, status};
+use super::{apply, params, render, status};
 use async_trait::async_trait;
 use coxswain_core::crd::CoxswainGatewayParameters;
 use coxswain_core::ownership::ObjectKey;
-use coxswain_reflector::gw_types::HttpRoute;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
-use coxswain_reflector::gw_types::v::referencegrants::ReferenceGrant;
 use coxswain_reflector::ingress::IngressPorts;
 use coxswain_reflector::tls::{
     GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
@@ -53,7 +51,6 @@ use coxswain_reflector::tls::{
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Node, Pod, Service, ServiceAccount};
-use k8s_openapi::api::rbac::v1::RoleBinding;
 use kube::{
     Api, Client, Resource as _,
     api::{DeleteParams, ObjectMeta, Patch, PatchParams},
@@ -106,9 +103,6 @@ pub(super) enum ReconcileError {
     /// SSA of one of the three rendered resources failed.
     #[error("apply: {0}")]
     Apply(#[from] apply::ApplyError),
-    /// Per-namespace `RoleBinding` reconcile or cleanup failed (#209).
-    #[error("rbac: {0}")]
-    Rbac(#[from] rbac::RbacError),
 }
 
 /// Bundle of inputs the operator's [`BackgroundService::start`] needs from
@@ -205,8 +199,6 @@ struct ReconcileContext {
     client: Client,
     class_store: Store<GatewayClass>,
     params_store: Store<CoxswainGatewayParameters>,
-    routes_store: Store<HttpRoute>,
-    grants_store: Store<ReferenceGrant>,
     /// Pods carrying the dedicated-proxy labels. Reads off this store drive
     /// the `gateway.coxswain-labs.dev/DedicatedProxyReady` condition (#210)
     /// and gate `Programmed=True` on having ≥1 Ready Pod (#211).
@@ -241,11 +233,11 @@ struct ReconcileContext {
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
 
-/// Finalizer key the operator places on every dedicated-mode Gateway. The
-/// reconcile clears cross-namespace `RoleBinding`s (and provisioned same-ns
-/// resources will GC via owner-ref) before removing this finalizer; without
-/// it K8s would delete the Gateway before we can clean up the bindings,
-/// leaving stale RBAC across the cluster.
+/// Finalizer key the operator places on every dedicated-mode Gateway. It keeps
+/// the Gateway alive across a dedicated→shared migration so the operator can
+/// hand status ownership back to the shared pool and tear the dedicated proxy
+/// resources down in order before the object is deleted; provisioned same-ns
+/// resources (Deployment/Service/SA) GC via owner-ref on a plain delete.
 const CLEANUP_FINALIZER: &str = "gateway.coxswain-labs.dev/dedicated-cleanup";
 
 /// Label selector matching every Pod the operator provisions for a
@@ -312,30 +304,6 @@ impl BackgroundService for Operator {
                 while stream.next().await.is_some() {}
             }
         });
-        let (routes_reader, routes_writer) = reflector::store::<HttpRoute>();
-        tasks.spawn({
-            let api = Api::<HttpRoute>::all(client.clone());
-            async move {
-                let stream = reflector::reflector(
-                    routes_writer,
-                    watcher(api, watcher::Config::default()).default_backoff(),
-                );
-                tokio::pin!(stream);
-                while stream.next().await.is_some() {}
-            }
-        });
-        let (grants_reader, grants_writer) = reflector::store::<ReferenceGrant>();
-        tasks.spawn({
-            let api = Api::<ReferenceGrant>::all(client.clone());
-            async move {
-                let stream = reflector::reflector(
-                    grants_writer,
-                    watcher(api, watcher::Config::default()).default_backoff(),
-                );
-                tokio::pin!(stream);
-                while stream.next().await.is_some() {}
-            }
-        });
         // Pod reflector for dedicated-proxy readiness (#210). Cluster-wide
         // scope (dedicated-proxy Pods live in each Gateway's own namespace)
         // narrowed to our own Pods via label selector — the watch streams
@@ -369,20 +337,16 @@ impl BackgroundService for Operator {
         });
 
         // Wait for every dependency reflector to complete its initial sync
-        // before exposing the stores to the reconcile loop. Without this,
-        // the first reconcile after pod start (or controller restart) can
-        // fire while `routes_store` / `grants_store` are still empty —
-        // producing a transient render whose `--proxy-watch-namespaces`
-        // arg list is missing every cross-namespace backend ns. SSA with
-        // `force=true` accepts the transient render, then a second reconcile
-        // with the full stores SSAs again — net effect: every controller
-        // restart bumps the proxy Deployment's `resourceVersion` twice
-        // (and triggers an unnecessary rolling update).
+        // before exposing the stores to the reconcile loop, so the first
+        // reconcile after pod start (or controller restart) sees populated
+        // GatewayClass/params/Pod/Node state rather than racing an empty
+        // store and producing a transient render that SSA must immediately
+        // re-apply (an unnecessary Deployment resourceVersion bump).
         //
-        // The wait is bounded at 30 s so a misconfigured RBAC (which would
-        // cause the watches to 403 forever) doesn't hang the operator
-        // indefinitely; the controller logs and proceeds, so partial
-        // observability is preferable to a stuck reconcile loop.
+        // The wait is bounded at 30 s so a misconfigured watch (e.g. one that
+        // 403s forever) doesn't hang the operator indefinitely; the controller
+        // logs and proceeds, so partial observability is preferable to a stuck
+        // reconcile loop.
         let sync_timeout = Duration::from_secs(30);
         let deadline = tokio::time::Instant::now() + sync_timeout;
         async fn wait_or_name<F: std::future::Future>(
@@ -400,19 +364,17 @@ impl BackgroundService for Operator {
         // operator is shutting down. We treat those as "synced" because there
         // is nothing left for this reader to deliver; the controller will
         // exit on the next iteration anyway.
-        let (a, b, c, d, e, f) = tokio::join!(
+        let (a, b, c, d) = tokio::join!(
             wait_or_name("GatewayClass", class_reader.wait_until_ready(), deadline),
             wait_or_name(
                 "CoxswainGatewayParameters",
                 params_reader.wait_until_ready(),
                 deadline,
             ),
-            wait_or_name("HTTPRoute", routes_reader.wait_until_ready(), deadline),
-            wait_or_name("ReferenceGrant", grants_reader.wait_until_ready(), deadline),
             wait_or_name("Pod", pods_reader.wait_until_ready(), deadline),
             wait_or_name("Node", nodes_reader.wait_until_ready(), deadline),
         );
-        let unsynced: Vec<&'static str> = [a, b, c, d, e, f].into_iter().flatten().collect();
+        let unsynced: Vec<&'static str> = [a, b, c, d].into_iter().flatten().collect();
         if !unsynced.is_empty() {
             tracing::warn!(
                 timeout = ?sync_timeout,
@@ -430,8 +392,6 @@ impl BackgroundService for Operator {
             client: client.clone(),
             class_store: class_reader,
             params_store: params_reader,
-            routes_store: routes_reader,
-            grants_store: grants_reader,
             pods_store: pods_reader,
             nodes_store: nodes_reader,
             tls_health: self.config.tls_health.clone(),
@@ -452,13 +412,9 @@ impl BackgroundService for Operator {
         let api_gateways: Api<Gateway> = Api::all(client.clone());
         let api_classes: Api<GatewayClass> = Api::all(client.clone());
         let api_params: Api<CoxswainGatewayParameters> = Api::all(client.clone());
-        let api_routes: Api<HttpRoute> = Api::all(client.clone());
-        let api_grants: Api<ReferenceGrant> = Api::all(client.clone());
-        let api_bindings: Api<RoleBinding> = Api::all(client.clone());
         let api_pods: Api<Pod> = Api::all(client.clone());
         let api_services: Api<Service> = Api::all(client);
         let class_store_for_watches = ctx.class_store.clone();
-        let routes_store_for_watches = ctx.routes_store.clone();
 
         // Build the health-channel retrigger stream (#211). We bridge two
         // `tokio::sync::watch::Receiver<u64>`s (which are `Send` but not
@@ -539,81 +495,6 @@ impl BackgroundService for Operator {
                         .collect()
                 }
             })
-            // HTTPRoute → Gateway: every parentRef pointing at a Gateway
-            // we manage triggers a reconcile for that Gateway. Precise
-            // mapping — no fan-out.
-            .watches(api_routes, watcher::Config::default(), {
-                move |route: HttpRoute| -> Vec<ObjectRef<Gateway>> {
-                    let route_ns = route
-                        .metadata
-                        .namespace
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_string();
-                    let Some(parents) = route.spec.parent_refs.as_deref() else {
-                        return vec![];
-                    };
-                    parents
-                        .iter()
-                        .filter(|p| {
-                            let group = p.group.as_deref().unwrap_or("gateway.networking.k8s.io");
-                            let kind = p.kind.as_deref().unwrap_or("Gateway");
-                            group == "gateway.networking.k8s.io" && kind == "Gateway"
-                        })
-                        .map(|p| {
-                            let ns = p.namespace.clone().unwrap_or_else(|| route_ns.clone());
-                            ObjectRef::new(&p.name).within(&ns)
-                        })
-                        .collect()
-                }
-            })
-            // ReferenceGrant → Gateway: filter to those whose routes have a
-            // backendRef into the grant's namespace. Engineering-correct
-            // precise mapping; we deliberately do not broad fan-out — the
-            // cost of maintaining the index closure is bounded
-            // (dedicated_gateways × routes × backend_refs) and the precise
-            // mapping scales naturally past today's "tens of Gateways" cap.
-            .watches(api_grants, watcher::Config::default(), {
-                let gateway_store = gateway_store.clone();
-                let routes_store = routes_store_for_watches.clone();
-                move |grant: ReferenceGrant| -> Vec<ObjectRef<Gateway>> {
-                    let Some(target_ns) = grant.metadata.namespace.clone() else {
-                        return vec![];
-                    };
-                    let routes: Vec<Arc<HttpRoute>> = routes_store.state();
-                    gateway_store
-                        .state()
-                        .into_iter()
-                        .filter(|gw| {
-                            let gw_ns = gw.metadata.namespace.as_deref().unwrap_or("");
-                            let gw_name = gw.metadata.name.as_deref().unwrap_or("");
-                            gateway_routes_into(&routes, gw_ns, gw_name, &target_ns)
-                        })
-                        .map(|gw| ObjectRef::from_obj(gw.as_ref()))
-                        .collect()
-                }
-            })
-            // RoleBinding → Gateway: managed-by label filter; mapper reads
-            // the gateway-namespace/gateway-name labels to identify the
-            // owning Gateway. Drives drift detection — an out-of-band delete
-            // re-creates within watch latency rather than waiting for the
-            // next natural reconcile trigger.
-            .watches(
-                api_bindings,
-                watcher::Config::default().labels("app.kubernetes.io/managed-by=coxswain"),
-                |rb: RoleBinding| -> Vec<ObjectRef<Gateway>> {
-                    let Some(labels) = rb.metadata.labels.as_ref() else {
-                        return vec![];
-                    };
-                    let Some(name) = labels.get("gateway.networking.k8s.io/gateway-name") else {
-                        return vec![];
-                    };
-                    let Some(ns) = labels.get("gateway.coxswain-labs.dev/gateway-namespace") else {
-                        return vec![];
-                    };
-                    vec![ObjectRef::new(name).within(ns)]
-                },
-            )
             // Pod → Gateway: dedicated-proxy Pods live in the Gateway's own
             // namespace, so the mapping is `pod.metadata.namespace` +
             // `pod.metadata.labels[gateway.networking.k8s.io/gateway-name]`.
@@ -713,22 +594,19 @@ async fn reconcile_inner(
     // ----- Finalizer / deletion path ------------------------------------
     //
     // A Gateway with `deletionTimestamp` set is being deleted; if it carries
-    // our finalizer, we own the synchronous cleanup of cross-namespace
-    // `RoleBinding`s before K8s can finalize the delete. Provisioned
-    // resources (Deployment/Service/SA) in the Gateway's own namespace
-    // GC via owner-refs — independent of this finalizer.
+    // our finalizer we just drop it — provisioned resources
+    // (Deployment/Service/SA) in the Gateway's own namespace GC via owner-refs.
+    // The finalizer exists for the dedicated→shared migration hand-off below,
+    // not for cleanup on a plain delete.
     if gw.metadata.deletion_timestamp.is_some() {
         if has_our_finalizer(&gw) {
             tracing::info!(
                 gateway = %gateway_id(&gw),
-                "operator: cleaning up dedicated-mode bindings for terminating Gateway"
+                "operator: finalizing terminating dedicated-mode Gateway"
             );
-            rbac::delete_all_for_gateway(&ctx.client, gw_namespace, gw_name).await?;
-            rbac::delete_all_cluster_bindings_for_gateway(&ctx.client, gw_namespace, gw_name)
-                .await?;
             remove_finalizer(&ctx.client, &gw).await?;
-            // GC of in-namespace resources is owner-ref driven; nothing else
-            // to do here.
+            // GC of in-namespace resources (Deployment/Service/SA) is
+            // owner-ref driven; nothing else to do here.
             ctx.last_hashes
                 .lock()
                 .unwrap_or_else(|e| panic!("invariant: hash-tracking mutex poisoned: {e}"))
@@ -784,12 +662,6 @@ async fn reconcile_inner(
             // conditions written by the shared-pool writer on every reconcile of
             // every non-dedicated Gateway, producing an unbounded patch loop.
             if has_our_finalizer(&gw) {
-                // Cross-namespace RBAC is safe to reconcile every pass — the
-                // deletes are NotFound-tolerant (idempotent).
-                rbac::delete_all_for_gateway(&ctx.client, gw_namespace, gw_name).await?;
-                rbac::delete_all_cluster_bindings_for_gateway(&ctx.client, gw_namespace, gw_name)
-                    .await?;
-
                 // Step 1 — hand status ownership back to the shared pool, ONCE.
                 // We are the sole writer of `DedicatedProxyReady`; its presence
                 // means we have not yet handed off. Clearing our dedicated-mode
@@ -872,20 +744,6 @@ async fn reconcile_inner(
         return Ok(Action::requeue(POST_FINALIZER_REQUEUE));
     }
 
-    // Derive RBAC scope from the Gateway's listener specs. Pure, no I/O.
-    let derived = rbac::derive_proxy_rbac(&gw);
-
-    // Compute the desired namespace set for per-namespace RoleBindings (#209).
-    // Cross-namespace routes contribute their backend namespaces when any
-    // listener has from: All or from: Selector.
-    let allow_cross_ns = derived.allow_cluster_wide_route_read;
-    let desired = rbac::desired_namespaces_for_gateway(
-        &gw,
-        &ctx.routes_store,
-        &ctx.grants_store,
-        allow_cross_ns,
-    );
-
     let rendered = render::render(&render::RenderInputs {
         gateway: &gw,
         params: &effective,
@@ -914,27 +772,12 @@ async fn reconcile_inner(
 
     // Stage 1b — provisioning (Deployment/Service/SA). SSA with force=true
     // re-asserts ownership on every reconcile; the apply order is SA →
-    // Service → Deployment so the ServiceAccount exists before any
-    // RoleBinding references it.
+    // Service → Deployment. The dedicated proxy is a pure discovery client
+    // (post-#424) with zero Kubernetes API access, so the rendered SA carries
+    // no RoleBindings — it exists only as the pod identity.
     apply::apply_rendered(&ctx.client, &gw, &rendered).await?;
 
-    // Stage 2 — per-namespace RoleBindings. The proxy SA name matches the
-    // rendered SA's name (GEP-1762 `<NAME>-<GATEWAY CLASS>`); we pass it in
-    // explicitly so reconciler.rs stays the single source of truth for
-    // resource naming.
-    let proxy_sa_name = rendered
-        .service_account
-        .metadata
-        .name
-        .as_deref()
-        .unwrap_or_else(|| panic!("invariant: rendered ServiceAccount has no name"));
-    rbac::reconcile_rbac(&ctx.client, &gw, proxy_sa_name, &desired).await?;
-
-    // Stage 2b — cluster-wide ClusterRoleBindings for from: All / Selector
-    // listeners (#229). Idempotent: creates/deletes based on derived flags.
-    rbac::reconcile_cluster_rbac(&ctx.client, &gw, proxy_sa_name, derived).await?;
-
-    // Stage 3 — write Gateway.status (#211). One JSON merge patch carries
+    // Stage 2 — write Gateway.status (#211). One JSON merge patch carries
     // Accepted/Programmed/per-listener/addresses + the
     // `gateway.coxswain-labs.dev/DedicatedProxyReady` cut-over signal the
     // shared-proxy reflector consumes (#210). All gated on observed Pod
@@ -1200,48 +1043,6 @@ fn ignore_not_found<T>(result: Result<T, kube::Error>) -> Result<(), kube::Error
 
 /// Returns true iff any HTTPRoute attached to the given Gateway has a
 /// `backendRef` whose target namespace equals `target_ns`. Used by the
-/// ReferenceGrant cross-watch mapper to filter affected Gateways precisely.
-fn gateway_routes_into(
-    routes: &[Arc<HttpRoute>],
-    gw_namespace: &str,
-    gw_name: &str,
-    target_ns: &str,
-) -> bool {
-    for route in routes {
-        let route_ns = route.metadata.namespace.as_deref().unwrap_or("");
-        let Some(parents) = route.spec.parent_refs.as_deref() else {
-            continue;
-        };
-        let attaches = parents.iter().any(|p| {
-            let group = p.group.as_deref().unwrap_or("gateway.networking.k8s.io");
-            let kind = p.kind.as_deref().unwrap_or("Gateway");
-            let ns = p.namespace.as_deref().unwrap_or(route_ns);
-            group == "gateway.networking.k8s.io"
-                && kind == "Gateway"
-                && p.name == gw_name
-                && ns == gw_namespace
-        });
-        if !attaches {
-            continue;
-        }
-        let Some(rules) = route.spec.rules.as_deref() else {
-            continue;
-        };
-        for rule in rules {
-            let Some(brefs) = rule.backend_refs.as_deref() else {
-                continue;
-            };
-            for b in brefs {
-                let ns = b.namespace.as_deref().unwrap_or(route_ns);
-                if ns == target_ns {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 /// Count the dedicated-proxy Pods that are Ready for the given Gateway.
 ///
 /// "Ready" means the Pod is in `gw_namespace`, carries the

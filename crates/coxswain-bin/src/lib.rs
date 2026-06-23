@@ -152,6 +152,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         tls: status_writer.outputs.tls.clone(),
         client_certs: status_writer.outputs.client_certs.clone(),
         tls_health: tls_health.clone(),
+        dedicated: status_writer.outputs.dedicated_registry.clone(),
     };
     let discovery_service = coxswain_discovery::DiscoveryService::new(
         discovery_source,
@@ -358,11 +359,9 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
     let health = HealthRegistry::new();
     let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
-    // NOTE(T7): the discovery server currently sends the full routing snapshot to
-    // every subscriber regardless of scope. This dedicated proxy subscribes with
-    // Scope::Gateway{name, namespace} but the server ignores the scope and
-    // delivers all routes. Per-gateway snapshot filtering is a tracked follow-up
-    // precondition for dedicated-proxy GA (v0.6).
+    // This dedicated proxy subscribes with Scope::Gateway{name, namespace}; the
+    // discovery server filters the snapshot to this Gateway's routing world via
+    // the dedicated registry (#426), so it receives only its own routes.
     let scope = Scope::Gateway {
         name: gateway_name.clone(),
         namespace: gateway_namespace.clone(),

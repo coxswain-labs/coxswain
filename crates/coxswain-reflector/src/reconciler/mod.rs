@@ -6,10 +6,9 @@
 //!
 //! - [`SharedProxyReconciler`] — `serve proxy --shared` and `serve dev`.
 //!   Cluster-wide watches; builds Ingress + Gateway routes, TLS store, listener
-//!   health, route health, policy health, and the cluster summary.
-//! - `DedicatedProxyReconciler` (Step 7) — `serve proxy --gateway`.
-//!   Namespace-narrowed watches scoped to one Gateway; builds only that
-//!   Gateway's routes + TLS store.
+//!   health, route health, policy health, and the cluster summary. Also
+//!   publishes per-cut-over-Gateway snapshots into the dedicated registry the
+//!   discovery server serves to dedicated proxies (#426).
 //! - `ControllerReconciler` (Step 7) — `serve controller`. Cluster-wide
 //!   watches; builds the health maps, the cluster summary, and the owned-gateway
 //!   set the status writer subscribes to. Does not build routing tables or the
@@ -21,12 +20,10 @@
 //! orchestration.
 
 pub mod controller;
-pub mod dedicated_proxy;
-pub mod shared_proxy;
+pub mod proxy;
 
 pub use controller::ControllerReconciler;
-pub use dedicated_proxy::{DedicatedConfig, DedicatedOutputs, DedicatedProxyReconciler};
-pub use shared_proxy::{
+pub use proxy::{
     IngressDefaultBackend, IngressDefaultBackendParseError, IngressEvent, ReconcilerHealth,
     ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusSubscriptions,
 };

@@ -64,7 +64,7 @@ use std::sync::Arc;
 
 /// `Gateway.status.conditions[type]` value for the dedicated-proxy
 /// readiness cut-over signal. The shared-proxy reflector reads this condition
-/// (in `coxswain_reflector::reconciler::shared_proxy::gateway_is_cut_over`)
+/// (in `coxswain_reflector::reconciler::proxy::gateway_is_cut_over`)
 /// to decide whether the shared pool should drop the Gateway from its
 /// routing table.
 pub(crate) const DEDICATED_PROXY_READY_CONDITION_TYPE: &str =

@@ -1,15 +1,18 @@
 {{- if .Values.controller.enabled -}}
-# Discovery control-plane Service (#423). Exposes the controller's two gRPC
-# listeners to proxy pods:
-#   - stream    (mTLS mandatory): pushes routing snapshots to SVID-bearing proxies
-#   - bootstrap (server-auth-only): issues SVIDs to fresh proxies via SA token + CSR
-# Named `coxswain-controller-discovery` (see the `coxswain.discovery.serviceName`
-# helper) so the controller operator's rendered dedicated-proxy endpoint and the
-# shared-proxy endpoint env both resolve to it.
+{{/*
+Discovery gRPC Service (#423). Exposes the controller's two gRPC listeners to proxy pods:
+  - stream    (mTLS mandatory): pushes routing snapshots to SVID-bearing proxies
+  - bootstrap (server-auth-only): issues SVIDs to fresh proxies via SA token + CSR
+The controller binary hardcodes the endpoint it hands to dedicated proxies as
+`https://coxswain-controller-discovery.<namespace>.svc:<discovery-port>`
+(coxswain-bin/src/lib.rs), so this Service MUST be named literally
+`coxswain-controller-discovery` regardless of release name. The shared proxy
+resolves the same name via the `coxswain.controller.discoveryEndpoint` helper.
+*/}}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "coxswain.discovery.serviceName" . }}
+  name: coxswain-controller-discovery
   namespace: {{ include "coxswain.namespace" . }}
   labels:
     {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
