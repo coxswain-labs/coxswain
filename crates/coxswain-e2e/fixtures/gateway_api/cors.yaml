@@ -39,8 +39,7 @@ spec:
         - type: CORS
           cors:
             allowOrigins:
-              - type: Exact
-                value: "https://allowed.example"
+              - "https://allowed.example"
             allowMethods:
               - GET
               - POST
@@ -60,8 +59,7 @@ spec:
         - type: CORS
           cors:
             allowOrigins:
-              - type: Exact
-                value: "https://allowed.example"
+              - "https://allowed.example"
             allowMethods:
               - GET
               - POST
