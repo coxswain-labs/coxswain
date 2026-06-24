@@ -13,14 +13,26 @@ use pingora_core::tls::{
 use std::any::Any;
 use std::sync::Arc;
 
-/// Information about the verified client certificate, stored in the connection's
-/// `SslDigest.extension` after a successful mTLS handshake.
-///
-/// Present iff this connection completed an mTLS handshake with a verified
-/// client certificate. Absence means the SNI did not require mTLS.
+/// Information about the verified client certificate, stored as a nested field
+/// inside [`ConnTlsInfo`] after a successful mTLS handshake.
 pub(crate) struct ClientCertInfo {
     /// PEM-encoded client certificate as presented by the peer.
     pub(crate) cert_pem: String,
+}
+
+/// TLS connection metadata stored in `SslDigest.extension` after every
+/// successful handshake.
+///
+/// Stored unconditionally for all TLS connections so the request path can
+/// read the negotiated SNI for misdirected-request detection (GEP-3567, #96)
+/// even when mTLS is not configured.
+pub(crate) struct ConnTlsInfo {
+    /// The SNI hostname the client sent during the handshake (`None` when the
+    /// client sent no SNI extension — legal per RFC 6066).
+    pub(crate) sni: Option<Box<str>>,
+    /// Verified peer certificate, present iff mTLS was configured for the SNI
+    /// and the client passed the CA verification.
+    pub(crate) client_cert: Option<ClientCertInfo>,
 }
 
 /// SNI-driven certificate selector for the Pingora TLS listener.
@@ -137,21 +149,26 @@ impl TlsAccept for SniCertSelector {
         &self,
         ssl: &TlsRef,
     ) -> Option<Arc<dyn Any + Send + Sync>> {
-        // Capture the verified peer cert (present iff mTLS was configured AND
-        // the client passed verification).  The cert is stored in the
-        // connection's `SslDigest.extension`; the request path reads it to
-        // enforce the cross-SNI guard and optionally forward it upstream.
-        let peer = ssl.peer_certificate()?;
-        match peer.to_pem() {
-            Ok(pem) => {
-                let cert_pem = String::from_utf8_lossy(&pem).into_owned();
-                Some(Arc::new(ClientCertInfo { cert_pem }))
-            }
+        // Capture the negotiated SNI and, if mTLS was configured and the client
+        // passed verification, the verified peer certificate.  Both are stored
+        // in the connection's `SslDigest.extension` as `ConnTlsInfo`.
+        //
+        // This callback fires for every TLS connection, so we return `Some`
+        // unconditionally: even connections without mTLS need the SNI
+        // propagated for the misdirected-request check (GEP-3567, #96).
+        let sni = ssl.servername(NameType::HOST_NAME).map(Box::<str>::from);
+
+        let client_cert = ssl.peer_certificate().and_then(|peer| match peer.to_pem() {
+            Ok(pem) => Some(ClientCertInfo {
+                cert_pem: String::from_utf8_lossy(&pem).into_owned(),
+            }),
             Err(e) => {
                 tracing::warn!(error = %e, "peer_certificate().to_pem() failed — not forwarding");
                 None
             }
-        }
+        });
+
+        Some(Arc::new(ConnTlsInfo { sni, client_cert }))
     }
 }
 
