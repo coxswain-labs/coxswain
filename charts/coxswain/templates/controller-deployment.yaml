@@ -119,9 +119,8 @@ spec:
             - name: COXSWAIN_IMAGE
               value: {{ .Values.controller.coxswainImage | quote }}
             {{- end }}
-            # Discovery control-plane / CA (#423).
-            - name: COXSWAIN_DISCOVERY_PORT
-              value: {{ .Values.discovery.port | quote }}
+            # Discovery control-plane / CA (#423). COXSWAIN_DISCOVERY_PORT is set
+            # above with the other bound ports.
             - name: COXSWAIN_DISCOVERY_BOOTSTRAP_PORT
               value: {{ .Values.discovery.bootstrapPort | quote }}
             - name: COXSWAIN_DISCOVERY_CA_SECRET
