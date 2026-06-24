@@ -1414,6 +1414,16 @@ fn circuit_breaker_from_wire(dto: &p::CircuitBreakerConfig) -> CircuitBreakerCon
 
 // ────────────────────────────────────────────────────────────────────────────
 // Enum mappings: from_wire
+//
+// Two deliberate patterns here, by whether the field has a safe default:
+//   - `route_kind` / `wildcard_kind` have NO sensible default — a route with no
+//     kind is meaningless — so proto3 `Unspecified` (the zero value, also where
+//     `try_from` lands an out-of-range int) returns `WireError::InvalidEnumValue`.
+//   - `normalize_level` / `protocol` DO have a safe default (`Base` / `Http1`),
+//     so `Unspecified` *and* any unknown/out-of-range value degrade to that
+//     default rather than rejecting the whole snapshot. This is intentional
+//     forward-compat: a newer controller advertising a level/protocol this build
+//     doesn't know falls back to safe behaviour instead of failing closed.
 // ────────────────────────────────────────────────────────────────────────────
 
 fn route_kind_from_wire(v: i32) -> Result<RouteKind, WireError> {

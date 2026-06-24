@@ -82,6 +82,7 @@ kube               = { version = "3.1", features = ["runtime", "derive", "client
 kube-leader-election = { version = "0.43" }
 matchit            = { version = "0.9" }
 nix                = { version = "0.31", features = ["signal", "process"] }
+parking_lot        = { version = "0.12" }
 percent-encoding   = { version = "2.3" }
 pingora            = { version = "0.8", default-features = false }
 pingora-cache      = { version = "0.8", default-features = false }

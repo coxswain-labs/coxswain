@@ -334,14 +334,13 @@ mod tests {
     }
 
     struct RecordingHook {
-        calls: std::sync::Mutex<Vec<(String, String)>>,
+        calls: parking_lot::Mutex<Vec<(String, String)>>,
     }
 
     impl RejectHook for RecordingHook {
         async fn on_reject(&self, principal: &str, reason: &str) {
             self.calls
                 .lock()
-                .unwrap_or_else(|e| panic!("invariant: hook lock not poisoned: {e}"))
                 .push((principal.to_owned(), reason.to_owned()));
         }
     }
@@ -404,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn bad_sa_token_returns_unauthenticated_and_fires_hook() {
         let hook = Arc::new(RecordingHook {
-            calls: std::sync::Mutex::new(vec![]),
+            calls: parking_lot::Mutex::new(vec![]),
         });
         let svc = BootstrapService::with_reject_hook(
             Arc::new(OkIssuer {
@@ -434,10 +433,7 @@ mod tests {
             "a rejected SA token must increment bootstrap_total{{rejected,sa_token}}"
         );
 
-        let calls = hook
-            .calls
-            .lock()
-            .unwrap_or_else(|e| panic!("invariant: hook lock not poisoned: {e}"));
+        let calls = hook.calls.lock();
         assert_eq!(calls.len(), 1);
         assert!(
             calls[0].1.contains("token expired"),

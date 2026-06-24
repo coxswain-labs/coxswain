@@ -53,10 +53,10 @@ pub enum CaStoreError {
     #[error("kubernetes API error: {0}")]
     Api(#[source] kube::Error),
     /// The Secret exists but is missing the expected PEM fields.
-    #[error("CA Secret missing required fields ('tls.crt' and 'tls.key')")]
+    #[error("CA secret missing required fields ('tls.crt' and 'tls.key')")]
     MissingFields,
     /// `mode=external` was configured but no Secret exists.
-    #[error("CA Secret absent and mode=external; operator must supply the Secret before deploying")]
+    #[error("CA secret absent and mode=external; operator must supply the secret before deploying")]
     ExternalMissing,
     /// The PEM bytes in the Secret are not a valid CA cert+key.
     #[error("CA certificate error: {0}")]

@@ -21,6 +21,28 @@ pub enum DiscoveryError {
         /// Wire version this client speaks (see [`crate::version::WIRE_VERSION`]).
         client: u32,
     },
+
+    /// A configured discovery endpoint string is not a valid URI.
+    ///
+    /// Operator misconfiguration (a malformed `--discovery-endpoint` / Helm
+    /// value). Surfaced at client construction so startup fails loudly rather
+    /// than the reconnect supervisor panicking on every attempt.
+    #[error("invalid discovery endpoint URI {uri:?}: {source}")]
+    InvalidEndpoint {
+        /// The endpoint string that failed to parse.
+        uri: String,
+        /// The underlying tonic transport parse error.
+        #[source]
+        source: tonic::transport::Error,
+    },
+
+    /// Building the mTLS channel config from the current cert material failed.
+    ///
+    /// Reachable at runtime when an SVID rotation writes malformed material into
+    /// the cell. The reconnect supervisor degrades to the last-good snapshot and
+    /// retries on the next rotation rather than crashing the data plane.
+    #[error("discovery channel TLS config: {0}")]
+    TlsConfig(#[from] AuthError),
 }
 
 /// Errors produced by the mTLS authentication layer during TLS config
@@ -46,11 +68,11 @@ pub enum AuthError {
     MissingKey,
 
     /// rustls rejected the certificate or configuration.
-    #[error("TLS error: {0}")]
+    #[error("rustls error: {0}")]
     Rustls(#[from] rustls::Error),
 
     /// The rustls verifier builder returned an error.
-    #[error("TLS verifier build failed: {0}")]
+    #[error("rustls verifier build failed: {0}")]
     VerifierBuild(String),
 }
 
@@ -122,7 +144,7 @@ pub enum WireError {
     InvalidProtocolEnum(i32),
 
     /// A `LoadBalance` discriminator did not match any known algorithm.
-    #[error("LoadBalance oneof missing or unknown")]
+    #[error("load-balance oneof missing or unknown")]
     InvalidLoadBalance,
 
     /// A path pattern string was rejected by the `matchit` router.

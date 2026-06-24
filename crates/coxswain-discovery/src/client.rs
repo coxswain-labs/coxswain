@@ -23,6 +23,7 @@ use tracing::{debug, warn};
 use tokio::sync::watch;
 
 use crate::auth::{DiscoveryClientTls, SpiffeMatcher};
+use crate::error::DiscoveryError;
 use crate::proto::v1::{
     self as p, client_message::Kind as CKind, discovery_client::DiscoveryClient as TonicClient,
     server_message::Kind as SKind,
@@ -157,12 +158,24 @@ impl DiscoveryClient {
     /// The returned [`Supervisor`] must be driven within a Tokio runtime.
     /// Register it as a Pingora background service so it starts after the runtime
     /// is up — calling [`Supervisor::run`] outside a runtime panics.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`DiscoveryError::InvalidEndpoint`] if any configured endpoint string is
+    /// not a valid URI — surfaced here, at construction, so a misconfigured
+    /// endpoint fails loudly at start-up rather than panicking inside the
+    /// reconnect supervisor on every attempt.
+    #[must_use = "the discovery client and its supervisor must be wired in and driven, or the proxy never receives routing"]
     pub fn new(
         config: DiscoveryClientConfig,
         health: SubsystemHandle,
         health_check: &str,
-    ) -> (Self, Supervisor) {
+    ) -> Result<(Self, Supervisor), DiscoveryError> {
+        // Parse-don't-validate: prove every endpoint URI is well-formed once,
+        // here, so the reconnect supervisor's `build_channel` never fails on the
+        // URI axis and a misconfigured endpoint fails loudly at start-up.
+        validate_endpoints(&config.endpoints)?;
+
         let ingress_routes = SharedIngressRoutingTable::new();
         let gateway_routes = SharedGatewayRoutingTable::new();
         let tls_store = SharedTlsStore::new();
@@ -189,7 +202,7 @@ impl DiscoveryClient {
             listener_health,
         };
 
-        (client, supervisor)
+        Ok((client, supervisor))
     }
 
     /// Spawn the supervised reconnect loop and return a handle to the routing cells.
@@ -197,14 +210,19 @@ impl DiscoveryClient {
     /// Convenience wrapper over [`DiscoveryClient::new`] that immediately
     /// `tokio::spawn`s the supervisor — **requires an active Tokio runtime**.
     /// The returned [`DiscoverySupervisor`] must have `.run()` awaited.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`DiscoveryError::InvalidEndpoint`] if any configured endpoint string is
+    /// not a valid URI (see [`DiscoveryClient::new`]).
+    #[must_use = "the discovery supervisor must have .run() awaited, or the proxy never receives routing"]
     pub fn spawn(
         config: DiscoveryClientConfig,
         health: SubsystemHandle,
         health_check: &str,
-    ) -> (Self, DiscoverySupervisor) {
-        let (client, supervisor) = Self::new(config, health, health_check);
-        (client, DiscoverySupervisor(supervisor))
+    ) -> Result<(Self, DiscoverySupervisor), DiscoveryError> {
+        let (client, supervisor) = Self::new(config, health, health_check)?;
+        Ok((client, DiscoverySupervisor(supervisor)))
     }
 
     /// Handle to the Ingress routing table [`Shared`] cell.
@@ -327,22 +345,30 @@ impl Supervisor {
 
             // Rebuild the channel on every iteration so a fresh SVID from
             // the bootstrap loop is picked up after a rotation-triggered
-            // reconnect.
-            let channel = build_channel(&self.config);
-            let mut grpc = TonicClient::new(channel);
-
-            // `svid_rotated` is an intentional reconnect, not a failure; track
-            // it separately so the backoff exponent is not incremented.
-            let (applied, svid_rotated) = if let Some(ref mut rx) = svid_rotation_rx {
-                tokio::select! {
-                    result = self.stream_until_closed(&mut grpc) => (result, false),
-                    Ok(()) = rx.changed() => {
-                        debug!("discovery client: SVID rotated; forcing reconnect with fresh SVID");
-                        (false, true)
+            // reconnect. A TLS-config failure here (e.g. a rotation that wrote
+            // malformed material) is treated like a failed connect — degrade to
+            // the last-good snapshot and back off — never a crash.
+            let (applied, svid_rotated) = match build_channel(&self.config) {
+                Ok(channel) => {
+                    let mut grpc = TonicClient::new(channel);
+                    // `svid_rotated` is an intentional reconnect, not a failure;
+                    // track it separately so the backoff exponent is not bumped.
+                    if let Some(ref mut rx) = svid_rotation_rx {
+                        tokio::select! {
+                            result = self.stream_until_closed(&mut grpc) => (result, false),
+                            Ok(()) = rx.changed() => {
+                                debug!("discovery client: SVID rotated; forcing reconnect with fresh SVID");
+                                (false, true)
+                            }
+                        }
+                    } else {
+                        (self.stream_until_closed(&mut grpc).await, false)
                     }
                 }
-            } else {
-                (self.stream_until_closed(&mut grpc).await, false)
+                Err(e) => {
+                    warn!(error = %e, "discovery client: channel build failed; backing off");
+                    (false, false)
+                }
             };
 
             if self.has_snapshot {
@@ -562,9 +588,16 @@ fn apply_snapshot(
 /// complete), falls back to plaintext — the supervisor will reconnect once the
 /// SVID rotation watch fires.
 ///
-/// An `AuthError` building the TLS config is treated as a hard invariant
-/// violation and panics with a descriptive message.
-fn build_channel(config: &DiscoveryClientConfig) -> Channel {
+/// # Errors
+///
+/// - [`DiscoveryError::InvalidEndpoint`] if an endpoint string is not a valid
+///   URI. In practice unreachable after [`validate_endpoints`] runs at
+///   construction, but handled here too so this never panics.
+/// - [`DiscoveryError::TlsConfig`] if the current SVID/cert material fails to
+///   build a TLS config (reachable when a rotation writes malformed material).
+///   The supervisor treats this like a failed connect: degrade to the last-good
+///   snapshot, back off, and retry on the next rotation.
+fn build_channel(config: &DiscoveryClientConfig) -> Result<Channel, DiscoveryError> {
     // Resolve which TLS config to use for this connection attempt.
     let resolved_tls: Option<DiscoveryClientTls> = config
         .svid_cell
@@ -589,27 +622,51 @@ fn build_channel(config: &DiscoveryClientConfig) -> Channel {
             })
         });
 
-    let configure = |uri: &str| -> Endpoint {
+    let configure = |uri: &str| -> Result<Endpoint, DiscoveryError> {
         let ep = Endpoint::from_shared(uri.to_owned())
-            .unwrap_or_else(|e| {
-                panic!("invariant: every discovery endpoint must be a valid URI: {e}")
-            })
+            .map_err(|source| DiscoveryError::InvalidEndpoint {
+                uri: uri.to_owned(),
+                source,
+            })?
             .http2_keep_alive_interval(config.http2_keep_alive_interval)
             .keep_alive_timeout(config.keep_alive_timeout)
             .keep_alive_while_idle(true);
         match &resolved_tls {
-            Some(tls) => tls
-                .apply(ep)
-                .unwrap_or_else(|e| panic!("invariant: discovery TLS config must be valid: {e}")),
-            None => ep,
+            Some(tls) => Ok(tls.apply(ep)?),
+            None => Ok(ep),
         }
     };
 
     if config.endpoints.len() == 1 {
-        configure(&config.endpoints[0]).connect_lazy()
+        Ok(configure(&config.endpoints[0])?.connect_lazy())
     } else {
-        Channel::balance_list(config.endpoints.iter().map(|u| configure(u)))
+        let endpoints = config
+            .endpoints
+            .iter()
+            .map(|u| configure(u))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Channel::balance_list(endpoints.into_iter()))
     }
+}
+
+/// Validate every configured endpoint string parses as a URI, at construction.
+///
+/// `parse-don't-validate`: proves the URI invariant once at start-up so the
+/// reconnect supervisor's [`build_channel`] never fails on the URI axis. A bad
+/// endpoint is operator misconfiguration and should fail loudly at boot, not
+/// loop forever in the supervisor.
+///
+/// # Errors
+///
+/// [`DiscoveryError::InvalidEndpoint`] for the first endpoint that fails to parse.
+fn validate_endpoints(endpoints: &[String]) -> Result<(), DiscoveryError> {
+    for uri in endpoints {
+        Endpoint::from_shared(uri.clone()).map_err(|source| DiscoveryError::InvalidEndpoint {
+            uri: uri.clone(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 /// Full-jitter exponential backoff delay.
@@ -812,6 +869,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn new_rejects_malformed_endpoint() {
+        // A bad endpoint URI is operator misconfiguration: it must fail
+        // construction loudly, not panic inside the reconnect supervisor on
+        // every attempt (parse-don't-validate).
+        let registry = HealthRegistry::new();
+        let handle = registry.register("disc", &["conn"]);
+        let config =
+            DiscoveryClientConfig::new(vec!["http://invalid host".to_owned()], "n".to_owned());
+        let result = DiscoveryClient::new(config, handle, "conn");
+        assert!(
+            matches!(result, Err(DiscoveryError::InvalidEndpoint { .. })),
+            "a malformed endpoint URI must fail construction with InvalidEndpoint"
+        );
+    }
+
+    #[test]
+    fn build_channel_surfaces_tls_error_instead_of_panicking() {
+        // A rotation that wrote malformed CA material must NOT crash the data
+        // plane. build_channel returns Err so the supervisor degrades to the
+        // last-good snapshot and retries on the next rotation, rather than the
+        // former `panic!("invariant: discovery TLS config must be valid")`.
+        let mut config =
+            DiscoveryClientConfig::new(vec!["http://127.0.0.1:50051".to_owned()], "n".to_owned());
+        config.tls = Some(DiscoveryClientTls {
+            client_cert_pem: b"not a cert".to_vec(),
+            client_key_pem: b"not a key".to_vec(),
+            server_ca_pem: b"not a ca bundle".to_vec(),
+            expected_server: SpiffeMatcher::Exact("spiffe://example.org/ns/x/sa/y".to_owned()),
+        });
+        assert!(
+            matches!(build_channel(&config), Err(DiscoveryError::TlsConfig(_))),
+            "malformed TLS material must surface as TlsConfig, never panic"
+        );
+    }
+
     /// Poll `f` until it returns `Some(T)` or the timeout elapses.
     async fn poll_until<F, T>(timeout: Duration, mut f: F) -> T
     where
@@ -840,7 +933,8 @@ mod tests {
 
         let registry = HealthRegistry::new();
         let handle = registry.register("disc", &["conn"]);
-        let (client, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let (client, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn")
+            .expect("test endpoints are valid URIs");
         let _task = tokio::spawn(supervisor.run());
 
         // Wait for the client to connect and send Subscribe.
@@ -901,7 +995,8 @@ mod tests {
 
         let registry = HealthRegistry::new();
         let handle = registry.register("disc", &["conn"]);
-        let (client, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let (client, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn")
+            .expect("test endpoints are valid URIs");
         let _task = tokio::spawn(supervisor.run());
 
         // Session #1: push one snapshot, confirm Ack.
@@ -965,7 +1060,8 @@ mod tests {
 
         let registry = HealthRegistry::new();
         let handle = registry.register("disc", &["conn"]);
-        let (client, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let (client, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn")
+            .expect("test endpoints are valid URIs");
         let _task = tokio::spawn(supervisor.run());
 
         let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
@@ -1026,7 +1122,8 @@ mod tests {
 
         let registry = HealthRegistry::new();
         let handle = registry.register("disc", &["conn"]);
-        let (_, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn");
+        let (_, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn")
+            .expect("test endpoints are valid URIs");
         let _task = tokio::spawn(supervisor.run());
 
         // Before first snapshot: registry reports not ready.

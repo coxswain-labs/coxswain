@@ -292,7 +292,7 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
     let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
     let (client, supervisor, bootstrap_runner) =
-        build_discovery_client(&args, proxy_handle, Scope::SharedPool);
+        build_discovery_client(&args, proxy_handle, Scope::SharedPool)?;
     let tls_health = client.listener_health();
 
     let cache = build_response_cache(&args.proxy);
@@ -371,7 +371,8 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
         name: gateway_name.clone(),
         namespace: gateway_namespace.clone(),
     };
-    let (client, supervisor, bootstrap_runner) = build_discovery_client(&args, proxy_handle, scope);
+    let (client, supervisor, bootstrap_runner) =
+        build_discovery_client(&args, proxy_handle, scope)?;
     let tls_health = client.listener_health();
 
     let cache = build_response_cache(&args.proxy);
@@ -980,7 +981,7 @@ fn build_discovery_client(
     args: &ProxyRoleArgs,
     proxy_handle: SubsystemHandle,
     scope: Scope,
-) -> (DiscoveryClient, Supervisor, Option<BootstrapRunner>) {
+) -> anyhow::Result<(DiscoveryClient, Supervisor, Option<BootstrapRunner>)> {
     let mut config = DiscoveryClientConfig::new(
         args.discovery_endpoint.clone(),
         args.common.pod_name.clone(),
@@ -1015,8 +1016,8 @@ fn build_discovery_client(
         runner
     });
 
-    let (client, supervisor) = DiscoveryClient::new(config, proxy_handle, "routing_table_loaded");
-    (client, supervisor, bootstrap_runner)
+    let (client, supervisor) = DiscoveryClient::new(config, proxy_handle, "routing_table_loaded")?;
+    Ok((client, supervisor, bootstrap_runner))
 }
 
 /// Register the discovery supervisor (and optional bootstrap loop) as Pingora
@@ -1048,13 +1049,14 @@ fn register_discovery_background_services(
 /// loop — which internally `tokio::spawn` and so need an active runtime — are
 /// started from the otherwise-synchronous bin startup path.
 struct FutureService {
-    fut: std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
+    fut:
+        parking_lot::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
 }
 
 impl FutureService {
     fn new(fut: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
         Self {
-            fut: std::sync::Mutex::new(Some(Box::pin(fut))),
+            fut: parking_lot::Mutex::new(Some(Box::pin(fut))),
         }
     }
 }
@@ -1062,11 +1064,7 @@ impl FutureService {
 #[async_trait]
 impl pingora_core::services::background::BackgroundService for FutureService {
     async fn start(&self, _shutdown: ShutdownWatch) {
-        let fut = self
-            .fut
-            .lock()
-            .unwrap_or_else(|e| panic!("invariant: FutureService mutex poisoned: {e}"))
-            .take();
+        let fut = self.fut.lock().take();
         if let Some(fut) = fut {
             fut.await;
         }

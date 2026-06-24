@@ -9,8 +9,10 @@
 //! UI convergence panel (T8).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::SystemTime;
+
+use parking_lot::Mutex;
 
 // ── NodeScope ────────────────────────────────────────────────────────────────
 
@@ -120,11 +122,7 @@ impl SharedNodeRegistry {
             last_ack_at: None,
             connected_since: now,
         };
-        self.0
-            .lock()
-            .unwrap_or_else(|e| panic!("invariant: NodeRegistry lock must not be poisoned: {e}"))
-            .nodes
-            .insert(node_id.to_owned(), entry);
+        self.0.lock().nodes.insert(node_id.to_owned(), entry);
     }
 
     /// Record a successful ACK from a node, updating its convergence state.
@@ -132,10 +130,7 @@ impl SharedNodeRegistry {
     /// If the node is not in the registry (e.g. late call after `disconnect`),
     /// this is a no-op.
     pub fn record_ack(&self, node_id: &str, version: String, now: SystemTime) {
-        let mut guard = self
-            .0
-            .lock()
-            .unwrap_or_else(|e| panic!("invariant: NodeRegistry lock must not be poisoned: {e}"));
+        let mut guard = self.0.lock();
         if let Some(entry) = guard.nodes.get_mut(node_id) {
             entry.last_acked_version = Some(version);
             entry.last_ack_at = Some(now);
@@ -149,10 +144,7 @@ impl SharedNodeRegistry {
     /// the node is not in the registry, this is a no-op (mirrors
     /// [`Self::record_ack`]).
     pub fn record_target(&self, node_id: &str, version: String) {
-        let mut guard = self
-            .0
-            .lock()
-            .unwrap_or_else(|e| panic!("invariant: NodeRegistry lock must not be poisoned: {e}"));
+        let mut guard = self.0.lock();
         if let Some(entry) = guard.nodes.get_mut(node_id) {
             entry.target_version = Some(version);
         }
@@ -194,11 +186,7 @@ impl SharedNodeRegistry {
     ///
     /// No-op if the node is not present.
     pub fn disconnect(&self, node_id: &str) {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| panic!("invariant: NodeRegistry lock must not be poisoned: {e}"))
-            .nodes
-            .remove(node_id);
+        self.0.lock().nodes.remove(node_id);
     }
 
     /// Return a cloned point-in-time snapshot of the registry.
@@ -207,10 +195,7 @@ impl SharedNodeRegistry {
     /// reconcile cycles.
     #[must_use]
     pub fn load(&self) -> NodeRegistry {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| panic!("invariant: NodeRegistry lock must not be poisoned: {e}"))
-            .clone()
+        self.0.lock().clone()
     }
 }
 

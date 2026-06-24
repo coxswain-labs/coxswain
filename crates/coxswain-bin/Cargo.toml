@@ -33,6 +33,7 @@ coxswain-proxy = { workspace = true }
 clap = { workspace = true }
 humantime = { workspace = true }
 kube = { workspace = true }
+parking_lot = { workspace = true }
 pingora-core = { workspace = true, features = ["boringssl"] }
 pingora-proxy = { workspace = true, features = ["boringssl"] }
 reqwest = { workspace = true }

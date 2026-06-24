@@ -20,6 +20,7 @@ constant_time_eq = { workspace = true }
 http = { workspace = true }
 ipnet = { workspace = true }
 itoa = { workspace = true }
+parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
 reqwest = { workspace = true }
 sha1 = { workspace = true }
