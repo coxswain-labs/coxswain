@@ -28,7 +28,9 @@
 //! The snapshot tests in `coxswain-core` fail on drift between this generator
 //! and the committed YAML.
 
-use coxswain_core::crd::{CoxswainGatewayParameters, CoxswainIngressClassParameters, RateLimit};
+use coxswain_core::crd::{
+    CoxswainGatewayParameters, CoxswainIngressClassParameters, PathRewriteRegex, RateLimit,
+};
 use kube::CustomResourceExt;
 
 fn main() -> Result<(), serde_yaml::Error> {
@@ -38,6 +40,7 @@ fn main() -> Result<(), serde_yaml::Error> {
             serde_yaml::to_writer(std::io::stdout(), &CoxswainIngressClassParameters::crd())
         }
         "RateLimit" => serde_yaml::to_writer(std::io::stdout(), &RateLimit::crd()),
+        "PathRewriteRegex" => serde_yaml::to_writer(std::io::stdout(), &PathRewriteRegex::crd()),
         // No arg or "GatewayParameters" → gateway (backward-compatible default).
         _ => serde_yaml::to_writer(std::io::stdout(), &CoxswainGatewayParameters::crd()),
     }

@@ -36,7 +36,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
-use coxswain_core::crd::{CoxswainIngressClassParameters, RateLimit};
+use coxswain_core::crd::{CoxswainIngressClassParameters, PathRewriteRegex, RateLimit};
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
 use coxswain_core::health::SubsystemHandle;
@@ -539,6 +539,9 @@ pub(super) struct ReflectorStores<'a> {
     /// `RateLimit` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters during Gateway API reconciliation.
     pub(super) rate_limits: &'a reflector::Store<RateLimit>,
+    /// `PathRewriteRegex` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
+    /// filters during Gateway API reconciliation.
+    pub(super) path_rewrites: &'a reflector::Store<PathRewriteRegex>,
 }
 
 struct SharedOutputs<'a> {
@@ -814,6 +817,7 @@ async fn spawn_tasks(
     let (policy_reader, policy_writer) = reader_writer::<BackendTlsPolicy>(pre_policies);
     let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
     let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
+    let (path_rewrite_reader, path_rewrite_writer) = reflector::store::<PathRewriteRegex>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
     let ns = watch_namespace.as_deref();
@@ -959,6 +963,14 @@ async fn spawn_tasks(
         ReflectorEffects::new(&notify, &controller_health, "rate_limit", metrics),
         "RateLimit",
     );
+    spawn_reflector(
+        &mut set,
+        path_rewrite_writer,
+        scoped_api::<PathRewriteRegex>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(&notify, &controller_health, "path_rewrite_regex", metrics),
+        "PathRewriteRegex",
+    );
 
     // --- Fleet pod watch (controller role only) ---
     //
@@ -1020,6 +1032,7 @@ async fn spawn_tasks(
                 policies: &policy_reader,
                 configmaps: &configmap_reader,
                 rate_limits: &rate_limit_reader,
+                path_rewrites: &path_rewrite_reader,
             };
             let outputs = SharedOutputs {
                 ingress_routes: &ingress_routes,
@@ -1468,6 +1481,7 @@ pub(super) fn build_gateway_routes(
                 listener_info: &listener_info,
                 policy_index: ownership.policy_index,
                 rate_limits: stores.rate_limits,
+                path_rewrites: stores.path_rewrites,
             },
             &mut builder,
         );

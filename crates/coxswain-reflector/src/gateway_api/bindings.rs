@@ -185,6 +185,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -223,6 +224,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -259,6 +261,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -295,6 +298,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -364,6 +368,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -386,6 +391,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );

@@ -16,7 +16,7 @@ use crate::gw_types::{
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
 use crate::tls::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, load_tls_cert};
-use coxswain_core::crd::RateLimit;
+use coxswain_core::crd::{PathRewriteRegex, RateLimit};
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
@@ -51,6 +51,9 @@ pub struct RouteResolution<'a> {
     /// `HTTPRouteRule`s. Looked up by `(namespace, name)` from the filter;
     /// missing CRs produce a WARN and fail-open (route is not limited).
     pub rate_limits: &'a reflector::Store<RateLimit>,
+    /// `PathRewriteRegex` CR store for resolving `ExtensionRef` filters on
+    /// `HTTPRouteRule`s.
+    pub path_rewrites: &'a reflector::Store<PathRewriteRegex>,
 }
 
 impl GatewayApiReconciler {
@@ -76,6 +79,7 @@ impl GatewayApiReconciler {
             listener_info,
             policy_index,
             rate_limits,
+            path_rewrites,
         } = resolution;
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
@@ -252,6 +256,8 @@ impl GatewayApiReconciler {
                 metric_route_id: &metric_route_id,
                 created_at,
                 rate_limit,
+                route_ns,
+                path_rewrites,
             };
             for (hostname_opt, port) in &bindings {
                 let pb = builder.for_port(*port);
@@ -345,6 +351,8 @@ struct RuleContext<'a> {
     metric_route_id: &'a Arc<str>,
     created_at: Option<SystemTime>,
     rate_limit: Option<Arc<RateLimitConfig>>,
+    route_ns: &'a str,
+    path_rewrites: &'a reflector::Store<PathRewriteRegex>,
 }
 
 /// Installs one HTTPRoute rule into a `HostRouterBuilder`.
@@ -386,7 +394,13 @@ fn apply_rule(
 
     match rule.matches.as_deref() {
         None | Some([]) => {
-            let filter_list = super::filters::build_filters(ctx.filters, "/", false);
+            let filter_list = super::filters::build_filters(
+                ctx.filters,
+                "/",
+                false,
+                ctx.route_ns,
+                ctx.path_rewrites,
+            );
             pb.add_prefix_route(
                 "/",
                 Arc::new(
@@ -418,7 +432,13 @@ fn apply_rule(
                     m.path.as_ref().and_then(|p| p.r#type.as_ref()),
                     None | Some(HttpRouteRulesMatchesPathType::PathPrefix)
                 );
-                let filter_list = super::filters::build_filters(ctx.filters, val, is_prefix);
+                let filter_list = super::filters::build_filters(
+                    ctx.filters,
+                    val,
+                    is_prefix,
+                    ctx.route_ns,
+                    ctx.path_rewrites,
+                );
                 let e =
                     Arc::new(make_entry(predicates, filter_list).with_path_pattern(Arc::from(val)));
 
@@ -778,6 +798,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -813,6 +834,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -848,6 +870,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -875,6 +898,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -901,6 +925,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -966,6 +991,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -1007,6 +1033,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -1073,6 +1100,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -1150,6 +1178,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -1202,6 +1231,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -1287,6 +1317,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -1329,6 +1360,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -1363,6 +1395,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -1399,6 +1432,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -1427,6 +1461,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -1461,6 +1496,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );

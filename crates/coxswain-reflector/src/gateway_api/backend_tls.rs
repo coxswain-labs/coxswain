@@ -848,6 +848,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &index,
                 rate_limits: &crate::tests::fixtures::empty_rate_limit_store(),
+                path_rewrites: &crate::tests::fixtures::empty_path_rewrite_store(),
             },
             &mut builder,
         );

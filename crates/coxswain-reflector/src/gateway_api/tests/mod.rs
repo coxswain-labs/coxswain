@@ -15,7 +15,7 @@ pub(super) use kube::api::ObjectMeta;
 pub(super) use std::collections::{HashMap, HashSet};
 
 pub(super) use crate::tests::fixtures::{
-    empty_rate_limit_store, empty_svc_store, make_slice, slice_store,
+    empty_path_rewrite_store, empty_rate_limit_store, empty_svc_store, make_slice, slice_store,
 };
 
 pub(super) fn owned(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {
