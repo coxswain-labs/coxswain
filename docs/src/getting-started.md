@@ -1,17 +1,18 @@
 # Getting started
 
-This guide installs Coxswain into an existing cluster, creates a `GatewayClass`, deploys a test `HTTPRoute`, and verifies traffic flows end-to-end. It takes about 10 minutes.
+This guide installs Coxswain into an existing cluster, deploys a test backend, routes traffic using either Gateway API or classic Ingress, and verifies the flow end-to-end. It takes about 10 minutes.
 
 ## Prerequisites
 
 - Kubernetes 1.30 or later
-- Gateway API CRDs v1.5.x or later (installed in Step 1)
 - `kubectl` configured against your target cluster
 - `helm` 3.x installed
 
 ## Step 1 — Install the Gateway API CRDs
 
-Coxswain supports both Gateway API and classic Ingress. The Gateway API CRDs are not bundled with Kubernetes and must be installed once per cluster:
+> **Ingress-only?** Skip this step. The Gateway API CRDs are only required if you plan to use `Gateway` and `HTTPRoute` resources in Step 4.
+
+The Gateway API CRDs are not bundled with Kubernetes and must be installed once per cluster:
 
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/download/standard-install.yaml
@@ -47,32 +48,7 @@ kubectl get gatewayclass coxswain
 # coxswain   coxswain-labs.dev/gateway-controller    True       ...
 ```
 
-## Step 3 — Create a Gateway
-
-```yaml
-# gateway.yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: example-gateway
-  namespace: default
-spec:
-  gatewayClassName: coxswain
-  listeners:
-    - name: http
-      port: 80
-      protocol: HTTP
-      allowedRoutes:
-        namespaces:
-          from: Same
-```
-
-```bash
-kubectl apply -f gateway.yaml
-kubectl wait gateway/example-gateway --for=condition=Programmed --timeout=30s
-```
-
-## Step 4 — Deploy a test backend
+## Step 3 — Deploy a test backend
 
 ```yaml
 # echo-backend.yaml
@@ -112,37 +88,96 @@ spec:
 kubectl apply -f echo-backend.yaml
 ```
 
-## Step 5 — Create an HTTPRoute
+## Step 4 — Route traffic
 
-```yaml
-# route.yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: echo-route
-spec:
-  parentRefs:
-    - name: example-gateway
-  hostnames:
-    - echo.example.com
-  rules:
-    - matches:
-        - path:
-            type: PathPrefix
-            value: /
-      backendRefs:
-        - name: echo
+=== "Gateway API"
+
+    Create a `Gateway` and an `HTTPRoute` that forwards traffic to the echo backend.
+
+    ```yaml
+    # gateway.yaml
+    apiVersion: gateway.networking.k8s.io/v1
+    kind: Gateway
+    metadata:
+      name: example-gateway
+      namespace: default
+    spec:
+      gatewayClassName: coxswain
+      listeners:
+        - name: http
           port: 80
-```
+          protocol: HTTP
+          allowedRoutes:
+            namespaces:
+              from: Same
+    ```
 
-```bash
-kubectl apply -f route.yaml
-kubectl get httproute echo-route
-# NAME         HOSTNAMES            AGE
-# echo-route   ["echo.example.com"]   5s
-```
+    ```bash
+    kubectl apply -f gateway.yaml
+    kubectl wait gateway/example-gateway --for=condition=Programmed --timeout=30s
+    ```
 
-## Step 6 — Verify traffic
+    ```yaml
+    # route.yaml
+    apiVersion: gateway.networking.k8s.io/v1
+    kind: HTTPRoute
+    metadata:
+      name: echo-route
+    spec:
+      parentRefs:
+        - name: example-gateway
+      hostnames:
+        - echo.example.com
+      rules:
+        - matches:
+            - path:
+                type: PathPrefix
+                value: /
+          backendRefs:
+            - name: echo
+              port: 80
+    ```
+
+    ```bash
+    kubectl apply -f route.yaml
+    kubectl get httproute echo-route
+    # NAME         HOSTNAMES              AGE
+    # echo-route   ["echo.example.com"]   5s
+    ```
+
+=== "Ingress"
+
+    Create an `Ingress` using the `coxswain` class that Coxswain registers at install time.
+
+    ```yaml
+    # ingress.yaml
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: echo-ingress
+    spec:
+      ingressClassName: coxswain
+      rules:
+        - host: echo.example.com
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: echo
+                    port:
+                      number: 80
+    ```
+
+    ```bash
+    kubectl apply -f ingress.yaml
+    kubectl get ingress echo-ingress
+    # NAME           CLASS      HOSTS              ADDRESS   PORTS   AGE
+    # echo-ingress   coxswain   echo.example.com             80      5s
+    ```
+
+## Step 5 — Verify traffic
 
 The proxy port depends on your cluster and install method. For a local cluster with a `NodePort` or port-forwarded service:
 
@@ -155,7 +190,7 @@ curl -H "Host: echo.example.com" http://<proxy-address>/
 # {"host":"echo.example.com","method":"GET","path":"/", ...}
 ```
 
-## Step 7 — Open the operator console
+## Step 6 — Open the operator console
 
 The controller exposes a built-in web UI on its admin port. Forward it locally:
 
