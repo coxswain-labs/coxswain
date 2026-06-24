@@ -12,7 +12,7 @@ workspace = true
 [features]
 # Expose alpha Gateway API resources and experimental fields. For contributor/CI
 # use only — never enabled in release builds. See docs/guides/gateway-api.md.
-experimental = ["gateway-api/experimental"]
+experimental = ["coxswain-reflector/experimental"]
 
 [dependencies]
 tracing = { workspace = true }
@@ -21,7 +21,6 @@ coxswain-core = { workspace = true }
 coxswain-discovery = { workspace = true }
 coxswain-reflector = { workspace = true }
 futures = { workspace = true }
-gateway-api = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 kube-leader-election = { workspace = true }

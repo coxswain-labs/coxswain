@@ -40,7 +40,7 @@ async fn raw_status(proxy_addr: SocketAddr, host: &str, path: &str) -> u16 {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
-            .expect("build reqwest client")
+            .unwrap_or_else(|e| panic!("build reqwest client: {e}"))
     });
     let url = format!("http://{proxy_addr}{path}");
     c.get(&url)
@@ -667,10 +667,9 @@ async fn session_affinity_header_pins_same_header_value_to_same_backend() -> any
                     .http
                     .get_full_with_headers(&host, "/", &[("X-Session-Id", value.as_str())])
                     .await
+                    && let Some(p) = body.pod
                 {
-                    if let Some(p) = body.pod {
-                        seen.insert(p);
-                    }
+                    seen.insert(p);
                 }
             }
             (seen.len() >= 2).then_some(seen)

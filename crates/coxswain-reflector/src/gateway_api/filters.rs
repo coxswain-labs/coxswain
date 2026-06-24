@@ -478,7 +478,6 @@ mod tests {
 
     // ── Filter tests ────────────────────────────────────────────────────────────
 
-    use coxswain_core::routing::{FilterAction, PathModifier, RouteOutcome};
     use crate::gw_types::v::httproutes::{
         HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
         HttpRouteRulesFiltersRequestHeaderModifierSet, HttpRouteRulesFiltersRequestRedirect,
@@ -487,6 +486,7 @@ mod tests {
         HttpRouteRulesFiltersUrlRewrite, HttpRouteRulesFiltersUrlRewritePath,
         HttpRouteRulesFiltersUrlRewritePathType,
     };
+    use coxswain_core::routing::{FilterAction, PathModifier, RouteOutcome};
 
     fn make_route_with_filters(
         ns: &str,
@@ -503,7 +503,6 @@ mod tests {
                 ..Default::default()
             },
             spec: HttpRouteSpec {
-                use_default_gateways: None,
                 parent_refs: default_parents(),
                 hostnames: Some(vec![hostname.to_string()]),
                 rules: Some(vec![HttpRouteRules {
@@ -516,6 +515,7 @@ mod tests {
                     filters: Some(filters),
                     ..Default::default()
                 }]),
+                ..Default::default()
             },
             ..Default::default()
         }

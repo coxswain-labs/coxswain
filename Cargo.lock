@@ -773,7 +773,6 @@ dependencies = [
  "coxswain-discovery",
  "coxswain-reflector",
  "futures",
- "gateway-api",
  "k8s-openapi",
  "kube",
  "kube-leader-election",

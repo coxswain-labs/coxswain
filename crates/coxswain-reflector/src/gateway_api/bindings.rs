@@ -341,7 +341,6 @@ mod tests {
                     ..Default::default()
                 },
                 spec: HttpRouteSpec {
-                use_default_gateways: None,
                     parent_refs: Some(vec![HttpRouteParentRefs {
                         name: "gw".to_string(),
                         namespace: Some("default".to_string()),
@@ -351,6 +350,7 @@ mod tests {
                     }]),
                     hostnames: Some(vec!["h.example.com".to_string()]),
                     rules: Some(vec![make_simple_rule("svc")]),
+                    ..Default::default()
                 },
                 status: None,
             }

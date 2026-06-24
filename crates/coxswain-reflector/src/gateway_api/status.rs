@@ -155,11 +155,11 @@ pub(super) fn compute_route_health(
             if accepted {
                 let has_unsupported = route.spec.rules.as_deref().unwrap_or(&[]).iter().any(|r| {
                     r.filters.as_deref().unwrap_or(&[]).iter().any(|f| {
-                        if matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
-                            if let Some(ext) = &f.extension_ref {
-                                return ext.group != "coxswain-labs.dev"
-                                    || (ext.kind != "RateLimit" && ext.kind != "PathRewriteRegex");
-                            }
+                        if matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef)
+                            && let Some(ext) = &f.extension_ref
+                        {
+                            return ext.group != "coxswain-labs.dev"
+                                || (ext.kind != "RateLimit" && ext.kind != "PathRewriteRegex");
                         }
                         false
                     })
@@ -348,7 +348,6 @@ mod tests {
                 ..Default::default()
             },
             spec: HttpRouteSpec {
-                use_default_gateways: None,
                 parent_refs: Some(vec![HttpRouteParentRefs {
                     name: gw_name.to_string(),
                     namespace: Some(gw_ns.to_string()),
@@ -367,6 +366,7 @@ mod tests {
                     }]),
                     ..Default::default()
                 }]),
+                ..Default::default()
             },
             ..Default::default()
         })

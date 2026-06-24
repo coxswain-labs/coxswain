@@ -77,7 +77,6 @@ pub(super) fn make_route(
             ..Default::default()
         },
         spec: HttpRouteSpec {
-                use_default_gateways: None,
             parent_refs: default_parents(),
             hostnames: if hostnames.is_empty() {
                 None
@@ -93,6 +92,7 @@ pub(super) fn make_route(
                 matches,
                 ..Default::default()
             }]),
+            ..Default::default()
         },
         ..Default::default()
     }
@@ -212,7 +212,6 @@ pub(super) fn make_route_with_hostnames_and_parent(
             ..Default::default()
         },
         spec: HttpRouteSpec {
-                use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: gw_name.to_string(),
                 namespace: Some(ns.to_string()),
@@ -221,6 +220,7 @@ pub(super) fn make_route_with_hostnames_and_parent(
             }]),
             hostnames: Some(hostnames.iter().map(|h| h.to_string()).collect()),
             rules: Some(vec![make_simple_rule("svc")]),
+            ..Default::default()
         },
         status: None,
     }
@@ -240,7 +240,6 @@ pub(super) fn make_route_with_parent_port(
             ..Default::default()
         },
         spec: HttpRouteSpec {
-                use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: gw_name.to_string(),
                 namespace: Some(ns.to_string()),
@@ -249,17 +248,14 @@ pub(super) fn make_route_with_parent_port(
             }]),
             hostnames: Some(hostnames.iter().map(|h| h.to_string()).collect()),
             rules: Some(vec![make_simple_rule("svc")]),
+            ..Default::default()
         },
         status: None,
     }
 }
 
-pub(super) fn make_simple_rule(
-    svc: &str,
-) -> crate::gw_types::v::httproutes::HttpRouteRules {
-    pub(super) use crate::gw_types::v::httproutes::{
-        HttpRouteRules, HttpRouteRulesBackendRefs,
-    };
+pub(super) fn make_simple_rule(svc: &str) -> crate::gw_types::v::httproutes::HttpRouteRules {
+    pub(super) use crate::gw_types::v::httproutes::{HttpRouteRules, HttpRouteRulesBackendRefs};
     HttpRouteRules {
         backend_refs: Some(vec![HttpRouteRulesBackendRefs {
             name: svc.to_string(),
