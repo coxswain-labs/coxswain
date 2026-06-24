@@ -7,7 +7,9 @@
 use pingora_core::protocols::tls::CaType;
 use pingora_core::tls::x509::X509;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 /// Thread-safe cache mapping `group_key` → parsed `CaType`.
 ///
@@ -30,7 +32,7 @@ impl UpstreamCaCache {
     /// Returns `None` when the PEM is malformed — callers should respond with 502.
     pub fn get_or_parse(&self, group_key: u64, pem: &[u8]) -> Option<Arc<CaType>> {
         {
-            let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let guard = self.inner.lock();
             if let Some(cached) = guard.get(&group_key) {
                 return Some(Arc::clone(cached));
             }
@@ -40,7 +42,7 @@ impl UpstreamCaCache {
             .map_err(|e| tracing::warn!(error = %e, "UpstreamCaCache: PEM parse failed"))
             .ok()?;
         let bundle: Arc<CaType> = Arc::new(stack.into_boxed_slice());
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock();
         Some(Arc::clone(guard.entry(group_key).or_insert(bundle)))
     }
 }

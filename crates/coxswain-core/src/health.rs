@@ -12,8 +12,10 @@
 
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+
+use parking_lot::Mutex;
 
 const SEV_READY: u8 = 0;
 const SEV_PENDING: u8 = 1;
@@ -141,11 +143,7 @@ impl SubsystemHandle {
     /// call that produced this handle. Check names are fixed at registration
     /// time; transitions to unknown checks are programming errors.
     pub fn set(&self, check: &str, state: CheckState) {
-        let mut checks = self
-            .inner
-            .checks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut checks = self.inner.checks.lock();
         let slot = checks.get_mut(check).unwrap_or_else(|| {
             panic!(
                 "invariant: check {check:?} not registered on subsystem {:?}",
@@ -237,10 +235,7 @@ impl HealthRegistry {
     /// errors.
     #[must_use]
     pub fn register(&self, name: &str, checks: &[&str]) -> SubsystemHandle {
-        let mut subsystems = self
-            .subsystems
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut subsystems = self.subsystems.lock();
         let name_arc: Arc<str> = Arc::from(name);
         if subsystems.contains_key(&name_arc) {
             panic!("invariant: subsystem {name:?} already registered");
@@ -273,10 +268,7 @@ impl HealthRegistry {
     /// for a specific subsystem.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        let subsystems = self
-            .subsystems
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let subsystems = self.subsystems.lock();
         subsystems
             .values()
             .all(|s| severity_is_ready(s.aggregate_severity.load(Ordering::Acquire)))
@@ -289,10 +281,7 @@ impl HealthRegistry {
     /// typos.
     #[must_use]
     pub fn is_subsystem_ready(&self, name: &str) -> bool {
-        let subsystems = self
-            .subsystems
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let subsystems = self.subsystems.lock();
         subsystems
             .get(name)
             .is_some_and(|s| severity_is_ready(s.aggregate_severity.load(Ordering::Acquire)))
@@ -305,16 +294,10 @@ impl HealthRegistry {
     /// hot path — call [`Self::is_ready`] when you only need the boolean.
     #[must_use]
     pub fn snapshot(&self) -> HealthSnapshot {
-        let subsystems = self
-            .subsystems
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let subsystems = self.subsystems.lock();
         let mut map = BTreeMap::new();
         for (name, inner) in subsystems.iter() {
-            let checks = inner
-                .checks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let checks = inner.checks.lock();
             let state = checks
                 .values()
                 .max_by_key(|c| c.severity())

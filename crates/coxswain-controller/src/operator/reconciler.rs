@@ -65,8 +65,10 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash as _, Hasher};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+
+use parking_lot::Mutex;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::task::JoinSet;
@@ -189,9 +191,11 @@ impl Operator {
 }
 
 /// Reconcile context shared across all per-Gateway reconcile invocations.
-/// `std::sync::Mutex` (not `tokio::sync::Mutex`) because the lock is held
+/// `parking_lot::Mutex` (not `tokio::sync::Mutex`) because the lock is held
 /// only briefly inside the reconcile body and never across `.await` — the
-/// async one would make the reconcile future `!Unpin` for no benefit.
+/// async one would make the reconcile future `!Unpin` for no benefit, and the
+/// `parking_lot` guard's `!Send` bound makes an accidental hold-across-await a
+/// compile error.
 struct ReconcileContext {
     controller_name: String,
     controller_image: String,
@@ -607,10 +611,7 @@ async fn reconcile_inner(
             remove_finalizer(&ctx.client, &gw).await?;
             // GC of in-namespace resources (Deployment/Service/SA) is
             // owner-ref driven; nothing else to do here.
-            ctx.last_hashes
-                .lock()
-                .unwrap_or_else(|e| panic!("invariant: hash-tracking mutex poisoned: {e}"))
-                .remove(&key);
+            ctx.last_hashes.lock().remove(&key);
         }
         return Ok(Action::await_change());
     }
@@ -705,10 +706,7 @@ async fn reconcile_inner(
                 );
                 delete_dedicated_resources(&ctx.client, gw_namespace, &resource_name).await?;
                 remove_finalizer(&ctx.client, &gw).await?;
-                ctx.last_hashes
-                    .lock()
-                    .unwrap_or_else(|e| panic!("invariant: hash-tracking mutex poisoned: {e}"))
-                    .remove(&key);
+                ctx.last_hashes.lock().remove(&key);
             }
             return Ok(Action::await_change());
         }
@@ -816,10 +814,7 @@ async fn reconcile_inner(
 
     let new_hash = hash_rendered(&rendered);
     let changed = {
-        let mut hashes = ctx
-            .last_hashes
-            .lock()
-            .unwrap_or_else(|e| panic!("invariant: hash-tracking mutex must not be poisoned: {e}"));
+        let mut hashes = ctx.last_hashes.lock();
         let prior = hashes.get(&key).copied();
         let changed = prior != Some(new_hash);
         if changed {

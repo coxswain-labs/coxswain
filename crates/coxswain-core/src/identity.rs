@@ -176,7 +176,7 @@ pub enum SpiffeIdError {
     #[error("invalid SPIFFE ID format; expected spiffe://<trust-domain>/ns/<ns>/sa/<sa>")]
     InvalidFormat,
     /// The trust domain portion is empty.
-    #[error("SPIFFE ID trust domain must not be empty")]
+    #[error("trust domain must not be empty")]
     EmptyTrustDomain,
 }
 

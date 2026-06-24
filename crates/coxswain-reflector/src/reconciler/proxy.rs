@@ -273,10 +273,10 @@ pub struct SharedProxyReconciler {
     /// Shared-store writers (status-relevant types) pre-created in `new` when
     /// `opts.status_subscriptions` is set; taken by `start` and moved into
     /// `spawn_tasks`. `None` when status subscriptions are disabled.
-    status_store_writers: std::sync::Mutex<Option<StatusStoreWriters>>,
+    status_store_writers: parking_lot::Mutex<Option<StatusStoreWriters>>,
     /// The subscriptions matching `status_store_writers`, taken once by
     /// [`SharedProxyReconciler::status_subscriptions`].
-    status_subscriptions: std::sync::Mutex<Option<StatusSubscriptions>>,
+    status_subscriptions: parking_lot::Mutex<Option<StatusSubscriptions>>,
 }
 
 /// The `Shared<T>` outputs the [`SharedProxyReconciler`] writes into on each rebuild.
@@ -460,8 +460,8 @@ impl SharedProxyReconciler {
             health,
             controller_name,
             opts,
-            status_store_writers: std::sync::Mutex::new(status_store_writers),
-            status_subscriptions: std::sync::Mutex::new(status_subscriptions),
+            status_store_writers: parking_lot::Mutex::new(status_store_writers),
+            status_subscriptions: parking_lot::Mutex::new(status_subscriptions),
         }
     }
 
@@ -471,10 +471,7 @@ impl SharedProxyReconciler {
     /// undrained on the reconciler, which would back-pressure the stores); a
     /// second call — or any call on a proxy-role reconciler — returns `None`.
     pub fn status_subscriptions(&self) -> Option<StatusSubscriptions> {
-        self.status_subscriptions
-            .lock()
-            .unwrap_or_else(|e| panic!("invariant: status_subscriptions mutex poisoned: {e}"))
-            .take()
+        self.status_subscriptions.lock().take()
     }
 
     /// Returns the shared route health handle so other services (e.g. the Controller)
@@ -692,11 +689,7 @@ impl BackgroundService for SharedProxyReconciler {
         // Hand the pre-created shared-store writers (if any) to the watch
         // tasks. Taken here so `spawn_tasks` drives the same stores the
         // status-writer subscribed to in `new`.
-        let status_writers = self
-            .status_store_writers
-            .lock()
-            .unwrap_or_else(|e| panic!("invariant: status_store_writers mutex poisoned: {e}"))
-            .take();
+        let status_writers = self.status_store_writers.lock().take();
         let mut set = spawn_tasks(client, handles, config, status_writers).await;
         loop {
             tokio::select! {

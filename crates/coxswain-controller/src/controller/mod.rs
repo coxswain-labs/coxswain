@@ -112,11 +112,11 @@ pub struct Controller {
     /// Shared-informer subscriptions handed over by the reflector; taken once
     /// in `start` (the handles are independent broadcast subscribers and must
     /// not be left undrained, which would back-pressure the stores).
-    subscriptions: std::sync::Mutex<Option<StatusSubscriptions>>,
+    subscriptions: parking_lot::Mutex<Option<StatusSubscriptions>>,
     /// Ingress diagnostic event channel. Taken once in `start` and driven by
     /// [`ingress_event_recorder::run`]. `None` in test / dev configurations
     /// that do not wire up an `ingress_event_tx` on the reconciler.
-    ingress_event_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<IngressEvent>>>,
+    ingress_event_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<IngressEvent>>>,
 }
 
 impl Controller {
@@ -136,8 +136,8 @@ impl Controller {
             owned_gateways,
             channels,
             config,
-            subscriptions: std::sync::Mutex::new(Some(subscriptions)),
-            ingress_event_rx: std::sync::Mutex::new(ingress_event_rx),
+            subscriptions: parking_lot::Mutex::new(Some(subscriptions)),
+            ingress_event_rx: parking_lot::Mutex::new(ingress_event_rx),
         }
     }
 
@@ -170,7 +170,6 @@ impl Controller {
         let subs = self
             .subscriptions
             .lock()
-            .unwrap_or_else(|e| panic!("invariant: subscriptions mutex poisoned: {e}"))
             .take()
             .unwrap_or_else(|| panic!("invariant: status subscriptions taken twice"));
         let StatusSubscriptions {
@@ -233,12 +232,7 @@ impl Controller {
         // Ingress diagnostic event recorder: receives route-conflict and
         // annotation-parse-failure events from the reconciler and emits
         // Kubernetes Warning Events on the affected Ingress objects.
-        if let Some(rx) = self
-            .ingress_event_rx
-            .lock()
-            .unwrap_or_else(|e| panic!("invariant: ingress_event_rx mutex poisoned: {e}"))
-            .take()
-        {
+        if let Some(rx) = self.ingress_event_rx.lock().take() {
             let reporter = kube::runtime::events::Reporter {
                 controller: self.config.controller_name.clone(),
                 instance: Some(self.config.pod_name.clone()),

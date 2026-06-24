@@ -111,8 +111,6 @@ spec:
             {{- end }}
             - name: COXSWAIN_CONTROLLER_NAME
               value: {{ .Values.controllerName | quote }}
-            - name: COXSWAIN_DISCOVERY_ENDPOINT
-              value: {{ include "coxswain.controller.discoveryEndpoint" . | quote }}
             {{- if .Values.watchNamespace }}
             - name: COXSWAIN_WATCH_NAMESPACE
               value: {{ .Values.watchNamespace | quote }}
@@ -122,9 +120,9 @@ spec:
             # server-auth-only bootstrap listener. Both resolve to the discovery
             # Service in the controller's namespace.
             - name: COXSWAIN_DISCOVERY_ENDPOINT
-              value: "https://{{ include "coxswain.discovery.serviceName" . }}.{{ include "coxswain.namespace" . }}.svc:{{ .Values.discovery.port }}"
+              value: {{ include "coxswain.controller.discoveryEndpoint" . | quote }}
             - name: COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT
-              value: "https://{{ include "coxswain.discovery.serviceName" . }}.{{ include "coxswain.namespace" . }}.svc:{{ .Values.discovery.bootstrapPort }}"
+              value: {{ include "coxswain.controller.discoveryBootstrapEndpoint" . | quote }}
             - name: COXSWAIN_DISCOVERY_SA_TOKEN_PATH
               value: "/var/run/secrets/coxswain/discovery-token/token"
             - name: COXSWAIN_DISCOVERY_CA_BUNDLE_PATH

@@ -127,13 +127,22 @@ Shared-proxy ServiceAccount name.
 {{- end }}
 
 {{/*
-Discovery gRPC endpoint the shared and dedicated proxies connect to.
-Must match the endpoint the controller binary hardcodes for dedicated proxies:
-`http://coxswain-controller-discovery.<namespace>.svc:<discovery-port>`
-(coxswain-bin/src/lib.rs). Plaintext in T7; mTLS is future work (T10/#423).
+Discovery gRPC stream endpoint the shared and dedicated proxies connect to over
+mTLS. Must match the value the controller binary hardcodes for dedicated proxies
+(coxswain-bin/src/lib.rs):
+`https://coxswain-controller-discovery.<namespace>.svc:<discovery-port>`.
 */}}
 {{- define "coxswain.controller.discoveryEndpoint" -}}
-{{- printf "http://coxswain-controller-discovery.%s.svc:%d" (include "coxswain.namespace" .) (.Values.discovery.port | int) }}
+{{- printf "https://%s.%s.svc:%d" (include "coxswain.discovery.serviceName" .) (include "coxswain.namespace" .) (.Values.discovery.port | int) }}
+{{- end }}
+
+{{/*
+Discovery bootstrap endpoint (server-auth-only TLS) where a fresh proxy obtains
+its SVID via SA token + CSR before opening the mTLS stream. Matches the value
+the controller binary hardcodes for dedicated proxies (coxswain-bin/src/lib.rs).
+*/}}
+{{- define "coxswain.controller.discoveryBootstrapEndpoint" -}}
+{{- printf "https://%s.%s.svc:%d" (include "coxswain.discovery.serviceName" .) (include "coxswain.namespace" .) (.Values.discovery.bootstrapPort | int) }}
 {{- end }}
 
 {{/*
