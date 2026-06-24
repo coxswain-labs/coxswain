@@ -614,6 +614,10 @@ fn wire_proxy_services(
     // see an empty store (no mTLS enforced), which is correct — no Ingresses
     // have been observed yet.
     shared_cfg.client_certs = source.client_cert_store();
+    // Wire the per-port HTTPS listener-hostname snapshot for misdirected-request
+    // detection (GEP-3567, #96). Empty until the first reconcile cycle (check
+    // inactive), which is correct — no Gateways observed yet.
+    shared_cfg.listener_hostnames = source.listener_hostnames();
 
     let ingress_specs: HashSet<ListenerSpec> =
         build_ingress_listeners(common, proxy).into_iter().collect();
@@ -1188,6 +1192,7 @@ fn run_dev(args: DevRoleArgs) -> Result<()> {
         status_writer.outputs.gateway_routes.clone(),
         status_writer.outputs.tls.clone(),
         status_writer.outputs.client_certs.clone(),
+        status_writer.outputs.listener_hostnames.clone(),
     );
     let tls_health = status_writer.outputs.tls_health.clone();
     // Operator's reconcile-all retrigger consumes both health channels — see

@@ -14,7 +14,9 @@ use std::time::Duration;
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::listener_health::SharedGatewayListenerHealth;
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
-use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
+use coxswain_core::tls::{
+    ListenerHostnamesBuilder, SharedClientCertStore, SharedListenerHostnames, SharedTlsStore,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
@@ -130,6 +132,7 @@ pub struct DiscoveryClient {
     tls_store: SharedTlsStore,
     client_cert_store: SharedClientCertStore,
     listener_health: SharedGatewayListenerHealth,
+    listener_hostnames: SharedListenerHostnames,
 }
 
 impl DiscoveryClient {
@@ -180,6 +183,7 @@ impl DiscoveryClient {
         let tls_store = SharedTlsStore::new();
         let client_cert_store = SharedClientCertStore::new();
         let listener_health = SharedGatewayListenerHealth::new();
+        let listener_hostnames = SharedListenerHostnames::new();
 
         let supervisor = Supervisor {
             config,
@@ -188,6 +192,7 @@ impl DiscoveryClient {
             tls: tls_store.clone(),
             client_certs: client_cert_store.clone(),
             listener_health: listener_health.clone(),
+            listener_hostnames: listener_hostnames.clone(),
             health,
             health_check: health_check.to_owned(),
             has_snapshot: false,
@@ -199,6 +204,7 @@ impl DiscoveryClient {
             tls_store,
             client_cert_store,
             listener_health,
+            listener_hostnames,
         };
 
         Ok((client, supervisor))
@@ -264,6 +270,15 @@ impl DiscoveryClient {
     pub fn listener_health(&self) -> SharedGatewayListenerHealth {
         self.listener_health.clone()
     }
+
+    /// Handle to the per-port HTTPS listener-hostname snapshot (GEP-3567, #96).
+    ///
+    /// Derived from the Gateway listener health that the discovery server
+    /// transmits; updated atomically with every applied snapshot.
+    #[must_use]
+    pub fn listener_hostnames(&self) -> SharedListenerHostnames {
+        self.listener_hostnames.clone()
+    }
 }
 
 impl coxswain_core::RoutingSource for DiscoveryClient {
@@ -281,6 +296,10 @@ impl coxswain_core::RoutingSource for DiscoveryClient {
 
     fn client_cert_store(&self) -> SharedClientCertStore {
         self.client_cert_store.clone()
+    }
+
+    fn listener_hostnames(&self) -> SharedListenerHostnames {
+        self.listener_hostnames.clone()
     }
 }
 
@@ -300,6 +319,7 @@ pub struct Supervisor {
     tls: SharedTlsStore,
     client_certs: SharedClientCertStore,
     listener_health: SharedGatewayListenerHealth,
+    listener_hostnames: SharedListenerHostnames,
     health: SubsystemHandle,
     health_check: String,
     has_snapshot: bool,
@@ -475,6 +495,7 @@ impl Supervisor {
                 &self.tls,
                 &self.client_certs,
                 &self.listener_health,
+                &self.listener_hostnames,
             ) {
                 Ok(()) => {
                     debug!(version, "discovery snapshot applied; sending Ack");
@@ -536,6 +557,7 @@ fn apply_snapshot(
     tls: &SharedTlsStore,
     client_certs: &SharedClientCertStore,
     health: &SharedGatewayListenerHealth,
+    listener_hostnames: &SharedListenerHostnames,
 ) -> Result<(), crate::WireError> {
     let ingress_table = ingress_from_wire(
         snapshot
@@ -567,6 +589,17 @@ fn apply_snapshot(
             .as_ref()
             .unwrap_or(&p::GatewayListenerHealth::default()),
     )?;
+
+    // Derive the per-port HTTPS listener-hostname snapshot from the health map
+    // (same data the reflector uses in build_tls) so GEP-3567 misdirected-request
+    // detection works in the two-pod shared-proxy deployment (#96).
+    let mut lh_builder = ListenerHostnamesBuilder::new();
+    for gw_health in listener_health_map.values() {
+        for li in gw_health.listeners.values() {
+            lh_builder.add_listener(li.port, &li.hostname, li.tls_outcome.is_https_terminate());
+        }
+    }
+    listener_hostnames.store(Arc::new(lh_builder.build()));
 
     ingress.store(Arc::new(ingress_table));
     gateway.store(Arc::new(gateway_table));

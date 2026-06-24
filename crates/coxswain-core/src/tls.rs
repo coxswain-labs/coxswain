@@ -421,6 +421,194 @@ impl ClientCertStoreBuilder {
 /// the server-cert snapshot.
 pub type SharedClientCertStore = Shared<ClientCertStore>;
 
+// ---------------------------------------------------------------------------
+// Listener-hostnames snapshot — GEP-3567 misdirected-request detection (#96)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when `host` matches the Gateway-listener hostname `pattern`.
+///
+/// - `*.suffix` → single-label wildcard via [`wildcard_matches`].
+/// - Any other pattern → exact string equality.
+fn listener_pattern_matches(host: &str, pattern: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        wildcard_matches(host, suffix)
+    } else {
+        host == pattern
+    }
+}
+
+/// Sort key for listener hostname patterns: most-specific first.
+///
+/// - Exact hostname → [`usize::MAX`] (always more specific than any wildcard).
+/// - `*.suffix` → suffix length (longer suffix = more specific).
+///
+/// The match-all (`""`) listener is excluded from the sorted patterns vec and
+/// tracked separately via [`PortListeners::has_match_all`].
+fn listener_specificity(pattern: &str) -> usize {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        suffix.len()
+    } else {
+        usize::MAX
+    }
+}
+
+/// Listener identity for the GEP-3567 misdirected-request equality check.
+///
+/// `Pattern(s)` borrows the stored hostname pattern string from the
+/// [`ListenerHostnames`] snapshot. Because Gateway API requires distinct
+/// hostname patterns per port, the pattern string is a unique listener key.
+/// `MatchAll` represents the no-hostname (`""`) Gateway HTTPS listener.
+#[non_exhaustive]
+#[derive(Debug, PartialEq, Eq)]
+pub enum ListenerId<'a> {
+    /// A named hostname pattern (exact or wildcard) identifies the listener.
+    Pattern(&'a str),
+    /// The no-hostname (`""`) catch-all listener on this port.
+    MatchAll,
+}
+
+/// Per-port set of HTTPS Gateway-listener hostname patterns.
+#[derive(Debug, Default, PartialEq)]
+struct PortListeners {
+    /// Exact and wildcard patterns sorted most-specific first (exact before
+    /// wildcard, wildcards in descending suffix-length order).
+    ///
+    /// The match-all (`""`) listener is excluded — tracked by `has_match_all`.
+    patterns: Vec<Box<str>>,
+    /// `true` iff this port has a no-hostname (`""`) HTTPS Gateway listener.
+    has_match_all: bool,
+}
+
+/// Immutable per-port snapshot of HTTPS Gateway-listener hostname patterns,
+/// used to detect misdirected HTTP/2 connections (GEP-3567, #96).
+///
+/// Built once per reconcile cycle by [`ListenerHostnamesBuilder`] and shared
+/// read-only with the proxy via [`SharedListenerHostnames`]. The
+/// [`Self::resolve`] / [`Self::resolve_sni`] lookups are zero-allocation: they
+/// iterate a pre-sorted `Vec<Box<str>>` of borrowed comparisons and return a
+/// borrowed [`ListenerId`].
+///
+/// Empty by default — non-HTTPS ports and Ingress-only deployments leave the
+/// snapshot empty so [`Self::has_https_port`] short-circuits with no allocation
+/// overhead on the request hot-path.
+#[non_exhaustive]
+#[derive(Debug, Default, PartialEq)]
+pub struct ListenerHostnames {
+    ports: HashMap<u16, PortListeners>,
+}
+
+impl ListenerHostnames {
+    /// Returns the identity of the most-specific HTTPS Gateway listener whose
+    /// hostname pattern matches `host` on `port`.
+    ///
+    /// - `Some(ListenerId::Pattern(pat))` — a named listener matched.
+    /// - `Some(ListenerId::MatchAll)` — no named pattern matched; the port's
+    ///   no-hostname listener is the fallback.
+    /// - `None` — `port` carries no HTTPS Gateway listeners (check inactive).
+    ///
+    /// All returned references borrow `self`. Zero allocation per call.
+    pub fn resolve<'a>(&'a self, port: u16, host: &str) -> Option<ListenerId<'a>> {
+        let p = self.ports.get(&port)?;
+        for pat in &p.patterns {
+            if listener_pattern_matches(host, pat) {
+                return Some(ListenerId::Pattern(pat));
+            }
+        }
+        p.has_match_all.then_some(ListenerId::MatchAll)
+    }
+
+    /// Resolves the most-specific listener for the negotiated TLS `sni`.
+    ///
+    /// Like [`Self::resolve`] but accepts `Option<&str>`: `None` means the
+    /// TLS client sent no SNI extension (legal per RFC 6066). When no named
+    /// pattern matches the SNI *and* the port has a no-hostname listener,
+    /// returns `Some(MatchAll)` — the GEP-3567 step-1 fallback rule.
+    ///
+    /// Returns `None` when `port` carries no HTTPS Gateway listeners, disabling
+    /// the misdirected-request check for that port entirely.
+    pub fn resolve_sni<'a>(&'a self, port: u16, sni: Option<&str>) -> Option<ListenerId<'a>> {
+        let p = self.ports.get(&port)?;
+        if let Some(sni) = sni {
+            for pat in &p.patterns {
+                if listener_pattern_matches(sni, pat) {
+                    return Some(ListenerId::Pattern(pat));
+                }
+            }
+        }
+        p.has_match_all.then_some(ListenerId::MatchAll)
+    }
+
+    /// Returns `true` when `port` has at least one HTTPS Gateway listener,
+    /// indicating that the misdirected-request check is active for this port.
+    #[must_use]
+    pub fn has_https_port(&self, port: u16) -> bool {
+        self.ports.contains_key(&port)
+    }
+}
+
+/// Builder for [`ListenerHostnames`]. Not thread-safe; used only inside the
+/// debounced reconcile rebuild, mirroring [`TlsStoreBuilder`].
+#[non_exhaustive]
+#[derive(Default)]
+pub struct ListenerHostnamesBuilder {
+    ports: HashMap<u16, (Vec<String>, bool)>,
+}
+
+impl ListenerHostnamesBuilder {
+    /// Construct an empty builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a Gateway listener's `hostname` and `port`.
+    ///
+    /// - `hostname == ""` or `"*"` → the no-hostname catch-all for this port.
+    /// - `hostname` starting with `*.` → wildcard pattern.
+    /// - Any other `hostname` → exact pattern.
+    /// - `is_https == false` → silently ignored; only HTTPS-terminating
+    ///   listeners participate in misdirected-request detection.
+    pub fn add_listener(&mut self, port: u16, hostname: &str, is_https: bool) {
+        if !is_https {
+            return;
+        }
+        let (patterns, has_match_all) = self.ports.entry(port).or_default();
+        if hostname.is_empty() || hostname == "*" {
+            *has_match_all = true;
+        } else {
+            patterns.push(hostname.to_string());
+        }
+    }
+
+    /// Compile accumulated listeners into an immutable [`ListenerHostnames`] snapshot.
+    pub fn build(self) -> ListenerHostnames {
+        let ports = self
+            .ports
+            .into_iter()
+            .map(|(port, (mut patterns, has_match_all))| {
+                patterns.sort_by_key(|p| Reverse(listener_specificity(p)));
+                let patterns = patterns.into_iter().map(String::into_boxed_str).collect();
+                (
+                    port,
+                    PortListeners {
+                        patterns,
+                        has_match_all,
+                    },
+                )
+            })
+            .collect();
+        ListenerHostnames { ports }
+    }
+}
+
+/// A cheaply-cloneable handle to the active per-port HTTPS listener-hostname
+/// snapshot.
+///
+/// Published by the reflector after each Gateway reconcile and consumed
+/// lock-free by the proxy on every HTTPS request to detect misdirected
+/// connections (GEP-3567,
+/// [#96](https://github.com/coxswain-labs/coxswain/issues/96)).
+pub type SharedListenerHostnames = Shared<ListenerHostnames>;
+
 #[cfg(test)]
 mod tests {
     use crate::tls::*;
@@ -683,5 +871,200 @@ mod tests {
         b.add_client_cert("*.b.com", cfg(b"ca"));
         b.add_client_cert("*", cfg(b"ca"));
         assert_eq!(b.build().host_count(), 3);
+    }
+
+    // --- ListenerHostnames tests ---
+
+    /// Builds the four-listener topology from the v1.5.1 conformance test
+    /// `GatewayHTTPSListenerDetectMisdirectedRequests`:
+    ///   `https`                              → no-hostname (catch-all)
+    ///   `https-with-hostname`                → `second-example.org`
+    ///   `https-with-wildcard-hostname`       → `*.wildcard.org`
+    ///   `https-with-hostname-matching-wildcard` → `fourth-example.wildcard.org`
+    /// All listeners are on port 443.
+    fn conformance_topology() -> ListenerHostnames {
+        let mut b = ListenerHostnamesBuilder::new();
+        b.add_listener(443, "", true);
+        b.add_listener(443, "second-example.org", true);
+        b.add_listener(443, "*.wildcard.org", true);
+        b.add_listener(443, "fourth-example.wildcard.org", true);
+        b.build()
+    }
+
+    #[test]
+    fn listener_hostnames_all_15_conformance_cases() {
+        let lh = conformance_topology();
+
+        // Returns true when the misdirected check would fire (421).
+        let misdirected = |sni: Option<&str>, host: &str| -> bool {
+            lh.resolve_sni(443, sni) != lh.resolve(443, host)
+        };
+
+        // Case 1: SNI=example.org, Host=example.org → both MatchAll → proceed
+        assert!(!misdirected(Some("example.org"), "example.org"), "case 1");
+        // Case 2: SNI=example.org, Host=second-example.org → MatchAll vs Pattern → 421
+        assert!(
+            misdirected(Some("example.org"), "second-example.org"),
+            "case 2"
+        );
+        // Case 3: SNI=example.org, Host=unknown-example.org → both MatchAll → proceed (404 later)
+        assert!(
+            !misdirected(Some("example.org"), "unknown-example.org"),
+            "case 3"
+        );
+        // Case 4: SNI=second-example.org, Host=second-example.org → same Pattern → proceed
+        assert!(
+            !misdirected(Some("second-example.org"), "second-example.org"),
+            "case 4"
+        );
+        // Case 5: SNI=second-example.org, Host=example.org → Pattern vs MatchAll → 421
+        assert!(
+            misdirected(Some("second-example.org"), "example.org"),
+            "case 5"
+        );
+        // Case 6: SNI=second-example.org, Host=unknown → Pattern vs MatchAll → 421
+        assert!(
+            misdirected(Some("second-example.org"), "unknown-example.org"),
+            "case 6"
+        );
+        // Case 7: SNI=third-example.wildcard.org, Host=third → same *.wildcard.org → proceed
+        assert!(
+            !misdirected(
+                Some("third-example.wildcard.org"),
+                "third-example.wildcard.org"
+            ),
+            "case 7"
+        );
+        // Case 8: SNI=third, Host=fith → both *.wildcard.org listener → proceed (SNI≠Host ok)
+        assert!(
+            !misdirected(
+                Some("third-example.wildcard.org"),
+                "fith-example.wildcard.org"
+            ),
+            "case 8"
+        );
+        // Case 9: SNI=third, Host=fourth → *.wildcard.org vs fourth-example.wildcard.org → 421
+        assert!(
+            misdirected(
+                Some("third-example.wildcard.org"),
+                "fourth-example.wildcard.org"
+            ),
+            "case 9"
+        );
+        // Case 10: SNI=third, Host=second-example.org → *.wildcard.org vs Pattern(second) → 421
+        assert!(
+            misdirected(Some("third-example.wildcard.org"), "second-example.org"),
+            "case 10"
+        );
+        // Case 11: SNI=third, Host=unknown → *.wildcard.org vs MatchAll → 421
+        assert!(
+            misdirected(Some("third-example.wildcard.org"), "unknown-example.org"),
+            "case 11"
+        );
+        // Case 12: SNI=fourth, Host=fourth → same Pattern → proceed
+        assert!(
+            !misdirected(
+                Some("fourth-example.wildcard.org"),
+                "fourth-example.wildcard.org"
+            ),
+            "case 12"
+        );
+        // Case 13: SNI=fourth, Host=fith → fourth-exact vs *.wildcard.org → 421
+        assert!(
+            misdirected(
+                Some("fourth-example.wildcard.org"),
+                "fith-example.wildcard.org"
+            ),
+            "case 13"
+        );
+        // Case 14: SNI=unknown, Host=example.org → both MatchAll → proceed
+        assert!(
+            !misdirected(Some("unknown-example.org"), "example.org"),
+            "case 14"
+        );
+        // Case 15: SNI=unknown, Host=unknown → both MatchAll → proceed (404 later)
+        assert!(
+            !misdirected(Some("unknown-example.org"), "unknown-example.org"),
+            "case 15"
+        );
+    }
+
+    #[test]
+    fn listener_hostnames_no_sni_falls_back_to_match_all() {
+        let mut b = ListenerHostnamesBuilder::new();
+        b.add_listener(443, "", true);
+        b.add_listener(443, "second-example.org", true);
+        let lh = b.build();
+        assert_eq!(lh.resolve_sni(443, None), Some(ListenerId::MatchAll));
+    }
+
+    #[test]
+    fn listener_hostnames_no_sni_without_match_all_returns_none() {
+        let mut b = ListenerHostnamesBuilder::new();
+        b.add_listener(443, "example.org", true);
+        let lh = b.build();
+        assert_eq!(lh.resolve_sni(443, None), None);
+    }
+
+    #[test]
+    fn listener_hostnames_non_https_listener_excluded() {
+        let mut b = ListenerHostnamesBuilder::new();
+        b.add_listener(80, "example.org", false);
+        let lh = b.build();
+        assert!(!lh.has_https_port(80));
+        assert!(lh.resolve(80, "example.org").is_none());
+    }
+
+    #[test]
+    fn listener_hostnames_empty_snapshot_is_inactive() {
+        let lh = ListenerHostnames::default();
+        assert!(!lh.has_https_port(443));
+        assert!(lh.resolve_sni(443, Some("example.org")).is_none());
+        assert!(lh.resolve(443, "example.org").is_none());
+    }
+
+    #[test]
+    fn listener_hostnames_exact_beats_wildcard_on_same_port() {
+        let mut b = ListenerHostnamesBuilder::new();
+        b.add_listener(443, "*.wildcard.org", true);
+        b.add_listener(443, "fourth-example.wildcard.org", true);
+        let lh = b.build();
+        assert_eq!(
+            lh.resolve(443, "fourth-example.wildcard.org"),
+            Some(ListenerId::Pattern("fourth-example.wildcard.org"))
+        );
+        assert_eq!(
+            lh.resolve(443, "other.wildcard.org"),
+            Some(ListenerId::Pattern("*.wildcard.org"))
+        );
+    }
+
+    #[test]
+    fn listener_hostnames_longer_wildcard_beats_shorter() {
+        let mut b = ListenerHostnamesBuilder::new();
+        b.add_listener(443, "*.org", true);
+        b.add_listener(443, "*.wildcard.org", true);
+        let lh = b.build();
+        assert_eq!(
+            lh.resolve(443, "foo.wildcard.org"),
+            Some(ListenerId::Pattern("*.wildcard.org"))
+        );
+        assert_eq!(
+            lh.resolve(443, "foo.org"),
+            Some(ListenerId::Pattern("*.org"))
+        );
+    }
+
+    #[test]
+    fn listener_hostnames_port_isolation() {
+        let mut b = ListenerHostnamesBuilder::new();
+        b.add_listener(443, "example.org", true);
+        b.add_listener(8443, "other.org", true);
+        let lh = b.build();
+        assert!(lh.has_https_port(443));
+        assert!(lh.has_https_port(8443));
+        // Port 443's listener doesn't bleed into port 8443's lookup.
+        assert!(lh.resolve(8443, "example.org").is_none());
+        assert!(lh.resolve(443, "other.org").is_none());
     }
 }

@@ -1,3 +1,17 @@
+# Gateway-API appProtocol h2c fixture (GEP-1911, #367).
+# Reuses the h2c-echo Deployment (apply backends::H2C_ECHO first): container port
+# 3001 speaks HTTP/2 cleartext (h2c, prior knowledge) and rejects HTTP/1.1.
+#
+# Two HTTPRoutes target the same h2c-only port 3001 through two Services that
+# differ only in appProtocol, so the upstream wire protocol is governed solely by
+# the Service appProtocol field:
+#
+#   * h2c.TESTNS.local       → h2c-echo (appProtocol: kubernetes.io/h2c)
+#       → BackendProtocol::H2c → proxy speaks h2c → 3001 serves (2xx echo).
+#   * h2c-plain.TESTNS.local → h2c-echo-plain (no appProtocol)
+#       → BackendProtocol::Http1 → proxy speaks HTTP/1.1 → 3001 rejects (non-2xx).
+#
+# The contrast proves appProtocol — not the port — flips the upstream wire.
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -9,6 +23,17 @@ spec:
     - name: http
       port: ${GATEWAY_HTTP_PORT}
       protocol: HTTP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: h2c-echo-plain
+spec:
+  selector:
+    app: h2c-echo
+  ports:
+    - port: 3001
+      targetPort: 3001
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -22,4 +47,18 @@ spec:
   rules:
     - backendRefs:
         - name: h2c-echo
+          port: 3001
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: h2c-route-plain
+spec:
+  parentRefs:
+    - name: h2c-gateway
+  hostnames:
+    - h2c-plain.${TESTNS}.local
+  rules:
+    - backendRefs:
+        - name: h2c-echo-plain
           port: 3001

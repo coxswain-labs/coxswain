@@ -37,7 +37,7 @@ use super::outcome::{merge_timeouts, resolve_outcome, try_redirect};
 use super::redirect::extract_host;
 use crate::auth;
 use crate::config::AccessLogPathMode;
-use crate::tls::ClientCertInfo;
+use crate::tls::ConnTlsInfo;
 use crate::upstream_ca::UpstreamCaCache;
 use bytes::Bytes;
 use coxswain_cache::ResponseCache;
@@ -152,6 +152,35 @@ pub(crate) async fn request_filter<K>(
         })
         .unwrap_or(0);
 
+    // ── GEP-3567 misdirected-request guard (#96) ────────────────────────────
+    //
+    // On HTTPS ports that carry named Gateway listeners, return 421 when the
+    // request Host resolves to a different listener than the one selected by
+    // the negotiated TLS SNI.  This blocks HTTP/2 connection coalescing from
+    // sending a request for host B over a connection whose certificate and
+    // listener were negotiated for a disjoint host A.
+    //
+    // The check is a no-op for: plain-HTTP requests, Ingress-only deployments,
+    // and ports with no HTTPS Gateway listeners (`has_https_port` miss →
+    // `listener_hostnames` default empty snapshot).
+    if proto == "https" {
+        let lh = cfg.listener_hostnames.load();
+        if lh.has_https_port(port) {
+            let sni = session
+                .as_downstream()
+                .digest()
+                .and_then(|d| d.ssl_digest.as_ref())
+                .and_then(|d| d.extension.get::<ConnTlsInfo>())
+                .and_then(|t| t.sni.as_deref());
+            if lh.resolve_sni(port, sni) != lh.resolve(port, &host) {
+                return Err(pingora_core::Error::explain(
+                    HTTPStatus(421),
+                    "request host resolves to a different listener than the negotiated SNI",
+                ));
+            }
+        }
+    }
+
     let outcome = {
         let route_ctx = RequestContext {
             method: &req.method,
@@ -185,11 +214,12 @@ pub(crate) async fn request_filter<K>(
 
     // ── Per-Ingress client-certificate mTLS cross-SNI guard (#267) ──────────────
     //
-    // If this Host requires mTLS, the connection MUST carry a verified `ClientCertInfo`
-    // in the TLS digest extension. A TLS connection whose SNI matched a different (non-mTLS)
-    // host will have no peer cert; return 421 Misdirected Request so the client reconnects
-    // on the correct SNI, which will trigger the mTLS handshake. Plain-HTTP connections
-    // (no ssl_digest) are exempt — the operator forces HTTPS via `ssl-redirect`.
+    // If this Host requires mTLS, the connection MUST carry a verified client cert in the
+    // `ConnTlsInfo` stored in the TLS digest extension. A TLS connection whose SNI matched
+    // a different (non-mTLS) host will have no peer cert; return 421 Misdirected Request
+    // so the client reconnects on the correct SNI, which will trigger the mTLS handshake.
+    // Plain-HTTP connections (no ssl_digest) are exempt — the operator forces HTTPS via
+    // `ssl-redirect`.
     {
         let cc_store = cfg.client_certs.load();
         if let Some(config_state) = cc_store.find_config(&host) {
@@ -198,7 +228,10 @@ pub(crate) async fn request_filter<K>(
                 .digest()
                 .and_then(|d| d.ssl_digest.as_ref());
             if let Some(ssl_digest) = ssl_digest {
-                let cert_info = ssl_digest.extension.get::<ClientCertInfo>();
+                let cert_info = ssl_digest
+                    .extension
+                    .get::<ConnTlsInfo>()
+                    .and_then(|t| t.client_cert.as_ref());
                 if cert_info.is_none() {
                     return Err(pingora_core::Error::explain(
                         HTTPStatus(421),

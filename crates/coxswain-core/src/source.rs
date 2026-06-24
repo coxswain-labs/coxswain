@@ -6,7 +6,7 @@
 //! without creating a circular dependency between the two crates.
 
 use crate::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
-use crate::tls::{SharedClientCertStore, SharedTlsStore};
+use crate::tls::{SharedClientCertStore, SharedListenerHostnames, SharedTlsStore};
 
 /// Source of routing snapshots for the proxy data plane.
 ///
@@ -31,4 +31,16 @@ pub trait RoutingSource: Send + Sync {
     /// Handle to the per-Ingress client-certificate mTLS config store (#267).
     #[must_use]
     fn client_cert_store(&self) -> SharedClientCertStore;
+
+    /// Handle to the per-port HTTPS Gateway-listener hostname snapshot for
+    /// misdirected-request detection (GEP-3567, #96).
+    ///
+    /// The default returns an empty snapshot (check inactive) so
+    /// [`coxswain_discovery::DiscoveryClient`] and other wire-backed
+    /// implementations compile unchanged until the discovery wire format is
+    /// extended to carry listener-hostnames data.
+    #[must_use]
+    fn listener_hostnames(&self) -> SharedListenerHostnames {
+        SharedListenerHostnames::new()
+    }
 }

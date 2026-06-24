@@ -19,7 +19,7 @@ use coxswain_core::DedicatedRoutingRegistry;
 use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::OwnedGateways;
-use coxswain_core::tls::SharedClientCertStore;
+use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames};
 use coxswain_reflector::{
     ControllerReconciler, IngressEvent, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
     SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
@@ -114,6 +114,7 @@ pub fn spawn_status_writer(
     let gateway_routes = coxswain_core::routing::SharedGatewayRoutingTable::new();
     let tls_store = coxswain_core::tls::SharedTlsStore::new();
     let client_cert_store = SharedClientCertStore::new();
+    let listener_hostnames = SharedListenerHostnames::new();
     let gateway_tls_health = SharedGatewayListenerHealth::new();
     let cluster_summary = SharedClusterSummary::new();
     let leader = Arc::new(AtomicBool::new(false));
@@ -146,15 +147,16 @@ pub fn spawn_status_writer(
     );
     let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
-    let outputs = ReconcilerOutputs::new(
+    let outputs = ReconcilerOutputs {
         ingress_routes,
         gateway_routes,
-        tls_store,
-        client_cert_store,
-        gateway_tls_health.clone(),
+        tls: tls_store,
+        client_certs: client_cert_store,
+        listener_hostnames,
+        tls_health: gateway_tls_health.clone(),
         cluster_summary,
         dedicated_registry,
-    );
+    };
 
     // Create the ingress-event channel before the reconciler, so the sender can
     // be moved into `ReconcilerOptions` and the receiver into `Controller`.
@@ -163,15 +165,16 @@ pub fn spawn_status_writer(
     let (ingress_event_tx, ingress_event_rx) = tokio::sync::mpsc::channel::<IngressEvent>(256);
 
     let reconciler = ControllerReconciler::new(
-        ReconcilerOutputs::new(
-            outputs.ingress_routes.clone(),
-            outputs.gateway_routes.clone(),
-            outputs.tls.clone(),
-            outputs.client_certs.clone(),
-            outputs.tls_health.clone(),
-            outputs.cluster_summary.clone(),
-            outputs.dedicated_registry.clone(),
-        ),
+        ReconcilerOutputs {
+            ingress_routes: outputs.ingress_routes.clone(),
+            gateway_routes: outputs.gateway_routes.clone(),
+            tls: outputs.tls.clone(),
+            client_certs: outputs.client_certs.clone(),
+            listener_hostnames: outputs.listener_hostnames.clone(),
+            tls_health: outputs.tls_health.clone(),
+            cluster_summary: outputs.cluster_summary.clone(),
+            dedicated_registry: outputs.dedicated_registry.clone(),
+        },
         owned_gateways.clone(),
         Arc::clone(&leader),
         ReconcilerHealth::new(controller_handle, proxy_handle),
