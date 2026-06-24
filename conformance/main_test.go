@@ -78,6 +78,8 @@ func TestConformance(t *testing.T) {
 		// previously omitted from the SupportedFeatures set, so the GatewayClass status
 		// did not advertise it. This declaration is paperwork only.
 		features.SupportReferenceGrant,
+		// Extended: ExtensionRef filters (#77)
+		features.SupportHTTPRouteFilterExtensionRef,
 	)
 
 	conformance.RunConformanceWithOptions(t, opts)

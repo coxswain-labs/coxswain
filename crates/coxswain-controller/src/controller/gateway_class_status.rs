@@ -23,6 +23,7 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteBackendRequestHeaderModification",
     "HTTPRouteBackendTimeout",
     "HTTPRouteDestinationPortMatching",
+    "HTTPRouteFilterExtensionRef",
     "HTTPRouteHostRewrite",
     "HTTPRouteMethodMatching",
     "HTTPRouteNamedRouteRule",
