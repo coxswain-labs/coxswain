@@ -26,6 +26,7 @@ use coxswain_proxy::{
     TrustedSources, UpstreamCaCache,
 };
 use coxswain_reflector::{GatewayListenerHealth, ListenerTlsOutcome};
+use pingora_core::apps::HttpServerOptions;
 use pingora_core::server::Server;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::server::configuration::{Opt, ServerConf};
@@ -416,6 +417,29 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
     server.run_forever();
 }
 
+/// Create a Pingora proxy service with h2c (HTTP/2 cleartext prior-knowledge)
+/// enabled on the standard accept path.
+///
+/// h2c detection is a non-destructive peek: HTTP/1.1 clients are unaffected.
+/// The PROXY-protocol accept path ignores `server_options` (it runs an h1-only
+/// keepalive loop), so setting `h2c = true` unconditionally is safe across all
+/// deployment modes.
+///
+/// `HttpServerOptions` is `#[non_exhaustive]` from another crate, so struct
+/// literal syntax is unavailable; the default-then-mutate pattern is the only
+/// valid construction form.
+fn make_http_proxy<SV>(conf: &Arc<ServerConf>, inner: SV) -> pingora_proxy::HttpProxy<SV>
+where
+    SV: pingora_proxy::ProxyHttp + Send + Sync + 'static,
+    <SV as pingora_proxy::ProxyHttp>::CTX: Send + Sync,
+{
+    let mut proxy = pingora_proxy::http_proxy(conf, inner);
+    let mut opts = HttpServerOptions::default();
+    opts.h2c = true;
+    proxy.server_options = Some(opts);
+    proxy
+}
+
 /// Wire only the `GatewayProxy` dynamic acceptor for `serve proxy --dedicated`.
 ///
 /// The listener set is driven by `tls_health` via a [`ListenerSpecsAdapter`]
@@ -455,7 +479,7 @@ fn wire_gateway_only_proxy_services(
         auth_client,
     );
 
-    let gateway_proxy = Arc::new(pingora_proxy::http_proxy(
+    let gateway_proxy = Arc::new(make_http_proxy(
         &server.configuration,
         GatewayProxy::new(Arc::new(RoutingEngine::new(source.gateway_routes())), cfg),
     ));
@@ -609,7 +633,7 @@ fn wire_proxy_services(
         let trusted = Arc::new(TrustedSources::new(proxy.proxy_trusted_sources.clone()));
 
         if !ingress_specs.is_empty() {
-            let p = Arc::new(pingora_proxy::http_proxy(
+            let p = Arc::new(make_http_proxy(
                 &server.configuration,
                 IngressProxy::new(
                     Arc::new(RoutingEngine::new(source.ingress_routes())),
@@ -630,7 +654,7 @@ fn wire_proxy_services(
             );
         }
 
-        let p = Arc::new(pingora_proxy::http_proxy(
+        let p = Arc::new(make_http_proxy(
             &server.configuration,
             GatewayProxy::new(
                 Arc::new(RoutingEngine::new(source.gateway_routes())),
@@ -651,7 +675,7 @@ fn wire_proxy_services(
         );
     } else {
         if !ingress_specs.is_empty() {
-            let p = Arc::new(pingora_proxy::http_proxy(
+            let p = Arc::new(make_http_proxy(
                 &server.configuration,
                 IngressProxy::new(
                     Arc::new(RoutingEngine::new(source.ingress_routes())),
@@ -672,7 +696,7 @@ fn wire_proxy_services(
             );
         }
 
-        let p = Arc::new(pingora_proxy::http_proxy(
+        let p = Arc::new(make_http_proxy(
             &server.configuration,
             GatewayProxy::new(
                 Arc::new(RoutingEngine::new(source.gateway_routes())),

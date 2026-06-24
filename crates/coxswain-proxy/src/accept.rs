@@ -13,12 +13,16 @@
 //!
 //! # Protocol support
 //!
-//! - **Plain HTTP and HTTPS (SNI-TLS)**: handled via Pingora's
-//!   [`ServerApp::process_new`], which detects ALPN and supports both
-//!   HTTP/1.1 and HTTP/2 transparently.
+//! - **Plain HTTP**: h1 and h2c (prior-knowledge) handled via Pingora's
+//!   [`ServerApp::process_new`].  h2c prior-knowledge is always enabled —
+//!   the detection is a non-destructive peek; HTTP/1.1 clients are unaffected.
+//! - **HTTPS (SNI-TLS)**: h1 and h2 via ALPN negotiation.  The acceptor
+//!   advertises `h2` and `http/1.1`; TLS clients that don't offer `h2` fall
+//!   back to HTTP/1.1.
 //! - **HAProxy PROXY protocol** (opt-in via `--proxy-accept-proxy-protocol`):
 //!   header is parsed before TLS and upstream dispatch; HTTP/1.1 only on this
-//!   path (existing behaviour; not regressed by this rewrite).
+//!   path (h2c detection and h2 ALPN are disabled for PROXY-wrapped
+//!   connections; see issue #32 for the follow-up).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -31,10 +35,10 @@ use pingora_core::apps::{HttpServerApp, ServerApp};
 use pingora_core::protocols::http::ServerSession;
 use pingora_core::protocols::l4::stream::Stream as L4Stream;
 use pingora_core::protocols::tls::server::handshake_with_callback;
-use pingora_core::protocols::{GetSocketDigest, SocketDigest};
+use pingora_core::protocols::{ALPN, GetSocketDigest, SocketDigest};
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::Service;
-use pingora_core::tls::ssl::{SslAcceptor, SslMethod};
+use pingora_core::tls::ssl::{AlpnError, SslAcceptor, SslMethod, SslRef, select_next_proto};
 use pingora_proxy::{HttpProxy, ProxyHttp};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
@@ -195,11 +199,15 @@ where
         drain_timeout: Duration,
     ) -> Result<Self, AcceptorBuildError> {
         // Validate the TLS acceptor eagerly so bind failures surface before runtime.
+        // ALPN h2 advertisement only applies to the standard path (`handle_standard`);
+        // the PROXY-protocol path (`handle_proxy_protocol`) runs an h1-only keepalive
+        // loop so we must not advertise h2 there.
+        let advertise_h2 = trusted.is_none();
         if initial_specs
             .iter()
             .any(|s| s.protocol == ListenerProtocol::Https)
         {
-            build_tls_context(&tls_selector)?;
+            build_tls_context(&tls_selector, advertise_h2)?;
         }
 
         Ok(Self {
@@ -655,8 +663,13 @@ fn observe_tls_handshake(result: &'static str) {
 
 /// Standard (non-PROXY-protocol) connection handler.
 ///
-/// Builds the [`pingora_core::protocols::Stream`], hands it to Pingora's
-/// [`ServerApp::process_new`] — which detects ALPN and handles h1/h2.
+/// For HTTPS connections: routes based on the ALPN selected during the TLS
+/// handshake.  ALPN h2 → [`ServerApp::process_new`] (correct: `h2c = true`
+/// in server options causes Pingora to take the h2 branch).  ALPN h1 or no
+/// ALPN → [`HttpServerApp::process_new_http`] keepalive loop (bypasses
+/// Pingora's h2c detection, which malfunctions on TLS streams that do not
+/// support read-and-rewind peeking).  For plain HTTP: [`ServerApp::process_new`]
+/// with `h2c = true` — peeking works on L4 streams, h2c detection is correct.
 async fn handle_standard<P>(
     tcp: TcpStream,
     protocol: ListenerProtocol,
@@ -675,9 +688,9 @@ async fn handle_standard<P>(
         tcp.as_raw_fd()
     };
 
-    let stream: pingora_core::protocols::Stream = match protocol {
+    match protocol {
         ListenerProtocol::Https => {
-            let tls_ctx = match build_tls_context(&tls_selector) {
+            let tls_ctx = match build_tls_context(&tls_selector, true) {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build TLS context; dropping connection");
@@ -686,29 +699,62 @@ async fn handle_standard<P>(
             };
             let mut l4: L4Stream = tcp.into();
             l4.set_socket_digest(SocketDigest::from_raw_fd(raw_fd));
-            match handshake_with_callback(&tls_ctx.acceptor, l4, tls_ctx.callbacks.as_ref()).await {
-                Ok(tls_stream) => {
-                    observe_tls_handshake("ok");
-                    Box::new(tls_stream)
+            let stream: pingora_core::protocols::Stream =
+                match handshake_with_callback(&tls_ctx.acceptor, l4, tls_ctx.callbacks.as_ref())
+                    .await
+                {
+                    Ok(tls_stream) => {
+                        observe_tls_handshake("ok");
+                        Box::new(tls_stream)
+                    }
+                    Err(e) => {
+                        observe_tls_handshake("fail");
+                        tracing::debug!(error = %e, "TLS handshake failed");
+                        return;
+                    }
+                };
+            // `h2c = true` in the proxy's `HttpServerOptions` causes Pingora's
+            // `process_new` to remain in h2 mode for TLS streams even when ALPN
+            // did NOT negotiate h2.  TLS streams return `Ok(false)` from
+            // `try_peek` (no read-and-rewind support), so the h2c preface check
+            // is skipped and h2c stays true — Pingora then attempts an h2
+            // handshake regardless of what ALPN actually selected.
+            //
+            // Fix: route based on the ALPN selection we know from the TLS
+            // handshake.  When the client negotiated h2 via ALPN, process_new
+            // is correct (h2c=true causes the h2 branch, which matches what
+            // ALPN said).  For h1 clients (or clients that sent no ALPN at
+            // all), bypass process_new and run the h1 keepalive loop directly —
+            // the same pattern used by `handle_proxy_protocol`.
+            match stream.selected_alpn_proto() {
+                Some(ALPN::H2) => {
+                    let _ = proxy.process_new(stream, &conn_shutdown).await;
                 }
-                Err(e) => {
-                    observe_tls_handshake("fail");
-                    tracing::debug!(error = %e, "TLS handshake failed");
-                    return;
+                _ => {
+                    let mut session = ServerSession::new_http1(stream);
+                    session.set_keepalive(Some(60));
+                    let mut session = Some(session);
+                    while let Some(current) = session.take() {
+                        match proxy.process_new_http(current, &conn_shutdown).await {
+                            Some(reused) => {
+                                let (s, _) = reused.consume();
+                                session = Some(ServerSession::new_http1(s));
+                            }
+                            None => break,
+                        }
+                    }
                 }
             }
         }
         ListenerProtocol::Http => {
             let mut l4 = L4Stream::from(tcp);
             l4.set_socket_digest(SocketDigest::from_raw_fd(raw_fd));
-            Box::new(l4)
+            let stream: pingora_core::protocols::Stream = Box::new(l4);
+            // `process_new` handles h2c detection (peek + rewind on L4 streams
+            // works correctly), ALPN, keepalive, and shutdown.
+            let _ = proxy.process_new(stream, &conn_shutdown).await;
         }
-    };
-
-    // `process_new` handles ALPN detection (h1/h2), keepalive, and shutdown
-    // internally.  `conn_shutdown` is the per-listener shutdown watch — when
-    // fired, Pingora stops accepting keepalive requests on this connection.
-    let _ = proxy.process_new(stream, &conn_shutdown).await;
+    }
 }
 
 /// Aggregated inputs for the PROXY-protocol connection handler, grouping the
@@ -770,7 +816,7 @@ async fn handle_proxy_protocol<P>(
 
     let stream: pingora_core::protocols::Stream = match protocol {
         ListenerProtocol::Https => {
-            let tls_ctx = match build_tls_context(&conn.tls_selector) {
+            let tls_ctx = match build_tls_context(&conn.tls_selector, false) {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build TLS context; dropping PROXY connection");
@@ -827,9 +873,27 @@ struct TlsContext {
     callbacks: Arc<pingora_core::listeners::TlsAcceptCallbacks>,
 }
 
-fn build_tls_context(selector: &SniCertSelector) -> Result<TlsContext, AcceptorBuildError> {
-    let builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
+/// Build a TLS acceptor for an HTTPS listener.
+///
+/// When `advertise_h2` is `true`, the acceptor registers an ALPN-select
+/// callback that prefers `h2` over `http/1.1`, enabling transparent HTTP/2
+/// negotiation with TLS clients.  Pass `false` for the PROXY-protocol path,
+/// which runs an h1-only keepalive loop and must not advertise h2.
+fn build_tls_context(
+    selector: &SniCertSelector,
+    advertise_h2: bool,
+) -> Result<TlsContext, AcceptorBuildError> {
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
         .map_err(|e| AcceptorBuildError::TlsAcceptorBuild(e.to_string()))?;
+    if advertise_h2 {
+        builder.set_alpn_select_callback(
+            |_ssl: &mut SslRef, client: &[u8]| -> Result<&[u8], AlpnError> {
+                // Wire-format: length-prefixed list — "\x02h2\x08http/1.1"
+                // prefers h2 and falls back to http/1.1.
+                select_next_proto(b"\x02h2\x08http/1.1", client).ok_or(AlpnError::NOACK)
+            },
+        );
+    }
     let callbacks: pingora_core::listeners::TlsAcceptCallbacks = Box::new(selector.clone());
     Ok(TlsContext {
         acceptor: Arc::new(builder.build()),

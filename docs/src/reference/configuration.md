@@ -68,7 +68,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_LOG` | `--log` | `info` | Log level; supports `RUST_LOG` directive syntax (e.g. `info,coxswain=debug`) |
 | `COXSWAIN_LOG_FORMAT` | `--log-format` | `json` | `json` (production) or `console` (human-readable) |
 | `COXSWAIN_MANAGEMENT_BIND_ADDRESS` | `--management-bind-address` | `0.0.0.0` | IP the health (`/healthz`, `/readyz`) and admin (`/metrics`, `/api/v1/routes`) servers bind to |
-| `COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL` | `--proxy-accept-proxy-protocol` | `false` | Require HAProxy PROXY v1/v2 on inbound connections; must be combined with `--proxy-trusted-sources` |
+| `COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL` | `--proxy-accept-proxy-protocol` | `false` | Require HAProxy PROXY v1/v2 on inbound connections; must be combined with `--proxy-trusted-sources`. Note: h2c prior-knowledge and h2 ALPN are not available on PROXY-wrapped connections (h1-only on that path). |
 | `COXSWAIN_PROXY_BIND_ADDRESS` | `--proxy-bind-address` | `0.0.0.0` | IP the data-plane HTTP/HTTPS proxy listeners bind to; health and admin bind separately via `--management-bind-address` |
 | `COXSWAIN_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT` | `--proxy-default-backend-request-timeout` | _(none)_ | Default upstream-only timeout when `HTTPRouteRule.timeouts.backendRequest` is not set |
 | `COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT` | `--proxy-default-request-timeout` | _(none)_ | Default total request timeout (client → proxy → upstream → client) when `HTTPRouteRule.timeouts.request` is not set |
@@ -98,6 +98,16 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | Bootstrap | `50052` | `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | _(controller)_ server-auth gRPC SVID issuance |
 
 The proxy listeners are disabled unless their port is explicitly set. The Helm chart defaults `proxy.http.port` to `80` and `proxy.https.port` to `443`.
+
+## HTTP/2 support
+
+Coxswain supports HTTP/2 on both the downstream (client → proxy) and upstream (proxy → backend) legs:
+
+- **h2 over TLS (HTTPS)** — automatic. The TLS acceptor advertises `h2` and `http/1.1` via ALPN; clients that don't offer `h2` fall back to HTTP/1.1 transparently.
+- **h2c (cleartext HTTP/2, prior-knowledge)** — automatic on plain-TCP listeners. The h2c preface is detected non-destructively; HTTP/1.1 clients on the same port are unaffected.
+- **Upstream h2c** — enabled per-route via `appProtocol: kubernetes.io/h2c` on the backend `Service` port (Gateway API GEP-1911 `HTTPRouteBackendProtocolH2C`).
+
+**PROXY-protocol restriction:** when `--proxy-accept-proxy-protocol` is set, inbound connections are h1-only. h2c prior-knowledge and h2 ALPN are disabled on PROXY-wrapped connections.
 
 ## Discovery control plane
 
