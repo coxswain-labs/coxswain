@@ -1,11 +1,9 @@
 //! Wiring helper for the `controller` pod role.
 //!
 //! Bundles the configuration, the leader-elected [`crate::Controller`] background
-//! service, and (in production startup) the reflector pipeline whose health
-//! channels the Controller subscribes to. The bin's `run_controller` arm
-//! invokes [`spawn_status_writer`] and registers the returned services with the
-//! Pingora server; the bin's `run_dev` arm reuses the same wiring for the
-//! in-process all-in-one mode.
+//! service, and the reflector pipeline whose health channels the Controller
+//! subscribes to. The bin's `run_controller` arm invokes [`spawn_status_writer`]
+//! and registers the returned services with the Pingora server.
 //!
 //! The proxy pod role does NOT call into this module. The shared-proxy
 //! ServiceAccount has zero write verbs and the proxy binary path never

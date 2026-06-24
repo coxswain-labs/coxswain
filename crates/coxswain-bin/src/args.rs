@@ -13,13 +13,9 @@
 //! - `proxy --dedicated --gateway-name=NAME --gateway-namespace=NS`: read-only
 //!   data plane scoped to a single Gateway. Connects to the controller
 //!   discovery gRPC server.
-//! - `dev` (hidden from `--help`): monolithic single-process pod for local
-//!   development.
 //!
-//! Bare `coxswain serve` (no role) currently falls back to `dev` with a
-//! deprecation warning so the existing Helm chart and Dockerfile keep working
-//! through v0.2.0; Step 5 removes the fallback once the chart sets the role
-//! explicitly.
+//! Bare `coxswain serve` (no role) parses with `role = None`; the dispatch in
+//! `lib.rs` rejects it, since production must pick a role explicitly.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -73,10 +69,6 @@ pub(crate) enum Commands {
 }
 
 /// Arguments for the `serve` subcommand.
-///
-/// The role is optional: bare `coxswain serve` falls back to [`Role::Dev`]
-/// with a deprecation warning so today's Helm chart keeps working. Once the
-/// chart sets the role explicitly (Step 5), the implicit fallback is removed.
 #[derive(Parser, Debug)]
 pub(crate) struct ServeArgs {
     /// Pod role.
@@ -97,10 +89,6 @@ pub(crate) enum Role {
     /// Read-only data plane pod. Use `--shared` for the shared pool or
     /// `--dedicated` for a per-Gateway pod.
     Proxy(ProxyRoleArgs),
-    /// Hidden: monolithic single-process pod for local development. Production
-    /// deployments must pick `controller` or `proxy` explicitly.
-    #[command(hide = true)]
-    Dev(DevRoleArgs),
 }
 
 /// Flags shared by every role.
@@ -525,23 +513,6 @@ pub(crate) enum CaModeArg {
     External,
 }
 
-/// Arguments accepted by the hidden `dev` role.
-///
-/// Carries every flag the monolithic single-process pod needs: management
-/// surface, proxy data plane, and reconciler.
-#[derive(Args, Debug)]
-pub(crate) struct DevRoleArgs {
-    /// Flags shared by every role.
-    #[command(flatten)]
-    pub common: CommonArgs,
-    /// Proxy data-plane flags.
-    #[command(flatten)]
-    pub proxy: ProxyArgs,
-    /// Reconciler + status writer flags.
-    #[command(flatten)]
-    pub controller: ControllerArgs,
-}
-
 /// Arguments accepted by the `controller` role.
 ///
 /// Controller pods run the reconciler and status writer; they do not bind
@@ -737,14 +708,6 @@ mod tests {
         assert!(serve.role.is_none());
     }
 
-    /// Explicit `coxswain serve dev` parses to `Role::Dev`.
-    #[test]
-    fn serve_dev_parses() {
-        let cli = Cli::try_parse_from(["coxswain", "serve", "dev"]).expect("parses");
-        let Commands::Serve(serve) = cli.command;
-        assert!(matches!(serve.role, Some(Role::Dev(_))));
-    }
-
     /// `coxswain serve controller` parses to `Role::Controller`.
     #[test]
     fn serve_controller_parses() {
@@ -904,47 +867,14 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
-    /// `serve --help` lists controller and proxy but not the hidden dev role.
+    /// `serve --help` lists controller and proxy roles.
     #[test]
-    fn serve_help_hides_dev() {
+    fn serve_help_lists_roles() {
         let mut cmd = Cli::command();
         let serve = cmd.find_subcommand_mut("serve").expect("serve exists");
         let help = serve.render_help().to_string();
         assert!(help.contains("controller"), "help should list controller");
         assert!(help.contains("proxy"), "help should list proxy");
-        // `dev` may still appear in unrelated copy (e.g. "for local
-        // development"). Tighten by matching the subcommand listing line.
-        assert!(
-            !help
-                .lines()
-                .any(|line| line.trim_start().starts_with("dev ")),
-            "dev should be hidden from `serve --help`:\n{help}"
-        );
-    }
-
-    /// `serve dev --help` renders successfully and exposes the full flag set.
-    #[test]
-    fn serve_dev_help_round_trip() {
-        let mut cmd = Cli::command();
-        let dev = cmd
-            .find_subcommand_mut("serve")
-            .and_then(|s| s.find_subcommand_mut("dev"))
-            .expect("dev subcommand exists even though hidden");
-        let help = dev.render_help().to_string();
-        // A flag from each group must appear.
-        assert!(help.contains("--log"), "common log flag in dev help");
-        assert!(
-            help.contains("--proxy-bind-address"),
-            "proxy bind address in dev help"
-        );
-        assert!(
-            help.contains("--controller-lease-ttl"),
-            "controller lease TTL in dev help"
-        );
-        assert!(
-            help.contains("--management-bind-address"),
-            "management bind address in dev help"
-        );
     }
 
     /// `serve proxy --help` lists both scope flags.
@@ -984,10 +914,17 @@ mod tests {
     /// `--access-log` defaults to `true` and `--access-log-path-mode` to `full`.
     #[test]
     fn access_log_defaults() {
-        let cli = Cli::try_parse_from(["coxswain", "serve", "dev"]).expect("dev parses");
+        let cli = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "proxy",
+            "--shared",
+            "--discovery-endpoint=http://ctrl:50051",
+        ])
+        .expect("proxy parses");
         let Commands::Serve(serve) = cli.command;
-        let Some(Role::Dev(args)) = serve.role else {
-            panic!("expected dev role");
+        let Some(Role::Proxy(args)) = serve.role else {
+            panic!("expected proxy role");
         };
         assert!(args.proxy.access_log, "access_log defaults to true");
         assert_eq!(
@@ -1001,7 +938,13 @@ mod tests {
     #[test]
     fn access_log_flags_parse() {
         let parse = |extra: &[&str]| {
-            let mut args = vec!["coxswain", "serve", "dev"];
+            let mut args = vec![
+                "coxswain",
+                "serve",
+                "proxy",
+                "--shared",
+                "--discovery-endpoint=http://ctrl:50051",
+            ];
             args.extend_from_slice(extra);
             Cli::try_parse_from(args).expect("parses")
         };
@@ -1009,41 +952,44 @@ mod tests {
         // Disabled access log
         let cli = parse(&["--access-log=false"]);
         let Commands::Serve(serve) = cli.command;
-        let Some(Role::Dev(args)) = serve.role else {
-            panic!("expected dev role");
+        let Some(Role::Proxy(args)) = serve.role else {
+            panic!("expected proxy role");
         };
         assert!(!args.proxy.access_log);
 
         // Pattern mode
         let cli = parse(&["--access-log-path-mode=pattern"]);
         let Commands::Serve(serve) = cli.command;
-        let Some(Role::Dev(args)) = serve.role else {
-            panic!("expected dev role");
+        let Some(Role::Proxy(args)) = serve.role else {
+            panic!("expected proxy role");
         };
         assert_eq!(args.proxy.access_log_path_mode, AccessLogPathMode::Pattern);
 
         // None mode
         let cli = parse(&["--access-log-path-mode=none"]);
         let Commands::Serve(serve) = cli.command;
-        let Some(Role::Dev(args)) = serve.role else {
-            panic!("expected dev role");
+        let Some(Role::Proxy(args)) = serve.role else {
+            panic!("expected proxy role");
         };
         assert_eq!(args.proxy.access_log_path_mode, AccessLogPathMode::None);
     }
 
-    /// `--access-log` and `--access-log-path-mode` appear in `dev --help`.
+    /// `--access-log` and `--access-log-path-mode` appear in `proxy --help`.
     #[test]
-    fn access_log_flags_in_dev_help() {
+    fn access_log_flags_in_proxy_help() {
         let mut cmd = Cli::command();
-        let dev = cmd
+        let proxy = cmd
             .find_subcommand_mut("serve")
-            .and_then(|s| s.find_subcommand_mut("dev"))
-            .expect("dev subcommand exists");
-        let help = dev.render_help().to_string();
-        assert!(help.contains("--access-log"), "dev help lists --access-log");
+            .and_then(|s| s.find_subcommand_mut("proxy"))
+            .expect("proxy subcommand exists");
+        let help = proxy.render_help().to_string();
+        assert!(
+            help.contains("--access-log"),
+            "proxy help lists --access-log"
+        );
         assert!(
             help.contains("--access-log-path-mode"),
-            "dev help lists --access-log-path-mode"
+            "proxy help lists --access-log-path-mode"
         );
     }
 
@@ -1105,18 +1051,6 @@ mod tests {
             panic!("expected controller role");
         };
         assert_eq!(args.controller.discovery_port, 9090);
-    }
-
-    /// `--discovery-port` is available on `serve dev` (controller flags are flattened in).
-    #[test]
-    fn discovery_port_available_on_dev_role() {
-        let cli = Cli::try_parse_from(["coxswain", "serve", "dev", "--discovery-port=50052"])
-            .expect("dev parses with custom discovery port");
-        let Commands::Serve(serve) = cli.command;
-        let Some(Role::Dev(args)) = serve.role else {
-            panic!("expected dev role");
-        };
-        assert_eq!(args.controller.discovery_port, 50052);
     }
 
     /// `--discovery-port` does not exist on the `proxy` role.

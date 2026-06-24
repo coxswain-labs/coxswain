@@ -54,7 +54,7 @@ Tunable fields on `CoxswainGatewayParameters`:
 
 ## Automatic provisioning by the controller
 
-`serve controller` (and `serve dev`) runs a provisioning operator that watches every `Gateway`. For any Gateway whose `parametersRef` (or whose `GatewayClass`'s `parametersRef`) resolves to a `CoxswainGatewayParameters` object, the operator applies a dedicated proxy `Deployment` / `Service` / `ServiceAccount` to the cluster via server-side-apply under field manager `coxswain-controller`, owner-referenced to the parent Gateway so deletion cascades.
+`serve controller` runs a provisioning operator that watches every `Gateway`. For any Gateway whose `parametersRef` (or whose `GatewayClass`'s `parametersRef`) resolves to a `CoxswainGatewayParameters` object, the operator applies a dedicated proxy `Deployment` / `Service` / `ServiceAccount` to the cluster via server-side-apply under field manager `coxswain-controller`, owner-referenced to the parent Gateway so deletion cascades.
 
 Apply the dev fixture set and verify the resources land:
 
@@ -110,7 +110,7 @@ instead of having the controller provision it. The proxy subscribes to the contr
 `Scope::Gateway` and receives only its Gateway's compiled snapshot — no `parametersRef` is required
 for the manual path.
 
-Start the controller first (in a separate terminal or `serve dev`), then start the dedicated proxy
+Start the controller first (in a separate terminal), then start the dedicated proxy
 alongside it:
 
 ```bash

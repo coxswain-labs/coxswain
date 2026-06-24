@@ -1,8 +1,8 @@
 # Mode-migration starting point (shared → dedicated). The Gateway has no
-# `infrastructure.parametersRef`, so the shared subprocess (`serve dev`)
-# serves its routes on the `GATEWAY_HTTP_PORT` listener. The test patches
-# in a parametersRef pointing at the `dedicated-params` object below to
-# drive the cutover.
+# `infrastructure.parametersRef`, so the shared proxy subprocess serves its
+# routes on the `GATEWAY_HTTP_PORT` listener. The test patches in a
+# parametersRef pointing at the `dedicated-params` object below to drive the
+# cutover.
 # TESTNS is substituted at runtime.
 ---
 apiVersion: gateway.coxswain-labs.dev/v1alpha1

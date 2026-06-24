@@ -4,9 +4,9 @@
 
 Coxswain exposes the Prometheus endpoint at `http://<admin-address>:<admin-port>/metrics` (default port `8082`). Series are emitted under one of three prefixes:
 
-- `coxswain_proxy_*` — emitted by `serve proxy --shared`, `serve proxy --dedicated`, and the proxy half of `serve dev`.
-- `coxswain_controller_*` — emitted by `serve controller` and the controller half of `serve dev`.
-- `coxswain_discovery_*` — the control-plane gRPC channel. Server-side series appear on the **controller** `/metrics` (it serves the stream); client-side series appear on each **proxy** `/metrics` (it consumes the stream). In `serve dev` both halves run in one process, so both appear together.
+- `coxswain_proxy_*` — emitted by `serve proxy --shared` and `serve proxy --dedicated`.
+- `coxswain_controller_*` — emitted by `serve controller`.
+- `coxswain_discovery_*` — the control-plane gRPC channel. Server-side series appear on the **controller** `/metrics` (it serves the stream); client-side series appear on each **proxy** `/metrics` (it consumes the stream).
 
 The `route` Prometheus label is a **stable rule identifier**, not a request path. Operators reading `coxswain_proxy_requests_total{route="httproute/checkout/api:0"}` see the same label value on the matching access-log line's `route_id` field, so a Grafana → Loki/Tempo pivot is an exact join (no fuzzy host/path matching). Path patterns stay on the access log for human-readable display.
 
