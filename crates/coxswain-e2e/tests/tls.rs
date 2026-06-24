@@ -1659,3 +1659,178 @@ async fn h1_over_tls_served_when_client_prefers_h1() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ── GEP-3567 misdirected-request helpers ─────────────────────────────────────
+
+/// Connect to `proxy_addr` with TLS SNI = `sni`, then send a plain HTTP/1.1
+/// GET with `Host: host_header`. Returns the HTTP response status code.
+///
+/// Uses a no-op certificate verifier so self-signed test certs are accepted.
+/// This is the building block for GEP-3567 e2e tests: the SNI in the TLS
+/// handshake deliberately differs from the `Host` request header to simulate
+/// HTTP/2 connection coalescing across listener boundaries.
+async fn https_get_with_sni(
+    sni: &str,
+    host_header: &str,
+    path: &str,
+    proxy_addr: std::net::SocketAddr,
+) -> anyhow::Result<u16> {
+    use anyhow::Context as _;
+    use rustls::ClientConfig;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+    use std::sync::Arc;
+    use tokio::net::TcpStream;
+    use tokio_rustls::TlsConnector;
+
+    #[derive(Debug)]
+    struct NoVerifier;
+    impl ServerCertVerifier for NoVerifier {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    let config = Arc::new(
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth(),
+    );
+    let connector = TlsConnector::from(config);
+    let tcp = TcpStream::connect(proxy_addr)
+        .await
+        .context("TCP connect to proxy")?;
+    let server_name = ServerName::try_from(sni.to_owned()).context("invalid SNI")?;
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .context("TLS handshake")?;
+
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+    tls.write_all(req.as_bytes())
+        .await
+        .context("write HTTP request")?;
+
+    let mut buf = Vec::new();
+    tls.read_to_end(&mut buf)
+        .await
+        .context("read HTTP response")?;
+
+    let text = String::from_utf8_lossy(&buf);
+    text.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .with_context(|| format!("parse HTTP status from: {:.100}", text))
+}
+
+/// Verifies GEP-3567 misdirected-request detection on Gateway HTTPS listeners.
+///
+/// A Gateway with two HTTPS listeners on the same port (one exact-hostname, one
+/// wildcard) must return 421 when the request's Host header resolves to a
+/// *different* listener than the one selected by the TLS SNI.  Connections where
+/// both SNI and Host resolve to the *same* listener (including the legitimate
+/// coalescing case within a wildcard listener) must be served normally (200).
+#[tokio::test]
+async fn gateway_https_coalescing_returns_421_for_cross_listener_host() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-mdr421").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Two listener hostnames: one exact, one wildcard.
+    let exact_host = format!("mdr-exact.{}.local", ns.name);
+    let wild_pattern = format!("*.mdr.{}.local", ns.name);
+    let wild_a = format!("a.mdr.{}.local", ns.name);
+    let wild_b = format!("b.mdr.{}.local", ns.name);
+
+    // One cert per listener; self-signed, accepted via NoVerifier in the test
+    // client — no SAN validation needed.
+    let cert_exact = GeneratedCert::for_host(&exact_host);
+    let cert_wild = GeneratedCert::for_host(&wild_pattern);
+
+    fixtures::apply_fixture(
+        gwa::TLS_TERMINATION,
+        FixtureVars::new(&ns.name)
+            .with("LISTENER_A_HOSTNAME", &exact_host)
+            .with("LISTENER_B_HOSTNAME", &wild_pattern)
+            .with("SECRET_A_NAME", "cert-mdr-exact")
+            .with("SECRET_B_NAME", "cert-mdr-wild")
+            .with("TLS_CRT_A_B64", cert_exact.cert_b64())
+            .with("TLS_KEY_A_B64", cert_exact.key_b64())
+            .with("TLS_CRT_B_B64", cert_wild.cert_b64())
+            .with("TLS_KEY_B_B64", cert_wild.key_b64()),
+    )
+    .await?;
+
+    // Verify both routes are live with normal (matching SNI+Host) requests before
+    // probing the mismatch cases.
+    wait::wait_for_https_route(
+        h.gateway_tls_addr,
+        &exact_host,
+        "/",
+        Duration::from_secs(60),
+    )
+    .await?;
+    wait::wait_for_https_route(h.gateway_tls_addr, &wild_a, "/", Duration::from_secs(60)).await?;
+
+    let proxy = h.gateway_tls_addr;
+
+    // ── Sad paths: cross-listener → 421 ─────────────────────────────────────
+
+    // SNI=exact listener, Host=wildcard-listener → different listeners → 421.
+    let status = https_get_with_sni(&exact_host, &wild_a, "/", proxy).await?;
+    assert_eq!(
+        status, 421,
+        "SNI={exact_host:?} Host={wild_a:?}: expected 421 Misdirected Request (cross-listener)"
+    );
+
+    // SNI=wildcard-listener, Host=exact-listener → different listeners → 421.
+    let status = https_get_with_sni(&wild_a, &exact_host, "/", proxy).await?;
+    assert_eq!(
+        status, 421,
+        "SNI={wild_a:?} Host={exact_host:?}: expected 421 Misdirected Request (cross-listener)"
+    );
+
+    // ── Happy coalescing path: same wildcard listener → 200 ─────────────────
+
+    // SNI=wild_a and Host=wild_b both resolve to the *.mdr listener → not
+    // misdirected; proxy routes by Host to echo-b and returns 200.
+    let status = https_get_with_sni(&wild_a, &wild_b, "/", proxy).await?;
+    assert_eq!(
+        status, 200,
+        "SNI={wild_a:?} Host={wild_b:?}: expected 200 (same *.mdr listener; coalescing is safe)"
+    );
+
+    Ok(())
+}
