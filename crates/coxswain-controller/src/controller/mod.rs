@@ -20,7 +20,7 @@ use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
-use coxswain_reflector::gw_types::{BackendTlsPolicy, HttpRoute};
+use coxswain_reflector::gw_types::{BackendTlsPolicy, GrpcRoute, HttpRoute};
 use coxswain_reflector::tls::{
     GatewayListenerHealth, SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth,
     SharedHttpRouteHealth,
@@ -53,6 +53,7 @@ mod gateway_class_events;
 mod gateway_class_status;
 mod gateway_events;
 mod gateway_status;
+mod grpc_route_events;
 mod ingress_event_recorder;
 mod ingress_events;
 mod ingress_status;
@@ -93,8 +94,13 @@ const DEFERRED_PROGRAMMED_REQUEUE: Duration = Duration::from_secs(2);
 pub struct StatusHealthChannels {
     /// Per-listener Gateway TLS health.
     pub tls: SharedGatewayListenerHealth,
-    /// Per-route Accepted/ResolvedRefs health.
+    /// Per-HTTPRoute Accepted/ResolvedRefs health.
     pub route: SharedHttpRouteHealth,
+    /// Per-GRPCRoute Accepted/ResolvedRefs health.
+    ///
+    /// Separate from `route` — `RouteParentKey` is kind-neutral and an HTTPRoute + GRPCRoute
+    /// with the same name/ns/gateway would collide in one map.
+    pub grpc_route: SharedHttpRouteHealth,
     /// Per-`BackendTLSPolicy` ancestor health.
     pub policy: SharedBackendTlsPolicyHealth,
 }
@@ -176,6 +182,7 @@ impl Controller {
             gateways,
             gateway_classes,
             routes,
+            grpc_routes,
             ingresses,
             ingress_classes,
             policies,
@@ -189,6 +196,7 @@ impl Controller {
         let gateways_reader = gateways.reader();
         let gateway_classes_reader = gateway_classes.reader();
         let routes_reader = routes.reader();
+        let grpc_routes_reader = grpc_routes.reader();
         let ingresses_reader = ingresses.reader();
         let ingress_classes_reader = ingress_classes.reader();
         let policies_reader = policies.reader();
@@ -204,6 +212,7 @@ impl Controller {
             owned_gateways: self.owned_gateways.clone(),
             tls_health: self.channels.tls.clone(),
             route_health: self.channels.route.clone(),
+            grpc_route_health: self.channels.grpc_route.clone(),
             policy_health: self.channels.policy.clone(),
             gateway_classes: gateway_classes_reader,
             ingress_classes: ingress_classes_reader,
@@ -217,12 +226,14 @@ impl Controller {
         let (gw_tx, gw_rx) = mpsc::unbounded::<()>();
         let (gc_tx, gc_rx) = mpsc::unbounded::<()>();
         let (route_tx, route_rx) = mpsc::unbounded::<()>();
+        let (grpc_route_tx, grpc_route_rx) = mpsc::unbounded::<()>();
         let (ing_tx, ing_rx) = mpsc::unbounded::<()>();
         let (pol_tx, pol_rx) = mpsc::unbounded::<()>();
         let leadership_txs = vec![
             gw_tx.clone(),
             gc_tx.clone(),
             route_tx.clone(),
+            grpc_route_tx.clone(),
             ing_tx.clone(),
             pol_tx.clone(),
         ];
@@ -250,6 +261,11 @@ impl Controller {
         // spuriously re-drive before any health flip occurs.
         spawn_health_forwarder(&mut tasks, self.channels.tls.subscribe(), gw_tx);
         spawn_health_forwarder(&mut tasks, self.channels.route.subscribe(), route_tx);
+        spawn_health_forwarder(
+            &mut tasks,
+            self.channels.grpc_route.subscribe(),
+            grpc_route_tx,
+        );
         spawn_health_forwarder(&mut tasks, self.channels.policy.subscribe(), pol_tx);
 
         // --- Gateway: primary Gateway, secondary GatewayClass → Gateways in
@@ -286,6 +302,14 @@ impl Controller {
             .reconcile_all_on(route_rx)
             .run(reconcile_route, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, route_ctrl, "HTTPRoute");
+
+        // --- GRPCRoute: primary only; re-driven on grpc-route-health flips +
+        // promotion. Sibling to HTTPRoute, feeds the same gateway routing table
+        // via a parallel reconcile path.
+        let grpc_route_ctrl = KubeController::for_shared_stream(grpc_routes, grpc_routes_reader)
+            .reconcile_all_on(grpc_route_rx)
+            .run(reconcile_grpc_route, error_policy, ctx.clone());
+        spawn_controller_stream(&mut tasks, grpc_route_ctrl, "GRPCRoute");
 
         // --- Ingress: primary Ingress, secondary IngressClass → all Ingresses
         // (ownership re-checked per reconcile); re-driven on promotion. ---
@@ -441,6 +465,7 @@ struct ReconcileContext {
     owned_gateways: OwnedGateways,
     tls_health: SharedGatewayListenerHealth,
     route_health: SharedHttpRouteHealth,
+    grpc_route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
     /// Synced GatewayClass store, read for Gateway ownership at reconcile time.
     gateway_classes: kube::runtime::reflector::Store<GatewayClass>,
@@ -582,6 +607,33 @@ async fn reconcile_route_inner(route: &HttpRoute, ctx: &ReconcileContext) -> Act
     let rh = ctx.route_health.load();
     route_events::mark_http_route_programmed(&ctx.client, route, &ctx.controller_name, &owned, &rh)
         .await;
+    Action::await_change()
+}
+
+async fn reconcile_grpc_route(
+    route: Arc<GrpcRoute>,
+    ctx: Arc<ReconcileContext>,
+) -> Result<Action, Infallible> {
+    let started = std::time::Instant::now();
+    let res: Result<Action, Infallible> = Ok(reconcile_grpc_route_inner(&route, &ctx).await);
+    crate::metrics::observe_reconcile("status_writer", started, &res);
+    res
+}
+
+async fn reconcile_grpc_route_inner(route: &GrpcRoute, ctx: &ReconcileContext) -> Action {
+    if !ctx.leader.load(Ordering::Acquire) {
+        return Action::requeue(NON_LEADER_REQUEUE);
+    }
+    let owned = ctx.owned_gateways.load();
+    let rh = ctx.grpc_route_health.load();
+    grpc_route_events::mark_grpc_route_programmed(
+        &ctx.client,
+        route,
+        &ctx.controller_name,
+        &owned,
+        &rh,
+    )
+    .await;
     Action::await_change()
 }
 

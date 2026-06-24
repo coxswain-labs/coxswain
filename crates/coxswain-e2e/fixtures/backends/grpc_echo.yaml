@@ -1,0 +1,54 @@
+# gRPC echo backend for e2e tests.
+# Uses gcr.io/k8s-staging-gateway-api/echo-basic in GRPC_ECHO_SERVER=1 mode,
+# which serves the GrpcEcho service on port 50051 over h2c (cleartext HTTP/2).
+# Service declares appProtocol: kubernetes.io/h2c so Coxswain uses
+# BackendProtocol::H2c and dials via h2c prior knowledge.
+#
+# Service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+# Methods: Echo, EchoTwo, EchoThree
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grpc-echo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grpc-echo
+  template:
+    metadata:
+      labels:
+        app: grpc-echo
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: grpc-echo
+          image: ${ECHO_IMAGE}
+          ports:
+            - containerPort: 50051
+          env:
+            - name: GRPC_ECHO_SERVER
+              value: "1"
+            - name: HTTP_PORT
+              value: "50051"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grpc-echo
+spec:
+  selector:
+    app: grpc-echo
+  ports:
+    - port: 50051
+      targetPort: 50051
+      appProtocol: kubernetes.io/h2c

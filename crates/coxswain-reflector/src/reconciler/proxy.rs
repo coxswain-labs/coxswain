@@ -15,9 +15,11 @@
 use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
 use crate::gateway_api::hostnames_intersect;
 use crate::gateway_api::{
-    BackendTlsIndex, GatewayApiReconciler, ListenerBinding, build_backend_tls_index,
+    BackendTlsIndex, GatewayApiReconciler, GrpcRouteReconciler, GrpcRouteResolution,
+    ListenerBinding, build_backend_tls_index,
 };
 use crate::gw_types::BackendTlsPolicy;
+use crate::gw_types::GrpcRoute;
 use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
@@ -263,6 +265,10 @@ pub struct SharedProxyReconciler {
     /// every rebuild; read by the discovery server to serve `Scope::Gateway` subscribers.
     dedicated_registry: DedicatedRoutingRegistry,
     route_health: SharedHttpRouteHealth,
+    /// Per-(GRPCRoute, parent) health — a dedicated instance separate from `route_health`
+    /// because `RouteParentKey` is kind-neutral and an HTTPRoute and GRPCRoute with the
+    /// same name+ns+gateway would collide in one map.
+    grpc_route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
     fleet: SharedFleet,
     owned_gateways: OwnedGateways,
@@ -348,6 +354,8 @@ pub struct StatusSubscriptions {
     pub gateway_classes: ReflectHandle<GatewayClass>,
     /// Applied-`HTTPRoute` stream + reader.
     pub routes: ReflectHandle<HttpRoute>,
+    /// Applied-`GRPCRoute` stream + reader.
+    pub grpc_routes: ReflectHandle<GrpcRoute>,
     /// Applied-`Ingress` stream + reader.
     pub ingresses: ReflectHandle<Ingress>,
     /// Applied-`IngressClass` stream + reader.
@@ -365,6 +373,7 @@ struct StatusStoreWriters {
     gateways: reflector::store::Writer<Gateway>,
     gateway_classes: reflector::store::Writer<GatewayClass>,
     routes: reflector::store::Writer<HttpRoute>,
+    grpc_routes: reflector::store::Writer<GrpcRoute>,
     ingresses: reflector::store::Writer<Ingress>,
     ingress_classes: reflector::store::Writer<IngressClass>,
     policies: reflector::store::Writer<BackendTlsPolicy>,
@@ -405,6 +414,7 @@ impl SharedProxyReconciler {
             let (_, gateway_classes) =
                 reflector::store_shared::<GatewayClass>(STATUS_SUBSCRIBE_BUFFER);
             let (_, routes) = reflector::store_shared::<HttpRoute>(STATUS_SUBSCRIBE_BUFFER);
+            let (_, grpc_routes) = reflector::store_shared::<GrpcRoute>(STATUS_SUBSCRIBE_BUFFER);
             let (_, ingresses) = reflector::store_shared::<Ingress>(STATUS_SUBSCRIBE_BUFFER);
             let (_, ingress_classes) =
                 reflector::store_shared::<IngressClass>(STATUS_SUBSCRIBE_BUFFER);
@@ -419,6 +429,9 @@ impl SharedProxyReconciler {
                 }),
                 routes: routes.subscribe().unwrap_or_else(|| {
                     panic!("invariant: store_shared writer must yield an HTTPRoute subscriber")
+                }),
+                grpc_routes: grpc_routes.subscribe().unwrap_or_else(|| {
+                    panic!("invariant: store_shared writer must yield a GRPCRoute subscriber")
                 }),
                 ingresses: ingresses.subscribe().unwrap_or_else(|| {
                     panic!("invariant: store_shared writer must yield an Ingress subscriber")
@@ -436,6 +449,7 @@ impl SharedProxyReconciler {
                 gateways,
                 gateway_classes,
                 routes,
+                grpc_routes,
                 ingresses,
                 ingress_classes,
                 policies,
@@ -453,6 +467,7 @@ impl SharedProxyReconciler {
             cluster_summary,
             dedicated_registry,
             route_health: SharedHttpRouteHealth::new(),
+            grpc_route_health: SharedHttpRouteHealth::new(),
             policy_health: SharedBackendTlsPolicyHealth::new(),
             fleet: SharedFleet::new(),
             owned_gateways,
@@ -478,6 +493,15 @@ impl SharedProxyReconciler {
     /// can subscribe to updates published by this reconciler.
     pub fn route_health(&self) -> SharedHttpRouteHealth {
         self.route_health.clone()
+    }
+
+    /// Returns the shared GRPCRoute health handle so the Controller can subscribe to
+    /// updates published by this reconciler.
+    ///
+    /// Separate from [`Self::route_health`] — `RouteParentKey` is kind-neutral, so
+    /// HTTPRoute and GRPCRoute health maps must never be merged.
+    pub fn grpc_route_health(&self) -> SharedHttpRouteHealth {
+        self.grpc_route_health.clone()
     }
 
     /// Returns the shared `BackendTLSPolicy` health handle so the Controller can
@@ -508,6 +532,7 @@ struct ReconcilerConfig {
 
 pub(super) struct ReflectorStores<'a> {
     pub(super) routes: &'a reflector::Store<HttpRoute>,
+    pub(super) grpc_routes: &'a reflector::Store<GrpcRoute>,
     pub(super) ingresses: &'a reflector::Store<Ingress>,
     pub(super) ingress_classes: &'a reflector::Store<IngressClass>,
     /// `CoxswainIngressClassParameters` CRs in scope — the per-class annotation
@@ -553,6 +578,7 @@ struct SharedOutputs<'a> {
     cluster_summary: &'a SharedClusterSummary,
     dedicated_registry: &'a DedicatedRoutingRegistry,
     route_health: &'a SharedHttpRouteHealth,
+    grpc_route_health: &'a SharedHttpRouteHealth,
     policy_health: &'a SharedBackendTlsPolicyHealth,
     ingress_event_tx: Option<&'a tokio::sync::mpsc::Sender<IngressEvent>>,
 }
@@ -682,6 +708,7 @@ impl BackgroundService for SharedProxyReconciler {
             cluster_summary: self.cluster_summary.clone(),
             dedicated_registry: self.dedicated_registry.clone(),
             route_health: self.route_health.clone(),
+            grpc_route_health: self.grpc_route_health.clone(),
             policy_health: self.policy_health.clone(),
             fleet: self.fleet.clone(),
             owned_gateways: self.owned_gateways.clone(),
@@ -720,6 +747,7 @@ struct SharedHandles {
     cluster_summary: SharedClusterSummary,
     dedicated_registry: DedicatedRoutingRegistry,
     route_health: SharedHttpRouteHealth,
+    grpc_route_health: SharedHttpRouteHealth,
     policy_health: SharedBackendTlsPolicyHealth,
     /// Populated by the fleet task when `watch_fleet` is enabled; carried here
     /// so the fleet-rebuild task can publish into the same cell that callers
@@ -763,6 +791,7 @@ async fn spawn_tasks(
         cluster_summary,
         dedicated_registry,
         route_health,
+        grpc_route_health,
         policy_health,
         fleet,
         owned_gateways,
@@ -784,6 +813,7 @@ async fn spawn_tasks(
     // rest are always fresh non-shared stores.
     let (
         pre_routes,
+        pre_grpc_routes,
         pre_ingresses,
         pre_ingress_classes,
         pre_gateways,
@@ -792,15 +822,17 @@ async fn spawn_tasks(
     ) = match status_writers {
         Some(w) => (
             Some(w.routes),
+            Some(w.grpc_routes),
             Some(w.ingresses),
             Some(w.ingress_classes),
             Some(w.gateways),
             Some(w.gateway_classes),
             Some(w.policies),
         ),
-        None => (None, None, None, None, None, None),
+        None => (None, None, None, None, None, None, None),
     };
     let (route_reader, route_writer) = reader_writer::<HttpRoute>(pre_routes);
+    let (grpc_route_reader, grpc_route_writer) = reader_writer::<GrpcRoute>(pre_grpc_routes);
     let (ingress_reader, ingress_writer) = reader_writer::<Ingress>(pre_ingresses);
     let (class_reader, class_writer) = reader_writer::<IngressClass>(pre_ingress_classes);
     let (class_params_reader, class_params_writer) =
@@ -829,6 +861,14 @@ async fn spawn_tasks(
         watcher::Config::default(),
         ReflectorEffects::new(&notify, &controller_health, "httproute", metrics),
         "HttpRoute",
+    );
+    spawn_reflector(
+        &mut set,
+        grpc_route_writer,
+        scoped_api::<GrpcRoute>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(&notify, &controller_health, "grpcroute", metrics),
+        "GrpcRoute",
     );
     spawn_reflector(
         &mut set,
@@ -1018,6 +1058,7 @@ async fn spawn_tasks(
             }
             let stores = ReflectorStores {
                 routes: &route_reader,
+                grpc_routes: &grpc_route_reader,
                 ingresses: &ingress_reader,
                 ingress_classes: &class_reader,
                 ingress_class_parameters: &class_params_reader,
@@ -1043,6 +1084,7 @@ async fn spawn_tasks(
                 cluster_summary: &cluster_summary,
                 dedicated_registry: &dedicated_registry,
                 route_health: &route_health,
+                grpc_route_health: &grpc_route_health,
                 policy_health: &policy_health,
                 ingress_event_tx: ingress_event_tx.as_ref(),
             };
@@ -1100,6 +1142,7 @@ fn rebuild(
     outputs: &SharedOutputs<'_>,
 ) -> bool {
     let routes = stores.routes.state();
+    let grpc_routes = stores.grpc_routes.state();
     let ingresses = stores.ingresses.state();
 
     let (owned_ingress_classes, owned_default_ingress_class, owned_gateway_classes, owned_gateways) =
@@ -1138,10 +1181,13 @@ fn rebuild(
     let routes_published = build_routes(
         stores,
         &routes,
+        &grpc_routes,
         &ingresses,
         &ownership,
-        ingress_default_backend,
-        ingress_ports,
+        IngressBuildConfig {
+            default_backend: ingress_default_backend,
+            ports: ingress_ports,
+        },
         outputs,
     );
 
@@ -1194,6 +1240,16 @@ fn rebuild(
         stores.services,
     );
 
+    // GRPCRoute health uses a separate map and channel — RouteParentKey is kind-neutral
+    // and an HTTPRoute + GRPCRoute with the same name/ns/gateway would collide.
+    let grpc_route_health_map = GrpcRouteReconciler::compute_route_health(
+        &grpc_routes,
+        &gateways,
+        &owned_gateways,
+        &backend_grants,
+        stores.services,
+    );
+
     // Publish the cluster summary while we still have access to gateway_tls_health
     // (it's moved into `tls_health.store_and_notify` next). Reads from already-
     // materialised state: nothing kube-side, no allocations beyond the summary.
@@ -1233,6 +1289,9 @@ fn rebuild(
         .tls_health
         .update_scoped(gateway_tls_health, |k| !cut_over_keys.contains(k));
     outputs.route_health.store_and_notify(route_health_map);
+    outputs
+        .grpc_route_health
+        .store_and_notify(grpc_route_health_map);
 
     // Compute per-policy ancestor lists and merge with the validity health from index build.
     let ancestor_health = GatewayApiReconciler::compute_policy_health(
@@ -1290,6 +1349,7 @@ fn rebuild(
         build_gateway_routes(
             stores,
             &routes,
+            &grpc_routes,
             &dedicated_ownership,
             &gw_routes_cell,
             false,
@@ -1398,6 +1458,13 @@ pub(super) fn compute_ownership(
     )
 }
 
+/// Ingress-specific build configuration grouped to keep `build_routes` under the
+/// workspace `clippy::too_many_arguments` threshold.
+struct IngressBuildConfig<'a> {
+    default_backend: Option<&'a IngressDefaultBackend>,
+    ports: IngressPorts,
+}
+
 /// Build and publish the Ingress and Gateway routing tables from their
 /// respective source resources.
 ///
@@ -1409,20 +1476,26 @@ pub(super) fn compute_ownership(
 fn build_routes(
     stores: &ReflectorStores<'_>,
     routes: &[Arc<HttpRoute>],
+    grpc_routes: &[Arc<GrpcRoute>],
     ingresses: &[Arc<Ingress>],
     ownership: &Ownership<'_>,
-    ingress_default_backend: Option<&IngressDefaultBackend>,
-    ingress_ports: IngressPorts,
+    ingress_cfg: IngressBuildConfig<'_>,
     outputs: &SharedOutputs<'_>,
 ) -> bool {
-    let gateway_published =
-        build_gateway_routes(stores, routes, ownership, outputs.gateway_routes, true);
+    let gateway_published = build_gateway_routes(
+        stores,
+        routes,
+        grpc_routes,
+        ownership,
+        outputs.gateway_routes,
+        true,
+    );
     let ingress_published = build_ingress_routes(
         stores,
         ingresses,
         ownership,
-        ingress_default_backend,
-        ingress_ports,
+        ingress_cfg.default_backend,
+        ingress_cfg.ports,
         outputs.ingress_routes,
         outputs.ingress_event_tx,
     );
@@ -1439,6 +1512,7 @@ fn build_routes(
 pub(super) fn build_gateway_routes(
     stores: &ReflectorStores<'_>,
     routes: &[Arc<HttpRoute>],
+    grpc_routes: &[Arc<GrpcRoute>],
     ownership: &Ownership<'_>,
     shared: &SharedGatewayRoutingTable,
     skip_cut_over: bool,
@@ -1486,12 +1560,28 @@ pub(super) fn build_gateway_routes(
             &mut builder,
         );
     }
+    // GRPCRoute rules are installed into the same builder — gRPC is HTTP/2 POST
+    // `/{Service}/{Method}`, so it competes in the same routing table as HTTPRoute.
+    for grpc_route in grpc_routes {
+        GrpcRouteReconciler::reconcile(
+            grpc_route,
+            stores.slices,
+            stores.services,
+            ownership.gateways,
+            ownership.backend_grants,
+            GrpcRouteResolution {
+                listener_info: &listener_info,
+                policy_index: ownership.policy_index,
+            },
+            &mut builder,
+        );
+    }
 
     publish_routes(
         shared,
         builder,
         "gateway",
-        routes.len(),
+        routes.len() + grpc_routes.len(),
         ownership.gateways.len(),
         None,
     )

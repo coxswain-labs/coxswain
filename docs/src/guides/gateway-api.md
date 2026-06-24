@@ -1,6 +1,6 @@
 # Gateway API guide
 
-Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) standard channel. It supports `GatewayClass`, `Gateway`, and `HTTPRoute` resources.
+Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) standard channel. It supports `GatewayClass`, `Gateway`, `HTTPRoute`, and `GRPCRoute` resources.
 
 ## Supported resources
 
@@ -9,11 +9,12 @@ Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io
 | `GatewayClass` | `gateway.networking.k8s.io/v1` | Full |
 | `Gateway` | `gateway.networking.k8s.io/v1` | HTTP and HTTPS listeners only |
 | `HTTPRoute` | `gateway.networking.k8s.io/v1` | Path, header, method, and query matching; weighted traffic split |
+| `GRPCRoute` | `gateway.networking.k8s.io/v1` | Service and method matching; cleartext h2c backends |
 | `ReferenceGrant` | `gateway.networking.k8s.io/v1beta1` | Cross-namespace backend and certificate access |
 | `BackendTLSPolicy` | `gateway.networking.k8s.io/v1` | Upstream TLS configuration referencing a CA `ConfigMap` or `Secret` |
 
 !!! warning "Not supported"
-    `TCPRoute`, `TLSRoute`, `UDPRoute`, and `GRPCRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected. The `RequestMirror` and `CORS` filters are skipped with a WARN log line.
+    `TCPRoute`, `TLSRoute`, and `UDPRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected. The `RequestMirror` and `CORS` filters are skipped with a WARN log line.
 
 ## GatewayClass
 
@@ -420,4 +421,88 @@ Inspect conditions when traffic is not flowing:
 
 ```bash
 kubectl describe httproute my-route
+```
+
+## GRPCRoute
+
+A `GRPCRoute` routes gRPC traffic attached to a `Gateway` listener. gRPC is HTTP/2 `POST /{ServiceName}/{MethodName}`, so no special listener protocol is required — an ordinary `HTTP` listener on the Gateway accepts gRPC connections.
+
+### Backend requirements
+
+gRPC backends must advertise cleartext HTTP/2 (h2c) by setting `appProtocol: kubernetes.io/h2c` on the Service port. Coxswain uses prior-knowledge h2c to connect to the backend, which preserves gRPC trailers (`grpc-status`, `grpc-message`).
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-grpc-service
+spec:
+  selector:
+    app: my-grpc-app
+  ports:
+    - port: 50051
+      targetPort: 50051
+      appProtocol: kubernetes.io/h2c   # required for gRPC backends
+```
+
+### Example
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: my-grpc-route
+  namespace: default
+spec:
+  parentRefs:
+    - name: my-gateway
+  hostnames:
+    - grpc.example.com
+  rules:
+    - matches:
+        - method:
+            type: Exact
+            service: com.example.MyService
+            method: SayHello
+      backendRefs:
+        - name: my-grpc-service
+          port: 50051
+```
+
+### Method matching
+
+| Spec | Behaviour |
+|------|-----------|
+| No `matches` (or empty `matches`) | Routes all gRPC traffic on attached listeners |
+| `method.type: Exact`, service + method | Routes `/{service}/{method}` exactly |
+| `method.type: Exact`, service only | Routes any method under `/{service}/` |
+| `method.type: Exact`, method only | Routes the method name on any service |
+| `method.type: RegularExpression` | `service` and `method` are RE2 patterns |
+
+Header matching uses the same `Exact` and `RegularExpression` semantics as `HTTPRoute`.
+
+### Supported fields
+
+| Field | Support |
+|-------|---------|
+| `spec.parentRefs` | Full (including `sectionName` and `port`) |
+| `spec.hostnames` | Full (including wildcards) |
+| `spec.rules[].matches[].method` | `Exact` and `RegularExpression` |
+| `spec.rules[].matches[].headers` | Full |
+| `spec.rules[].filters` | `RequestHeaderModifier`, `ResponseHeaderModifier` |
+| `spec.rules[].backendRefs` | Service backends only |
+| `spec.rules[].backendRefs[].weight` | Full |
+
+`RequestMirror` and `ExtensionRef` filters are skipped with a WARN log line.
+
+### Status conditions
+
+| Condition | True when |
+|-----------|-----------|
+| `Accepted` | The route is attached to a Gateway listener |
+| `Programmed` | The route is active in the data plane |
+| `ResolvedRefs` | All `backendRefs` resolve to a reachable Service |
+
+```bash
+kubectl describe grpcroute my-grpc-route
 ```

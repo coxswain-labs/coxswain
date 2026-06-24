@@ -21,6 +21,7 @@ use coxswain_e2e::{
     harness::wait,
 };
 use gateway_api::apis::standard::gateways::Gateway;
+use gateway_api::apis::standard::grpcroutes::GRPCRoute;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
@@ -1110,4 +1111,114 @@ async fn coxswain_gateway_parameters_invalid_service_type_rejected() -> anyhow::
         "CRD rejection message must name the offending field, got: {msg}"
     );
     Ok(())
+}
+
+/// A valid GRPCRoute with a resolvable backend reaches `Accepted=True`,
+/// `Programmed=True`, and `ResolvedRefs=True`.
+///
+/// Closes the GRPCRoute status writer happy path: the controller must populate
+/// all three conditions on a well-formed route, mirroring the HTTPRoute path.
+#[tokio::test]
+async fn grpc_route_accepted_and_programmed_when_valid() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-grpc-good").await?;
+
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_ROUTE_STATUS, FixtureVars::new(&ns.name)).await?;
+
+    wait::wait_for_grpcroute_programmed(
+        &h.client,
+        "good-grpc-route",
+        &ns.name,
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    let routes: kube::Api<GRPCRoute> = kube::Api::namespaced(h.client.clone(), &ns.name);
+    let good = routes.get("good-grpc-route").await?;
+
+    assert_eq!(
+        grpcroute_parent_condition(&good, "Accepted").map(|(s, _)| s),
+        Some("True".to_string()),
+        "good-grpc-route must be Accepted=True"
+    );
+    assert_eq!(
+        grpcroute_parent_condition(&good, "Programmed").map(|(s, _)| s),
+        Some("True".to_string()),
+        "good-grpc-route must be Programmed=True"
+    );
+    assert_eq!(
+        grpcroute_parent_condition(&good, "ResolvedRefs"),
+        Some(("True".to_string(), "ResolvedRefs".to_string())),
+        "good-grpc-route backend must resolve to ResolvedRefs=True"
+    );
+
+    Ok(())
+}
+
+/// A GRPCRoute whose backendRef points at a missing Service gets
+/// `Accepted=True` but `ResolvedRefs=False(BackendNotFound)`.
+///
+/// Mirrors the HTTPRoute `ghost-route` sad path: the route is structurally
+/// valid (Accepted) but the controller cannot resolve the backend reference.
+#[tokio::test]
+async fn grpc_route_resolvedrefs_false_when_backend_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-grpc-ghost").await?;
+
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_ROUTE_STATUS, FixtureVars::new(&ns.name)).await?;
+
+    // Wait for good-grpc-route to be Programmed — proves the writer is live in
+    // this namespace, so ghost-grpc-route has had equal opportunity.
+    wait::wait_for_grpcroute_programmed(
+        &h.client,
+        "good-grpc-route",
+        &ns.name,
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    let routes: kube::Api<GRPCRoute> = kube::Api::namespaced(h.client.clone(), &ns.name);
+
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            let observed = routes.get("ghost-grpc-route").await.ok().map_or_else(
+                || "<could not fetch ghost-grpc-route>".to_string(),
+                |r| {
+                    format!(
+                        "Accepted={:?}, ResolvedRefs={:?}",
+                        grpcroute_parent_condition(&r, "Accepted"),
+                        grpcroute_parent_condition(&r, "ResolvedRefs"),
+                    )
+                },
+            );
+            format!(
+                "ghost-grpc-route to be Accepted=True + ResolvedRefs=False(BackendNotFound); observed {observed}"
+            )
+        },
+        || async {
+            let r = routes.get("ghost-grpc-route").await.ok()?;
+            (grpcroute_parent_condition(&r, "Accepted").map(|(s, _)| s)
+                == Some("True".to_string())
+                && grpcroute_parent_condition(&r, "ResolvedRefs")
+                    == Some(("False".to_string(), "BackendNotFound".to_string())))
+            .then_some(())
+        },
+    )
+    .await
+}
+
+/// `(status, reason)` of the first parent condition of `type_` on a GRPCRoute, or `None`.
+fn grpcroute_parent_condition(route: &GRPCRoute, type_: &str) -> Option<(String, String)> {
+    route.status.as_ref()?.parents.iter().find_map(|p| {
+        p.conditions
+            .iter()
+            .find(|c| c.type_ == type_)
+            .map(|c| (c.status.clone(), c.reason.clone()))
+    })
 }

@@ -857,6 +857,7 @@ dependencies = [
  "gateway-api",
  "k8s-openapi",
  "kube",
+ "prost",
  "rcgen",
  "reqwest",
  "rustls",
@@ -865,6 +866,8 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tonic",
+ "tonic-prost",
  "tracing",
  "tracing-subscriber",
 ]

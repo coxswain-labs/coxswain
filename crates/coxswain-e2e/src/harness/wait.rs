@@ -4,6 +4,7 @@ use anyhow::Context as _;
 use gateway_api::apis::standard::backendtlspolicies::BackendTLSPolicy;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
+use gateway_api::apis::standard::grpcroutes::GRPCRoute;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -219,6 +220,38 @@ pub async fn wait_for_httproute_programmed(
                 .await
                 .ok()
                 .filter(|r| route_has_condition(r, "Programmed"))
+                .map(|_| ())
+        },
+    )
+    .await
+}
+
+/// Poll until the GRPCRoute has a `Programmed=True` condition from at least one parent.
+///
+/// # Errors
+///
+/// Returns an error if the condition is not observed before `timeout` elapses.
+pub async fn wait_for_grpcroute_programmed(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<GRPCRoute> = Api::namespaced(client.clone(), namespace);
+    poll_until(
+        timeout,
+        POLL,
+        || async {
+            format!(
+                "GRPCRoute {namespace}/{name} to be Programmed; observed {}",
+                grpcroute_state(&api, name).await
+            )
+        },
+        || async {
+            api.get(name)
+                .await
+                .ok()
+                .filter(|r| grpcroute_has_condition(r, "Programmed"))
                 .map(|_| ())
         },
     )
@@ -949,6 +982,14 @@ fn route_has_condition(route: &HTTPRoute, type_: &str) -> bool {
     })
 }
 
+fn grpcroute_has_condition(route: &GRPCRoute, type_: &str) -> bool {
+    route.status.as_ref().is_some_and(|s| {
+        s.parents
+            .iter()
+            .any(|p| has_condition(p.conditions.as_slice(), type_))
+    })
+}
+
 fn has_condition(conditions: &[Condition], type_: &str) -> bool {
     condition_matches(conditions, type_, "True")
 }
@@ -1002,6 +1043,30 @@ async fn gateway_listener_state(api: &Api<Gateway>, gw_name: &str, listener_name
             format!("listener conditions={conds}")
         }
         Err(e) => format!("<could not fetch Gateway {gw_name}: {e}>"),
+    }
+}
+
+/// Fetch and summarize a GRPCRoute's per-parent conditions for a timeout dump.
+async fn grpcroute_state(api: &Api<GRPCRoute>, name: &str) -> String {
+    match api.get(name).await {
+        Ok(route) => match route.status.as_ref() {
+            Some(s) => {
+                let parents: Vec<String> = s
+                    .parents
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}:{}",
+                            p.controller_name,
+                            summarize_conditions(p.conditions.as_slice())
+                        )
+                    })
+                    .collect();
+                format!("parents=[{}]", parents.join(", "))
+            }
+            None => "<no status yet>".to_string(),
+        },
+        Err(e) => format!("<could not fetch GRPCRoute {name}: {e}>"),
     }
 }
 

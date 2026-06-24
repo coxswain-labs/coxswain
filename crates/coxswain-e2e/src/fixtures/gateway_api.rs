@@ -124,6 +124,17 @@ pub const REJECT_GATEWAY_OUT_OF_RANGE_PORT: &str =
 pub const REJECT_HTTPROUTE_INVALID_PATH_TYPE: &str =
     fixture!("reject_httproute_invalid_path_type.yaml");
 
+// ── GRPCRoute (#33) ──────────────────────────────────────────────────────────
+
+/// Gateway + GRPCRoute with an exact `service`+`method` match on
+/// `gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo`.
+/// Hostnamed `grpc-echo.${TESTNS}.local`. Backend: `grpc-echo:50051` (h2c).
+pub const GRPC_ROUTE_EXACT_METHOD: &str = fixture!("grpc_route_exact_method.yaml");
+
+/// Gateway + two GRPCRoutes: `good-grpc-route` (resolvable backend) and
+/// `ghost-grpc-route` (missing backend). Used for status-condition assertions.
+pub const GRPC_ROUTE_STATUS: &str = fixture!("grpc_route_status.yaml");
+
 /// `RateLimit` CR with `requestsPerSecond` omitted — rejected by the
 /// coxswain-owned CRD schema (`requestsPerSecond` is a required field).
 pub const REJECT_RATELIMIT_MISSING_RPS: &str = fixture!("reject_ratelimit_missing_rps.yaml");

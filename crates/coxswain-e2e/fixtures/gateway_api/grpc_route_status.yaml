@@ -1,0 +1,42 @@
+# Gateway + two GRPCRoutes: one with a resolvable backend, one ghost.
+# Used for GRPCRoute status-condition control-plane tests.
+#
+# good-grpc-route: backendRef grpc-echo:50051 exists → Accepted=True, Programmed=True,
+#   ResolvedRefs=True.
+# ghost-grpc-route: backendRef does-not-exist:50051 is missing → Accepted=True,
+#   ResolvedRefs=False(BackendNotFound).
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-status-gw
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: good-grpc-route
+spec:
+  parentRefs:
+    - name: coxswain-grpc-status-gw
+  rules:
+    - backendRefs:
+        - name: grpc-echo
+          port: 50051
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: ghost-grpc-route
+spec:
+  parentRefs:
+    - name: coxswain-grpc-status-gw
+  rules:
+    - backendRefs:
+        - name: does-not-exist
+          port: 50051

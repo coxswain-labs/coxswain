@@ -26,7 +26,10 @@ import (
 func TestConformance(t *testing.T) {
 	opts := conformance.DefaultOptions(t)
 	opts.GatewayClassName = "coxswain"
-	opts.ConformanceProfiles = sets.New[suite.ConformanceProfileName](suite.GatewayHTTPConformanceProfileName)
+	opts.ConformanceProfiles = sets.New[suite.ConformanceProfileName](
+		suite.GatewayHTTPConformanceProfileName,
+		suite.GatewayGRPCConformanceProfileName,
+	)
 
 	// Declare only features that are currently implemented.
 	// Add entries here as each feature issue closes.
@@ -76,6 +79,8 @@ func TestConformance(t *testing.T) {
 		// previously omitted from the SupportedFeatures set, so the GatewayClass status
 		// did not advertise it. This declaration is paperwork only.
 		features.SupportReferenceGrant,
+		// Standard: GRPCRoute — GEP-1016 (#33)
+		features.SupportGRPCRoute,
 	)
 
 	conformance.RunConformanceWithOptions(t, opts)
