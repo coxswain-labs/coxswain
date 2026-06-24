@@ -54,7 +54,7 @@ Tunable fields on `CoxswainGatewayParameters`:
 
 ## Automatic provisioning by the controller
 
-`serve controller` (and `serve dev`) runs a provisioning operator that watches every `Gateway`. For any Gateway whose `parametersRef` (or whose `GatewayClass`'s `parametersRef`) resolves to a `CoxswainGatewayParameters` object, the operator applies a dedicated-proxy `Deployment` / `Service` / `ServiceAccount` to the cluster via server-side-apply under field manager `coxswain-controller`, owner-referenced to the parent Gateway so deletion cascades.
+`serve controller` (and `serve dev`) runs a provisioning operator that watches every `Gateway`. For any Gateway whose `parametersRef` (or whose `GatewayClass`'s `parametersRef`) resolves to a `CoxswainGatewayParameters` object, the operator applies a dedicated proxy `Deployment` / `Service` / `ServiceAccount` to the cluster via server-side-apply under field manager `coxswain-controller`, owner-referenced to the parent Gateway so deletion cascades.
 
 Apply the dev fixture set and verify the resources land:
 
@@ -87,7 +87,7 @@ If `parametersRef` targets a missing `CoxswainGatewayParameters` object, the ope
 
 When a listener declares `allowedRoutes.namespaces.from: All` or `from: Selector`, no additional
 operator action is needed. The controller's cluster-wide reflector already watches routes across all
-namespaces; cross-namespace HTTPRoutes are resolved at reconcile time and compiled into the per-Gateway
+namespaces; cross-namespace HTTPRoutes are resolved at reconcile time and compiled into the dedicated
 snapshot before it is pushed to the dedicated proxy. The dedicated proxy receives the complete,
 pre-scoped routing world from the controller — it has no cluster-wide reflector and no K8s RBAC of
 its own.

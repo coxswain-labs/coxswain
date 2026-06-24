@@ -1,8 +1,8 @@
 # Coxswain
 
-!!! info "Pre-1.0 — early adopter release"
-    Coxswain's core proxy is functional and ships a complete `ingress.coxswain-labs.dev/*` annotation surface with admission-time validation.
-    Active development continues toward v0.5 (Gateway API extended features). Feedback and contributions are welcome.
+!!! info "Pre-1.0 release"
+    Coxswain has been re-architected with a strict controller/proxy boundary and ships a complete `ingress.coxswain-labs.dev/*` annotation surface with admission-time validation.
+    Active development is getting ready for v0.5 (Gateway API extended features). Feedback and contributions are welcome.
 
 !!! warning "Production use"
     Coxswain is under active development, production use is at your own risk.

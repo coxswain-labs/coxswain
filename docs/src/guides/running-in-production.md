@@ -18,7 +18,7 @@ Verify the `PodDisruptionBudget` is in place:
 kubectl -n coxswain-system get pdb
 ```
 
-Pod anti-affinity is not set by default. Add it via your `values.yaml` to spread shared-proxy replicas across nodes:
+Pod anti-affinity is not set by default. Add it via your `values.yaml` to spread shared proxy replicas across nodes:
 
 ```yaml
 proxy:
@@ -163,7 +163,7 @@ The default `ClusterRole` grants Coxswain cluster-wide:
 - Read on `gatewayclasses`, `gateways`, `httproutes`, `referencegrants`, `backendtlspolicies` (`gateway.networking.k8s.io`).
 - Status writes (`*/status`) on `ingresses`, `gateways`, `httproutes`, `backendtlspolicies`, and `gatewayclasses`.
 
-A separate namespaced `Role` (in `coxswain-system`) grants `get`, `create`, `patch` on `coordination.k8s.io/leases` — used only by the controller pod for leader election. Review the rendered manifests with `helm template` or read `deploy/manifests/controller-rbac.yaml` before deploying. The shared-proxy and dedicated-proxy ServiceAccounts hold **no Kubernetes RBAC** — they are identity-only SAs whose projected tokens are used solely for mTLS bootstrap with the controller; verify with `kubectl auth can-i --list --as=system:serviceaccount:coxswain-system:coxswain-shared-proxy` (output should show only Kubernetes baseline grants).
+A separate namespaced `Role` (in `coxswain-system`) grants `get`, `create`, `patch` on `coordination.k8s.io/leases` — used only by the controller pod for leader election. Review the rendered manifests with `helm template` or read `deploy/manifests/controller-rbac.yaml` before deploying. The shared proxy and dedicated proxy ServiceAccounts hold **no Kubernetes RBAC** — they are identity-only SAs whose projected tokens are used solely for mTLS bootstrap with the controller; verify with `kubectl auth can-i --list --as=system:serviceaccount:coxswain-system:coxswain-shared-proxy` (output should show only Kubernetes baseline grants).
 
 If Coxswain should only manage resources in a single namespace, set `watchNamespace`. This restricts only the controller's reflectors; the proxy's discovery client is unaffected (it receives routing from the controller, not from K8s directly). The controller's `ClusterRole`/`ClusterRoleBinding` still ships cluster-wide; to scope it to a namespace, edit the rendered manifests by hand.
 
