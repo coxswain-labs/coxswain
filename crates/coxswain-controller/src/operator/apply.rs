@@ -19,7 +19,7 @@
 //!
 //! [`FIELD_MANAGER`] is `"coxswain-controller"`. The e2e suite asserts this
 //! literal on `metadata.managedFields[].manager`; renaming it requires a
-//! coordinated change to `provisioning_rbac.rs`.
+//! coordinated change to `provisioning.rs`.
 
 use super::render::RenderedSpecs;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
@@ -34,7 +34,7 @@ use thiserror::Error;
 /// The Step 9 acceptance criterion (#208) verifies this is exactly
 /// `"coxswain-controller"` via `kubectl get deployment ... -o json | jq
 /// '.metadata.managedFields[].manager'`. Do not rename without coordinating
-/// the e2e assertion in `crates/coxswain-e2e/tests/provisioning_rbac.rs`.
+/// the e2e assertion in `crates/coxswain-e2e/tests/provisioning.rs`.
 pub(super) const FIELD_MANAGER: &str = "coxswain-controller";
 
 /// Errors returned by [`apply_rendered`]. Each variant carries the underlying

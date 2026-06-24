@@ -80,7 +80,7 @@ Every issue requires e2e coverage for both happy paths and sad/error paths.
 Test names follow the **behaviour/outcome** pattern: `what_happens_when_condition`.
 
 For each scenario list:
-- **Plane**: `routing`, `tls`, `traffic_policy`, `status_conditions`, `provisioning_rbac`, `resilience`, `observability` — use the plane of the primary assertion target
+- **Plane**: `routing`, `tls`, `traffic_policy`, `status_conditions`, `provisioning`, `resilience`, `observability`, `discovery` — use the plane of the primary assertion target
 - **File**: `crates/coxswain-e2e/tests/<plane>.rs`
 - **Name**: `behaviour_when_condition` (snake_case)
 - **Happy path**: what the test sets up and asserts succeeds

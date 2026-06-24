@@ -1,0 +1,540 @@
+#![allow(missing_docs)]
+//! Provisioning control-plane: the dedicated-proxy operator.
+//!
+//! Plane: **control-plane**. Execution: **parallel** — every test owns a fresh
+//! namespace and a fresh dedicated Gateway.
+//!
+//! Classification rule: a test belongs to the plane of its *primary assertion
+//! target*. "A resource is provisioned / GC'd" is control-plane even if it
+//! sends a probe. Covers dedicated-proxy resource provisioning (GEP-1762
+//! labels, owner refs, SSA), garbage collection, per-field
+//! `CoxswainGatewayParameters` rendering, ReferenceGrant-gated cross-namespace
+//! backends, the dedicated proxy serving traffic end-to-end, and per-proxy
+//! scope isolation.
+//!
+//! Note: `lifecycle_dedicated_proxy_routes_traffic` and
+//! `lifecycle_cross_namespace_backend` assert traffic, but are kept here with the
+//! dedicated-provisioning lifecycle they validate (and share its helper set)
+//! rather than in `routing.rs`. Controller-restart and mode-migration lifecycle
+//! tests live in `resilience.rs`; the #211 status-writer tests in
+//! `status_conditions.rs`. Discovery bootstrap-credential tests and the
+//! read-only-proxy ServiceAccount audit live in `discovery.rs`. Shared dedicated
+//! helpers live in `common::dedicated`.
+
+use coxswain_e2e::{
+    FixtureVars, Harness, NamespaceGuard,
+    fixtures::{self, backends, dedicated_proxy as dedicated},
+    harness::{HttpClient, wait},
+};
+use gateway_api::apis::standard::gateways::Gateway;
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{Service, ServiceAccount};
+use kube::api::{Api, DeleteParams};
+use std::time::Duration;
+
+mod common;
+use common::dedicated::{
+    GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, assert_provisioning_contract, wait_for_cut_over,
+};
+
+/// 1. Apply a dedicated-mode Gateway → assert all three resources are created
+///    with the GEP-1762 labels (including merged infrastructure labels), the
+///    correct owner reference back to the Gateway, and the SSA field manager
+///    set to `"coxswain-controller"`.
+#[tokio::test]
+async fn provisions_resources_for_dedicated_proxy() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-create").await?;
+
+    let (_, _, _, deploy, svc, sa) = apply_and_wait(&h, &ns).await?;
+
+    // GEP-1762 labels + owner reference + SSA field manager (shared contract).
+    assert_provisioning_contract(&deploy, &svc, &sa);
+
+    // Fixture-specific: this fixture sets `infrastructure.labels`/`annotations`,
+    // which must merge onto every provisioned resource.
+    for (kind, meta) in [
+        ("Deployment", &deploy.metadata),
+        ("Service", &svc.metadata),
+        ("ServiceAccount", &sa.metadata),
+    ] {
+        let labels = meta.labels.as_ref().unwrap_or_else(|| {
+            panic!("{kind}: labels missing");
+        });
+        assert_eq!(
+            labels.get("team").map(String::as_str),
+            Some("platform"),
+            "{kind}: infrastructure.labels.team should merge"
+        );
+        let annotations = meta.annotations.as_ref().unwrap_or_else(|| {
+            panic!("{kind}: annotations missing");
+        });
+        assert_eq!(
+            annotations
+                .get("coxswain.example/owner")
+                .map(String::as_str),
+            Some("tenant-team"),
+            "{kind}: infrastructure.annotations.owner should merge"
+        );
+    }
+
+    Ok(())
+}
+
+/// 2. Delete the Gateway → assert all three resources are garbage-collected
+///    within 30 s via the owner-ref cascade. No explicit deletion of the
+///    provisioned resources; K8s GC drives it from the owner reference.
+#[tokio::test]
+async fn gateway_deletion_garbage_collects_resources() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-gc").await?;
+
+    let (deployments, services, sas, _, _, _) = apply_and_wait(&h, &ns).await?;
+
+    // Delete the Gateway and wait for GC to cascade.
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    gateways
+        .delete(GATEWAY_NAME, &DeleteParams::default())
+        .await?;
+
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            format!("Deployment/Service/ServiceAccount '{RESOURCE_NAME}' to be garbage-collected")
+        },
+        || async {
+            let deploy_gone = deployments.get(RESOURCE_NAME).await.is_err();
+            let svc_gone = services.get(RESOURCE_NAME).await.is_err();
+            let sa_gone = sas.get(RESOURCE_NAME).await.is_err();
+            (deploy_gone && svc_gone && sa_gone).then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+// ── Per-field CoxswainGatewayParameters coverage (#333) ──────────────────────
+//
+// The happy-path provisioning tests assert only the GEP-1762 contract (labels,
+// owner refs, SSA manager), never the individual tunables. Each parameter field
+// is an independent mapping with its own failure mode, so it gets one atomic
+// test (charter #2) — a failure names the exact field that stopped rendering.
+// All five share the `DEDICATED_GATEWAY_FIELDS` fixture (every knob set) and
+// assert their own field against the rendered objects.
+
+/// Provision the all-fields dedicated Gateway in `ns` and return the rendered
+/// Deployment + Service for the per-field assertions below.
+async fn provision_field_gateway(
+    h: &Harness,
+    ns: &NamespaceGuard,
+) -> anyhow::Result<(Deployment, Service)> {
+    fixtures::apply_fixture(
+        dedicated::DEDICATED_GATEWAY_FIELDS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let deploy =
+        wait::wait_for_resource(&deployments, RESOURCE_NAME, Duration::from_secs(15)).await?;
+    let svc = wait::wait_for_resource(&services, RESOURCE_NAME, Duration::from_secs(15)).await?;
+    Ok((deploy, svc))
+}
+
+/// The `coxswain` container of the rendered dedicated-proxy Deployment.
+fn coxswain_container(deploy: &Deployment) -> &k8s_openapi::api::core::v1::Container {
+    deploy
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .map(|s| s.containers.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find(|c| c.name == "coxswain")
+        .unwrap_or_else(|| panic!("coxswain container present"))
+}
+
+/// #333 — `replicas` renders to `Deployment.spec.replicas`.
+#[tokio::test]
+async fn params_replicas_sets_deployment_replicas() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-replicas").await?;
+    let (deploy, _) = provision_field_gateway(&h, &ns).await?;
+    assert_eq!(
+        deploy.spec.as_ref().and_then(|s| s.replicas),
+        Some(3),
+        "replicas should render to Deployment.spec.replicas"
+    );
+    Ok(())
+}
+
+/// #333 — `image` renders to the `coxswain` container image.
+#[tokio::test]
+async fn params_image_sets_container_image() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-image").await?;
+    let (deploy, _) = provision_field_gateway(&h, &ns).await?;
+    assert_eq!(
+        coxswain_container(&deploy).image.as_deref(),
+        Some("registry.invalid/custom-proxy:v9"),
+        "image override should render to the coxswain container image"
+    );
+    Ok(())
+}
+
+/// #333 — `resources` render to the `coxswain` container requests/limits.
+#[tokio::test]
+async fn params_resources_set_container_resources() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-resources").await?;
+    let (deploy, _) = provision_field_gateway(&h, &ns).await?;
+    let resources = coxswain_container(&deploy)
+        .resources
+        .as_ref()
+        .expect("container resources");
+    let requests = resources.requests.as_ref().expect("resource requests");
+    assert_eq!(
+        requests.get("cpu").map(|q| q.0.as_str()),
+        Some("125m"),
+        "cpu request should render"
+    );
+    assert_eq!(
+        requests.get("memory").map(|q| q.0.as_str()),
+        Some("64Mi"),
+        "memory request should render"
+    );
+    let limits = resources.limits.as_ref().expect("resource limits");
+    assert_eq!(
+        limits.get("cpu").map(|q| q.0.as_str()),
+        Some("250m"),
+        "cpu limit should render"
+    );
+    assert_eq!(
+        limits.get("memory").map(|q| q.0.as_str()),
+        Some("128Mi"),
+        "memory limit should render"
+    );
+    Ok(())
+}
+
+/// #333 — `podTemplate` merges onto the rendered pod template (label + nodeSelector).
+#[tokio::test]
+async fn params_pod_template_merges_onto_template() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-podtemplate").await?;
+    let (deploy, _) = provision_field_gateway(&h, &ns).await?;
+    let tmpl = &deploy.spec.as_ref().expect("Deployment spec").template;
+    let labels = tmpl
+        .metadata
+        .as_ref()
+        .and_then(|m| m.labels.as_ref())
+        .expect("pod template labels");
+    assert_eq!(
+        labels.get("tier").map(String::as_str),
+        Some("edge"),
+        "podTemplate label should merge onto the rendered pod template"
+    );
+    let node_selector = tmpl
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_selector.as_ref())
+        .expect("podTemplate nodeSelector");
+    assert_eq!(
+        node_selector
+            .get("coxswain-labs.dev/pool")
+            .map(String::as_str),
+        Some("edge"),
+        "podTemplate nodeSelector should merge onto the rendered pod template"
+    );
+    Ok(())
+}
+
+/// #333 — `serviceType: NodePort` renders to `Service.spec.type`.
+#[tokio::test]
+async fn params_service_type_sets_service_type() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-svctype").await?;
+    let (_, svc) = provision_field_gateway(&h, &ns).await?;
+    assert_eq!(
+        svc.spec.as_ref().and_then(|s| s.type_.as_deref()),
+        Some("NodePort"),
+        "serviceType should render to Service.spec.type"
+    );
+    Ok(())
+}
+
+/// 11 — Apply a dedicated-mode Gateway → assert Deployment/Service/ServiceAccount
+/// land with the GEP-1762 labels, owner references back to the Gateway, and the
+/// SSA field manager set to `coxswain-controller`.
+#[tokio::test]
+async fn lifecycle_provisioning_creates_resources() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ded-life-prov").await?;
+
+    fixtures::apply_fixture(dedicated::PROVISIONING, FixtureVars::new(&ns.name)).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
+
+    let deploy =
+        wait::wait_for_resource(&deployments, RESOURCE_NAME, Duration::from_secs(30)).await?;
+    let svc = wait::wait_for_resource(&services, RESOURCE_NAME, Duration::from_secs(30)).await?;
+    let sa = wait::wait_for_resource(&sas, RESOURCE_NAME, Duration::from_secs(30)).await?;
+
+    // GEP-1762 labels + owner reference + SSA field manager (shared contract).
+    assert_provisioning_contract(&deploy, &svc, &sa);
+
+    Ok(())
+}
+
+/// 12 — Spawn a dedicated-proxy host subprocess once the controller has flipped
+/// `DedicatedProxyReady=True`, send a GET via the Gateway listener, assert the
+/// expected backend.
+#[tokio::test]
+#[ignore = "dedicated-over-discovery clobbers shared routing cells under concurrent provisioning; unignore when per-proxy scope filtering lands (#426)"]
+async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ded-life-traffic").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(dedicated::TRAFFIC, FixtureVars::new(&ns.name)).await?;
+
+    // Wait for the controller to flip DedicatedProxyReady=True (cutover).
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    // The operator provisions a LoadBalancer Service for the dedicated pod;
+    // wait for it to get a real IP then verify traffic flows through it.
+    let dedicated_addr =
+        wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http = HttpClient::new(dedicated_addr)?;
+
+    let host = format!("dedicated.{}.local", ns.name);
+    let resp = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    // Negative (#210 cut-over): once DedicatedProxyReady=True the shared pool must
+    // relinquish the Gateway — without this the shared pool could double-serve the
+    // same Gateway the dedicated pod now owns.
+    //
+    // Assert this against the shared proxy's OWN routing table, not by probing its
+    // listener for a 404: Gateway listener ports are bound dynamically and the
+    // socket is released once no shared Gateway uses the port (see
+    // docs/src/guides/running-in-production.md — "removed ports … socket is
+    // released"). With this the only Gateway, the shared proxy unbinds the gateway
+    // port entirely, so a data-plane probe is TCP-refused, never a 404. The
+    // relinquish is faithfully observed as the host leaving `/api/v1/routes`.
+    let routes_url = h.admin_url("/api/v1/routes");
+    let client = reqwest::Client::new();
+    let still_serving = |json: &serde_json::Value, host: &str| -> bool {
+        json["gateway"]["hosts"]
+            .as_array()
+            .is_some_and(|hosts| hosts.iter().any(|e| e["host"].as_str() == Some(host)))
+    };
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            let state = match client.get(&routes_url).send().await {
+                Ok(r) => match r.json::<serde_json::Value>().await {
+                    Ok(j) => format!("still serving = {}", still_serving(&j, &host)),
+                    Err(e) => format!("routes body parse error: {e}"),
+                },
+                Err(e) => format!("routes request error: {e}"),
+            };
+            format!("shared proxy to drop '{host}' from its gateway routing table; {state}")
+        },
+        || async {
+            let json = client
+                .get(&routes_url)
+                .send()
+                .await
+                .ok()?
+                .json::<serde_json::Value>()
+                .await
+                .ok()?;
+            (!still_serving(&json, &host)).then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// 12b — Scope isolation (#426): two cut-over dedicated Gateways A and B exist
+/// concurrently. A's dedicated proxy must serve only A's host and return `404`
+/// for B's host — proving the discovery server filters each subscriber's
+/// snapshot to its own Gateway's routing world via the dedicated registry, and
+/// never leaks another scope's routes. This is the direct regression guard for
+/// the per-proxy scope-filtering behaviour; the other dedicated tests assert it
+/// only indirectly via the shared-pool relinquish.
+#[tokio::test]
+async fn dedicated_proxy_does_not_serve_foreign_gateway_routes() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns_a = NamespaceGuard::create(&h.client, "prov-ded-scope-a").await?;
+    let ns_b = NamespaceGuard::create(&h.client, "prov-ded-scope-b").await?;
+
+    // Provision two independent cut-over dedicated Gateways, one per namespace.
+    for ns in [&ns_a, &ns_b] {
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(dedicated::TRAFFIC, FixtureVars::new(&ns.name)).await?;
+        let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+        wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+    }
+
+    let host_a = format!("dedicated.{}.local", ns_a.name);
+    let host_b = format!("dedicated.{}.local", ns_b.name);
+
+    let addr_a =
+        wait::wait_for_dedicated_proxy_endpoint(&ns_a.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http_a = HttpClient::new(addr_a)?;
+
+    // Positive: A serves its own Gateway's route — proves A's subscription
+    // (Scope::Gateway{ns_a}) received its own slice from the dedicated registry.
+    let resp = wait::wait_for_route(&http_a, &host_a, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    // Negative: A must NOT serve B's host. B is a *real* cut-over Gateway whose
+    // routes exist in the dedicated registry under B's own key, so this 404
+    // proves scope filtering — A never receives B's routes, not merely that the
+    // host is unknown cluster-wide.
+    wait::wait_for_route_status(&http_a, &host_b, "/", 404, Duration::from_secs(30)).await?;
+
+    Ok(())
+}
+
+/// 13 — An HTTPRoute with a backend Service in a different namespace resolves
+/// via `ReferenceGrant`, and traffic flows through the dedicated subprocess.
+#[tokio::test]
+#[ignore = "dedicated-over-discovery clobbers shared routing cells under concurrent provisioning; unignore when per-proxy scope filtering lands (#426)"]
+async fn lifecycle_cross_namespace_backend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ded-life-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "prov-ded-life-xns-tenant").await?;
+
+    fixtures::apply_fixture(
+        dedicated::CROSS_NAMESPACE_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
+
+    fixtures::apply_fixture(
+        dedicated::CROSS_NAMESPACE_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    let dedicated_addr =
+        wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http = HttpClient::new(dedicated_addr)?;
+
+    let host = format!("cross-ns.{}.local", ns.name);
+    let resp = wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-d");
+
+    Ok(())
+}
+
+/// 14 — Delete the `ReferenceGrant` → the cross-namespace backend is dropped
+/// from the dedicated proxy's routing table (requests 500).
+#[tokio::test]
+#[ignore = "dedicated-over-discovery clobbers shared routing cells under concurrent provisioning; unignore when per-proxy scope filtering lands (#426)"]
+async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ded-life-revoke").await?;
+    let tenant = NamespaceGuard::create(&h.client, "prov-ded-life-revoke-tenant").await?;
+
+    fixtures::apply_fixture(
+        dedicated::CROSS_NAMESPACE_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
+
+    fixtures::apply_fixture(
+        dedicated::CROSS_NAMESPACE_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+
+    let dedicated_addr =
+        wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http = HttpClient::new(dedicated_addr)?;
+
+    let host = format!("cross-ns.{}.local", ns.name);
+    // Baseline — the route resolves while the grant is in place.
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
+
+    use gateway_api::apis::standard::referencegrants::ReferenceGrant;
+    let grants: Api<ReferenceGrant> = Api::namespaced(h.client.clone(), &tenant.name);
+    let grant_name = format!("allow-httproute-from-{}", ns.name);
+    grants.delete(&grant_name, &DeleteParams::default()).await?;
+
+    // Cross-namespace backend dropped from the routing table → reflector
+    // installs an "error route" returning 500 ("No ready endpoints for rule —
+    // installing error route (500)"; see `gateway_api::reconcile`).
+    wait::wait_for_route_status(&http, &host, "/", 500, Duration::from_secs(30)).await?;
+
+    Ok(())
+}
+
+/// 16 — Gateway deletion cascades to Deployment/Service/ServiceAccount via
+/// owner-ref GC, and the Gateway itself is removed after the dedicated-cleanup
+/// finalizer runs. (Sibling of test 2 which asserts the same against
+/// `DEDICATED_GATEWAY` without the pause stub; this variant exercises the same
+/// path with a pause-image fixture for consistency with the rest of the
+/// lifecycle suite.)
+#[tokio::test]
+async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ded-life-gc").await?;
+
+    fixtures::apply_fixture(dedicated::PROVISIONING, FixtureVars::new(&ns.name)).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
+
+    wait::wait_for_resource(&deployments, RESOURCE_NAME, Duration::from_secs(30)).await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    gateways
+        .delete(GATEWAY_NAME, &DeleteParams::default())
+        .await?;
+
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            format!(
+                "Deployment/Service/ServiceAccount '{RESOURCE_NAME}' and Gateway {GATEWAY_NAME} to be garbage-collected"
+            )
+        },
+        || async {
+            let gone = deployments.get(RESOURCE_NAME).await.is_err()
+                && services.get(RESOURCE_NAME).await.is_err()
+                && sas.get(RESOURCE_NAME).await.is_err()
+                && gateways.get(GATEWAY_NAME).await.is_err();
+            gone.then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}

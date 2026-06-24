@@ -19,7 +19,7 @@ TESTS_DIR="crates/coxswain-e2e/tests"
 ALLOWED=(
   discovery
   observability
-  provisioning_rbac
+  provisioning
   resilience
   routing
   security

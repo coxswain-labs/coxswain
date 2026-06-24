@@ -3,8 +3,8 @@
 //!
 //! Re-exports the [`Harness`] entry point, fixture path constants, and all harness
 //! utilities used by the by-plane integration suite under `tests/` (`routing`,
-//! `tls`, `status_conditions`, `provisioning_rbac`, `resilience`, `observability`,
-//! and the `security`/`traffic_policy` planes).
+//! `tls`, `status_conditions`, `provisioning`, `resilience`, `observability`,
+//! `discovery`, and the `security`/`traffic_policy` planes).
 //!
 //! # Charter
 //!

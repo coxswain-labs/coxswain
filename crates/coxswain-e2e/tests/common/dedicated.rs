@@ -1,7 +1,7 @@
 //! Shared test-orchestration helpers for the dedicated-mode Gateway suite.
 //!
 //! The dedicated-proxy tests are classified by behavior plane across
-//! `provisioning_rbac.rs`, `status_conditions.rs`, and `resilience.rs`, but they
+//! `provisioning.rs`, `status_conditions.rs`, and `resilience.rs`, but they
 //! share a common vocabulary: the fixture-coupled resource names, the
 //! provision-then-poll setup, and the condition/address accessors. These live
 //! here (DAMP test support) rather than in the library so the read-only-proxy

@@ -230,8 +230,8 @@ Each suite runs as **two passes** — a parallel pass (`e2e`), then a serial pas
 # Suites are by behavior plane (see each tests/*.rs header). For each suite:
 cargo nextest run --profile e2e        -p coxswain-e2e -E 'binary(routing)' --no-tests=pass
 cargo nextest run --profile e2e-serial -p coxswain-e2e -E 'binary(routing)' --no-tests=pass
-# …and likewise for: tls, traffic_policy, status_conditions, provisioning_rbac,
-# resilience, observability.
+# …and likewise for: tls, traffic_policy, status_conditions, provisioning,
+# resilience, observability, discovery.
 ```
 
 `.config/nextest.toml` defines two profiles whose `default-filter`s split the work, so the command is identical per suite — only the profile changes:
