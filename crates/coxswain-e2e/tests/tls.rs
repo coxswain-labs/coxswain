@@ -900,12 +900,19 @@ async fn websocket_passthrough() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Does NOT verify the h2c wire: it does not assert the proxy speaks HTTP/2
-/// cleartext on the upstream leg (that is covered by the conformance suite, which
-/// needs a backend that natively accepts h2c). What it verifies (GEP-1911) is
-/// that a Service's `appProtocol: kubernetes.io/h2c` propagates through the data
-/// pipeline (endpoint resolution → BackendGroup → proxy) and the route is
-/// programmed and serves responses.
+/// Verifies the Gateway-API `appProtocol: kubernetes.io/h2c` path (GEP-1911, #367):
+/// a Service port declaring h2c makes the proxy speak HTTP/2 cleartext on the
+/// upstream leg (distinct from the Ingress annotation path in
+/// [`annotation_backend_protocol_grpc_selects_h2c`]).
+///
+/// Two HTTPRoutes point at the same h2c-only port 3001 through two Services that
+/// differ only in `appProtocol`, so the upstream wire protocol is governed solely
+/// by the Service field — not the port:
+/// - `appProtocol: kubernetes.io/h2c` → `BackendProtocol::H2c` → the proxy speaks
+///   h2c → the port serves (2xx).
+/// - no `appProtocol` → `BackendProtocol::Http1` → the proxy speaks HTTP/1.1 → the
+///   h2c-only port rejects it (non-2xx). This is the negative that proves the
+///   `appProtocol` field — not the Service identity — flipped the protocol.
 #[tokio::test]
 async fn backend_protocol_h2c() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -915,10 +922,19 @@ async fn backend_protocol_h2c() -> anyhow::Result<()> {
     wait::wait_for_deployments(&ns.name, &["h2c-echo"]).await?;
     fixtures::apply_fixture(gwa::BACKEND_PROTOCOL_H2C, FixtureVars::new(&ns.name)).await?;
 
+    // Positive: appProtocol h2c → h2c → the h2c-only port serves.
     let host = format!("h2c.{}.local", ns.name);
-
     let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("h2c-echo");
+
+    // Negative: no appProtocol → HTTP/1.1 → the h2c-only port rejects the request.
+    // The route is programmed (the positive proved the fixture reconciled); only the
+    // wire protocol differs. The rejection surfaces as 400 or 502 depending on how the
+    // h2c/HTTP-1.1 mismatch fails, so assert the rejection class rather than a single code.
+    let plain_host = format!("h2c-plain.{}.local", ns.name);
+    wait::wait_for_route_rejected(&h.gateway_http, &plain_host, "/", Duration::from_secs(60))
+        .await?;
+
     Ok(())
 }
 
