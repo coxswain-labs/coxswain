@@ -14,7 +14,7 @@ Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io
 | `BackendTLSPolicy` | `gateway.networking.k8s.io/v1` | Upstream TLS configuration referencing a CA `ConfigMap` or `Secret` |
 
 !!! warning "Not supported"
-    `TCPRoute`, `TLSRoute`, and `UDPRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected. The `RequestMirror` and `CORS` filters are skipped with a WARN log line.
+    `TCPRoute`, `TLSRoute`, and `UDPRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected. The `RequestMirror` filter is skipped with a WARN log line.
 
 ## GatewayClass
 
@@ -244,7 +244,7 @@ spec:
 | `RequestRedirect` | Supported (scheme, hostname, port, path, status code) |
 | `RequestMirror` | Not supported — skipped with a WARN log line |
 | `ExtensionRef` | Supported (for `RateLimit` and `PathRewriteRegex` Coxswain extensions) |
-| `CORS` | Not supported — skipped with a WARN log line |
+| `CORS` | Supported — GEP-1767 preflight short-circuit and response-header injection |
 
 ### Attaching to a Gateway
 
