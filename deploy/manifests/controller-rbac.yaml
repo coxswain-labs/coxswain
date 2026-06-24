@@ -68,7 +68,7 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
-      ["gatewayclasses", "httproutes", "referencegrants", "backendtlspolicies"]
+      ["gatewayclasses", "httproutes", "grpcroutes", "referencegrants", "backendtlspolicies"]
     verbs: ["get", "list", "watch"]
   # `gateways` has `patch` / `update` on the main resource (in addition to the
   # /status subresource) so the controller can manage a finalizer for
@@ -81,7 +81,7 @@ rules:
     verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
-      ["gatewayclasses/status", "gateways/status", "httproutes/status", "backendtlspolicies/status"]
+      ["gatewayclasses/status", "gateways/status", "httproutes/status", "grpcroutes/status", "backendtlspolicies/status"]
     verbs: ["patch", "update"]
   # Read CoxswainGatewayParameters so the provisioning operator (#207) can
   # resolve `parametersRef`s from Gateway and GatewayClass. No write verbs:

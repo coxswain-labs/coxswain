@@ -25,6 +25,32 @@ use coxswain_e2e::{
     harness::{http, wait},
 };
 use gateway_api::apis::standard::httproutes::HTTPRoute;
+
+// Minimal prost message types for the GrpcEcho conformance service.
+// Service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+// Derived by hand from grpcecho.proto — avoids a prost-build dependency.
+mod grpcecho {
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct EchoRequest {}
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct GrpcContext {
+        #[prost(string, tag = "4")]
+        pub pod: String,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct EchoAssertions {
+        #[prost(message, optional, tag = "4")]
+        pub context: Option<GrpcContext>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct EchoResponse {
+        #[prost(message, optional, tag = "1")]
+        pub assertions: Option<EchoAssertions>,
+    }
+}
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -1815,6 +1841,148 @@ async fn h1_client_unaffected_when_h2c_active() -> anyhow::Result<()> {
     // Standard HTTP/1.1 client — same path as all other routing tests.
     let resp = wait::wait_for_route(&h.gateway_http, &host, "/a", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// A GRPCRoute with an exact service+method match forwards the call to the
+/// correct backend and returns a successful gRPC response (`grpc-status: 0`).
+///
+/// Verifies that:
+/// - the proxy understands `GRPCRoute` and translates `method.type=Exact` to a
+///   path match on `/{service}/{method}`;
+/// - trailers (`grpc-status`) are forwarded transparently (Pingora h2 path);
+/// - the pod identity in the response confirms which backend served the call.
+#[tokio::test]
+async fn grpc_route_forwards_to_matched_service_method() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-grpc-exact-method").await?;
+
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_ROUTE_EXACT_METHOD, FixtureVars::new(&ns.name)).await?;
+
+    wait::wait_for_grpcroute_programmed(
+        &h.client,
+        "grpc-echo-route",
+        &ns.name,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let host = format!("grpc-echo.{}.local", ns.name);
+    let gw_addr = h.controller.gateway_http_addr;
+    let origin: tonic::transport::Uri = format!("http://{}:{}", host, gw_addr.port()).parse()?;
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))?.origin(origin);
+
+    // Poll until the data plane picks up the new route and the gRPC call succeeds.
+    let inner = wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("gRPC Echo call via {host} to succeed") },
+        || async {
+            let channel = endpoint.clone().connect().await.ok()?;
+            let mut client = tonic::client::Grpc::new(channel);
+            client.ready().await.ok()?;
+            let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo"
+                .parse::<tonic::codegen::http::uri::PathAndQuery>()
+                .ok()?;
+            let codec =
+                tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+            client
+                .unary(tonic::Request::new(grpcecho::EchoRequest {}), path, codec)
+                .await
+                .ok()
+                .map(tonic::Response::into_inner)
+        },
+    )
+    .await?;
+
+    let pod = inner
+        .assertions
+        .and_then(|a| a.context)
+        .map(|c| c.pod)
+        .unwrap_or_default();
+    assert!(
+        pod.starts_with("grpc-echo-"),
+        "response must come from grpc-echo-* pod, got {pod:?}"
+    );
+
+    Ok(())
+}
+
+/// A gRPC call to a method not covered by any GRPCRoute rule is not forwarded
+/// to the backend — the proxy returns an error response.
+///
+/// The GRPCRoute only matches `GrpcEcho/Echo`; a call to `GrpcEcho/EchoTwo`
+/// has no matching rule and must fail (the proxy returns a non-OK HTTP or gRPC
+/// status). Validates the GRPCRoute's match semantics: only the declared
+/// methods are admitted.
+#[tokio::test]
+async fn grpc_route_unmatched_method_is_not_served() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-grpc-unmatched").await?;
+
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_ROUTE_EXACT_METHOD, FixtureVars::new(&ns.name)).await?;
+
+    wait::wait_for_grpcroute_programmed(
+        &h.client,
+        "grpc-echo-route",
+        &ns.name,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let host = format!("grpc-echo.{}.local", ns.name);
+    let gw_addr = h.controller.gateway_http_addr;
+    let origin: tonic::transport::Uri = format!("http://{}:{}", host, gw_addr.port()).parse()?;
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))?.origin(origin);
+
+    // First confirm the happy path is live so we know the data plane is ready.
+    wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("gRPC Echo warm-up via {host} to succeed") },
+        || async {
+            let channel = endpoint.clone().connect().await.ok()?;
+            let mut client = tonic::client::Grpc::new(channel);
+            client.ready().await.ok()?;
+            let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo"
+                .parse::<tonic::codegen::http::uri::PathAndQuery>()
+                .ok()?;
+            let codec =
+                tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+            client
+                .unary(tonic::Request::new(grpcecho::EchoRequest {}), path, codec)
+                .await
+                .ok()
+                .map(|_| ())
+        },
+    )
+    .await?;
+
+    // Now call EchoTwo — not matched by any rule → must fail.
+    let channel = endpoint.connect().await.context("connect to gateway")?;
+    let mut client = tonic::client::Grpc::new(channel);
+    client
+        .ready()
+        .await
+        .map_err(|e| anyhow::anyhow!("gRPC channel not ready: {e}"))?;
+    let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/EchoTwo"
+        .parse::<tonic::codegen::http::uri::PathAndQuery>()?;
+    let codec = tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+    let result = client
+        .unary(tonic::Request::new(grpcecho::EchoRequest {}), path, codec)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "call to unmatched GrpcEcho/EchoTwo must fail, but got a successful response"
+    );
 
     Ok(())
 }

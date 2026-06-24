@@ -82,6 +82,16 @@ pub const DRAIN_ECHO: &str = concat!(
     "/fixtures/backends/drain_echo.yaml"
 );
 
+/// gRPC echo backend for GRPCRoute e2e tests (#33).
+///
+/// Runs `echo-basic` in `GRPC_ECHO_SERVER=1` mode, serving the
+/// `gateway_api_conformance.echo_basic.grpcecho.GrpcEcho` service on port 50051
+/// over h2c. Service declares `appProtocol: kubernetes.io/h2c`.
+pub const GRPC_ECHO: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/grpc_echo.yaml"
+);
+
 /// Standalone go-httpbin backend for circuit-breaker tests (#282).
 ///
 /// Exposes `/status/:code` so tests can drive configurable upstream HTTP

@@ -124,6 +124,7 @@ pub fn spawn_status_writer(
         "controller",
         &[
             "httproute",
+            "grpcroute",
             "ingress",
             "ingress_class",
             "ingress_class_parameters",
@@ -192,6 +193,7 @@ pub fn spawn_status_writer(
     );
 
     let route_health: SharedHttpRouteHealth = reconciler.route_health();
+    let grpc_route_health: SharedHttpRouteHealth = reconciler.grpc_route_health();
     let policy_health: SharedBackendTlsPolicyHealth = reconciler.policy_health();
 
     // Take the shared-informer subscriptions the reconciler created (it must
@@ -207,6 +209,7 @@ pub fn spawn_status_writer(
         StatusHealthChannels {
             tls: gateway_tls_health,
             route: route_health,
+            grpc_route: grpc_route_health,
             policy: policy_health,
         },
         subscriptions,

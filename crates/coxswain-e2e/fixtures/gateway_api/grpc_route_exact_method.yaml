@@ -1,0 +1,36 @@
+# Gateway + GRPCRoute: exact service+method match on GrpcEcho/Echo.
+# Used for GRPCRoute routing data-plane tests.
+#
+# The GRPCRoute matches only the Echo method of the GrpcEcho service; calls
+# to EchoTwo or EchoThree will not be routed to the backend and must fail.
+# Backend: grpc-echo Service port 50051, appProtocol kubernetes.io/h2c.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-echo-route
+spec:
+  hostnames:
+    - "grpc-echo.${TESTNS}.local"
+  parentRefs:
+    - name: coxswain-grpc-test
+  rules:
+    - matches:
+        - method:
+            type: Exact
+            service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+            method: Echo
+      backendRefs:
+        - name: grpc-echo
+          port: 50051

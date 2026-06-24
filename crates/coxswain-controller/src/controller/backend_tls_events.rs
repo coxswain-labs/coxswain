@@ -6,7 +6,7 @@
 use super::conditions::make_condition;
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::BackendTlsPolicy;
-use coxswain_reflector::gw_types::backendtlspolicies::{
+use coxswain_reflector::gw_types::v::backendtlspolicies::{
     BackendTlsPolicyStatusAncestors, BackendTlsPolicyStatusAncestorsAncestorRef,
 };
 use coxswain_reflector::tls::{BackendTlsPolicyHealth, BackendTlsPolicyHealthMap};

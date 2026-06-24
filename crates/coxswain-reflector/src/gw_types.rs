@@ -13,14 +13,10 @@ pub use gateway_api::apis::standard as v;
 #[cfg(feature = "experimental")]
 pub use gateway_api::apis::experimental as v;
 
-// `backendtlspolicies` is Core/v1 in Gateway API v1.5 and lives ONLY in the
-// `standard` channel — the experimental channel mirror does not include it.
-// Always alias from `standard` so `--features experimental` keeps building.
-pub use gateway_api::apis::standard::backendtlspolicies;
-
 // Project-canonical aliases: the codegen emits uppercase acronyms (`HTTPRoute`,
 // `BackendTLSPolicy`); we use PascalCase everywhere internally to satisfy
 // `upper_case_acronyms`. Keep the all-caps forms only in literal strings sent to
 // the Kubernetes API server.
-pub use backendtlspolicies::BackendTLSPolicy as BackendTlsPolicy;
+pub use v::backendtlspolicies::BackendTLSPolicy as BackendTlsPolicy;
+pub use v::grpcroutes::GRPCRoute as GrpcRoute;
 pub use v::httproutes::HTTPRoute as HttpRoute;
