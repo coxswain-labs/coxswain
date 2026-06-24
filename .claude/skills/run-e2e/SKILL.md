@@ -1,6 +1,6 @@
 ---
 name: run-e2e
-description: Reset the local Kubernetes cluster and run one or more of the coxswain by-plane e2e suites (routing, tls, traffic_policy, status_conditions, provisioning_rbac, resilience, observability, conformance) against it. Use when the user wants to validate a change against a live cluster — for example "run e2e", "test e2e", "run conformance", or "run the full e2e suite". Asks which suites to run; auto-detects the local cluster type (caches the reset command in memory after first use); reports a clean summary; offers to debug on failure. Requires cargo-nextest: install with `cargo install cargo-nextest` if absent.
+description: Reset the local Kubernetes cluster and run one or more of the coxswain by-plane e2e suites (routing, tls, traffic_policy, status_conditions, provisioning, resilience, observability, discovery, conformance) against it. Use when the user wants to validate a change against a live cluster — for example "run e2e", "test e2e", "run conformance", or "run the full e2e suite". Asks which suites to run; auto-detects the local cluster type (caches the reset command in memory after first use); reports a clean summary; offers to debug on failure. Requires cargo-nextest: install with `cargo install cargo-nextest` if absent.
 ---
 
 Run one or more of the project's e2e suites against a freshly-reset local Kubernetes cluster. Follow these steps in order.
@@ -15,8 +15,9 @@ Suites are organized by **behavior plane** (see each `tests/*.rs` header). `secu
 - **tls** — data-plane: SNI termination, cert rotation/fallback, cert-manager, BackendTLSPolicy, PROXY protocol, h2c, WebSocket (Ingress + Gateway API). `two-pass run (see step 4) on `binary(tls)``
 - **traffic_policy** — data-plane: per-route/backend knobs (currently the connect-retry annotation; v0.3 knobs land here). `two-pass run (see step 4) on `binary(traffic_policy)``
 - **status_conditions** — control-plane: Ingress LB status, Gateway Accepted/Programmed/observedGeneration, GatewayClass features, dedicated-mode (#211) status writer. `two-pass run (see step 4) on `binary(status_conditions)``
-- **provisioning_rbac** — control-plane: dedicated-proxy provisioning + GC, per-namespace + cluster-wide RBAC, ReferenceGrant, dedicated traffic, and the read-only-proxy SA audit. `two-pass run (see step 4) on `binary(provisioning_rbac)``
+- **provisioning** — control-plane: dedicated-proxy provisioning + GC, `CoxswainGatewayParameters` field rendering, ReferenceGrant-gated cross-namespace backends, dedicated traffic, and per-proxy scope isolation. `two-pass run (see step 4) on `binary(provisioning)``
 - **resilience** — control-plane (serial): in-flight listener add/remove under load, crash-loop shared-pool fallback, controller-restart idempotency, mode migration. `two-pass run (see step 4) on `binary(resilience)``
+- **discovery** — control-plane (serial): SPIFFE trust-domain auth rejection, convergence/readiness lifecycle, reconnect after controller restart, SA-token bootstrap (zero-cert happy path + wrong-audience reject), and the read-only-proxy SA audit. `two-pass run (see step 4) on `binary(discovery)``
 - **observability** — cross-cutting: readiness/status (formerly `health.rs`), the `coxswain_proxy_*` / `coxswain_controller_*` Prometheus surface, the access-log contract, the problems aggregate, and the routing admin endpoints. `two-pass run (see step 4) on `binary(observability)``
 - **conformance** — Gateway API Go conformance suite. Unlike the Cargo suites, conformance is NOT auto-bootstrapped — it needs the production multi-stage `Dockerfile` and conformance-specific Helm overrides. Use `scripts/setup-conformance.sh` to prepare the cluster, then `go test` runs against the deployed cluster. Setup is ~3–5 min on macOS (BoringSSL build); the test itself is ~2 min.
 
@@ -45,7 +46,7 @@ For each reset: briefly tell the user one line ("Resetting <type> cluster with `
 
 ## 3 — Bootstrap
 
-**All Cargo suites** (routing, tls, traffic_policy, status_conditions, provisioning_rbac, resilience, observability) bootstrap the cluster themselves via `coxswain-e2e`'s harness — no manual cluster setup. The bootstrap:
+**All Cargo suites** (routing, tls, traffic_policy, status_conditions, provisioning, resilience, observability, discovery) bootstrap the cluster themselves via `coxswain-e2e`'s harness — no manual cluster setup. The bootstrap:
 1. Detects cluster type (OrbStack vs kind).
 2. Builds the `coxswain:e2e` Docker image. **On Linux CI runners**: `Dockerfile.e2e` — a 2-line COPY-only image wrapping the already-compiled binary (~5 s). **On macOS (or any non-Linux host)**: the production multi-stage `Dockerfile`, because the host produces Mach-O binaries that won't run in Linux containers. First macOS build is ~5–10 min for BoringSSL; cached afterwards. The harness picks the right Dockerfile at compile time via `cfg!(target_os = "linux")`.
 3. For kind: `kind load docker-image` + starts cloud-provider-kind if not running.
@@ -57,7 +58,7 @@ The bootstrap builds the Docker image automatically (using the production multi-
 
 ## 4 — Run each chosen suite
 
-**routing / tls / traffic_policy / status_conditions / provisioning_rbac / resilience / observability**:
+**routing / tls / traffic_policy / status_conditions / provisioning / resilience / observability / discovery**:
 
 Each suite runs as **two passes** — a parallel pass, then a serial pass — both filtered by `binary(<suite>)`:
 

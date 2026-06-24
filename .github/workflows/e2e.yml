@@ -170,8 +170,8 @@ jobs:
             test: traffic_policy
           - suite: status-conditions
             test: status_conditions
-          - suite: provisioning-rbac
-            test: provisioning_rbac
+          - suite: provisioning
+            test: provisioning
           - suite: resilience
             test: resilience
           - suite: observability
@@ -283,7 +283,7 @@ jobs:
           - suite: security
           - suite: traffic-policy
           - suite: status-conditions
-          - suite: provisioning-rbac
+          - suite: provisioning
           - suite: resilience
           - suite: observability
           - suite: discovery
