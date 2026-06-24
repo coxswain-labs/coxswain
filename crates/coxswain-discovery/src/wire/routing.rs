@@ -44,12 +44,12 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, BasicCredential, CircuitBreakerConfig, CompressionConfig,
-    ExtAuthConfig, ExtAuthTransport, FilterAction, ForwardedForConfig, GatewayRoutingTable,
-    HashSource, HeaderMod, HeaderPredicate, HostPattern, HostRouter, HostRouterBuilder,
-    HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable, LoadBalance, MatchPredicates,
-    NormalizeLevel, PasswordHash, PathModifier, PortRoutingTable, QueryPredicate, RateLimitConfig,
-    RateLimitKey, RouteEntry, RouteKind, RouteTimeouts, RouterError, SessionAffinity, UpstreamCa,
-    UpstreamTls, ValueMatch, WildcardKind,
+    CorsConfig, CorsOrigin, ExtAuthConfig, ExtAuthTransport, FilterAction, ForwardedForConfig,
+    GatewayRoutingTable, HashSource, HeaderMod, HeaderPredicate, HostPattern, HostRouter,
+    HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable, LoadBalance,
+    MatchPredicates, NormalizeLevel, PasswordHash, PathModifier, PortRoutingTable, QueryPredicate,
+    RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts, RouterError,
+    SessionAffinity, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
 };
 
 use crate::error::WireError;
@@ -355,6 +355,7 @@ fn filter_to_wire(f: &FilterAction, depth: usize) -> p::FilterAction {
                 depth.saturating_add(1),
             ))
         }
+        FilterAction::Cors(cfg) => p::filter_action::Action::Cors(cors_config_to_wire(cfg)),
         _ => unreachable!(
             "invariant: all FilterAction variants handled; update wire.rs when adding new variants"
         ),
@@ -993,6 +994,9 @@ fn filter_from_wire(dto: &p::FilterAction, depth: usize) -> Result<FilterAction,
             let backend = Arc::new(bg_from_wire(bg_dto, depth + 1)?);
             Ok(FilterAction::Mirror { backend })
         }
+        p::filter_action::Action::Cors(cors_dto) => Ok(FilterAction::Cors(Arc::new(
+            cors_config_from_wire(cors_dto)?,
+        ))),
     }
 }
 
@@ -1020,6 +1024,75 @@ fn header_mod_from_wire(dto: &p::HeaderMod) -> Result<HeaderMod, WireError> {
                  add a new arm when the core type gains a variant"
         ),
     })
+}
+
+fn cors_config_to_wire(cfg: &CorsConfig) -> p::CorsFilter {
+    // Reconstruct origin strings from parsed CorsOrigin variants.
+    let allow_origins: Vec<String> = cfg
+        .allow_origins
+        .iter()
+        .map(|o| match o {
+            CorsOrigin::Exact(s) => s.clone(),
+            CorsOrigin::Wildcard { prefix, suffix } => format!("{}*{}", prefix, suffix),
+            _ => unreachable!(
+                "invariant: all CorsOrigin variants handled; update wire.rs when adding new variants"
+            ),
+        })
+        .collect();
+    // Pre-joined header values are sent as-is (the proxy re-parses into HeaderValue).
+    let header_str = |hv: &Option<http::HeaderValue>| -> Option<String> {
+        hv.as_ref()
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    p::CorsFilter {
+        allow_origins,
+        allow_all_origins: cfg.allow_all_origins,
+        allow_credentials: cfg.allow_credentials,
+        allow_methods: header_str(&cfg.allow_methods),
+        allow_headers: header_str(&cfg.allow_headers),
+        expose_headers: header_str(&cfg.expose_headers),
+        max_age: cfg.max_age.to_str().unwrap_or("5").parse().unwrap_or(5),
+    }
+}
+
+fn cors_config_from_wire(dto: &p::CorsFilter) -> Result<CorsConfig, WireError> {
+    use http::HeaderValue;
+
+    let mut allow_origins: Vec<CorsOrigin> = Vec::with_capacity(dto.allow_origins.len());
+    for origin in &dto.allow_origins {
+        if let Some(star_pos) = origin.find('*') {
+            let prefix = origin[..star_pos].to_ascii_lowercase().into_boxed_str();
+            let suffix = origin[star_pos + 1..].to_ascii_lowercase().into_boxed_str();
+            allow_origins.push(CorsOrigin::Wildcard { prefix, suffix });
+        } else {
+            allow_origins.push(CorsOrigin::Exact(origin.to_ascii_lowercase()));
+        }
+    }
+
+    let parse_header_opt = |s: &Option<String>| -> Result<Option<HeaderValue>, WireError> {
+        let Some(val) = s.as_deref() else {
+            return Ok(None);
+        };
+        if val.is_empty() {
+            return Ok(None);
+        }
+        HeaderValue::from_str(val)
+            .map(Some)
+            .map_err(WireError::InvalidHeaderValue)
+    };
+
+    let max_age = HeaderValue::from(dto.max_age);
+
+    Ok(CorsConfig::new(
+        allow_origins,
+        dto.allow_all_origins,
+        dto.allow_credentials,
+        parse_header_opt(&dto.allow_methods)?,
+        parse_header_opt(&dto.allow_headers)?,
+        parse_header_opt(&dto.expose_headers)?,
+        max_age,
+    ))
 }
 
 fn path_modifier_from_wire(dto: &p::PathModifier) -> Result<PathModifier, WireError> {
@@ -1972,5 +2045,123 @@ mod tests {
             dto2.encode_to_vec(),
             "repeated to_wire calls must produce identical bytes"
         );
+    }
+
+    // ── CORS filter round-trip ────────────────────────────────────────────────
+
+    #[test]
+    fn cors_filter_round_trips() {
+        use coxswain_core::routing::{CorsConfig, CorsOrigin};
+        use http::HeaderValue;
+
+        let cfg = CorsConfig::new(
+            vec![
+                CorsOrigin::Exact("https://allowed.example".to_string()),
+                CorsOrigin::Wildcard {
+                    prefix: "https://".into(),
+                    suffix: ".trusted.example".into(),
+                },
+            ],
+            false, // allow_all_origins
+            true,  // allow_credentials
+            Some(HeaderValue::from_static("GET, POST")),
+            Some(HeaderValue::from_static("Content-Type")),
+            Some(HeaderValue::from_static("X-Custom-Header")),
+            HeaderValue::from_static("3600"),
+        );
+        let filter = FilterAction::Cors(Arc::new(cfg));
+        let bg = simple_bg("ns/svc", &[addr("10.0.0.1:80")]);
+        let entry = Arc::new(RouteEntry::with_filters(
+            bg,
+            MatchPredicates::default(),
+            vec![filter],
+            RouteTimeouts::default(),
+            "cors-route".to_string(),
+            None,
+        ));
+
+        let mut b = GatewayRoutingTableBuilder::new();
+        b.for_port(80)
+            .exact_host("api.example.com")
+            .add_exact_route("/", entry);
+
+        let rt = rt_gateway(b);
+        let RouteOutcome::Found(m) = rt.find(80, "api.example.com", "/", &ctx()) else {
+            panic!("expected Found")
+        };
+        let FilterAction::Cors(cfg) = &m.filters[0] else {
+            panic!("expected FilterAction::Cors")
+        };
+
+        // Origins preserved
+        assert_eq!(cfg.allow_origins.len(), 2);
+        assert!(cfg.allow_origins[0].matches("https://allowed.example"));
+        assert!(!cfg.allow_origins[0].matches("https://other.example"));
+        assert!(cfg.allow_origins[1].matches("https://foo.trusted.example"));
+        assert!(!cfg.allow_origins[1].matches("https://foo.other.example"));
+        assert!(!cfg.allow_all_origins);
+        assert!(cfg.allow_credentials);
+
+        // Pre-rendered header values preserved
+        assert_eq!(cfg.allow_methods.as_ref().expect("methods"), "GET, POST");
+        assert_eq!(cfg.allow_headers.as_ref().expect("headers"), "Content-Type");
+        assert_eq!(
+            cfg.expose_headers.as_ref().expect("expose"),
+            "X-Custom-Header"
+        );
+        assert_eq!(cfg.max_age, "3600");
+
+        // Echo-origin logic works end-to-end
+        let hv = cfg
+            .resolve_origin("https://allowed.example")
+            .expect("should match");
+        assert_eq!(hv, "https://allowed.example");
+        assert!(cfg.resolve_origin("https://evil.example").is_none());
+    }
+
+    #[test]
+    fn cors_filter_allow_all_origins_round_trips() {
+        use coxswain_core::routing::CorsConfig;
+        use http::HeaderValue;
+
+        let cfg = CorsConfig::new(
+            vec![],
+            true,  // allow_all_origins (bare '*')
+            false, // allow_credentials
+            None,
+            None,
+            None,
+            HeaderValue::from_static("5"),
+        );
+        let filter = FilterAction::Cors(Arc::new(cfg));
+        let bg = simple_bg("ns/svc", &[addr("10.0.0.1:80")]);
+        let entry = Arc::new(RouteEntry::with_filters(
+            bg,
+            MatchPredicates::default(),
+            vec![filter],
+            RouteTimeouts::default(),
+            "cors-wildcard-route".to_string(),
+            None,
+        ));
+
+        let mut b = GatewayRoutingTableBuilder::new();
+        b.for_port(80)
+            .exact_host("api.example.com")
+            .add_exact_route("/", entry);
+
+        let rt = rt_gateway(b);
+        let RouteOutcome::Found(m) = rt.find(80, "api.example.com", "/", &ctx()) else {
+            panic!("expected Found")
+        };
+        let FilterAction::Cors(cfg) = &m.filters[0] else {
+            panic!("expected FilterAction::Cors")
+        };
+        assert!(cfg.allow_all_origins);
+        assert!(cfg.allow_origins.is_empty());
+        assert!(!cfg.allow_credentials);
+        let hv = cfg
+            .resolve_origin("https://any.example")
+            .expect("allow_all_origins should match anything");
+        assert_eq!(hv, "https://any.example");
     }
 }

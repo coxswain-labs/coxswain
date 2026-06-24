@@ -336,7 +336,20 @@ message FilterAction {
     RequestRedirect request_redirect = 3;
     UrlRewrite url_rewrite = 4;
     BackendGroup mirror = 5; // Mirror { backend }
+    CorsFilter cors = 6; // Cors(Arc<CorsConfig>)
   }
+}
+
+// Mirrors CorsConfig — from_wire parses these back into pre-rendered HeaderValues.
+message CorsFilter {
+  repeated string allow_origins = 1; // raw origin strings (may contain '*'); see CorsOrigin
+  bool allow_all_origins = 2;
+  bool allow_credentials = 3;
+  // Pre-joined header-value strings (e.g. "GET, POST").  Empty string means absent.
+  optional string allow_methods = 4;
+  optional string allow_headers = 5;
+  optional string expose_headers = 6;
+  int32 max_age = 7; // seconds; default 5
 }
 
 // Mirrors HeaderMod — raw strings; from_wire calls HeaderMod::parse.
