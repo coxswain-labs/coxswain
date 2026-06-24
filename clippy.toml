@@ -13,3 +13,7 @@ disallowed-types = [
     { path = "std::sync::Mutex", reason = "use parking_lot::Mutex — no poison, !Send guard catches lock-across-await at compile time" },
     { path = "std::sync::RwLock", reason = "use parking_lot::RwLock — no poison, !Send guard catches lock-across-await at compile time" },
 ]
+
+disallowed-methods = [
+    { path = "dashmap::DashMap::entry", reason = "DashMap::entry takes an exclusive write lock immediately. Use .get() first on the hot path." },
+]

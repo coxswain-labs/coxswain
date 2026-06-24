@@ -43,10 +43,9 @@ use bytes::Bytes;
 use coxswain_cache::ResponseCache;
 use coxswain_core::routing::{
     BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HashSource, RateLimitKey,
-    RequestContext, RetryOn, RouteTimeouts, SessionAffinity, UpstreamCa, affinity_hash,
-    affinity_hash_parts,
+    RequestContext, RetryOn, SessionAffinity, UpstreamCa, affinity_hash, affinity_hash_parts,
 };
-use coxswain_core::tls::{ClientCertConfigState, SharedClientCertStore};
+use coxswain_core::tls::ClientCertConfigState;
 use http::header;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use pingora_cache::key::{CacheKey, HashBinary};
@@ -120,10 +119,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
 /// `Error::explain(404, ...)` when no route matches the host or path.
 pub(crate) async fn request_filter<K>(
     engine: &RoutingEngine<K>,
-    default_timeouts: &RouteTimeouts,
-    rate_limiter: &crate::rate_limit::RateLimiterRegistry,
-    auth_client: &reqwest::Client,
-    client_certs: &SharedClientCertStore,
+    cfg: &crate::config::SharedProxyConfig,
     session: &mut Session,
     ctx: &mut ProxyCtx,
 ) -> Result<bool> {
@@ -195,7 +191,7 @@ pub(crate) async fn request_filter<K>(
     // on the correct SNI, which will trigger the mTLS handshake. Plain-HTTP connections
     // (no ssl_digest) are exempt — the operator forces HTTPS via `ssl-redirect`.
     {
-        let cc_store = client_certs.load();
+        let cc_store = cfg.client_certs.load();
         if let Some(config_state) = cc_store.find_config(&host) {
             let ssl_digest = session
                 .as_downstream()
@@ -251,40 +247,36 @@ pub(crate) async fn request_filter<K>(
     // never consume a rate-limit slot) and before redirect (a rate-limited client
     // does not receive a redirect, preventing URL leakage). Fail-open on absent
     // client key (undeterminable IP or missing header) — matches nginx + Envoy.
-    if let Some(cfg) = m.rate_limit.as_deref() {
+    if let Some(rl_config) = m.rate_limit.as_deref() {
         let client_ip = ctx.client_ip;
         let client_key = {
             // Scope the immutable req borrow so it does not outlive the next mutable
             // session borrow (write_response_header below).
             let req = session.req_header();
-            let header_val = if let RateLimitKey::Header(name) = &cfg.key {
+            let header_val = if let RateLimitKey::Header(name) = &rl_config.key {
                 req.headers.get(name.as_ref()).and_then(|v| v.to_str().ok())
             } else {
                 None
             };
-            crate::rate_limit::extract_client_key(cfg, client_ip, header_val)
+            crate::rate_limit::extract_client_key(rl_config, client_ip, header_val)
         };
-        if let Some(key) = client_key {
-            use crate::rate_limit::CheckOutcome;
-            if let CheckOutcome::Limited { retry_after_secs } =
-                rate_limiter.check(&m.metric_route_id, cfg, key)
-            {
-                let mut resp = ResponseHeader::build(429, Some(1))?;
-                // Render the u16 Retry-After into a stack buffer — matches the
-                // file's itoa label discipline, no heap allocation (#397).
-                let mut retry_after_buf = itoa::Buffer::new();
-                resp.insert_header(
-                    header::RETRY_AFTER,
-                    retry_after_buf.format(retry_after_secs),
-                )?;
-                session
-                    .write_response_header(Box::new(resp), true)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::error!("failed to write rate-limit response: {e}")
-                    });
-                return Ok(true);
-            }
+        if let Some(key) = client_key
+            && let crate::rate_limit::CheckOutcome::Limited { retry_after_secs } =
+                cfg.rate_limiter.check(&m.metric_route_id, rl_config, key)
+        {
+            let mut resp = ResponseHeader::build(429, Some(1))?;
+            // Render the u16 Retry-After into a stack buffer — matches the
+            // file's itoa label discipline, no heap allocation (#397).
+            let mut retry_after_buf = itoa::Buffer::new();
+            resp.insert_header(
+                header::RETRY_AFTER,
+                retry_after_buf.format(retry_after_secs),
+            )?;
+            session
+                .write_response_header(Box::new(resp), true)
+                .await
+                .unwrap_or_else(|e| tracing::error!("failed to write rate-limit response: {e}"));
+            return Ok(true);
         }
     }
 
@@ -293,12 +285,18 @@ pub(crate) async fn request_filter<K>(
     // unauthenticated client must not receive a redirect leaking the canonical
     // URL). `enforce()` writes a denial response and returns `Ok(true)`.
     if let Some(auth) = m.auth.as_deref()
-        && crate::auth::enforce(auth_client, auth, session, &mut ctx.auth_response_headers).await?
+        && crate::auth::enforce(
+            &cfg.auth_client,
+            auth,
+            session,
+            &mut ctx.auth_response_headers,
+        )
+        .await?
     {
         return Ok(true);
     }
 
-    let timeouts = merge_timeouts(&m.timeouts, default_timeouts);
+    let timeouts = merge_timeouts(&m.timeouts, &cfg.default_timeouts);
     ctx.request_deadline = timeouts.request.map(|d| Instant::now() + d);
 
     if try_redirect(
@@ -379,7 +377,7 @@ pub(crate) async fn request_filter<K>(
 
     if let Some(mirror_backend) = mirror_backend {
         let method;
-        let headers: Vec<(String, String)>;
+        let headers: Vec<(http::header::HeaderName, http::header::HeaderValue)>;
         {
             // Re-borrow req_header to capture method + forwardable headers.
             // The mutable session borrows above (auth, rate-limit, redirect) have already
@@ -397,10 +395,7 @@ pub(crate) async fn request_filter<K>(
                     {
                         return None;
                     }
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|v| (name.to_string(), v.to_string()))
+                    Some((name.clone(), value.clone()))
                 })
                 .collect();
         } // req borrow released
@@ -420,7 +415,13 @@ pub(crate) async fn request_filter<K>(
         // Reuse the captured `Arc<str>` when there is no query to append — only the
         // query arm allocates (#397).
         let path_and_query: Arc<str> = match query.as_deref() {
-            Some(q) => Arc::from(format!("{original_path}?{q}")),
+            Some(q) => {
+                let mut pq = String::with_capacity(original_path.len() + 1 + q.len());
+                pq.push_str(&original_path);
+                pq.push('?');
+                pq.push_str(q);
+                Arc::from(pq)
+            }
             None => Arc::clone(&original_path),
         };
 
@@ -435,7 +436,12 @@ pub(crate) async fn request_filter<K>(
         if ctx.max_body_size.is_none() {
             // Header-only mode: no body will be buffered; dispatch now.
             // Covers bodyless methods (GET, HEAD) and routes without max-body-size.
-            spawn_mirror_dispatch(dispatch, auth_client.clone(), Bytes::new());
+            spawn_mirror_dispatch(
+                dispatch,
+                cfg.auth_client.clone(),
+                Bytes::new(),
+                &cfg.mirror_tracker,
+            );
         } else {
             // Body-buffering mode: stash the dispatch; request_body_filter accumulates
             // chunks and dispatches on end_of_stream.
@@ -768,7 +774,7 @@ pub(crate) fn record_cache_miss(ctx: &ProxyCtx) {
 pub(crate) fn request_body_filter(
     body: Option<&Bytes>,
     end_of_stream: bool,
-    auth_client: &reqwest::Client,
+    cfg: &crate::config::SharedProxyConfig,
     ctx: &mut ProxyCtx,
 ) -> Result<()> {
     // ── Body size enforcement (unchanged) ────────────────────────────────────
@@ -804,7 +810,12 @@ pub(crate) fn request_body_filter(
                     }
                     buf.freeze()
                 };
-                spawn_mirror_dispatch(dispatch, auth_client.clone(), body_bytes);
+                spawn_mirror_dispatch(
+                    dispatch,
+                    cfg.auth_client.clone(),
+                    body_bytes,
+                    &cfg.mirror_tracker,
+                );
             }
         }
     }
@@ -825,8 +836,13 @@ pub(crate) fn request_body_filter(
 /// 6. Emits `WARN` on connect/send errors or timeout and drops the mirror.
 ///
 /// The spawned task owns all its data; no session or primary-path state is borrowed.
-fn spawn_mirror_dispatch(dispatch: MirrorDispatch, client: reqwest::Client, body: Bytes) {
-    tokio::spawn(async move {
+fn spawn_mirror_dispatch(
+    dispatch: MirrorDispatch,
+    client: reqwest::Client,
+    body: Bytes,
+    tracker: &tokio_util::task::TaskTracker,
+) {
+    tracker.spawn(async move {
         let Some((addr, _)) = dispatch.backend.next_endpoint_with_filters() else {
             tracing::warn!(
                 host = %dispatch.host,
@@ -840,7 +856,9 @@ fn spawn_mirror_dispatch(dispatch: MirrorDispatch, client: reqwest::Client, body
             _ => "http",
         };
 
-        let url = format!("{scheme}://{addr}{}", dispatch.path_and_query);
+        use std::fmt::Write;
+        let mut url = String::with_capacity(scheme.len() + 3 + 45 + dispatch.path_and_query.len());
+        let _ = write!(&mut url, "{}://{}{}", scheme, addr, dispatch.path_and_query);
 
         let mut builder = client.request(dispatch.method.clone(), &url).body(body);
 
@@ -848,7 +866,7 @@ fn spawn_mirror_dispatch(dispatch: MirrorDispatch, client: reqwest::Client, body
         builder = builder.header(reqwest::header::HOST, dispatch.host.as_ref());
 
         for (name, value) in &dispatch.headers {
-            builder = builder.header(name.as_str(), value.as_str());
+            builder = builder.header(name, value);
         }
 
         const MIRROR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1113,7 +1131,13 @@ pub(crate) async fn upstream_request_filter(
     // see the correct base path and the upstream receives the normalized form.
     if !original_path.is_empty() && upstream_request.uri.path() != original_path {
         let pq = match upstream_request.uri.query() {
-            Some(q) => format!("{original_path}?{q}"),
+            Some(q) => {
+                let mut pq = String::with_capacity(original_path.len() + 1 + q.len());
+                pq.push_str(original_path);
+                pq.push('?');
+                pq.push_str(q);
+                pq
+            }
             None => original_path.to_string(),
         };
         if let Ok(uri) = http::Uri::builder().path_and_query(pq.as_str()).build() {
@@ -1358,6 +1382,7 @@ fn maybe_setup_compression(
         // Safety: choose_algorithm only returns Gzip or Brotli.
         _ => return,
     };
+
     // Vary: extend the existing value rather than clobber it.
     let vary = resp
         .headers

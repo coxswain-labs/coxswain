@@ -42,8 +42,6 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use coxswain_core::listener_health::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome};
-use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, BasicCredential, CircuitBreakerConfig, CompressionConfig,
     ExtAuthConfig, ExtAuthTransport, FilterAction, ForwardedForConfig, GatewayRoutingTable,
@@ -53,14 +51,9 @@ use coxswain_core::routing::{
     RateLimitKey, RouteEntry, RouteKind, RouteTimeouts, RouterError, SessionAffinity, UpstreamCa,
     UpstreamTls, ValueMatch, WildcardKind,
 };
-use coxswain_core::tls::{
-    ClientCertConfig, ClientCertConfigState, ClientCertStore, ClientCertStoreBuilder, TlsCert,
-    TlsStore, TlsStoreBuilder,
-};
 
 use crate::error::WireError;
 use crate::proto::v1 as p;
-use crate::subscription::Scope;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -631,175 +624,6 @@ fn protocol_to_wire(proto: BackendProtocol) -> p::BackendProtocol {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// TLS store: to_wire
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Serialise a [`TlsStore`] to its wire DTO.
-#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn tls_to_wire(store: &TlsStore) -> p::TlsStore {
-    let mut exact_entries: Vec<(&str, Arc<TlsCert>)> = store
-        .iter_exact()
-        .map(|(h, c)| (h, Arc::clone(c)))
-        .collect();
-    exact_entries.sort_by_key(|(h, _)| *h);
-
-    let mut wildcard_entries: Vec<(&str, Arc<TlsCert>)> = store
-        .iter_wildcard()
-        .map(|(s, c)| (s, Arc::clone(c)))
-        .collect();
-    wildcard_entries.sort_by_key(|(s, _)| *s);
-
-    p::TlsStore {
-        exact: exact_entries
-            .into_iter()
-            .map(|(h, c)| p::TlsCertEntry {
-                host_pattern: h.to_string(),
-                cert: Some(tls_cert_to_wire(&c)),
-            })
-            .collect(),
-        wildcard: wildcard_entries
-            .into_iter()
-            .map(|(s, c)| p::TlsCertEntry {
-                host_pattern: s.to_string(),
-                cert: Some(tls_cert_to_wire(&c)),
-            })
-            .collect(),
-        default: store.default_cert().map(|c| tls_cert_to_wire(c)),
-    }
-}
-
-fn tls_cert_to_wire(c: &TlsCert) -> p::TlsCert {
-    p::TlsCert {
-        cert_pem: c.cert_pem.clone(),
-        key_pem: c.key_pem.clone(),
-        source: c.source.clone(),
-        not_after_unix_secs: c
-            .not_after
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())),
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Client-cert store: to_wire
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Serialise a [`ClientCertStore`] to its wire DTO.
-#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn client_cert_to_wire(store: &ClientCertStore) -> p::ClientCertStore {
-    let mut exact_entries: Vec<(&str, Arc<ClientCertConfigState>)> = store
-        .iter_exact()
-        .map(|(h, s)| (h, Arc::clone(s)))
-        .collect();
-    exact_entries.sort_by_key(|(h, _)| *h);
-
-    let mut wildcard_entries: Vec<(&str, Arc<ClientCertConfigState>)> = store
-        .iter_wildcard()
-        .map(|(s, cfg)| (s, Arc::clone(cfg)))
-        .collect();
-    wildcard_entries.sort_by_key(|(s, _)| *s);
-
-    p::ClientCertStore {
-        exact: exact_entries
-            .into_iter()
-            .map(|(h, s)| p::ClientCertEntry {
-                host_pattern: h.to_string(),
-                state: Some(client_cert_state_to_wire(&s)),
-            })
-            .collect(),
-        wildcard: wildcard_entries
-            .into_iter()
-            .map(|(s, cfg)| p::ClientCertEntry {
-                host_pattern: s.to_string(),
-                state: Some(client_cert_state_to_wire(&cfg)),
-            })
-            .collect(),
-        default: store.default_state().map(|s| client_cert_state_to_wire(s)),
-    }
-}
-
-fn client_cert_state_to_wire(s: &ClientCertConfigState) -> p::ClientCertConfigState {
-    let kind = match s {
-        ClientCertConfigState::Config(cfg) => {
-            p::client_cert_config_state::Kind::Config(p::ClientCertConfig {
-                ca_pem: cfg.ca_pem.clone(),
-                verify_depth: cfg.verify_depth,
-                pass_to_upstream: cfg.pass_to_upstream,
-            })
-        }
-        ClientCertConfigState::Unavailable => p::client_cert_config_state::Kind::Unavailable(true),
-        &_ => unreachable!(
-            "invariant: all ClientCertConfigState variants handled; \
-             add a new arm when the core type gains a variant"
-        ),
-    };
-    p::ClientCertConfigState { kind: Some(kind) }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Listener health: to_wire
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Serialise a map of `ObjectKey → GatewayListenerHealth` to its wire DTO.
-///
-/// Entries are sorted by `ObjectKey` string representation for hash determinism.
-#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn listener_health_to_wire(
-    map: &std::collections::HashMap<ObjectKey, GatewayListenerHealth>,
-) -> p::GatewayListenerHealth {
-    let mut entries: Vec<(&ObjectKey, &GatewayListenerHealth)> = map.iter().collect();
-    entries.sort_by_key(|(k, _)| k.to_string());
-
-    p::GatewayListenerHealth {
-        entries: entries
-            .into_iter()
-            .map(|(key, health)| p::GatewayHealthEntry {
-                object_key: key.to_string(),
-                health: Some(p::ListenerHealth {
-                    // BTreeMap<String, ListenerInfo> is already sorted by key.
-                    listeners: health
-                        .listeners
-                        .iter()
-                        .map(|(name, info)| p::ListenerInfoEntry {
-                            name: name.clone(),
-                            info: Some(listener_info_to_wire(info)),
-                        })
-                        .collect(),
-                }),
-            })
-            .collect(),
-    }
-}
-
-fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
-    let (outcome, message) = match &info.tls_outcome {
-        ListenerTlsOutcome::NotApplicable => (p::ListenerTlsOutcome::NotApplicable, String::new()),
-        ListenerTlsOutcome::Resolved => (p::ListenerTlsOutcome::Resolved, String::new()),
-        ListenerTlsOutcome::RefNotPermitted { message } => {
-            (p::ListenerTlsOutcome::RefNotPermitted, message.clone())
-        }
-        ListenerTlsOutcome::InvalidCertificateRef { message } => (
-            p::ListenerTlsOutcome::InvalidCertificateRef,
-            message.clone(),
-        ),
-        ListenerTlsOutcome::Invalid { message } => {
-            (p::ListenerTlsOutcome::Invalid, message.clone())
-        }
-        &_ => unreachable!(
-            "invariant: all ListenerTlsOutcome variants handled; \
-             add a new arm when the core type gains a variant"
-        ),
-    };
-    p::ListenerInfo {
-        tls_outcome: outcome as i32,
-        tls_message: message,
-        attached_routes: info.attached_routes,
-        hostname: info.hostname.clone(),
-        allows_all_namespaces: info.allows_all_namespaces,
-        port: u32::from(info.port),
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
 // Routing table: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -992,7 +816,7 @@ fn build_route_entry(dto: &p::RouteEntry) -> Result<RouteEntry, WireError> {
 // BackendGroup: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-fn bg_from_wire(dto: &p::BackendGroup, depth: usize) -> Result<BackendGroup, WireError> {
+pub(crate) fn bg_from_wire(dto: &p::BackendGroup, depth: usize) -> Result<BackendGroup, WireError> {
     if depth > MAX_MIRROR_DEPTH {
         return Err(WireError::MirrorTooDeep {
             limit: MAX_MIRROR_DEPTH,
@@ -1299,7 +1123,7 @@ fn duration_from_wire(dto: &p::Duration) -> Duration {
 // Per-route config: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-fn rate_limit_from_wire(dto: &p::RateLimitConfig) -> Result<RateLimitConfig, WireError> {
+pub(crate) fn rate_limit_from_wire(dto: &p::RateLimitConfig) -> Result<RateLimitConfig, WireError> {
     let rps = NonZeroU32::new(dto.requests_per_second).ok_or(WireError::ZeroRps)?;
     let key = dto
         .key
@@ -1468,243 +1292,22 @@ fn protocol_from_wire(v: i32) -> Result<BackendProtocol, WireError> {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// TLS store: from_wire
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Reconstruct a [`TlsStore`] from its wire DTO.
-///
-/// # Errors
-///
-/// Returns [`WireError`] if any required field is missing.
-#[must_use = "the rebuilt TLS store must be stored for the proxy to use it"]
-pub fn tls_from_wire(dto: &p::TlsStore) -> Result<TlsStore, WireError> {
-    let mut builder = TlsStoreBuilder::new();
-    for entry in &dto.exact {
-        let cert = cert_from_wire(entry.cert.as_ref().ok_or(WireError::MissingRequiredField {
-            field: "tls_cert_entry.cert",
-        })?);
-        builder.add_cert(&entry.host_pattern, Arc::new(cert));
-    }
-    for entry in &dto.wildcard {
-        let cert = cert_from_wire(entry.cert.as_ref().ok_or(WireError::MissingRequiredField {
-            field: "tls_cert_entry.cert",
-        })?);
-        // Wildcard entries store the suffix; add_cert expects "*.{suffix}".
-        let pattern = format!("*.{}", entry.host_pattern);
-        builder.add_cert(&pattern, Arc::new(cert));
-    }
-    if let Some(default_dto) = &dto.default {
-        let cert = cert_from_wire(default_dto);
-        // Empty pattern → default bucket in add_cert.
-        builder.add_cert("", Arc::new(cert));
-    }
-    Ok(builder.build())
-}
-
-fn cert_from_wire(dto: &p::TlsCert) -> TlsCert {
-    let not_after = dto
-        .not_after_unix_secs
-        .map(|s| UNIX_EPOCH + Duration::from_secs(s));
-    TlsCert::new(
-        dto.cert_pem.clone(),
-        dto.key_pem.clone(),
-        dto.source.clone(),
-    )
-    .with_not_after(not_after)
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Client-cert store: from_wire
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Reconstruct a [`ClientCertStore`] from its wire DTO.
-///
-/// # Errors
-///
-/// Returns [`WireError`] if any required field is missing.
-#[must_use = "the rebuilt client-cert store must be stored for the proxy to use it"]
-pub fn client_cert_from_wire(dto: &p::ClientCertStore) -> Result<ClientCertStore, WireError> {
-    let mut builder = ClientCertStoreBuilder::new();
-    for entry in &dto.exact {
-        let state = client_cert_state_from_wire(entry.state.as_ref().ok_or(
-            WireError::MissingRequiredField {
-                field: "client_cert_entry.state",
-            },
-        )?);
-        builder.add_config(&entry.host_pattern, Arc::new(state));
-    }
-    for entry in &dto.wildcard {
-        let state = client_cert_state_from_wire(entry.state.as_ref().ok_or(
-            WireError::MissingRequiredField {
-                field: "client_cert_entry.state",
-            },
-        )?);
-        let pattern = format!("*.{}", entry.host_pattern);
-        builder.add_config(&pattern, Arc::new(state));
-    }
-    if let Some(default_dto) = &dto.default {
-        let state = client_cert_state_from_wire(default_dto);
-        builder.add_config("", Arc::new(state));
-    }
-    Ok(builder.build())
-}
-
-fn client_cert_state_from_wire(dto: &p::ClientCertConfigState) -> ClientCertConfigState {
-    match &dto.kind {
-        Some(p::client_cert_config_state::Kind::Config(cfg)) => ClientCertConfigState::Config(
-            ClientCertConfig::new(cfg.ca_pem.clone(), cfg.verify_depth, cfg.pass_to_upstream),
-        ),
-        Some(p::client_cert_config_state::Kind::Unavailable(_)) | None => {
-            ClientCertConfigState::Unavailable
-        }
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Listener health: from_wire
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Reconstruct a `HashMap<ObjectKey, GatewayListenerHealth>` from its wire DTO.
-///
-/// # Errors
-///
-/// Returns [`WireError`] if any required field is missing.
-#[must_use = "the rebuilt listener-health map must be stored for the proxy to use it"]
-pub fn listener_health_from_wire(
-    dto: &p::GatewayListenerHealth,
-) -> Result<std::collections::HashMap<ObjectKey, GatewayListenerHealth>, WireError> {
-    dto.entries
-        .iter()
-        .map(|e| {
-            let key =
-                e.object_key
-                    .parse::<ObjectKey>()
-                    .map_err(|_| WireError::MissingRequiredField {
-                        field: "gateway_health_entry.object_key",
-                    })?;
-            let health_dto = e.health.as_ref().ok_or(WireError::MissingRequiredField {
-                field: "gateway_health_entry.health",
-            })?;
-            let health = listener_health_from_dto(health_dto)?;
-            Ok((key, health))
-        })
-        .collect()
-}
-
-fn listener_health_from_dto(dto: &p::ListenerHealth) -> Result<GatewayListenerHealth, WireError> {
-    let mut glh = GatewayListenerHealth::default();
-    for entry in &dto.listeners {
-        let info = entry.info.as_ref().ok_or(WireError::MissingRequiredField {
-            field: "listener_info_entry.info",
-        })?;
-        let li = listener_info_from_wire(info)?;
-        glh.listeners.insert(entry.name.clone(), li);
-    }
-    Ok(glh)
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Scope: to_wire / from_wire
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Serialise a [`Scope`] to its wire DTO.
-///
-/// `SharedPool` → `shared_pool` oneof arm; `Gateway` → `gateway` arm.
-/// Infallible: every variant has a canonical encoding.
-#[must_use = "wire DTO must be embedded in a Subscribe to reach the server"]
-pub fn scope_to_wire(scope: &Scope) -> p::Scope {
-    let kind = match scope {
-        Scope::SharedPool => p::scope::Kind::SharedPool(p::SharedPoolScope {}),
-        Scope::Gateway { name, namespace } => p::scope::Kind::Gateway(p::GatewayScope {
-            namespace: namespace.clone(),
-            name: name.clone(),
-        }),
-    };
-    p::Scope { kind: Some(kind) }
-}
-
-/// Deserialise a [`p::Scope`] proto DTO into a [`Scope`].
-///
-/// Returns `Err(WireError::MissingRequiredField)` when the `kind` discriminator
-/// is absent — a `Scope {}` with no oneof arm is malformed and must not be
-/// silently promoted to `SharedPool` (which would be a privilege escalation).
-///
-/// # Errors
-///
-/// Returns [`WireError::MissingRequiredField`] if `dto.kind` is `None`.
-#[must_use = "wire decode failure must be handled; discarding the error silently promotes to SharedPool"]
-pub fn scope_from_wire(dto: &p::Scope) -> Result<Scope, WireError> {
-    match &dto.kind {
-        Some(p::scope::Kind::SharedPool(_)) => Ok(Scope::SharedPool),
-        Some(p::scope::Kind::Gateway(g)) => Ok(Scope::Gateway {
-            name: g.name.clone(),
-            namespace: g.namespace.clone(),
-        }),
-        None => Err(WireError::MissingRequiredField {
-            field: "scope.kind",
-        }),
-    }
-}
-
-fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerInfo, WireError> {
-    let tls_outcome = match p::ListenerTlsOutcome::try_from(dto.tls_outcome)
-        .unwrap_or(p::ListenerTlsOutcome::Unspecified)
-    {
-        p::ListenerTlsOutcome::Unspecified | p::ListenerTlsOutcome::NotApplicable => {
-            ListenerTlsOutcome::NotApplicable
-        }
-        p::ListenerTlsOutcome::Resolved => ListenerTlsOutcome::Resolved,
-        p::ListenerTlsOutcome::RefNotPermitted => ListenerTlsOutcome::RefNotPermitted {
-            message: dto.tls_message.clone(),
-        },
-        p::ListenerTlsOutcome::InvalidCertificateRef => ListenerTlsOutcome::InvalidCertificateRef {
-            message: dto.tls_message.clone(),
-        },
-        p::ListenerTlsOutcome::Invalid => ListenerTlsOutcome::Invalid {
-            message: dto.tls_message.clone(),
-        },
-    };
-
-    let mut li = ListenerInfo::default();
-    li.tls_outcome = tls_outcome;
-    li.attached_routes = dto.attached_routes;
-    li.hostname = dto.hostname.clone();
-    li.allows_all_namespaces = dto.allows_all_namespaces;
-    li.port = dto.port as u16;
-    Ok(li)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::net::SocketAddr;
-    use std::num::NonZeroU32;
-
-    use coxswain_core::listener_health::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome};
-    use coxswain_core::ownership::ObjectKey;
-    use coxswain_core::routing::{
-        BackendGroup, CompressionConfig, FilterAction, GatewayRoutingTableBuilder,
-        IngressRoutingTableBuilder, MatchPredicates, NormalizeLevel, PathModifier, RateLimitConfig,
-        RateLimitKey, RequestContext, RouteEntry, RouteOutcome, RouteTimeouts, WildcardKind,
-    };
-    use coxswain_core::tls::{
-        ClientCertConfig, ClientCertConfigState, ClientCertStoreBuilder, TlsCert, TlsStoreBuilder,
-    };
-    use prost::Message as _;
+    use crate::wire::tests::*;
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    fn addr(s: &str) -> SocketAddr {
+    pub(super) fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap_or_else(|e| panic!("bad addr {s}: {e}"))
     }
 
-    fn simple_bg(name: &str, addrs: &[SocketAddr]) -> Arc<BackendGroup> {
+    pub(super) fn simple_bg(name: &str, addrs: &[SocketAddr]) -> Arc<BackendGroup> {
         Arc::new(BackendGroup::new(name.to_string(), addrs.to_vec()))
     }
 
-    fn simple_entry(bg: Arc<BackendGroup>) -> RouteEntry {
+    pub(super) fn simple_entry(bg: Arc<BackendGroup>) -> RouteEntry {
         RouteEntry::with_filters(
             bg,
             MatchPredicates::default(),
@@ -1715,11 +1318,11 @@ mod tests {
         )
     }
 
-    fn ctx() -> RequestContext<'static> {
+    pub(super) fn ctx() -> RequestContext<'static> {
         RequestContext::default()
     }
 
-    fn rt_ingress(
+    pub(super) fn rt_ingress(
         builder: IngressRoutingTableBuilder,
     ) -> coxswain_core::routing::IngressRoutingTable {
         let t = builder.build().expect("build");
@@ -1727,7 +1330,7 @@ mod tests {
         ingress_from_wire(&dto).expect("from_wire")
     }
 
-    fn rt_gateway(
+    pub(super) fn rt_gateway(
         builder: GatewayRoutingTableBuilder,
     ) -> coxswain_core::routing::GatewayRoutingTable {
         let t = builder.build().expect("build");
@@ -1854,70 +1457,6 @@ mod tests {
         assert_eq!(spec.weighted.len(), 2, "two backend groups");
         assert_eq!(spec.weighted[0].1, 4, "first group weight = 4 (pre-GCD)");
         assert_eq!(spec.weighted[1].1, 2, "second group weight = 2 (pre-GCD)");
-    }
-
-    // ── 5. TLS store exact + wildcard + default ───────────────────────────────
-
-    #[test]
-    fn tls_store_round_trips() {
-        fn cert(source: &str) -> Arc<TlsCert> {
-            Arc::new(TlsCert::new(
-                b"CERT".to_vec(),
-                b"KEY".to_vec(),
-                source.to_string(),
-            ))
-        }
-
-        let mut b = TlsStoreBuilder::new();
-        b.add_cert("exact.example.com", cert("exact"));
-        b.add_cert("*.example.com", cert("wildcard"));
-        b.add_cert("*", cert("default")); // "*" maps to the default fallback slot
-        let store = b.build();
-
-        let dto = tls_to_wire(&store);
-        let store2 = tls_from_wire(&dto).expect("from_wire");
-
-        assert!(store2.find_cert("exact.example.com").is_some(), "exact hit");
-        assert!(
-            store2.find_cert("sub.example.com").is_some(),
-            "wildcard hit"
-        );
-        assert!(
-            store2.find_cert("other.io").is_some(),
-            "default fallback hit"
-        );
-    }
-
-    // ── 6. mTLS Config + Unavailable ─────────────────────────────────────────
-
-    #[test]
-    fn client_cert_store_config_and_unavailable_round_trip() {
-        let cfg = Arc::new(ClientCertConfigState::Config(ClientCertConfig::new(
-            b"CA".to_vec(),
-            3,
-            true,
-        )));
-        let unavail = Arc::new(ClientCertConfigState::Unavailable);
-
-        let mut b = ClientCertStoreBuilder::new();
-        b.add_config("strict.example.com", cfg);
-        b.add_config("*.example.com", unavail);
-        let store = b.build();
-
-        let dto = client_cert_to_wire(&store);
-        let store2 = client_cert_from_wire(&dto).expect("from_wire");
-
-        match store2.find_config("strict.example.com").as_deref() {
-            Some(ClientCertConfigState::Config(c)) => {
-                assert_eq!(c.verify_depth, 3, "verify_depth preserved");
-                assert!(c.pass_to_upstream, "pass_to_upstream preserved");
-            }
-            other => panic!("expected Config, got {other:?}"),
-        }
-        match store2.find_config("sub.example.com").as_deref() {
-            Some(ClientCertConfigState::Unavailable) => {}
-            other => panic!("expected Unavailable, got {other:?}"),
-        }
     }
 
     // ── 7. Compression config ─────────────────────────────────────────────────
@@ -2432,88 +1971,6 @@ mod tests {
             dto1.encode_to_vec(),
             dto2.encode_to_vec(),
             "repeated to_wire calls must produce identical bytes"
-        );
-    }
-
-    // ── Listener health round-trip ────────────────────────────────────────────
-
-    #[test]
-    fn listener_health_round_trips() {
-        let mut map = std::collections::HashMap::new();
-        let mut health = GatewayListenerHealth::default();
-
-        let mut http_info = ListenerInfo::default();
-        http_info.tls_outcome = ListenerTlsOutcome::NotApplicable;
-        http_info.attached_routes = 3;
-        http_info.hostname = "example.com".to_string();
-        http_info.port = 80;
-        health.listeners.insert("http".to_string(), http_info);
-
-        let mut https_info = ListenerInfo::default();
-        https_info.tls_outcome = ListenerTlsOutcome::Resolved;
-        https_info.attached_routes = 5;
-        https_info.hostname = "example.com".to_string();
-        https_info.allows_all_namespaces = true;
-        https_info.port = 443;
-        health.listeners.insert("https".to_string(), https_info);
-
-        map.insert(ObjectKey::new("default", "my-gw"), health);
-
-        let dto = listener_health_to_wire(&map);
-        let map2 = listener_health_from_wire(&dto).expect("from_wire");
-
-        let h2 = map2
-            .get(&ObjectKey::new("default", "my-gw"))
-            .expect("key found");
-        assert_eq!(h2.listeners.len(), 2, "listener count preserved");
-        assert_eq!(
-            h2.listeners["http"].attached_routes, 3,
-            "attached_routes preserved"
-        );
-        assert!(
-            matches!(
-                h2.listeners["https"].tls_outcome,
-                ListenerTlsOutcome::Resolved
-            ),
-            "tls_outcome preserved"
-        );
-    }
-
-    // ── scope round-trips ────────────────────────────────────────────────────
-
-    #[test]
-    fn scope_shared_pool_round_trips() {
-        let scope = Scope::SharedPool;
-        let wire = scope_to_wire(&scope);
-        let back = scope_from_wire(&wire).expect("SharedPool round-trip");
-        assert_eq!(scope, back, "SharedPool round-trip");
-    }
-
-    #[test]
-    fn scope_gateway_round_trips() {
-        let scope = Scope::Gateway {
-            name: "my-gateway".to_owned(),
-            namespace: "production".to_owned(),
-        };
-        let wire = scope_to_wire(&scope);
-        let back = scope_from_wire(&wire).expect("Gateway round-trip");
-        assert_eq!(scope, back, "Gateway round-trip");
-    }
-
-    #[test]
-    fn scope_absent_kind_returns_error() {
-        // A `Scope {}` with no `kind` discriminator is malformed — promoting it to
-        // SharedPool would be a privilege escalation for a client that omits the field.
-        let wire = p::Scope { kind: None };
-        let err = scope_from_wire(&wire).expect_err("absent kind must be rejected");
-        assert!(
-            matches!(
-                err,
-                WireError::MissingRequiredField {
-                    field: "scope.kind"
-                }
-            ),
-            "expected MissingRequiredField(scope.kind), got {err:?}",
         );
     }
 }

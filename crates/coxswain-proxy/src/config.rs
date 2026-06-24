@@ -52,6 +52,8 @@ pub struct SharedProxyConfig {
     /// a `CircuitBreakerConfig` so the registry is only touched for Ingress routes
     /// that configure `circuit-breaker-threshold`.
     pub circuit_breakers: CircuitBreakerRegistry,
+    /// Tracker for fire-and-forget mirror tasks.
+    pub mirror_tracker: tokio_util::task::TaskTracker,
 }
 
 impl SharedProxyConfig {
@@ -76,6 +78,7 @@ impl SharedProxyConfig {
             auth_client,
             client_certs: SharedClientCertStore::new(),
             circuit_breakers: CircuitBreakerRegistry::new(),
+            mirror_tracker: tokio_util::task::TaskTracker::new(),
         }
     }
 }

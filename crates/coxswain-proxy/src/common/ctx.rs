@@ -107,7 +107,7 @@ pub(crate) struct MirrorDispatch {
     /// without a copy (#397); matches the sibling [`Self::host`].
     pub path_and_query: Arc<str>,
     /// Forwardable request headers (hop-by-hop stripped, `Host` excluded).
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(http::header::HeaderName, http::header::HeaderValue)>,
 }
 
 /// Per-request context carrying the real client address extracted from the PROXY header.

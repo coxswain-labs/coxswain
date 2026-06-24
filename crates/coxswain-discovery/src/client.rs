@@ -52,8 +52,7 @@ pub struct DiscoveryClientConfig {
     pub node_id: String,
     /// Subscription scope.
     ///
-    /// Reserved for v0.6 delta streaming; always serialised as an empty proto
-    /// `Scope {}` in v0.5 regardless of the variant.
+    /// Controls which endpoints and gateways are pushed by the controller.
     pub scope: Scope,
     /// HTTP/2 keep-alive ping interval (default: 30 s).
     pub http2_keep_alive_interval: Duration,
@@ -93,10 +92,10 @@ pub struct DiscoveryClientConfig {
 impl DiscoveryClientConfig {
     /// Construct with required fields; optional fields get their defaults.
     #[must_use]
-    pub fn new(endpoints: Vec<String>, node_id: String) -> Self {
+    pub fn new(endpoints: Vec<String>, node_id: impl Into<String>) -> Self {
         Self {
             endpoints,
-            node_id,
+            node_id: node_id.into(),
             scope: Scope::SharedPool,
             http2_keep_alive_interval: Duration::from_secs(30),
             keep_alive_timeout: Duration::from_secs(5),
@@ -661,10 +660,12 @@ fn build_channel(config: &DiscoveryClientConfig) -> Result<Channel, DiscoveryErr
 /// [`DiscoveryError::InvalidEndpoint`] for the first endpoint that fails to parse.
 fn validate_endpoints(endpoints: &[String]) -> Result<(), DiscoveryError> {
     for uri in endpoints {
-        Endpoint::from_shared(uri.clone()).map_err(|source| DiscoveryError::InvalidEndpoint {
-            uri: uri.clone(),
-            source,
-        })?;
+        if let Err(source) = Endpoint::from_shared(uri.clone()) {
+            return Err(DiscoveryError::InvalidEndpoint {
+                uri: uri.clone(),
+                source,
+            });
+        }
     }
     Ok(())
 }

@@ -46,11 +46,11 @@ pub struct BootstrapClientConfig {
     /// Filesystem path to the projected ServiceAccount token.
     ///
     /// Standard location: `/var/run/secrets/coxswain/discovery-token/token`.
-    pub sa_token_path: String,
+    pub sa_token_path: std::path::PathBuf,
     /// Filesystem path to the CA bundle from the trust-bundle ConfigMap.
     ///
     /// Standard location: `/var/run/secrets/coxswain/trust-bundle/ca.crt`.
-    pub ca_bundle_path: String,
+    pub ca_bundle_path: std::path::PathBuf,
     /// SPIFFE trust domain (e.g. `"cluster.local"`).
     pub trust_domain: String,
     /// Pod namespace; used to form the controller's expected SPIFFE ID.
@@ -66,8 +66,8 @@ impl BootstrapClientConfig {
     #[must_use]
     pub fn new(
         endpoint: impl Into<String>,
-        sa_token_path: impl Into<String>,
-        ca_bundle_path: impl Into<String>,
+        sa_token_path: impl Into<std::path::PathBuf>,
+        ca_bundle_path: impl Into<std::path::PathBuf>,
         trust_domain: impl Into<String>,
         controller_namespace: impl Into<String>,
     ) -> Self {
@@ -242,7 +242,7 @@ async fn do_bootstrap(
     let sa_token = match tokio::fs::read_to_string(&config.sa_token_path).await {
         Ok(t) => t.trim().to_owned(),
         Err(e) => {
-            warn!(error = %e, path = %config.sa_token_path, "bootstrap: failed to read SA token");
+            warn!(error = %e, path = %config.sa_token_path.display(), "bootstrap: failed to read SA token");
             return Err(());
         }
     };
@@ -251,7 +251,7 @@ async fn do_bootstrap(
     let ca_bundle_pem = match tokio::fs::read(&config.ca_bundle_path).await {
         Ok(b) => b,
         Err(e) => {
-            warn!(error = %e, path = %config.ca_bundle_path, "bootstrap: failed to read CA bundle");
+            warn!(error = %e, path = %config.ca_bundle_path.display(), "bootstrap: failed to read CA bundle");
             return Err(());
         }
     };

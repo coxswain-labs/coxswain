@@ -571,8 +571,7 @@ async fn handle_connection<P>(
     P: ProxyHttp + Send + Sync + 'static,
     <P as ProxyHttp>::CTX: Send + Sync,
 {
-    let listener_label = handler.local_addr.port().to_string();
-    let _conn_guard = ConnectionGuard::new(listener_label);
+    let _conn_guard = ConnectionGuard::new(handler.local_addr.port());
     if let Some(trusted) = handler.trusted {
         handle_proxy_protocol(
             tcp,
@@ -606,20 +605,22 @@ async fn handle_connection<P>(
 /// every connection-termination path (clean close, drain abort, TLS failure,
 /// panic).
 struct ConnectionGuard {
-    listener: String,
+    port: u16,
     start: Instant,
 }
 
 impl ConnectionGuard {
-    fn new(listener: String) -> Self {
+    fn new(port: u16) -> Self {
+        let mut buf = itoa::Buffer::new();
+        let listener = buf.format(port);
         metrics::connections_total()
-            .with_label_values(&[&listener])
+            .with_label_values(&[listener])
             .inc();
         metrics::connections_active()
-            .with_label_values(&[&listener])
+            .with_label_values(&[listener])
             .inc();
         Self {
-            listener,
+            port,
             start: Instant::now(),
         }
     }
@@ -627,11 +628,13 @@ impl ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
+        let mut buf = itoa::Buffer::new();
+        let listener = buf.format(self.port);
         metrics::connections_active()
-            .with_label_values(&[&self.listener])
+            .with_label_values(&[listener])
             .dec();
         metrics::connection_duration_seconds()
-            .with_label_values(&[&self.listener])
+            .with_label_values(&[listener])
             .observe(self.start.elapsed().as_secs_f64());
     }
 }
