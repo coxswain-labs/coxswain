@@ -42,6 +42,16 @@ pub enum ListenerTlsOutcome {
 }
 
 impl ListenerTlsOutcome {
+    /// Returns `true` when this listener is an HTTPS listener whose certificate
+    /// was successfully resolved (`Resolved`).
+    ///
+    /// Used to decide which listeners contribute to the per-port listener-hostname
+    /// snapshot for misdirected-request detection (GEP-3567, #96).
+    #[must_use]
+    pub fn is_https_terminate(&self) -> bool {
+        matches!(self, Self::Resolved)
+    }
+
     /// Returns `true` for outcomes the controller should treat as healthy.
     ///
     /// `NotApplicable` (non-HTTPS listener) and `Resolved` are healthy; every
