@@ -9,7 +9,7 @@ use crate::rate_limit::RateLimiterRegistry;
 use crate::upstream_ca::UpstreamCaCache;
 use coxswain_cache::ResponseCache;
 use coxswain_core::routing::RouteTimeouts;
-use coxswain_core::tls::SharedClientCertStore;
+use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames};
 use std::sync::Arc;
 
 /// Startup-time collaborators shared between both proxy types.
@@ -44,6 +44,15 @@ pub struct SharedProxyConfig {
     /// Defaults to an empty store (no mTLS enforced) until the reflector's
     /// first reconcile cycle completes.
     pub client_certs: SharedClientCertStore,
+    /// Per-port HTTPS Gateway-listener hostname snapshot for misdirected-request
+    /// detection (GEP-3567, #96).
+    ///
+    /// Looked up in `request_filter` on every HTTPS request: when the request
+    /// Host resolves to a different listener than the negotiated SNI, the proxy
+    /// returns 421 Misdirected Request so the client opens a fresh connection
+    /// on the correct listener. Defaults to an empty snapshot (check inactive)
+    /// until the reflector's first Gateway reconcile completes.
+    pub listener_hostnames: SharedListenerHostnames,
     /// Per-process per-endpoint circuit-breaker registry (#282).
     ///
     /// Keyed by `(metric_route_id, SocketAddr)`. Built once at startup; gated in
@@ -77,6 +86,7 @@ impl SharedProxyConfig {
             rate_limiter,
             auth_client,
             client_certs: SharedClientCertStore::new(),
+            listener_hostnames: SharedListenerHostnames::new(),
             circuit_breakers: CircuitBreakerRegistry::new(),
             mirror_tracker: tokio_util::task::TaskTracker::new(),
         }

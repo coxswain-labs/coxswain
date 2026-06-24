@@ -9,7 +9,7 @@
 //! circular dependency. It is re-exported here for backwards compatibility.
 
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
-use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
+use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedTlsStore};
 
 pub use coxswain_core::RoutingSource;
 
@@ -26,6 +26,7 @@ pub struct KubernetesSource {
     gateway_routes: SharedGatewayRoutingTable,
     tls_store: SharedTlsStore,
     client_cert_store: SharedClientCertStore,
+    listener_hostnames: SharedListenerHostnames,
 }
 
 impl KubernetesSource {
@@ -36,12 +37,14 @@ impl KubernetesSource {
         gateway_routes: SharedGatewayRoutingTable,
         tls_store: SharedTlsStore,
         client_cert_store: SharedClientCertStore,
+        listener_hostnames: SharedListenerHostnames,
     ) -> Self {
         Self {
             ingress_routes,
             gateway_routes,
             tls_store,
             client_cert_store,
+            listener_hostnames,
         }
     }
 }
@@ -61,5 +64,9 @@ impl RoutingSource for KubernetesSource {
 
     fn client_cert_store(&self) -> SharedClientCertStore {
         self.client_cert_store.clone()
+    }
+
+    fn listener_hostnames(&self) -> SharedListenerHostnames {
+        self.listener_hostnames.clone()
     }
 }
