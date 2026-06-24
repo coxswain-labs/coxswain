@@ -8,6 +8,7 @@
 _staging/
 __pycache__/
 conformance/reports/*.yaml
+conformance/conformance.test
 graphify-out/
 site/
 target/
