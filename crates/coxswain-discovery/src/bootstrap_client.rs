@@ -190,6 +190,9 @@ async fn run_bootstrap(
 
         let not_after = match do_bootstrap(&config, &keypair).await {
             Ok((material, not_after_unix)) => {
+                crate::metrics::client_bootstrap_total()
+                    .with_label_values(&["success"])
+                    .inc();
                 generation = generation.saturating_add(1);
                 svid_cell.store(std::sync::Arc::new(Some(material)));
                 // Ignore send errors: if all receivers are gone, this task is orphaned.
@@ -198,6 +201,9 @@ async fn run_bootstrap(
                 not_after_unix
             }
             Err(()) => {
+                crate::metrics::client_bootstrap_total()
+                    .with_label_values(&["failure"])
+                    .inc();
                 attempt = attempt.saturating_add(1);
                 let delay = backoff_jitter(attempt, config.backoff_base, config.backoff_cap);
                 warn!(
@@ -216,6 +222,7 @@ async fn run_bootstrap(
             .unwrap_or_default()
             .as_secs() as i64;
         let remaining_secs = (not_after - now_unix).max(0) as u64;
+        crate::metrics::client_svid_expiry_seconds().set(not_after - now_unix);
         refresh_after = Duration::from_secs(remaining_secs / 2).max(Duration::from_secs(1));
 
         debug!(

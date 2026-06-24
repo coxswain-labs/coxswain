@@ -43,6 +43,7 @@ mod common;
 use common::dedicated::{
     GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, assert_provisioning_contract, wait_for_cut_over,
 };
+use common::discovery::scrape_metric_label_sum;
 
 /// 1. Apply a dedicated-mode Gateway → assert all three resources are created
 ///    with the GEP-1762 labels (including merged infrastructure labels), the
@@ -694,6 +695,17 @@ async fn invalid_sa_token_is_rejected_with_event() -> anyhow::Result<()> {
     let events: Api<Event> = Api::namespaced(h.client.clone(), DISCOVERY_NAMESPACE);
     let before = count_bootstrap_rejected(&events).await?;
 
+    // Baseline the controller's rejection counter so we can prove this rogue's
+    // rejects (not some earlier test's) drive the metric up.
+    let metrics_url = h.controller_admin_url("/metrics");
+    let rejected_before = scrape_metric_label_sum(
+        &metrics_url,
+        "coxswain_discovery_bootstrap_total",
+        "result=\"rejected\"",
+    )
+    .await
+    .unwrap_or(0.0);
+
     // A rogue proxy whose projected token is minted for the WRONG audience.
     // Everything else mirrors a normal shared proxy.
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
@@ -763,6 +775,36 @@ async fn invalid_sa_token_is_rejected_with_event() -> anyhow::Result<()> {
         || async {
             let now = count_bootstrap_rejected(&events).await.unwrap_or(before);
             (now > before).then_some(())
+        },
+    )
+    .await?;
+
+    // The same rejection must also increment the controller's Prometheus counter,
+    // not just the K8s Event — operators alert on the metric. Poll because the
+    // port-forwarded scrape and the reject path are independently timed.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let now = scrape_metric_label_sum(
+                &metrics_url,
+                "coxswain_discovery_bootstrap_total",
+                "result=\"rejected\"",
+            )
+            .await;
+            format!(
+                "controller coxswain_discovery_bootstrap_total{{result=\"rejected\"}} to exceed \
+                 the {rejected_before} baseline; currently: {now:?}"
+            )
+        },
+        || async {
+            let now = scrape_metric_label_sum(
+                &metrics_url,
+                "coxswain_discovery_bootstrap_total",
+                "result=\"rejected\"",
+            )
+            .await?;
+            (now > rejected_before).then_some(())
         },
     )
     .await?;
