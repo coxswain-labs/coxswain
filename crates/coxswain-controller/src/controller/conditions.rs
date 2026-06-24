@@ -81,9 +81,9 @@ mod tests {
         has_condition, make_condition,
     };
     use coxswain_core::ownership::ObjectKey;
-    use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassStatus};
-    use gateway_api::apis::standard::gateways::{Gateway, GatewayStatus};
-    use gateway_api::apis::standard::httproutes::HttpRouteParentRefs;
+    use coxswain_reflector::gw_types::v::gatewayclasses::{GatewayClass, GatewayClassStatus};
+    use coxswain_reflector::gw_types::v::gateways::{Gateway, GatewayStatus};
+    use coxswain_reflector::gw_types::v::httproutes::HttpRouteParentRefs;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use kube::api::ObjectMeta;
     use std::collections::HashSet;

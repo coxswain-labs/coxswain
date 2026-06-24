@@ -185,6 +185,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -223,6 +224,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -259,6 +261,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -295,6 +298,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -329,7 +333,7 @@ mod tests {
         let owned_gw = owned(&[("default", "gw")]);
 
         let make_route_sn_port = |section_name: Option<&str>, port: Option<i32>| {
-            use gateway_api::apis::standard::httproutes::HttpRouteSpec;
+            use crate::gw_types::v::httproutes::HttpRouteSpec;
             HttpRoute {
                 metadata: kube::api::ObjectMeta {
                     name: Some("test-route".to_string()),
@@ -346,6 +350,7 @@ mod tests {
                     }]),
                     hostnames: Some(vec!["h.example.com".to_string()]),
                     rules: Some(vec![make_simple_rule("svc")]),
+                    ..Default::default()
                 },
                 status: None,
             }
@@ -364,6 +369,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -386,6 +392,7 @@ mod tests {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );

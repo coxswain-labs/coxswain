@@ -138,6 +138,7 @@ pub fn spawn_status_writer(
             "backend_tls_policy",
             "config_map",
             "rate_limit",
+            "path_rewrite_regex",
             "pod",
             "routing_table_built",
         ],

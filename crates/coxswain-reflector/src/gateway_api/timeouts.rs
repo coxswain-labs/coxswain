@@ -38,8 +38,8 @@ mod tests {
 
     // ── Timeout tests ────────────────────────────────────────────────────────────
 
+    use crate::gw_types::v::httproutes::HttpRouteRulesTimeouts;
     use coxswain_core::routing::RouteOutcome;
-    use gateway_api::apis::standard::httproutes::HttpRouteRulesTimeouts;
     use std::time::Duration;
 
     fn find_timeouts(
@@ -98,23 +98,22 @@ mod tests {
                 namespace: Some("default".to_string()),
                 ..Default::default()
             },
-            spec: gateway_api::apis::standard::httproutes::HttpRouteSpec {
+            spec: crate::gw_types::v::httproutes::HttpRouteSpec {
                 parent_refs: default_parents(),
                 hostnames: Some(vec!["example.com".to_string()]),
-                rules: Some(vec![
-                    gateway_api::apis::standard::httproutes::HttpRouteRules {
-                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
-                            name: "svc".to_string(),
-                            port: Some(80),
-                            ..Default::default()
-                        }]),
-                        timeouts: Some(HttpRouteRulesTimeouts {
-                            request: Some("10s".to_string()),
-                            backend_request: Some("2s".to_string()),
-                        }),
+                rules: Some(vec![crate::gw_types::v::httproutes::HttpRouteRules {
+                    backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                        name: "svc".to_string(),
+                        port: Some(80),
                         ..Default::default()
-                    },
-                ]),
+                    }]),
+                    timeouts: Some(HttpRouteRulesTimeouts {
+                        request: Some("10s".to_string()),
+                        backend_request: Some("2s".to_string()),
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -131,6 +130,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -156,6 +156,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );

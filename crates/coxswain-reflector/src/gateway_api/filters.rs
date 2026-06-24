@@ -26,6 +26,8 @@ pub(super) fn build_filters(
     filters: &[HttpRouteRulesFilters],
     matched_prefix: &str,
     is_prefix_match: bool,
+    route_ns: &str,
+    path_rewrites: &reflector::Store<coxswain_core::crd::PathRewriteRegex>,
 ) -> Vec<FilterAction> {
     let mut out = Vec::new();
     for f in filters {
@@ -132,9 +134,53 @@ pub(super) fn build_filters(
                     path,
                 });
             }
-            HttpRouteRulesFiltersType::RequestMirror
-            | HttpRouteRulesFiltersType::ExtensionRef
-            | HttpRouteRulesFiltersType::Cors => {
+            HttpRouteRulesFiltersType::ExtensionRef => {
+                let Some(ext) = &f.extension_ref else {
+                    tracing::warn!("Skipping ExtensionRef filter — payload is missing");
+                    continue;
+                };
+                if ext.group == "coxswain-labs.dev" && ext.kind == "PathRewriteRegex" {
+                    let obj_ref =
+                        reflector::ObjectRef::<coxswain_core::crd::PathRewriteRegex>::new(
+                            &ext.name,
+                        )
+                        .within(route_ns);
+                    if let Some(cr) = path_rewrites.get(&obj_ref) {
+                        match regex::Regex::new(&cr.spec.pattern) {
+                            Ok(regex) => {
+                                out.push(FilterAction::UrlRewrite {
+                                    hostname: None,
+                                    path: Some(PathModifier::RegexReplace {
+                                        regex: Arc::new(regex),
+                                        replacement: Box::from(cr.spec.replacement.as_str()),
+                                    }),
+                                });
+                            }
+                            Err(e) => tracing::warn!(
+                                name = %ext.name,
+                                ns = route_ns,
+                                error = %e,
+                                "PathRewriteRegex CR has invalid regex — filter skipped"
+                            ),
+                        }
+                    } else {
+                        tracing::warn!(
+                            name = %ext.name,
+                            ns = route_ns,
+                            "PathRewriteRegex CR not found — filter skipped"
+                        );
+                    }
+                } else if ext.group == "coxswain-labs.dev" && ext.kind == "RateLimit" {
+                    // Handled separately by `resolve_rate_limit`.
+                } else {
+                    tracing::warn!(
+                        group = %ext.group,
+                        kind = %ext.kind,
+                        "Skipping unsupported ExtensionRef filter"
+                    );
+                }
+            }
+            HttpRouteRulesFiltersType::RequestMirror | HttpRouteRulesFiltersType::Cors => {
                 tracing::warn!(
                     filter_type = ?f.r#type,
                     "Skipping unsupported HTTPRouteFilter type"
@@ -432,8 +478,7 @@ mod tests {
 
     // ── Filter tests ────────────────────────────────────────────────────────────
 
-    use coxswain_core::routing::{FilterAction, PathModifier, RouteOutcome};
-    use gateway_api::apis::standard::httproutes::{
+    use crate::gw_types::v::httproutes::{
         HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
         HttpRouteRulesFiltersRequestHeaderModifierSet, HttpRouteRulesFiltersRequestRedirect,
         HttpRouteRulesFiltersResponseHeaderModifier,
@@ -441,6 +486,7 @@ mod tests {
         HttpRouteRulesFiltersUrlRewrite, HttpRouteRulesFiltersUrlRewritePath,
         HttpRouteRulesFiltersUrlRewritePathType,
     };
+    use coxswain_core::routing::{FilterAction, PathModifier, RouteOutcome};
 
     fn make_route_with_filters(
         ns: &str,
@@ -469,6 +515,7 @@ mod tests {
                     filters: Some(filters),
                     ..Default::default()
                 }]),
+                ..Default::default()
             },
             ..Default::default()
         }
@@ -519,6 +566,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -567,6 +615,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -613,6 +662,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );
@@ -665,6 +715,7 @@ mod tests {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
             },
             &mut builder,
         );

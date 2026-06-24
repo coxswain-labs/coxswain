@@ -164,10 +164,10 @@ pub(super) fn build_gateway_status_patch(
 #[cfg(test)]
 mod tests {
     use super::super::gateway_status::gateway_needs_status_patch;
-    use coxswain_reflector::tls::GatewayListenerHealth;
-    use gateway_api::apis::standard::gateways::{
+    use coxswain_reflector::gw_types::v::gateways::{
         Gateway, GatewaySpec, GatewayStatus, GatewayStatusListeners,
     };
+    use coxswain_reflector::tls::GatewayListenerHealth;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 
     fn condition(type_: &str, observed_gen: i64) -> Condition {
@@ -210,12 +210,14 @@ mod tests {
                 ..Default::default()
             },
             spec: GatewaySpec {
-                listeners: vec![gateway_api::apis::standard::gateways::GatewayListeners {
-                    name: "http".to_string(),
-                    port: 80,
-                    protocol: "HTTP".to_string(),
-                    ..Default::default()
-                }],
+                listeners: vec![
+                    coxswain_reflector::gw_types::v::gateways::GatewayListeners {
+                        name: "http".to_string(),
+                        port: 80,
+                        protocol: "HTTP".to_string(),
+                        ..Default::default()
+                    },
+                ],
                 ..Default::default()
             },
             status: Some(GatewayStatus {

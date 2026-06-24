@@ -15,7 +15,7 @@ pub(super) use kube::api::ObjectMeta;
 pub(super) use std::collections::{HashMap, HashSet};
 
 pub(super) use crate::tests::fixtures::{
-    empty_rate_limit_store, empty_svc_store, make_slice, slice_store,
+    empty_path_rewrite_store, empty_rate_limit_store, empty_svc_store, make_slice, slice_store,
 };
 
 pub(super) fn owned(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {
@@ -92,6 +92,7 @@ pub(super) fn make_route(
                 matches,
                 ..Default::default()
             }]),
+            ..Default::default()
         },
         ..Default::default()
     }
@@ -203,7 +204,7 @@ pub(super) fn make_route_with_hostnames_and_parent(
     gw_name: &str,
     section_name: Option<&str>,
 ) -> HttpRoute {
-    pub(super) use gateway_api::apis::standard::httproutes::HttpRouteSpec;
+    pub(super) use crate::gw_types::v::httproutes::HttpRouteSpec;
     HttpRoute {
         metadata: kube::api::ObjectMeta {
             name: Some("test-route".to_string()),
@@ -219,6 +220,7 @@ pub(super) fn make_route_with_hostnames_and_parent(
             }]),
             hostnames: Some(hostnames.iter().map(|h| h.to_string()).collect()),
             rules: Some(vec![make_simple_rule("svc")]),
+            ..Default::default()
         },
         status: None,
     }
@@ -230,7 +232,7 @@ pub(super) fn make_route_with_parent_port(
     gw_name: &str,
     port: Option<i32>,
 ) -> HttpRoute {
-    pub(super) use gateway_api::apis::standard::httproutes::HttpRouteSpec;
+    pub(super) use crate::gw_types::v::httproutes::HttpRouteSpec;
     HttpRoute {
         metadata: kube::api::ObjectMeta {
             name: Some("test-route".to_string()),
@@ -246,17 +248,14 @@ pub(super) fn make_route_with_parent_port(
             }]),
             hostnames: Some(hostnames.iter().map(|h| h.to_string()).collect()),
             rules: Some(vec![make_simple_rule("svc")]),
+            ..Default::default()
         },
         status: None,
     }
 }
 
-pub(super) fn make_simple_rule(
-    svc: &str,
-) -> gateway_api::apis::standard::httproutes::HttpRouteRules {
-    pub(super) use gateway_api::apis::standard::httproutes::{
-        HttpRouteRules, HttpRouteRulesBackendRefs,
-    };
+pub(super) fn make_simple_rule(svc: &str) -> crate::gw_types::v::httproutes::HttpRouteRules {
+    pub(super) use crate::gw_types::v::httproutes::{HttpRouteRules, HttpRouteRulesBackendRefs};
     HttpRouteRules {
         backend_refs: Some(vec![HttpRouteRulesBackendRefs {
             name: svc.to_string(),

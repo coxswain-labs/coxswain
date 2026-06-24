@@ -1,0 +1,48 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: pathrewriteregexes.coxswain-labs.dev
+spec:
+  group: coxswain-labs.dev
+  names:
+    categories: []
+    kind: PathRewriteRegex
+    plural: pathrewriteregexes
+    shortNames: []
+    singular: pathrewriteregex
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for PathRewriteRegexSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Path rewrite policy using regular expressions.
+
+              Reference this CR from an `HTTPRouteRule.filters` entry with
+              `type: ExtensionRef` pointing at `group: coxswain-labs.dev`,
+              `kind: PathRewriteRegex`.
+            properties:
+              pattern:
+                description: |-
+                  Regular expression pattern to match against the request path.
+
+                  Must be a valid Rust `regex` crate pattern.
+                type: string
+              replacement:
+                description: Replacement string, which can include capture group references like `$1`.
+                type: string
+            required:
+            - pattern
+            - replacement
+            type: object
+        required:
+        - spec
+        title: PathRewriteRegex
+        type: object
+    served: true
+    storage: true
+    subresources: {}

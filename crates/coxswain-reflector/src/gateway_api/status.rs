@@ -144,13 +144,31 @@ pub(super) fn compute_route_health(
             ))
             .collect();
 
-            let (accepted, accepted_reason) = compute_accepted(
+            let (mut accepted, mut accepted_reason) = compute_accepted(
                 &route_hostnames,
                 &section,
                 pr.port.map(|p| p as u16),
                 &gw_key,
                 &listeners_hn,
             );
+
+            if accepted {
+                let has_unsupported = route.spec.rules.as_deref().unwrap_or(&[]).iter().any(|r| {
+                    r.filters.as_deref().unwrap_or(&[]).iter().any(|f| {
+                        if matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef)
+                            && let Some(ext) = &f.extension_ref
+                        {
+                            return ext.group != "coxswain-labs.dev"
+                                || (ext.kind != "RateLimit" && ext.kind != "PathRewriteRegex");
+                        }
+                        false
+                    })
+                });
+                if has_unsupported {
+                    accepted = false;
+                    accepted_reason = "UnsupportedValue";
+                }
+            }
 
             let (resolved_refs, resolved_refs_reason) = if accepted {
                 check_backend_refs(route, route_ns, backend_grants, service_store)
@@ -348,6 +366,7 @@ mod tests {
                     }]),
                     ..Default::default()
                 }]),
+                ..Default::default()
             },
             ..Default::default()
         })

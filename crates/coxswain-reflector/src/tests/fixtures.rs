@@ -1,4 +1,4 @@
-use coxswain_core::crd::RateLimit;
+use coxswain_core::crd::{PathRewriteRegex, RateLimit};
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use kube::api::ObjectMeta;
@@ -66,6 +66,10 @@ pub(crate) fn empty_svc_store() -> reflector::Store<Service> {
 
 pub(crate) fn empty_rate_limit_store() -> reflector::Store<RateLimit> {
     reflector::store::Writer::<RateLimit>::default().as_reader()
+}
+
+pub(crate) fn empty_path_rewrite_store() -> reflector::Store<PathRewriteRegex> {
+    reflector::store::Writer::<PathRewriteRegex>::default().as_reader()
 }
 
 pub(crate) fn empty_secret_store() -> reflector::Store<Secret> {

@@ -60,11 +60,11 @@ rules:
   - apiGroups: ["ingress.coxswain-labs.dev"]
     resources: ["coxswainingressclassparameters"]
     verbs: ["get", "list", "watch"]
-  # Read RateLimit CRs so HTTPRouteRule ExtensionRef filters can be resolved
-  # into per-route rate-limiting config (#25). No write verbs: operators author
+  # Read RateLimit and PathRewriteRegex CRs so HTTPRouteRule ExtensionRef filters can be resolved
+  # into per-route rate-limiting config (#25) and path rewrites (#77). No write verbs: operators author
   # these objects; coxswain only reads them.
   - apiGroups: ["coxswain-labs.dev"]
-    resources: ["ratelimits"]
+    resources: ["ratelimits", "pathrewriteregexes"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
