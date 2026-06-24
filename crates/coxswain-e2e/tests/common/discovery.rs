@@ -345,3 +345,35 @@ pub async fn scrape_metric(metrics_url: &str, metric: &str) -> Option<f64> {
         rest.strip_prefix(' ')?.trim().parse::<f64>().ok()
     })
 }
+
+/// Scrape `GET <metrics_url>` and sum every sample of `metric` whose label set
+/// contains `label_substr`, returning `0.0` when no such series is present.
+///
+/// The labelled analogue of [`scrape_metric`]: a counter like
+/// `coxswain_discovery_bootstrap_total{result="rejected",reason="sa_token"}`
+/// fans out across `reason` values, so a `result="rejected"` assertion must sum
+/// the matching lines rather than read a single one. Returns `None` only when
+/// the scrape itself fails (so callers can distinguish "endpoint unreachable"
+/// from "series at zero").
+pub async fn scrape_metric_label_sum(
+    metrics_url: &str,
+    metric: &str,
+    label_substr: &str,
+) -> Option<f64> {
+    let body = reqwest::get(metrics_url).await.ok()?.text().await.ok()?;
+    let sum = body
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let rest = l.strip_prefix(metric)?;
+            // Only the labelled form: `{...} <value>`.
+            let rest = rest.strip_prefix('{')?;
+            let (labels, value) = rest.rsplit_once('}')?;
+            labels
+                .contains(label_substr)
+                .then(|| value.trim().parse::<f64>().ok())
+                .flatten()
+        })
+        .sum();
+    Some(sum)
+}

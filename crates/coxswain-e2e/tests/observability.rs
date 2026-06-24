@@ -844,6 +844,13 @@ async fn routing_api_surfaces_gateways_routes_and_problems() -> anyhow::Result<(
     Ok(())
 }
 
+/// Read a bare, label-less `<name> <value>` series. Returns `None` when absent.
+fn bare_metric(body: &str, name: &str) -> Option<f64> {
+    body.lines()
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
+}
+
 /// Sum the values of all `<name>{...}` series whose label set contains
 /// `label_substr`. Returns `None` when no matching series is present.
 fn metric_sum_for_label(body: &str, name: &str, label_substr: &str) -> Option<f64> {
@@ -929,6 +936,52 @@ async fn cache_hit_and_miss_counters_increment_when_caching() -> anyhow::Result<
         hits.is_some_and(|v| v >= 1.0),
         "coxswain_cache_hits_total must record at least one hit for {route_label}; \
          got {hits:?}"
+    );
+
+    // Depth gauges: the cached entry must show as live capacity on the
+    // process-wide LRU (these are unlabelled, so they reflect the whole cache —
+    // a single entry suffices to prove both are non-zero).
+    let entries = bare_metric(&metrics, "coxswain_proxy_cache_entries");
+    let bytes = bare_metric(&metrics, "coxswain_proxy_cache_bytes");
+    assert!(
+        entries.is_some_and(|v| v >= 1.0),
+        "coxswain_proxy_cache_entries must report at least one tracked entry; got {entries:?}"
+    );
+    assert!(
+        bytes.is_some_and(|v| v > 0.0),
+        "coxswain_proxy_cache_bytes must report the cached body's size; got {bytes:?}"
+    );
+
+    // Purge the entry through the admin API and confirm the hit-outcome counter
+    // moves. The purge path keys on `GET {host}{path}`, matching what was cached.
+    let purge_before = metric_sum_for_label(
+        &metrics,
+        "coxswain_proxy_cache_purges_total",
+        "result=\"hit\"",
+    )
+    .unwrap_or(0.0);
+    let purge_url = h.admin_url(&format!("/cache/{host}/"));
+    let purge_status = reqwest::Client::new()
+        .delete(&purge_url)
+        .send()
+        .await?
+        .status();
+    assert!(
+        purge_status.is_success(),
+        "DELETE {purge_url} must succeed; got {purge_status}"
+    );
+
+    let after = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let purge_after = metric_sum_for_label(
+        &after,
+        "coxswain_proxy_cache_purges_total",
+        "result=\"hit\"",
+    )
+    .unwrap_or(0.0);
+    assert!(
+        purge_after > purge_before,
+        "coxswain_proxy_cache_purges_total{{result=\"hit\"}} must increment after purging a \
+         cached entry; before={purge_before}, after={purge_after}"
     );
 
     Ok(())

@@ -19,7 +19,7 @@
 
 mod metrics;
 
-pub use metrics::{cache_hits_total, cache_misses_total};
+pub use metrics::{cache_hits_total, cache_misses_total, cache_purges_total};
 
 use pingora_cache::eviction::EvictionManager;
 use pingora_cache::eviction::lru::Manager as LruManager;
@@ -80,6 +80,8 @@ impl ResponseCache {
         let eviction: &'static LruManager<LRU_SHARDS> = Box::leak(Box::new(
             LruManager::with_capacity(max_bytes, LRU_SHARD_CAPACITY),
         ));
+        // Expose the eviction manager's depth on the proxy `/metrics` (pull-based).
+        metrics::register_cache_depth_collector(eviction);
         Self { storage, eviction }
     }
 
@@ -116,6 +118,9 @@ impl ResponseCache {
         if purged {
             self.eviction.remove(&key);
         }
+        metrics::cache_purges_total()
+            .with_label_values(&[if purged { "hit" } else { "miss" }])
+            .inc();
         purged
     }
 }
@@ -159,9 +164,17 @@ mod tests {
     #[tokio::test]
     async fn purge_returns_false_when_entry_absent() {
         let cache = ResponseCache::with_max_bytes(1024);
+        let miss_before = cache_purges_total().with_label_values(&["miss"]).get();
+
         assert!(
             !cache.purge("example.com", "/missing").await,
             "purging an entry that was never cached must report nothing removed"
+        );
+
+        assert_eq!(
+            cache_purges_total().with_label_values(&["miss"]).get(),
+            miss_before + 1,
+            "a no-op purge must increment coxswain_proxy_cache_purges_total{{miss}}"
         );
     }
 }

@@ -96,7 +96,107 @@ pub fn acks_total() -> &'static IntCounter {
     })
 }
 
+// ── Server-side bootstrap/PKI metrics (controller process) ──────────────────
+
+/// Counter: cumulative Bootstrap RPC outcomes, by result and reason.
+///
+/// Labels:
+/// - `result` — `accepted` (SVID issued) or `rejected` (any failure before issue).
+/// - `reason` — the discriminating cause. `ok` for accepts; for rejects one of
+///   `wire_version`, `sa_token`, `token_review_error`, `invalid_principal`,
+///   `ca_not_ready`, `malformed_csr`, `signing_error`, `internal`.
+///
+/// `sum(result="rejected")` answers "is the fleet failing to bootstrap"; the
+/// `reason` breakdown distinguishes a misconfigured client (`sa_token`,
+/// `wire_version`) from a controller-side fault (`ca_not_ready`,
+/// `token_review_error`). Surfaced on the controller admin `/metrics`.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn bootstrap_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_discovery_bootstrap_total",
+                "Cumulative Bootstrap RPC outcomes, by result and reason"
+            ),
+            &["result", "reason"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: cumulative SVIDs signed by the CA on the Bootstrap path.
+///
+/// Incremented once per CSR the controller signs for a bootstrapping proxy; the
+/// controller's own self-issued server cert is not counted. The rate tracks
+/// fleet-wide SVID issuance throughput; a flat line while proxies report
+/// expiring SVIDs flags a stuck issuance path.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn svid_issued_total() -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter!(
+            "coxswain_discovery_svid_issued_total",
+            "Cumulative SVIDs signed by the CA on the Bootstrap path"
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
 // ── Client-side metrics (proxy process) ─────────────────────────────────────
+
+/// Counter: cumulative proxy-side Bootstrap outcomes, by result.
+///
+/// Labels: `result` (`success` — an SVID was issued and stored; `failure` — the
+/// rotation attempt failed at token read, CA-bundle read, CSR build, transport
+/// setup, or the RPC). A climbing `failure` rate with no `success` means the
+/// proxy is serving its last-good SVID and will eventually expire out. Surfaced
+/// on the proxy admin `/metrics`.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn client_bootstrap_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_discovery_client_bootstrap_total",
+                "Cumulative proxy-side Bootstrap outcomes, by result"
+            ),
+            &["result"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Gauge: seconds until the proxy's current SVID `not_after`.
+///
+/// Set on every successful bootstrap to `not_after - now`. A value approaching
+/// zero (or going negative) means rotation is not keeping up with the SVID TTL —
+/// the proxy will lose its control-plane credential. Mirrors the
+/// `coxswain_proxy_tls_cert_expiry_seconds` precedent. Surfaced on the proxy
+/// admin `/metrics`.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn client_svid_expiry_seconds() -> &'static IntGauge {
+    static GAUGE: OnceLock<IntGauge> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        register_int_gauge!(
+            "coxswain_discovery_client_svid_expiry_seconds",
+            "Seconds until the proxy's current SVID notAfter"
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
 
 /// Counter: cumulative reconnect attempts made by the proxy's discovery
 /// supervisor. The first connect is not counted; every subsequent channel

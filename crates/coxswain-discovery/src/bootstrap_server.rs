@@ -165,6 +165,7 @@ where
                 "wire version mismatch: server={WIRE_VERSION}, client={}",
                 req.wire_version
             );
+            reject("wire_version");
             self.reject_hook.on_reject("<unknown>", &reason).await;
             return Err(Status::failed_precondition(reason));
         }
@@ -174,16 +175,19 @@ where
             Ok(id) => id,
             Err(AuthnError::Unauthenticated(msg)) => {
                 warn!(reason = %msg, "bootstrap: SA token rejected");
+                reject("sa_token");
                 self.reject_hook.on_reject("<unauthenticated>", &msg).await;
                 return Err(Status::unauthenticated(format!("SA token rejected: {msg}")));
             }
             Err(AuthnError::ApiError(msg)) => {
                 warn!(reason = %msg, "bootstrap: TokenReview API error");
+                reject("token_review_error");
                 self.reject_hook.on_reject("<api-error>", &msg).await;
                 return Err(Status::internal(format!("TokenReview error: {msg}")));
             }
             Err(AuthnError::InvalidPrincipal(msg)) => {
                 warn!(reason = %msg, "bootstrap: unexpected principal format");
+                reject("invalid_principal");
                 self.reject_hook
                     .on_reject("<invalid-principal>", &msg)
                     .await;
@@ -195,6 +199,7 @@ where
             Err(e) => {
                 let msg = e.to_string();
                 warn!(reason = %msg, "bootstrap: unexpected auth error");
+                reject("internal");
                 self.reject_hook.on_reject("<unknown>", &msg).await;
                 return Err(Status::internal(format!("authentication error: {msg}")));
             }
@@ -208,16 +213,19 @@ where
             Ok(s) => s,
             Err(IssuerError::NotReady) => {
                 let msg = "CA not yet initialised";
+                reject("ca_not_ready");
                 self.reject_hook.on_reject(spiffe_id.as_str(), msg).await;
                 return Err(Status::unavailable(msg));
             }
             Err(IssuerError::MalformedCsr(msg)) => {
                 warn!(spiffe_id = %spiffe_id, reason = %msg, "bootstrap: malformed CSR");
+                reject("malformed_csr");
                 self.reject_hook.on_reject(spiffe_id.as_str(), &msg).await;
                 return Err(Status::invalid_argument(format!("malformed CSR: {msg}")));
             }
             Err(IssuerError::Signing(msg)) => {
                 warn!(spiffe_id = %spiffe_id, reason = %msg, "bootstrap: signing error");
+                reject("signing_error");
                 self.reject_hook.on_reject(spiffe_id.as_str(), &msg).await;
                 return Err(Status::internal(format!("signing error: {msg}")));
             }
@@ -225,10 +233,17 @@ where
             Err(e) => {
                 let msg = e.to_string();
                 warn!(spiffe_id = %spiffe_id, reason = %msg, "bootstrap: unexpected issuer error");
+                reject("internal");
                 self.reject_hook.on_reject(spiffe_id.as_str(), &msg).await;
                 return Err(Status::internal(format!("issuer error: {msg}")));
             }
         };
+
+        // Accept: one signed SVID returned to the proxy.
+        crate::metrics::bootstrap_total()
+            .with_label_values(&["accepted", "ok"])
+            .inc();
+        crate::metrics::svid_issued_total().inc();
 
         let trust_bundle = self.issuer.trust_bundle();
 
@@ -244,6 +259,17 @@ where
             not_after_unix: svid.not_after_unix,
         }))
     }
+}
+
+/// Record a rejected Bootstrap outcome on `coxswain_discovery_bootstrap_total`.
+///
+/// `reason` is the bounded discriminator (e.g. `sa_token`, `ca_not_ready`); the
+/// `result` label is always `rejected` here — accepts are recorded inline in the
+/// success path.
+fn reject(reason: &str) {
+    crate::metrics::bootstrap_total()
+        .with_label_values(&["rejected", reason])
+        .inc();
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -347,6 +373,11 @@ mod tests {
             Arc::new(OkAuthenticator(proxy_id())),
         );
 
+        let accepted_before = crate::metrics::bootstrap_total()
+            .with_label_values(&["accepted", "ok"])
+            .get();
+        let issued_before = crate::metrics::svid_issued_total().get();
+
         let resp = svc
             .bootstrap(make_request("tok", b"csr"))
             .await
@@ -355,6 +386,19 @@ mod tests {
         assert_eq!(body.svid_cert_pem, cert);
         assert_eq!(body.trust_bundle_pem, bundle);
         assert_eq!(body.not_after_unix, 9999);
+
+        assert_eq!(
+            crate::metrics::bootstrap_total()
+                .with_label_values(&["accepted", "ok"])
+                .get(),
+            accepted_before + 1,
+            "an accepted bootstrap must increment bootstrap_total{{accepted,ok}}"
+        );
+        assert_eq!(
+            crate::metrics::svid_issued_total().get(),
+            issued_before + 1,
+            "an accepted bootstrap must increment svid_issued_total"
+        );
     }
 
     #[tokio::test]
@@ -372,11 +416,23 @@ mod tests {
             hook.clone(),
         );
 
+        let rejected_before = crate::metrics::bootstrap_total()
+            .with_label_values(&["rejected", "sa_token"])
+            .get();
+
         let err = svc
             .bootstrap(make_request("bad-token", b"csr"))
             .await
             .expect_err("should fail");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+        assert_eq!(
+            crate::metrics::bootstrap_total()
+                .with_label_values(&["rejected", "sa_token"])
+                .get(),
+            rejected_before + 1,
+            "a rejected SA token must increment bootstrap_total{{rejected,sa_token}}"
+        );
 
         let calls = hook
             .calls
@@ -396,11 +452,23 @@ mod tests {
             Arc::new(FailIssuer(IssuerError::NotReady)),
             Arc::new(OkAuthenticator(proxy_id())),
         );
+        let rejected_before = crate::metrics::bootstrap_total()
+            .with_label_values(&["rejected", "ca_not_ready"])
+            .get();
+
         let err = svc
             .bootstrap(make_request("tok", b"csr"))
             .await
             .expect_err("should fail");
         assert_eq!(err.code(), tonic::Code::Unavailable);
+
+        assert_eq!(
+            crate::metrics::bootstrap_total()
+                .with_label_values(&["rejected", "ca_not_ready"])
+                .get(),
+            rejected_before + 1,
+            "a not-ready CA must increment bootstrap_total{{rejected,ca_not_ready}}"
+        );
     }
 
     #[tokio::test]
@@ -418,8 +486,20 @@ mod tests {
             csr_pem: vec![],
             wire_version: WIRE_VERSION + 99,
         });
+        let rejected_before = crate::metrics::bootstrap_total()
+            .with_label_values(&["rejected", "wire_version"])
+            .get();
+
         let err = svc.bootstrap(req).await.expect_err("should fail");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        assert_eq!(
+            crate::metrics::bootstrap_total()
+                .with_label_values(&["rejected", "wire_version"])
+                .get(),
+            rejected_before + 1,
+            "a wire-version mismatch must increment bootstrap_total{{rejected,wire_version}}"
+        );
     }
 
     // NOTE: BootstrapService::stream is a one-line stub returning Status::unimplemented.
