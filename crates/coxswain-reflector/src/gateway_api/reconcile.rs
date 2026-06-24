@@ -953,6 +953,7 @@ mod tests {
                 ..Default::default()
             },
             spec: HttpRouteSpec {
+                use_default_gateways: None,
                 parent_refs: default_parents(),
                 hostnames: Some(vec!["example.com".to_string()]),
                 rules: Some(vec![
@@ -1062,6 +1063,7 @@ mod tests {
                 ..Default::default()
             },
             spec: HttpRouteSpec {
+                use_default_gateways: None,
                 parent_refs: default_parents(),
                 hostnames: Some(vec!["example.com".to_string()]),
                 rules: Some(vec![
@@ -1140,6 +1142,7 @@ mod tests {
                 ..Default::default()
             },
             spec: HttpRouteSpec {
+                use_default_gateways: None,
                 parent_refs: default_parents(),
                 hostnames: Some(vec!["example.com".to_string()]),
                 rules: Some(vec![
@@ -1277,6 +1280,7 @@ mod tests {
                 ..Default::default()
             },
             spec: HttpRouteSpec {
+                use_default_gateways: None,
                 parent_refs: default_parents(),
                 hostnames: Some(vec!["example.com".to_string()]),
                 rules: Some(vec![HttpRouteRules {

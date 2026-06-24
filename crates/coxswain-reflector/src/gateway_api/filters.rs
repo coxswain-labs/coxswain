@@ -479,7 +479,7 @@ mod tests {
     // ── Filter tests ────────────────────────────────────────────────────────────
 
     use coxswain_core::routing::{FilterAction, PathModifier, RouteOutcome};
-    use gateway_api::apis::standard::httproutes::{
+    use crate::gw_types::v::httproutes::{
         HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
         HttpRouteRulesFiltersRequestHeaderModifierSet, HttpRouteRulesFiltersRequestRedirect,
         HttpRouteRulesFiltersResponseHeaderModifier,
@@ -503,6 +503,7 @@ mod tests {
                 ..Default::default()
             },
             spec: HttpRouteSpec {
+                use_default_gateways: None,
                 parent_refs: default_parents(),
                 hostnames: Some(vec![hostname.to_string()]),
                 rules: Some(vec![HttpRouteRules {

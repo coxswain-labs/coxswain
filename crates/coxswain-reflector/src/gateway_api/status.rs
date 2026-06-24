@@ -348,6 +348,7 @@ mod tests {
                 ..Default::default()
             },
             spec: HttpRouteSpec {
+                use_default_gateways: None,
                 parent_refs: Some(vec![HttpRouteParentRefs {
                     name: gw_name.to_string(),
                     namespace: Some(gw_ns.to_string()),

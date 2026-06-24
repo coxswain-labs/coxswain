@@ -77,6 +77,7 @@ pub(super) fn make_route(
             ..Default::default()
         },
         spec: HttpRouteSpec {
+                use_default_gateways: None,
             parent_refs: default_parents(),
             hostnames: if hostnames.is_empty() {
                 None
@@ -203,7 +204,7 @@ pub(super) fn make_route_with_hostnames_and_parent(
     gw_name: &str,
     section_name: Option<&str>,
 ) -> HttpRoute {
-    pub(super) use gateway_api::apis::standard::httproutes::HttpRouteSpec;
+    pub(super) use crate::gw_types::v::httproutes::HttpRouteSpec;
     HttpRoute {
         metadata: kube::api::ObjectMeta {
             name: Some("test-route".to_string()),
@@ -211,6 +212,7 @@ pub(super) fn make_route_with_hostnames_and_parent(
             ..Default::default()
         },
         spec: HttpRouteSpec {
+                use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: gw_name.to_string(),
                 namespace: Some(ns.to_string()),
@@ -230,7 +232,7 @@ pub(super) fn make_route_with_parent_port(
     gw_name: &str,
     port: Option<i32>,
 ) -> HttpRoute {
-    pub(super) use gateway_api::apis::standard::httproutes::HttpRouteSpec;
+    pub(super) use crate::gw_types::v::httproutes::HttpRouteSpec;
     HttpRoute {
         metadata: kube::api::ObjectMeta {
             name: Some("test-route".to_string()),
@@ -238,6 +240,7 @@ pub(super) fn make_route_with_parent_port(
             ..Default::default()
         },
         spec: HttpRouteSpec {
+                use_default_gateways: None,
             parent_refs: Some(vec![HttpRouteParentRefs {
                 name: gw_name.to_string(),
                 namespace: Some(ns.to_string()),
@@ -253,8 +256,8 @@ pub(super) fn make_route_with_parent_port(
 
 pub(super) fn make_simple_rule(
     svc: &str,
-) -> gateway_api::apis::standard::httproutes::HttpRouteRules {
-    pub(super) use gateway_api::apis::standard::httproutes::{
+) -> crate::gw_types::v::httproutes::HttpRouteRules {
+    pub(super) use crate::gw_types::v::httproutes::{
         HttpRouteRules, HttpRouteRulesBackendRefs,
     };
     HttpRouteRules {

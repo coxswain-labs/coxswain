@@ -333,7 +333,7 @@ mod tests {
         let owned_gw = owned(&[("default", "gw")]);
 
         let make_route_sn_port = |section_name: Option<&str>, port: Option<i32>| {
-            use gateway_api::apis::standard::httproutes::HttpRouteSpec;
+            use crate::gw_types::v::httproutes::HttpRouteSpec;
             HttpRoute {
                 metadata: kube::api::ObjectMeta {
                     name: Some("test-route".to_string()),
@@ -341,6 +341,7 @@ mod tests {
                     ..Default::default()
                 },
                 spec: HttpRouteSpec {
+                use_default_gateways: None,
                     parent_refs: Some(vec![HttpRouteParentRefs {
                         name: "gw".to_string(),
                         namespace: Some("default".to_string()),

@@ -39,7 +39,7 @@ mod tests {
     // ── Timeout tests ────────────────────────────────────────────────────────────
 
     use coxswain_core::routing::RouteOutcome;
-    use gateway_api::apis::standard::httproutes::HttpRouteRulesTimeouts;
+    use crate::gw_types::v::httproutes::HttpRouteRulesTimeouts;
     use std::time::Duration;
 
     fn find_timeouts(
@@ -98,11 +98,12 @@ mod tests {
                 namespace: Some("default".to_string()),
                 ..Default::default()
             },
-            spec: gateway_api::apis::standard::httproutes::HttpRouteSpec {
+            spec: crate::gw_types::v::httproutes::HttpRouteSpec {
+                use_default_gateways: None,
                 parent_refs: default_parents(),
                 hostnames: Some(vec!["example.com".to_string()]),
                 rules: Some(vec![
-                    gateway_api::apis::standard::httproutes::HttpRouteRules {
+                    crate::gw_types::v::httproutes::HttpRouteRules {
                         backend_refs: Some(vec![HttpRouteRulesBackendRefs {
                             name: "svc".to_string(),
                             port: Some(80),
