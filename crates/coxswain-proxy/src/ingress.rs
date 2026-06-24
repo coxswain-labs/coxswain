@@ -59,16 +59,7 @@ impl ProxyHttp for IngressProxy {
     where
         Self::CTX: Send + Sync,
     {
-        hooks::request_filter(
-            &self.engine,
-            &self.cfg.default_timeouts,
-            &self.cfg.rate_limiter,
-            &self.cfg.auth_client,
-            &self.cfg.client_certs,
-            session,
-            ctx,
-        )
-        .await
+        hooks::request_filter(&self.engine, &self.cfg, session, ctx).await
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut ProxyCtx) -> Result<()> {
@@ -127,7 +118,7 @@ impl ProxyHttp for IngressProxy {
     where
         Self::CTX: Send + Sync,
     {
-        hooks::request_body_filter(body.as_ref(), end_of_stream, &self.cfg.auth_client, ctx)
+        hooks::request_body_filter(body.as_ref(), end_of_stream, &self.cfg, ctx)
     }
 
     async fn upstream_peer(

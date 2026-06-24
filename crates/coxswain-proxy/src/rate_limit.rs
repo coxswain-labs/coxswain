@@ -127,18 +127,21 @@ impl RateLimiterRegistry {
     /// Get the live limiter for `route_id`, rebuilding it when `config` has
     /// changed since last use.
     fn get_or_build(&self, route_id: &Arc<str>, config: &RateLimitConfig) -> Arc<KeyedLimiter> {
-        let mut entry =
-            self.inner
-                .entry(Arc::clone(route_id))
-                .or_insert_with(|| RouteLimiterEntry {
-                    config: config.clone(),
-                    limiter: Arc::new(build_limiter(config)),
-                });
-        if &entry.config != config {
-            entry.config = config.clone();
-            entry.limiter = Arc::new(build_limiter(config));
+        // Fast path: read-only lock.
+        if let Some(entry) = self.inner.get(route_id)
+            && &entry.config == config
+        {
+            return Arc::clone(&entry.limiter);
         }
-        Arc::clone(&entry.limiter)
+
+        // Slow path: construct a new limiter.
+        let new_limiter = Arc::new(build_limiter(config));
+        let entry = RouteLimiterEntry {
+            config: config.clone(),
+            limiter: Arc::clone(&new_limiter),
+        };
+        self.inner.insert(Arc::clone(route_id), entry);
+        new_limiter
     }
 }
 

@@ -251,7 +251,6 @@ impl CircuitBreakerRegistry {
         });
     }
 
-    /// Get or build the `BreakerEntry` for `(route_id, addr)`.
     fn get_or_build(
         &self,
         route_id: &Arc<str>,
@@ -259,12 +258,13 @@ impl CircuitBreakerRegistry {
         cfg: &CircuitBreakerConfig,
     ) -> Arc<BreakerEntry> {
         let key = (Arc::clone(route_id), addr);
-        Arc::clone(
-            self.inner
-                .entry(key)
-                .or_insert_with(|| Arc::new(build_entry(route_id, addr, cfg)))
-                .value(),
-        )
+        if let Some(entry) = self.inner.get(&key) {
+            return Arc::clone(entry.value());
+        }
+
+        let new_entry = Arc::new(build_entry(route_id, addr, cfg));
+        self.inner.insert(key, Arc::clone(&new_entry));
+        new_entry
     }
 }
 
