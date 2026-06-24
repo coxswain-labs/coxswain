@@ -1757,10 +1757,22 @@ async fn https_get_with_sni(
         .await
         .context("write HTTP request")?;
 
+    // Pingora closes the connection without a TLS close_notify after an error
+    // response (e.g. 421 Misdirected Request) and after any `Connection: close`
+    // reply. rustls surfaces that as `UnexpectedEof`, which `read_to_end` treats
+    // as fatal — masking the response bytes that already arrived. Real clients
+    // (reqwest, curl, browsers) tolerate this; mirror that by reading chunks and
+    // accepting `UnexpectedEof` as a clean end-of-stream once the bytes are in.
     let mut buf = Vec::new();
-    tls.read_to_end(&mut buf)
-        .await
-        .context("read HTTP response")?;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tls.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(anyhow::Error::new(e)).context("read HTTP response"),
+        }
+    }
 
     let text = String::from_utf8_lossy(&buf);
     text.split_whitespace()
