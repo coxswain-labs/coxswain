@@ -35,7 +35,7 @@ use pingora_core::apps::{HttpServerApp, ServerApp};
 use pingora_core::protocols::http::ServerSession;
 use pingora_core::protocols::l4::stream::Stream as L4Stream;
 use pingora_core::protocols::tls::server::handshake_with_callback;
-use pingora_core::protocols::{GetSocketDigest, SocketDigest};
+use pingora_core::protocols::{ALPN, GetSocketDigest, SocketDigest};
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::Service;
 use pingora_core::tls::ssl::{AlpnError, SslAcceptor, SslMethod, SslRef, select_next_proto};
@@ -663,8 +663,13 @@ fn observe_tls_handshake(result: &'static str) {
 
 /// Standard (non-PROXY-protocol) connection handler.
 ///
-/// Builds the [`pingora_core::protocols::Stream`], hands it to Pingora's
-/// [`ServerApp::process_new`] — which detects ALPN and handles h1/h2.
+/// For HTTPS connections: routes based on the ALPN selected during the TLS
+/// handshake.  ALPN h2 → [`ServerApp::process_new`] (correct: `h2c = true`
+/// in server options causes Pingora to take the h2 branch).  ALPN h1 or no
+/// ALPN → [`HttpServerApp::process_new_http`] keepalive loop (bypasses
+/// Pingora's h2c detection, which malfunctions on TLS streams that do not
+/// support read-and-rewind peeking).  For plain HTTP: [`ServerApp::process_new`]
+/// with `h2c = true` — peeking works on L4 streams, h2c detection is correct.
 async fn handle_standard<P>(
     tcp: TcpStream,
     protocol: ListenerProtocol,
@@ -683,7 +688,7 @@ async fn handle_standard<P>(
         tcp.as_raw_fd()
     };
 
-    let stream: pingora_core::protocols::Stream = match protocol {
+    match protocol {
         ListenerProtocol::Https => {
             let tls_ctx = match build_tls_context(&tls_selector, true) {
                 Ok(ctx) => ctx,
@@ -694,29 +699,62 @@ async fn handle_standard<P>(
             };
             let mut l4: L4Stream = tcp.into();
             l4.set_socket_digest(SocketDigest::from_raw_fd(raw_fd));
-            match handshake_with_callback(&tls_ctx.acceptor, l4, tls_ctx.callbacks.as_ref()).await {
-                Ok(tls_stream) => {
-                    observe_tls_handshake("ok");
-                    Box::new(tls_stream)
+            let stream: pingora_core::protocols::Stream =
+                match handshake_with_callback(&tls_ctx.acceptor, l4, tls_ctx.callbacks.as_ref())
+                    .await
+                {
+                    Ok(tls_stream) => {
+                        observe_tls_handshake("ok");
+                        Box::new(tls_stream)
+                    }
+                    Err(e) => {
+                        observe_tls_handshake("fail");
+                        tracing::debug!(error = %e, "TLS handshake failed");
+                        return;
+                    }
+                };
+            // `h2c = true` in the proxy's `HttpServerOptions` causes Pingora's
+            // `process_new` to remain in h2 mode for TLS streams even when ALPN
+            // did NOT negotiate h2.  TLS streams return `Ok(false)` from
+            // `try_peek` (no read-and-rewind support), so the h2c preface check
+            // is skipped and h2c stays true — Pingora then attempts an h2
+            // handshake regardless of what ALPN actually selected.
+            //
+            // Fix: route based on the ALPN selection we know from the TLS
+            // handshake.  When the client negotiated h2 via ALPN, process_new
+            // is correct (h2c=true causes the h2 branch, which matches what
+            // ALPN said).  For h1 clients (or clients that sent no ALPN at
+            // all), bypass process_new and run the h1 keepalive loop directly —
+            // the same pattern used by `handle_proxy_protocol`.
+            match stream.selected_alpn_proto() {
+                Some(ALPN::H2) => {
+                    let _ = proxy.process_new(stream, &conn_shutdown).await;
                 }
-                Err(e) => {
-                    observe_tls_handshake("fail");
-                    tracing::debug!(error = %e, "TLS handshake failed");
-                    return;
+                _ => {
+                    let mut session = ServerSession::new_http1(stream);
+                    session.set_keepalive(Some(60));
+                    let mut session = Some(session);
+                    while let Some(current) = session.take() {
+                        match proxy.process_new_http(current, &conn_shutdown).await {
+                            Some(reused) => {
+                                let (s, _) = reused.consume();
+                                session = Some(ServerSession::new_http1(s));
+                            }
+                            None => break,
+                        }
+                    }
                 }
             }
         }
         ListenerProtocol::Http => {
             let mut l4 = L4Stream::from(tcp);
             l4.set_socket_digest(SocketDigest::from_raw_fd(raw_fd));
-            Box::new(l4)
+            let stream: pingora_core::protocols::Stream = Box::new(l4);
+            // `process_new` handles h2c detection (peek + rewind on L4 streams
+            // works correctly), ALPN, keepalive, and shutdown.
+            let _ = proxy.process_new(stream, &conn_shutdown).await;
         }
-    };
-
-    // `process_new` handles ALPN detection (h1/h2), keepalive, and shutdown
-    // internally.  `conn_shutdown` is the per-listener shutdown watch — when
-    // fired, Pingora stops accepting keepalive requests on this connection.
-    let _ = proxy.process_new(stream, &conn_shutdown).await;
+    }
 }
 
 /// Aggregated inputs for the PROXY-protocol connection handler, grouping the
