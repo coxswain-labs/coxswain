@@ -105,3 +105,70 @@ pub(crate) async fn try_redirect(
     }
     Ok(false)
 }
+
+/// If `filters` contains a `Cors` filter AND the request is a preflight `OPTIONS`
+/// (identified by the presence of `Access-Control-Request-Method`) AND the request
+/// origin matches the allow-list, write a `204 No Content` with the CORS allow-headers
+/// and return `true`. Returns `false` in every other case (no CORS filter, wrong
+/// method, no `Origin`, origin not allowed).
+///
+/// Must be called after routing is resolved but before forwarding to the upstream,
+/// so that the upstream backend is never contacted for preflight requests.
+///
+/// # Errors
+/// Propagates Pingora I/O errors from response-header construction.
+pub(crate) async fn try_cors_preflight(
+    session: &mut Session,
+    filters: &[FilterAction],
+    cors_origin: Option<&str>,
+) -> Result<bool> {
+    let Some(origin_str) = cors_origin else {
+        return Ok(false);
+    };
+    {
+        let req = session.req_header();
+        if req.method != http::Method::OPTIONS {
+            return Ok(false);
+        }
+        if req
+            .headers
+            .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+            .is_none()
+        {
+            // Not a real preflight (OPTIONS without ACRM is a regular request).
+            return Ok(false);
+        }
+    }
+    for f in filters {
+        if let FilterAction::Cors(cfg) = f {
+            let Some(allow_origin) = cfg.resolve_origin(origin_str) else {
+                // Origin present but not in the allow-list — let the request proceed;
+                // the browser enforces the CORS policy based on the absent response header.
+                return Ok(false);
+            };
+            let mut resp = ResponseHeader::build(204, Some(4))?;
+            resp.insert_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin)?;
+            if cfg.allow_credentials {
+                resp.insert_header(
+                    header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                    http::HeaderValue::from_static("true"),
+                )?;
+            }
+            if let Some(methods) = &cfg.allow_methods {
+                resp.insert_header(header::ACCESS_CONTROL_ALLOW_METHODS, methods.clone())?;
+            }
+            if let Some(headers) = &cfg.allow_headers {
+                resp.insert_header(header::ACCESS_CONTROL_ALLOW_HEADERS, headers.clone())?;
+            }
+            resp.insert_header(header::ACCESS_CONTROL_MAX_AGE, cfg.max_age.clone())?;
+            session
+                .write_response_header(Box::new(resp), true)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!("failed to write CORS preflight response: {e}")
+                });
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}

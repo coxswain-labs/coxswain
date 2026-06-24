@@ -33,7 +33,7 @@ use super::affinity;
 use super::ctx::{CONN_INFO, MirrorDispatch, ProxyCtx, ResolvedRoute};
 use super::engine::RoutingEngine;
 use super::filter::TrafficFilter;
-use super::outcome::{merge_timeouts, resolve_outcome, try_redirect};
+use super::outcome::{merge_timeouts, resolve_outcome, try_cors_preflight, try_redirect};
 use super::redirect::extract_host;
 use crate::auth;
 use crate::config::AccessLogPathMode;
@@ -103,6 +103,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             lb_track: None,
             hash_key: None,
             circuit_breaker_rejected: false,
+            cors_origin: None,
         })
         .unwrap_or_default()
 }
@@ -130,6 +131,13 @@ pub(crate) async fn request_filter<K>(
     let host: Arc<str> = Arc::from(extract_host(req));
     let path: Arc<str> = Arc::from(req.uri.path());
     let query = req.uri.query().map(str::to_string);
+    // Capture Origin early, before the session is mutably borrowed for response writing
+    // (CORS preflight and response-header injection both need the value).
+    ctx.cors_origin = req
+        .headers
+        .get(http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(Box::from);
     // PROXY-protocol path sets real_client_proto directly; standard Pingora TLS path
     // does not set CONN_INFO, so fall back to inspecting the session's TLS digest.
     let proto = ctx.real_client_proto.unwrap_or_else(|| {
@@ -331,6 +339,12 @@ pub(crate) async fn request_filter<K>(
 
     let timeouts = merge_timeouts(&m.timeouts, &cfg.default_timeouts);
     ctx.request_deadline = timeouts.request.map(|d| Instant::now() + d);
+
+    // CORS preflight short-circuit (GEP-1767, #41).
+    // OPTIONS + Access-Control-Request-Method with a matched Origin → 204, no upstream.
+    if try_cors_preflight(session, &m.filters, ctx.cors_origin.as_deref()).await? {
+        return Ok(true);
+    }
 
     if try_redirect(
         session,
@@ -1266,7 +1280,11 @@ pub(crate) async fn upstream_response_filter(
     ctx: &mut ProxyCtx,
 ) -> Result<()> {
     if let Some(resolved) = &ctx.resolved {
-        TrafficFilter::apply_response_filters(upstream_response, &resolved.filters);
+        TrafficFilter::apply_response_filters(
+            upstream_response,
+            &resolved.filters,
+            ctx.cors_origin.as_deref(),
+        );
     }
 
     // Session affinity (cookie mode): when a fresh pin was established this request,
