@@ -1835,7 +1835,9 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let no_class_defaults = HashMap::new();
-        IngressReconciler::reconcile(
+        // Diagnostics return ignored: these tests assert on the built routing
+        // table, not the forwarded annotation issues.
+        let _ = IngressReconciler::reconcile(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -1867,7 +1869,9 @@ mod tests {
         );
         let mut builder = RoutingTableBuilder::new();
         let no_class_defaults = HashMap::new();
-        IngressReconciler::reconcile(
+        // Diagnostics return ignored: these tests assert on the built routing
+        // table, not the forwarded annotation issues.
+        let _ = IngressReconciler::reconcile(
             &ingress,
             &store,
             &empty_svc_store(),
@@ -2459,7 +2463,9 @@ mod tests {
         let mut builder = IngressRoutingTableBuilder::new();
         // Reconcile with BOTH HTTP (80) and HTTPS (443) ports active.
         let no_class_defaults = HashMap::new();
-        IngressReconciler::reconcile(
+        // Diagnostics return ignored: these tests assert on the built routing
+        // table, not the forwarded annotation issues.
+        let _ = IngressReconciler::reconcile(
             &ing,
             &store,
             &svcs,
