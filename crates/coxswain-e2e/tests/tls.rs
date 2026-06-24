@@ -26,6 +26,7 @@ use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Api;
 use kube::api::PostParams;
+use reqwest::Version;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1536,6 +1537,125 @@ async fn backend_tls_policy_cross_namespace_ca_fails_gracefully() -> anyhow::Res
     // Right now, it'll fail or result in 502 Bad Gateway due to missing CA bundle resolution.
     let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-tls");
+
+    Ok(())
+}
+
+/// Verifies that HTTPS clients negotiate HTTP/2 via ALPN with the proxy (#32).
+///
+/// The proxy advertises `h2` and `http/1.1` in its TLS ALPN extension.  A
+/// TLS client that supports h2 must receive an HTTP/2 response — confirmed by
+/// `resp.version() == HTTP_2`.
+#[tokio::test]
+async fn h2_negotiated_over_tls_via_alpn() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-h2-alpn").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host_a = format!("h2-alpn-a.{}.local", ns.name);
+    let host_b = format!("h2-alpn-b.{}.local", ns.name); // required by the two-listener fixture
+    let cert_a = GeneratedCert::for_host(&host_a);
+    let cert_b = GeneratedCert::for_host(&host_b);
+
+    fixtures::apply_fixture(
+        gwa::TLS_TERMINATION,
+        FixtureVars::new(&ns.name)
+            .with("LISTENER_A_HOSTNAME", &host_a)
+            .with("LISTENER_B_HOSTNAME", &host_b)
+            .with("SECRET_A_NAME", "cert-h2-a")
+            .with("SECRET_B_NAME", "cert-h2-b")
+            .with("TLS_CRT_A_B64", cert_a.cert_b64())
+            .with("TLS_KEY_A_B64", cert_a.key_b64())
+            .with("TLS_CRT_B_B64", cert_b.cert_b64())
+            .with("TLS_KEY_B_B64", cert_b.key_b64()),
+    )
+    .await?;
+
+    // Wait for the HTTPS route to be live (uses a plain h1 client internally).
+    wait::wait_for_https_route(h.gateway_tls_addr, &host_a, "/", Duration::from_secs(60)).await?;
+
+    // Build an h2-capable TLS client (no .http1_only()) — reqwest with rustls will
+    // negotiate h2 via ALPN when the server offers it.
+    let gw_tls = h.gateway_tls_addr;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .resolve(&host_a, gw_tls)
+        .build()?;
+    let url = format!("https://{}:{}/", host_a, gw_tls.port());
+    let resp = client.get(&url).send().await?;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "HTTPS h2 request must return 200"
+    );
+    assert_eq!(
+        resp.version(),
+        Version::HTTP_2,
+        "proxy must negotiate HTTP/2 via ALPN for a TLS client that offers h2"
+    );
+
+    Ok(())
+}
+
+/// Verifies that HTTPS clients that prefer HTTP/1.1 are still served correctly
+/// after h2 ALPN is added (#32 backward compatibility).
+///
+/// A client calling `.http1_only()` sends no `h2` ALPN extension.  The proxy
+/// must fall back to HTTP/1.1 and serve the request normally.
+#[tokio::test]
+async fn h1_over_tls_served_when_client_prefers_h1() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-h1-alpn").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host_a = format!("h1-alpn-a.{}.local", ns.name);
+    let host_b = format!("h1-alpn-b.{}.local", ns.name);
+    let cert_a = GeneratedCert::for_host(&host_a);
+    let cert_b = GeneratedCert::for_host(&host_b);
+
+    fixtures::apply_fixture(
+        gwa::TLS_TERMINATION,
+        FixtureVars::new(&ns.name)
+            .with("LISTENER_A_HOSTNAME", &host_a)
+            .with("LISTENER_B_HOSTNAME", &host_b)
+            .with("SECRET_A_NAME", "cert-h1-a")
+            .with("SECRET_B_NAME", "cert-h1-b")
+            .with("TLS_CRT_A_B64", cert_a.cert_b64())
+            .with("TLS_KEY_A_B64", cert_a.key_b64())
+            .with("TLS_CRT_B_B64", cert_b.cert_b64())
+            .with("TLS_KEY_B_B64", cert_b.key_b64()),
+    )
+    .await?;
+
+    wait::wait_for_https_route(h.gateway_tls_addr, &host_a, "/", Duration::from_secs(60)).await?;
+
+    // Force h1: the ALPN callback must not select h2 when the client doesn't offer it.
+    let gw_tls = h.gateway_tls_addr;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .http1_only()
+        .resolve(&host_a, gw_tls)
+        .build()?;
+    let url = format!("https://{}:{}/", host_a, gw_tls.port());
+    let resp = client.get(&url).send().await?;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "HTTPS h1 request must return 200"
+    );
+    assert_eq!(
+        resp.version(),
+        Version::HTTP_11,
+        "proxy must fall back to HTTP/1.1 when client does not offer h2 in ALPN"
+    );
 
     Ok(())
 }

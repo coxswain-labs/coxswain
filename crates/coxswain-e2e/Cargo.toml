@@ -24,10 +24,11 @@ gateway-api = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 rcgen = { workspace = true }
+# `http2` adds h2c (.http2_prior_knowledge()) and h2-over-TLS ALPN support.
 # `stream` adds reqwest::Body::wrap_stream, used to send an unknown-length
 # (chunked, no Content-Length) request body that exercises the proxy's mid-stream
 # max-body-size cap. Merged with the workspace reqwest feature set.
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["http2", "stream"] }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

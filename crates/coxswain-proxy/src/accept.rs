@@ -13,12 +13,16 @@
 //!
 //! # Protocol support
 //!
-//! - **Plain HTTP and HTTPS (SNI-TLS)**: handled via Pingora's
-//!   [`ServerApp::process_new`], which detects ALPN and supports both
-//!   HTTP/1.1 and HTTP/2 transparently.
+//! - **Plain HTTP**: h1 and h2c (prior-knowledge) handled via Pingora's
+//!   [`ServerApp::process_new`].  h2c prior-knowledge is always enabled —
+//!   the detection is a non-destructive peek; HTTP/1.1 clients are unaffected.
+//! - **HTTPS (SNI-TLS)**: h1 and h2 via ALPN negotiation.  The acceptor
+//!   advertises `h2` and `http/1.1`; TLS clients that don't offer `h2` fall
+//!   back to HTTP/1.1.
 //! - **HAProxy PROXY protocol** (opt-in via `--proxy-accept-proxy-protocol`):
 //!   header is parsed before TLS and upstream dispatch; HTTP/1.1 only on this
-//!   path (existing behaviour; not regressed by this rewrite).
+//!   path (h2c detection and h2 ALPN are disabled for PROXY-wrapped
+//!   connections; see issue #32 for the follow-up).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -34,7 +38,7 @@ use pingora_core::protocols::tls::server::handshake_with_callback;
 use pingora_core::protocols::{GetSocketDigest, SocketDigest};
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::Service;
-use pingora_core::tls::ssl::{SslAcceptor, SslMethod};
+use pingora_core::tls::ssl::{AlpnError, SslAcceptor, SslMethod, SslRef, select_next_proto};
 use pingora_proxy::{HttpProxy, ProxyHttp};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
@@ -195,11 +199,15 @@ where
         drain_timeout: Duration,
     ) -> Result<Self, AcceptorBuildError> {
         // Validate the TLS acceptor eagerly so bind failures surface before runtime.
+        // ALPN h2 advertisement only applies to the standard path (`handle_standard`);
+        // the PROXY-protocol path (`handle_proxy_protocol`) runs an h1-only keepalive
+        // loop so we must not advertise h2 there.
+        let advertise_h2 = trusted.is_none();
         if initial_specs
             .iter()
             .any(|s| s.protocol == ListenerProtocol::Https)
         {
-            build_tls_context(&tls_selector)?;
+            build_tls_context(&tls_selector, advertise_h2)?;
         }
 
         Ok(Self {
@@ -677,7 +685,7 @@ async fn handle_standard<P>(
 
     let stream: pingora_core::protocols::Stream = match protocol {
         ListenerProtocol::Https => {
-            let tls_ctx = match build_tls_context(&tls_selector) {
+            let tls_ctx = match build_tls_context(&tls_selector, true) {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build TLS context; dropping connection");
@@ -770,7 +778,7 @@ async fn handle_proxy_protocol<P>(
 
     let stream: pingora_core::protocols::Stream = match protocol {
         ListenerProtocol::Https => {
-            let tls_ctx = match build_tls_context(&conn.tls_selector) {
+            let tls_ctx = match build_tls_context(&conn.tls_selector, false) {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build TLS context; dropping PROXY connection");
@@ -827,9 +835,27 @@ struct TlsContext {
     callbacks: Arc<pingora_core::listeners::TlsAcceptCallbacks>,
 }
 
-fn build_tls_context(selector: &SniCertSelector) -> Result<TlsContext, AcceptorBuildError> {
-    let builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
+/// Build a TLS acceptor for an HTTPS listener.
+///
+/// When `advertise_h2` is `true`, the acceptor registers an ALPN-select
+/// callback that prefers `h2` over `http/1.1`, enabling transparent HTTP/2
+/// negotiation with TLS clients.  Pass `false` for the PROXY-protocol path,
+/// which runs an h1-only keepalive loop and must not advertise h2.
+fn build_tls_context(
+    selector: &SniCertSelector,
+    advertise_h2: bool,
+) -> Result<TlsContext, AcceptorBuildError> {
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
         .map_err(|e| AcceptorBuildError::TlsAcceptorBuild(e.to_string()))?;
+    if advertise_h2 {
+        builder.set_alpn_select_callback(
+            |_ssl: &mut SslRef, client: &[u8]| -> Result<&[u8], AlpnError> {
+                // Wire-format: length-prefixed list — "\x02h2\x08http/1.1"
+                // prefers h2 and falls back to http/1.1.
+                select_next_proto(b"\x02h2\x08http/1.1", client).ok_or(AlpnError::NOACK)
+            },
+        );
+    }
     let callbacks: pingora_core::listeners::TlsAcceptCallbacks = Box::new(selector.clone());
     Ok(TlsContext {
         acceptor: Arc::new(builder.build()),

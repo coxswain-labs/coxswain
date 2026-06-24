@@ -65,10 +65,8 @@ func TestConformance(t *testing.T) {
 		features.SupportHTTPRouteDestinationPortMatching,
 		// Extended: per-port listener routing (#82, #98)
 		features.SupportHTTPRouteParentRefPort,
-		// Extended: backend protocol selection — GEP-1911 (#90)
-		// SupportHTTPRouteBackendProtocolH2C requires the proxy to accept h2c
-		// connections from clients, not just use h2c on the upstream leg.
-		// Deferred until downstream h2c is implemented — see #32.
+		// Extended: backend protocol selection — GEP-1911 (#90, #32)
+		features.SupportHTTPRouteBackendProtocolH2C,
 		features.SupportHTTPRouteBackendProtocolWebSocket,
 		// Core: BackendTLSPolicy — GEP-1897 (#16)
 		// SupportBackendTLSPolicySANValidation is Extended and not yet implemented.

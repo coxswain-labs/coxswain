@@ -13,9 +13,11 @@
 //! Covers: path/host/header/method/query matching, weighted split, named-port,
 //! default-backend, default IngressClass, wildcard hosts, cross-namespace +
 //! ReferenceGrant, endpoint serving-state exclusion, parent-ref port scoping,
-//! HTTPRoute filters, request/backend timeouts, and the rewrite-target
-//! annotation. TLS lives in `tls.rs`; traffic-policy knobs in `traffic_policy.rs`.
+//! HTTPRoute filters, request/backend timeouts, rewrite-target annotation, and
+//! downstream HTTP/2 (h2c prior-knowledge and h1 backward compatibility).
+//! TLS lives in `tls.rs`; traffic-policy knobs in `traffic_policy.rs`.
 
+use anyhow::Context as _;
 use coxswain_e2e::{
     ControllerOptions, ControllerProcess, FixtureVars, Harness, HttpClient, IngressClassGuard,
     NamespaceGuard, bootstrap,
@@ -29,6 +31,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Api;
 use kube::api::{DeleteParams, PostParams};
 use reqwest::Method;
+use reqwest::Version;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -1745,6 +1748,73 @@ async fn gateway_route_encoded_dot_segment_resolved_by_default() -> anyhow::Resu
         Some("/v1"),
         "Gateway HTTPRoute: upstream must see /v1 after dot-segment removal from /api/%2E%2E/v1"
     );
+
+    Ok(())
+}
+
+/// Verifies downstream HTTP/2 cleartext (h2c, prior-knowledge) support (#32).
+///
+/// A client that sends the h2c connection preface on a plain-TCP listener must
+/// have its request routed to the backend and receive an HTTP/2 response.  The
+/// detection is non-destructive: HTTP/1.1 clients on the same listener are
+/// unaffected (verified by [`h1_client_unaffected_when_h2c_active`]).
+#[tokio::test]
+async fn h2c_prior_knowledge_request_reaches_backend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-h2c-dk").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("echo.{}.local", ns.name);
+    // Wait for the route to be live before issuing the h2c request.
+    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+
+    // Build a client that sends h2c prior-knowledge (PRI * HTTP/2.0... preface).
+    let gw_addr = h.controller.gateway_http_addr;
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .timeout(Duration::from_secs(5))
+        .resolve(&host, gw_addr)
+        .build()?;
+    let url = format!("http://{}:{}/a", host, gw_addr.port());
+    let resp = client.get(&url).send().await?;
+
+    assert_eq!(resp.status().as_u16(), 200, "h2c request must return 200");
+    assert_eq!(
+        resp.version(),
+        Version::HTTP_2,
+        "proxy must negotiate HTTP/2 for a client using h2c prior-knowledge"
+    );
+    let body = resp
+        .json::<http::EchoResponse>()
+        .await
+        .context("parse echo response")?;
+    body.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// Verifies that HTTP/1.1 clients reach the backend normally on a listener that
+/// also accepts h2c prior-knowledge (#32 backward compatibility).
+///
+/// h2c detection is a non-destructive peek — an HTTP/1.1 request does not start
+/// with the h2c connection preface, so the proxy falls through to HTTP/1.1
+/// handling without any disruption.
+#[tokio::test]
+async fn h1_client_unaffected_when_h2c_active() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-h1-h2c").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("echo.{}.local", ns.name);
+    // Standard HTTP/1.1 client — same path as all other routing tests.
+    let resp = wait::wait_for_route(&h.gateway_http, &host, "/a", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
 
     Ok(())
 }
