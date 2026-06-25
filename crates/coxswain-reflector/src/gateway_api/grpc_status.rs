@@ -1,276 +1,175 @@
-//! Computes the `ResolvedRefs` and `Accepted` health for each (GRPCRoute, parent) pair.
-//!
-//! Sibling of `status.rs` — copied and adapted for the `GRPCRoute` concrete type.
-//! No shared abstraction with the HTTPRoute path per the issue's no-generic constraint.
+//! [`RouteLike`] impl for `GRPCRoute` — the GRPCRoute-specific projections and
+//! filter predicate. The kind-generic `Accepted`/`ResolvedRefs` algorithm lives
+//! in [`super::route_health`]; this realizes the abstraction issue #33 deferred
+//! until the second concrete route kind existed.
 
-use crate::gateway_api::hostnames::hostnames_intersect;
-use crate::gw_types::v::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom};
+use super::route_health::{BackendRefView, ParentRefView, RouteLike};
 use crate::gw_types::v::grpcroutes::{GRPCRoute, GrpcRouteRulesFiltersType};
-use crate::keys::RouteParentKey;
-use crate::tls::{HttpRouteHealthMap, RouteParentHealth};
-use coxswain_core::ownership::ObjectKey;
-use coxswain_core::reference_grants::{self, ReferenceGrantKey};
-use k8s_openapi::api::core::v1::Service;
-use kube::runtime::reflector;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
-struct ListenerEntry {
-    name: String,
-    hostname: String,
-    allows_all: bool,
-    port: u16,
-}
+impl RouteLike for GRPCRoute {
+    fn route_namespace(&self) -> Option<&str> {
+        self.metadata.namespace.as_deref()
+    }
 
-struct ListenerHnEntry {
-    name: String,
-    hostname: String,
-    port: u16,
-}
+    fn route_name(&self) -> Option<&str> {
+        self.metadata.name.as_deref()
+    }
 
-type ListenerHnMap = HashMap<ObjectKey, Vec<ListenerHnEntry>>;
-
-/// Computes `Accepted` and `ResolvedRefs` health for every (GRPCRoute, parent) pair
-/// that references an owned gateway.
-pub(super) fn compute_route_health(
-    routes: &[Arc<GRPCRoute>],
-    gateways: &[Arc<Gateway>],
-    owned_gateways: &HashSet<ObjectKey>,
-    backend_grants: &HashSet<ReferenceGrantKey>,
-    service_store: &reflector::Store<Service>,
-) -> HttpRouteHealthMap {
-    let gw_listeners: HashMap<ObjectKey, Vec<ListenerEntry>> = gateways
-        .iter()
-        .filter_map(|gw| {
-            let ns = gw.metadata.namespace.as_deref()?.to_string();
-            let name = gw.metadata.name.as_deref()?.to_string();
-            let key = ObjectKey::new(&ns, &name);
-            if !owned_gateways.contains(&key) {
-                return None;
-            }
-            let listeners = gw
-                .spec
-                .listeners
-                .iter()
-                .map(|l| {
-                    let allows_all = l
-                        .allowed_routes
-                        .as_ref()
-                        .and_then(|ar| ar.namespaces.as_ref())
-                        .and_then(|ns| ns.from.as_ref())
-                        .map(|f| !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same))
-                        .unwrap_or(false);
-                    ListenerEntry {
-                        name: l.name.clone(),
-                        hostname: l.hostname.as_deref().unwrap_or("").to_string(),
-                        allows_all,
-                        port: l.port as u16,
-                    }
-                })
-                .collect();
-            Some((key, listeners))
-        })
-        .collect();
-
-    let mut map = HttpRouteHealthMap::new();
-
-    for route in routes {
-        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-        let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
-        let route_hostnames: Vec<&str> = route
-            .spec
+    fn route_hostnames(&self) -> Vec<&str> {
+        self.spec
             .hostnames
             .as_deref()
             .unwrap_or(&[])
             .iter()
             .map(String::as_str)
-            .collect();
+            .collect()
+    }
 
-        for pr in route.spec.parent_refs.as_deref().unwrap_or(&[]) {
-            let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
-            let gw_name = pr.name.as_str();
-            let gw_key = ObjectKey::new(gw_ns, gw_name);
+    fn route_parent_refs(&self) -> Vec<ParentRefView<'_>> {
+        self.spec
+            .parent_refs
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|pr| ParentRefView {
+                namespace: pr.namespace.as_deref(),
+                name: pr.name.as_str(),
+                section_name: pr.section_name.as_deref(),
+                port: pr.port.map(|p| p as u16),
+            })
+            .collect()
+    }
 
-            if !owned_gateways.contains(&gw_key) {
-                continue;
-            }
+    fn has_unsupported_filter(&self) -> bool {
+        self.spec.rules.as_deref().unwrap_or(&[]).iter().any(|r| {
+            r.filters.as_deref().unwrap_or(&[]).iter().any(|f| {
+                matches!(
+                    f.r#type,
+                    GrpcRouteRulesFiltersType::RequestMirror
+                        | GrpcRouteRulesFiltersType::ExtensionRef
+                )
+            })
+        })
+    }
 
-            let section = pr.section_name.as_deref().unwrap_or("").to_string();
-            let health_key =
-                RouteParentKey::new(route_ns, route_name, gw_ns, gw_name, section.clone());
-
-            if gw_ns != route_ns {
-                let blocked = gw_listeners.get(&gw_key).is_some_and(|ls| {
-                    let relevant: Vec<_> = if section.is_empty() {
-                        ls.iter().collect()
-                    } else {
-                        ls.iter().filter(|l| l.name.as_str() == section).collect()
-                    };
-                    !relevant.is_empty() && relevant.iter().all(|l| !l.allows_all)
+    fn health_backend_refs(&self) -> Vec<BackendRefView<'_>> {
+        // GRPCRoute has no RequestRedirect filter, so (unlike HTTPRoute) no rule
+        // is skipped — every rule's backend refs are validated.
+        let mut out = Vec::new();
+        for rule in self.spec.rules.as_deref().unwrap_or(&[]) {
+            for b in rule.backend_refs.as_deref().unwrap_or(&[]) {
+                out.push(BackendRefView {
+                    kind: b.kind.as_deref().unwrap_or("Service"),
+                    group: b.group.as_deref().unwrap_or(""),
+                    namespace: b.namespace.as_deref(),
+                    name: &b.name,
+                    has_port: b.port.is_some(),
                 });
-                if blocked {
-                    map.insert(
-                        health_key,
-                        RouteParentHealth {
-                            accepted: false,
-                            accepted_reason: "NotAllowedByListeners",
-                            resolved_refs: true,
-                            resolved_refs_reason: "ResolvedRefs",
-                        },
-                    );
-                    continue;
-                }
             }
+        }
+        out
+    }
+}
 
-            let listeners_hn: ListenerHnMap = std::iter::once((
-                gw_key.clone(),
-                gw_listeners
-                    .get(&gw_key)
-                    .map(|ls| {
-                        ls.iter()
-                            .map(|l| ListenerHnEntry {
-                                name: l.name.clone(),
-                                hostname: l.hostname.clone(),
-                                port: l.port,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+#[cfg(test)]
+mod tests {
+    use crate::gateway_api::route_health::compute_route_health;
+    use crate::gw_types::GrpcRoute;
+    use crate::gw_types::v::gateways::{Gateway, GatewayListeners, GatewaySpec};
+    use crate::gw_types::v::grpcroutes::{
+        GrpcRouteParentRefs, GrpcRouteRules, GrpcRouteRulesBackendRefs, GrpcRouteSpec,
+    };
+    use crate::keys::RouteParentKey;
+    use coxswain_core::ownership::ObjectKey;
+    use coxswain_core::reference_grants::ReferenceGrantKey;
+    use k8s_openapi::api::core::v1::Service;
+    use kube::api::ObjectMeta;
+    use kube::runtime::{reflector, watcher};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    /// Smoke test for the GRPCRoute [`RouteLike`] impl exercising the shared
+    /// engine end-to-end (the bulk of the algorithm is covered by the HTTPRoute
+    /// tests in `status.rs`; this confirms the GRPC projections wire up).
+    #[test]
+    fn grpc_route_with_owned_gateway_is_accepted_and_resolved() {
+        let gw = Arc::new(Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "coxswain".to_string(),
+                listeners: vec![GatewayListeners {
+                    name: "grpc".to_string(),
+                    protocol: "HTTP".to_string(),
+                    port: 80,
+                    hostname: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            status: None,
+        });
+
+        let route = Arc::new(GrpcRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GrpcRouteSpec {
+                parent_refs: Some(vec![GrpcRouteParentRefs {
+                    name: "gw".to_string(),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                }]),
+                rules: Some(vec![GrpcRouteRules {
+                    backend_refs: Some(vec![GrpcRouteRulesBackendRefs {
+                        name: "svc".to_string(),
+                        port: Some(80),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut w = reflector::store::Writer::<Service>::default();
+        w.apply_watcher_event(&watcher::Event::Apply(Service {
+            metadata: ObjectMeta {
+                name: Some("svc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let services = w.as_reader();
+
+        let owned: HashSet<ObjectKey> = std::iter::once(ObjectKey::new("default", "gw")).collect();
+        let map = compute_route_health(
+            &[route],
+            &[gw],
+            &owned,
+            &HashSet::<ReferenceGrantKey>::new(),
+            &services,
+        );
+
+        let h = map
+            .get(&RouteParentKey::new(
+                "default",
+                "route",
+                "default",
+                "gw",
+                String::new(),
             ))
-            .collect();
-
-            let (mut accepted, mut accepted_reason) = compute_accepted(
-                &route_hostnames,
-                &section,
-                pr.port.map(|p| p as u16),
-                &gw_key,
-                &listeners_hn,
-            );
-
-            if accepted {
-                let has_unsupported = route.spec.rules.as_deref().unwrap_or(&[]).iter().any(|r| {
-                    r.filters.as_deref().unwrap_or(&[]).iter().any(|f| {
-                        matches!(
-                            f.r#type,
-                            GrpcRouteRulesFiltersType::RequestMirror
-                                | GrpcRouteRulesFiltersType::ExtensionRef
-                        )
-                    })
-                });
-                if has_unsupported {
-                    accepted = false;
-                    accepted_reason = "UnsupportedValue";
-                }
-            }
-
-            let (resolved_refs, resolved_refs_reason) = if accepted {
-                check_backend_refs(route, route_ns, backend_grants, service_store)
-            } else {
-                (true, "ResolvedRefs")
-            };
-
-            map.insert(
-                health_key,
-                RouteParentHealth {
-                    resolved_refs,
-                    resolved_refs_reason,
-                    accepted,
-                    accepted_reason,
-                },
-            );
-        }
+            .expect("health entry for the (route, parent) pair");
+        assert!(h.accepted, "expected Accepted=true");
+        assert_eq!(h.accepted_reason, "Accepted");
+        assert!(h.resolved_refs);
+        assert_eq!(h.resolved_refs_reason, "ResolvedRefs");
     }
-
-    map
-}
-
-fn compute_accepted(
-    route_hostnames: &[&str],
-    section_name: &str,
-    port: Option<u16>,
-    gw_key: &ObjectKey,
-    gw_listeners: &ListenerHnMap,
-) -> (bool, &'static str) {
-    let Some(listeners) = gw_listeners.get(gw_key) else {
-        return (true, "Accepted");
-    };
-
-    if !section_name.is_empty() {
-        let matching: Vec<&ListenerHnEntry> = listeners
-            .iter()
-            .filter(|l| l.name == section_name)
-            .collect();
-        if matching.is_empty() {
-            return (false, "NoMatchingParent");
-        }
-        if let Some(p) = port
-            && !matching.iter().any(|l| l.port == p)
-        {
-            return (false, "NoMatchingParent");
-        }
-        let intersects = matching
-            .iter()
-            .any(|l| hostnames_intersect(route_hostnames, &l.hostname));
-        return if intersects {
-            (true, "Accepted")
-        } else {
-            (false, "NoMatchingListenerHostname")
-        };
-    }
-
-    let port_filtered: Vec<&ListenerHnEntry> = if let Some(p) = port {
-        listeners.iter().filter(|l| l.port == p).collect()
-    } else {
-        listeners.iter().collect()
-    };
-
-    if port.is_some() && port_filtered.is_empty() {
-        return (false, "NoMatchingParent");
-    }
-
-    let intersects = port_filtered
-        .iter()
-        .any(|l| hostnames_intersect(route_hostnames, &l.hostname));
-    if intersects {
-        (true, "Accepted")
-    } else {
-        (false, "NoMatchingListenerHostname")
-    }
-}
-
-/// Checks all backend refs in a GRPCRoute for validity.
-///
-/// Returns `(resolved_refs, reason)` — `resolved_refs=true` means all backends valid.
-pub(super) fn check_backend_refs(
-    route: &GRPCRoute,
-    route_ns: &str,
-    backend_grants: &HashSet<ReferenceGrantKey>,
-    service_store: &reflector::Store<Service>,
-) -> (bool, &'static str) {
-    for rule in route.spec.rules.as_deref().unwrap_or(&[]) {
-        for b in rule.backend_refs.as_deref().unwrap_or(&[]) {
-            let b_kind = b.kind.as_deref().unwrap_or("Service");
-            let b_group = b.group.as_deref().unwrap_or("");
-
-            if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
-                return (false, "InvalidKind");
-            }
-
-            let b_ns = b.namespace.as_deref().unwrap_or(route_ns);
-
-            if b_ns != route_ns
-                && !reference_grants::backend_ref_allowed(route_ns, b_ns, &b.name, backend_grants)
-            {
-                return (false, "RefNotPermitted");
-            }
-
-            if b.port.is_some() {
-                let svc_key = reflector::ObjectRef::<Service>::new(&b.name).within(b_ns);
-                if service_store.get(&svc_key).is_none() {
-                    return (false, "BackendNotFound");
-                }
-            }
-        }
-    }
-    (true, "ResolvedRefs")
 }
