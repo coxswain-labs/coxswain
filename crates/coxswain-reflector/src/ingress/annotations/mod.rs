@@ -5,7 +5,9 @@
 //! - [`traffic_policy`] — timeout, retry, and backend-protocol annotations.
 //! - [`routing`] — path rewrite and regex opt-in annotations.
 //! - [`filters`] — request/response header modifiers, redirect, and ssl-redirect annotations.
-//! - [`security`] — edge access control (source-IP allow-list, rate limiting, auth).
+//! - [`edge_access`] — source-IP allow/deny, forwarded-for trust, rate limiting.
+//! - [`auth`] — request authentication (`auth-*`, #24).
+//! - [`client_cert`] — per-host client-certificate mTLS (`auth-tls-*`, #267).
 //! - [`caching`] — RFC 7234 response-cache opt-in.
 //! - [`session`] — sticky-session (session-affinity) binding.
 //!
@@ -21,26 +23,30 @@
 //! The controller consumer converts those into `tracing::warn!` log lines and
 //! `Warning` Kubernetes Events; the proxy discards them silently.
 
+pub(crate) mod auth;
 mod caching;
+pub(crate) mod client_cert;
+pub(crate) mod edge_access;
 mod filters;
 mod routing;
-pub(crate) mod security;
 mod session;
 pub(crate) mod traffic_policy;
 
+pub use auth::*;
 pub use caching::*;
+pub use client_cert::*;
+pub use edge_access::*;
 pub use filters::*;
 pub use routing::*;
-pub use security::*;
 pub use session::*;
 pub use traffic_policy::*;
 
+use auth::AuthAnnotation;
 use coxswain_core::routing::{
     BackendProtocol, CircuitBreakerConfig, CompressionConfig, FilterAction, ForwardedForConfig,
     HeaderMod, LoadBalance, NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicy,
     RouteTimeouts, SessionAffinity,
 };
-use security::AuthAnnotation;
 use std::collections::BTreeMap;
 
 // ── Structured annotation diagnostic ─────────────────────────────────────────
@@ -467,7 +473,7 @@ impl IngressAnnotations {
         );
 
         // ── External / basic auth (#24) ───────────────────────────────────────
-        let auth = security::parse_auth(ann, route_id, &mut diag);
+        let auth = auth::parse_auth(ann, route_id, &mut diag);
 
         // ── Mirror target (#283) ──────────────────────────────────────────────
         let mirror_target = get(ann, MIRROR_TARGET).and_then(|v| {
@@ -494,7 +500,7 @@ impl IngressAnnotations {
         let compression = traffic_policy::parse_compression(ann, route_id, &mut diag);
 
         // ── Trusted-proxy forwarded-IP headers (#271) ─────────────────────────
-        let forwarded_for = security::parse_forwarded_for(ann, route_id, &mut diag);
+        let forwarded_for = edge_access::parse_forwarded_for(ann, route_id, &mut diag);
 
         // ── Load-balance algorithm (#275, #276) ───────────────────────────────
         let load_balance = get(ann, LOAD_BALANCE)

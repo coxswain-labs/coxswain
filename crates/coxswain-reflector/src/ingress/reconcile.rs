@@ -1,7 +1,7 @@
 //! Core Ingress reconciliation: maps rules to routing-table entries.
 
 use super::IngressReconciler;
-use super::annotations::security::{AuthAnnotation, parse_htpasswd};
+use super::annotations::auth::{AuthAnnotation, parse_htpasswd};
 use super::annotations::{AnnotationIssue, IngressAnnotations};
 use super::backend::resolve_backend_port;
 use super::class::{ResolvedClassParams, claimed_ingress_class};

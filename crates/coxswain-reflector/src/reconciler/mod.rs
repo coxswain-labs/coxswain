@@ -21,6 +21,7 @@
 
 pub mod controller;
 pub mod proxy;
+mod route_builder;
 
 pub use controller::ControllerReconciler;
 pub use proxy::{
