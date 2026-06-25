@@ -2,7 +2,7 @@
 //! and `auth-tls-*` annotations into the client-cert mTLS store (#267).
 
 use super::IngressReconciler;
-use super::annotations::security::{ClientCertAnnotation, parse_client_cert};
+use super::annotations::client_cert::{ClientCertAnnotation, parse_client_cert};
 use super::class::claimed_ingress_class;
 use crate::tls::load_tls_cert;
 use coxswain_core::tls::{

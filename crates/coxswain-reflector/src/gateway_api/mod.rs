@@ -8,6 +8,7 @@ mod grpc_reconcile;
 mod grpc_status;
 mod hostnames;
 mod reconcile;
+mod route_health;
 mod status;
 mod timeouts;
 
@@ -49,7 +50,7 @@ impl GatewayApiReconciler {
         backend_grants: &HashSet<ReferenceGrantKey>,
         service_store: &reflector::Store<Service>,
     ) -> HttpRouteHealthMap {
-        status::compute_route_health(
+        route_health::compute_route_health(
             routes,
             gateways,
             owned_gateways,
@@ -119,7 +120,7 @@ impl GrpcRouteReconciler {
         backend_grants: &HashSet<ReferenceGrantKey>,
         service_store: &reflector::Store<Service>,
     ) -> HttpRouteHealthMap {
-        grpc_status::compute_route_health(
+        route_health::compute_route_health(
             routes,
             gateways,
             owned_gateways,
