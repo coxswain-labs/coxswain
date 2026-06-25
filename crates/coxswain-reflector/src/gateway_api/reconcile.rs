@@ -406,9 +406,11 @@ fn apply_rule(
                 false,
                 ctx.route_ns,
                 ctx.path_rewrites,
-                ctx.slices,
-                ctx.services,
-                ctx.grants,
+                &super::filters::BackendStores {
+                    slices: ctx.slices,
+                    services: ctx.services,
+                    grants: ctx.grants,
+                },
             );
             pb.add_prefix_route(
                 "/",
@@ -447,9 +449,11 @@ fn apply_rule(
                     is_prefix,
                     ctx.route_ns,
                     ctx.path_rewrites,
-                    ctx.slices,
-                    ctx.services,
-                    ctx.grants,
+                    &super::filters::BackendStores {
+                        slices: ctx.slices,
+                        services: ctx.services,
+                        grants: ctx.grants,
+                    },
                 );
                 let e =
                     Arc::new(make_entry(predicates, filter_list).with_path_pattern(Arc::from(val)));

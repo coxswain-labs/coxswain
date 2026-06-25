@@ -22,6 +22,14 @@ use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+/// Store references needed to resolve `backendRef` targets in filters (e.g.
+/// `RequestMirror`).
+pub(super) struct BackendStores<'a> {
+    pub(super) slices: &'a reflector::Store<EndpointSlice>,
+    pub(super) services: &'a reflector::Store<Service>,
+    pub(super) grants: &'a HashSet<ReferenceGrantKey>,
+}
+
 /// Translates `HTTPRouteFilter` entries into `FilterAction` values.
 ///
 /// `matched_prefix` is the path pattern for this match rule (used for
@@ -29,7 +37,7 @@ use std::sync::Arc;
 /// `PathPrefix`; if it is not, a `ReplacePrefixMatch` path modifier is invalid
 /// per spec and will be skipped with a warning.
 ///
-/// `slices`, `services`, and `grants` are required to resolve the `backendRef`
+/// `stores` carries the reflector stores required to resolve the `backendRef`
 /// inside each `RequestMirror` filter (GEP-3171, #261).
 pub(super) fn build_filters(
     filters: &[HttpRouteRulesFilters],
@@ -37,9 +45,7 @@ pub(super) fn build_filters(
     is_prefix_match: bool,
     route_ns: &str,
     path_rewrites: &reflector::Store<coxswain_core::crd::PathRewriteRegex>,
-    slices: &reflector::Store<EndpointSlice>,
-    services: &reflector::Store<Service>,
-    grants: &HashSet<ReferenceGrantKey>,
+    stores: &BackendStores<'_>,
 ) -> Vec<FilterAction> {
     let mut out = Vec::new();
     for f in filters {
@@ -235,7 +241,10 @@ pub(super) fn build_filters(
                 // Cross-namespace mirror refs require a ReferenceGrant (GEP-3171).
                 if mirror_ns != route_ns
                     && !reference_grants::backend_ref_allowed(
-                        route_ns, mirror_ns, &bref.name, grants,
+                        route_ns,
+                        mirror_ns,
+                        &bref.name,
+                        stores.grants,
                     )
                 {
                     tracing::warn!(
@@ -269,7 +278,8 @@ pub(super) fn build_filters(
                         .and_then(|p| MirrorFraction::new(p as u32, 100))
                 };
 
-                let resolved = endpoints::resolve(mirror_ns, &bref.name, port, slices, services);
+                let resolved =
+                    endpoints::resolve(mirror_ns, &bref.name, port, stores.slices, stores.services);
                 if !resolved.service_exists {
                     tracing::warn!(
                         mirror_ns,
