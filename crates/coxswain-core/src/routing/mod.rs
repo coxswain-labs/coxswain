@@ -24,9 +24,10 @@ pub use common::backend::{
 pub use common::circuit_breaker::CircuitBreakerConfig;
 pub use common::compression::CompressionConfig;
 pub use common::entry::{
-    BackendProtocol, CorsConfig, CorsOrigin, FilterAction, ForwardedForConfig, HeaderMod,
-    HeaderModError, MirrorFraction, PathModifier, RetryOn, RetryPolicy, RouteConflict, RouteEntry,
-    RouteInfo, RouteKind, RouteTimeouts, UpstreamCa, UpstreamTls, parse_app_protocol,
+    ForwardedForConfig, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts,
+};
+pub use common::filters::{
+    CorsConfig, CorsOrigin, FilterAction, HeaderMod, HeaderModError, MirrorFraction, PathModifier,
 };
 pub use common::host_router::{
     HostRouter, HostRouterBuilder, RouteMatch, WildcardKind, compile_path_regex,
@@ -37,7 +38,9 @@ pub use common::predicate::{
     HeaderPredicate, MatchPredicates, QueryPredicate, RequestContext, ValueMatch,
 };
 pub use common::rate_limit::{RateLimitConfig, RateLimitKey};
+pub use common::retry::{RetryOn, RetryPolicy};
 pub use common::table::{RouteOutcome, RouterError, RoutingTable, RoutingTableBuilder};
+pub use common::upstream_tls::{BackendProtocol, UpstreamCa, UpstreamTls, parse_app_protocol};
 
 pub use gateway::{
     Gateway, GatewayRoutingTable, GatewayRoutingTableBuilder, SharedGatewayRoutingTable,

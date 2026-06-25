@@ -8,7 +8,9 @@
 //! route-entry and filter data model that *carries* a [`BackendGroup`] lives in
 //! the sibling [`super::entry`] module.
 
-use super::entry::{BackendProtocol, FilterAction, RetryPolicy, UpstreamTls};
+use super::filters::FilterAction;
+use super::retry::RetryPolicy;
+use super::upstream_tls::{BackendProtocol, UpstreamTls};
 use http::HeaderName;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -967,7 +969,9 @@ static_assertions::assert_eq_size!(BackendPool, [u8; 24]);
 
 #[cfg(test)]
 mod tests {
-    use super::super::entry::{ForwardedForConfig, HeaderMod, RouteEntry, UpstreamCa};
+    use super::super::entry::{ForwardedForConfig, RouteEntry};
+    use super::super::filters::HeaderMod;
+    use super::super::upstream_tls::UpstreamCa;
     use super::*;
     use http::HeaderValue;
     use std::net::SocketAddr;
