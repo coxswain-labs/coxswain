@@ -92,6 +92,15 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         ListenerTlsOutcome::Invalid { message } => {
             (p::ListenerTlsOutcome::Invalid, message.clone())
         }
+        // ResolvedPartial: listener serves the good certs (is HTTPS-terminating)
+        // but some refs failed.  Wire as Resolved so the proxy correctly includes
+        // this listener in misdirected-request detection.  The partial-failure
+        // detail is surfaced by the controller via K8s conditions; the proxy has
+        // no use for it.  A dedicated proto enum value will be added in a follow-up
+        // commit when the multi-cert wire format is extended.
+        ListenerTlsOutcome::ResolvedPartial { .. } => {
+            (p::ListenerTlsOutcome::Resolved, String::new())
+        }
         &_ => unreachable!(
             "invariant: all ListenerTlsOutcome variants handled; \
              add a new arm when the core type gains a variant"
@@ -153,7 +162,6 @@ fn listener_health_from_dto(dto: &p::ListenerHealth) -> Result<GatewayListenerHe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::tests::*;
 
     // ── Listener health round-trip ────────────────────────────────────────────
 

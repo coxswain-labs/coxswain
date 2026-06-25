@@ -3,7 +3,7 @@
 use crate::keys::RouteParentKey;
 use arc_swap::ArcSwap;
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::tls::TlsCert;
+use coxswain_core::tls::{KeyAlgorithm, TlsCert};
 use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::reflector;
 use std::collections::HashMap;
@@ -234,25 +234,31 @@ pub(crate) fn load_tls_cert(
         return Err(TlsLoadError::InvalidPem);
     }
 
-    let not_after = parse_leaf_not_after(&cert_pem).unwrap_or_else(|e| {
+    let (not_after, key_algorithm) = parse_leaf_cert_metadata(&cert_pem).unwrap_or_else(|e| {
         tracing::warn!(
             ns,
             name,
             error = %e,
-            "TLS cert notAfter parse failed — expiry metric will omit this cert"
+            "TLS cert parse failed — expiry metric will omit this cert, algorithm defaults to Other"
         );
-        None
+        (None, KeyAlgorithm::Other)
     });
 
-    Ok(TlsCert::new(cert_pem, key_pem, format!("{ns}/{name}")).with_not_after(not_after))
+    Ok(TlsCert::new(cert_pem, key_pem, format!("{ns}/{name}"))
+        .with_not_after(not_after)
+        .with_key_algorithm(key_algorithm))
 }
 
-/// Parse the leaf certificate's `notAfter` field from a PEM chain.
+/// Parse the leaf certificate's `notAfter` field and SPKI key algorithm in a
+/// single parse pass.
 ///
-/// Returns `Ok(None)` if the chain parsed but contained no certificate (a
-/// degenerate case — `Ok(Some(_))` is the expected shape for any well-formed
-/// `kubernetes.io/tls` Secret). Returns `Err` on PEM/ASN.1 parse failure.
-fn parse_leaf_not_after(cert_pem: &[u8]) -> Result<Option<std::time::SystemTime>, String> {
+/// Returns `Ok((None, Other))` if the chain parsed but contained no certificate
+/// (a degenerate case — the expected shape for any well-formed
+/// `kubernetes.io/tls` Secret is `Ok((Some(_), Rsa | Ecdsa))`). Returns `Err`
+/// on PEM/ASN.1 parse failure.
+fn parse_leaf_cert_metadata(
+    cert_pem: &[u8],
+) -> Result<(Option<std::time::SystemTime>, KeyAlgorithm), String> {
     use x509_parser::pem::Pem;
     use x509_parser::prelude::*;
     let mut reader = std::io::Cursor::new(cert_pem);
@@ -261,13 +267,35 @@ fn parse_leaf_not_after(cert_pem: &[u8]) -> Result<Option<std::time::SystemTime>
         .0;
     let (_, cert) =
         parse_x509_certificate(&pem.contents).map_err(|e| format!("X509 parse: {e}"))?;
+
+    // notAfter
     let not_after_unix = cert.validity().not_after.timestamp();
-    if not_after_unix < 0 {
-        return Ok(None);
-    }
-    // `timestamp()` is a Unix epoch i64; convert to SystemTime via Duration.
-    let secs = u64::try_from(not_after_unix).map_err(|e| format!("notAfter overflow: {e}"))?;
-    Ok(Some(
-        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
-    ))
+    let not_after = if not_after_unix < 0 {
+        None
+    } else {
+        // `timestamp()` is a Unix epoch i64; convert to SystemTime via Duration.
+        u64::try_from(not_after_unix)
+            .ok()
+            .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s))
+    };
+
+    // SPKI key algorithm — match well-known OIDs by their dotted-decimal string.
+    //
+    // OIDs:
+    //   rsaEncryption   1.2.840.113549.1.1.1  (RFC 3279)
+    //   id-ecPublicKey  1.2.840.10045.2.1      (RFC 5480)
+    let key_algorithm = match cert
+        .tbs_certificate
+        .subject_pki
+        .algorithm
+        .algorithm
+        .to_string()
+        .as_str()
+    {
+        "1.2.840.113549.1.1.1" => KeyAlgorithm::Rsa,
+        "1.2.840.10045.2.1" => KeyAlgorithm::Ecdsa,
+        _ => KeyAlgorithm::Other,
+    };
+
+    Ok((not_after, key_algorithm))
 }

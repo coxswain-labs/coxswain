@@ -117,7 +117,6 @@ pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::tests::*;
 
     // ── scope round-trips ────────────────────────────────────────────────────
 

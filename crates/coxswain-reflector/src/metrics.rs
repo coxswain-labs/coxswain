@@ -110,7 +110,7 @@ impl ReflectorMetrics {
         exact: usize,
         wildcard: usize,
         default: usize,
-        expiries: &[(String, SystemTime)],
+        expiries: &[(String, String, SystemTime)],
     ) {
         let loaded = tls_certs_loaded(self.prefix);
         loaded
@@ -129,13 +129,13 @@ impl ReflectorMetrics {
         let expiry = tls_cert_expiry_seconds();
         expiry.reset();
         let now = SystemTime::now();
-        for (sni, not_after) in expiries {
+        for (sni, source, not_after) in expiries {
             let secs = not_after
                 .duration_since(now)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             expiry
-                .with_label_values(&[sni])
+                .with_label_values(&[sni, source])
                 .set(i64::try_from(secs).unwrap_or(i64::MAX));
         }
     }
@@ -312,9 +312,9 @@ fn tls_cert_expiry_seconds() -> &'static IntGaugeVec {
         register_int_gauge_vec!(
             Opts::new(
                 "coxswain_proxy_tls_cert_expiry_seconds",
-                "Seconds until each loaded TLS cert's notAfter, by SNI hostname"
+                "Seconds until each loaded TLS cert's notAfter, by SNI hostname and source Secret"
             ),
-            &["sni"]
+            &["sni", "source"]
         )
         .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
     })

@@ -249,7 +249,6 @@ fn client_cert_state_from_wire(dto: &p::ClientCertConfigState) -> ClientCertConf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::tests::*;
 
     // ── 5. TLS store exact + wildcard + default ───────────────────────────────
 
