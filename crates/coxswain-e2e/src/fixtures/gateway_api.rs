@@ -143,3 +143,21 @@ pub const REJECT_RATELIMIT_MISSING_RPS: &str = fixture!("reject_ratelimit_missin
 /// the sole allowed origin; GET and POST are the allowed methods.
 /// Hostnamed `cors.${TESTNS}.local`.
 pub const CORS: &str = fixture!("cors.yaml");
+
+// ── RequestMirror (#261) ──────────────────────────────────────────────────────
+
+/// Gateway + HTTPRoute with a single `RequestMirror` filter (GEP-3171).
+/// Primary backend: echo-a.  Mirror backend: echo-b (100%) and a second rule
+/// with `percent: 0` (never mirrors).  Hostnamed `mirror.${TESTNS}.local`.
+pub const MIRROR: &str = fixture!("mirror.yaml");
+
+/// Gateway + HTTPRoute with two `RequestMirror` filters on one rule (GEP-3171).
+/// Primary: echo-a.  Mirrors: echo-b AND echo-c.
+/// Hostnamed `mirror-multi.${TESTNS}.local`.
+pub const MIRROR_MULTIPLE: &str = fixture!("mirror_multiple.yaml");
+
+/// Gateway + HTTPRoute with a cross-namespace `RequestMirror` filter (GEP-3171).
+/// Primary: echo-a in TESTNS.  Mirror: echo-d in TENANTNS.
+/// Pair with [`CROSS_NAMESPACE_TENANT`] (echo-d + ReferenceGrant) applied to TENANTNS.
+/// Hostnamed `mirror-xns.${TESTNS}.local`.  Requires `TENANTNS` substitution.
+pub const MIRROR_XNS: &str = fixture!("mirror_xns.yaml");

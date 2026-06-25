@@ -218,6 +218,31 @@ pub(crate) fn upstream_retries_total() -> &'static IntCounterVec {
     })
 }
 
+/// Counter: mirror requests dispatched fire-and-forget by the proxy.
+///
+/// Keyed by the matched route and the mirror upstream address selected at
+/// dispatch time.  Incremented once per mirror dispatch regardless of whether
+/// the mirror upstream returns an error — the counter reflects *attempts*, not
+/// successes.  Use in conjunction with the mirror-specific access log rows
+/// (`mirror = true`) for per-request outcome detail.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
+pub(crate) fn mirror_requests_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_proxy_mirror_requests_total",
+                "Mirror requests dispatched fire-and-forget by the proxy, by route and upstream",
+            ),
+            &["route", "upstream"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
 // `active_upstreams`, `tls_certs_loaded`, and `tls_cert_expiry_seconds` are
 // registered by `coxswain_reflector::metrics` — the proxy crate doesn't
 // duplicate them here because both modules would try to register the same

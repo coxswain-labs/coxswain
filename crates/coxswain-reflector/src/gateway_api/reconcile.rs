@@ -258,6 +258,9 @@ impl GatewayApiReconciler {
                 rate_limit,
                 route_ns,
                 path_rewrites,
+                slices,
+                services,
+                grants,
             };
             for (hostname_opt, port) in &bindings {
                 let pb = builder.for_port(*port);
@@ -353,6 +356,9 @@ struct RuleContext<'a> {
     rate_limit: Option<Arc<RateLimitConfig>>,
     route_ns: &'a str,
     path_rewrites: &'a reflector::Store<PathRewriteRegex>,
+    slices: &'a reflector::Store<EndpointSlice>,
+    services: &'a reflector::Store<Service>,
+    grants: &'a HashSet<ReferenceGrantKey>,
 }
 
 /// Installs one HTTPRoute rule into a `HostRouterBuilder`.
@@ -400,6 +406,9 @@ fn apply_rule(
                 false,
                 ctx.route_ns,
                 ctx.path_rewrites,
+                ctx.slices,
+                ctx.services,
+                ctx.grants,
             );
             pb.add_prefix_route(
                 "/",
@@ -438,6 +447,9 @@ fn apply_rule(
                     is_prefix,
                     ctx.route_ns,
                     ctx.path_rewrites,
+                    ctx.slices,
+                    ctx.services,
+                    ctx.grants,
                 );
                 let e =
                     Arc::new(make_entry(predicates, filter_list).with_path_pattern(Arc::from(val)));

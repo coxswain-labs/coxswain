@@ -380,6 +380,62 @@ impl CorsConfig {
     }
 }
 
+/// GEP-3171 mirror sampling fraction.
+///
+/// Normalises both the `percent` (integer 0–100) and `fraction { numerator, denominator }`
+/// forms from the Gateway API `HTTPRequestMirrorFilter` into a single representation.
+/// `None` on a [`FilterAction::Mirror`] means 100% (mirror every request).
+///
+/// The proxy draws one random `u32` per mirror candidate and calls [`MirrorFraction::should_sample`]
+/// to decide whether to dispatch; this keeps the RNG in the proxy and the arithmetic here
+/// where it can be unit-tested cheaply.
+///
+/// # Invariants
+///
+/// `numerator ≤ denominator` and `denominator > 0`.  [`MirrorFraction::new`] returns `None`
+/// when these do not hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MirrorFraction {
+    /// Requests to mirror out of `denominator`.  0 means never mirror.
+    numerator: u32,
+    /// Denominator of the fraction.  Must be > 0.
+    denominator: u32,
+}
+
+impl MirrorFraction {
+    /// Constructs a [`MirrorFraction`] from `numerator / denominator`.
+    ///
+    /// Returns `None` when `denominator == 0` or `numerator > denominator`.
+    #[must_use]
+    pub fn new(numerator: u32, denominator: u32) -> Option<Self> {
+        if denominator == 0 || numerator > denominator {
+            return None;
+        }
+        Some(Self {
+            numerator,
+            denominator,
+        })
+    }
+
+    /// Returns `true` when a request with the given `draw` (a uniform random `u32`)
+    /// should be mirrored.
+    ///
+    /// The gate is `draw % denominator < numerator`, which is uniform and allocation-free.
+    /// `numerator == 0` always returns `false`; `numerator == denominator` always returns
+    /// `true` (100% mirror).
+    #[must_use]
+    pub fn should_sample(self, draw: u32) -> bool {
+        draw % self.denominator < self.numerator
+    }
+
+    /// Returns `(numerator, denominator)` for wire encoding.
+    #[must_use]
+    pub fn as_parts(self) -> (u32, u32) {
+        (self.numerator, self.denominator)
+    }
+}
+
 /// A filter action evaluated per-request on the proxy hot path.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -419,6 +475,10 @@ pub enum FilterAction {
     Mirror {
         /// Pre-resolved mirror backend (round-robins to a concrete endpoint at dispatch time).
         backend: Arc<BackendGroup>,
+        /// GEP-3171 sampling fraction.  `None` means mirror every request (100%).
+        /// When `Some`, the proxy draws a random value per request and skips dispatch
+        /// when the draw falls outside the fraction's range.
+        fraction: Option<MirrorFraction>,
     },
     /// Apply CORS policy (GEP-1767) to the matched request.
     ///

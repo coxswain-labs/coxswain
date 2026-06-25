@@ -211,6 +211,7 @@ impl IngressReconciler {
                     ));
                     base_filters.push(FilterAction::Mirror {
                         backend: mirror_group,
+                        fraction: None, // annotation mirror always sends 100%
                     });
                 }
             } // end cross-namespace else

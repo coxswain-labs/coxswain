@@ -1,18 +1,24 @@
 //! Translates `HTTPRouteRule` filter specs into [`FilterAction`][coxswain_core::routing::FilterAction]s.
 
+use crate::endpoints;
 use crate::gw_types::v::httproutes::{
     HttpRouteRulesBackendRefsFilters, HttpRouteRulesBackendRefsFiltersType, HttpRouteRulesFilters,
     HttpRouteRulesFiltersCors, HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType,
     HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesQueryParamsType,
 };
 use coxswain_core::crd::RateLimit;
+use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
-    CorsConfig, CorsOrigin, FilterAction, HeaderMod, HeaderPredicate, MatchPredicates,
-    PathModifier, QueryPredicate, RateLimitConfig, RateLimitKey, ValueMatch,
+    BackendGroup, CorsConfig, CorsOrigin, FilterAction, HeaderMod, HeaderPredicate,
+    MatchPredicates, MirrorFraction, PathModifier, QueryPredicate, RateLimitConfig, RateLimitKey,
+    ValueMatch,
 };
 use http::{HeaderName, Method};
+use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use regex::Regex;
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -22,12 +28,18 @@ use std::sync::Arc;
 /// `ReplacePrefixMatch`). `is_prefix_match` signals whether the path type is
 /// `PathPrefix`; if it is not, a `ReplacePrefixMatch` path modifier is invalid
 /// per spec and will be skipped with a warning.
+///
+/// `slices`, `services`, and `grants` are required to resolve the `backendRef`
+/// inside each `RequestMirror` filter (GEP-3171, #261).
 pub(super) fn build_filters(
     filters: &[HttpRouteRulesFilters],
     matched_prefix: &str,
     is_prefix_match: bool,
     route_ns: &str,
     path_rewrites: &reflector::Store<coxswain_core::crd::PathRewriteRegex>,
+    slices: &reflector::Store<EndpointSlice>,
+    services: &reflector::Store<Service>,
+    grants: &HashSet<ReferenceGrantKey>,
 ) -> Vec<FilterAction> {
     let mut out = Vec::new();
     for f in filters {
@@ -190,10 +202,92 @@ pub(super) fn build_filters(
                 }
             }
             HttpRouteRulesFiltersType::RequestMirror => {
-                tracing::warn!(
-                    filter_type = ?f.r#type,
-                    "Skipping unsupported HTTPRouteFilter type"
-                );
+                let Some(mirror) = &f.request_mirror else {
+                    tracing::warn!(
+                        "Skipping RequestMirror filter — request_mirror payload is missing"
+                    );
+                    continue;
+                };
+                let bref = &mirror.backend_ref;
+
+                // Validate kind/group (only core Service is supported).
+                let b_kind = bref.kind.as_deref().unwrap_or("Service");
+                let b_group = bref.group.as_deref().unwrap_or("");
+                if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
+                    tracing::warn!(
+                        kind = b_kind,
+                        group = b_group,
+                        "Skipping RequestMirror — only core Service backendRefs are supported"
+                    );
+                    continue;
+                }
+
+                let Some(port) = bref.port else {
+                    tracing::warn!(
+                        name = %bref.name,
+                        "Skipping RequestMirror — port is required"
+                    );
+                    continue;
+                };
+
+                let mirror_ns = bref.namespace.as_deref().unwrap_or(route_ns);
+
+                // Cross-namespace mirror refs require a ReferenceGrant (GEP-3171).
+                if mirror_ns != route_ns
+                    && !reference_grants::backend_ref_allowed(
+                        route_ns, mirror_ns, &bref.name, grants,
+                    )
+                {
+                    tracing::warn!(
+                        route_ns,
+                        mirror_ns,
+                        mirror_svc = %bref.name,
+                        "Skipping RequestMirror — cross-namespace ref denied (no matching ReferenceGrant)"
+                    );
+                    continue;
+                }
+
+                // Normalize GEP-3171 sampling.  Spec: only one of `fraction`/`percent`
+                // may be set; if neither is set, mirror 100% of requests.
+                let fraction: Option<MirrorFraction> = if mirror.fraction.is_some()
+                    && mirror.percent.is_some()
+                {
+                    tracing::warn!(
+                        "RequestMirror has both fraction and percent set — using fraction"
+                    );
+                    mirror.fraction.as_ref().and_then(|fr| {
+                        MirrorFraction::new(
+                            fr.numerator as u32,
+                            fr.denominator.unwrap_or(100) as u32,
+                        )
+                    })
+                } else if let Some(fr) = &mirror.fraction {
+                    MirrorFraction::new(fr.numerator as u32, fr.denominator.unwrap_or(100) as u32)
+                } else {
+                    mirror
+                        .percent
+                        .and_then(|p| MirrorFraction::new(p as u32, 100))
+                };
+
+                let resolved = endpoints::resolve(mirror_ns, &bref.name, port, slices, services);
+                if !resolved.service_exists {
+                    tracing::warn!(
+                        mirror_ns,
+                        mirror_svc = %bref.name,
+                        "RequestMirror backend Service not found — skipping"
+                    );
+                    continue;
+                }
+                // Empty addrs: Service exists but has no ready endpoints. Install the
+                // filter anyway so the proxy can log the drop at dispatch time.
+                let mirror_group = Arc::new(BackendGroup::new(
+                    format!("{mirror_ns}/{}", bref.name),
+                    resolved.addrs,
+                ));
+                out.push(FilterAction::Mirror {
+                    backend: mirror_group,
+                    fraction,
+                });
             }
             // ExternalAuth is an alpha filter that only exists in the experimental channel.
             #[cfg(feature = "experimental")]

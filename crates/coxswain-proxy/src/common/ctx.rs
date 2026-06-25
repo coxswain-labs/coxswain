@@ -108,6 +108,9 @@ pub(crate) struct MirrorDispatch {
     pub path_and_query: Arc<str>,
     /// Forwardable request headers (hop-by-hop stripped, `Host` excluded).
     pub headers: Vec<(http::header::HeaderName, http::header::HeaderValue)>,
+    /// Canonical route identifier for the `route` Prometheus label on
+    /// `coxswain_proxy_mirror_requests_total`.
+    pub metric_route_id: Arc<str>,
 }
 
 /// Per-request context carrying the real client address extracted from the PROXY header.
@@ -187,17 +190,19 @@ pub struct ProxyCtx {
     /// at the auth-response parsing step so `upstream_request_filter` can use a
     /// case-insensitive comparison without per-request allocation.
     pub auth_response_headers: Option<Vec<(Box<str>, Box<str>)>>,
-    /// Pending fire-and-forget mirror dispatch (#283).
+    /// Pending fire-and-forget mirror dispatches (#283, #261).
     ///
-    /// Set in `request_filter` when the route carries a `FilterAction::Mirror` filter
-    /// and `max-body-size` is configured (body-mirroring mode).  `request_body_filter`
-    /// accumulates body chunks in [`Self::mirror_body`] and `take`s this on
-    /// end-of-stream to dispatch. When `max-body-size` is absent (header-only mode),
-    /// this is never set — the dispatch fires immediately in `request_filter`.
-    pub(crate) mirror: Option<MirrorDispatch>,
+    /// Populated in `request_filter` when the route carries one or more
+    /// `FilterAction::Mirror` filters that survive the GEP-3171 sampling gate
+    /// and `max-body-size` is configured (body-mirroring mode).
+    /// `request_body_filter` accumulates body chunks in [`Self::mirror_body`]
+    /// and drains this Vec on end-of-stream to dispatch all mirrors.
+    /// When `max-body-size` is absent (header-only mode), dispatches fire
+    /// immediately in `request_filter` and this Vec is never populated.
+    pub(crate) mirrors: Vec<MirrorDispatch>,
     /// Body chunks collected for fire-and-forget body mirroring.
     ///
-    /// Only populated when [`Self::mirror`] is `Some` and the route has
+    /// Only populated when [`Self::mirrors`] is non-empty and the route has
     /// `max-body-size` set.  Each chunk is a [`Bytes`] refcount clone of the
     /// original request chunk — zero data copies.  Consumed (and cleared) by
     /// `request_body_filter` on end-of-stream.
@@ -299,4 +304,8 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 192);
 // ProxyCtx: +8 because embedded ResolvedRoute grew for circuit_breaker field (#282) (600→608).
 // ProxyCtx: +0 for circuit_breaker_rejected: bool absorbed into existing alignment padding (#282).
 // ProxyCtx: +16 for cors_origin: Option<Box<str>> (fat pointer via niche; GEP-1767 CORS #41) (608→624).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 624);
+// ProxyCtx: -64 mirrors: Vec<MirrorDispatch> (24B) replaces mirror: Option<MirrorDispatch> (88B);
+//   Vec is smaller because Option<T> with a niche can't be smaller than T itself; the Vec
+//   pointer/len/cap triple (24B) is much smaller than a full MirrorDispatch struct (88B)
+//   (GEP-3171 multiple mirrors, #261) (624→560).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 560);

@@ -1,0 +1,59 @@
+# HTTPRoute RequestMirror multiple-mirrors fixture — GEP-3171 (#261).
+# TESTNS is substituted with the test namespace at runtime.
+#
+# Routes:
+#   PathPrefix /mirror-multi/both  → echo-a  (mirrors: echo-b AND echo-c, 100%)
+#   Exact      /mirror-multi/probe → echo-a  (readiness probe)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mirror-multi-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "mirror-multi.${TESTNS}.local"
+  rules:
+    # Rule 1: two mirror filters — both shadow backends must receive the request.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mirror-multi/both
+      filters:
+        - type: RequestMirror
+          requestMirror:
+            backendRef:
+              name: echo-b
+              port: 3000
+        - type: RequestMirror
+          requestMirror:
+            backendRef:
+              name: echo-c
+              port: 3000
+      backendRefs:
+        - name: echo-a
+          port: 3000
+
+    # Probe rule.
+    - matches:
+        - path:
+            type: Exact
+            value: /mirror-multi/probe
+      backendRefs:
+        - name: echo-a
+          port: 3000

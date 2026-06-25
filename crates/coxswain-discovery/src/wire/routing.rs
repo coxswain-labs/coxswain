@@ -47,9 +47,9 @@ use coxswain_core::routing::{
     CorsConfig, CorsOrigin, ExtAuthConfig, ExtAuthTransport, FilterAction, ForwardedForConfig,
     GatewayRoutingTable, HashSource, HeaderMod, HeaderPredicate, HostPattern, HostRouter,
     HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable, LoadBalance,
-    MatchPredicates, NormalizeLevel, PasswordHash, PathModifier, PortRoutingTable, QueryPredicate,
-    RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts, RouterError,
-    SessionAffinity, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
+    MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier, PortRoutingTable,
+    QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts,
+    RouterError, SessionAffinity, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
 };
 
 use crate::error::WireError;
@@ -346,14 +346,20 @@ fn filter_to_wire(f: &FilterAction, depth: usize) -> p::FilterAction {
                 path: path.as_ref().map(path_modifier_to_wire),
             })
         }
-        FilterAction::Mirror { backend } => {
+        FilterAction::Mirror { backend, fraction } => {
             // Saturate depth rather than panic — depth > MAX_MIRROR_DEPTH is
             // only reachable if the runtime type was built with malformed data
             // (defensive guard; from_wire is the primary enforcement site).
-            p::filter_action::Action::Mirror(backend_group_to_wire(
-                backend,
-                depth.saturating_add(1),
-            ))
+            p::filter_action::Action::Mirror(p::MirrorFilter {
+                backend: Some(backend_group_to_wire(backend, depth.saturating_add(1))),
+                fraction: fraction.map(|f| {
+                    let (numerator, denominator) = f.as_parts();
+                    p::MirrorFractionProto {
+                        numerator,
+                        denominator,
+                    }
+                }),
+            })
         }
         FilterAction::Cors(cfg) => p::filter_action::Action::Cors(cors_config_to_wire(cfg)),
         _ => unreachable!(
@@ -990,9 +996,19 @@ fn filter_from_wire(dto: &p::FilterAction, depth: usize) -> Result<FilterAction,
             hostname: uw.hostname.clone(),
             path: uw.path.as_ref().map(path_modifier_from_wire).transpose()?,
         }),
-        p::filter_action::Action::Mirror(bg_dto) => {
+        p::filter_action::Action::Mirror(mirror_dto) => {
+            let bg_dto = mirror_dto
+                .backend
+                .as_ref()
+                .ok_or(WireError::MissingRequiredField {
+                    field: "MirrorFilter.backend",
+                })?;
             let backend = Arc::new(bg_from_wire(bg_dto, depth + 1)?);
-            Ok(FilterAction::Mirror { backend })
+            let fraction = mirror_dto
+                .fraction
+                .as_ref()
+                .and_then(|f| MirrorFraction::new(f.numerator, f.denominator));
+            Ok(FilterAction::Mirror { backend, fraction })
         }
         p::filter_action::Action::Cors(cors_dto) => Ok(FilterAction::Cors(Arc::new(
             cors_config_from_wire(cors_dto)?,
@@ -1689,6 +1705,7 @@ mod tests {
         ));
         let inner_filter = FilterAction::Mirror {
             backend: mirror_bg.clone(),
+            fraction: None,
         };
         let outer_bg = Arc::new(
             BackendGroup::new("outer".to_string(), vec![addr("10.0.0.1:80")])
@@ -1697,7 +1714,10 @@ mod tests {
         let entry = Arc::new(RouteEntry::with_filters(
             outer_bg,
             MatchPredicates::default(),
-            vec![FilterAction::Mirror { backend: mirror_bg }],
+            vec![FilterAction::Mirror {
+                backend: mirror_bg,
+                fraction: None,
+            }],
             RouteTimeouts::default(),
             "mirror-route".to_string(),
             None,
@@ -1730,7 +1750,10 @@ mod tests {
                 }
             } else {
                 let filter = p::FilterAction {
-                    action: Some(p::filter_action::Action::Mirror(nested_bg(depth - 1))),
+                    action: Some(p::filter_action::Action::Mirror(p::MirrorFilter {
+                        backend: Some(nested_bg(depth - 1)),
+                        fraction: None,
+                    })),
                 };
                 p::BackendGroup {
                     name: format!("depth-{depth}"),
