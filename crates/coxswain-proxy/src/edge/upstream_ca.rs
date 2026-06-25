@@ -4,10 +4,13 @@
 //! `group_key`. The Mutex is never held across an `.await` point — `upstream_peer`
 //! calls `get_or_parse` synchronously.
 
+use coxswain_core::routing::{UpstreamCa, UpstreamTls};
 use parking_lot::Mutex;
 use pingora_core::protocols::tls::CaType;
 use pingora_core::tls::{pkey::PKey, x509::X509};
+use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
+use pingora_core::{HTTPStatus, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -100,6 +103,41 @@ impl BackendClientCertCache {
         let mut guard = self.inner.lock();
         Some(Arc::clone(guard.entry(group_key).or_insert(cert_key)))
     }
+}
+
+/// Apply all `BackendTLSPolicy`-driven TLS material to `peer`: CA bundle and
+/// (when present) the GEP-3155 backend client certificate.
+///
+/// Both caches ensure the crypto work runs at most once per distinct
+/// `group_key`; subsequent connections return the cached parsed objects.
+///
+/// # Errors
+///
+/// Returns a `502` error when either PEM fails to parse.
+pub(crate) fn apply_upstream_tls(
+    peer: &mut HttpPeer,
+    btls: &UpstreamTls,
+    ca_cache: &UpstreamCaCache,
+    client_cert_cache: &BackendClientCertCache,
+) -> Result<()> {
+    if let UpstreamCa::Bundle(pem) = &btls.ca {
+        let ca = ca_cache.get_or_parse(btls.group_key, pem).ok_or_else(|| {
+            pingora_core::Error::explain(HTTPStatus(502), "BackendTLSPolicy CA bundle parse failed")
+        })?;
+        peer.options.ca = Some(ca);
+    }
+    if let Some(cc) = btls.client_cert() {
+        let cert_key = client_cert_cache
+            .get_or_parse(btls.group_key, &cc.cert_pem, &cc.key_pem)
+            .ok_or_else(|| {
+                pingora_core::Error::explain(
+                    HTTPStatus(502),
+                    "gateway backend client cert PEM parse failed",
+                )
+            })?;
+        peer.client_cert_key = Some(cert_key);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
