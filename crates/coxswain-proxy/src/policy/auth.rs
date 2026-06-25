@@ -1,6 +1,6 @@
 //! External and basic authentication enforcement for the Ingress proxy.
 //!
-//! Called from [`crate::common::hooks::request_filter`] after rate-limiting and
+//! Called from [`crate::hooks::request_filter`] after rate-limiting and
 //! before redirect/body handling.  Implements two modes:
 //!
 //! - **External (`ext_authz`)**: forwards a sub-request to a configurable HTTP
@@ -58,7 +58,7 @@ pub(crate) const HOP_BY_HOP: &[&str] = &[
 ///
 /// `auth_response_headers` is populated when the auth service returns 2xx and the
 /// route's `auth-response-headers` list is non-empty; the caller stores it on
-/// `ctx` for [`crate::common::hooks::upstream_request_filter`] to apply.
+/// `ctx` for [`crate::hooks::upstream_request_filter`] to apply.
 ///
 /// # Errors
 ///

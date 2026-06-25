@@ -29,36 +29,30 @@
 //! TLS-path allocations (once per upstream connection, not per request), and
 //! cleartext upstream connections skip them entirely.
 
-use super::affinity;
-use super::ctx::{CONN_INFO, MirrorDispatch, ProxyCtx, ResolvedRoute};
-use super::engine::RoutingEngine;
-use super::filter::TrafficFilter;
-use super::outcome::{merge_timeouts, resolve_outcome, try_cors_preflight, try_redirect};
-use super::redirect::extract_host;
-use crate::auth;
 use crate::config::AccessLogPathMode;
-use crate::tls::ConnTlsInfo;
-use crate::upstream_ca::UpstreamCaCache;
+use crate::ctx::{CONN_INFO, MirrorDispatch, ProxyCtx, ResolvedRoute};
+use crate::edge::tls::ConnTlsInfo;
+use crate::edge::upstream_ca::UpstreamCaCache;
+use crate::filters::TrafficFilter;
+use crate::filters::cors::try_cors_preflight;
+use crate::filters::redirect::{extract_host, try_redirect};
+use crate::policy::access_control::{ip_allowed, ip_denied, resolve_client_ip};
+use crate::policy::affinity;
+use crate::policy::auth;
+use crate::routing::engine::RoutingEngine;
+use crate::routing::outcome::{merge_timeouts, resolve_outcome};
 use bytes::Bytes;
-use coxswain_cache::ResponseCache;
 use coxswain_core::routing::{
-    BackendGroup, BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HashSource,
-    MirrorFraction, RateLimitKey, RequestContext, RetryOn, SessionAffinity, UpstreamCa,
-    affinity_hash, affinity_hash_parts,
+    BackendGroup, FilterAction, HashSource, MirrorFraction, RateLimitKey, RequestContext, RetryOn,
+    SessionAffinity, UpstreamCa, affinity_hash, affinity_hash_parts,
 };
 use coxswain_core::tls::ClientCertConfigState;
 use http::header;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use pingora_cache::key::{CacheKey, HashBinary};
-use pingora_cache::{CacheMeta, NoCacheReason, RespCacheable, VarianceBuilder};
-use pingora_core::protocols::http::compression::Algorithm;
 use pingora_core::upstreams::peer::HttpPeer;
-use pingora_core::{
-    ConnectTimedout, ConnectionClosed, Error, ErrorSource, HTTPStatus, ReadError, ReadTimedout,
-    Result, WriteError, WriteTimedout,
-};
+use pingora_core::{Error, HTTPStatus, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{FailToProxy, Session};
+use pingora_proxy::Session;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -69,7 +63,7 @@ use std::time::Instant;
 /// endpoints that the Ingress author may not fully control.  Leaking them would
 /// make the mirror a credential-harvesting surface.
 ///
-/// `proxy-authorization` is already covered by [`crate::auth::HOP_BY_HOP`];
+/// `proxy-authorization` is already covered by [`crate::policy::auth::HOP_BY_HOP`];
 /// it is listed here for documentation clarity.
 const MIRROR_CREDENTIAL_HEADERS: &[&str] = &["authorization", "cookie", "proxy-authorization"];
 
@@ -300,10 +294,10 @@ pub(crate) async fn request_filter<K>(
             } else {
                 None
             };
-            crate::rate_limit::extract_client_key(rl_config, client_ip, header_val)
+            crate::policy::rate_limit::extract_client_key(rl_config, client_ip, header_val)
         };
         if let Some(key) = client_key
-            && let crate::rate_limit::CheckOutcome::Limited { retry_after_secs } =
+            && let crate::policy::rate_limit::CheckOutcome::Limited { retry_after_secs } =
                 cfg.rate_limiter.check(&m.metric_route_id, rl_config, key)
         {
             let mut resp = ResponseHeader::build(429, Some(1))?;
@@ -327,7 +321,7 @@ pub(crate) async fn request_filter<K>(
     // unauthenticated client must not receive a redirect leaking the canonical
     // URL). `enforce()` writes a denial response and returns `Ok(true)`.
     if let Some(auth) = m.auth.as_deref()
-        && crate::auth::enforce(
+        && crate::policy::auth::enforce(
             &cfg.auth_client,
             auth,
             session,
@@ -504,7 +498,7 @@ pub(crate) async fn request_filter<K>(
                 // Header-only mode: no body will be buffered; dispatch all now.
                 // Covers bodyless methods (GET, HEAD) and routes without max-body-size.
                 for dispatch in dispatches {
-                    spawn_mirror_dispatch(
+                    crate::filters::mirror::spawn_mirror_dispatch(
                         dispatch,
                         cfg.auth_client.clone(),
                         Bytes::new(),
@@ -559,122 +553,6 @@ fn extract_hash_key(
     }
 }
 
-/// Private and reserved IP ranges that are never treated as a real client IP when
-/// extracting from a forwarded header.  Includes RFC 1918 private ranges, loopback,
-/// link-local, ULA (fc00::/7), and the unspecified address.
-static PRIVATE_NETS: std::sync::LazyLock<[ipnet::IpNet; 9]> = std::sync::LazyLock::new(|| {
-    [
-        "10.0.0.0/8"
-            .parse()
-            .unwrap_or_else(|e| panic!("invariant: {e}")),
-        "172.16.0.0/12"
-            .parse()
-            .unwrap_or_else(|e| panic!("invariant: {e}")),
-        "192.168.0.0/16"
-            .parse()
-            .unwrap_or_else(|e| panic!("invariant: {e}")),
-        "127.0.0.0/8"
-            .parse()
-            .unwrap_or_else(|e| panic!("invariant: {e}")),
-        "169.254.0.0/16"
-            .parse()
-            .unwrap_or_else(|e| panic!("invariant: {e}")),
-        "::1/128"
-            .parse()
-            .unwrap_or_else(|e| panic!("invariant: {e}")),
-        "fe80::/10"
-            .parse()
-            .unwrap_or_else(|e| panic!("invariant: {e}")),
-        "fc00::/7"
-            .parse()
-            .unwrap_or_else(|e| panic!("invariant: {e}")),
-        "::/128"
-            .parse()
-            .unwrap_or_else(|e| panic!("invariant: {e}")),
-    ]
-});
-
-/// Scan a comma-separated header value for the first non-private, non-loopback
-/// IP address.  Returns `None` when every token is private, unparseable, or the
-/// value is empty.
-///
-/// "First" is left-to-right per the XFF convention: the leftmost value is the
-/// one closest to the original client and furthest from potential LB injection.
-fn first_non_private_ip(header_value: &str) -> Option<std::net::IpAddr> {
-    header_value
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .filter_map(|t| t.parse::<std::net::IpAddr>().ok())
-        .find(|ip| !PRIVATE_NETS.iter().any(|n| n.contains(ip)))
-}
-
-/// Resolve the effective client IP for the current request.
-///
-/// Resolution order (per `ForwardedForConfig` doc):
-/// 1. If no config → L4 IP (current behavior).
-/// 2. If `trusted_cidrs` non-empty AND L4 IP ∉ any CIDR → L4 IP (anti-spoofing).
-/// 3. Else extract the first non-private IP from the configured header; fall back
-///    to L4 IP when absent or all entries are private.
-fn resolve_client_ip(
-    session: &Session,
-    real_client_addr: Option<std::net::SocketAddr>,
-    fwd: Option<&ForwardedForConfig>,
-) -> Option<std::net::IpAddr> {
-    let l4_ip = real_client_addr.map(|a| a.ip()).or_else(|| {
-        session
-            .as_downstream()
-            .client_addr()
-            .and_then(|a| a.as_inet())
-            .map(|a| a.ip())
-    });
-
-    let Some(cfg) = fwd else {
-        return l4_ip;
-    };
-
-    // Anti-spoofing gate: if trusted CIDRs are configured, only trust the header
-    // when the L4 peer is within one of those CIDRs.
-    if !cfg.trusted_cidrs.is_empty()
-        && !l4_ip.is_some_and(|ip| cfg.trusted_cidrs.iter().any(|n| n.contains(&ip)))
-    {
-        return l4_ip;
-    }
-
-    // Trust the header: grab the forwarded-IP value and find the first public IP.
-    let header_ip = session
-        .req_header()
-        .headers
-        .get(cfg.header.as_ref())
-        .and_then(|v| v.to_str().ok())
-        .and_then(first_non_private_ip);
-
-    header_ip.or(l4_ip)
-}
-
-/// Returns `true` if `client_ip` is admitted by the CIDR allow-list `nets`.
-///
-/// Fail-closed: a `None` client IP (the peer could not be determined) is
-/// rejected — an un-attributable request must not pass a security allow-list.
-/// Matching is strict (no IPv4-mapped-IPv6 normalization), matching `ipnet`'s
-/// default and the `TrustedSources` PROXY-protocol check.
-#[must_use]
-pub(crate) fn ip_allowed(client_ip: Option<std::net::IpAddr>, nets: &[ipnet::IpNet]) -> bool {
-    client_ip.is_some_and(|ip| nets.iter().any(|n| n.contains(&ip)))
-}
-
-/// Returns `true` if `client_ip` falls inside any CIDR in the deny-list `nets`.
-///
-/// Inverse-fail-open on identity: a `None` client IP (peer could not be determined)
-/// is **not** considered to match any CIDR and is therefore **not** denied — a block
-/// list only blocks IPs it can positively attribute to a listed range. This is the
-/// inverse of [`ip_allowed`]'s fail-closed semantics.
-/// Matching is strict (no IPv4-mapped-IPv6 normalization).
-#[must_use]
-pub(crate) fn ip_denied(client_ip: Option<std::net::IpAddr>, nets: &[ipnet::IpNet]) -> bool {
-    client_ip.is_some_and(|ip| nets.iter().any(|n| n.contains(&ip)))
-}
-
 /// Read and parse the `Content-Length` request header, if present and valid.
 ///
 /// Returns `None` when the header is absent, non-ASCII, or not a valid unsigned
@@ -687,138 +565,6 @@ fn content_length(session: &Session) -> Option<u64> {
         .get(http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
-}
-
-// ── Response caching (#40) ──────────────────────────────────────────────────
-
-/// Default cache freshness: never cache implicitly.
-///
-/// Returning `None` for every status means an object is admitted only when the
-/// upstream gives it explicit freshness (`Cache-Control: max-age` / `Expires`),
-/// matching the issue's explicit-freshness-only scope.
-fn no_implicit_freshness(_status: http::StatusCode) -> Option<std::time::Duration> {
-    None
-}
-
-/// Cache metadata defaults: no implicit TTL, no stale-while-revalidate, no
-/// stale-if-error. Shared across all requests.
-static CACHE_DEFAULTS: pingora_cache::CacheMetaDefaults =
-    pingora_cache::CacheMetaDefaults::new(no_implicit_freshness, 0, 0);
-
-/// Enable Pingora's response cache for this request when the matched route
-/// opted in and the request is safely cacheable.
-///
-/// Caching is restricted to `GET`/`HEAD`, and bypassed for requests carrying
-/// `Authorization` or `Cookie` (per-user state must never be shared between
-/// clients). When this returns without enabling, the request proxies normally
-/// with no caching. `cache` is `None` when the process started without a cache
-/// (e.g. `--cache-max-size=0`).
-pub(crate) fn request_cache_filter(
-    cache: Option<ResponseCache>,
-    session: &mut Session,
-    ctx: &ProxyCtx,
-) -> Result<()> {
-    let Some(cache) = cache else { return Ok(()) };
-    if !ctx.resolved.as_ref().is_some_and(|r| r.cache_enabled) {
-        return Ok(());
-    }
-    let req = session.req_header();
-    if !matches!(req.method, http::Method::GET | http::Method::HEAD) {
-        return Ok(());
-    }
-    if req.headers.contains_key(http::header::AUTHORIZATION)
-        || req.headers.contains_key(http::header::COOKIE)
-    {
-        return Ok(());
-    }
-    session
-        .cache
-        .enable(cache.storage(), Some(cache.eviction()), None, None, None);
-    Ok(())
-}
-
-/// Build the cache key for this request: host namespace + `"{method} {path?query}"`.
-///
-/// Routes through [`coxswain_cache::cache_key`] so it derives identically to the
-/// admin purge path; the host is taken from the resolved route's captured
-/// `original_host` to match what was routed.
-pub(crate) fn cache_key_callback(session: &Session, ctx: &ProxyCtx) -> CacheKey {
-    let req = session.req_header();
-    let method = req.method.as_str();
-    let path_and_query = req
-        .uri
-        .path_and_query()
-        .map_or_else(|| req.uri.path(), |pq| pq.as_str());
-    let host = ctx
-        .resolved
-        .as_ref()
-        .map_or("", |r| r.original_host.as_ref());
-    coxswain_cache::cache_key(method, host, path_and_query)
-}
-
-/// Decide whether the upstream response is cacheable per RFC 7234.
-///
-/// Delegates to Pingora's `resp_cacheable`, which honors `Cache-Control`
-/// (`no-store`/`no-cache`/`private`/`max-age`) and `Expires`. With
-/// [`CACHE_DEFAULTS`] supplying no implicit TTL, only explicitly-fresh responses
-/// are admitted.
-///
-/// A response carrying `Set-Cookie` is refused outright: `resp_cacheable` would
-/// otherwise store and replay the cookie verbatim to every client (it only
-/// strips it when the origin uses the qualified `Cache-Control: no-cache=
-/// "set-cookie"` form), which is session leakage / cache poisoning on a shared
-/// cache. RFC 7234 §3 permits caching `Set-Cookie` responses only with explicit
-/// authorization; we take the conservative stance and never do.
-pub(crate) fn response_cache_filter(resp: &ResponseHeader) -> RespCacheable {
-    if resp.headers.contains_key(http::header::SET_COOKIE) {
-        return RespCacheable::Uncacheable(NoCacheReason::OriginNotCache);
-    }
-    let cc = pingora_cache::cache_control::CacheControl::from_resp_headers(resp);
-    pingora_cache::filters::resp_cacheable(cc.as_ref(), resp.clone(), false, &CACHE_DEFAULTS)
-}
-
-/// Build the `Vary` variance key from the cached response's `Vary` header and
-/// the incoming request's matching header values.
-///
-/// Returns `None` when the response carries no `Vary` (the common case), so such
-/// entries are keyed by URL alone.
-pub(crate) fn cache_vary_filter(meta: &CacheMeta, req: &RequestHeader) -> Option<HashBinary> {
-    let vary = meta.headers().get(http::header::VARY)?.to_str().ok()?;
-    let names: Vec<&str> = vary
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut builder = VarianceBuilder::new();
-    for name in &names {
-        let value = req
-            .headers
-            .get(*name)
-            .map_or_else(Vec::new, |v| v.as_bytes().to_vec());
-        builder.add_owned_value(name, value);
-    }
-    builder.finalize()
-}
-
-/// The `route` metric label for the matched route, or `"none"` when unresolved.
-fn route_label(ctx: &ProxyCtx) -> &str {
-    ctx.resolved
-        .as_ref()
-        .map_or("none", |r| r.metric_route_id.as_ref())
-}
-
-/// Increment `coxswain_cache_hits_total` for the matched route.
-pub(crate) fn record_cache_hit(ctx: &ProxyCtx) {
-    coxswain_cache::cache_hits_total()
-        .with_label_values(&[route_label(ctx)])
-        .inc();
-}
-
-/// Increment `coxswain_cache_misses_total` for the matched route.
-pub(crate) fn record_cache_miss(ctx: &ProxyCtx) {
-    coxswain_cache::cache_misses_total()
-        .with_label_values(&[route_label(ctx)])
-        .inc();
 }
 
 /// Pingora `request_body_filter` body: enforce the per-route request-body size limit
@@ -835,7 +581,8 @@ pub(crate) fn record_cache_miss(ctx: &ProxyCtx) {
 ///
 /// When `mirror-target` is active and `max-body-size` is set, each chunk is also teed
 /// into [`ProxyCtx::mirror_body`] (a [`Bytes`] refcount clone — no data copy). On
-/// `end_of_stream` the mirror dispatch fires fire-and-forget via [`spawn_mirror_dispatch`].
+/// `end_of_stream` the mirror dispatch fires fire-and-forget via
+/// [`crate::filters::mirror::spawn_mirror_dispatch`].
 /// The `auth_client` is only cloned when a mirror dispatch is triggered (i.e., when
 /// `ctx.mirrors.is_empty()` is false and `end_of_stream` is true).
 ///
@@ -883,7 +630,7 @@ pub(crate) fn request_body_filter(
                 // Dispatch all pending mirrors, sharing the assembled body via
                 // Bytes refcount clone (no extra data copy per mirror).
                 for dispatch in ctx.mirrors.drain(..) {
-                    spawn_mirror_dispatch(
+                    crate::filters::mirror::spawn_mirror_dispatch(
                         dispatch,
                         cfg.auth_client.clone(),
                         body_bytes.clone(),
@@ -896,104 +643,6 @@ pub(crate) fn request_body_filter(
     Ok(())
 }
 
-/// Dispatch a fire-and-forget mirror request, discarding the response.
-///
-/// Spawns a Tokio task that:
-/// 1. Selects one endpoint from `dispatch.backend` via weighted round-robin.
-/// 2. Builds a `reqwest` request with the original method, forwarded headers, and
-///    the assembled body (empty for header-only mirrors).
-/// 3. Sends with a bounded 5-second timeout (mirror latency must not stall the caller).
-/// 4. Discards the response entirely.
-/// 5. Emits a `coxswain_proxy::access` log row tagged `mirror = true` carrying
-///    `host`, `path`, `upstream`, and `status` (the primary observability signal
-///    for mirroring and the e2e side channel for asserting mirror receipt).
-/// 6. Emits `WARN` on connect/send errors or timeout and drops the mirror.
-///
-/// The spawned task owns all its data; no session or primary-path state is borrowed.
-fn spawn_mirror_dispatch(
-    dispatch: MirrorDispatch,
-    client: reqwest::Client,
-    body: Bytes,
-    tracker: &tokio_util::task::TaskTracker,
-) {
-    // Bump synchronously before spawning so the counter is updated by the time
-    // the primary request returns — enables deterministic negative assertions in
-    // tests without requiring an async poll.  The upstream label uses the backend
-    // group name (ns/service) rather than the resolved addr because addr
-    // selection is round-robin inside the spawned task.
-    crate::metrics::mirror_requests_total()
-        .with_label_values(&[dispatch.metric_route_id.as_ref(), dispatch.backend.name()])
-        .inc();
-
-    tracker.spawn(async move {
-        let Some((addr, _)) = dispatch.backend.next_endpoint_with_filters() else {
-            tracing::warn!(
-                host = %dispatch.host,
-                "mirror-target has no active endpoints — dropping mirror"
-            );
-            return;
-        };
-
-        let scheme = match dispatch.backend.protocol() {
-            BackendProtocol::Https => "https",
-            _ => "http",
-        };
-
-        use std::fmt::Write;
-        let mut url = String::with_capacity(scheme.len() + 3 + 45 + dispatch.path_and_query.len());
-        let _ = write!(&mut url, "{}://{}{}", scheme, addr, dispatch.path_and_query);
-
-        let mut builder = client.request(dispatch.method.clone(), &url).body(body);
-
-        // Re-inject the original Host first (reqwest strips it by default).
-        builder = builder.header(reqwest::header::HOST, dispatch.host.as_ref());
-
-        for (name, value) in &dispatch.headers {
-            builder = builder.header(name, value);
-        }
-
-        const MIRROR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-        let status = match tokio::time::timeout(MIRROR_TIMEOUT, builder.send()).await {
-            Ok(Ok(resp)) => {
-                let s = resp.status().as_u16();
-                // Discard the response body (no await on body, just drop the response).
-                s
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    host = %dispatch.host,
-                    upstream = %addr,
-                    error = %e,
-                    "mirror dispatch failed — dropping mirror"
-                );
-                return;
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    host = %dispatch.host,
-                    upstream = %addr,
-                    timeout_ms = MIRROR_TIMEOUT.as_millis(),
-                    "mirror dispatch timed out — dropping mirror"
-                );
-                return;
-            }
-        };
-
-        // Emit an access-log row for the mirror sub-request so operators can
-        // observe mirror traffic and e2e tests can assert mirror receipt.
-        tracing::info!(
-            target: "coxswain_proxy::access",
-            mirror = true,
-            host = %dispatch.host,
-            path = %dispatch.path_and_query,
-            upstream = %addr,
-            status = status,
-            "mirror",
-        );
-    });
-}
-
 /// Pingora `upstream_peer` body: choose the backend address from the resolved
 /// route, set up TLS / SNI, and translate per-route timeouts into Pingora
 /// peer options.
@@ -1004,7 +653,7 @@ fn spawn_mirror_dispatch(
 /// `BackendTLSPolicy` CA bundle).
 pub(crate) async fn upstream_peer(
     ca_cache: &UpstreamCaCache,
-    circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry,
+    circuit_breakers: &crate::policy::circuit_breaker::CircuitBreakerRegistry,
     ctx: &mut ProxyCtx,
 ) -> Result<Box<HttpPeer>> {
     let resolved = ctx.resolved.as_ref().ok_or_else(|| {
@@ -1338,7 +987,7 @@ pub(crate) async fn upstream_response_filter(
 
     let status = upstream_response.status.as_u16();
     if status >= 500 {
-        inc_upstream_error(ctx, "5xx");
+        crate::retry::inc_upstream_error(ctx, "5xx");
 
         // 5xx-response retry: check policy, budget, and replay safety.
         let retry_allowed = ctx.resolved.as_ref().is_some_and(|r| {
@@ -1354,7 +1003,7 @@ pub(crate) async fn upstream_response_filter(
         if retry_allowed && budget_ok && !session.as_ref().retry_buffer_truncated() {
             ctx.retries_used += 1;
             ctx.last_retry_condition = Some(RetryOn::HTTP_5XX);
-            inc_upstream_retry(ctx, "5xx");
+            crate::retry::inc_upstream_retry(ctx, "5xx");
             let mut e = Error::explain(
                 HTTPStatus(status),
                 format!(
@@ -1372,154 +1021,15 @@ pub(crate) async fn upstream_response_filter(
     // compression enabled and this response qualifies. Must run after the 5xx retry
     // check so we do not set up an encoder for a response we are about to discard.
     if let Some(cfg) = ctx.resolved.as_ref().and_then(|r| r.compression.clone()) {
-        maybe_setup_compression(session.req_header(), upstream_response, ctx, &cfg);
+        crate::policy::compression::maybe_setup_compression(
+            session.req_header(),
+            upstream_response,
+            ctx,
+            &cfg,
+        );
     }
 
     Ok(())
-}
-
-/// Decide whether to compress this response and, if so, initialise a streaming
-/// encoder on `ctx.compression_encoder`.
-///
-/// Called from [`upstream_response_filter`] when the matched route carries a
-/// [`CompressionConfig`].  The decision is a conjunction of five guards:
-///
-/// 1. The response status is a normal body-bearing code (not 1xx/204/304).
-/// 2. The response does not already have a `Content-Encoding` header.
-/// 3. The response `Content-Type` (media type before `;`) is in the allow-list.
-/// 4. The response `Content-Length` is either absent or ≥ `min_size`.
-/// 5. The client's `Accept-Encoding` advertises at least one enabled codec.
-///    Brotli is preferred when both are enabled and `br` is offered.
-///
-/// On a positive decision, the encoder is stored in `ctx.compression_encoder`;
-/// the response headers are adjusted (add `Content-Encoding`, add/extend `Vary`,
-/// remove `Content-Length` and `Accept-Ranges`) so that downstream sees a chunked
-/// compressed body. On any negative branch the function returns without touching
-/// `ctx` or the headers.
-fn maybe_setup_compression(
-    req: &RequestHeader,
-    resp: &mut ResponseHeader,
-    ctx: &mut ProxyCtx,
-    cfg: &CompressionConfig,
-) {
-    use http::header::{
-        ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING, VARY,
-    };
-
-    // Guard 1: skip 1xx, 204 (no content), 304 (not modified) — no body.
-    let status = resp.status.as_u16();
-    if status < 200 || status == 204 || status == 304 {
-        return;
-    }
-
-    // Guard 2: already compressed — pass through untouched.
-    if resp.headers.contains_key(CONTENT_ENCODING) {
-        return;
-    }
-
-    // Guard 3: Content-Type must be in the allow-list.
-    let ct = resp
-        .headers
-        .get(CONTENT_TYPE)
-        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-        .unwrap_or("");
-    if !cfg.allows_type(ct) {
-        return;
-    }
-
-    // Guard 4: Content-Length, when present, must be >= min_size.
-    // Absent Content-Length (chunked upstream) is allowed — we cannot know the
-    // size in advance, so we compress optimistically.
-    if let Some(cl_val) = resp.headers.get(CONTENT_LENGTH) {
-        let cl: u64 = std::str::from_utf8(cl_val.as_bytes())
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        if cl < cfg.min_size {
-            return;
-        }
-    }
-
-    // Guard 5: client Accept-Encoding — pick algorithm (brotli preferred).
-    let ae = req
-        .headers
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-        .unwrap_or("");
-
-    let algorithm = choose_algorithm(ae, cfg);
-    let Some(algorithm) = algorithm else {
-        return;
-    };
-
-    // Build the encoder. `Algorithm::compressor` may return None for unknown
-    // algorithms, but Gzip and Brotli always return Some.
-    let Some(encoder) = algorithm.compressor(cfg.level) else {
-        return;
-    };
-
-    ctx.compression_encoder = Some(encoder);
-
-    // Adjust response headers: set Content-Encoding, extend Vary, remove
-    // Content-Length (body length changes) and Accept-Ranges (ranges are
-    // meaningless on a compressed stream).
-    let ce_value = match algorithm {
-        Algorithm::Gzip => "gzip",
-        Algorithm::Brotli => "br",
-        // Safety: choose_algorithm only returns Gzip or Brotli.
-        _ => return,
-    };
-
-    // Vary: extend the existing value rather than clobber it.
-    let vary = resp
-        .headers
-        .get(VARY)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let new_vary = match vary {
-        Some(existing) if existing.to_ascii_lowercase().contains("accept-encoding") => existing,
-        Some(existing) => format!("{existing}, Accept-Encoding"),
-        None => "Accept-Encoding".to_string(),
-    };
-
-    // Use Pingora's safe header API so both `base.headers` and `header_name_map`
-    // stay in sync.  Direct `resp.headers.insert/remove` (via DerefMut) only
-    // touches `base.headers`; `write_response_header` later zips the two maps
-    // via `case_header_iter` and asserts key-order parity — a mismatch panics,
-    // aborting the proxy process (`panic = "abort"` in release profile).
-    let _ = resp.insert_header(CONTENT_ENCODING, ce_value);
-    let _ = resp.insert_header(VARY, new_vary.as_str());
-    resp.remove_header(&CONTENT_LENGTH);
-    resp.remove_header(&ACCEPT_RANGES);
-    // Pingora's H1 handler decides whether to add Transfer-Encoding: chunked
-    // *before* calling upstream_response_filter, based on the upstream's
-    // Content-Length.  Because we remove Content-Length here, we must set
-    // chunked ourselves so the downstream has a valid body framing.
-    let _ = resp.insert_header(TRANSFER_ENCODING, "chunked");
-}
-
-/// Choose a compression algorithm from the client's `Accept-Encoding` string,
-/// respecting the route's `gzip` / `brotli` flags. Brotli is preferred when both
-/// are enabled and the client advertises `br`.
-///
-/// Returns `None` when no enabled algorithm is offered by the client.
-fn choose_algorithm(accept_encoding: &str, cfg: &CompressionConfig) -> Option<Algorithm> {
-    let brotli_offered = accept_encoding
-        .split(',')
-        .map(|t| t.trim().split(';').next().unwrap_or("").trim())
-        .any(|t| t.eq_ignore_ascii_case("br"));
-    let gzip_offered = accept_encoding
-        .split(',')
-        .map(|t| t.trim().split(';').next().unwrap_or("").trim())
-        .any(|t| t.eq_ignore_ascii_case("gzip"));
-
-    if cfg.brotli && brotli_offered {
-        Some(Algorithm::Brotli)
-    } else if cfg.gzip && gzip_offered {
-        Some(Algorithm::Gzip)
-    } else {
-        None
-    }
 }
 
 /// Pingora `response_body_filter` body: stream each response body chunk
@@ -1568,203 +1078,6 @@ pub(crate) fn response_body_filter(
     Ok(())
 }
 
-/// Pingora `fail_to_connect` body: retry upstream connection failures when the
-/// route's `RetryPolicy` permits.
-///
-/// Called when establishing the TCP/TLS connection to the upstream fails **before**
-/// any request bytes are sent, so replaying the request is always safe.
-/// Marks the error retryable when:
-/// - `retry-on` includes `connect-failure` (for `ErrorSource::Upstream` non-timeout
-///   errors) or `timeout` (for `ConnectTimedout`); and
-/// - the `max-retries` budget is not exhausted.
-pub(crate) fn fail_to_connect(
-    _session: &mut Session,
-    _peer: &HttpPeer,
-    ctx: &mut ProxyCtx,
-    mut e: Box<pingora_core::Error>,
-) -> Box<pingora_core::Error> {
-    let Some(resolved) = ctx.resolved.as_ref() else {
-        return e;
-    };
-    let policy = resolved.backend_group.retry_policy();
-    if policy.is_disabled() || ctx.retries_used >= policy.max_retries {
-        return e;
-    }
-    let is_timeout = matches!(e.etype(), ConnectTimedout);
-    let condition = if is_timeout {
-        RetryOn::TIMEOUT
-    } else {
-        RetryOn::CONNECT_FAILURE
-    };
-    if policy.on.contains(condition) {
-        ctx.retries_used += 1;
-        ctx.last_retry_condition = Some(condition);
-        e.retry = true.into();
-        let condition_label = if is_timeout {
-            "timeout"
-        } else {
-            "connect-failure"
-        };
-        inc_upstream_retry(ctx, condition_label);
-    }
-    e
-}
-
-/// Pingora `error_while_proxy` body: preserve retry decisions made by
-/// `upstream_response_filter`, and allow connect-level retries on fresh connections.
-///
-/// Pingora's default implementation gates retries on `client_reused &&
-/// !retry_buffer_truncated()`.  We override it to:
-/// - Keep the `retry = true` set by `fail_to_connect` (connect-failure path) or
-///   `upstream_response_filter` (5xx-response path) unconditionally when those
-///   hooks already bumped `retries_used`.
-/// - Fall back to Pingora's default reuse-check for errors not triggered by our
-///   own retry logic (e.g. mid-response I/O errors).
-pub(crate) fn error_while_proxy(
-    peer: &HttpPeer,
-    session: &mut Session,
-    mut e: Box<pingora_core::Error>,
-    ctx: &mut ProxyCtx,
-    client_reused: bool,
-) -> Box<pingora_core::Error> {
-    if ctx.last_retry_condition == Some(RetryOn::HTTP_5XX) {
-        // 5xx-response retry was already set in upstream_response_filter; preserve it.
-        // (Do NOT gate on client_reused — the connection held the response, not a reuse.)
-        e.retry = true.into();
-        return e;
-    }
-    // For connection-error retries (fail_to_connect already set retry=true) or
-    // unrelated errors, apply Pingora's default reuse check.
-    let mut e = e.more_context(format!("Peer: {peer}"));
-    e.retry
-        .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
-    e
-}
-
-/// Select the HTTP status for a failed proxy attempt from the Pingora error and
-/// the per-request timeout-attribution flags.
-///
-/// Extracted from [`fail_to_proxy`] so the mapping is unit-testable without
-/// constructing a live [`Session`].
-///
-/// # Status rules
-///
-/// - `HTTPStatus(code)` — passthrough (Pingora-level overrides).
-/// - `ReadTimedout | WriteTimedout` while a request or backend-request budget is
-///   controlling → 504 (Gateway API spec, GEP-1742).
-/// - `ConnectTimedout` while a backend-request budget is active → 502.
-/// - Everything else: 502 for upstream sources, 0 (no response written) for
-///   downstream connection-level errors, 400 for other downstream errors, 500
-///   for internal faults.
-fn select_failure_status(
-    etype: &pingora_core::ErrorType,
-    esource: &ErrorSource,
-    request_timeout_is_controlling: bool,
-    backend_request_timeout_active: bool,
-) -> u16 {
-    match etype {
-        HTTPStatus(code) => *code,
-        // request/backendRequest read/write timeouts → 504 (Gateway API spec, GEP-1742).
-        // Connect failure while backendRequest active → 502 (upstream unreachable).
-        // Flags set in upstream_peer avoid races with OS timer granularity.
-        ReadTimedout | WriteTimedout
-            if request_timeout_is_controlling || backend_request_timeout_active =>
-        {
-            504
-        }
-        ConnectTimedout if backend_request_timeout_active => 502,
-        _ => match esource {
-            ErrorSource::Upstream => 502,
-            ErrorSource::Downstream => match etype {
-                ConnectionClosed | ReadError | WriteError => 0,
-                _ => 400,
-            },
-            _ => 500,
-        },
-    }
-}
-
-/// Pingora `fail_to_proxy` body: map upstream/downstream errors to HTTP
-/// status codes and write a short plain-text body.
-///
-/// Mirrors Pingora's default code-selection logic but calls
-/// `respond_error_with_body` so clients see "503 Service Unavailable\n"
-/// rather than a zero-length body.
-pub(crate) async fn fail_to_proxy(
-    session: &mut Session,
-    e: &pingora_core::Error,
-    ctx: &mut ProxyCtx,
-) -> FailToProxy {
-    let code = select_failure_status(
-        e.etype(),
-        e.esource(),
-        ctx.request_timeout_is_controlling,
-        ctx.backend_request_timeout_active,
-    );
-    let error_type = classify_upstream_error(e);
-    inc_upstream_error(ctx, error_type);
-    if code > 0 {
-        let reason = http::StatusCode::from_u16(code)
-            .ok()
-            .and_then(|s| s.canonical_reason())
-            .unwrap_or("Unknown");
-        session
-            .respond_error_with_body(code, Bytes::from(format!("{code} {reason}\n")))
-            .await
-            .unwrap_or_else(|err| tracing::error!("failed to send error response: {err}"));
-    }
-    FailToProxy {
-        error_code: code,
-        can_reuse_downstream: false,
-    }
-}
-
-/// Bucket a Pingora `Error` into the `error_type` taxonomy carried on
-/// `coxswain_proxy_upstream_errors_total`.
-fn classify_upstream_error(e: &pingora_core::Error) -> &'static str {
-    match e.etype() {
-        ConnectTimedout | ReadTimedout | WriteTimedout => "timeout",
-        _ => match e.esource() {
-            ErrorSource::Upstream => "connect",
-            _ => "other",
-        },
-    }
-}
-
-/// Increment `coxswain_proxy_upstream_retries_total{listener, route, upstream,
-/// condition}` from a per-request `ProxyCtx`. Called once per retry attempt,
-/// not per request. Best-effort: falls back to `"none"` labels when routing
-/// has not yet resolved (should not occur in practice since retries require a
-/// resolved route).
-fn inc_upstream_retry(ctx: &ProxyCtx, condition: &'static str) {
-    let mut port_buf = itoa::Buffer::new();
-    let listener = port_buf.format(ctx.local_port.unwrap_or(0));
-    let (route, upstream) = ctx.resolved.as_ref().map_or(("none", "none"), |r| {
-        (r.metric_route_id.as_ref(), r.backend_group.name())
-    });
-    crate::metrics::upstream_retries_total()
-        .with_label_values(&[listener, route, upstream, condition])
-        .inc();
-}
-
-/// Increment `coxswain_proxy_upstream_errors_total{listener, route, upstream,
-/// error_type}` from a per-request `ProxyCtx`. Best-effort: when the request
-/// reached `fail_to_proxy` before routing resolved, `route`/`upstream` carry
-/// the literal `"none"` fallback so the increment isn't dropped.
-fn inc_upstream_error(ctx: &ProxyCtx, error_type: &'static str) {
-    // `itoa::Buffer` writes into a stack-only buffer; no heap allocation for
-    // the u16 → &str render. Re-issuing `p.to_string()` here would allocate
-    // per request and is what #239's metric emission accidentally regressed.
-    let mut port_buf = itoa::Buffer::new();
-    let listener = port_buf.format(ctx.local_port.unwrap_or(0));
-    let (route, upstream) = ctx.resolved.as_ref().map_or(("none", "none"), |r| {
-        (r.metric_route_id.as_ref(), r.backend_group.name())
-    });
-    crate::metrics::upstream_errors_total()
-        .with_label_values(&[listener, route, upstream, error_type])
-        .inc();
-}
-
 /// Pingora `logging` body: emit one structured access-log event per request
 /// *and* increment the per-request Prometheus counters.
 ///
@@ -1776,7 +1089,7 @@ fn inc_upstream_error(ctx: &ProxyCtx, error_type: &'static str) {
 pub(crate) async fn logging(
     access_log_enabled: bool,
     access_log_path_mode: AccessLogPathMode,
-    circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry,
+    circuit_breakers: &crate::policy::circuit_breaker::CircuitBreakerRegistry,
     session: &mut Session,
     e: Option<&pingora_core::Error>,
     ctx: &ProxyCtx,
@@ -1886,540 +1199,4 @@ pub(crate) async fn logging(
         error = err_msg.as_deref(),
         "access",
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ip_allowed, ip_denied};
-    use std::net::IpAddr;
-
-    fn nets(cidrs: &[&str]) -> Vec<ipnet::IpNet> {
-        cidrs
-            .iter()
-            .map(|c| c.parse().expect("valid CIDR"))
-            .collect()
-    }
-
-    fn ip(s: &str) -> Option<IpAddr> {
-        Some(s.parse().expect("valid IP"))
-    }
-
-    #[test]
-    fn in_range_v4_allowed() {
-        assert!(ip_allowed(ip("10.1.2.3"), &nets(&["10.0.0.0/8"])));
-    }
-
-    #[test]
-    fn out_of_range_v4_rejected() {
-        assert!(!ip_allowed(ip("192.168.0.1"), &nets(&["10.0.0.0/8"])));
-    }
-
-    #[test]
-    fn in_range_v6_allowed() {
-        assert!(ip_allowed(ip("2001:db8::1"), &nets(&["2001:db8::/32"])));
-    }
-
-    #[test]
-    fn out_of_range_v6_rejected() {
-        assert!(!ip_allowed(ip("2001:dead::1"), &nets(&["2001:db8::/32"])));
-    }
-
-    #[test]
-    fn matches_second_cidr_in_list() {
-        assert!(ip_allowed(
-            ip("192.168.1.5"),
-            &nets(&["10.0.0.0/8", "192.168.1.0/24"])
-        ));
-    }
-
-    #[test]
-    fn missing_client_ip_is_rejected_fail_closed() {
-        // A peer we cannot attribute must never pass a security allow-list.
-        assert!(!ip_allowed(None, &nets(&["10.0.0.0/8"])));
-    }
-
-    #[test]
-    fn empty_allow_list_rejects_everything() {
-        assert!(!ip_allowed(ip("10.0.0.1"), &[]));
-    }
-
-    #[test]
-    fn v4_mapped_v6_does_not_match_v4_cidr() {
-        // Strict matching: an IPv4-mapped IPv6 client does NOT satisfy an IPv4 CIDR.
-        // Locks the documented behavior so leniency would be a deliberate change.
-        assert!(!ip_allowed(ip("::ffff:10.0.0.1"), &nets(&["10.0.0.0/8"])));
-    }
-
-    // ── ip_denied ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn in_range_v4_denied() {
-        assert!(ip_denied(ip("10.1.2.3"), &nets(&["10.0.0.0/8"])));
-    }
-
-    #[test]
-    fn out_of_range_v4_not_denied() {
-        assert!(!ip_denied(ip("192.168.0.1"), &nets(&["10.0.0.0/8"])));
-    }
-
-    #[test]
-    fn in_range_v6_denied() {
-        assert!(ip_denied(ip("2001:db8::1"), &nets(&["2001:db8::/32"])));
-    }
-
-    #[test]
-    fn out_of_range_v6_not_denied() {
-        assert!(!ip_denied(ip("2001:dead::1"), &nets(&["2001:db8::/32"])));
-    }
-
-    #[test]
-    fn missing_client_ip_is_not_denied_fail_open() {
-        // A peer we cannot attribute must NOT be auto-denied — a block list only
-        // blocks IPs it can positively attribute to a listed range.
-        assert!(!ip_denied(None, &nets(&["10.0.0.0/8"])));
-    }
-
-    #[test]
-    fn empty_deny_list_denies_nothing() {
-        assert!(!ip_denied(ip("10.0.0.1"), &[]));
-    }
-
-    #[test]
-    fn v4_mapped_v6_does_not_match_deny_v4_cidr() {
-        // Strict matching: an IPv4-mapped IPv6 client does NOT match an IPv4 deny CIDR.
-        assert!(!ip_denied(ip("::ffff:10.0.0.1"), &nets(&["10.0.0.0/8"])));
-    }
-
-    // ── first_non_private_ip ──────────────────────────────────────────────────
-
-    #[test]
-    fn first_non_private_ip_skips_private_finds_public() {
-        let result = super::first_non_private_ip("10.0.0.1, 203.0.113.5, 198.51.100.1");
-        assert_eq!(result, "203.0.113.5".parse::<IpAddr>().ok());
-    }
-
-    #[test]
-    fn first_non_private_ip_single_public() {
-        let result = super::first_non_private_ip("1.2.3.4");
-        assert_eq!(result, "1.2.3.4".parse::<IpAddr>().ok());
-    }
-
-    #[test]
-    fn first_non_private_ip_all_private_is_none() {
-        let result = super::first_non_private_ip("10.0.0.1, 192.168.0.1, 172.16.0.1");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn first_non_private_ip_empty_is_none() {
-        assert!(super::first_non_private_ip("").is_none());
-        assert!(super::first_non_private_ip("  ,  ").is_none());
-    }
-
-    #[test]
-    fn first_non_private_ip_loopback_is_private() {
-        assert!(super::first_non_private_ip("127.0.0.1").is_none());
-        assert!(super::first_non_private_ip("::1").is_none());
-    }
-
-    // ── resolve_client_ip: unit tests (no Session available; tested via integration) ─
-    // The per-request happy/sad path is covered by the e2e security-plane tests.
-
-    #[test]
-    fn cacheable_response_without_set_cookie_is_admitted() {
-        use super::response_cache_filter;
-        use pingora_cache::RespCacheable;
-        use pingora_http::ResponseHeader;
-
-        let mut resp = ResponseHeader::build(200, None).expect("build response");
-        resp.insert_header("Cache-Control", "max-age=300")
-            .expect("insert cache-control");
-        assert!(
-            matches!(response_cache_filter(&resp), RespCacheable::Cacheable(_)),
-            "an explicitly-fresh response with no Set-Cookie must be cacheable"
-        );
-    }
-
-    #[test]
-    fn response_with_set_cookie_is_never_cached() {
-        use super::response_cache_filter;
-        use pingora_cache::RespCacheable;
-        use pingora_http::ResponseHeader;
-
-        // A Set-Cookie response that is otherwise fresh must be refused: caching it
-        // would replay one client's cookie to every other client (session leakage).
-        let mut resp = ResponseHeader::build(200, None).expect("build response");
-        resp.insert_header("Cache-Control", "max-age=300")
-            .expect("insert cache-control");
-        resp.insert_header("Set-Cookie", "session=secret")
-            .expect("insert set-cookie");
-        assert!(
-            matches!(response_cache_filter(&resp), RespCacheable::Uncacheable(_)),
-            "a Set-Cookie response must never be admitted to the shared cache"
-        );
-    }
-
-    // ── maybe_setup_compression / choose_algorithm ────────────────────────────
-
-    use super::{choose_algorithm, maybe_setup_compression};
-    use crate::common::ctx::ProxyCtx;
-    use coxswain_core::routing::CompressionConfig;
-    use pingora_http::{RequestHeader, ResponseHeader};
-
-    fn gzip_cfg() -> CompressionConfig {
-        CompressionConfig::new(
-            true,
-            false,
-            6,
-            1024,
-            vec!["application/json".into(), "text/html".into()].into_boxed_slice(),
-        )
-    }
-
-    fn both_cfg() -> CompressionConfig {
-        CompressionConfig::new(
-            true,
-            true,
-            6,
-            1024,
-            vec!["application/json".into()].into_boxed_slice(),
-        )
-    }
-
-    fn req_with_ae(accept_encoding: &str) -> RequestHeader {
-        let mut r = RequestHeader::build("GET", b"/", None).expect("build request");
-        r.insert_header("accept-encoding", accept_encoding)
-            .expect("insert ae");
-        r
-    }
-
-    fn resp_200(ct: &str, cl: Option<u64>) -> ResponseHeader {
-        let mut r = ResponseHeader::build(200, None).expect("build response");
-        r.insert_header("content-type", ct).expect("insert ct");
-        if let Some(n) = cl {
-            r.insert_header("content-length", n.to_string())
-                .expect("insert cl");
-        }
-        r
-    }
-
-    #[test]
-    fn choose_algorithm_prefers_brotli_when_both_enabled_and_br_offered() {
-        use pingora_core::protocols::http::compression::Algorithm;
-        let cfg = both_cfg();
-        assert_eq!(
-            choose_algorithm("gzip, br", &cfg),
-            Some(Algorithm::Brotli),
-            "brotli must be preferred when both enabled and br advertised"
-        );
-    }
-
-    #[test]
-    fn choose_algorithm_falls_back_to_gzip() {
-        use pingora_core::protocols::http::compression::Algorithm;
-        let cfg = both_cfg();
-        assert_eq!(
-            choose_algorithm("gzip", &cfg),
-            Some(Algorithm::Gzip),
-            "should fall back to gzip when br not offered"
-        );
-    }
-
-    #[test]
-    fn choose_algorithm_none_when_no_match() {
-        let cfg = gzip_cfg();
-        assert!(
-            choose_algorithm("br", &cfg).is_none(),
-            "gzip-only config must not match br"
-        );
-    }
-
-    #[test]
-    fn choose_algorithm_none_when_ae_empty() {
-        let cfg = gzip_cfg();
-        assert!(choose_algorithm("", &cfg).is_none());
-    }
-
-    #[test]
-    fn setup_compression_sets_content_encoding_and_vary() {
-        let cfg = gzip_cfg();
-        let req = req_with_ae("gzip");
-        let mut resp = resp_200("application/json", Some(2048));
-        let mut ctx = ProxyCtx::default();
-        maybe_setup_compression(&req, &mut resp, &mut ctx, &cfg);
-        assert!(ctx.compression_encoder.is_some(), "encoder must be set");
-        assert_eq!(
-            resp.headers
-                .get("content-encoding")
-                .and_then(|v| v.to_str().ok()),
-            Some("gzip")
-        );
-        assert!(
-            resp.headers
-                .get("vary")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .contains("accept-encoding"),
-            "Vary must include Accept-Encoding"
-        );
-        assert!(
-            resp.headers.get("content-length").is_none(),
-            "Content-Length must be removed"
-        );
-    }
-
-    #[test]
-    fn setup_compression_passes_through_already_compressed() {
-        let cfg = gzip_cfg();
-        let req = req_with_ae("gzip");
-        let mut resp = resp_200("application/json", Some(2048));
-        resp.insert_header("content-encoding", "gzip")
-            .expect("insert ce");
-        let mut ctx = ProxyCtx::default();
-        maybe_setup_compression(&req, &mut resp, &mut ctx, &cfg);
-        assert!(
-            ctx.compression_encoder.is_none(),
-            "must not re-compress an already-compressed response"
-        );
-    }
-
-    #[test]
-    fn setup_compression_skips_disallowed_content_type() {
-        let cfg = gzip_cfg();
-        let req = req_with_ae("gzip");
-        let mut resp = resp_200("image/png", Some(4096));
-        let mut ctx = ProxyCtx::default();
-        maybe_setup_compression(&req, &mut resp, &mut ctx, &cfg);
-        assert!(
-            ctx.compression_encoder.is_none(),
-            "image/png must not be compressed"
-        );
-    }
-
-    #[test]
-    fn setup_compression_skips_below_min_size() {
-        let cfg = gzip_cfg(); // min_size = 1024
-        let req = req_with_ae("gzip");
-        let mut resp = resp_200("application/json", Some(100));
-        let mut ctx = ProxyCtx::default();
-        maybe_setup_compression(&req, &mut resp, &mut ctx, &cfg);
-        assert!(
-            ctx.compression_encoder.is_none(),
-            "response below min_size must not be compressed"
-        );
-    }
-
-    #[test]
-    fn setup_compression_allows_chunked_without_content_length() {
-        // No Content-Length (chunked) → always compress regardless of min_size.
-        let cfg = gzip_cfg();
-        let req = req_with_ae("gzip");
-        let mut resp = resp_200("application/json", None); // no Content-Length
-        let mut ctx = ProxyCtx::default();
-        maybe_setup_compression(&req, &mut resp, &mut ctx, &cfg);
-        assert!(
-            ctx.compression_encoder.is_some(),
-            "chunked response without Content-Length must be compressed"
-        );
-    }
-
-    #[test]
-    fn setup_compression_skips_204_no_content() {
-        let cfg = gzip_cfg();
-        let req = req_with_ae("gzip");
-        let mut resp = ResponseHeader::build(204, None).expect("build 204");
-        resp.insert_header("content-type", "application/json")
-            .expect("insert ct");
-        let mut ctx = ProxyCtx::default();
-        maybe_setup_compression(&req, &mut resp, &mut ctx, &cfg);
-        assert!(ctx.compression_encoder.is_none(), "204 must be skipped");
-    }
-
-    #[test]
-    fn setup_compression_vary_extends_existing() {
-        let cfg = gzip_cfg();
-        let req = req_with_ae("gzip");
-        let mut resp = resp_200("application/json", None);
-        resp.insert_header("vary", "Cookie").expect("insert vary");
-        let mut ctx = ProxyCtx::default();
-        maybe_setup_compression(&req, &mut resp, &mut ctx, &cfg);
-        let vary = resp
-            .headers
-            .get("vary")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            vary.to_ascii_lowercase().contains("cookie"),
-            "original Vary value must be preserved"
-        );
-        assert!(
-            vary.to_ascii_lowercase().contains("accept-encoding"),
-            "Accept-Encoding must be appended to Vary"
-        );
-    }
-
-    // ── select_failure_status / classify_upstream_error ──────────────────────
-    //
-    // `fail_to_proxy` is async and writes to a live Session, so the status-
-    // selection logic is extracted into `select_failure_status` and tested here.
-
-    use super::{classify_upstream_error, select_failure_status};
-    use pingora_core::{
-        ConnectTimedout, ConnectionClosed, ErrorSource, HTTPStatus, ReadError, ReadTimedout,
-        WriteError, WriteTimedout,
-    };
-
-    // ── WriteTimedout (the `send-timeout` annotation, #341) ───────────────────
-
-    #[test]
-    fn write_timeout_maps_to_502_upstream() {
-        // `ingress.coxswain-labs.dev/send-timeout` fires a WriteTimedout with
-        // ErrorSource::Upstream.  No request/backend budget is active, so the
-        // generic upstream arm applies: 502.
-        assert_eq!(
-            select_failure_status(&WriteTimedout, &ErrorSource::Upstream, false, false),
-            502,
-            "WriteTimedout from upstream without an active budget must map to 502"
-        );
-    }
-
-    #[test]
-    fn write_timeout_with_request_budget_maps_to_504() {
-        // When the *request* timeout (GEP-1742) is the controlling deadline a
-        // WriteTimedout is reclassified to 504.
-        assert_eq!(
-            select_failure_status(&WriteTimedout, &ErrorSource::Upstream, true, false),
-            504,
-            "WriteTimedout while request timeout is controlling must map to 504"
-        );
-    }
-
-    #[test]
-    fn write_timeout_with_backend_budget_maps_to_504() {
-        // Same reclassification when the *backendRequest* budget is active.
-        assert_eq!(
-            select_failure_status(&WriteTimedout, &ErrorSource::Upstream, false, true),
-            504,
-            "WriteTimedout while backend-request budget active must map to 504"
-        );
-    }
-
-    // ── ReadTimedout (`read-timeout` annotation) ──────────────────────────────
-
-    #[test]
-    fn read_timeout_maps_to_502_upstream() {
-        assert_eq!(
-            select_failure_status(&ReadTimedout, &ErrorSource::Upstream, false, false),
-            502,
-            "ReadTimedout from upstream without an active budget must map to 502"
-        );
-    }
-
-    #[test]
-    fn read_timeout_with_request_budget_maps_to_504() {
-        assert_eq!(
-            select_failure_status(&ReadTimedout, &ErrorSource::Upstream, true, false),
-            504,
-        );
-    }
-
-    // ── ConnectTimedout (`connect-timeout` annotation) ────────────────────────
-
-    #[test]
-    fn connect_timeout_without_backend_budget_maps_to_502_via_upstream_source() {
-        // ConnectTimedout without a backend budget falls through to the
-        // ErrorSource::Upstream => 502 arm (connect is always upstream-sourced).
-        assert_eq!(
-            select_failure_status(&ConnectTimedout, &ErrorSource::Upstream, false, false),
-            502,
-        );
-    }
-
-    #[test]
-    fn connect_timeout_with_backend_budget_maps_to_502() {
-        assert_eq!(
-            select_failure_status(&ConnectTimedout, &ErrorSource::Upstream, false, true),
-            502,
-        );
-    }
-
-    // ── HTTPStatus passthrough ────────────────────────────────────────────────
-
-    #[test]
-    fn http_status_passthrough() {
-        // A Pingora-level HTTPStatus override is forwarded verbatim regardless of
-        // source or budget flags.
-        assert_eq!(
-            select_failure_status(&HTTPStatus(503), &ErrorSource::Upstream, false, false),
-            503,
-        );
-        assert_eq!(
-            select_failure_status(&HTTPStatus(429), &ErrorSource::Internal, true, true),
-            429,
-        );
-    }
-
-    // ── Downstream errors ─────────────────────────────────────────────────────
-
-    #[test]
-    fn downstream_connection_closed_maps_to_zero() {
-        // 0 means "don't write a response" (client already gone).
-        assert_eq!(
-            select_failure_status(&ConnectionClosed, &ErrorSource::Downstream, false, false),
-            0,
-        );
-    }
-
-    #[test]
-    fn downstream_read_write_error_maps_to_zero() {
-        assert_eq!(
-            select_failure_status(&ReadError, &ErrorSource::Downstream, false, false),
-            0,
-        );
-        assert_eq!(
-            select_failure_status(&WriteError, &ErrorSource::Downstream, false, false),
-            0,
-        );
-    }
-
-    #[test]
-    fn downstream_other_error_maps_to_400() {
-        // Any downstream error that isn't a connection-level close maps to 400.
-        assert_eq!(
-            select_failure_status(&ConnectTimedout, &ErrorSource::Downstream, false, false),
-            400,
-        );
-    }
-
-    #[test]
-    fn internal_error_maps_to_500() {
-        assert_eq!(
-            select_failure_status(&ReadTimedout, &ErrorSource::Internal, false, false),
-            500,
-        );
-    }
-
-    // ── classify_upstream_error ───────────────────────────────────────────────
-
-    #[test]
-    fn classify_upstream_error_timeout_bucket() {
-        // ConnectTimedout, ReadTimedout, and WriteTimedout all map to "timeout"
-        // for the upstream-error Prometheus label.
-        assert_eq!(
-            classify_upstream_error(pingora_core::Error::new(ConnectTimedout).as_ref()),
-            "timeout",
-            "ConnectTimedout must bucket as 'timeout'"
-        );
-        assert_eq!(
-            classify_upstream_error(pingora_core::Error::new(ReadTimedout).as_ref()),
-            "timeout",
-            "ReadTimedout must bucket as 'timeout'"
-        );
-        assert_eq!(
-            classify_upstream_error(pingora_core::Error::new(WriteTimedout).as_ref()),
-            "timeout",
-            "WriteTimedout must bucket as 'timeout'"
-        );
-    }
 }

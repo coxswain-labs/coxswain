@@ -58,8 +58,8 @@ impl<Kind> RoutingEngine<Kind> {
 
 #[cfg(test)]
 mod tests {
-    use crate::common::engine::RoutingEngine;
-    use crate::common::redirect::{RedirectOrigin, build_redirect_location};
+    use crate::filters::redirect::{RedirectOrigin, build_redirect_location};
+    use crate::routing::engine::RoutingEngine;
     use coxswain_core::routing::{
         BackendGroup, FilterAction, GatewayRoutingTableBuilder, HeaderMod, PathModifier,
         RequestContext, RouteEntry, RouteOutcome, SharedGatewayRoutingTable,

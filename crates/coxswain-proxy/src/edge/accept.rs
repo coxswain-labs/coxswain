@@ -48,7 +48,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::SniCertSelector;
-use crate::common::ctx::{CONN_INFO, ConnectionInfo};
+use crate::ctx::{CONN_INFO, ConnectionInfo};
 use crate::metrics;
 
 /// Maximum number of in-flight per-connection tasks per listener.

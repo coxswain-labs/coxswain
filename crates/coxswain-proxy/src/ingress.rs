@@ -1,18 +1,20 @@
 //! `IngressProxy`: Pingora `ProxyHttp` implementation that serves traffic for
 //! Kubernetes `Ingress` resources.
 //!
-//! The proxy holds a typed [`RoutingEngine`][crate::common::engine::RoutingEngine]
+//! The proxy holds a typed [`RoutingEngine`][crate::routing::engine::RoutingEngine]
 //! pinned to `Ingress`-flavored routing data and a CA-bundle parse cache. All
 //! `ProxyHttp` hooks delegate to the shared bodies in
-//! [`crate::common::hooks`] — the only thing that varies between
+//! [`crate::hooks`] — the only thing that varies between
 //! `IngressProxy` and `GatewayProxy` today is the static `Kind` parameter on
 //! the engine, which prevents a routing snapshot for one spec from being
 //! handed to the proxy that serves the other.
 
-use crate::common::ctx::ProxyCtx;
-use crate::common::engine::RoutingEngine;
-use crate::common::hooks;
 use crate::config::SharedProxyConfig;
+use crate::ctx::ProxyCtx;
+use crate::hooks;
+use crate::policy::cache;
+use crate::retry;
+use crate::routing::engine::RoutingEngine;
 use async_trait::async_trait;
 use bytes::Bytes;
 use coxswain_core::routing::Ingress;
@@ -63,11 +65,11 @@ impl ProxyHttp for IngressProxy {
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut ProxyCtx) -> Result<()> {
-        hooks::request_cache_filter(self.cfg.cache, session, ctx)
+        cache::request_cache_filter(self.cfg.cache, session, ctx)
     }
 
     fn cache_key_callback(&self, session: &Session, ctx: &mut ProxyCtx) -> Result<CacheKey> {
-        Ok(hooks::cache_key_callback(session, ctx))
+        Ok(cache::cache_key_callback(session, ctx))
     }
 
     fn response_cache_filter(
@@ -76,7 +78,7 @@ impl ProxyHttp for IngressProxy {
         resp: &ResponseHeader,
         _ctx: &mut ProxyCtx,
     ) -> Result<RespCacheable> {
-        Ok(hooks::response_cache_filter(resp))
+        Ok(cache::response_cache_filter(resp))
     }
 
     fn cache_vary_filter(
@@ -85,7 +87,7 @@ impl ProxyHttp for IngressProxy {
         _ctx: &mut ProxyCtx,
         req: &RequestHeader,
     ) -> Option<HashBinary> {
-        hooks::cache_vary_filter(meta, req)
+        cache::cache_vary_filter(meta, req)
     }
 
     async fn cache_hit_filter(
@@ -99,12 +101,12 @@ impl ProxyHttp for IngressProxy {
     where
         Self::CTX: Send + Sync,
     {
-        hooks::record_cache_hit(ctx);
+        cache::record_cache_hit(ctx);
         Ok(None)
     }
 
     fn cache_miss(&self, session: &mut Session, ctx: &mut ProxyCtx) {
-        hooks::record_cache_miss(ctx);
+        cache::record_cache_miss(ctx);
         session.cache.cache_miss();
     }
 
@@ -188,7 +190,7 @@ impl ProxyHttp for IngressProxy {
         ctx: &mut ProxyCtx,
         e: Box<pingora_core::Error>,
     ) -> Box<pingora_core::Error> {
-        hooks::fail_to_connect(session, peer, ctx, e)
+        retry::fail_to_connect(session, peer, ctx, e)
     }
 
     fn error_while_proxy(
@@ -199,7 +201,7 @@ impl ProxyHttp for IngressProxy {
         ctx: &mut ProxyCtx,
         client_reused: bool,
     ) -> Box<pingora_core::Error> {
-        hooks::error_while_proxy(peer, session, e, ctx, client_reused)
+        retry::error_while_proxy(peer, session, e, ctx, client_reused)
     }
 
     async fn fail_to_proxy(
@@ -211,7 +213,7 @@ impl ProxyHttp for IngressProxy {
     where
         Self::CTX: Send + Sync,
     {
-        hooks::fail_to_proxy(session, e, ctx).await
+        retry::fail_to_proxy(session, e, ctx).await
     }
 
     async fn logging(
