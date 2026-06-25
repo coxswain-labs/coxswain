@@ -729,7 +729,7 @@ pub(crate) async fn upstream_peer(
 
     // BackendTLSPolicy overrides appProtocol-derived TLS decisions.
     let btls_opt = resolved.backend_group.upstream_tls();
-    let (is_tls, sni_host, group_key, ca_override) = if let Some(btls) = btls_opt.as_deref() {
+    let (is_tls, sni_host, group_key, ca_override) = if let Some(btls) = btls_opt {
         let ca = match &btls.ca {
             UpstreamCa::System => None,
             UpstreamCa::Bundle(pem) => {
@@ -768,19 +768,18 @@ pub(crate) async fn upstream_peer(
     // client cert, load (or get from cache) and set it on the peer so the proxy
     // presents it during the upstream TLS handshake. Failure → 502 rather than
     // silently connecting without a cert (fail-closed, matching BackendTLSPolicy CA).
-    if let Some(btls) = btls_opt.as_deref() {
-        if let Some(cc) = btls.client_cert() {
-            match backend_client_cert_cache.get_or_parse(btls.group_key, &cc.cert_pem, &cc.key_pem)
-            {
-                Some(cert_key) => {
-                    peer.client_cert_key = Some(cert_key);
-                }
-                None => {
-                    return Err(pingora_core::Error::explain(
-                        HTTPStatus(502),
-                        "gateway backend client cert PEM parse failed",
-                    ));
-                }
+    if let Some(btls) = btls_opt
+        && let Some(cc) = btls.client_cert()
+    {
+        match backend_client_cert_cache.get_or_parse(btls.group_key, &cc.cert_pem, &cc.key_pem) {
+            Some(cert_key) => {
+                peer.client_cert_key = Some(cert_key);
+            }
+            None => {
+                return Err(pingora_core::Error::explain(
+                    HTTPStatus(502),
+                    "gateway backend client cert PEM parse failed",
+                ));
             }
         }
     }
