@@ -72,10 +72,20 @@ impl TlsAccept for SniCertSelector {
 
         // ── Server certificate ────────────────────────────────────────────────
         let store = self.tls.load();
-        let Some(cert) = store.find_cert(&sni) else {
+        let certs = store.find_certs(&sni);
+        if certs.is_empty() {
             tracing::debug!(sni, "No TLS cert for SNI — handshake will fail");
             return;
-        };
+        }
+        // Install the first (highest-priority) cert for this SNI.
+        //
+        // `TlsStoreBuilder::build()` sorts certs ECDSA→RSA→Other so a dual-cert
+        // listener serves ECDSA by default.  Full client-sigalg-based selection
+        // (fall back to RSA for RSA-only clients) would require calling
+        // `SSL_get0_peer_verify_algorithms` via FFI, which the project bans via
+        // `unsafe_code = "deny"`.  Track in #72 for a follow-up once boring
+        // exposes a safe wrapper.
+        let cert = &certs[0];
 
         let x509 = match X509::from_pem(&cert.cert_pem) {
             Ok(c) => c,

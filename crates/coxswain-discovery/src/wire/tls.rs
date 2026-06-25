@@ -27,6 +27,10 @@
 //! across reconcile cycles for the same routing world, which keeps the
 //! `ContentHash` oracle stable.
 //!
+//! Per-pattern cert vecs are already sorted by [`TlsStoreBuilder::build`]
+//! (ECDSA → RSA → Other, newest `notAfter` first), so the wire order is
+//! canonical without extra sorting here.
+//!
 //! # Recursion guard
 //!
 //! `FilterAction::Mirror` embeds an `Arc<BackendGroup>`, which itself may carry
@@ -41,8 +45,8 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use coxswain_core::tls::{
-    ClientCertConfig, ClientCertConfigState, ClientCertStore, ClientCertStoreBuilder, TlsCert,
-    TlsStore, TlsStoreBuilder,
+    ClientCertConfig, ClientCertConfigState, ClientCertStore, ClientCertStoreBuilder, KeyAlgorithm,
+    TlsCert, TlsStore, TlsStoreBuilder,
 };
 
 use crate::error::WireError;
@@ -55,34 +59,32 @@ use crate::proto::v1 as p;
 /// Serialise a [`TlsStore`] to its wire DTO.
 #[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
 pub fn tls_to_wire(store: &TlsStore) -> p::TlsStore {
-    let mut exact_entries: Vec<(&str, Arc<TlsCert>)> = store
-        .iter_exact()
-        .map(|(h, c)| (h, Arc::clone(c)))
-        .collect();
+    let mut exact_entries: Vec<(&str, &[Arc<TlsCert>])> = store.iter_exact_all().collect();
     exact_entries.sort_by_key(|(h, _)| *h);
 
-    let mut wildcard_entries: Vec<(&str, Arc<TlsCert>)> = store
-        .iter_wildcard()
-        .map(|(s, c)| (s, Arc::clone(c)))
-        .collect();
+    let mut wildcard_entries: Vec<(&str, &[Arc<TlsCert>])> = store.iter_wildcard_all().collect();
     wildcard_entries.sort_by_key(|(s, _)| *s);
 
     p::TlsStore {
         exact: exact_entries
             .into_iter()
-            .map(|(h, c)| p::TlsCertEntry {
+            .map(|(h, certs)| p::TlsCertEntry {
                 host_pattern: h.to_string(),
-                cert: Some(tls_cert_to_wire(&c)),
+                certs: certs.iter().map(|c| tls_cert_to_wire(c)).collect(),
             })
             .collect(),
         wildcard: wildcard_entries
             .into_iter()
-            .map(|(s, c)| p::TlsCertEntry {
+            .map(|(s, certs)| p::TlsCertEntry {
                 host_pattern: s.to_string(),
-                cert: Some(tls_cert_to_wire(&c)),
+                certs: certs.iter().map(|c| tls_cert_to_wire(c)).collect(),
             })
             .collect(),
-        default: store.default_cert().map(|c| tls_cert_to_wire(c)),
+        default_certs: store
+            .default_certs()
+            .iter()
+            .map(|c| tls_cert_to_wire(c))
+            .collect(),
     }
 }
 
@@ -94,6 +96,16 @@ fn tls_cert_to_wire(c: &TlsCert) -> p::TlsCert {
         not_after_unix_secs: c
             .not_after
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())),
+        key_algorithm: key_algorithm_to_wire(c.key_algorithm) as i32,
+    }
+}
+
+fn key_algorithm_to_wire(algo: KeyAlgorithm) -> p::KeyAlgorithm {
+    match algo {
+        KeyAlgorithm::Rsa => p::KeyAlgorithm::Rsa,
+        KeyAlgorithm::Ecdsa => p::KeyAlgorithm::Ecdsa,
+        KeyAlgorithm::Other => p::KeyAlgorithm::Other,
+        _ => p::KeyAlgorithm::Unspecified,
     }
 }
 
@@ -166,23 +178,20 @@ fn client_cert_state_to_wire(s: &ClientCertConfigState) -> p::ClientCertConfigSt
 pub fn tls_from_wire(dto: &p::TlsStore) -> Result<TlsStore, WireError> {
     let mut builder = TlsStoreBuilder::new();
     for entry in &dto.exact {
-        let cert = cert_from_wire(entry.cert.as_ref().ok_or(WireError::MissingRequiredField {
-            field: "tls_cert_entry.cert",
-        })?);
-        builder.add_cert(&entry.host_pattern, Arc::new(cert));
+        for cert_dto in &entry.certs {
+            builder.add_cert(&entry.host_pattern, Arc::new(cert_from_wire(cert_dto)));
+        }
     }
     for entry in &dto.wildcard {
-        let cert = cert_from_wire(entry.cert.as_ref().ok_or(WireError::MissingRequiredField {
-            field: "tls_cert_entry.cert",
-        })?);
         // Wildcard entries store the suffix; add_cert expects "*.{suffix}".
         let pattern = format!("*.{}", entry.host_pattern);
-        builder.add_cert(&pattern, Arc::new(cert));
+        for cert_dto in &entry.certs {
+            builder.add_cert(&pattern, Arc::new(cert_from_wire(cert_dto)));
+        }
     }
-    if let Some(default_dto) = &dto.default {
-        let cert = cert_from_wire(default_dto);
+    for cert_dto in &dto.default_certs {
         // Empty pattern → default bucket in add_cert.
-        builder.add_cert("", Arc::new(cert));
+        builder.add_cert("", Arc::new(cert_from_wire(cert_dto)));
     }
     Ok(builder.build())
 }
@@ -191,12 +200,20 @@ fn cert_from_wire(dto: &p::TlsCert) -> TlsCert {
     let not_after = dto
         .not_after_unix_secs
         .map(|s| UNIX_EPOCH + Duration::from_secs(s));
+    let key_algorithm = match p::KeyAlgorithm::try_from(dto.key_algorithm)
+        .unwrap_or(p::KeyAlgorithm::Unspecified)
+    {
+        p::KeyAlgorithm::Rsa => KeyAlgorithm::Rsa,
+        p::KeyAlgorithm::Ecdsa => KeyAlgorithm::Ecdsa,
+        p::KeyAlgorithm::Other | p::KeyAlgorithm::Unspecified => KeyAlgorithm::Other,
+    };
     TlsCert::new(
         dto.cert_pem.clone(),
         dto.key_pem.clone(),
         dto.source.clone(),
     )
     .with_not_after(not_after)
+    .with_key_algorithm(key_algorithm)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -249,7 +266,6 @@ fn client_cert_state_from_wire(dto: &p::ClientCertConfigState) -> ClientCertConf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::tests::*;
 
     // ── 5. TLS store exact + wildcard + default ───────────────────────────────
 
@@ -281,6 +297,60 @@ mod tests {
             store2.find_cert("other.io").is_some(),
             "default fallback hit"
         );
+    }
+
+    #[test]
+    fn tls_store_multi_cert_round_trips() {
+        fn cert_algo(source: &str, algo: KeyAlgorithm) -> Arc<TlsCert> {
+            Arc::new(
+                TlsCert::new(
+                    format!("CERT-{source}").into_bytes(),
+                    b"KEY".to_vec(),
+                    source.to_string(),
+                )
+                .with_key_algorithm(algo),
+            )
+        }
+
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("example.com", cert_algo("ecdsa", KeyAlgorithm::Ecdsa));
+        b.add_cert("example.com", cert_algo("rsa", KeyAlgorithm::Rsa));
+        let store = b.build();
+
+        // Both certs survive round-trip.
+        let dto = tls_to_wire(&store);
+        let store2 = tls_from_wire(&dto).expect("from_wire");
+        let certs = store2.find_certs("example.com");
+        assert_eq!(certs.len(), 2, "both certs survive round-trip");
+        assert_eq!(
+            certs[0].key_algorithm,
+            KeyAlgorithm::Ecdsa,
+            "ECDSA first after round-trip"
+        );
+        assert_eq!(
+            certs[1].key_algorithm,
+            KeyAlgorithm::Rsa,
+            "RSA second after round-trip"
+        );
+    }
+
+    #[test]
+    fn key_algorithm_round_trips() {
+        for algo in [KeyAlgorithm::Rsa, KeyAlgorithm::Ecdsa, KeyAlgorithm::Other] {
+            let c = Arc::new(
+                TlsCert::new(b"CERT".to_vec(), b"KEY".to_vec(), "src".to_string())
+                    .with_key_algorithm(algo),
+            );
+            let mut b = TlsStoreBuilder::new();
+            b.add_cert("host.example.com", c);
+            let dto = tls_to_wire(&b.build());
+            let store2 = tls_from_wire(&dto).expect("from_wire");
+            let certs = store2.find_certs("host.example.com");
+            assert_eq!(
+                certs[0].key_algorithm, algo,
+                "algorithm round-trip for {algo:?}"
+            );
+        }
     }
 
     // ── 6. mTLS Config + Unavailable ─────────────────────────────────────────

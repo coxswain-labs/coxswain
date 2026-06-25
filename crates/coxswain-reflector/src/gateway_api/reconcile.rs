@@ -724,63 +724,102 @@ fn resolve_listener_tls(
         };
     }
 
-    let cert_ref = &refs[0];
+    // Load all certificateRefs (GEP-851). Each ref is validated independently;
+    // failures on individual refs do not prevent the others from being loaded.
+    // Tracks failures to detect partial success (ResolvedPartial).
+    let mut resolved_count: u32 = 0;
+    // `(message, is_ref_not_permitted)` for each failed ref.
+    let mut failures: Vec<(String, bool)> = Vec::new();
 
-    // Only core/Secret (empty group, "core", or absent) is supported.
-    let ref_kind = cert_ref.kind.as_deref().unwrap_or("Secret");
-    let ref_group = cert_ref.group.as_deref().unwrap_or("");
-    if ref_kind != "Secret" || (!ref_group.is_empty() && ref_group != "core") {
-        return ListenerTlsOutcome::InvalidCertificateRef {
-            message: format!(
+    for cert_ref in refs {
+        // Only core/Secret (empty group, "core", or absent) is supported.
+        let ref_kind = cert_ref.kind.as_deref().unwrap_or("Secret");
+        let ref_group = cert_ref.group.as_deref().unwrap_or("");
+        if ref_kind != "Secret" || (!ref_group.is_empty() && ref_group != "core") {
+            let msg = format!(
                 "unsupported certificateRef {ref_group}/{ref_kind}: only core/Secret is supported"
-            ),
-        };
-    }
-
-    let ref_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
-
-    if ref_ns != gw_ns
-        && !reference_grants::backend_ref_allowed(gw_ns, ref_ns, &cert_ref.name, cert_grants)
-    {
-        tracing::warn!(
-            gateway = %format!("{gw_ns}/{gw_name}"),
-            listener = %listener.name,
-            secret = %format!("{ref_ns}/{}", cert_ref.name),
-            "Cross-namespace certificateRef denied — no matching ReferenceGrant"
-        );
-        return ListenerTlsOutcome::RefNotPermitted {
-            message: format!(
-                "cross-namespace Secret {ref_ns}/{} requires a ReferenceGrant",
-                cert_ref.name
-            ),
-        };
-    }
-
-    match load_tls_cert(ref_ns, &cert_ref.name, secrets) {
-        Ok(cert) => {
-            builder.add_cert(hostname, Arc::new(cert));
-            tracing::debug!(
-                gateway = %format!("{gw_ns}/{gw_name}"),
-                listener = %listener.name,
-                secret = %format!("{ref_ns}/{}", cert_ref.name),
-                hostname,
-                "Gateway TLS cert installed"
             );
-            ListenerTlsOutcome::Resolved
+            failures.push((msg, false));
+            continue;
         }
-        Err(e) => {
+
+        let ref_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
+
+        if ref_ns != gw_ns
+            && !reference_grants::backend_ref_allowed(gw_ns, ref_ns, &cert_ref.name, cert_grants)
+        {
             tracing::warn!(
                 gateway = %format!("{gw_ns}/{gw_name}"),
                 listener = %listener.name,
                 secret = %format!("{ref_ns}/{}", cert_ref.name),
-                error = %e,
-                "Gateway TLS Secret unusable — listener skipped"
+                "Cross-namespace certificateRef denied — no matching ReferenceGrant"
             );
-            ListenerTlsOutcome::InvalidCertificateRef {
-                message: e.to_string(),
+            let msg = format!(
+                "cross-namespace Secret {ref_ns}/{} requires a ReferenceGrant",
+                cert_ref.name
+            );
+            failures.push((msg, true));
+            continue;
+        }
+
+        match load_tls_cert(ref_ns, &cert_ref.name, secrets) {
+            Ok(cert) => {
+                builder.add_cert(hostname, Arc::new(cert));
+                resolved_count += 1;
+                tracing::debug!(
+                    gateway = %format!("{gw_ns}/{gw_name}"),
+                    listener = %listener.name,
+                    secret = %format!("{ref_ns}/{}", cert_ref.name),
+                    hostname,
+                    "Gateway TLS cert installed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    gateway = %format!("{gw_ns}/{gw_name}"),
+                    listener = %listener.name,
+                    secret = %format!("{ref_ns}/{}", cert_ref.name),
+                    error = %e,
+                    "Gateway TLS Secret unusable — continuing with remaining refs"
+                );
+                failures.push((e.to_string(), false));
             }
         }
     }
+
+    if resolved_count == 0 {
+        // Every ref failed — surface the most specific failure kind.
+        // RefNotPermitted takes priority (operator needs to add a ReferenceGrant)
+        // over generic cert errors.
+        let any_ref_not_permitted = failures.iter().any(|(_, rnp)| *rnp);
+        let messages: Vec<String> = failures.into_iter().map(|(m, _)| m).collect();
+        let message = messages.join("; ");
+        if any_ref_not_permitted {
+            return ListenerTlsOutcome::RefNotPermitted { message };
+        }
+        return ListenerTlsOutcome::InvalidCertificateRef { message };
+    }
+
+    if !failures.is_empty() {
+        // Some refs failed but at least one resolved — listener serves the good
+        // certs and surfaces the failures via a degraded condition.
+        let messages: Vec<String> = failures.into_iter().map(|(m, _)| m).collect();
+        let message = format!(
+            "{} of {} certificateRef(s) failed: {}",
+            messages.len(),
+            resolved_count as usize + messages.len(),
+            messages.join("; ")
+        );
+        tracing::warn!(
+            gateway = %format!("{gw_ns}/{gw_name}"),
+            listener = %listener.name,
+            ?message,
+            "Listener is serving only a subset of its certificateRefs (ResolvedPartial)"
+        );
+        return ListenerTlsOutcome::ResolvedPartial { message };
+    }
+
+    ListenerTlsOutcome::Resolved
 }
 
 #[cfg(test)]

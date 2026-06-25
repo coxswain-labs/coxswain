@@ -39,23 +39,39 @@ pub enum ListenerTlsOutcome {
         /// Human-readable description of the configuration error.
         message: String,
     },
+    /// HTTPS listener; at least one `certificateRef` resolved but at least one
+    /// failed (e.g. Secret missing, wrong type, or a denied `ReferenceGrant`).
+    ///
+    /// The listener **continues serving** the successfully-resolved certificates
+    /// so traffic is not interrupted when one cert in a dual-algorithm or
+    /// rotation-overlap set breaks. The degraded state is surfaced via a
+    /// `ResolvedRefs=False / InvalidCertificateRef` condition so operators can
+    /// detect and fix the broken ref. This mirrors the graceful-degradation
+    /// approach used by Envoy-based implementations (GEP-851).
+    ResolvedPartial {
+        /// Human-readable description naming the failed ref(s) and why they failed.
+        message: String,
+    },
 }
 
 impl ListenerTlsOutcome {
-    /// Returns `true` when this listener is an HTTPS listener whose certificate
-    /// was successfully resolved (`Resolved`).
+    /// Returns `true` when this listener is an HTTPS listener that is serving
+    /// at least one certificate.
     ///
-    /// Used to decide which listeners contribute to the per-port listener-hostname
-    /// snapshot for misdirected-request detection (GEP-3567, #96).
+    /// Both `Resolved` and `ResolvedPartial` return `true` — the listener is
+    /// operational even when some refs failed. Used to decide which listeners
+    /// contribute to the per-port listener-hostname snapshot for
+    /// misdirected-request detection (GEP-3567, #96).
     #[must_use]
     pub fn is_https_terminate(&self) -> bool {
-        matches!(self, Self::Resolved)
+        matches!(self, Self::Resolved | Self::ResolvedPartial { .. })
     }
 
     /// Returns `true` for outcomes the controller should treat as healthy.
     ///
-    /// `NotApplicable` (non-HTTPS listener) and `Resolved` are healthy; every
-    /// failure variant is unhealthy.
+    /// `NotApplicable` (non-HTTPS listener) and `Resolved` (all refs resolved)
+    /// are healthy. `ResolvedPartial` is **not** healthy — it carries a degraded
+    /// `ResolvedRefs=False` condition — even though the listener is still serving.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         matches!(self, Self::NotApplicable | Self::Resolved)
@@ -66,7 +82,9 @@ impl ListenerTlsOutcome {
     pub fn reason(&self) -> &'static str {
         match self {
             Self::RefNotPermitted { .. } => "RefNotPermitted",
-            Self::InvalidCertificateRef { .. } => "InvalidCertificateRef",
+            Self::InvalidCertificateRef { .. } | Self::ResolvedPartial { .. } => {
+                "InvalidCertificateRef"
+            }
             Self::Invalid { .. } => "Invalid",
             Self::NotApplicable | Self::Resolved => "Resolved",
         }
@@ -79,7 +97,8 @@ impl ListenerTlsOutcome {
         match self {
             Self::RefNotPermitted { message }
             | Self::InvalidCertificateRef { message }
-            | Self::Invalid { message } => message.as_str(),
+            | Self::Invalid { message }
+            | Self::ResolvedPartial { message } => message.as_str(),
             Self::NotApplicable | Self::Resolved => "",
         }
     }

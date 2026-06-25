@@ -92,6 +92,9 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         ListenerTlsOutcome::Invalid { message } => {
             (p::ListenerTlsOutcome::Invalid, message.clone())
         }
+        ListenerTlsOutcome::ResolvedPartial { message } => {
+            (p::ListenerTlsOutcome::ResolvedPartial, message.clone())
+        }
         &_ => unreachable!(
             "invariant: all ListenerTlsOutcome variants handled; \
              add a new arm when the core type gains a variant"
@@ -153,7 +156,6 @@ fn listener_health_from_dto(dto: &p::ListenerHealth) -> Result<GatewayListenerHe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::tests::*;
 
     // ── Listener health round-trip ────────────────────────────────────────────
 

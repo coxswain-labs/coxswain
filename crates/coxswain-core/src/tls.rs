@@ -6,6 +6,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// Key algorithm of the TLS certificate's public key.
+///
+/// Classified once at load time from the Subject Public Key Info (SPKI) of
+/// the leaf certificate. Used by the proxy to prefer ECDSA over RSA when both
+/// are available for the same SNI — mirroring Envoy's key-type selection logic.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyAlgorithm {
+    /// RSA public key.
+    Rsa,
+    /// EC (ECDSA) public key.
+    Ecdsa,
+    /// Unknown or unclassified algorithm.
+    #[default]
+    Other,
+}
+
 /// Raw PEM bytes for a single TLS cert/key pair sourced from a `kubernetes.io/tls` Secret.
 ///
 /// Validation happens once in the controller before insertion; the proxy re-parses
@@ -25,19 +42,26 @@ pub struct TlsCert {
     /// time — never fatal because a metrics gap must not break route
     /// serving). Consumed by `coxswain_proxy_tls_cert_expiry_seconds`.
     pub not_after: Option<SystemTime>,
+    /// Public key algorithm, classified from the SPKI of the leaf certificate.
+    ///
+    /// `Other` when no algorithm classification was performed (e.g. Ingress
+    /// certs loaded before GEP-851 multi-cert support was wired in). The proxy
+    /// uses this to prefer ECDSA over RSA when both are available for an SNI.
+    pub key_algorithm: KeyAlgorithm,
 }
 
 impl TlsCert {
     /// Construct a [`TlsCert`] from raw PEM bytes and a diagnostic source label.
     ///
-    /// Use [`TlsCert::with_not_after`] to record a parsed expiry on the
-    /// returned cert.
+    /// Use [`TlsCert::with_not_after`] and [`TlsCert::with_key_algorithm`] to
+    /// attach parsed metadata on the returned cert.
     pub fn new(cert_pem: Vec<u8>, key_pem: Vec<u8>, source: String) -> Self {
         Self {
             cert_pem,
             key_pem,
             source,
             not_after: None,
+            key_algorithm: KeyAlgorithm::Other,
         }
     }
 
@@ -47,10 +71,20 @@ impl TlsCert {
         self.not_after = not_after;
         self
     }
+
+    /// Builder-style setter for the public key algorithm.
+    ///
+    /// Set from the SPKI OID of the leaf certificate at load time.
+    #[must_use]
+    pub fn with_key_algorithm(mut self, key_algorithm: KeyAlgorithm) -> Self {
+        self.key_algorithm = key_algorithm;
+        self
+    }
 }
 
-/// PEM bytes only; `source` and `not_after` are diagnostic and excluded so a
-/// cert moving between owners does not trigger an unnecessary `ArcSwap` store.
+/// PEM bytes only; `source`, `not_after`, and `key_algorithm` are diagnostic /
+/// derived and excluded so a cert moving between owners does not trigger an
+/// unnecessary `ArcSwap` store.
 impl PartialEq for TlsCert {
     fn eq(&self, other: &Self) -> bool {
         self.cert_pem == other.cert_pem && self.key_pem == other.key_pem
@@ -58,93 +92,153 @@ impl PartialEq for TlsCert {
 }
 
 /// Immutable snapshot of all TLS certs indexed by host pattern.
+///
+/// Each host pattern maps to a **sorted** `Vec` of certs: ECDSA first, then RSA,
+/// then Other; within the same algorithm, newest `notAfter` first; then by
+/// `source` for a fully deterministic order. The sort is established once at
+/// [`TlsStoreBuilder::build`] time and never mutated.
 #[non_exhaustive]
 #[derive(Debug, Default, PartialEq)]
 pub struct TlsStore {
-    exact: HashMap<String, Arc<TlsCert>>,
+    exact: HashMap<String, Vec<Arc<TlsCert>>>,
     /// Sorted most-specific (longest suffix) first.
-    wildcard: Vec<(String, Arc<TlsCert>)>,
-    /// Fallback cert for listeners with no hostname restriction (Gateway API allows
-    /// HTTPS listeners without a `hostname` — they match any SNI).
-    default: Option<Arc<TlsCert>>,
+    wildcard: Vec<(String, Vec<Arc<TlsCert>>)>,
+    /// Fallback certs for listeners with no hostname restriction (Gateway API
+    /// allows HTTPS listeners without a `hostname` — they match any SNI).
+    default: Vec<Arc<TlsCert>>,
 }
 
 impl TlsStore {
-    /// SNI cert lookup: exact host wins over wildcard, wildcard over default.
-    /// Returns `None` when no cert matches — the caller should fail the handshake.
-    pub fn find_cert(&self, sni: &str) -> Option<Arc<TlsCert>> {
-        if let Some(cert) = self.exact.get(sni) {
-            return Some(Arc::clone(cert));
+    /// SNI cert lookup — returns all certs registered for the matching pattern.
+    ///
+    /// Lookup precedence: exact host wins over wildcard suffix, wildcard over
+    /// default. Returns an empty slice when no cert matches.
+    pub fn find_certs(&self, sni: &str) -> &[Arc<TlsCert>] {
+        if let Some(certs) = self.exact.get(sni) {
+            return certs.as_slice();
         }
-        if let Some((_, cert)) = self
+        if let Some((_, certs)) = self
             .wildcard
             .iter()
             .find(|(suffix, _)| wildcard_matches(sni, suffix))
         {
-            return Some(Arc::clone(cert));
+            return certs.as_slice();
         }
-        self.default.as_ref().map(Arc::clone)
+        self.default.as_slice()
+    }
+
+    /// Compatibility wrapper: returns the first (highest-priority) cert for
+    /// `sni`, or `None` when no cert matches.
+    ///
+    /// Callers that need all available certs (e.g. the proxy algorithm-selection
+    /// path) should use [`Self::find_certs`] instead.
+    pub fn find_cert(&self, sni: &str) -> Option<Arc<TlsCert>> {
+        self.find_certs(sni).first().map(Arc::clone)
     }
 
     /// Total number of certificates across all buckets (exact + wildcard + default).
     pub fn cert_count(&self) -> usize {
-        self.exact.len() + self.wildcard.len() + self.default.is_some() as usize
+        self.exact.values().map(Vec::len).sum::<usize>()
+            + self.wildcard.iter().map(|(_, v)| v.len()).sum::<usize>()
+            + self.default.len()
     }
 
     /// `(exact, wildcard, default)` cert counts — feeds the
     /// `*_tls_certs_loaded{bucket}` gauge.
     pub fn cert_counts(&self) -> (usize, usize, usize) {
         (
-            self.exact.len(),
-            self.wildcard.len(),
-            usize::from(self.default.is_some()),
+            self.exact.values().map(Vec::len).sum(),
+            self.wildcard.iter().map(|(_, v)| v.len()).sum(),
+            self.default.len(),
         )
     }
 
     /// Iterate over all exact-hostname → cert mappings, in unspecified order.
     ///
-    /// Used by the discovery wire layer to serialise the TLS store.
+    /// Returns the **first** (highest-priority) cert per pattern. Compat
+    /// wrapper; callers that need all certs per pattern should use
+    /// [`Self::iter_exact_all`].
     pub fn iter_exact(&self) -> impl Iterator<Item = (&str, &Arc<TlsCert>)> {
-        self.exact.iter().map(|(h, c)| (h.as_str(), c))
+        self.exact
+            .iter()
+            .filter_map(|(h, certs)| certs.first().map(|c| (h.as_str(), c)))
     }
 
-    /// Iterate over all wildcard-suffix → cert mappings (suffix without the `*.` prefix),
-    /// in longest-suffix-first order (the same precedence order as [`Self::find_cert`]).
+    /// Iterate over all exact-hostname → **all certs** mappings, in unspecified order.
     ///
-    /// Used by the discovery wire layer to serialise the TLS store.
+    /// Used by the multi-cert discovery wire serialiser.
+    pub fn iter_exact_all(&self) -> impl Iterator<Item = (&str, &[Arc<TlsCert>])> {
+        self.exact
+            .iter()
+            .map(|(h, certs)| (h.as_str(), certs.as_slice()))
+    }
+
+    /// Iterate over all wildcard-suffix → cert mappings (suffix without the `*.`
+    /// prefix), in longest-suffix-first order (the same precedence order as
+    /// [`Self::find_certs`]).
+    ///
+    /// Returns the **first** (highest-priority) cert per pattern. Compat
+    /// wrapper; callers that need all certs per pattern should use
+    /// [`Self::iter_wildcard_all`].
     pub fn iter_wildcard(&self) -> impl Iterator<Item = (&str, &Arc<TlsCert>)> {
-        self.wildcard.iter().map(|(s, c)| (s.as_str(), c))
+        self.wildcard
+            .iter()
+            .filter_map(|(s, certs)| certs.first().map(|c| (s.as_str(), c)))
     }
 
-    /// The default (catch-all) certificate, if one is configured.
+    /// Iterate over all wildcard-suffix → **all certs** mappings, in
+    /// longest-suffix-first order.
     ///
-    /// Used by the discovery wire layer to serialise the TLS store.
+    /// Used by the multi-cert discovery wire serialiser.
+    pub fn iter_wildcard_all(&self) -> impl Iterator<Item = (&str, &[Arc<TlsCert>])> {
+        self.wildcard
+            .iter()
+            .map(|(s, certs)| (s.as_str(), certs.as_slice()))
+    }
+
+    /// The highest-priority default (catch-all) certificate, if one is configured.
+    ///
+    /// Compat wrapper; callers needing all default certs should use [`Self::default_certs`].
     pub fn default_cert(&self) -> Option<&Arc<TlsCert>> {
-        self.default.as_ref()
+        self.default.first()
     }
 
-    /// `(sni, not_after)` pairs for every cert with a parsed expiry. Used by
-    /// the proxy-pod `*_tls_cert_expiry_seconds{sni}` gauge. Certs whose
-    /// `not_after` is `None` (PEM parse failure) are omitted.
+    /// All default (catch-all) certificates, in sorted order.
     ///
-    /// SNI labels: exact patterns are themselves; wildcard patterns are
-    /// emitted as `"*.suffix"`; the default cert is labelled `"*"`.
-    pub fn expiries(&self) -> Vec<(String, SystemTime)> {
+    /// Used by the multi-cert discovery wire serialiser.
+    pub fn default_certs(&self) -> &[Arc<TlsCert>] {
+        self.default.as_slice()
+    }
+
+    /// `(sni_label, source, not_after)` triples for every cert with a parsed
+    /// expiry. Used by the proxy-pod
+    /// `*_tls_cert_expiry_seconds{sni,source}` gauge. Certs whose `not_after`
+    /// is `None` (PEM parse failure) are omitted.
+    ///
+    /// - `sni_label`: exact patterns are themselves; wildcard patterns are
+    ///   `"*.suffix"`; the default certs are `"*"`.
+    /// - `source`: the `"namespace/secret-name"` label from the cert —
+    ///   disambiguates co-located RSA+ECDSA certs on the same SNI.
+    pub fn expiries(&self) -> Vec<(String, String, SystemTime)> {
         let mut out = Vec::with_capacity(self.cert_count());
-        for (sni, cert) in &self.exact {
-            if let Some(t) = cert.not_after {
-                out.push((sni.clone(), t));
+        for (sni, certs) in &self.exact {
+            for cert in certs {
+                if let Some(t) = cert.not_after {
+                    out.push((sni.clone(), cert.source.clone(), t));
+                }
             }
         }
-        for (suffix, cert) in &self.wildcard {
-            if let Some(t) = cert.not_after {
-                out.push((format!("*.{suffix}"), t));
+        for (suffix, certs) in &self.wildcard {
+            for cert in certs {
+                if let Some(t) = cert.not_after {
+                    out.push((format!("*.{suffix}"), cert.source.clone(), t));
+                }
             }
         }
-        if let Some(cert) = &self.default
-            && let Some(t) = cert.not_after
-        {
-            out.push(("*".to_string(), t));
+        for cert in &self.default {
+            if let Some(t) = cert.not_after {
+                out.push(("*".to_string(), cert.source.clone(), t));
+            }
         }
         out
     }
@@ -162,14 +256,54 @@ fn wildcard_matches(sni: &str, suffix: &str) -> bool {
     false
 }
 
+/// Sort order for [`KeyAlgorithm`] during per-pattern cert sorting: ECDSA first,
+/// then RSA, then Other.
+fn algo_sort_key(ka: KeyAlgorithm) -> u8 {
+    match ka {
+        KeyAlgorithm::Ecdsa => 0,
+        KeyAlgorithm::Rsa => 1,
+        KeyAlgorithm::Other => 2,
+    }
+}
+
+/// Sort a cert vec in-place: ECDSA → RSA → Other; within algorithm, newest
+/// `not_after` first (certs without expiry last); then `source` alphabetically
+/// for a fully deterministic, byte-stable order.
+fn sort_cert_vec(certs: &mut [Arc<TlsCert>]) {
+    certs.sort_by(|a, b| {
+        algo_sort_key(a.key_algorithm)
+            .cmp(&algo_sort_key(b.key_algorithm))
+            .then_with(|| {
+                // Descending not_after: None is treated as epoch 0 (sorts last).
+                b.not_after.cmp(&a.not_after)
+            })
+            .then_with(|| a.source.cmp(&b.source))
+    });
+}
+
+/// Deduplicate a cert vec in-place, keeping the first occurrence of each unique
+/// PEM pair and discarding exact duplicates. Order is preserved for the
+/// surviving elements.
+fn dedup_cert_vec(certs: &mut Vec<Arc<TlsCert>>) {
+    let mut i = 0;
+    while i < certs.len() {
+        let is_dup = (0..i).any(|j| certs[j].as_ref() == certs[i].as_ref());
+        if is_dup {
+            certs.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Builder for [`TlsStore`]. Not thread-safe; used only inside the debounced rebuild.
 #[non_exhaustive]
 #[derive(Default)]
 pub struct TlsStoreBuilder {
-    exact: HashMap<String, Arc<TlsCert>>,
+    exact: HashMap<String, Vec<Arc<TlsCert>>>,
     /// Keyed by suffix (e.g. `"example.com"` for the pattern `"*.example.com"`).
-    wildcard: HashMap<String, Arc<TlsCert>>,
-    default: Option<Arc<TlsCert>>,
+    wildcard: HashMap<String, Vec<Arc<TlsCert>>>,
+    default: Vec<Arc<TlsCert>>,
 }
 
 impl TlsStoreBuilder {
@@ -182,38 +316,68 @@ impl TlsStoreBuilder {
     ///
     /// - `*.suffix` → wildcard bucket (suffix stored without `*.` prefix).
     /// - Exact hostname → exact bucket.
-    /// - `""` or `"*"` → default fallback (served when no exact/wildcard matches the SNI).
-    /// - Duplicate host → last-writer-wins with a warning.
+    /// - `""` or `"*"` → default fallback (served when no exact/wildcard matches).
+    ///
+    /// Multiple certs for the same pattern are all registered (supports dual-
+    /// algorithm RSA+ECDSA and rotation overlap). Exact-duplicate PEM bytes within
+    /// a pattern are silently skipped to avoid churn.
+    ///
+    /// Call order within a pattern does not affect selection order — certs are
+    /// sorted deterministically at [`Self::build`] time.
     pub fn add_cert(&mut self, host_pattern: &str, cert: Arc<TlsCert>) {
         if host_pattern.is_empty() || host_pattern == "*" {
-            self.default = Some(cert);
+            self.default.push(cert);
             return;
         }
         if let Some(suffix) = host_pattern.strip_prefix("*.") {
-            if let Some(prev) = self.wildcard.insert(suffix.to_string(), cert) {
-                tracing::warn!(
-                    host = %host_pattern,
-                    previous_source = %prev.source,
-                    "TLS cert overwritten by a later Ingress"
-                );
-            }
-        } else if let Some(prev) = self.exact.insert(host_pattern.to_string(), cert) {
-            tracing::warn!(
-                host = %host_pattern,
-                previous_source = %prev.source,
-                "TLS cert overwritten by a later Ingress"
-            );
+            self.wildcard
+                .entry(suffix.to_string())
+                .or_default()
+                .push(cert);
+        } else {
+            self.exact
+                .entry(host_pattern.to_string())
+                .or_default()
+                .push(cert);
         }
     }
 
     /// Compile accumulated certs into an immutable [`TlsStore`].
+    ///
+    /// Each pattern's cert vec is deduplicated (same PEM bytes → keep first)
+    /// then sorted: ECDSA first, then RSA, then Other; newest `notAfter` first
+    /// within an algorithm; `source` alphabetically as the final tiebreaker.
     pub fn build(self) -> TlsStore {
-        let mut wildcard: Vec<(String, Arc<TlsCert>)> = self.wildcard.into_iter().collect();
+        let exact: HashMap<String, Vec<Arc<TlsCert>>> = self
+            .exact
+            .into_iter()
+            .map(|(h, mut certs)| {
+                dedup_cert_vec(&mut certs);
+                sort_cert_vec(&mut certs);
+                (h, certs)
+            })
+            .collect();
+
+        let mut wildcard: Vec<(String, Vec<Arc<TlsCert>>)> = self
+            .wildcard
+            .into_iter()
+            .map(|(suffix, mut certs)| {
+                dedup_cert_vec(&mut certs);
+                sort_cert_vec(&mut certs);
+                (suffix, certs)
+            })
+            .collect();
+        // Longest suffix first (most specific first).
         wildcard.sort_by_key(|(suffix, _)| Reverse(suffix.len()));
+
+        let mut default = self.default;
+        dedup_cert_vec(&mut default);
+        sort_cert_vec(&mut default);
+
         TlsStore {
-            exact: self.exact,
+            exact,
             wildcard,
-            default: self.default,
+            default,
         }
     }
 }
@@ -613,7 +777,10 @@ pub type SharedListenerHostnames = Shared<ListenerHostnames>;
 mod tests {
     use crate::tls::*;
     use std::sync::Arc;
+    use std::time::{Duration, UNIX_EPOCH};
 
+    /// Cert with identical PEM bytes regardless of `source`. Used when the test
+    /// cares about SNI/precedence but not about distinguishing cert content.
     fn cert(source: &str) -> Arc<TlsCert> {
         Arc::new(TlsCert::new(
             b"cert".to_vec(),
@@ -621,6 +788,33 @@ mod tests {
             source.to_string(),
         ))
     }
+
+    /// Cert with unique PEM bytes derived from `id`. Used when the test needs to
+    /// distinguish multiple certs by content (e.g. multi-cert per pattern tests).
+    fn cert_id(id: u8, source: &str) -> Arc<TlsCert> {
+        Arc::new(TlsCert::new(
+            vec![id, b'c'],
+            vec![id, b'k'],
+            source.to_string(),
+        ))
+    }
+
+    /// Cert with unique bytes, a set key algorithm, and an optional not_after.
+    fn cert_algo(
+        id: u8,
+        source: &str,
+        algo: KeyAlgorithm,
+        not_after_secs: Option<u64>,
+    ) -> Arc<TlsCert> {
+        let not_after = not_after_secs.map(|s| UNIX_EPOCH + Duration::from_secs(s));
+        Arc::new(
+            TlsCert::new(vec![id, b'c'], vec![id, b'k'], source.to_string())
+                .with_key_algorithm(algo)
+                .with_not_after(not_after),
+        )
+    }
+
+    // ── TlsStore lookups ──────────────────────────────────────────────────────
 
     #[test]
     fn exact_host_lookup() {
@@ -644,8 +838,8 @@ mod tests {
     #[test]
     fn exact_beats_wildcard_on_sni() {
         let mut b = TlsStoreBuilder::new();
-        b.add_cert("api.example.com", cert("exact"));
-        b.add_cert("*.example.com", cert("wildcard"));
+        b.add_cert("api.example.com", cert_id(1, "exact"));
+        b.add_cert("*.example.com", cert_id(2, "wildcard"));
         let store = b.build();
         let found = store.find_cert("api.example.com").unwrap();
         assert_eq!(found.source, "exact");
@@ -655,49 +849,207 @@ mod tests {
     fn no_match_returns_none() {
         let store = TlsStoreBuilder::new().build();
         assert!(store.find_cert("example.com").is_none());
-    }
-
-    #[test]
-    fn catchall_host_becomes_default() {
-        let mut b = TlsStoreBuilder::new();
-        b.add_cert("", cert("ns/s1"));
-        b.add_cert("*", cert("ns/s2")); // last writer wins
-        let store = b.build();
-        assert_eq!(store.cert_count(), 1);
-        // Default is served for any SNI that has no exact/wildcard match.
-        assert_eq!(
-            store.find_cert("anything.example.com").unwrap().source,
-            "ns/s2"
-        );
+        assert!(store.find_certs("example.com").is_empty());
     }
 
     #[test]
     fn default_cert_is_fallback_only() {
         let mut b = TlsStoreBuilder::new();
-        b.add_cert("example.com", cert("exact"));
-        b.add_cert("", cert("default"));
+        b.add_cert("example.com", cert_id(1, "exact"));
+        b.add_cert("", cert_id(2, "default"));
         let store = b.build();
         assert_eq!(store.find_cert("example.com").unwrap().source, "exact");
         assert_eq!(store.find_cert("other.com").unwrap().source, "default");
     }
 
     #[test]
-    fn last_writer_wins_on_duplicate_exact_host() {
+    fn wildcard_sorted_longest_suffix_first() {
         let mut b = TlsStoreBuilder::new();
-        b.add_cert("example.com", cert("first"));
-        b.add_cert("example.com", cert("second"));
+        b.add_cert("*.example.com", cert_id(1, "short"));
+        b.add_cert("*.api.example.com", cert_id(2, "long"));
         let store = b.build();
-        assert_eq!(store.find_cert("example.com").unwrap().source, "second");
+        assert_eq!(
+            store.find_cert("v1.api.example.com").unwrap().source,
+            "long"
+        );
+        assert_eq!(store.find_cert("web.example.com").unwrap().source, "short");
+    }
+
+    // ── multi-cert per pattern ────────────────────────────────────────────────
+
+    #[test]
+    fn multi_cert_exact_host_both_stored() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("example.com", cert_id(1, "first"));
+        b.add_cert("example.com", cert_id(2, "second"));
+        let store = b.build();
+        assert_eq!(
+            store.find_certs("example.com").len(),
+            2,
+            "both certs stored"
+        );
+        let sources: Vec<&str> = store
+            .find_certs("example.com")
+            .iter()
+            .map(|c| c.source.as_str())
+            .collect();
+        assert!(sources.contains(&"first") && sources.contains(&"second"));
     }
 
     #[test]
-    fn last_writer_wins_on_duplicate_wildcard() {
+    fn multi_cert_wildcard_both_stored() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("*.example.com", cert_id(1, "first"));
+        b.add_cert("*.example.com", cert_id(2, "second"));
+        let store = b.build();
+        assert_eq!(
+            store.find_certs("api.example.com").len(),
+            2,
+            "both wildcard certs stored"
+        );
+    }
+
+    #[test]
+    fn multi_cert_default_both_stored() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("", cert_id(1, "first"));
+        b.add_cert("*", cert_id(2, "second"));
+        let store = b.build();
+        assert_eq!(store.find_certs("anything.example.com").len(), 2);
+    }
+
+    #[test]
+    fn find_certs_returns_empty_slice_for_no_match() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("other.com", cert("ns/s1"));
+        let store = b.build();
+        assert!(store.find_certs("example.com").is_empty());
+    }
+
+    #[test]
+    fn find_cert_compat_wrapper_returns_first() {
+        let mut b = TlsStoreBuilder::new();
+        // ECDSA sorts first, so it should be the find_cert() result.
+        b.add_cert(
+            "example.com",
+            cert_algo(1, "rsa-cert", KeyAlgorithm::Rsa, None),
+        );
+        b.add_cert(
+            "example.com",
+            cert_algo(2, "ecdsa-cert", KeyAlgorithm::Ecdsa, None),
+        );
+        let store = b.build();
+        // find_cert returns first of sorted vec — ECDSA sorts before RSA.
+        assert_eq!(store.find_cert("example.com").unwrap().source, "ecdsa-cert");
+    }
+
+    // ── deduplication ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn dedup_same_pem_exact_host() {
+        let mut b = TlsStoreBuilder::new();
+        // cert() produces identical PEM bytes regardless of source.
+        b.add_cert("example.com", cert("first"));
+        b.add_cert("example.com", cert("second"));
+        let store = b.build();
+        // Same PEM → deduplicated to 1.
+        assert_eq!(store.find_certs("example.com").len(), 1);
+    }
+
+    #[test]
+    fn dedup_same_pem_wildcard() {
         let mut b = TlsStoreBuilder::new();
         b.add_cert("*.example.com", cert("first"));
         b.add_cert("*.example.com", cert("second"));
         let store = b.build();
-        assert_eq!(store.find_cert("api.example.com").unwrap().source, "second");
+        assert_eq!(store.find_certs("api.example.com").len(), 1);
     }
+
+    #[test]
+    fn dedup_same_pem_default() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("", cert("first"));
+        b.add_cert("*", cert("second"));
+        let store = b.build();
+        // Both have same PEM bytes → deduplicated.
+        assert_eq!(store.find_certs("anything.io").len(), 1);
+        assert_eq!(store.cert_count(), 1);
+    }
+
+    // ── cert_count / cert_counts ──────────────────────────────────────────────
+
+    #[test]
+    fn cert_count_sums_all_vecs() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("example.com", cert_id(1, "e1"));
+        b.add_cert("example.com", cert_id(2, "e2"));
+        b.add_cert("*.example.com", cert_id(3, "w1"));
+        b.add_cert("", cert_id(4, "d1"));
+        let store = b.build();
+        assert_eq!(store.cert_count(), 4);
+        let (exact, wildcard, default) = store.cert_counts();
+        assert_eq!((exact, wildcard, default), (2, 1, 1));
+    }
+
+    // ── sort order ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn certs_sorted_ecdsa_before_rsa_before_other() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert(
+            "example.com",
+            cert_algo(1, "other", KeyAlgorithm::Other, None),
+        );
+        b.add_cert("example.com", cert_algo(2, "rsa", KeyAlgorithm::Rsa, None));
+        b.add_cert(
+            "example.com",
+            cert_algo(3, "ecdsa", KeyAlgorithm::Ecdsa, None),
+        );
+        let store = b.build();
+        let certs = store.find_certs("example.com");
+        assert_eq!(certs.len(), 3);
+        assert_eq!(certs[0].source, "ecdsa");
+        assert_eq!(certs[1].source, "rsa");
+        assert_eq!(certs[2].source, "other");
+    }
+
+    #[test]
+    fn certs_same_algo_sorted_newest_first() {
+        let mut b = TlsStoreBuilder::new();
+        // older cert
+        b.add_cert(
+            "example.com",
+            cert_algo(1, "old", KeyAlgorithm::Rsa, Some(1_000_000)),
+        );
+        // newer cert
+        b.add_cert(
+            "example.com",
+            cert_algo(2, "new", KeyAlgorithm::Rsa, Some(2_000_000)),
+        );
+        let store = b.build();
+        let certs = store.find_certs("example.com");
+        assert_eq!(certs[0].source, "new", "newest not_after first");
+        assert_eq!(certs[1].source, "old");
+    }
+
+    #[test]
+    fn certs_no_expiry_sorted_last() {
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert(
+            "example.com",
+            cert_algo(1, "no-expiry", KeyAlgorithm::Rsa, None),
+        );
+        b.add_cert(
+            "example.com",
+            cert_algo(2, "has-expiry", KeyAlgorithm::Rsa, Some(1_000_000)),
+        );
+        let store = b.build();
+        let certs = store.find_certs("example.com");
+        assert_eq!(certs[0].source, "has-expiry");
+        assert_eq!(certs[1].source, "no-expiry");
+    }
+
+    // ── PartialEq ─────────────────────────────────────────────────────────────
 
     #[test]
     fn equal_stores_same_pem_different_source() {
@@ -735,20 +1087,7 @@ mod tests {
         assert_ne!(b1.build(), b2.build());
     }
 
-    #[test]
-    fn wildcard_sorted_longest_suffix_first() {
-        let mut b = TlsStoreBuilder::new();
-        b.add_cert("*.example.com", cert("short"));
-        b.add_cert("*.api.example.com", cert("long"));
-        let store = b.build();
-        assert_eq!(
-            store.find_cert("v1.api.example.com").unwrap().source,
-            "long"
-        );
-        assert_eq!(store.find_cert("web.example.com").unwrap().source, "short");
-    }
-
-    // --- ClientCertStore tests ---
+    // ── ClientCertStore tests ─────────────────────────────────────────────────
 
     fn cfg(ca: &[u8]) -> Arc<ClientCertConfigState> {
         Arc::new(ClientCertConfigState::Config(ClientCertConfig::new(
@@ -873,7 +1212,7 @@ mod tests {
         assert_eq!(b.build().host_count(), 3);
     }
 
-    // --- ListenerHostnames tests ---
+    // ── ListenerHostnames tests ───────────────────────────────────────────────
 
     /// Builds the four-listener topology from the v1.5.1 conformance test
     /// `GatewayHTTPSListenerDetectMisdirectedRequests`:

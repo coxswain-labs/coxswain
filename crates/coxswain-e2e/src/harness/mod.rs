@@ -13,7 +13,7 @@ pub use bootstrap::{GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, bootstrap, bootstrap_
 pub use controller::{ControllerOptions, ControllerProcess, INGRESS_HTTP_PORT, INGRESS_HTTPS_PORT};
 pub use http::HttpClient;
 pub use namespace::{IngressClassGuard, NamespaceGuard};
-pub use tls::{GeneratedCert, MtlsCerts};
+pub use tls::{GeneratedCert, MtlsCerts, StaticRsaCert};
 
 /// Top-level test harness: wraps the in-cluster coxswain installation with a
 /// Kubernetes client, an HTTP test client, and fixture application helpers.
