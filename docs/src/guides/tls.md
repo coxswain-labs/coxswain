@@ -174,6 +174,97 @@ curl --resolve example.com:443:127.0.0.1 -k https://example.com/
 openssl s_client -connect 127.0.0.1:443 -servername example.com -brief
 ```
 
+## Gateway frontend client certificate validation (GEP-91)
+
+Coxswain implements **GEP-91** (Standard channel, Gateway API v1.5): gateway-wide TLS client certificate validation configured via `spec.tls.frontend.default.validation` on an HTTPS listener.
+
+### CA bundle
+
+The CA bundle is loaded from a `ConfigMap` in the **same namespace** as the Gateway, under the key `ca.crt` (Core support). The ConfigMap is referenced by name:
+
+```yaml
+spec:
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: app.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: app-tls
+        frontend:
+          default:
+            validation:
+              caCertificateRefs:
+                - group: ""
+                  kind: ConfigMap
+                  name: my-ca-bundle   # must have key ca.crt
+```
+
+The ConfigMap:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-ca-bundle
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    ...
+    -----END CERTIFICATE-----
+```
+
+The CA bundle is **hot-reloaded** when the ConfigMap changes — no Gateway or proxy restart required.
+
+If the referenced ConfigMap is missing, does not contain a `ca.crt` key, or is not PEM-encoded, Coxswain falls back to `Unavailable` and **fails closed**: every TLS handshake to that hostname is rejected until the ConfigMap is corrected.
+
+### Validation modes
+
+| Mode | Behaviour |
+|------|-----------|
+| `AllowValidOnly` (default) | Client cert is required and must be signed by the configured CA. Missing or invalid cert → TLS handshake aborted (Istio MUTUAL semantics). |
+| `AllowInsecureFallback` | Client cert is requested and validated if present, but the handshake is never aborted. Missing or invalid cert → request passes through; authorization is delegated to the backend. |
+
+```yaml
+# AllowInsecureFallback (GEP-91)
+frontend:
+  default:
+    validation:
+      mode: AllowInsecureFallback
+      caCertificateRefs:
+        - group: ""
+          kind: ConfigMap
+          name: my-ca-bundle
+```
+
+### InsecureFrontendValidationMode condition
+
+When `AllowInsecureFallback` is active, the Gateway emits a top-level status condition:
+
+```
+type:   InsecureFrontendValidationMode
+status: True
+reason: ConfigurationChanged
+```
+
+This condition is **absent** when the mode is `AllowValidOnly`. Operators can use it to audit cluster state:
+
+```bash
+kubectl get gateway <name> -o jsonpath='{.status.conditions[?(@.type=="InsecureFrontendValidationMode")]}'
+```
+
+### Out of scope
+
+| Feature | Status |
+|---------|--------|
+| Secret-backed CA refs | Not yet — only `ConfigMap`/`ca.crt` is Core-certified |
+| Cross-namespace CA refs | Not yet — ReferenceGrant extension; same namespace only |
+| `perPort` validation overrides | Not applicable — Coxswain's shared `:443` listener is SNI-keyed, not port-keyed |
+| Multiple `caCertificateRefs` | Planned (Extended support); currently only the first ref is used |
+
 ## Wildcard TLS
 
 For wildcard hostname TLS (e.g. `*.example.com`), the TLS Secret's `tls.crt` must include a wildcard SAN. Coxswain follows RFC 6125 for TLS matching: a single-label wildcard (`*.example.com`) matches `foo.example.com` but not `foo.bar.example.com`.

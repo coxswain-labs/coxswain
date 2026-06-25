@@ -40,10 +40,17 @@ pub(crate) struct ConnTlsInfo {
 /// On every handshake:
 /// 1. Selects the server certificate by SNI.
 /// 2. If the SNI maps to a client-cert mTLS config, configures BoringSSL to
-///    require and verify a peer certificate (`PEER | FAIL_IF_NO_PEER_CERT`).
-///    A missing/invalid/over-depth cert aborts the TLS handshake (Istio MUTUAL
-///    semantics). An `Unavailable` config installs an empty verify store so all
-///    handshakes to that host fail-closed.
+///    request and verify a peer certificate.  The exact verify mode depends on
+///    the configured [`coxswain_core::tls::ClientCertConfig::allow_insecure_fallback`]:
+///    - `false` (default, GEP-91 `AllowValidOnly`): `PEER | FAIL_IF_NO_PEER_CERT`.
+///      A missing, invalid, or over-depth cert aborts the TLS handshake (Istio
+///      MUTUAL semantics).
+///    - `true` (GEP-91 `AllowInsecureFallback`): `PEER` with a permissive verify
+///      callback that always returns `true`.  The client cert is requested and
+///      validated, but a missing or invalid cert does **not** abort the handshake.
+///      The CA store is still installed so backends receive the cert if presented.
+/// 3. An `Unavailable` config (CA missing / unlabeled) is fail-closed: every
+///    handshake to that host is rejected.
 ///
 /// Cheaply clonable: the underlying stores are `Arc`-backed.
 #[non_exhaustive]
@@ -122,6 +129,8 @@ impl TlsAccept for SniCertSelector {
         match config_state.as_ref() {
             ClientCertConfigState::Config(cfg) => {
                 // Build an X509Store from the operator-supplied CA PEM bundle.
+                // On failure, fall through: no CA store installed means BoringSSL
+                // rejects every client cert regardless of verify mode (fail-closed).
                 match build_ca_store(&cfg.ca_pem, &sni) {
                     Ok(ca_store) => {
                         if let Err(e) = ext::ssl_set_verify_cert_store(ssl, &ca_store) {
@@ -131,17 +140,36 @@ impl TlsAccept for SniCertSelector {
                     }
                     Err(e) => {
                         tracing::warn!(sni, error = %e, "CA store build failed — fail-closing mTLS");
-                        // Fall through to set PEER|FAIL_IF_NO_PEER_CERT with no store
-                        // installed: BoringSSL will reject every client cert.
                     }
                 }
-                // Require the client to present a certificate.  BoringSSL aborts
-                // the handshake on a missing, invalid, or over-depth cert.
-                ssl.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
-                tracing::debug!(sni, depth = cfg.verify_depth, "mTLS: requiring client cert");
+
+                if cfg.allow_insecure_fallback {
+                    // GEP-91 AllowInsecureFallback: request the client cert and
+                    // validate it against the CA, but never abort the handshake
+                    // on a missing or invalid cert.  Authorization is delegated
+                    // to the backend.
+                    //
+                    // `set_verify_callback` is a safe boring `SslRef` method —
+                    // no `unsafe` is required.
+                    ssl.set_verify_callback(SslVerifyMode::PEER, |_preverify_ok, _ctx| true);
+                    tracing::debug!(
+                        sni,
+                        depth = cfg.verify_depth,
+                        "mTLS: AllowInsecureFallback — cert optional"
+                    );
+                } else {
+                    // GEP-91 AllowValidOnly (default): abort the handshake on a
+                    // missing, invalid, or over-depth cert.
+                    ssl.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+                    tracing::debug!(
+                        sni,
+                        depth = cfg.verify_depth,
+                        "mTLS: AllowValidOnly — requiring client cert"
+                    );
+                }
             }
             ClientCertConfigState::Unavailable => {
-                // CA Secret missing/unlabeled/unparseable — fail-closed: every
+                // CA missing/unlabeled/unparseable — fail-closed: every
                 // handshake to this SNI will fail (no CA store, but verify mode
                 // requires a valid cert).
                 ssl.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);

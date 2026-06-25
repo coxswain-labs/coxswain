@@ -72,6 +72,9 @@ func TestConformance(t *testing.T) {
 		features.SupportGatewayPort8080,
 		// Extended: empty Gateway address value (#34)
 		features.SupportGatewayAddressEmpty,
+		// Standard: frontend client-certificate validation — GEP-91 (#86)
+		features.SupportGatewayFrontendClientCertificateValidation,
+		features.SupportGatewayFrontendClientCertificateValidationInsecureFallback,
 		// Extended: parentRef port mismatch → NoMatchingParent (#34)
 		features.SupportHTTPRouteDestinationPortMatching,
 		// Extended: per-port listener routing (#82, #98)

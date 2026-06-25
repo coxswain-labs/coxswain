@@ -1,0 +1,60 @@
+# Gateway frontend mTLS with a CA ConfigMap reference that does not exist — GEP-91 (#86).
+#
+# The controller must resolve to ClientCertConfigState::Unavailable, and the proxy
+# must fail-close every TLS handshake to this hostname.
+#
+# Placeholders:
+#   HOSTNAME        — listener hostname and HTTPRoute hostname
+#   SECRET_NAME     — name of the kubernetes.io/tls server-cert Secret
+#   TLS_CRT_B64     — base64-encoded PEM server certificate
+#   TLS_KEY_B64     — base64-encoded PEM server private key
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SECRET_NAME}
+type: kubernetes.io/tls
+data:
+  tls.crt: ${TLS_CRT_B64}
+  tls.key: ${TLS_KEY_B64}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-frontend-missing-ca
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: https
+      port: ${GATEWAY_HTTPS_PORT}
+      protocol: HTTPS
+      hostname: "${HOSTNAME}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: ${SECRET_NAME}
+        frontend:
+          default:
+            validation:
+              caCertificateRefs:
+                - group: ""
+                  kind: ConfigMap
+                  name: does-not-exist
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: frontend-missing-ca-route
+spec:
+  parentRefs:
+    - name: coxswain-frontend-missing-ca
+  hostnames:
+    - "${HOSTNAME}"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000

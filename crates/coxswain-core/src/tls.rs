@@ -392,29 +392,31 @@ pub type SharedTlsStore = Shared<TlsStore>;
 // Client-certificate mTLS store (#267)
 // ---------------------------------------------------------------------------
 
-/// Per-host client-certificate mTLS state resolved from an [`Ingress`] annotation.
+/// Per-host client-certificate mTLS state resolved from an Ingress annotation or
+/// a Gateway `spec.tls.frontend.default.validation` block.
 ///
 /// Keyed by SNI host pattern in [`ClientCertStore`] and read by the proxy during
 /// every TLS handshake. The enum is crypto-free; PEM parsing happens at reconcile
 /// time (reflector) and at handshake time (proxy).
-///
-/// [`Ingress`]: k8s_openapi::api::networking::v1::Ingress
 #[non_exhaustive]
 #[derive(Debug, PartialEq)]
 pub enum ClientCertConfigState {
-    /// mTLS configured and the CA Secret was resolved successfully.
+    /// mTLS configured and the CA bundle was resolved successfully.
     Config(ClientCertConfig),
-    /// The annotation is present but the CA Secret was missing, unlabeled,
+    /// The annotation or ref is present but the CA bundle was missing, unlabeled,
     /// lacked a `ca.crt` key, or held unparseable PEM. Fail-closed: the proxy
-    /// aborts every TLS handshake to this host until the Secret is corrected.
+    /// aborts every TLS handshake to this host until the source is corrected.
     Unavailable,
 }
 
-/// Resolved client-certificate mTLS configuration for a single Ingress host.
+/// Resolved client-certificate mTLS configuration for a single host.
+///
+/// Sources: Ingress `auth-tls-*` annotations (via [`ClientCertStoreBuilder`]) or
+/// Gateway `spec.tls.frontend.default.validation` (GEP-91, #86).
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct ClientCertConfig {
-    /// PEM-encoded CA certificate bundle sourced from `Secret.data["ca.crt"]`.
+    /// PEM-encoded CA certificate bundle.
     pub ca_pem: Vec<u8>,
     /// Maximum client-certificate chain verification depth. Default is `1`
     /// (leaf certificate only, matching Istio's default for `tls.mode: MUTUAL`).
@@ -422,22 +424,37 @@ pub struct ClientCertConfig {
     /// When `true` the verified client certificate is forwarded to the upstream
     /// as `X-SSL-Client-Cert` (URL-encoded PEM).
     pub pass_to_upstream: bool,
+    /// When `true`, the proxy uses `AllowInsecureFallback` semantics (GEP-91):
+    /// the CA is installed and the client cert is requested, but a missing or
+    /// invalid cert does **not** abort the TLS handshake. Authorization is
+    /// delegated to the backend. Default is `false` (AllowValidOnly).
+    pub allow_insecure_fallback: bool,
 }
 
 impl ClientCertConfig {
-    /// Construct a new [`ClientCertConfig`].
+    /// Construct a new [`ClientCertConfig`] with `allow_insecure_fallback = false`.
     pub fn new(ca_pem: Vec<u8>, verify_depth: u32, pass_to_upstream: bool) -> Self {
         Self {
             ca_pem,
             verify_depth,
             pass_to_upstream,
+            allow_insecure_fallback: false,
         }
+    }
+
+    /// Set the insecure-fallback mode (GEP-91 `AllowInsecureFallback`).
+    ///
+    /// When `true`, a missing or invalid client cert does not abort the handshake.
+    #[must_use]
+    pub fn with_insecure_fallback(mut self, value: bool) -> Self {
+        self.allow_insecure_fallback = value;
+        self
     }
 }
 
-/// Equality compares PEM bytes, depth, and pass flag only. The diagnostic `source`
-/// label (if any) is excluded so a CA moving between Secrets does not churn the
-/// [`ArcSwap`] — same pattern as [`TlsCert`].
+/// Equality compares PEM bytes, depth, pass flag, and fallback mode. A fallback-mode
+/// flip must churn the [`ArcSwap`] so the proxy re-applies BoringSSL verify flags.
+/// The diagnostic `source` label (if any) is excluded — same pattern as [`TlsCert`].
 ///
 /// [`ArcSwap`]: arc_swap::ArcSwap
 impl PartialEq for ClientCertConfig {
@@ -445,6 +462,7 @@ impl PartialEq for ClientCertConfig {
         self.ca_pem == other.ca_pem
             && self.verify_depth == other.verify_depth
             && self.pass_to_upstream == other.pass_to_upstream
+            && self.allow_insecure_fallback == other.allow_insecure_fallback
     }
 }
 

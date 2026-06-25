@@ -36,6 +36,19 @@ pub(super) async fn patch_gateway_status(
     };
     let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
     let now = Time(k8s_openapi::jiff::Timestamp::now());
+    // GEP-91 (#86): warn when the frontend CA ref did not resolve so that operators
+    // can see the failure in controller logs.  The proxy already fail-closes all
+    // handshakes to the affected hostnames until the ConfigMap is corrected.
+    if let Some(fv) = health.frontend_validation.as_ref()
+        && !fv.resolved_refs
+    {
+        tracing::warn!(
+            name,
+            ns,
+            message = %fv.message,
+            "Gateway frontend CA ref unresolvable — proxy fail-closing mTLS handshakes"
+        );
+    }
     let patch = build_gateway_status_patch(gw, health, generation, &now, addr, ingress_ports);
     let started = std::time::Instant::now();
     let result = api

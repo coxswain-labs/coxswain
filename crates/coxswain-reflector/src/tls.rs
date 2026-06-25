@@ -14,7 +14,9 @@ use tokio::sync::watch;
 // Pure data types and the shared wrapper live in coxswain-core so the
 // discovery wire layer can import them without pulling in the reflector crate.
 pub use coxswain_core::listener_health::SharedGatewayListenerHealth;
-pub use coxswain_core::listener_health::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome};
+pub use coxswain_core::listener_health::{
+    FrontendValidationHealth, GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome,
+};
 
 #[derive(Debug, Error)]
 pub(crate) enum TlsLoadError {

@@ -1177,7 +1177,14 @@ fn rebuild(
         outputs.listener_hostnames,
         true,
     );
-    build_client_certs(stores, &ingresses, &ownership, outputs.client_certs);
+    build_client_certs(
+        stores,
+        &ingresses,
+        &ownership,
+        outputs.client_certs,
+        &mut gateway_tls_health,
+        true,
+    );
 
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
 
@@ -1354,10 +1361,18 @@ fn rebuild(
             &listener_hostnames_cell,
             false,
         );
-        build_client_certs(stores, &ingresses, &dedicated_ownership, &client_certs_cell);
+        let mut dedicated_tls_health = gw_listener_health;
+        build_client_certs(
+            stores,
+            &ingresses,
+            &dedicated_ownership,
+            &client_certs_cell,
+            &mut dedicated_tls_health,
+            false,
+        );
 
         // Retain only the health entry for the owning Gateway.
-        let listener_health: HashMap<ObjectKey, GatewayListenerHealth> = gw_listener_health
+        let listener_health: HashMap<ObjectKey, GatewayListenerHealth> = dedicated_tls_health
             .into_iter()
             .filter(|(k, _)| k == &key)
             .collect();

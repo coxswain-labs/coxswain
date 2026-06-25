@@ -610,6 +610,10 @@ message ClientCertConfig {
   bytes ca_pem = 1;
   uint32 verify_depth = 2;
   bool pass_to_upstream = 3;
+  // GEP-91 AllowInsecureFallback: when true the proxy requests the client cert
+  // but never aborts the handshake on missing/invalid cert (authz delegated to
+  // the backend). Defaults to false (AllowValidOnly). Added in #86.
+  bool allow_insecure_fallback = 4;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

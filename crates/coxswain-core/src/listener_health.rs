@@ -125,12 +125,41 @@ pub struct ListenerInfo {
     pub port: u16,
 }
 
+/// Outcome of resolving the Gateway-wide frontend client-certificate validation
+/// config (GEP-91, `spec.tls.frontend.default.validation`).
+///
+/// Produced during each reconciler rebuild and consumed by the controller's
+/// status writer to emit the `InsecureFrontendValidationMode` condition.
+/// `None` on a [`GatewayListenerHealth`] means no frontend validation is configured.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default)]
+pub struct FrontendValidationHealth {
+    /// `true` when the effective mode is `AllowInsecureFallback`.
+    ///
+    /// Triggers a `InsecureFrontendValidationMode=True/ConfigurationChanged` top-level
+    /// condition on the Gateway (GEP-91 requirement).
+    pub insecure_fallback: bool,
+    /// `true` when all CA ConfigMap refs resolved successfully; `false` when any ref
+    /// was missing, held no `ca.crt` key, or lacked a valid PEM header.
+    ///
+    /// A `false` value here means the proxy fail-closed (every handshake rejected for
+    /// the affected hostnames) and the controller should log a warning and emit an Event.
+    pub resolved_refs: bool,
+    /// Human-readable description for the `resolved_refs=false` case.
+    pub message: String,
+}
+
 /// Per-listener health for one Gateway, keyed by listener name.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct GatewayListenerHealth {
     /// All listeners for this Gateway. Keyed by listener name.
     pub listeners: BTreeMap<String, ListenerInfo>,
+    /// Frontend client-certificate validation health for this Gateway (GEP-91, #86).
+    ///
+    /// `None` when `spec.tls.frontend.default.validation` is absent.
+    /// `Some` when the field is present, regardless of whether refs resolved.
+    pub frontend_validation: Option<FrontendValidationHealth>,
 }
 
 // ── SharedGatewayListenerHealth ───────────────────────────────────────────────

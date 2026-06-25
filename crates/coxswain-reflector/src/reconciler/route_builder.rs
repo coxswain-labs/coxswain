@@ -430,22 +430,33 @@ pub(super) fn build_tls(
     gateway_tls_health
 }
 
-/// Build and publish the per-Ingress client-certificate mTLS config store.
+/// Build and publish the per-host client-certificate mTLS config store.
 ///
-/// Mirrors [`build_tls`], but iterates over `auth-tls-*` Ingress annotations instead of
-/// `spec.tls[].secretName`.  Gateway API routes do not support per-listener client-cert config
-/// via Coxswain annotations, so only Ingresses are reconciled here.
+/// Two sources are reconciled into a single [`ClientCertStoreBuilder`]:
+///
+/// 1. **Ingress** `auth-tls-*` annotations (`reconcile_client_certs`) — per-listener CA
+///    sourced from a labeled Secret.
+/// 2. **Gateway** `spec.tls.frontend.default.validation` (GEP-91, #86) — gateway-wide CA
+///    sourced from a ConfigMap, keyed by listener hostname.
+///
+/// The function also annotates `gateway_tls_health` with
+/// [`coxswain_core::listener_health::FrontendValidationHealth`] so the controller can emit
+/// the `InsecureFrontendValidationMode` condition required by GEP-91.
 ///
 /// Uses a `PartialEq` short-circuit identical to [`build_tls`]: if the new store is byte-for-byte
-/// equal to the current snapshot (same CA PEMs, depths, and pass-to-upstream flags) the
-/// [`SharedClientCertStore`] ArcSwap is NOT updated, preventing a spurious hot-reload.
+/// equal to the current snapshot the [`SharedClientCertStore`] ArcSwap is NOT updated, preventing
+/// a spurious hot-reload.
 pub(super) fn build_client_certs(
     stores: &ReflectorStores<'_>,
     ingresses: &[Arc<Ingress>],
     ownership: &Ownership<'_>,
     client_certs_shared: &SharedClientCertStore,
+    gateway_tls_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
+    skip_cut_over: bool,
 ) {
     let mut builder = ClientCertStoreBuilder::new();
+
+    // ── Ingress: auth-tls-* annotations ──────────────────────────────────────
     for ingress in ingresses {
         IngressReconciler::reconcile_client_certs(
             ingress,
@@ -455,6 +466,32 @@ pub(super) fn build_client_certs(
             &mut builder,
         );
     }
+
+    // ── Gateway: spec.tls.frontend.default.validation (GEP-91) ───────────────
+    for gw in stores.gateways.state() {
+        if !ownership
+            .gateway_classes
+            .contains(&gw.spec.gateway_class_name)
+        {
+            continue;
+        }
+        if skip_cut_over && gateway_is_cut_over(&gw) {
+            continue;
+        }
+        let ns = gw.metadata.namespace.clone().unwrap_or_default();
+        let name = gw.metadata.name.clone().unwrap_or_default();
+        let key = ObjectKey::new(ns, name);
+        // Update the health entry that was created by build_tls for this Gateway.
+        // If no entry exists yet (race on first rebuild) create a default one.
+        let health = gateway_tls_health.entry(key).or_default();
+        crate::gateway_api::frontend_tls::reconcile_frontend_validation(
+            &gw,
+            stores.configmaps,
+            &mut builder,
+            health,
+        );
+    }
+
     let store = builder.build();
     let count = store.host_count();
     let current = client_certs_shared.load();
