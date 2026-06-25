@@ -2129,11 +2129,27 @@ async fn gateway_frontend_mtls_fails_closed_when_ca_configmap_missing() -> anyho
     )
     .await?;
 
-    // Wait for the gateway to be Programmed (server cert resolved).
-    wait::wait_for_gateway_programmed(
+    // GEP-91: a Gateway-wide frontend CA ref that can't resolve drives the HTTPS
+    // listener to ResolvedRefs=False / Programmed=False (the
+    // GatewayFrontendInvalidDefaultClientCertificateValidation conformance
+    // contract), even though the listener's own server cert is valid.
+    wait::wait_for_gateway_listener_condition(
         &h.client,
         "coxswain-frontend-missing-ca",
         &ns.name,
+        "https",
+        "ResolvedRefs",
+        "False",
+        Duration::from_secs(60),
+    )
+    .await?;
+    wait::wait_for_gateway_listener_condition(
+        &h.client,
+        "coxswain-frontend-missing-ca",
+        &ns.name,
+        "https",
+        "Programmed",
+        "False",
         Duration::from_secs(60),
     )
     .await?;

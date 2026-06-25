@@ -221,6 +221,14 @@ The CA bundle is **hot-reloaded** when the ConfigMap changes — no Gateway or p
 
 If the referenced ConfigMap is missing, does not contain a `ca.crt` key, or is not PEM-encoded, Coxswain falls back to `Unavailable` and **fails closed**: every TLS handshake to that hostname is rejected until the ConfigMap is corrected.
 
+Because frontend validation is gateway-wide, an unresolvable CA ref impacts **every HTTPS listener** on the Gateway, which surfaces it in listener status (HTTP listeners are unaffected and keep serving):
+
+```
+ResolvedRefs: False  reason: InvalidCACertificateRef
+Accepted:     False  reason: NoValidCACertificate
+Programmed:   False
+```
+
 ### Validation modes
 
 | Mode | Behaviour |

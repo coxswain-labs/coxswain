@@ -49,16 +49,19 @@ spec:
         certificateRefs:
           - kind: Secret
             name: ${SECRET_NAME}
-        frontend:
-          default:
-            validation:
-              caCertificateRefs:
-                - group: ""
-                  kind: ConfigMap
-                  name: frontend-ca
       allowedRoutes:
         namespaces:
           from: Same
+  # GEP-91 frontend client-cert validation is gateway-level (spec.tls.frontend),
+  # a sibling of spec.listeners — not nested under a listener's tls block.
+  tls:
+    frontend:
+      default:
+        validation:
+          caCertificateRefs:
+            - group: ""
+              kind: ConfigMap
+              name: frontend-ca
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

@@ -47,11 +47,20 @@ pub(super) fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerH
         .and_then(|s| s.listeners.as_ref())
         .map(Vec::as_slice)
         .unwrap_or(&[]);
+    // GEP-91: a Gateway-wide frontend CA ref that failed to resolve drives every
+    // HTTPS listener to ResolvedRefs=False, so it must be folded into the
+    // desired-health comparison or a frontend-only failure would never patch.
+    let frontend_ca_failed = health
+        .frontend_validation
+        .as_ref()
+        .is_some_and(|fv| !fv.resolved_refs);
     for listener in &gw.spec.listeners {
         let (has_invalid_kinds, _) = listener_route_kind_info(listener);
         let info = health.listeners.get(&listener.name);
-        let desired_healthy =
-            !has_invalid_kinds && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true);
+        let frontend_impacts = listener.protocol == "HTTPS" && frontend_ca_failed;
+        let desired_healthy = !has_invalid_kinds
+            && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true)
+            && !frontend_impacts;
         let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);
         let current_resolved = current_listener
             .map(|sl| has_condition(Some(sl.conditions.as_slice()), "ResolvedRefs"))
@@ -167,7 +176,14 @@ pub(super) fn build_gateway_status_patch(
         .iter()
         .map(|l| {
             let info = health.listeners.get(&l.name);
-            build_listener_status(l, info, ingress_ports, generation, now)
+            build_listener_status(
+                l,
+                info,
+                ingress_ports,
+                generation,
+                now,
+                health.frontend_validation.as_ref(),
+            )
         })
         .collect();
 

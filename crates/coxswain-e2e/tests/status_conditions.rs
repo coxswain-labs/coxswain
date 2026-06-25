@@ -1263,37 +1263,29 @@ async fn gateway_signals_insecure_frontend_validation_mode_condition() -> anyhow
     )
     .await?;
 
-    // Patch the mode back to AllowValidOnly by removing the validation block.
+    // Flip the gateway-level frontend validation mode back to AllowValidOnly.
+    // GEP-91 places frontend validation at spec.tls.frontend (gateway-wide), a
+    // sibling of spec.listeners — not under a listener's tls block. A JSON merge
+    // patch on just the mode field leaves caCertificateRefs intact.
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
-    // A strategic merge patch that removes the validation block:
-    let remove_validation = serde_json::json!({
+    let revert_to_valid_only = serde_json::json!({
         "spec": {
-            "listeners": [{
-                "name": "https",
-                "tls": {
-                    "frontend": {
-                        "default": {
-                            "validation": {
-                                "mode": "AllowValidOnly",
-                                "caCertificateRefs": [
-                                    {
-                                        "group": "",
-                                        "kind": "ConfigMap",
-                                        "name": "frontend-ca-fallback"
-                                    }
-                                ]
-                            }
+            "tls": {
+                "frontend": {
+                    "default": {
+                        "validation": {
+                            "mode": "AllowValidOnly"
                         }
                     }
                 }
-            }]
+            }
         }
     });
     gateways
         .patch(
             "coxswain-frontend-fallback",
             &PatchParams::apply("coxswain-e2e"),
-            &Patch::Merge(&remove_validation),
+            &Patch::Merge(&revert_to_valid_only),
         )
         .await?;
 

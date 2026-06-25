@@ -242,7 +242,14 @@ pub(crate) fn build_dedicated_gateway_status_patch(
         .iter()
         .map(|l| {
             let info = inputs.tls_health.listeners.get(&l.name);
-            build_listener_status(l, info, inputs.ingress_ports, generation, now)
+            build_listener_status(
+                l,
+                info,
+                inputs.ingress_ports,
+                generation,
+                now,
+                inputs.tls_health.frontend_validation.as_ref(),
+            )
         })
         .collect();
 
