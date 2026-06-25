@@ -107,13 +107,18 @@ pub(crate) async fn try_redirect(
 }
 
 /// If `filters` contains a `Cors` filter AND the request is a preflight `OPTIONS`
-/// (identified by the presence of `Access-Control-Request-Method`) AND the request
-/// origin matches the allow-list, write a `204 No Content` with the CORS allow-headers
-/// and return `true`. Returns `false` in every other case (no CORS filter, wrong
-/// method, no `Origin`, origin not allowed).
+/// (identified by the presence of `Access-Control-Request-Method`), write a
+/// `204 No Content` and return `true`. Returns `false` only when there is no CORS
+/// filter, the method is not `OPTIONS`, or no `Origin` header is present.
 ///
-/// Must be called after routing is resolved but before forwarding to the upstream,
-/// so that the upstream backend is never contacted for preflight requests.
+/// A genuine preflight on a CORS-enabled route is *always* short-circuited so the
+/// upstream is never contacted (GEP-1767). When the request origin matches the
+/// allow-list the 204 carries the full `Access-Control-*` set (origin echoed,
+/// optional credentials/methods/headers/expose-headers, max-age). When the origin
+/// does not match, the 204 carries no CORS headers — the browser then blocks the
+/// cross-origin request because `Access-Control-Allow-Origin` is absent.
+///
+/// Must be called after routing is resolved but before forwarding to the upstream.
 ///
 /// # Errors
 /// Propagates Pingora I/O errors from response-header construction.
@@ -141,26 +146,27 @@ pub(crate) async fn try_cors_preflight(
     }
     for f in filters {
         if let FilterAction::Cors(cfg) = f {
-            let Some(allow_origin) = cfg.resolve_origin(origin_str) else {
-                // Origin present but not in the allow-list — let the request proceed;
-                // the browser enforces the CORS policy based on the absent response header.
-                return Ok(false);
-            };
-            let mut resp = ResponseHeader::build(204, Some(4))?;
-            resp.insert_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin)?;
-            if cfg.allow_credentials {
-                resp.insert_header(
-                    header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-                    http::HeaderValue::from_static("true"),
-                )?;
+            // Cap of 6 covers origin + credentials + methods + headers + expose + max-age.
+            let mut resp = ResponseHeader::build(204, Some(6))?;
+            if let Some(allow_origin) = cfg.resolve_origin(origin_str) {
+                resp.insert_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin)?;
+                if cfg.allow_credentials {
+                    resp.insert_header(
+                        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                        http::HeaderValue::from_static("true"),
+                    )?;
+                }
+                if let Some(methods) = &cfg.allow_methods {
+                    resp.insert_header(header::ACCESS_CONTROL_ALLOW_METHODS, methods.clone())?;
+                }
+                if let Some(headers) = &cfg.allow_headers {
+                    resp.insert_header(header::ACCESS_CONTROL_ALLOW_HEADERS, headers.clone())?;
+                }
+                if let Some(expose) = &cfg.expose_headers {
+                    resp.insert_header(header::ACCESS_CONTROL_EXPOSE_HEADERS, expose.clone())?;
+                }
+                resp.insert_header(header::ACCESS_CONTROL_MAX_AGE, cfg.max_age.clone())?;
             }
-            if let Some(methods) = &cfg.allow_methods {
-                resp.insert_header(header::ACCESS_CONTROL_ALLOW_METHODS, methods.clone())?;
-            }
-            if let Some(headers) = &cfg.allow_headers {
-                resp.insert_header(header::ACCESS_CONTROL_ALLOW_HEADERS, headers.clone())?;
-            }
-            resp.insert_header(header::ACCESS_CONTROL_MAX_AGE, cfg.max_age.clone())?;
             session
                 .write_response_header(Box::new(resp), true)
                 .await
