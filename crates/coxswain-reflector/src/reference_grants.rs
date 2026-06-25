@@ -33,6 +33,14 @@ pub fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
     (backend_grants, cert_grants)
 }
 
+/// Flatten the `Gateway → ConfigMap` grants used by GEP-91 frontend
+/// client-certificate validation when a `caCertificateRefs` entry points at a
+/// ConfigMap in another namespace (#86). Same filter rules as [`flatten_grants`].
+#[must_use]
+pub fn flatten_ca_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
+    flatten(grants, "Gateway", "ConfigMap")
+}
+
 fn flatten(grants: &[Arc<ReferenceGrant>], from_kind: &str, to_kind: &str) -> GrantSet {
     grants
         .iter()

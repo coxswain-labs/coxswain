@@ -27,7 +27,7 @@ use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
 use crate::ingress::IngressPorts;
 use crate::k8s_utils::scoped_api;
-use crate::reference_grants::{GrantSet, flatten_grants};
+use crate::reference_grants::{GrantSet, flatten_ca_grants, flatten_grants};
 use crate::tls::{
     GatewayListenerHealth, SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth,
     SharedHttpRouteHealth,
@@ -564,6 +564,9 @@ pub(super) struct Ownership<'a> {
     pub(super) gateway_classes: &'a HashSet<String>,
     pub(super) backend_grants: &'a GrantSet,
     pub(super) cert_grants: &'a GrantSet,
+    /// `Gateway → ConfigMap` grants for GEP-91 frontend client-cert validation
+    /// CA refs that point at a ConfigMap in another namespace (#86).
+    pub(super) ca_grants: &'a GrantSet,
     /// Per-(Service, port) `BackendTLSPolicy` lookup table, built before this
     /// `Ownership` is constructed. Carried alongside ownership data because
     /// `build_routes` and the per-route `reconcile` both need it on the same
@@ -1132,7 +1135,9 @@ fn rebuild(
             owned_gateways_handle,
         );
 
-    let (backend_grants, cert_grants) = flatten_grants(&stores.grants.state());
+    let grants_snapshot = stores.grants.state();
+    let (backend_grants, cert_grants) = flatten_grants(&grants_snapshot);
+    let ca_grants = flatten_ca_grants(&grants_snapshot);
 
     tracing::debug!(
         http_routes = routes.len(),
@@ -1153,6 +1158,7 @@ fn rebuild(
         gateway_classes: &owned_gateway_classes,
         backend_grants: &backend_grants,
         cert_grants: &cert_grants,
+        ca_grants: &ca_grants,
         policy_index: &policy_index,
     };
 
@@ -1331,6 +1337,7 @@ fn rebuild(
             gateway_classes: &owned_gateway_classes,
             backend_grants: &backend_grants,
             cert_grants: &cert_grants,
+            ca_grants: &ca_grants,
             policy_index: &policy_index,
         };
 

@@ -268,10 +268,12 @@ kubectl get gateway <name> -o jsonpath='{.status.conditions[?(@.type=="InsecureF
 
 | Feature | Status |
 |---------|--------|
+| `perPort` validation overrides | **Supported** — `spec.tls.frontend.perPort[].tls.validation` overrides the gateway `default` for listeners on that port; resolution is keyed by the listener's hostname |
+| Cross-namespace CA refs | **Supported** — a CA `ConfigMap` in another namespace requires a `Gateway → ConfigMap` `ReferenceGrant`; without one the listener surfaces `ResolvedRefs=False/RefNotPermitted` |
 | Secret-backed CA refs | Not yet — only `ConfigMap`/`ca.crt` is Core-certified |
-| Cross-namespace CA refs | Not yet — ReferenceGrant extension; same namespace only |
-| `perPort` validation overrides | Not applicable — Coxswain's shared `:443` listener is SNI-keyed, not port-keyed |
 | Multiple `caCertificateRefs` | Planned (Extended support); currently only the first ref is used |
+
+A listener whose effective CA ref cannot be resolved fails closed and surfaces the GEP-91 reason on its `ResolvedRefs` condition: `InvalidCACertificateRef` (missing ConfigMap / no `ca.crt` / not PEM), `InvalidCACertificateKind` (ref kind is not `ConfigMap`), or `RefNotPermitted` (cross-namespace without a `ReferenceGrant`).
 
 ## Wildcard TLS
 

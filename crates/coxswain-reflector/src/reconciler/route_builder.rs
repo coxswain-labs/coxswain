@@ -487,6 +487,7 @@ pub(super) fn build_client_certs(
         crate::gateway_api::frontend_tls::reconcile_frontend_validation(
             &gw,
             stores.configmaps,
+            ownership.ca_grants,
             &mut builder,
             health,
         );

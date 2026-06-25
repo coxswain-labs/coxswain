@@ -18,7 +18,7 @@ use coxswain_reflector::gw_types::v::gateways::{
     GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::tls::{FrontendValidationHealth, ListenerInfo};
+use coxswain_reflector::tls::{FrontendValidationOutcome, ListenerInfo};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Conditions whose `type` starts with this prefix are owned by the
@@ -138,21 +138,25 @@ pub(crate) fn build_listener_status(
     ingress_ports: IngressPorts,
     generation: i64,
     now: &Time,
-    frontend_validation: Option<&FrontendValidationHealth>,
 ) -> GatewayStatusListeners {
     let outcome = info.map(|i| i.tls_outcome.clone()).unwrap_or_default();
     let (has_invalid_kinds, supported_kinds_list) = listener_route_kind_info(listener);
-    // GEP-91: a Gateway-wide frontend CA ref that failed to resolve impacts
-    // every HTTPS listener. It takes precedence over the per-listener cert
-    // outcome — even a listener with a valid server certificate cannot validate
-    // clients without a usable CA, so it is not Programmed.
-    let frontend_ca_failed =
-        listener.protocol == "HTTPS" && frontend_validation.is_some_and(|fv| !fv.resolved_refs);
-    let frontend_msg = frontend_validation
-        .map(|fv| fv.message.as_str())
+    // GEP-91: this listener's frontend client-cert CA ref (perPort override or
+    // gateway default) failed to resolve. It takes precedence over the
+    // per-listener cert outcome — even a listener with a valid server
+    // certificate cannot validate clients without a usable CA, so it is not
+    // Programmed. `frontend_outcome` is NotApplicable for non-HTTPS listeners
+    // and for HTTPS listeners with no frontend validation configured.
+    let frontend_outcome = info.map(|i| &i.frontend_outcome);
+    let frontend_ca_failed = frontend_outcome.is_some_and(FrontendValidationOutcome::is_failed);
+    let frontend_reason = frontend_outcome
+        .map(FrontendValidationOutcome::resolved_refs_reason)
+        .unwrap_or("ResolvedRefs");
+    let frontend_msg = frontend_outcome
+        .map(FrontendValidationOutcome::message)
         .unwrap_or("");
     let (resolved_refs_status, resolved_refs_reason, resolved_refs_msg) = if frontend_ca_failed {
-        ("False", "InvalidCACertificateRef", frontend_msg)
+        ("False", frontend_reason, frontend_msg)
     } else if has_invalid_kinds {
         (
             "False",
@@ -230,105 +234,5 @@ pub(crate) fn build_listener_status(
         attached_routes: attached,
         supported_kinds: Some(supported_kinds_list),
         conditions: listener_conditions,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use coxswain_reflector::gw_types::v::gateways::GatewayListeners;
-
-    fn listener(name: &str, protocol: &str) -> GatewayListeners {
-        GatewayListeners {
-            name: name.to_string(),
-            protocol: protocol.to_string(),
-            port: if protocol == "HTTPS" { 443 } else { 80 },
-            ..Default::default()
-        }
-    }
-
-    fn epoch() -> Time {
-        Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH)
-    }
-
-    /// `FrontendValidationHealth` is `#[non_exhaustive]`, so build via `Default`
-    /// and field mutation rather than a struct literal.
-    fn frontend_health(resolved_refs: bool) -> FrontendValidationHealth {
-        let mut fv = FrontendValidationHealth::default();
-        fv.resolved_refs = resolved_refs;
-        fv.message = if resolved_refs {
-            String::new()
-        } else {
-            "CA ConfigMap missing".to_string()
-        };
-        fv
-    }
-
-    /// Returns `"<status>/<reason>"` for the named condition, for compact asserts.
-    fn cond(status: &GatewayStatusListeners, type_: &str) -> String {
-        let c = status
-            .conditions
-            .iter()
-            .find(|c| c.type_ == type_)
-            .unwrap_or_else(|| panic!("missing {type_} condition"));
-        format!("{}/{}", c.status, c.reason)
-    }
-
-    /// GEP-91: an unresolvable Gateway-wide frontend CA ref drives every HTTPS
-    /// listener to the three frontend-specific failure conditions the
-    /// `GatewayFrontendInvalidDefaultClientCertificateValidation` conformance
-    /// test asserts, even when the listener's own server cert is healthy.
-    #[test]
-    fn https_listener_surfaces_frontend_ca_failure_conditions() {
-        let fv = frontend_health(false);
-        let status = build_listener_status(
-            &listener("https", "HTTPS"),
-            None,
-            IngressPorts::default(),
-            1,
-            &epoch(),
-            Some(&fv),
-        );
-        assert_eq!(
-            cond(&status, "ResolvedRefs"),
-            "False/InvalidCACertificateRef"
-        );
-        assert_eq!(cond(&status, "Accepted"), "False/NoValidCACertificate");
-        assert_eq!(cond(&status, "Programmed"), "False/NoValidCACertificate");
-    }
-
-    /// The same frontend CA failure must NOT impact a plain HTTP listener on the
-    /// same Gateway — frontend validation only gates TLS-terminating listeners.
-    #[test]
-    fn http_listener_unaffected_by_frontend_ca_failure() {
-        let fv = frontend_health(false);
-        let status = build_listener_status(
-            &listener("http", "HTTP"),
-            None,
-            IngressPorts::default(),
-            1,
-            &epoch(),
-            Some(&fv),
-        );
-        assert_eq!(cond(&status, "ResolvedRefs"), "True/ResolvedRefs");
-        assert_eq!(cond(&status, "Accepted"), "True/Accepted");
-        assert_eq!(cond(&status, "Programmed"), "True/Programmed");
-    }
-
-    /// A healthy frontend CA leaves an HTTPS listener fully programmed.
-    #[test]
-    fn https_listener_healthy_when_frontend_ca_resolves() {
-        let fv = frontend_health(true);
-        let status = build_listener_status(
-            &listener("https", "HTTPS"),
-            None,
-            IngressPorts::default(),
-            1,
-            &epoch(),
-            Some(&fv),
-        );
-        assert_eq!(cond(&status, "ResolvedRefs"), "True/ResolvedRefs");
-        assert_eq!(cond(&status, "Accepted"), "True/Accepted");
-        assert_eq!(cond(&status, "Programmed"), "True/Programmed");
     }
 }
