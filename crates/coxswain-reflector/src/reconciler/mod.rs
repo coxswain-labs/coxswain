@@ -4,7 +4,7 @@
 //! snapshots into routing tables, TLS stores, and status-health maps. Each pod
 //! role has its own reconciler type with a focused output set:
 //!
-//! - [`SharedProxyReconciler`] — `serve proxy --shared` and `serve dev`.
+//! - [`SharedProxyReconciler`] — `serve proxy --shared`.
 //!   Cluster-wide watches; builds Ingress + Gateway routes, TLS store, listener
 //!   health, route health, policy health, and the cluster summary. Also
 //!   publishes per-cut-over-Gateway snapshots into the dedicated registry the

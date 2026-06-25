@@ -106,8 +106,8 @@ pub struct StatusHealthChannels {
 }
 
 /// Leader-elected status writer. Registered as a Pingora `BackgroundService`
-/// next to the reflector (whose shared informers it consumes) in `serve
-/// controller` and `serve dev`.
+/// next to the reflector (whose shared informers it consumes) in
+/// `serve controller`.
 #[non_exhaustive]
 pub struct Controller {
     health: HealthRegistry,

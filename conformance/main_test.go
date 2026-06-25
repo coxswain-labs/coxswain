@@ -60,6 +60,8 @@ func TestConformance(t *testing.T) {
 		features.SupportHTTPRouteNamedRouteRule,
 		// Extended: HTTP listener isolation (#34)
 		features.SupportGatewayHTTPListenerIsolation,
+		// Extended: CORS filter — GEP-1767 (#41)
+		features.SupportHTTPRouteCORS,
 		// Extended: HTTPS misdirected-request detection — GEP-3567 (#96)
 		features.SupportGatewayHTTPSListenerDetectMisdirectedRequests,
 		// Extended: port 8080 listener (#34)

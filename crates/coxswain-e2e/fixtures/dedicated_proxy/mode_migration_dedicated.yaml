@@ -1,10 +1,10 @@
 # Mode-migration starting point (dedicated → shared). The Gateway already
 # carries `infrastructure.parametersRef`, so on apply the controller
 # provisions a dedicated proxy pod and flips `DedicatedProxyReady=True`;
-# the shared subprocess (`serve dev`) drops the Gateway from its routing
-# table. The test then spawns a dedicated subprocess on the same listener
-# port (now free), removes the parametersRef, kills the dedicated
-# subprocess, and observes the shared subprocess re-adopt the Gateway.
+# the shared proxy subprocess drops the Gateway from its routing table. The
+# test then spawns a dedicated subprocess on the same listener port (now
+# free), removes the parametersRef, kills the dedicated subprocess, and
+# observes the shared proxy subprocess re-adopt the Gateway.
 # TESTNS is substituted at runtime.
 ---
 apiVersion: gateway.coxswain-labs.dev/v1alpha1

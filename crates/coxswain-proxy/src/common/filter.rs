@@ -3,6 +3,7 @@
 
 use super::ctx::ProxyCtx;
 use coxswain_core::routing::{FilterAction, HeaderMod, PathModifier};
+use http::header as hdr;
 use http::{HeaderName, HeaderValue};
 use std::sync::LazyLock;
 
@@ -127,14 +128,42 @@ impl TrafficFilter {
         Ok(())
     }
 
-    /// Apply response-side filters (header modifiers only).
+    /// Apply response-side filters: header modifiers and CORS response headers.
+    ///
+    /// `cors_origin` is the request `Origin` header value captured in
+    /// `request_filter`.  Pass `None` on the non-CORS fast path — the CORS arm
+    /// exits immediately with zero work.
     pub fn apply_response_filters(
         upstream_response: &mut ResponseHeader,
         filters: &[FilterAction],
+        cors_origin: Option<&str>,
     ) {
         for filter in filters {
-            if let FilterAction::ResponseHeaderModifier(m) = filter {
-                apply_header_mod(upstream_response, m, |_| false);
+            match filter {
+                FilterAction::ResponseHeaderModifier(m) => {
+                    apply_header_mod(upstream_response, m, |_| false);
+                }
+                FilterAction::Cors(cfg) => {
+                    let Some(origin_str) = cors_origin else {
+                        continue;
+                    };
+                    let Some(allow_origin) = cfg.resolve_origin(origin_str) else {
+                        continue;
+                    };
+                    let _ = upstream_response
+                        .insert_header(hdr::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin);
+                    if cfg.allow_credentials {
+                        let _ = upstream_response.insert_header(
+                            hdr::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                            HeaderValue::from_static("true"),
+                        );
+                    }
+                    if let Some(expose) = &cfg.expose_headers {
+                        let _ = upstream_response
+                            .insert_header(hdr::ACCESS_CONTROL_EXPOSE_HEADERS, expose.clone());
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -412,7 +441,7 @@ mod tests {
         let mut r = resp();
         let m = hmod(&[], &[("x-forwarded-for", "10.0.0.1")], &[]);
         let filters = vec![FilterAction::ResponseHeaderModifier(m)];
-        TrafficFilter::apply_response_filters(&mut r, &filters);
+        TrafficFilter::apply_response_filters(&mut r, &filters, None);
         assert_eq!(
             r.headers.get("x-forwarded-for").map(|v| v.as_bytes()),
             Some(b"10.0.0.1".as_ref()),

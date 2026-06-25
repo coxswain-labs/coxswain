@@ -31,7 +31,7 @@ pub const GATEWAY_NAME_LABEL: &str = "gateway.networking.k8s.io/gateway-name";
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Component {
-    /// A controller-role pod (`serve controller` or `serve dev`).
+    /// A controller-role pod (`serve controller`).
     Controller,
     /// A shared-pool proxy pod (`serve proxy --shared`).
     SharedProxy,

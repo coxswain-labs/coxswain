@@ -174,9 +174,9 @@ pub struct OperatorConfig {
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
-/// to the [`crate::Controller`] in `serve controller` and `serve dev`;
-/// shares the controller pod's process and leader-election truth-source but
-/// owns its own kube-rs `Controller` and reflector stores.
+/// to the [`crate::Controller`] in `serve controller`; shares the controller
+/// pod's process and leader-election truth-source but owns its own kube-rs
+/// `Controller` and reflector stores.
 #[non_exhaustive]
 pub struct Operator {
     config: OperatorConfig,

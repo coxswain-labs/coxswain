@@ -267,6 +267,119 @@ impl HeaderMod {
     }
 }
 
+/// A single origin entry from `HTTPRoute` CORS `allowOrigins` (GEP-1767).
+///
+/// Wildcard entries carry a `*` that may appear anywhere in the pattern;
+/// matching checks that the request origin (lowercased) starts with `prefix`
+/// and ends with `suffix`. Both halves are stored lowercased at parse time.
+///
+/// A bare `*` entry (match-all) is expressed via
+/// [`CorsConfig::allow_all_origins`] rather than this enum.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub enum CorsOrigin {
+    /// Exact origin string (lowercased at construction time).
+    Exact(String),
+    /// Wildcard pattern split at the `*` (e.g. `https://*.example.com` →
+    /// `prefix = "https://"`, `suffix = ".example.com"`).
+    ///
+    /// Matches when the lowercased request origin starts with `prefix`
+    /// and ends with `suffix`.
+    Wildcard {
+        /// Portion of the allowOrigins pattern before the `*`, lowercased.
+        prefix: Box<str>,
+        /// Portion of the allowOrigins pattern after the `*`, lowercased.
+        suffix: Box<str>,
+    },
+}
+
+impl CorsOrigin {
+    /// Returns `true` if `request_origin` matches this entry (case-insensitive).
+    #[must_use]
+    pub fn matches(&self, request_origin: &str) -> bool {
+        let lower = request_origin.to_ascii_lowercase();
+        match self {
+            CorsOrigin::Exact(s) => lower == s.as_str(),
+            CorsOrigin::Wildcard { prefix, suffix } => {
+                lower.starts_with(prefix.as_ref()) && lower.ends_with(suffix.as_ref())
+            }
+        }
+    }
+}
+
+/// Pre-rendered CORS policy for one `HTTPRoute` rule (GEP-1767).
+///
+/// All `HeaderValue`s are built once at reconcile time so the response path
+/// allocates nothing beyond a cheap `Bytes`-backed clone per injection.
+///
+/// Origin matching always echoes the concrete request `Origin` back rather than
+/// `*`, which is spec-correct in all cases and is required when
+/// [`allow_credentials`][Self::allow_credentials] is `true` (Fetch spec §3.2.5).
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct CorsConfig {
+    /// Parsed origin allow-list. Empty means "match none".
+    pub allow_origins: Vec<CorsOrigin>,
+    /// `true` when the allow-list contained a bare `*` entry — match any origin.
+    pub allow_all_origins: bool,
+    /// Whether to emit `Access-Control-Allow-Credentials: true`.
+    pub allow_credentials: bool,
+    /// Pre-joined `Access-Control-Allow-Methods` value, or `None` if unset.
+    pub allow_methods: Option<HeaderValue>,
+    /// Pre-joined `Access-Control-Allow-Headers` value, or `None` if unset.
+    pub allow_headers: Option<HeaderValue>,
+    /// Pre-joined `Access-Control-Expose-Headers` value, or `None` if unset.
+    pub expose_headers: Option<HeaderValue>,
+    /// `Access-Control-Max-Age` value (pre-formatted; default `"5"`).
+    pub max_age: HeaderValue,
+}
+
+impl CorsConfig {
+    /// Constructs a new [`CorsConfig`].
+    ///
+    /// Called at reconcile time (reflector / discovery deserialization), not on
+    /// the hot path. Pass `None` for optional pre-rendered header values.
+    pub fn new(
+        allow_origins: Vec<CorsOrigin>,
+        allow_all_origins: bool,
+        allow_credentials: bool,
+        allow_methods: Option<HeaderValue>,
+        allow_headers: Option<HeaderValue>,
+        expose_headers: Option<HeaderValue>,
+        max_age: HeaderValue,
+    ) -> Self {
+        Self {
+            allow_origins,
+            allow_all_origins,
+            allow_credentials,
+            allow_methods,
+            allow_headers,
+            expose_headers,
+            max_age,
+        }
+    }
+
+    /// Returns the `Access-Control-Allow-Origin` value to emit for the given
+    /// request origin, or `None` when no allow-list entry matches.
+    ///
+    /// The concrete request origin is echoed rather than `*` — this is always
+    /// spec-correct and satisfies the credential-mode requirement without a
+    /// special-case branch.
+    ///
+    /// Returns `None` (without error) when the origin contains bytes that cannot
+    /// form a valid [`HeaderValue`]; callers treat this as a non-match.
+    #[must_use]
+    pub fn resolve_origin(&self, request_origin: &str) -> Option<HeaderValue> {
+        let matched =
+            self.allow_all_origins || self.allow_origins.iter().any(|o| o.matches(request_origin));
+        if matched {
+            HeaderValue::from_str(request_origin).ok()
+        } else {
+            None
+        }
+    }
+}
+
 /// A filter action evaluated per-request on the proxy hot path.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -307,6 +420,17 @@ pub enum FilterAction {
         /// Pre-resolved mirror backend (round-robins to a concrete endpoint at dispatch time).
         backend: Arc<BackendGroup>,
     },
+    /// Apply CORS policy (GEP-1767) to the matched request.
+    ///
+    /// On `OPTIONS` preflight requests (presence of `Access-Control-Request-Method`),
+    /// the proxy short-circuits with a `204` carrying the allow-headers without
+    /// forwarding to the upstream. On actual CORS requests, the proxy injects
+    /// `Access-Control-Allow-Origin` (and optionally `Allow-Credentials` /
+    /// `Expose-Headers`) into the upstream response.
+    ///
+    /// Wrapped in [`Arc`] so this variant stays one pointer wide in the hot
+    /// `Arc<[FilterAction]>` slice.
+    Cors(Arc<CorsConfig>),
 }
 
 /// Per-rule timeout configuration.
@@ -1075,5 +1199,110 @@ mod tests {
     fn upstream_default_protocol_is_http1() {
         let u = BackendGroup::new("ns/svc".to_string(), vec![]);
         assert_eq!(u.protocol(), BackendProtocol::Http1);
+    }
+
+    // ── CorsOrigin::matches ───────────────────────────────────────────────────────
+
+    #[test]
+    fn cors_origin_exact_matches_case_insensitively() {
+        let o = CorsOrigin::Exact("https://example.com".to_string());
+        assert!(o.matches("https://example.com"));
+        assert!(o.matches("https://EXAMPLE.COM"));
+        assert!(o.matches("HTTPS://Example.Com"));
+    }
+
+    #[test]
+    fn cors_origin_exact_rejects_different_origin() {
+        let o = CorsOrigin::Exact("https://example.com".to_string());
+        assert!(!o.matches("https://other.com"));
+        assert!(!o.matches("http://example.com")); // different scheme
+        assert!(!o.matches("https://example.com:8080")); // port mismatch
+    }
+
+    #[test]
+    fn cors_origin_wildcard_matches_subdomain() {
+        let o = CorsOrigin::Wildcard {
+            prefix: "https://".into(),
+            suffix: ".example.com".into(),
+        };
+        assert!(o.matches("https://foo.example.com"));
+        assert!(o.matches("https://BAR.example.com")); // case-insensitive
+    }
+
+    #[test]
+    fn cors_origin_wildcard_rejects_wrong_scheme_or_suffix() {
+        let o = CorsOrigin::Wildcard {
+            prefix: "https://".into(),
+            suffix: ".example.com".into(),
+        };
+        assert!(!o.matches("http://foo.example.com")); // wrong scheme
+        assert!(!o.matches("https://foo.other.com")); // wrong suffix
+        assert!(!o.matches("https://example.com")); // no subdomain — doesn't end with .example.com after the prefix
+    }
+
+    // ── CorsConfig::resolve_origin ────────────────────────────────────────────────
+
+    fn cors_config_exact(origin: &str) -> CorsConfig {
+        CorsConfig {
+            allow_origins: vec![CorsOrigin::Exact(origin.to_ascii_lowercase())],
+            allow_all_origins: false,
+            allow_credentials: false,
+            allow_methods: None,
+            allow_headers: None,
+            expose_headers: None,
+            max_age: HeaderValue::from_static("5"),
+        }
+    }
+
+    #[test]
+    fn resolve_origin_returns_echoed_origin_on_match() {
+        let cfg = cors_config_exact("https://allowed.example");
+        let hv = cfg
+            .resolve_origin("https://allowed.example")
+            .expect("should match");
+        assert_eq!(hv, "https://allowed.example");
+    }
+
+    #[test]
+    fn resolve_origin_returns_none_when_no_match() {
+        let cfg = cors_config_exact("https://allowed.example");
+        assert!(cfg.resolve_origin("https://evil.example").is_none());
+    }
+
+    #[test]
+    fn resolve_origin_allow_all_origins_matches_any() {
+        let cfg = CorsConfig {
+            allow_origins: vec![],
+            allow_all_origins: true,
+            allow_credentials: false,
+            allow_methods: None,
+            allow_headers: None,
+            expose_headers: None,
+            max_age: HeaderValue::from_static("5"),
+        };
+        let hv = cfg
+            .resolve_origin("https://any.random.example")
+            .expect("should match");
+        assert_eq!(hv, "https://any.random.example");
+    }
+
+    #[test]
+    fn resolve_origin_echoes_concrete_origin_not_wildcard() {
+        // Even when allow_all_origins is set the concrete origin is echoed,
+        // satisfying the credentials-mode requirement without a special-case branch.
+        let cfg = CorsConfig {
+            allow_origins: vec![],
+            allow_all_origins: true,
+            allow_credentials: true,
+            allow_methods: None,
+            allow_headers: None,
+            expose_headers: None,
+            max_age: HeaderValue::from_static("5"),
+        };
+        let hv = cfg
+            .resolve_origin("https://specific.example.com")
+            .expect("should match");
+        assert_eq!(hv, "https://specific.example.com");
+        assert_ne!(hv, "*");
     }
 }

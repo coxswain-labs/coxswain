@@ -21,9 +21,9 @@ use coxswain_discovery::{
     SpiffeMatcher, Supervisor, serve_discovery_with_tls,
 };
 use coxswain_proxy::{
-    GatewayProxy, IngressProxy, KubernetesSource, ListenerProtocol, ListenerSpec, ProxyAcceptor,
-    RateLimiterRegistry, RoutingEngine, RoutingSource, SharedProxyConfig, SniCertSelector,
-    TrustedSources, UpstreamCaCache,
+    GatewayProxy, IngressProxy, ListenerProtocol, ListenerSpec, ProxyAcceptor, RateLimiterRegistry,
+    RoutingEngine, RoutingSource, SharedProxyConfig, SniCertSelector, TrustedSources,
+    UpstreamCaCache,
 };
 use coxswain_reflector::{GatewayListenerHealth, ListenerTlsOutcome};
 use pingora_core::apps::HttpServerOptions;
@@ -43,8 +43,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::args::{
     AccessLogPathMode as BinAccessLogPathMode, CaModeArg, Cli, Commands, CommonArgs,
-    ControllerArgs, ControllerRoleArgs, DevRoleArgs, LogFormat, ProxyArgs, ProxyRoleArgs,
-    ProxyScope, Role,
+    ControllerArgs, ControllerRoleArgs, LogFormat, ProxyArgs, ProxyRoleArgs, ProxyScope, Role,
 };
 use coxswain_cache::ResponseCache;
 use coxswain_proxy::AccessLogPathMode;
@@ -72,13 +71,11 @@ pub fn run() -> Result<()> {
 
     let role = serve.role.ok_or_else(|| {
         anyhow::anyhow!(
-            "missing role: pick one of `controller`, `proxy --shared`, `proxy --dedicated`, \
-             or `dev` (hidden, for local development)"
+            "missing role: pick one of `controller`, `proxy --shared`, or `proxy --dedicated`"
         )
     })?;
 
     match role {
-        Role::Dev(dev_args) => run_dev(dev_args),
         Role::Controller(controller_args) => run_controller(controller_args),
         Role::Proxy(proxy_args) => match proxy_args.scope() {
             ProxyScope::Shared => run_proxy_shared(proxy_args),
@@ -317,9 +314,6 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
             leader,
             ingress_routes: client.ingress_routes(),
             gateway_routes: client.gateway_routes(),
-            aggregator: None,
-            events: None,
-            serve_ui: false,
             cache,
         },
     );
@@ -397,9 +391,6 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
             leader,
             ingress_routes: client.ingress_routes(),
             gateway_routes: client.gateway_routes(),
-            aggregator: None,
-            events: None,
-            serve_ui: false,
             cache,
         },
     );
@@ -1155,140 +1146,6 @@ fn derive_gateway_specs(
     specs
 }
 
-// ── Dev role ──────────────────────────────────────────────────────────────────
-
-/// Wire and run the hidden `dev` pod role: single-process all-in-one for local
-/// development.
-fn run_dev(args: DevRoleArgs) -> Result<()> {
-    init_logger(args.common.log_format, &args.common.log_filter)?;
-
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        role = "dev",
-        controller_name = %args.common.controller_name,
-        "Starting"
-    );
-
-    let controller_config = build_controller_config(&args.common, &args.controller)?;
-    let mut server = build_server(&args.proxy);
-
-    let health = HealthRegistry::new();
-    let status_writer = spawn_status_writer(
-        StatusWriterConfig {
-            controller: controller_config,
-            watch_namespace: args.common.watch_namespace.clone(),
-            controller_name: args.common.controller_name.clone(),
-            ingress_default_backend: args.proxy.ingress_default_backend.clone(),
-            ingress_ports: IngressPorts::new(
-                args.common.ingress_http_port,
-                args.common.ingress_https_port,
-            ),
-        },
-        health.clone(),
-    )?;
-
-    let source = KubernetesSource::new(
-        status_writer.outputs.ingress_routes.clone(),
-        status_writer.outputs.gateway_routes.clone(),
-        status_writer.outputs.tls.clone(),
-        status_writer.outputs.client_certs.clone(),
-        status_writer.outputs.listener_hostnames.clone(),
-    );
-    let tls_health = status_writer.outputs.tls_health.clone();
-    // Operator's reconcile-all retrigger consumes both health channels — see
-    // the `run_controller` arm for the shared rationale (#211).
-    let route_health = status_writer.reconciler.route_health();
-    // Capture fleet before the reconciler is moved into its background service.
-    let fleet = status_writer.reconciler.fleet();
-
-    // Event sources for /api/v1/events (#250); capture before the originals are
-    // moved into the operator and aggregator below.
-    let events = EventSources::new(
-        route_health.subscribe(),
-        fleet.clone(),
-        status_writer.outputs.cluster_summary.clone(),
-        args.common.pod_name.clone(),
-    );
-
-    server.add_service(background_service("controller", status_writer.controller));
-    server.add_service(background_service("reconciler", status_writer.reconciler));
-
-    server.add_service(background_service(
-        "operator",
-        Operator::new(OperatorConfig {
-            controller_name: args.common.controller_name.clone(),
-            controller_image: resolve_controller_image(),
-            leader: Arc::clone(&status_writer.leader),
-            tls_health: tls_health.clone(),
-            route_health,
-            ingress_ports: IngressPorts::new(
-                args.common.ingress_http_port,
-                args.common.ingress_https_port,
-            ),
-            admin_port: args.common.admin_port,
-            // mTLS Stream listener (#423): the dedicated proxy connects over
-            // https for routing snapshots and bootstraps its SVID over the
-            // server-auth bootstrap listener — the same wiring the shared proxy
-            // gets from the Helm chart, rendered here into the dedicated-proxy
-            // Deployment by the operator.
-            discovery_endpoint: format!(
-                "https://coxswain-controller-discovery.{}.svc:{}",
-                args.common.pod_namespace, args.controller.discovery_port
-            ),
-            discovery_bootstrap_endpoint: format!(
-                "https://coxswain-controller-discovery.{}.svc:{}",
-                args.common.pod_namespace, args.controller.discovery_bootstrap_port
-            ),
-            discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token".to_string(),
-            discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt".to_string(),
-            discovery_trust_domain: args.controller.discovery_trust_domain.clone(),
-            controller_namespace: args.common.pod_namespace.clone(),
-        }),
-    ));
-
-    let cache = build_response_cache(&args.proxy);
-    wire_proxy_services(
-        &mut server,
-        &args.common,
-        &args.proxy,
-        &source,
-        &tls_health,
-        cache,
-    )?;
-
-    let dev_aggregator =
-        OperatorAggregator::new(fleet, status_writer.outputs.cluster_summary, None);
-
-    wire_management_servers(
-        &mut server,
-        &args.common,
-        ManagementServerConfig {
-            health,
-            leader: status_writer.leader,
-            ingress_routes: source.ingress_routes(),
-            gateway_routes: source.gateway_routes(),
-            aggregator: Some(dev_aggregator),
-            events: Some(events),
-            serve_ui: true,
-            cache,
-        },
-    );
-
-    tracing::info!(
-        proxy_bind_address = %args.proxy.proxy_bind_address,
-        ingress_http_port = ?args.common.ingress_http_port,
-        ingress_https_port = ?args.common.ingress_https_port,
-        management_bind_address = %args.common.management_bind_address,
-        health_port = args.common.health_port,
-        admin_port = args.common.admin_port,
-        proxy_shutdown_grace_period = ?args.proxy.proxy_shutdown_grace_period,
-        proxy_shutdown_timeout = ?args.proxy.proxy_shutdown_timeout,
-        proxy_listener_drain_timeout = ?args.proxy.proxy_listener_drain_timeout,
-        "Listening"
-    );
-    server.run_forever();
-}
-
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 fn build_controller_config(
@@ -1337,15 +1194,6 @@ struct ManagementServerConfig {
     leader: Arc<AtomicBool>,
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
-    /// `Some` on the dev role (enables the aggregator REST surface on the
-    /// single-process dev binary). Controller wires the aggregator inline.
-    aggregator: Option<OperatorAggregator>,
-    /// `Some` on the dev role (enables the `/api/v1/events` SSE stream).
-    /// Controller wires events inline; proxy roles leave it `None`.
-    events: Option<EventSources>,
-    /// `true` on the dev role (serves the embedded operator UI at `GET /`).
-    /// Controller wires `.with_ui()` inline; proxy roles leave this `false`.
-    serve_ui: bool,
     /// Shared response cache for the `DELETE /cache/{host}/{path}` purge
     /// endpoint, or `None` when caching is disabled. Must be the *same* handle
     /// the data-plane proxies were built with so a purge hits the live cache.
@@ -1370,18 +1218,9 @@ fn wire_management_servers(
     });
 
     let admin_addr = SocketAddr::new(common.management_bind_address, common.admin_port);
-    let mut admin = AdminServer::new(config.health, config.leader)
+    let admin = AdminServer::new(config.health, config.leader)
         .with_routes(config.ingress_routes, config.gateway_routes)
         .with_cache(config.cache);
-    if let Some(ag) = config.aggregator {
-        admin = admin.with_aggregator(ag);
-    }
-    if let Some(ev) = config.events {
-        admin = admin.with_events(ev);
-    }
-    if config.serve_ui {
-        admin = admin.with_ui();
-    }
     server.add_service(admin.into_service(admin_addr));
 }
 

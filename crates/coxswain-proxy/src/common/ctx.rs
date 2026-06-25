@@ -251,6 +251,16 @@ pub struct ProxyCtx {
     /// in the [`crate::circuit_breaker::CircuitBreakerRegistry`] — no upstream request
     /// was ever attempted, so there is no success/failure to record.
     pub circuit_breaker_rejected: bool,
+    /// `Origin` request header value (GEP-1767 CORS, #41).
+    ///
+    /// Captured once in `request_filter` from the raw request header; stored as a
+    /// heap-allocated string so the borrow of the request header is released before
+    /// the session is mutated.  `None` when the request carries no `Origin` header
+    /// (the common non-CORS case) — no allocation in that path.
+    ///
+    /// Consumed in `upstream_response_filter` to inject `Access-Control-Allow-Origin`
+    /// and in `try_cors_preflight` for the preflight short-circuit.
+    pub cors_origin: Option<Box<str>>,
 }
 
 // Hot types — review with the team before bumping these numbers.
@@ -288,4 +298,5 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 192);
 // ProxyCtx: -8 for MirrorDispatch.path_and_query String→Arc<str> (16 not 24; #397) (608→600).
 // ProxyCtx: +8 because embedded ResolvedRoute grew for circuit_breaker field (#282) (600→608).
 // ProxyCtx: +0 for circuit_breaker_rejected: bool absorbed into existing alignment padding (#282).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 608);
+// ProxyCtx: +16 for cors_origin: Option<Box<str>> (fat pointer via niche; GEP-1767 CORS #41) (608→624).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 624);

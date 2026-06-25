@@ -138,3 +138,8 @@ pub const GRPC_ROUTE_STATUS: &str = fixture!("grpc_route_status.yaml");
 /// `RateLimit` CR with `requestsPerSecond` omitted — rejected by the
 /// coxswain-owned CRD schema (`requestsPerSecond` is a required field).
 pub const REJECT_RATELIMIT_MISSING_RPS: &str = fixture!("reject_ratelimit_missing_rps.yaml");
+
+/// HTTPRoute with a CORS filter (GEP-1767): `https://allowed.example` is
+/// the sole allowed origin; GET and POST are the allowed methods.
+/// Hostnamed `cors.${TESTNS}.local`.
+pub const CORS: &str = fixture!("cors.yaml");

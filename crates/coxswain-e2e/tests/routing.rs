@@ -1986,3 +1986,168 @@ async fn grpc_route_unmatched_method_is_not_served() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ── CORS filter — GEP-1767 (#41) ─────────────────────────────────────────────
+
+/// Preflight `OPTIONS` from an allowed origin returns 204 with
+/// `Access-Control-Allow-Origin` echoing the concrete request origin and
+/// `Access-Control-Allow-Methods` listing the configured methods. The backend
+/// is never contacted (no echo body in the response).
+#[tokio::test]
+async fn cors_preflight_returns_204_with_allow_headers() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-cors-preflight").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::CORS, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("cors.{}.local", ns.name);
+    wait::wait_for_route(
+        &h.gateway_http,
+        &host,
+        "/cors/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let url = format!(
+        "http://{}:{}/cors/preflight",
+        h.gateway_http.proxy_addr.ip(),
+        h.gateway_http.proxy_addr.port()
+    );
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .request(Method::OPTIONS, &url)
+        .header("Host", &host)
+        .header("Origin", "https://allowed.example")
+        .header("Access-Control-Request-Method", "POST")
+        .send()
+        .await?;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        204,
+        "CORS preflight from allowed origin must return 204"
+    );
+    let acao = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        acao, "https://allowed.example",
+        "CORS preflight: Access-Control-Allow-Origin must echo the request origin, got {acao:?}"
+    );
+    let acam = resp
+        .headers()
+        .get("access-control-allow-methods")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        acam.contains("POST"),
+        "CORS preflight: Access-Control-Allow-Methods must include POST, got {acam:?}"
+    );
+
+    Ok(())
+}
+
+/// A preflight `OPTIONS` from an origin not in the allow-list: the proxy must
+/// NOT return any `Access-Control-Allow-Origin` header (the browser then blocks
+/// the cross-origin request).
+#[tokio::test]
+async fn cors_disallowed_origin_omits_allow_origin_header() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-cors-sad").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::CORS, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("cors.{}.local", ns.name);
+    wait::wait_for_route(
+        &h.gateway_http,
+        &host,
+        "/cors/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let url = format!(
+        "http://{}:{}/cors/actual",
+        h.gateway_http.proxy_addr.ip(),
+        h.gateway_http.proxy_addr.port()
+    );
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .get(&url)
+        .header("Host", &host)
+        .header("Origin", "https://evil.example")
+        .send()
+        .await?;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "CORS: disallowed origin must not block the request itself"
+    );
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "CORS: response for a disallowed origin must carry no Access-Control-Allow-Origin header"
+    );
+
+    Ok(())
+}
+
+/// An actual (non-preflight) GET from an allowed origin: the proxy must forward
+/// the request to the backend AND inject `Access-Control-Allow-Origin` echoing
+/// the request origin into the response.
+#[tokio::test]
+async fn cors_actual_request_injects_allow_origin_header() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-cors-actual").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::CORS, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("cors.{}.local", ns.name);
+    wait::wait_for_route(
+        &h.gateway_http,
+        &host,
+        "/cors/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let (status, resp_headers, body) = h
+        .gateway_http
+        .get_full_with_headers(
+            &host,
+            "/cors/actual",
+            &[("Origin", "https://allowed.example")],
+        )
+        .await?;
+
+    assert_eq!(
+        status, 200,
+        "CORS actual request from allowed origin must reach the backend (200)"
+    );
+    assert!(
+        body.is_some(),
+        "CORS actual request: expected echo response body from backend"
+    );
+    let acao = resp_headers
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        acao, "https://allowed.example",
+        "CORS actual request: Access-Control-Allow-Origin must echo the request origin, got {acao:?}"
+    );
+
+    Ok(())
+}

@@ -1,11 +1,11 @@
 //! Shared-proxy reconciler: cluster-wide watches feeding the shared-pool data
-//! plane (`serve proxy --shared` and `serve dev`).
+//! plane (`serve proxy --shared`).
 //!
 //! Owns the debounced watch + rebuild pipeline that turns reflector snapshots
 //! into the full set of outputs the shared pool needs: Ingress + Gateway
 //! routing tables, the TLS cert store, the per-listener health map (consumed
 //! by `HotReloader`), the per-route and per-policy health maps (consumed by
-//! the controller's status writer in `dev` mode), and the cluster summary.
+//! the controller's status writer), and the cluster summary.
 //!
 //! Sibling reconcilers in this module narrow the scope:
 //!

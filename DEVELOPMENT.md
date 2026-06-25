@@ -7,10 +7,12 @@ cargo build                                    # build
 cargo test --workspace --exclude coxswain-e2e  # unit tests (no cluster)
 cargo clippy -- -D warnings                    # lint
 cargo fmt                                      # format
-cargo run --bin coxswain -- serve dev --log-format console  # run locally (all-in-one)
+cargo run --bin coxswain -- serve controller --log-format console  # terminal 1
+cargo run --bin coxswain -- serve proxy --shared --log-format console \
+  --ingress-http-port 80 --ingress-https-port 443              # terminal 2
 ```
 
-The `dev` role runs both the status writer and the proxy data plane in one process — convenient for local development. In production Coxswain ships as two cooperating pods: `serve controller` (writer) and `serve proxy --shared` (read-only data plane). The Helm chart and `deploy/manifests/` render both Deployments by default.
+Coxswain ships as two cooperating pods: `serve controller` (writer + operator UI) and `serve proxy --shared` (read-only data plane). Run them in separate terminals against the same cluster.
 
 For the release procedure, see `RELEASE.md`. For contributing conventions (docs site, etc.), see `CONTRIBUTING.md`.
 
@@ -63,25 +65,18 @@ kubectl -n coxswain-system scale deployment/coxswain-shared-proxy --replicas=0
 
 ### 3. Run the binary
 
-```bash
-cargo run --bin coxswain -- serve dev \
-  --log-format console \
-  --ingress-http-port 80 \
-  --ingress-https-port 443
-```
-
-`serve dev` is the hidden all-in-one role for local development: same process as production but wiring both the status writer and the proxy data plane. `--log-format console` produces human-readable output instead of JSON. `--ingress-http-port` and `--ingress-https-port` are required to bind proxy listeners; omitting both starts no listeners.
-
-To exercise the production split locally, run two terminals:
+Run the two roles in separate terminals:
 
 ```bash
-# Terminal 1 — controller (writer)
+# Terminal 1 — controller (status writer + operator UI)
 cargo run --bin coxswain -- serve controller --log-format console
 
 # Terminal 2 — shared-proxy (read-only data plane)
 cargo run --bin coxswain -- serve proxy --shared --log-format console \
   --ingress-http-port 80 --ingress-https-port 443
 ```
+
+`--log-format console` produces human-readable output instead of JSON. `--ingress-http-port` and `--ingress-https-port` are required on the proxy to bind listeners; omitting both starts no listeners.
 
 To run a dedicated-mode proxy (per-Gateway data plane) locally, see [docs/src/guides/dedicated-mode.md](docs/src/guides/dedicated-mode.md).
 
@@ -105,7 +100,7 @@ curl -s http://localhost:8081/readyz       # ok (after every subsystem check is 
 
 # Admin diagnostics
 curl -s http://localhost:8082/api/v1/health  # {"version":"...","kubernetes_version":"...","leader":...,"subsystems":{...}}
-curl -s http://localhost:8082/api/v1/routes  # {"ingress":{"hosts":[]},"gateway":{"hosts":[]}} (proxy/dev only)
+curl -s http://localhost:8082/api/v1/routes  # {"ingress":{"hosts":[]},"gateway":{"hosts":[]}} (proxy role only)
 curl -s http://localhost:8082/metrics        # Prometheus text
 
 # Kubernetes
@@ -177,7 +172,7 @@ curl -s http://localhost:8082/api/v1/routes | jq .    # lists all active hostnam
 
 ## Operator UI
 
-The operator web UI lives in `ui/` (Vite + Preact, built to a single self-contained `dist/index.html`). That file is embedded into `coxswain-admin` via `include_str!` and served at `GET /` on the **controller admin port** (controller and `dev` roles only — proxy pods return 404). `dist/` is gitignored: the Docker `ui-builder` stage rebuilds it, so it is never committed.
+The operator web UI lives in `ui/` (Vite + Preact, built to a single self-contained `dist/index.html`). That file is embedded into `coxswain-admin` via `include_str!` and served at `GET /` on the **controller admin port** (controller role only — proxy pods return 404). `dist/` is gitignored: the Docker `ui-builder` stage rebuilds it, so it is never committed.
 
 ### Fast iteration (no cluster)
 
@@ -195,7 +190,7 @@ The dev server uses Vite; the binary serves the *embedded* build, which only cha
 
 ```bash
 cd ui && npm run build      # regenerates dist/index.html
-# then restart `serve controller` / `serve dev`
+# then restart `serve controller`
 ```
 
 ### Testing against a cluster

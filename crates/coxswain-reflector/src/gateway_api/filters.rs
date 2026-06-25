@@ -2,13 +2,13 @@
 
 use crate::gw_types::v::httproutes::{
     HttpRouteRulesBackendRefsFilters, HttpRouteRulesBackendRefsFiltersType, HttpRouteRulesFilters,
-    HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
-    HttpRouteRulesMatchesQueryParamsType,
+    HttpRouteRulesFiltersCors, HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType,
+    HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesQueryParamsType,
 };
 use coxswain_core::crd::RateLimit;
 use coxswain_core::routing::{
-    FilterAction, HeaderMod, HeaderPredicate, MatchPredicates, PathModifier, QueryPredicate,
-    RateLimitConfig, RateLimitKey, ValueMatch,
+    CorsConfig, CorsOrigin, FilterAction, HeaderMod, HeaderPredicate, MatchPredicates,
+    PathModifier, QueryPredicate, RateLimitConfig, RateLimitKey, ValueMatch,
 };
 use http::{HeaderName, Method};
 use kube::runtime::reflector;
@@ -180,7 +180,16 @@ pub(super) fn build_filters(
                     );
                 }
             }
-            HttpRouteRulesFiltersType::RequestMirror | HttpRouteRulesFiltersType::Cors => {
+            HttpRouteRulesFiltersType::Cors => {
+                let Some(cors) = &f.cors else {
+                    tracing::warn!("Skipping CORS filter — cors payload is missing");
+                    continue;
+                };
+                if let Some(cfg) = build_cors_config(cors) {
+                    out.push(FilterAction::Cors(Arc::new(cfg)));
+                }
+            }
+            HttpRouteRulesFiltersType::RequestMirror => {
                 tracing::warn!(
                     filter_type = ?f.r#type,
                     "Skipping unsupported HTTPRouteFilter type"
@@ -245,6 +254,75 @@ fn parse_url_rewrite_path(
             })
         }
     }
+}
+
+/// Translates an `HTTPRoute` CORS filter payload into a [`CorsConfig`].
+///
+/// Returns `None` only when there is nothing meaningful to apply (e.g. both
+/// `allowOrigins` and the wildcard flag are absent).  Individual sub-fields with
+/// invalid header bytes are skipped with a WARN log rather than aborting the whole
+/// filter — a partial CORS policy is still useful.
+fn build_cors_config(cors: &HttpRouteRulesFiltersCors) -> Option<CorsConfig> {
+    use http::HeaderValue;
+
+    let origins_raw = cors.allow_origins.as_deref().unwrap_or(&[]);
+    let mut allow_origins: Vec<CorsOrigin> = Vec::with_capacity(origins_raw.len());
+    let mut allow_all_origins = false;
+
+    for origin in origins_raw {
+        if origin == "*" {
+            allow_all_origins = true;
+        } else if let Some(star_pos) = origin.find('*') {
+            let prefix = origin[..star_pos].to_ascii_lowercase().into_boxed_str();
+            let suffix = origin[star_pos + 1..].to_ascii_lowercase().into_boxed_str();
+            allow_origins.push(CorsOrigin::Wildcard { prefix, suffix });
+        } else {
+            allow_origins.push(CorsOrigin::Exact(origin.to_ascii_lowercase()));
+        }
+    }
+
+    if !allow_all_origins && allow_origins.is_empty() {
+        tracing::warn!("CORS filter has no allowOrigins entries — filter skipped");
+        return None;
+    }
+
+    let join_header = |items: &[String], field: &'static str| -> Option<HeaderValue> {
+        if items.is_empty() {
+            return None;
+        }
+        let joined = items.join(", ");
+        HeaderValue::from_str(&joined)
+            .map_err(|e| {
+                tracing::warn!(field, error = %e, "CORS filter sub-field has invalid header bytes — skipping");
+            })
+            .ok()
+    };
+
+    let allow_methods = cors
+        .allow_methods
+        .as_deref()
+        .and_then(|v| join_header(v, "allowMethods"));
+    let allow_headers = cors
+        .allow_headers
+        .as_deref()
+        .and_then(|v| join_header(v, "allowHeaders"));
+    let expose_headers = cors
+        .expose_headers
+        .as_deref()
+        .and_then(|v| join_header(v, "exposeHeaders"));
+
+    let max_age_secs = cors.max_age.unwrap_or(5);
+    let max_age = HeaderValue::from(max_age_secs);
+
+    Some(CorsConfig::new(
+        allow_origins,
+        allow_all_origins,
+        cors.allow_credentials.unwrap_or(false),
+        allow_methods,
+        allow_headers,
+        expose_headers,
+        max_age,
+    ))
 }
 
 /// Builds `MatchPredicates` from a single `HttpRouteRulesMatches` entry.
@@ -479,9 +557,9 @@ mod tests {
     // ── Filter tests ────────────────────────────────────────────────────────────
 
     use crate::gw_types::v::httproutes::{
-        HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
-        HttpRouteRulesFiltersRequestHeaderModifierSet, HttpRouteRulesFiltersRequestRedirect,
-        HttpRouteRulesFiltersResponseHeaderModifier,
+        HttpRouteRulesFilters, HttpRouteRulesFiltersCors,
+        HttpRouteRulesFiltersRequestHeaderModifier, HttpRouteRulesFiltersRequestHeaderModifierSet,
+        HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersResponseHeaderModifier,
         HttpRouteRulesFiltersResponseHeaderModifierAdd, HttpRouteRulesFiltersType,
         HttpRouteRulesFiltersUrlRewrite, HttpRouteRulesFiltersUrlRewritePath,
         HttpRouteRulesFiltersUrlRewritePathType,
@@ -736,6 +814,82 @@ mod tests {
                 assert_eq!(replacement, "/v3");
             }
             _ => panic!("expected UrlRewrite with ReplacePrefixMatch"),
+        }
+    }
+
+    #[test]
+    fn reconcile_cors_filter_stored() {
+        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let route = make_route_with_filters(
+            "default",
+            "example.com",
+            "/",
+            HttpRouteRulesMatchesPathType::PathPrefix,
+            "svc",
+            vec![HttpRouteRulesFilters {
+                r#type: HttpRouteRulesFiltersType::Cors,
+                cors: Some(HttpRouteRulesFiltersCors {
+                    allow_origins: Some(vec![
+                        "https://allowed.example".to_string(),
+                        "https://*.trusted.example".to_string(),
+                    ]),
+                    allow_methods: Some(vec!["GET".to_string(), "POST".to_string()]),
+                    allow_headers: Some(vec!["Content-Type".to_string()]),
+                    expose_headers: Some(vec!["X-Custom-Header".to_string()]),
+                    allow_credentials: Some(true),
+                    max_age: Some(3600),
+                }),
+                ..Default::default()
+            }],
+        );
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            &route,
+            &store,
+            &empty_svc_store(),
+            &default_owned(),
+            &HashSet::new(),
+            crate::gateway_api::RouteResolution {
+                listener_info: &no_listener_info(),
+                policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
+            },
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let filter_list = find_filters(&table, "example.com", "/");
+        assert_eq!(filter_list.len(), 1, "expected exactly one CORS filter");
+        match &filter_list[0] {
+            FilterAction::Cors(cfg) => {
+                // Origins: exact + wildcard, case-folded
+                assert_eq!(cfg.allow_origins.len(), 2);
+                assert!(
+                    cfg.allow_origins[0].matches("https://allowed.example"),
+                    "exact origin should match"
+                );
+                assert!(
+                    cfg.allow_origins[1].matches("https://foo.trusted.example"),
+                    "wildcard origin should match subdomain"
+                );
+                assert!(!cfg.allow_all_origins);
+                assert!(cfg.allow_credentials);
+                // Pre-joined header values
+                assert_eq!(
+                    cfg.allow_methods.as_ref().expect("allow_methods set"),
+                    "GET, POST"
+                );
+                assert_eq!(
+                    cfg.allow_headers.as_ref().expect("allow_headers set"),
+                    "Content-Type"
+                );
+                assert_eq!(
+                    cfg.expose_headers.as_ref().expect("expose_headers set"),
+                    "X-Custom-Header"
+                );
+                assert_eq!(cfg.max_age, "3600");
+            }
+            _ => panic!("expected FilterAction::Cors"),
         }
     }
 }

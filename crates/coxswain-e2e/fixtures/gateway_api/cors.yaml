@@ -1,0 +1,77 @@
+# HTTPRoute CORS filter fixture — GEP-1767.
+# TESTNS is substituted with the test namespace at runtime.
+#
+# Routes:
+#   PathPrefix /cors/preflight  → echo-a  (CORS: allowOrigins=[https://allowed.example], GET+POST)
+#   PathPrefix /cors/actual     → echo-a  (CORS: allowOrigins=[https://allowed.example], GET+POST)
+#   Exact      /cors/probe      → echo-a  (readiness probe, no filter)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cors-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "cors.${TESTNS}.local"
+  rules:
+    # Rule 1: preflight + actual requests with a concrete allowed origin.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /cors/preflight
+      filters:
+        - type: CORS
+          cors:
+            allowOrigins:
+              - "https://allowed.example"
+            allowMethods:
+              - GET
+              - POST
+            allowHeaders:
+              - Content-Type
+            maxAge: 600
+      backendRefs:
+        - name: echo-a
+          port: 3000
+
+    # Rule 2: actual-request CORS header injection.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /cors/actual
+      filters:
+        - type: CORS
+          cors:
+            allowOrigins:
+              - "https://allowed.example"
+            allowMethods:
+              - GET
+              - POST
+      backendRefs:
+        - name: echo-a
+          port: 3000
+
+    # Probe rule — used by wait_for_route to detect when the HTTPRoute is live.
+    - matches:
+        - path:
+            type: Exact
+            value: /cors/probe
+      backendRefs:
+        - name: echo-a
+          port: 3000

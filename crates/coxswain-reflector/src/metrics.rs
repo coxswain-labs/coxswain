@@ -32,17 +32,15 @@ const REBUILD_DURATION_BUCKETS: &[f64] = &[0.005, 0.025, 0.1, 0.5, 1.0, 2.5, 5.0
 /// Identifies which pod role is emitting the reflector's series.
 ///
 /// Selects the `coxswain_proxy_*` vs `coxswain_controller_*` series prefix at
-/// metric-handle construction time. A `serve dev` process holds two
-/// [`ReflectorMetrics`] instances (one per role) so both prefixes get emitted.
+/// metric-handle construction time.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MetricsPrefix {
-    /// Proxy pod (`serve proxy --shared`, `serve proxy --dedicated`, or the
-    /// proxy half of `serve dev`). Emits routing-table mirrors, TLS expiry,
-    /// and active-upstream gauges.
+    /// Proxy pod (`serve proxy --shared` or `serve proxy --dedicated`). Emits
+    /// routing-table mirrors, TLS expiry, and active-upstream gauges.
     Proxy,
-    /// Controller pod (`serve controller` or the controller half of
-    /// `serve dev`). Emits routing-table mirrors and watch counters.
+    /// Controller pod (`serve controller`). Emits routing-table mirrors and
+    /// watch counters.
     Controller,
 }
 
