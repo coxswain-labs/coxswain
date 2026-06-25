@@ -82,7 +82,7 @@ pub struct ResolvedRoute {
     /// Populated from [`RouteEntry::circuit_breaker`]; `Some` only for Ingress
     /// routes configured with `circuit-breaker-threshold`. The proxy consumes
     /// this in `upstream_peer` to gate the request through the per-endpoint
-    /// [`crate::circuit_breaker::CircuitBreakerRegistry`], and in `logging` to
+    /// [`crate::policy::circuit_breaker::CircuitBreakerRegistry`], and in `logging` to
     /// record the outcome.
     pub circuit_breaker: Option<Arc<CircuitBreakerConfig>>,
 }
@@ -181,7 +181,7 @@ pub struct ProxyCtx {
     pub affinity_set_cookie: bool,
     /// Headers from the ext_authz response to inject into the upstream request.
     ///
-    /// Populated by [`crate::auth::enforce`] when the auth service returns 2xx and
+    /// Populated by [`crate::policy::auth::enforce`] when the auth service returns 2xx and
     /// the route's `auth-response-headers` allow-list is non-empty.  Applied in
     /// `upstream_request_filter` after rule-level filters.  `None` (the common
     /// case) incurs no cost.
@@ -221,7 +221,7 @@ pub struct ProxyCtx {
     ///
     /// Set in `request_filter` when the matched Ingress has
     /// `auth-tls-pass-certificate-to-upstream: "true"` AND the connection's
-    /// `SslDigest` carries a verified [`crate::tls::ClientCertInfo`].
+    /// `SslDigest` carries a verified [`crate::edge::tls::ClientCertInfo`].
     /// Consumed (`.take()`d) in `upstream_request_filter` to inject the
     /// `X-SSL-Client-Cert` header (URL-encoded PEM).  `None` (the common case)
     /// incurs no cost.
@@ -253,7 +253,7 @@ pub struct ProxyCtx {
     pub hash_key: Option<u64>,
     /// `true` when `upstream_peer` returned 503 because the endpoint's circuit breaker
     /// was Open (fail-fast path, #282). When set, `logging` skips recording the outcome
-    /// in the [`crate::circuit_breaker::CircuitBreakerRegistry`] — no upstream request
+    /// in the [`crate::policy::circuit_breaker::CircuitBreakerRegistry`] — no upstream request
     /// was ever attempted, so there is no success/failure to record.
     pub circuit_breaker_rejected: bool,
     /// `Origin` request header value (GEP-1767 CORS, #41).

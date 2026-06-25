@@ -4,9 +4,9 @@
 //! `coxswain-bin`) and stored on the proxy instances. They are intentionally
 //! independent of the bin crate so the proxy crate remains self-contained.
 
-use crate::circuit_breaker::CircuitBreakerRegistry;
-use crate::rate_limit::RateLimiterRegistry;
-use crate::upstream_ca::UpstreamCaCache;
+use crate::edge::upstream_ca::UpstreamCaCache;
+use crate::policy::circuit_breaker::CircuitBreakerRegistry;
+use crate::policy::rate_limit::RateLimiterRegistry;
 use coxswain_cache::ResponseCache;
 use coxswain_core::routing::RouteTimeouts;
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames};

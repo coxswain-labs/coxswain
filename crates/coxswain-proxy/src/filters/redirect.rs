@@ -1,8 +1,12 @@
-//! Builds `Location` header values for `RequestRedirect` filters.
+//! `RequestRedirect` filter handling: the preflight short-circuit
+//! ([`try_redirect`]) that writes a 3xx without contacting the upstream, plus
+//! the [`Location`][build_redirect_location] URL construction it relies on.
 
-use coxswain_core::routing::PathModifier;
+use coxswain_core::routing::{FilterAction, PathModifier};
 use http::header;
-use pingora_http::RequestHeader;
+use pingora_core::Result;
+use pingora_http::{RequestHeader, ResponseHeader};
+use pingora_proxy::Session;
 
 /// Extract the bare hostname from a request (strips port suffix, prefers URI host over Host header).
 ///
@@ -75,4 +79,53 @@ pub(crate) fn build_redirect_location(
     } else {
         format!("{eff_scheme}://{}:{eff_port}{path_and_query}", eff_host)
     }
+}
+
+/// If `filters` contains a `RequestRedirect`, build the `Location` header,
+/// write the 3xx response, and return `true`. Returns `false` otherwise.
+///
+/// # Errors
+/// Propagates Pingora I/O errors from response-header construction.
+pub(crate) async fn try_redirect(
+    session: &mut Session,
+    filters: &[FilterAction],
+    proto: &str,
+    host: &str,
+    incoming_port: u16,
+    path: &str,
+    query: Option<&str>,
+) -> Result<bool> {
+    for f in filters {
+        if let FilterAction::RequestRedirect {
+            scheme,
+            hostname,
+            port,
+            status_code,
+            path: path_mod,
+        } = f
+        {
+            let origin = RedirectOrigin {
+                scheme: proto,
+                host,
+                port: incoming_port,
+                path,
+                query,
+            };
+            let location = build_redirect_location(
+                scheme.as_deref(),
+                hostname.as_deref(),
+                *port,
+                path_mod.as_ref(),
+                &origin,
+            );
+            let mut resp = ResponseHeader::build(*status_code, Some(2))?;
+            resp.insert_header(header::LOCATION, location)?;
+            session
+                .write_response_header(Box::new(resp), true)
+                .await
+                .unwrap_or_else(|e| tracing::error!("failed to write redirect response: {e}"));
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
