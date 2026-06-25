@@ -17,7 +17,7 @@
 
 use coxswain_e2e::{
     ControllerOptions, ControllerProcess, FixtureVars, GeneratedCert, Harness, NamespaceGuard,
-    bootstrap,
+    StaticRsaCert, bootstrap,
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::{http, wait},
 };
@@ -1859,6 +1859,122 @@ async fn gateway_https_coalescing_returns_421_for_cross_listener_host() -> anyho
         status, 200,
         "SNI={wild_a:?} Host={wild_b:?}: expected 200 (same *.mdr listener; coalescing is safe)"
     );
+
+    Ok(())
+}
+
+/// GEP-851 dual-certificate listener — happy path:
+/// - Gateway listener declares two `certificateRefs` (an ECDSA cert + a static RSA cert).
+/// - Controller resolves both Secrets → listener `ResolvedRefs=True`.
+/// - HTTPS routing succeeds; the proxy serves the ECDSA cert because
+///   `TlsStoreBuilder::build()` sorts ECDSA ahead of RSA.
+#[tokio::test]
+async fn https_listener_serves_ecdsa_cert_when_dual_cert_configured() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-dual-cert-happy").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("dual.{}.local", ns.name);
+    let ecdsa_cert = GeneratedCert::for_host(&host);
+
+    fixtures::apply_fixture(
+        gwa::TLS_DUAL_CERT,
+        FixtureVars::new(&ns.name)
+            .with("HOSTNAME", &host)
+            .with("ECDSA_SECRET", "cert-ecdsa")
+            .with("RSA_SECRET", "cert-rsa")
+            .with("ECDSA_CRT_B64", ecdsa_cert.cert_b64())
+            .with("ECDSA_KEY_B64", ecdsa_cert.key_b64())
+            .with("RSA_CRT_B64", StaticRsaCert::cert_b64())
+            .with("RSA_KEY_B64", StaticRsaCert::key_b64()),
+    )
+    .await?;
+
+    // Both cert refs resolve → ResolvedRefs=True.
+    wait::wait_for_gateway_listener_condition(
+        &h.client,
+        "coxswain-dual-cert-test",
+        &ns.name,
+        "https",
+        "ResolvedRefs",
+        "True",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    // HTTPS routing must work via the dual-cert listener.
+    let resp =
+        wait::wait_for_https_route(h.gateway_tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    // The proxy must serve the ECDSA cert (sorted first by TlsStoreBuilder::build()).
+    let served_der = http::https_peer_leaf_der(&host, "/", h.gateway_tls_addr).await?;
+    assert_eq!(
+        served_der,
+        ecdsa_cert.cert_der(),
+        "expected ECDSA cert to be served; TlsStoreBuilder sorts ECDSA ahead of RSA"
+    );
+
+    Ok(())
+}
+
+/// GEP-851 dual-certificate listener — partial-resolve sad path:
+/// - Gateway listener declares two `certificateRefs`: one valid ECDSA Secret and
+///   one that does not exist.
+/// - Controller resolves one ref and fails the other →
+///   listener `ResolvedRefs=False` (GEP-851: partial resolution must degrade, not succeed).
+/// - HTTPS routing still works via the valid cert (best-effort serve).
+#[tokio::test]
+async fn https_listener_degrades_when_one_certificate_ref_is_invalid() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-dual-cert-sad").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("dual-sad.{}.local", ns.name);
+    let ecdsa_cert = GeneratedCert::for_host(&host);
+
+    // Apply the dual-cert fixture but supply only the ECDSA Secret.
+    // The RSA Secret ("cert-rsa-missing") does not exist → partial resolution.
+    fixtures::apply_fixture(
+        gwa::TLS_DUAL_CERT,
+        FixtureVars::new(&ns.name)
+            .with("HOSTNAME", &host)
+            .with("ECDSA_SECRET", "cert-ecdsa-sad")
+            .with("RSA_SECRET", "cert-rsa-missing")
+            .with("ECDSA_CRT_B64", ecdsa_cert.cert_b64())
+            .with("ECDSA_KEY_B64", ecdsa_cert.key_b64())
+            // RSA Secret values are irrelevant — the Secret itself is omitted below.
+            .with("RSA_CRT_B64", StaticRsaCert::cert_b64())
+            .with("RSA_KEY_B64", StaticRsaCert::key_b64()),
+    )
+    .await?;
+
+    // The fixture creates both Secrets; delete the RSA one to simulate "missing".
+    let secrets_api: Api<Secret> = Api::namespaced(h.client.clone(), &ns.name);
+    secrets_api
+        .delete("cert-rsa-missing", &Default::default())
+        .await?;
+
+    // Partial resolution → ResolvedRefs=False on the listener.
+    wait::wait_for_gateway_listener_condition(
+        &h.client,
+        "coxswain-dual-cert-test",
+        &ns.name,
+        "https",
+        "ResolvedRefs",
+        "False",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    // The valid cert is still served → HTTPS routing must succeed (best-effort).
+    let resp =
+        wait::wait_for_https_route(h.gateway_tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
 
     Ok(())
 }

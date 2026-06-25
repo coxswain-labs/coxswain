@@ -155,33 +155,59 @@ impl TlsStore {
 
     /// Iterate over all exact-hostname → cert mappings, in unspecified order.
     ///
-    /// Returns the **first** (highest-priority) cert per pattern. Used by the
-    /// discovery wire layer to serialise the TLS store; the multi-cert wire
-    /// upgrade will add a separate iterator.
+    /// Returns the **first** (highest-priority) cert per pattern. Compat
+    /// wrapper; callers that need all certs per pattern should use
+    /// [`Self::iter_exact_all`].
     pub fn iter_exact(&self) -> impl Iterator<Item = (&str, &Arc<TlsCert>)> {
         self.exact
             .iter()
             .filter_map(|(h, certs)| certs.first().map(|c| (h.as_str(), c)))
     }
 
+    /// Iterate over all exact-hostname → **all certs** mappings, in unspecified order.
+    ///
+    /// Used by the multi-cert discovery wire serialiser.
+    pub fn iter_exact_all(&self) -> impl Iterator<Item = (&str, &[Arc<TlsCert>])> {
+        self.exact
+            .iter()
+            .map(|(h, certs)| (h.as_str(), certs.as_slice()))
+    }
+
     /// Iterate over all wildcard-suffix → cert mappings (suffix without the `*.`
     /// prefix), in longest-suffix-first order (the same precedence order as
     /// [`Self::find_certs`]).
     ///
-    /// Returns the **first** (highest-priority) cert per pattern. Used by the
-    /// discovery wire layer to serialise the TLS store; the multi-cert wire
-    /// upgrade will add a separate iterator.
+    /// Returns the **first** (highest-priority) cert per pattern. Compat
+    /// wrapper; callers that need all certs per pattern should use
+    /// [`Self::iter_wildcard_all`].
     pub fn iter_wildcard(&self) -> impl Iterator<Item = (&str, &Arc<TlsCert>)> {
         self.wildcard
             .iter()
             .filter_map(|(s, certs)| certs.first().map(|c| (s.as_str(), c)))
     }
 
+    /// Iterate over all wildcard-suffix → **all certs** mappings, in
+    /// longest-suffix-first order.
+    ///
+    /// Used by the multi-cert discovery wire serialiser.
+    pub fn iter_wildcard_all(&self) -> impl Iterator<Item = (&str, &[Arc<TlsCert>])> {
+        self.wildcard
+            .iter()
+            .map(|(s, certs)| (s.as_str(), certs.as_slice()))
+    }
+
     /// The highest-priority default (catch-all) certificate, if one is configured.
     ///
-    /// Used by the discovery wire layer to serialise the TLS store.
+    /// Compat wrapper; callers needing all default certs should use [`Self::default_certs`].
     pub fn default_cert(&self) -> Option<&Arc<TlsCert>> {
         self.default.first()
+    }
+
+    /// All default (catch-all) certificates, in sorted order.
+    ///
+    /// Used by the multi-cert discovery wire serialiser.
+    pub fn default_certs(&self) -> &[Arc<TlsCert>] {
+        self.default.as_slice()
     }
 
     /// `(sni_label, source, not_after)` triples for every cert with a parsed

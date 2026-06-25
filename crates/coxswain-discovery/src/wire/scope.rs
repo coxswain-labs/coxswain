@@ -103,6 +103,9 @@ pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerI
         p::ListenerTlsOutcome::Invalid => ListenerTlsOutcome::Invalid {
             message: dto.tls_message.clone(),
         },
+        p::ListenerTlsOutcome::ResolvedPartial => ListenerTlsOutcome::ResolvedPartial {
+            message: dto.tls_message.clone(),
+        },
     };
 
     let mut li = ListenerInfo::default();

@@ -55,5 +55,5 @@ pub mod harness;
 pub use fixtures::FixtureVars;
 pub use harness::{
     ControllerOptions, ControllerProcess, GeneratedCert, Harness, HttpClient, IngressClassGuard,
-    MtlsCerts, NamespaceGuard, bootstrap, bootstrap_cluster,
+    MtlsCerts, NamespaceGuard, StaticRsaCert, bootstrap, bootstrap_cluster,
 };

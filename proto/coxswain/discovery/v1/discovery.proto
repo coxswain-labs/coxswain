@@ -556,21 +556,31 @@ message CircuitBreakerConfig {
 
 // Mirrors TlsStore.  Sorted by host pattern ascending.
 message TlsStore {
-  TlsCert default = 1; // absent = no default cert
+  repeated TlsCert default_certs = 1; // absent / empty = no default cert
   repeated TlsCertEntry exact = 2;
   repeated TlsCertEntry wildcard = 3; // suffix without "*." prefix; sorted
 }
 
 message TlsCertEntry {
   string host_pattern = 1; // exact hostname or bare suffix
-  TlsCert cert = 2;
+  repeated TlsCert certs = 2; // sorted: ECDSA first, then RSA, then Other; newest notAfter first
 }
 
+// Mirrors TlsCert + KeyAlgorithm.
 message TlsCert {
   string source = 1;
   bytes cert_pem = 2;
   bytes key_pem = 3;
   optional uint64 not_after_unix_secs = 4;
+  KeyAlgorithm key_algorithm = 5; // absent / UNSPECIFIED maps to Other
+}
+
+// Mirrors coxswain_core::tls::KeyAlgorithm.
+enum KeyAlgorithm {
+  KEY_ALGORITHM_UNSPECIFIED = 0; // treated as Other on decode
+  KEY_ALGORITHM_RSA = 1;
+  KEY_ALGORITHM_ECDSA = 2;
+  KEY_ALGORITHM_OTHER = 3;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -646,4 +656,7 @@ enum ListenerTlsOutcome {
   LISTENER_TLS_OUTCOME_REF_NOT_PERMITTED = 3;
   LISTENER_TLS_OUTCOME_INVALID_CERTIFICATE_REF = 4;
   LISTENER_TLS_OUTCOME_INVALID = 5;
+  // Some certificateRefs loaded, ≥1 failed.  Listener serves the good certs
+  // (is_https_terminate = true) but ResolvedRefs=False in GW status.
+  LISTENER_TLS_OUTCOME_RESOLVED_PARTIAL = 6;
 }
