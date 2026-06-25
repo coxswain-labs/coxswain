@@ -1,45 +1,31 @@
-//! Request and response filter application: header modifiers, URL rewrites, and the
-//! `Forwarded` header injection for PROXY-protocol connections.
+//! Declarative Gateway-API/Ingress `FilterAction` handlers.
+//!
+//! This module's [`TrafficFilter`] is the in-band dispatch facade: it walks a
+//! route's `FilterAction` list and applies the request/response header modifiers,
+//! URL rewrites, and CORS response headers, plus the proxy-owned `Forwarded` /
+//! `X-Proxy-Engine` infrastructure headers. The per-variant mechanics live in
+//! submodules so that adding a GEP filter touches a single file:
+//! [`header`] (header modifiers + the proxy-owned forwarding deny-list),
+//! [`rewrite`] (`UrlRewrite` path rewriting), [`redirect`] (`RequestRedirect`
+//! short-circuit), [`cors`] (CORS preflight, GEP-1767), and [`mirror`]
+//! (`RequestMirror` fire-and-forget dispatch, GEP-3171).
 
-use super::ctx::ProxyCtx;
-use coxswain_core::routing::{FilterAction, HeaderMod, PathModifier};
+pub(crate) mod cors;
+pub(crate) mod header;
+pub(crate) mod mirror;
+pub(crate) mod redirect;
+pub(crate) mod rewrite;
+
+use crate::ctx::ProxyCtx;
+use coxswain_core::routing::FilterAction;
+use http::HeaderValue;
 use http::header as hdr;
-use http::{HeaderName, HeaderValue};
+use pingora_core::Result;
+use pingora_http::{RequestHeader, ResponseHeader};
 use std::sync::LazyLock;
 
 static X_PROXY_ENGINE: LazyLock<HeaderValue> =
     LazyLock::new(|| HeaderValue::from_static(concat!("Coxswain/", env!("CARGO_PKG_VERSION"))));
-use pingora_core::Result;
-use pingora_http::{RequestHeader, ResponseHeader};
-
-/// Headers the proxy unconditionally owns on every upstream request.
-///
-/// The proxy strips whatever the downstream client sent and, when PROXY-protocol
-/// is active, replaces `Forwarded` with a proxy-generated value derived from the
-/// real client address.  Route operators must also not re-inject these headers via
-/// `RequestHeaderModifier` filters — `apply_header_mod` skips `set`/`add` operations
-/// for any name in this list when called on the request path (#409, #410).
-///
-/// Never extend this list with headers the proxy does not itself set;
-/// strip-without-replace is the safe default for unknown infrastructure headers.
-static CLIENT_FORWARDING_HEADERS: std::sync::LazyLock<[http::HeaderName; 4]> =
-    std::sync::LazyLock::new(|| {
-        [
-            http::HeaderName::from_static("forwarded"),
-            http::HeaderName::from_static("x-forwarded-for"),
-            http::HeaderName::from_static("x-forwarded-proto"),
-            http::HeaderName::from_static("x-real-ip"),
-        ]
-    });
-
-/// Returns `true` when `name` is a proxy-owned forwarding header that neither
-/// clients nor route operators may inject.
-///
-/// Used by [`apply_header_mod`] to gate `set`/`add` operations on the request
-/// path — the `remove` operation is always allowed.
-pub(crate) fn is_owned_forwarding_header(name: &http::HeaderName) -> bool {
-    CLIENT_FORWARDING_HEADERS.iter().any(|h| h == name)
-}
 
 /// Applies Gateway-API and Ingress filter actions to the in-flight request
 /// and response headers, plus the fixed `X-Proxy-Engine` and RFC-7239
@@ -50,7 +36,7 @@ pub struct TrafficFilter;
 impl TrafficFilter {
     /// Strip client-supplied forwarding headers from the upstream request.
     ///
-    /// Called unconditionally in [`super::hooks::upstream_request_filter`]
+    /// Called unconditionally in [`crate::hooks::upstream_request_filter`]
     /// **before** any operator filter or proxy-generated header insertion runs.
     /// This ensures client-injected values for `Forwarded`, `X-Forwarded-For`,
     /// `X-Forwarded-Proto`, and `X-Real-IP` never reach the backend regardless
@@ -58,7 +44,7 @@ impl TrafficFilter {
     ///
     /// Zero allocations — `remove_header` is an in-place map removal.
     pub(crate) fn strip_client_forwarding_headers(upstream_request: &mut RequestHeader) {
-        for name in CLIENT_FORWARDING_HEADERS.iter() {
+        for name in header::CLIENT_FORWARDING_HEADERS.iter() {
             upstream_request.remove_header(name);
         }
     }
@@ -83,7 +69,11 @@ impl TrafficFilter {
         for filter in filters {
             match filter {
                 FilterAction::RequestHeaderModifier(m) => {
-                    apply_header_mod(upstream_request, m, is_owned_forwarding_header);
+                    header::apply_header_mod(
+                        upstream_request,
+                        m,
+                        header::is_owned_forwarding_header,
+                    );
                 }
                 FilterAction::UrlRewrite { hostname, path } => {
                     if let Some(h) = hostname {
@@ -94,7 +84,7 @@ impl TrafficFilter {
                         }
                     }
                     if let Some(pm) = path {
-                        rewrite_path(upstream_request, pm, original_path);
+                        rewrite::rewrite_path(upstream_request, pm, original_path);
                     }
                 }
                 // Redirect and response filters are handled elsewhere.
@@ -141,7 +131,7 @@ impl TrafficFilter {
         for filter in filters {
             match filter {
                 FilterAction::ResponseHeaderModifier(m) => {
-                    apply_header_mod(upstream_response, m, |_| false);
+                    header::apply_header_mod(upstream_response, m, |_| false);
                 }
                 FilterAction::Cors(cfg) => {
                     let Some(origin_str) = cors_origin else {
@@ -169,90 +159,21 @@ impl TrafficFilter {
     }
 }
 
-pub(crate) trait HeaderTarget {
-    fn hdr_set(&mut self, name: HeaderName, value: HeaderValue);
-    fn hdr_add(&mut self, name: HeaderName, value: HeaderValue);
-    fn hdr_remove(&mut self, name: &HeaderName);
-}
-
-impl HeaderTarget for RequestHeader {
-    fn hdr_set(&mut self, name: HeaderName, value: HeaderValue) {
-        let _ = self.insert_header(name, value);
-    }
-    fn hdr_add(&mut self, name: HeaderName, value: HeaderValue) {
-        let _ = self.append_header(name, value);
-    }
-    fn hdr_remove(&mut self, name: &HeaderName) {
-        self.remove_header(name);
-    }
-}
-
-impl HeaderTarget for ResponseHeader {
-    fn hdr_set(&mut self, name: HeaderName, value: HeaderValue) {
-        let _ = self.insert_header(name, value);
-    }
-    fn hdr_add(&mut self, name: HeaderName, value: HeaderValue) {
-        let _ = self.append_header(name, value);
-    }
-    fn hdr_remove(&mut self, name: &HeaderName) {
-        self.remove_header(name);
-    }
-}
-
-/// Apply a [`HeaderMod`] to `target`, skipping `set`/`add` entries for which
-/// `skip` returns `true`.
-///
-/// On the **request path** pass [`is_owned_forwarding_header`] as `skip` so that
-/// route operators cannot re-inject proxy-owned forwarding headers after the
-/// client-strip step (#409, #410).  On the **response path** pass `|_| false`.
-///
-/// The `remove` loop is never gated — silently removing a blocked header is
-/// harmless and prevents stale values reaching the backend.
-pub(crate) fn apply_header_mod<H: HeaderTarget>(
-    target: &mut H,
-    m: &HeaderMod,
-    skip: impl Fn(&http::HeaderName) -> bool,
-) {
-    for (name, value) in &m.set {
-        if !skip(name) {
-            target.hdr_set(name.clone(), value.clone());
-        }
-    }
-    for (name, value) in &m.add {
-        if !skip(name) {
-            target.hdr_add(name.clone(), value.clone());
-        }
-    }
-    for name in &m.remove {
-        target.hdr_remove(name);
-    }
-}
-
-pub(crate) fn rewrite_path(req: &mut RequestHeader, modifier: &PathModifier, original_path: &str) {
-    // `apply` already owns an allocation; when a query is present, extend it in
-    // place rather than allocating a second string via `format!`.
-    let mut path_and_query = modifier.apply(original_path);
-    if let Some(q) = req.uri.query() {
-        path_and_query.reserve(1 + q.len());
-        path_and_query.push('?');
-        path_and_query.push_str(q);
-    }
-    match http::Uri::builder()
-        .path_and_query(path_and_query.as_str())
-        .build()
-    {
-        Ok(uri) => req.set_uri(uri),
-        Err(e) => tracing::warn!(error = %e, "URLRewrite: failed to build new URI"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{TrafficFilter, apply_header_mod, is_owned_forwarding_header, rewrite_path};
+    use super::TrafficFilter;
     use coxswain_core::routing::{FilterAction, HeaderMod};
     use pingora_http::{RequestHeader, ResponseHeader};
 
-    use crate::common::ctx::ProxyCtx;
+    use crate::ctx::ProxyCtx;
+
+    fn resp() -> ResponseHeader {
+        ResponseHeader::build(200, None).unwrap()
+    }
+
+    fn hmod(add: &[(&str, &str)], set: &[(&str, &str)], remove: &[&str]) -> HeaderMod {
+        HeaderMod::parse(add, set, remove).unwrap()
+    }
 
     #[test]
     fn strip_removes_all_client_forwarding_headers() {
@@ -287,64 +208,6 @@ mod tests {
             Some(b"keep-me".as_ref()),
             "unrelated header must survive"
         );
-    }
-
-    fn req() -> RequestHeader {
-        let mut r = RequestHeader::build("GET", b"/original/path?q=1", None).unwrap();
-        r.insert_header("x-keep", "yes").unwrap();
-        r
-    }
-
-    fn resp() -> ResponseHeader {
-        ResponseHeader::build(200, None).unwrap()
-    }
-
-    fn hmod(add: &[(&str, &str)], set: &[(&str, &str)], remove: &[&str]) -> HeaderMod {
-        HeaderMod::parse(add, set, remove).unwrap()
-    }
-
-    #[test]
-    fn request_header_set_overwrites() {
-        let mut r = req();
-        let m = hmod(&[], &[("x-keep", "overwritten")], &[]);
-        apply_header_mod(&mut r, &m, |_| false);
-        assert_eq!(r.headers.get("x-keep").unwrap(), "overwritten");
-    }
-
-    #[test]
-    fn request_header_add_appends() {
-        let mut r = req();
-        let m = hmod(&[("x-keep", "extra")], &[], &[]);
-        apply_header_mod(&mut r, &m, |_| false);
-        let vals: Vec<_> = r.headers.get_all("x-keep").iter().collect();
-        assert_eq!(vals.len(), 2);
-    }
-
-    #[test]
-    fn request_header_remove() {
-        let mut r = req();
-        let m = hmod(&[], &[], &["x-keep"]);
-        apply_header_mod(&mut r, &m, |_| false);
-        assert!(r.headers.get("x-keep").is_none());
-    }
-
-    #[test]
-    fn response_header_set_overwrites() {
-        let mut r = resp();
-        r.insert_header("x-old", "old").unwrap();
-        let m = hmod(&[], &[("x-old", "new")], &[]);
-        apply_header_mod(&mut r, &m, |_| false);
-        assert_eq!(r.headers.get("x-old").unwrap(), "new");
-    }
-
-    #[test]
-    fn response_header_add_appends() {
-        let mut r = resp();
-        r.insert_header("x-multi", "a").unwrap();
-        let m = hmod(&[("x-multi", "b")], &[], &[]);
-        apply_header_mod(&mut r, &m, |_| false);
-        let vals: Vec<_> = r.headers.get_all("x-multi").iter().collect();
-        assert_eq!(vals.len(), 2);
     }
 
     // ── Operator deny-list (#410) ──────────────────────────────────────────────
@@ -447,98 +310,5 @@ mod tests {
             Some(b"10.0.0.1".as_ref()),
             "response-side modifier must be allowed to set forwarding header names (#410)"
         );
-    }
-
-    #[test]
-    fn is_owned_forwarding_header_recognises_all_four() {
-        for name in &[
-            "forwarded",
-            "x-forwarded-for",
-            "x-forwarded-proto",
-            "x-real-ip",
-        ] {
-            let h = http::HeaderName::from_bytes(name.as_bytes()).unwrap();
-            assert!(
-                is_owned_forwarding_header(&h),
-                "{name} must be recognised as a proxy-owned header (#410)"
-            );
-        }
-    }
-
-    #[test]
-    fn is_owned_forwarding_header_allows_custom_headers() {
-        for name in &["x-team-id", "x-request-id", "x-proxy-engine"] {
-            let h = http::HeaderName::from_bytes(name.as_bytes()).unwrap();
-            assert!(
-                !is_owned_forwarding_header(&h),
-                "{name} must NOT be treated as a proxy-owned header (#410)"
-            );
-        }
-    }
-
-    #[test]
-    fn url_rewrite_full_path_replaces_path_and_keeps_query() {
-        let mut r = req();
-        let pm = coxswain_core::routing::PathModifier::ReplaceFullPath("/new".to_string());
-        rewrite_path(&mut r, &pm, "/original/path");
-        assert_eq!(r.uri.path(), "/new");
-        assert_eq!(r.uri.query(), Some("q=1"));
-    }
-
-    #[test]
-    fn url_rewrite_prefix_match_replaces_prefix() {
-        let mut r = RequestHeader::build("GET", b"/api/v2/users", None).unwrap();
-        let pm = coxswain_core::routing::PathModifier::ReplacePrefixMatch {
-            prefix: "/api".to_string(),
-            replacement: "/v3".to_string(),
-        };
-        rewrite_path(&mut r, &pm, "/api/v2/users");
-        assert_eq!(r.uri.path(), "/v3/v2/users");
-    }
-
-    #[test]
-    fn url_rewrite_prefix_match_exact_path_becomes_replacement() {
-        let mut r = RequestHeader::build("GET", b"/api", None).unwrap();
-        let pm = coxswain_core::routing::PathModifier::ReplacePrefixMatch {
-            prefix: "/api".to_string(),
-            replacement: "/v3".to_string(),
-        };
-        rewrite_path(&mut r, &pm, "/api");
-        assert_eq!(r.uri.path(), "/v3");
-    }
-
-    #[test]
-    fn url_rewrite_prefix_match_trailing_slash_path() {
-        let mut r = RequestHeader::build("GET", b"/api/", None).unwrap();
-        let pm = coxswain_core::routing::PathModifier::ReplacePrefixMatch {
-            prefix: "/api".to_string(),
-            replacement: "/v3".to_string(),
-        };
-        rewrite_path(&mut r, &pm, "/api/");
-        assert_eq!(r.uri.path(), "/v3");
-    }
-
-    #[test]
-    fn url_rewrite_prefix_match_strip_to_root() {
-        // Exact path match with replacement "/" must yield "/" not ""
-        let mut r = RequestHeader::build("GET", b"/strip-prefix", None).unwrap();
-        let pm = coxswain_core::routing::PathModifier::ReplacePrefixMatch {
-            prefix: "/strip-prefix".to_string(),
-            replacement: "/".to_string(),
-        };
-        rewrite_path(&mut r, &pm, "/strip-prefix");
-        assert_eq!(r.uri.path(), "/");
-    }
-
-    #[test]
-    fn url_rewrite_prefix_match_strip_to_root_with_suffix() {
-        // Path with suffix after stripped prefix: /strip-prefix/foo -> /foo
-        let mut r = RequestHeader::build("GET", b"/strip-prefix/foo", None).unwrap();
-        let pm = coxswain_core::routing::PathModifier::ReplacePrefixMatch {
-            prefix: "/strip-prefix".to_string(),
-            replacement: "/".to_string(),
-        };
-        rewrite_path(&mut r, &pm, "/strip-prefix/foo");
-        assert_eq!(r.uri.path(), "/foo");
     }
 }

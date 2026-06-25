@@ -338,7 +338,7 @@ pub(crate) fn upstream_connections_total() -> &'static IntCounterVec {
 /// Values: `0` = Closed, `1` = Open, `2` = HalfOpen.
 /// Labels: `route` (the `metric_route_id`), `upstream` (the `SocketAddr` string).
 ///
-/// Updated by [`crate::circuit_breaker::MetricsInstrument`] in the `on_open`,
+/// Updated by [`crate::policy::circuit_breaker::MetricsInstrument`] in the `on_open`,
 /// `on_half_open`, and `on_closed` [`failsafe::Instrument`] callbacks — transition
 /// time only, never on the per-request hot path.
 ///
