@@ -5,9 +5,9 @@ use super::backend::BackendGroup;
 use super::circuit_breaker::CircuitBreakerConfig;
 use super::compression::CompressionConfig;
 use super::entry::{
-    FilterAction, ForwardedForConfig, RouteConflict, RouteEntry, RouteInfo, RouteKind,
-    RouteTimeouts,
+    ForwardedForConfig, RouteConflict, RouteEntry, RouteInfo, RouteKind, RouteTimeouts,
 };
+use super::filters::FilterAction;
 use super::path_normalize::NormalizeLevel;
 use super::predicate::{MatchPredicates, RequestContext, ValueMatch};
 use super::rate_limit::RateLimitConfig;
@@ -134,7 +134,7 @@ impl RouteMatch {
 /// uncompilable pattern can be skipped with a WARN rather than failing the whole
 /// routing-table [`build`](HostRouterBuilder::build) (which would drop every route).
 /// The returned [`regex::Regex`] is also what capture-group rewrites
-/// ([`PathModifier::RegexReplace`](super::entry::PathModifier::RegexReplace)) match
+/// ([`PathModifier::RegexReplace`](super::filters::PathModifier::RegexReplace)) match
 /// against. The matcher itself compiles the same pattern into a
 /// [`RegexSet`] at build time; both use the default `regex` parser, so a pattern that
 /// compiles here is guaranteed to compile there.
