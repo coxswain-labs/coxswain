@@ -437,9 +437,7 @@ pub(crate) async fn request_filter<K>(
         // `None` fraction == 100% — never filtered out.
         let surviving: Vec<Arc<BackendGroup>> = mirror_backends
             .into_iter()
-            .filter(|(_, fraction)| {
-                fraction.map_or(true, |f| f.should_sample(rand::random::<u32>()))
-            })
+            .filter(|(_, fraction)| fraction.is_none_or(|f| f.should_sample(rand::random::<u32>())))
             .map(|(b, _)| b)
             .collect();
 
