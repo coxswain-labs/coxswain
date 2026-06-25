@@ -223,6 +223,12 @@ pub(crate) async fn request_filter<K>(
     // so the client reconnects on the correct SNI, which will trigger the mTLS handshake.
     // Plain-HTTP connections (no ssl_digest) are exempt — the operator forces HTTPS via
     // `ssl-redirect`.
+    //
+    // GEP-91 AllowInsecureFallback (#86): when the host's frontend validation runs in
+    // insecure-fallback mode, the client cert is requested but a missing/invalid cert is
+    // NOT rejected here — authorization is delegated to the backend. The TLS layer already
+    // allowed the handshake to complete without a cert (`set_verify_callback`), so this
+    // HTTP-layer guard must mirror that and let the request through.
     {
         let cc_store = cfg.client_certs.load();
         if let Some(config_state) = cc_store.find_config(&host) {
@@ -235,7 +241,11 @@ pub(crate) async fn request_filter<K>(
                     .extension
                     .get::<ConnTlsInfo>()
                     .and_then(|t| t.client_cert.as_ref());
-                if cert_info.is_none() {
+                let insecure_fallback = matches!(
+                    config_state.as_ref(),
+                    ClientCertConfigState::Config(cc) if cc.allow_insecure_fallback
+                );
+                if cert_info.is_none() && !insecure_fallback {
                     return Err(pingora_core::Error::explain(
                         HTTPStatus(421),
                         "client certificate required for this host",
