@@ -4,6 +4,7 @@
 mod backend_tls;
 mod bindings;
 mod filters;
+pub(crate) mod frontend_tls;
 mod grpc_reconcile;
 mod grpc_status;
 mod hostnames;

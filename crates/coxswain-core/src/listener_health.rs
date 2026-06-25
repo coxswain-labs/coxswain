@@ -104,12 +104,91 @@ impl ListenerTlsOutcome {
     }
 }
 
+/// Outcome of resolving one HTTPS listener's GEP-91 frontend client-certificate
+/// validation CA ref (`spec.tls.frontend.{default,perPort}.validation`).
+///
+/// Frontend validation is resolved **per listener**: the effective config is the
+/// `perPort[listener.port]` override if present, else the gateway-wide `default`.
+/// Each variant drives the listener's `ResolvedRefs`/`Accepted`/`Programmed`
+/// status conditions to the exact reasons the GEP-91 conformance suite asserts.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default)]
+pub enum FrontendValidationOutcome {
+    /// Non-HTTPS listener, or no frontend validation applies to it.
+    #[default]
+    NotApplicable,
+    /// CA ref resolved; the listener validates client certs against it.
+    Resolved,
+    /// The referenced ConfigMap is missing, has no `ca.crt`, or isn't PEM —
+    /// `ResolvedRefs=False/InvalidCACertificateRef`.
+    InvalidCACertificateRef {
+        /// Human-readable description of the resolution failure.
+        message: String,
+    },
+    /// The CA ref kind is not `core/ConfigMap` —
+    /// `ResolvedRefs=False/InvalidCACertificateKind`.
+    InvalidCACertificateKind {
+        /// Human-readable description naming the unsupported kind.
+        message: String,
+    },
+    /// A cross-namespace CA ref with no permitting `ReferenceGrant` —
+    /// `ResolvedRefs=False/RefNotPermitted`.
+    RefNotPermitted {
+        /// Human-readable description of the denied cross-namespace ref.
+        message: String,
+    },
+}
+
+impl FrontendValidationOutcome {
+    /// `true` when frontend validation was configured for this listener but its
+    /// CA ref could not be resolved — the listener fails closed and surfaces a
+    /// `False` condition triplet.
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidCACertificateRef { .. }
+                | Self::InvalidCACertificateKind { .. }
+                | Self::RefNotPermitted { .. }
+        )
+    }
+
+    /// Stable reason string for the `ResolvedRefs` listener condition when failed.
+    #[must_use]
+    pub fn resolved_refs_reason(&self) -> &'static str {
+        match self {
+            Self::InvalidCACertificateRef { .. } => "InvalidCACertificateRef",
+            Self::InvalidCACertificateKind { .. } => "InvalidCACertificateKind",
+            Self::RefNotPermitted { .. } => "RefNotPermitted",
+            Self::NotApplicable | Self::Resolved => "ResolvedRefs",
+        }
+    }
+
+    /// Human-readable message attached to the failed conditions; empty otherwise.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::InvalidCACertificateRef { message }
+            | Self::InvalidCACertificateKind { message }
+            | Self::RefNotPermitted { message } => message.as_str(),
+            Self::NotApplicable | Self::Resolved => "",
+        }
+    }
+}
+
 /// Consolidated per-listener metadata for one Gateway listener.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct ListenerInfo {
     /// TLS resolution outcome for this listener.
     pub tls_outcome: ListenerTlsOutcome,
+    /// GEP-91 frontend client-cert validation outcome for this listener (#86).
+    ///
+    /// Computed in the controller's reconcile (not transported over the
+    /// discovery wire — the proxy never reads it); consumed by the status
+    /// writer to set the listener's `ResolvedRefs`/`Accepted`/`Programmed`
+    /// conditions when a frontend CA ref fails to resolve.
+    pub frontend_outcome: FrontendValidationOutcome,
     /// Number of routes attached to this listener.
     ///
     /// Populated by the reconciler's route-counting pass after the TLS walk.
@@ -125,12 +204,41 @@ pub struct ListenerInfo {
     pub port: u16,
 }
 
+/// Outcome of resolving the Gateway-wide frontend client-certificate validation
+/// config (GEP-91, `spec.tls.frontend.default.validation`).
+///
+/// Produced during each reconciler rebuild and consumed by the controller's
+/// status writer to emit the `InsecureFrontendValidationMode` condition.
+/// `None` on a [`GatewayListenerHealth`] means no frontend validation is configured.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default)]
+pub struct FrontendValidationHealth {
+    /// `true` when the effective mode is `AllowInsecureFallback`.
+    ///
+    /// Triggers a `InsecureFrontendValidationMode=True/ConfigurationChanged` top-level
+    /// condition on the Gateway (GEP-91 requirement).
+    pub insecure_fallback: bool,
+    /// `true` when all CA ConfigMap refs resolved successfully; `false` when any ref
+    /// was missing, held no `ca.crt` key, or lacked a valid PEM header.
+    ///
+    /// A `false` value here means the proxy fail-closed (every handshake rejected for
+    /// the affected hostnames) and the controller should log a warning and emit an Event.
+    pub resolved_refs: bool,
+    /// Human-readable description for the `resolved_refs=false` case.
+    pub message: String,
+}
+
 /// Per-listener health for one Gateway, keyed by listener name.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct GatewayListenerHealth {
     /// All listeners for this Gateway. Keyed by listener name.
     pub listeners: BTreeMap<String, ListenerInfo>,
+    /// Frontend client-certificate validation health for this Gateway (GEP-91, #86).
+    ///
+    /// `None` when `spec.tls.frontend.default.validation` is absent.
+    /// `Some` when the field is present, regardless of whether refs resolved.
+    pub frontend_validation: Option<FrontendValidationHealth>,
 }
 
 // ── SharedGatewayListenerHealth ───────────────────────────────────────────────
@@ -227,5 +335,59 @@ impl SharedGatewayListenerHealth {
     /// the first `changed()` to fire even when no publish has happened yet.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.0.tx.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontend_outcome_reason_and_failed_flags() {
+        let msg = || "boom".to_string();
+        let cases = [
+            (
+                FrontendValidationOutcome::NotApplicable,
+                false,
+                "ResolvedRefs",
+            ),
+            (FrontendValidationOutcome::Resolved, false, "ResolvedRefs"),
+            (
+                FrontendValidationOutcome::InvalidCACertificateRef { message: msg() },
+                true,
+                "InvalidCACertificateRef",
+            ),
+            (
+                FrontendValidationOutcome::InvalidCACertificateKind { message: msg() },
+                true,
+                "InvalidCACertificateKind",
+            ),
+            (
+                FrontendValidationOutcome::RefNotPermitted { message: msg() },
+                true,
+                "RefNotPermitted",
+            ),
+        ];
+        for (outcome, failed, reason) in cases {
+            assert_eq!(outcome.is_failed(), failed, "is_failed for {outcome:?}");
+            assert_eq!(
+                outcome.resolved_refs_reason(),
+                reason,
+                "reason for {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frontend_outcome_message_only_on_failures() {
+        assert_eq!(FrontendValidationOutcome::Resolved.message(), "");
+        assert_eq!(FrontendValidationOutcome::NotApplicable.message(), "");
+        assert_eq!(
+            FrontendValidationOutcome::RefNotPermitted {
+                message: "denied".to_string()
+            }
+            .message(),
+            "denied"
+        );
     }
 }

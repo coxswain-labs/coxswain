@@ -27,7 +27,7 @@ use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
 use crate::ingress::IngressPorts;
 use crate::k8s_utils::scoped_api;
-use crate::reference_grants::{GrantSet, flatten_grants};
+use crate::reference_grants::{GrantSet, flatten_ca_grants, flatten_grants};
 use crate::tls::{
     GatewayListenerHealth, SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth,
     SharedHttpRouteHealth,
@@ -564,6 +564,9 @@ pub(super) struct Ownership<'a> {
     pub(super) gateway_classes: &'a HashSet<String>,
     pub(super) backend_grants: &'a GrantSet,
     pub(super) cert_grants: &'a GrantSet,
+    /// `Gateway → ConfigMap` grants for GEP-91 frontend client-cert validation
+    /// CA refs that point at a ConfigMap in another namespace (#86).
+    pub(super) ca_grants: &'a GrantSet,
     /// Per-(Service, port) `BackendTLSPolicy` lookup table, built before this
     /// `Ownership` is constructed. Carried alongside ownership data because
     /// `build_routes` and the per-route `reconcile` both need it on the same
@@ -1132,7 +1135,9 @@ fn rebuild(
             owned_gateways_handle,
         );
 
-    let (backend_grants, cert_grants) = flatten_grants(&stores.grants.state());
+    let grants_snapshot = stores.grants.state();
+    let (backend_grants, cert_grants) = flatten_grants(&grants_snapshot);
+    let ca_grants = flatten_ca_grants(&grants_snapshot);
 
     tracing::debug!(
         http_routes = routes.len(),
@@ -1153,6 +1158,7 @@ fn rebuild(
         gateway_classes: &owned_gateway_classes,
         backend_grants: &backend_grants,
         cert_grants: &cert_grants,
+        ca_grants: &ca_grants,
         policy_index: &policy_index,
     };
 
@@ -1177,7 +1183,14 @@ fn rebuild(
         outputs.listener_hostnames,
         true,
     );
-    build_client_certs(stores, &ingresses, &ownership, outputs.client_certs);
+    build_client_certs(
+        stores,
+        &ingresses,
+        &ownership,
+        outputs.client_certs,
+        &mut gateway_tls_health,
+        true,
+    );
 
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
 
@@ -1324,6 +1337,7 @@ fn rebuild(
             gateway_classes: &owned_gateway_classes,
             backend_grants: &backend_grants,
             cert_grants: &cert_grants,
+            ca_grants: &ca_grants,
             policy_index: &policy_index,
         };
 
@@ -1354,10 +1368,18 @@ fn rebuild(
             &listener_hostnames_cell,
             false,
         );
-        build_client_certs(stores, &ingresses, &dedicated_ownership, &client_certs_cell);
+        let mut dedicated_tls_health = gw_listener_health;
+        build_client_certs(
+            stores,
+            &ingresses,
+            &dedicated_ownership,
+            &client_certs_cell,
+            &mut dedicated_tls_health,
+            false,
+        );
 
         // Retain only the health entry for the owning Gateway.
-        let listener_health: HashMap<ObjectKey, GatewayListenerHealth> = gw_listener_health
+        let listener_health: HashMap<ObjectKey, GatewayListenerHealth> = dedicated_tls_health
             .into_iter()
             .filter(|(k, _)| k == &key)
             .collect();

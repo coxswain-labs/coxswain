@@ -16,8 +16,8 @@
 //! lives in `routing.rs`.
 
 use coxswain_e2e::{
-    ControllerOptions, ControllerProcess, FixtureVars, GeneratedCert, Harness, NamespaceGuard,
-    StaticRsaCert, bootstrap,
+    ControllerOptions, ControllerProcess, FixtureVars, GeneratedCert, Harness, MtlsCerts,
+    NamespaceGuard, StaticRsaCert, bootstrap,
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::{http, wait},
 };
@@ -1976,5 +1976,381 @@ async fn https_listener_degrades_when_one_certificate_ref_is_invalid() -> anyhow
         wait::wait_for_https_route(h.gateway_tls_addr, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
+    Ok(())
+}
+
+// ── Gateway frontend client-certificate mTLS — GEP-91 (#86) ──────────────────
+
+/// Gateway `spec.tls.frontend.default.validation` (AllowValidOnly): a TLS
+/// connection presenting a valid client certificate signed by the configured CA
+/// is admitted (200).  The CA is delivered via a ConfigMap with key `ca.crt`
+/// (Core-support ref, GEP-91 happy path).
+#[tokio::test]
+async fn gateway_frontend_mtls_accepts_valid_client_cert() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-mtls-valid").await?;
+
+    let mtls = MtlsCerts::generate();
+    let server_cert = GeneratedCert::for_host(&format!("gw-mtls.{}.local", ns.name));
+    let host = format!("gw-mtls.{}.local", ns.name);
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        gwa::FRONTEND_MTLS_CONFIGMAP,
+        FixtureVars::new(&ns.name)
+            .with("HOSTNAME", &host)
+            .with("SECRET_NAME", "gw-mtls-server-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64())
+            .with("CA_CRT_PEM", &mtls.ca_cert_pem),
+    )
+    .await?;
+
+    // Poll until the route is live and the CA is reconciled into the ClientCertStore:
+    // a valid client cert must be admitted (200 echo body).
+    let resp = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!(
+                "GEP-91 AllowValidOnly route {host}/ to admit a valid client cert (200 echo body)"
+            )
+        },
+        || async {
+            match http::https_get_with_client_cert(
+                &host,
+                "/",
+                h.gateway_tls_addr,
+                &mtls.client_cert_pem,
+                &mtls.client_key_pem,
+            )
+            .await
+            {
+                Ok((_, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    resp.assert_backend("echo-a");
+    Ok(())
+}
+
+/// Gateway `spec.tls.frontend.default.validation` (AllowValidOnly): a TLS
+/// connection presenting **no** client certificate is rejected at the TLS
+/// handshake — the server aborts with `FAIL_IF_NO_PEER_CERT` before the HTTP
+/// layer is reached (GEP-91 sad path — Istio MUTUAL model).
+#[tokio::test]
+async fn gateway_frontend_mtls_rejects_missing_client_cert() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-mtls-nocert").await?;
+
+    let mtls = MtlsCerts::generate();
+    let server_cert = GeneratedCert::for_host(&format!("gw-mtls.{}.local", ns.name));
+    let host = format!("gw-mtls.{}.local", ns.name);
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        gwa::FRONTEND_MTLS_CONFIGMAP,
+        FixtureVars::new(&ns.name)
+            .with("HOSTNAME", &host)
+            .with("SECRET_NAME", "gw-mtls-server-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64())
+            .with("CA_CRT_PEM", &mtls.ca_cert_pem),
+    )
+    .await?;
+
+    // Pre-condition: wait until mTLS is active — a valid cert must be accepted.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!("GEP-91 AllowValidOnly route {host}/ to be active (valid cert accepted)")
+        },
+        || async {
+            match http::https_get_with_client_cert(
+                &host,
+                "/",
+                h.gateway_tls_addr,
+                &mtls.client_cert_pem,
+                &mtls.client_key_pem,
+            )
+            .await
+            {
+                Ok((_, Some(_))) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    // Now attempt without a client certificate.  The server must abort the TLS
+    // handshake (FAIL_IF_NO_PEER_CERT) so reqwest returns an error before any
+    // HTTP response is decoded.
+    let result = http::https_get(&host, "/", h.gateway_tls_addr).await;
+    anyhow::ensure!(
+        result.is_err(),
+        "expected TLS handshake failure when no client cert is presented on \
+         GEP-91 AllowValidOnly host {host}; got Ok: {:?}",
+        result.ok()
+    );
+
+    Ok(())
+}
+
+/// Gateway `spec.tls.frontend.default.validation` referencing an absent
+/// ConfigMap: the controller resolves to `Unavailable`, and the proxy
+/// fail-closes every TLS handshake to the listener hostname
+/// (GEP-91 sad path — fail-closed on unresolvable CA ref).
+#[tokio::test]
+async fn gateway_frontend_mtls_fails_closed_when_ca_configmap_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-mtls-noca").await?;
+
+    let mtls = MtlsCerts::generate();
+    let server_cert = GeneratedCert::for_host(&format!("gw-mtls.{}.local", ns.name));
+    let host = format!("gw-mtls.{}.local", ns.name);
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    // The fixture references ConfigMap `does-not-exist` which is absent — the
+    // controller must produce `ClientCertConfigState::Unavailable` for this host.
+    fixtures::apply_fixture(
+        gwa::FRONTEND_MTLS_MISSING_CA,
+        FixtureVars::new(&ns.name)
+            .with("HOSTNAME", &host)
+            .with("SECRET_NAME", "gw-mtls-server-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64()),
+    )
+    .await?;
+
+    // GEP-91: a Gateway-wide frontend CA ref that can't resolve drives the HTTPS
+    // listener to ResolvedRefs=False / Programmed=False (the
+    // GatewayFrontendInvalidDefaultClientCertificateValidation conformance
+    // contract), even though the listener's own server cert is valid.
+    wait::wait_for_gateway_listener_condition(
+        &h.client,
+        "coxswain-frontend-missing-ca",
+        &ns.name,
+        "https",
+        "ResolvedRefs",
+        "False",
+        Duration::from_secs(60),
+    )
+    .await?;
+    wait::wait_for_gateway_listener_condition(
+        &h.client,
+        "coxswain-frontend-missing-ca",
+        &ns.name,
+        "https",
+        "Programmed",
+        "False",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Every connection attempt must fail at the TLS layer — the CA is Unavailable
+    // so the proxy installs PEER | FAIL_IF_NO_PEER_CERT with no CA store, which
+    // causes BoringSSL to reject every cert (including valid ones).
+    let with_cert = http::https_get_with_client_cert(
+        &host,
+        "/",
+        h.gateway_tls_addr,
+        &mtls.client_cert_pem,
+        &mtls.client_key_pem,
+    )
+    .await;
+    anyhow::ensure!(
+        with_cert.is_err(),
+        "expected TLS failure with a valid client cert when CA ConfigMap is missing \
+         (proxy must fail-close); got Ok: {:?}",
+        with_cert.ok()
+    );
+
+    let without_cert = http::https_get(&host, "/", h.gateway_tls_addr).await;
+    anyhow::ensure!(
+        without_cert.is_err(),
+        "expected TLS failure without a client cert when CA ConfigMap is missing \
+         (proxy must fail-close); got Ok: {:?}",
+        without_cert.ok()
+    );
+
+    Ok(())
+}
+
+/// Gateway `spec.tls.frontend.default.validation` CA ConfigMap hot-reload:
+/// rotate the CA ConfigMap to a new CA and confirm that certs signed by the new
+/// CA are accepted and certs signed by the old CA are rejected
+/// (GEP-91 hot-reload).
+#[tokio::test]
+async fn gateway_frontend_mtls_reloads_ca_on_configmap_change() -> anyhow::Result<()> {
+    use k8s_openapi::api::core::v1::ConfigMap;
+    use kube::api::{Patch as KubePatch, PatchParams as KubePP};
+
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-mtls-rotate").await?;
+
+    let old_mtls = MtlsCerts::generate();
+    let new_mtls = MtlsCerts::generate();
+    let server_cert = GeneratedCert::for_host(&format!("gw-mtls.{}.local", ns.name));
+    let host = format!("gw-mtls.{}.local", ns.name);
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    // Start with the old CA.
+    fixtures::apply_fixture(
+        gwa::FRONTEND_MTLS_CONFIGMAP,
+        FixtureVars::new(&ns.name)
+            .with("HOSTNAME", &host)
+            .with("SECRET_NAME", "gw-mtls-server-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64())
+            .with("CA_CRT_PEM", &old_mtls.ca_cert_pem),
+    )
+    .await?;
+
+    // Wait until the old CA is active: old client cert is admitted.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("GEP-91 AllowValidOnly route {host}/ to accept old-CA client cert") },
+        || async {
+            match http::https_get_with_client_cert(
+                &host,
+                "/",
+                h.gateway_tls_addr,
+                &old_mtls.client_cert_pem,
+                &old_mtls.client_key_pem,
+            )
+            .await
+            {
+                Ok((_, Some(_))) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    // Rotate the CA ConfigMap to the new CA.
+    let cms_api: Api<ConfigMap> = Api::namespaced(h.client.clone(), &ns.name);
+    let patch = serde_json::json!({
+        "data": {
+            "ca.crt": new_mtls.ca_cert_pem
+        }
+    });
+    cms_api
+        .patch(
+            "frontend-ca",
+            &KubePP::apply("coxswain-e2e"),
+            &KubePatch::Merge(&patch),
+        )
+        .await?;
+
+    // After rotation: new client cert must be accepted.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!(
+                "GEP-91 AllowValidOnly route {host}/ to accept new-CA client cert after CA rotation"
+            )
+        },
+        || async {
+            match http::https_get_with_client_cert(
+                &host,
+                "/",
+                h.gateway_tls_addr,
+                &new_mtls.client_cert_pem,
+                &new_mtls.client_key_pem,
+            )
+            .await
+            {
+                Ok((_, Some(_))) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    // Old client cert must now be rejected (signed by rotated-out CA).
+    let old_result = http::https_get_with_client_cert(
+        &host,
+        "/",
+        h.gateway_tls_addr,
+        &old_mtls.client_cert_pem,
+        &old_mtls.client_key_pem,
+    )
+    .await;
+    anyhow::ensure!(
+        old_result.is_err(),
+        "expected TLS failure for cert signed by old (rotated-out) CA after CA rotation; \
+         got Ok: {:?}",
+        old_result.ok()
+    );
+
+    Ok(())
+}
+
+/// Gateway `spec.tls.frontend.default.validation.mode: AllowInsecureFallback`:
+/// a connection presenting **no** client certificate is admitted (200) because
+/// the handshake is never aborted (GEP-91 happy path — AllowInsecureFallback).
+#[tokio::test]
+async fn gateway_frontend_mtls_insecure_fallback_admits_missing_cert() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-mtls-fallback").await?;
+
+    let mtls = MtlsCerts::generate();
+    let server_cert = GeneratedCert::for_host(&format!("gw-mtls.{}.local", ns.name));
+    let host = format!("gw-mtls.{}.local", ns.name);
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        gwa::FRONTEND_MTLS_INSECURE_FALLBACK,
+        FixtureVars::new(&ns.name)
+            .with("HOSTNAME", &host)
+            .with("SECRET_NAME", "gw-mtls-server-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64())
+            .with("CA_CRT_PEM", &mtls.ca_cert_pem),
+    )
+    .await?;
+
+    // AllowInsecureFallback: a plain HTTPS connection (no client cert) must reach
+    // the backend — the proxy must not abort the handshake.
+    let resp =
+        wait::wait_for_https_route(h.gateway_tls_addr, &host, "/", Duration::from_secs(90)).await?;
+    resp.assert_backend("echo-a");
+
+    // A valid client cert must also be accepted (fallback ≠ cert rejection).
+    let resp_with_cert = wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            format!("GEP-91 AllowInsecureFallback route {host}/ to also accept a valid client cert")
+        },
+        || async {
+            match http::https_get_with_client_cert(
+                &host,
+                "/",
+                h.gateway_tls_addr,
+                &mtls.client_cert_pem,
+                &mtls.client_key_pem,
+            )
+            .await
+            {
+                Ok((_, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    resp_with_cert.assert_backend("echo-a");
     Ok(())
 }

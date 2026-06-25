@@ -16,7 +16,7 @@
 //! `lastTransitionTime` or bump `observedGeneration` (#347).
 
 use coxswain_e2e::{
-    ControllerOptions, FixtureVars, Harness, NamespaceGuard,
+    ControllerOptions, FixtureVars, GeneratedCert, Harness, MtlsCerts, NamespaceGuard,
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress},
     harness::wait,
 };
@@ -1221,4 +1221,100 @@ fn grpcroute_parent_condition(route: &GRPCRoute, type_: &str) -> Option<(String,
             .find(|c| c.type_ == type_)
             .map(|c| (c.status.clone(), c.reason.clone()))
     })
+}
+
+// ── GEP-91 InsecureFrontendValidationMode condition (#86) ─────────────────────
+
+/// Gateway `spec.tls.frontend.default.validation.mode: AllowInsecureFallback`
+/// must produce a top-level Gateway condition
+/// `InsecureFrontendValidationMode=True/ConfigurationChanged` (GEP-91 mandate).
+/// Reverting to `AllowValidOnly` must remove that condition.
+#[tokio::test]
+async fn gateway_signals_insecure_frontend_validation_mode_condition() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-insecure-cond").await?;
+
+    let mtls = MtlsCerts::generate();
+    let server_cert = GeneratedCert::for_host(&format!("gw-insecure.{}.local", ns.name));
+    let host = format!("gw-insecure.{}.local", ns.name);
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+
+    // Apply with AllowInsecureFallback; the gateway emits the GEP-91 warning condition.
+    fixtures::apply_fixture(
+        gwa::FRONTEND_MTLS_INSECURE_FALLBACK,
+        FixtureVars::new(&ns.name)
+            .with("HOSTNAME", &host)
+            .with("SECRET_NAME", "gw-insecure-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64())
+            .with("CA_CRT_PEM", &mtls.ca_cert_pem),
+    )
+    .await?;
+
+    // Gateway must gain InsecureFrontendValidationMode=True (GEP-91 mandate).
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-frontend-fallback",
+        &ns.name,
+        "InsecureFrontendValidationMode",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Flip the gateway-level frontend validation mode back to AllowValidOnly.
+    // GEP-91 places frontend validation at spec.tls.frontend (gateway-wide), a
+    // sibling of spec.listeners — not under a listener's tls block. A JSON merge
+    // patch on just the mode field leaves caCertificateRefs intact.
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let revert_to_valid_only = serde_json::json!({
+        "spec": {
+            "tls": {
+                "frontend": {
+                    "default": {
+                        "validation": {
+                            "mode": "AllowValidOnly"
+                        }
+                    }
+                }
+            }
+        }
+    });
+    gateways
+        .patch(
+            "coxswain-frontend-fallback",
+            &PatchParams::apply("coxswain-e2e"),
+            &Patch::Merge(&revert_to_valid_only),
+        )
+        .await?;
+
+    // InsecureFrontendValidationMode must be removed (absence = AllowValidOnly).
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            "Gateway coxswain-frontend-fallback to drop InsecureFrontendValidationMode condition \
+             after reverting to AllowValidOnly"
+                .to_string()
+        },
+        || async {
+            gateways
+                .get("coxswain-frontend-fallback")
+                .await
+                .ok()
+                .filter(|gw| {
+                    gw.status
+                        .as_ref()
+                        .and_then(|s| s.conditions.as_deref())
+                        .is_some_and(|conds| {
+                            !conds
+                                .iter()
+                                .any(|c| c.type_ == "InsecureFrontendValidationMode")
+                        })
+                })
+                .map(|_| ())
+        },
+    )
+    .await
 }

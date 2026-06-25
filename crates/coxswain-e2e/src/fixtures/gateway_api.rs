@@ -165,3 +165,27 @@ pub const MIRROR_MULTIPLE: &str = fixture!("mirror_multiple.yaml");
 /// Pair with [`CROSS_NAMESPACE_TENANT`] (echo-d + ReferenceGrant) applied to TENANTNS.
 /// Hostnamed `mirror-xns.${TESTNS}.local`.  Requires `TENANTNS` substitution.
 pub const MIRROR_XNS: &str = fixture!("mirror_xns.yaml");
+
+// ── Gateway frontend client-cert mTLS — GEP-91 (#86) ─────────────────────────
+
+/// Gateway + HTTPS listener with `spec.tls.frontend.default.validation`
+/// (AllowValidOnly, the GEP-91 default).  CA delivered via a ConfigMap with
+/// key `ca.crt`.  Handshakes without a valid client cert are aborted.
+/// Hostnamed `${HOSTNAME}`.
+/// Placeholders: `HOSTNAME`, `SECRET_NAME`, `TLS_CRT_B64`, `TLS_KEY_B64`, `CA_CRT_PEM`.
+pub const FRONTEND_MTLS_CONFIGMAP: &str = fixture!("frontend_mtls_configmap.yaml");
+
+/// Gateway + HTTPS listener with `spec.tls.frontend.default.validation.mode:
+/// AllowInsecureFallback` (GEP-91).  Client cert is requested but the handshake
+/// is never aborted on a missing or invalid cert.
+/// Hostnamed `${HOSTNAME}`.
+/// Placeholders: `HOSTNAME`, `SECRET_NAME`, `TLS_CRT_B64`, `TLS_KEY_B64`, `CA_CRT_PEM`.
+pub const FRONTEND_MTLS_INSECURE_FALLBACK: &str = fixture!("frontend_mtls_insecure_fallback.yaml");
+
+/// Gateway + HTTPS listener whose `spec.tls.frontend.default.validation`
+/// references a ConfigMap (`does-not-exist`) that is absent from the cluster.
+/// The controller resolves to `Unavailable` and the proxy fail-closes every
+/// TLS handshake on this hostname.
+/// Hostnamed `${HOSTNAME}`.
+/// Placeholders: `HOSTNAME`, `SECRET_NAME`, `TLS_CRT_B64`, `TLS_KEY_B64`.
+pub const FRONTEND_MTLS_MISSING_CA: &str = fixture!("frontend_mtls_missing_ca.yaml");

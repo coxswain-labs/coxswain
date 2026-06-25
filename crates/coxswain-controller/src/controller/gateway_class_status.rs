@@ -14,6 +14,8 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "GRPCRoute",
     "Gateway",
     "GatewayAddressEmpty",
+    "GatewayFrontendClientCertificateValidation",
+    "GatewayFrontendClientCertificateValidationInsecureFallback",
     "GatewayHTTPListenerIsolation",
     "GatewayHTTPSListenerDetectMisdirectedRequests",
     "GatewayPort8080",

@@ -154,6 +154,7 @@ fn client_cert_state_to_wire(s: &ClientCertConfigState) -> p::ClientCertConfigSt
                 ca_pem: cfg.ca_pem.clone(),
                 verify_depth: cfg.verify_depth,
                 pass_to_upstream: cfg.pass_to_upstream,
+                allow_insecure_fallback: cfg.allow_insecure_fallback,
             })
         }
         ClientCertConfigState::Unavailable => p::client_cert_config_state::Kind::Unavailable(true),
@@ -255,7 +256,8 @@ pub fn client_cert_from_wire(dto: &p::ClientCertStore) -> Result<ClientCertStore
 fn client_cert_state_from_wire(dto: &p::ClientCertConfigState) -> ClientCertConfigState {
     match &dto.kind {
         Some(p::client_cert_config_state::Kind::Config(cfg)) => ClientCertConfigState::Config(
-            ClientCertConfig::new(cfg.ca_pem.clone(), cfg.verify_depth, cfg.pass_to_upstream),
+            ClientCertConfig::new(cfg.ca_pem.clone(), cfg.verify_depth, cfg.pass_to_upstream)
+                .with_insecure_fallback(cfg.allow_insecure_fallback),
         ),
         Some(p::client_cert_config_state::Kind::Unavailable(_)) | None => {
             ClientCertConfigState::Unavailable
@@ -362,10 +364,14 @@ mod tests {
             3,
             true,
         )));
+        let fallback_cfg = Arc::new(ClientCertConfigState::Config(
+            ClientCertConfig::new(b"CA2".to_vec(), 1, false).with_insecure_fallback(true),
+        ));
         let unavail = Arc::new(ClientCertConfigState::Unavailable);
 
         let mut b = ClientCertStoreBuilder::new();
         b.add_config("strict.example.com", cfg);
+        b.add_config("fallback.example.com", fallback_cfg);
         b.add_config("*.example.com", unavail);
         let store = b.build();
 
@@ -376,8 +382,21 @@ mod tests {
             Some(ClientCertConfigState::Config(c)) => {
                 assert_eq!(c.verify_depth, 3, "verify_depth preserved");
                 assert!(c.pass_to_upstream, "pass_to_upstream preserved");
+                assert!(
+                    !c.allow_insecure_fallback,
+                    "allow_insecure_fallback defaults false"
+                );
             }
             other => panic!("expected Config, got {other:?}"),
+        }
+        match store2.find_config("fallback.example.com").as_deref() {
+            Some(ClientCertConfigState::Config(c)) => {
+                assert!(
+                    c.allow_insecure_fallback,
+                    "allow_insecure_fallback=true round-trips"
+                );
+            }
+            other => panic!("expected Config for fallback, got {other:?}"),
         }
         match store2.find_config("sub.example.com").as_deref() {
             Some(ClientCertConfigState::Unavailable) => {}

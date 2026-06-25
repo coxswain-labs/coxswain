@@ -18,7 +18,7 @@ use coxswain_reflector::gw_types::v::gateways::{
     GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::tls::ListenerInfo;
+use coxswain_reflector::tls::{FrontendValidationOutcome, ListenerInfo};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Conditions whose `type` starts with this prefix are owned by the
@@ -118,6 +118,15 @@ pub(crate) fn listener_route_kind_info(
 ///   mirrors the TLS outcome — `True, reason=Programmed` when healthy,
 ///   `False, reason=<outcome.reason()>` otherwise.
 ///
+/// `frontend_validation` is the Gateway-wide GEP-91 client-cert validation
+/// health (`spec.tls.frontend.default.validation`). When it failed to resolve
+/// its CA ref, **every HTTPS listener** is impacted (the listener can no longer
+/// validate clients): `ResolvedRefs=False/InvalidCACertificateRef`,
+/// `Accepted=False/NoValidCACertificate`, `Programmed=False`. HTTP listeners
+/// are untouched — frontend validation only gates TLS-terminating listeners.
+/// This is what the `GatewayFrontendInvalidDefaultClientCertificateValidation`
+/// conformance test asserts.
+///
 /// `info` is the snapshot for this listener from
 /// `SharedGatewayListenerHealth.load()`; pass `None` for listeners the
 /// reflector hasn't yet computed (initial sync, or a Gateway whose class
@@ -132,7 +141,23 @@ pub(crate) fn build_listener_status(
 ) -> GatewayStatusListeners {
     let outcome = info.map(|i| i.tls_outcome.clone()).unwrap_or_default();
     let (has_invalid_kinds, supported_kinds_list) = listener_route_kind_info(listener);
-    let (resolved_refs_status, resolved_refs_reason, resolved_refs_msg) = if has_invalid_kinds {
+    // GEP-91: this listener's frontend client-cert CA ref (perPort override or
+    // gateway default) failed to resolve. It takes precedence over the
+    // per-listener cert outcome — even a listener with a valid server
+    // certificate cannot validate clients without a usable CA, so it is not
+    // Programmed. `frontend_outcome` is NotApplicable for non-HTTPS listeners
+    // and for HTTPS listeners with no frontend validation configured.
+    let frontend_outcome = info.map(|i| &i.frontend_outcome);
+    let frontend_ca_failed = frontend_outcome.is_some_and(FrontendValidationOutcome::is_failed);
+    let frontend_reason = frontend_outcome
+        .map(FrontendValidationOutcome::resolved_refs_reason)
+        .unwrap_or("ResolvedRefs");
+    let frontend_msg = frontend_outcome
+        .map(FrontendValidationOutcome::message)
+        .unwrap_or("");
+    let (resolved_refs_status, resolved_refs_reason, resolved_refs_msg) = if frontend_ca_failed {
+        ("False", frontend_reason, frontend_msg)
+    } else if has_invalid_kinds {
         (
             "False",
             "InvalidRouteKinds",
@@ -142,6 +167,13 @@ pub(crate) fn build_listener_status(
         ("True", "ResolvedRefs", "")
     } else {
         ("False", outcome.reason(), outcome.message())
+    };
+    // Accepted is True/Accepted unless the frontend CA failed, in which case the
+    // HTTPS listener has no valid CA to terminate mutual TLS with.
+    let (accepted_status, accepted_reason, accepted_msg) = if frontend_ca_failed {
+        ("False", "NoValidCACertificate", frontend_msg)
+    } else {
+        ("True", "Accepted", "")
     };
     // Port-conflict detection (#201): a Gateway listener whose port is
     // reserved by the Ingress data plane (--proxy-http-port / --proxy-https-port)
@@ -155,6 +187,8 @@ pub(crate) fn build_listener_status(
     );
     let (listener_prog_status, listener_prog_reason, listener_prog_msg) = if port_conflict {
         ("False", "PortUnavailable", port_conflict_msg.as_str())
+    } else if frontend_ca_failed {
+        ("False", "NoValidCACertificate", frontend_msg)
     } else if outcome.is_healthy() {
         ("True", "Programmed", "")
     } else {
@@ -170,7 +204,14 @@ pub(crate) fn build_listener_status(
         "Listener status"
     );
     let listener_conditions = vec![
-        make_condition("Accepted", "True", "Accepted", "", generation, now.clone()),
+        make_condition(
+            "Accepted",
+            accepted_status,
+            accepted_reason,
+            accepted_msg,
+            generation,
+            now.clone(),
+        ),
         make_condition(
             "ResolvedRefs",
             resolved_refs_status,

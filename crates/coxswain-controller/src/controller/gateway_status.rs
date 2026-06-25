@@ -19,6 +19,19 @@ pub(super) fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerH
     if !super::conditions::gateway_programmed(gw) {
         return true;
     }
+    // GEP-91: a mode flip to/from AllowInsecureFallback must add/remove the
+    // InsecureFrontendValidationMode condition, which in turn requires a patch.
+    let desired_insecure = health
+        .frontend_validation
+        .as_ref()
+        .is_some_and(|fv| fv.insecure_fallback);
+    let current_insecure = has_condition(
+        gw.status.as_ref().and_then(|s| s.conditions.as_deref()),
+        "InsecureFrontendValidationMode",
+    );
+    if desired_insecure != current_insecure {
+        return true;
+    }
     let current_listener_count = gw
         .status
         .as_ref()
@@ -34,11 +47,16 @@ pub(super) fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerH
         .and_then(|s| s.listeners.as_ref())
         .map(Vec::as_slice)
         .unwrap_or(&[]);
+    // GEP-91: a per-listener frontend CA ref that failed to resolve drives that
+    // listener to ResolvedRefs=False, so it must be folded into the
+    // desired-health comparison or a frontend-only failure would never patch.
     for listener in &gw.spec.listeners {
         let (has_invalid_kinds, _) = listener_route_kind_info(listener);
         let info = health.listeners.get(&listener.name);
-        let desired_healthy =
-            !has_invalid_kinds && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true);
+        let frontend_impacts = info.is_some_and(|i| i.frontend_outcome.is_failed());
+        let desired_healthy = !has_invalid_kinds
+            && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true)
+            && !frontend_impacts;
         let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);
         let current_resolved = current_listener
             .map(|sl| has_condition(Some(sl.conditions.as_slice()), "ResolvedRefs"))
@@ -123,6 +141,22 @@ pub(super) fn build_gateway_status_patch(
             now.clone(),
         ),
     ];
+    // GEP-91: emit InsecureFrontendValidationMode=True when mode is AllowInsecureFallback.
+    // The condition is omitted entirely when mode is AllowValidOnly (its absence = valid).
+    if let Some(fv) = health.frontend_validation.as_ref()
+        && fv.insecure_fallback
+    {
+        conditions.push(make_condition(
+            "InsecureFrontendValidationMode",
+            "True",
+            "ConfigurationChanged",
+            "Gateway spec.tls.frontend.default.validation.mode is AllowInsecureFallback; \
+             client certificates are requested but not enforced. \
+             Authorization is delegated to backends.",
+            generation,
+            now.clone(),
+        ));
+    }
     if let Some(existing) = gw.status.as_ref().and_then(|s| s.conditions.as_deref()) {
         conditions.extend(
             existing
