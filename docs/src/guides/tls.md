@@ -275,6 +275,92 @@ kubectl get gateway <name> -o jsonpath='{.status.conditions[?(@.type=="InsecureF
 
 A listener whose effective CA ref cannot be resolved fails closed and surfaces the GEP-91 reason on its `ResolvedRefs` condition: `InvalidCACertificateRef` (missing ConfigMap / no `ca.crt` / not PEM), `InvalidCACertificateKind` (ref kind is not `ConfigMap`), or `RefNotPermitted` (cross-namespace without a `ReferenceGrant`).
 
+## Gateway backend client certificate (GEP-3155)
+
+Coxswain implements **GEP-3155**: when a Gateway carries `spec.tls.backend.clientCertificateRef`, the proxy presents that certificate as its client identity when opening TLS connections to upstream pods. This enables backend mutual TLS — the upstream can verify the proxy's identity in addition to the proxy verifying the upstream's certificate.
+
+!!! important
+    The backend client cert is **only applied on connections driven by a `BackendTLSPolicy`**. `BackendTLSPolicy` is the Gateway API mechanism for configuring upstream TLS; without it the connection to the backend is cleartext (or appProtocol-derived TLS without policy), and `clientCertificateRef` has no effect.
+
+### Configuration
+
+Store the client certificate in a `kubernetes.io/tls` Secret in the **same namespace** as the Gateway, then reference it from `spec.tls.backend.clientCertificateRef`:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      ...
+  tls:
+    backend:
+      clientCertificateRef:
+        group: ""
+        kind: Secret
+        name: proxy-client-cert    # kubernetes.io/tls; same namespace as Gateway
+```
+
+The Secret must be type `kubernetes.io/tls` with both `tls.crt` (PEM certificate chain) and `tls.key` (PEM private key):
+
+```bash
+kubectl create secret tls proxy-client-cert \
+  --cert=path/to/client.pem \
+  --key=path/to/client.key
+```
+
+Pair with a `BackendTLSPolicy` that selects the upstream pods — the policy establishes the upstream TLS context in which the client cert is presented:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1alpha3
+kind: BackendTLSPolicy
+metadata:
+  name: my-service-tls
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: my-service
+  validation:
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: my-service-ca
+    hostname: my-service.internal
+```
+
+### Status conditions
+
+The controller reflects resolution on a gateway-level `ResolvedRefs` condition:
+
+| Outcome | `ResolvedRefs` | Reason |
+|---------|---------------|--------|
+| Secret found with valid `tls.crt`/`tls.key` | `True` | `ResolvedRefs` |
+| `clientCertificateRef` not set | condition absent | — |
+| Secret missing | `False` | `InvalidClientCertificateRef` |
+| Secret is not type `kubernetes.io/tls` | `False` | `InvalidClientCertificateRef` |
+| Unsupported group or kind in the ref | `False` | `InvalidClientCertificateRef` |
+| Cross-namespace ref without a `ReferenceGrant` | `False` | `RefNotPermitted` |
+
+When the ref fails to resolve, the proxy **fails closed on that upstream**: any connection to a BackendTLSPolicy-selected backend via this Gateway returns `502`. Connections to non-TLS backends are unaffected.
+
+### Hot-reload
+
+The controller resolves the Secret and pushes the cert bytes to the proxy via the discovery snapshot. When the Secret is updated (e.g. certificate rotation), the controller re-resolves and publishes the new bytes; the proxy picks them up on the next connection without any restart.
+
+Connections already in flight use the cert that was in effect when the connection was opened. New connections after the rotation use the new cert.
+
+### Out of scope
+
+| Feature | Status |
+|---------|--------|
+| Cross-namespace `clientCertificateRef` | Planned — requires a `ReferenceGrant`; without one the Gateway surfaces `ResolvedRefs=False/RefNotPermitted` |
+
 ## Wildcard TLS
 
 For wildcard hostname TLS (e.g. `*.example.com`), the TLS Secret's `tls.crt` must include a wildcard SAN. Coxswain follows RFC 6125 for TLS matching: a single-label wildcard (`*.example.com`) matches `foo.example.com` but not `foo.bar.example.com`.

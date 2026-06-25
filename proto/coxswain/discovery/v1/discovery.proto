@@ -286,6 +286,11 @@ message UpstreamTls {
     bytes bundle = 3; // PEM bytes
   }
   uint64 group_key = 4;
+  // GEP-3155 backend client certificate the Gateway presents to the upstream.
+  // All three empty/absent = no client cert. client_cert_source is "ns/name".
+  bytes client_cert_pem = 5;
+  bytes client_cert_key = 6;
+  string client_cert_source = 7;
 }
 
 // Mirrors RetryPolicy.

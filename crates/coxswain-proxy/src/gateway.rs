@@ -126,7 +126,13 @@ impl ProxyHttp for GatewayProxy {
         _session: &mut Session,
         ctx: &mut ProxyCtx,
     ) -> Result<Box<HttpPeer>> {
-        hooks::upstream_peer(&self.cfg.ca_cache, &self.cfg.circuit_breakers, ctx).await
+        hooks::upstream_peer(
+            &self.cfg.ca_cache,
+            &self.cfg.backend_client_cert_cache,
+            &self.cfg.circuit_breakers,
+            ctx,
+        )
+        .await
     }
 
     async fn upstream_request_filter(

@@ -72,6 +72,8 @@ func TestConformance(t *testing.T) {
 		features.SupportGatewayPort8080,
 		// Extended: empty Gateway address value (#34)
 		features.SupportGatewayAddressEmpty,
+		// Standard: backend client-certificate (mTLS to upstream) — GEP-3155 (#87)
+		features.SupportGatewayBackendClientCertificate,
 		// Standard: frontend client-certificate validation — GEP-91 (#86)
 		features.SupportGatewayFrontendClientCertificateValidation,
 		features.SupportGatewayFrontendClientCertificateValidationInsecureFallback,

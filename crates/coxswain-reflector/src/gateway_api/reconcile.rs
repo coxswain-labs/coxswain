@@ -20,8 +20,9 @@ use coxswain_core::crd::{PathRewriteRegex, RateLimit};
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
-    BackendGroup, BackendProtocol, FilterAction, GatewayRoutingTableBuilder, HostRouterBuilder,
-    MatchPredicates, RateLimitConfig, RouteEntry, RouteTimeouts, UpstreamTls, WildcardKind,
+    BackendClientCert, BackendGroup, BackendProtocol, FilterAction, GatewayRoutingTableBuilder,
+    HostRouterBuilder, MatchPredicates, RateLimitConfig, RouteEntry, RouteTimeouts, UpstreamTls,
+    WildcardKind,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -54,6 +55,11 @@ pub struct RouteResolution<'a> {
     /// `PathRewriteRegex` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s.
     pub path_rewrites: &'a reflector::Store<PathRewriteRegex>,
+    /// `ObjectKey(gw_ns, gw_name) → BackendClientCert` for Gateways that resolved a
+    /// `spec.tls.backend.clientCertificateRef` (GEP-3155). A route's effective client
+    /// cert comes from its owned parent Gateway; it is attached to any `UpstreamTls`
+    /// the route's backends carry (BackendTLSPolicy-driven TLS).
+    pub backend_client_certs: &'a HashMap<ObjectKey, Arc<BackendClientCert>>,
 }
 
 impl GatewayApiReconciler {
@@ -80,6 +86,7 @@ impl GatewayApiReconciler {
             policy_index,
             rate_limits,
             path_rewrites,
+            backend_client_certs,
         } = resolution;
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
@@ -112,6 +119,37 @@ impl GatewayApiReconciler {
             );
             return;
         }
+
+        // GEP-3155: the backend client cert the Gateway presents on upstream TLS is
+        // gateway-scoped. A route inherits it from its first owned parent Gateway that
+        // resolved a `spec.tls.backend.clientCertificateRef`. Attached below to any
+        // `UpstreamTls` the route's backends carry (BackendTLSPolicy-driven TLS).
+        //
+        // A route attached to multiple owned Gateways with *different* backend client
+        // certs resolves to the first such parentRef in declaration order: the cert
+        // rides the route's single shared `BackendGroup`, so per-parent divergence
+        // cannot be expressed. Deterministic (parentRefs is an ordered list); the
+        // single-Gateway case (and conformance) is unambiguous.
+        let route_client_cert: Option<&Arc<BackendClientCert>> = route
+            .spec
+            .parent_refs
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|p| {
+                parent_ref_owned(
+                    p.group.as_deref(),
+                    p.kind.as_deref(),
+                    p.namespace.as_deref(),
+                    &p.name,
+                    route_ns,
+                    owned_gateways,
+                )
+            })
+            .find_map(|p| {
+                let gw_ns = p.namespace.as_deref().unwrap_or(route_ns);
+                backend_client_certs.get(&ObjectKey::new(gw_ns, p.name.as_str()))
+            });
 
         let rules = match route.spec.rules.as_deref() {
             Some(r) if !r.is_empty() => r,
@@ -218,6 +256,14 @@ impl GatewayApiReconciler {
                     .with_protocol(protocol)
                     .with_per_backend_filters(per_backend_filters);
                 if let Some(tls) = policy_tls {
+                    // Attach the gateway's GEP-3155 client cert to the policy-derived
+                    // UpstreamTls so the proxy presents it for upstream mTLS. Clones the
+                    // shared Arc'd UpstreamTls only on the rare route that has both a
+                    // BackendTLSPolicy and a gateway backend client cert.
+                    let tls = match route_client_cert {
+                        Some(cc) => Arc::new((*tls).clone().with_client_cert(Arc::clone(cc))),
+                        None => tls,
+                    };
                     group = group.with_tls(tls);
                 }
                 let group = Arc::new(group);
@@ -854,6 +900,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -890,6 +937,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -926,6 +974,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -954,6 +1003,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -981,6 +1031,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -1048,6 +1099,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -1090,6 +1142,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -1158,6 +1211,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -1237,6 +1291,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -1290,6 +1345,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -1377,6 +1433,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -1420,6 +1477,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -1455,6 +1513,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -1492,6 +1551,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -1521,6 +1581,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -1556,6 +1617,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );

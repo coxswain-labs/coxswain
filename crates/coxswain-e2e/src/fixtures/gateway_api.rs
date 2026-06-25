@@ -189,3 +189,15 @@ pub const FRONTEND_MTLS_INSECURE_FALLBACK: &str = fixture!("frontend_mtls_insecu
 /// Hostnamed `${HOSTNAME}`.
 /// Placeholders: `HOSTNAME`, `SECRET_NAME`, `TLS_CRT_B64`, `TLS_KEY_B64`.
 pub const FRONTEND_MTLS_MISSING_CA: &str = fixture!("frontend_mtls_missing_ca.yaml");
+
+/// Gateway HTTP listener + HTTPRoute → echo-tls backend + BackendTLSPolicy +
+/// `spec.tls.backend.clientCertificateRef` pointing to a `kubernetes.io/tls` Secret.
+/// Happy path for GEP-3155 (#87).
+/// Placeholders: `TLS_HOSTNAME`, `CA_PEM`, `CLIENT_CERT_B64`, `CLIENT_KEY_B64`.
+pub const BACKEND_CLIENT_CERT: &str = fixture!("backend_client_cert.yaml");
+
+/// Gateway with `spec.tls.backend.clientCertificateRef` pointing to a Secret that
+/// does not exist — controller must write `ResolvedRefs=False/InvalidClientCertificateRef`.
+/// Sad path for GEP-3155 (#87).  No backend deployment needed.
+pub const BACKEND_CLIENT_CERT_MISSING_SECRET: &str =
+    fixture!("backend_client_cert_missing_secret.yaml");

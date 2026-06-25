@@ -749,6 +749,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -798,6 +799,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -845,6 +847,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -898,6 +901,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );
@@ -958,6 +962,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
             },
             &mut builder,
         );

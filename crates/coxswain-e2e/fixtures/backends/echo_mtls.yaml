@@ -1,0 +1,80 @@
+# mTLS echo backend for GEP-3155 backend-client-cert e2e tests (#87).
+#
+# Like echo_tls.yaml but additionally sets TLS_CLIENT_CACERTS so the server
+# requires and validates a client certificate from every caller.  Only callers
+# presenting a cert signed by TLS_CLIENT_CA_B64 will complete the TLS handshake.
+#
+# Substitutions (see tests applying backends::ECHO_MTLS):
+#   * base64-encoded server certificate PEM (TLS_SERVER_CERT_B64)
+#   * base64-encoded server private key PEM (TLS_SERVER_KEY_B64)
+#   * base64-encoded client-CA certificate PEM (TLS_CLIENT_CA_B64) — the CA
+#     used to verify the proxy's client cert
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: echo-mtls-creds
+type: Opaque
+data:
+  tls.crt: ${TLS_SERVER_CERT_B64}
+  tls.key: ${TLS_SERVER_KEY_B64}
+  client-ca.crt: ${TLS_CLIENT_CA_B64}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-mtls
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-mtls
+  template:
+    metadata:
+      labels:
+        app: echo-mtls
+    spec:
+      containers:
+        - name: echo
+          image: ${ECHO_IMAGE}
+          ports:
+            - containerPort: 3000
+              name: http
+            - containerPort: 8443
+              name: https
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: TLS_SERVER_CERT
+              value: /certs/tls.crt
+            - name: TLS_SERVER_PRIVKEY
+              value: /certs/tls.key
+            - name: TLS_CLIENT_CACERTS
+              value: /certs/client-ca.crt
+          volumeMounts:
+            - name: tls-creds
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: tls-creds
+          secret:
+            secretName: echo-mtls-creds
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-mtls
+spec:
+  selector:
+    app: echo-mtls
+  ports:
+    - port: 8443
+      targetPort: 8443
+      name: https
+      appProtocol: https

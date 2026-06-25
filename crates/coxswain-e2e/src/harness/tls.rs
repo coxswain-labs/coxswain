@@ -208,4 +208,16 @@ impl MtlsCerts {
     pub fn ca_cert_b64(&self) -> String {
         base64::engine::general_purpose::STANDARD.encode(self.ca_cert_pem.as_bytes())
     }
+
+    /// Client certificate PEM encoded as base64, for use in a Kubernetes Secret's `data` field.
+    #[must_use]
+    pub fn client_cert_b64(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(self.client_cert_pem.as_bytes())
+    }
+
+    /// Client private key PEM encoded as base64, for use in a Kubernetes Secret's `data` field.
+    #[must_use]
+    pub fn client_key_b64(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(self.client_key_pem.as_bytes())
+    }
 }

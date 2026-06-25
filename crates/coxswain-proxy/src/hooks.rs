@@ -32,7 +32,7 @@
 use crate::config::AccessLogPathMode;
 use crate::ctx::{CONN_INFO, MirrorDispatch, ProxyCtx, ResolvedRoute};
 use crate::edge::tls::ConnTlsInfo;
-use crate::edge::upstream_ca::UpstreamCaCache;
+use crate::edge::upstream_ca::{BackendClientCertCache, UpstreamCaCache};
 use crate::filters::TrafficFilter;
 use crate::filters::cors::try_cors_preflight;
 use crate::filters::redirect::{extract_host, try_redirect};
@@ -663,6 +663,7 @@ pub(crate) fn request_body_filter(
 /// `BackendTLSPolicy` CA bundle).
 pub(crate) async fn upstream_peer(
     ca_cache: &UpstreamCaCache,
+    backend_client_cert_cache: &BackendClientCertCache,
     circuit_breakers: &crate::policy::circuit_breaker::CircuitBreakerRegistry,
     ctx: &mut ProxyCtx,
 ) -> Result<Box<HttpPeer>> {
@@ -727,33 +728,33 @@ pub(crate) async fn upstream_peer(
     let protocol = resolved.backend_group.protocol();
 
     // BackendTLSPolicy overrides appProtocol-derived TLS decisions.
-    let (is_tls, sni_host, group_key, ca_override) =
-        if let Some(btls) = resolved.backend_group.upstream_tls() {
-            let ca = match &btls.ca {
-                UpstreamCa::System => None,
-                UpstreamCa::Bundle(pem) => {
-                    let parsed = ca_cache.get_or_parse(btls.group_key, pem);
-                    if parsed.is_none() {
-                        return Err(pingora_core::Error::explain(
-                            HTTPStatus(502),
-                            "BackendTLSPolicy CA bundle parse failed",
-                        ));
-                    }
-                    parsed
+    let btls_opt = resolved.backend_group.upstream_tls();
+    let (is_tls, sni_host, group_key, ca_override) = if let Some(btls) = btls_opt.as_deref() {
+        let ca = match &btls.ca {
+            UpstreamCa::System => None,
+            UpstreamCa::Bundle(pem) => {
+                let parsed = ca_cache.get_or_parse(btls.group_key, pem);
+                if parsed.is_none() {
+                    return Err(pingora_core::Error::explain(
+                        HTTPStatus(502),
+                        "BackendTLSPolicy CA bundle parse failed",
+                    ));
                 }
-                _ => None, // non-exhaustive guard
-            };
-            // SNI must be an owned `String`: `HttpPeer::new` takes ownership, so a
-            // fresh allocation is unavoidable here regardless of any cache (#397).
-            // This is once per outbound TLS connection, not per request.
-            (true, btls.sni.to_string(), btls.group_key, ca)
-        } else if protocol.is_tls() {
-            // appProtocol-driven TLS: use the request Host as SNI (existing behaviour).
-            // Owned for the same `HttpPeer::new` reason as the BackendTLSPolicy arm.
-            (true, resolved.original_host.to_string(), 0u64, None)
-        } else {
-            (false, String::new(), 0u64, None)
+                parsed
+            }
+            _ => None, // non-exhaustive guard
         };
+        // SNI must be an owned `String`: `HttpPeer::new` takes ownership, so a
+        // fresh allocation is unavoidable here regardless of any cache (#397).
+        // This is once per outbound TLS connection, not per request.
+        (true, btls.sni.to_string(), btls.group_key, ca)
+    } else if protocol.is_tls() {
+        // appProtocol-driven TLS: use the request Host as SNI (existing behaviour).
+        // Owned for the same `HttpPeer::new` reason as the BackendTLSPolicy arm.
+        (true, resolved.original_host.to_string(), 0u64, None)
+    } else {
+        (false, String::new(), 0u64, None)
+    };
 
     // Pass SocketAddr directly — avoids the per-request addr.to_string() allocation.
     let mut peer = HttpPeer::new(addr, is_tls, sni_host);
@@ -762,6 +763,26 @@ pub(crate) async fn upstream_peer(
     peer.options.verify_hostname = is_tls;
     if let Some(ca) = ca_override {
         peer.options.ca = Some(ca);
+    }
+    // GEP-3155: if the matched BackendTLSPolicy route carries a gateway-level backend
+    // client cert, load (or get from cache) and set it on the peer so the proxy
+    // presents it during the upstream TLS handshake. Failure → 502 rather than
+    // silently connecting without a cert (fail-closed, matching BackendTLSPolicy CA).
+    if let Some(btls) = btls_opt.as_deref() {
+        if let Some(cc) = btls.client_cert() {
+            match backend_client_cert_cache.get_or_parse(btls.group_key, &cc.cert_pem, &cc.key_pem)
+            {
+                Some(cert_key) => {
+                    peer.client_cert_key = Some(cert_key);
+                }
+                None => {
+                    return Err(pingora_core::Error::explain(
+                        HTTPStatus(502),
+                        "gateway backend client cert PEM parse failed",
+                    ));
+                }
+            }
+        }
     }
     if protocol.is_h2() {
         peer.options.set_http_version(2, 2);

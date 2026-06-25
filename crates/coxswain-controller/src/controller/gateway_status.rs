@@ -32,6 +32,30 @@ pub(super) fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerH
     if desired_insecure != current_insecure {
         return true;
     }
+    // GEP-3155: the gateway-level ResolvedRefs condition mirrors backend
+    // client-cert resolution. A change in its presence, status, or reason
+    // requires a patch (a frontend/listener change alone would otherwise miss it).
+    let current_resolved_refs = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .and_then(|cs| cs.iter().find(|c| c.type_ == "ResolvedRefs"));
+    match health.backend_client_cert.as_ref() {
+        Some(outcome) => {
+            let up_to_date = current_resolved_refs.is_some_and(|c| {
+                c.status == outcome.resolved_refs_status()
+                    && c.reason == outcome.resolved_refs_reason()
+            });
+            if !up_to_date {
+                return true;
+            }
+        }
+        None => {
+            if current_resolved_refs.is_some() {
+                return true;
+            }
+        }
+    }
     let current_listener_count = gw
         .status
         .as_ref()
@@ -157,6 +181,21 @@ pub(super) fn build_gateway_status_patch(
             now.clone(),
         ));
     }
+    // GEP-3155: emit a gateway-level ResolvedRefs condition reflecting
+    // spec.tls.backend.clientCertificateRef resolution. Emitted only when the ref is
+    // present (`Some`); its absence means no backend client cert is configured. This
+    // is independent of Accepted/Programmed, which stay True — the invalid-config
+    // conformance gateways keep Accepted=True while ResolvedRefs goes False.
+    if let Some(outcome) = health.backend_client_cert.as_ref() {
+        conditions.push(make_condition(
+            "ResolvedRefs",
+            outcome.resolved_refs_status(),
+            outcome.resolved_refs_reason(),
+            outcome.message(),
+            generation,
+            now.clone(),
+        ));
+    }
     if let Some(existing) = gw.status.as_ref().and_then(|s| s.conditions.as_deref()) {
         conditions.extend(
             existing
@@ -197,12 +236,13 @@ pub(super) fn build_gateway_status_patch(
 
 #[cfg(test)]
 mod tests {
-    use super::super::gateway_status::gateway_needs_status_patch;
+    use super::super::gateway_status::{build_gateway_status_patch, gateway_needs_status_patch};
     use coxswain_reflector::gw_types::v::gateways::{
         Gateway, GatewaySpec, GatewayStatus, GatewayStatusListeners,
     };
-    use coxswain_reflector::tls::GatewayListenerHealth;
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+    use coxswain_reflector::ingress::IngressPorts;
+    use coxswain_reflector::tls::{BackendClientCertOutcome, GatewayListenerHealth};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
     fn condition(type_: &str, observed_gen: i64) -> Condition {
         // Reason matches what `build_gateway_status_patch` writes: `Accepted` and
@@ -328,5 +368,143 @@ mod tests {
             Some(vec![listener_status("http", 1)]),
         );
         assert!(!gateway_needs_status_patch(&gw, &default_health()));
+    }
+
+    // ── GEP-3155 gateway-level ResolvedRefs (backend client cert) ─────────────
+
+    fn epoch() -> Time {
+        Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH)
+    }
+
+    fn health_with_backend(outcome: BackendClientCertOutcome) -> GatewayListenerHealth {
+        let mut h = GatewayListenerHealth::default();
+        h.backend_client_cert = Some(outcome);
+        h
+    }
+
+    #[test]
+    fn needs_patch_when_backend_resolvedrefs_missing() {
+        // Ref configured (Resolved) but status has no top-level ResolvedRefs yet.
+        let gw = gateway(
+            1,
+            Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
+            Some(vec![listener_status("http", 1)]),
+        );
+        assert!(gateway_needs_status_patch(
+            &gw,
+            &health_with_backend(BackendClientCertOutcome::Resolved)
+        ));
+    }
+
+    #[test]
+    fn needs_patch_when_backend_resolvedrefs_reason_changed() {
+        // Status says True/ResolvedRefs but desired is False/InvalidClientCertificateRef.
+        let gw = gateway(
+            1,
+            Some(vec![
+                condition("Accepted", 1),
+                condition("Programmed", 1),
+                condition("ResolvedRefs", 1),
+            ]),
+            Some(vec![listener_status("http", 1)]),
+        );
+        let desired = BackendClientCertOutcome::InvalidClientCertificateRef {
+            message: "Secret gw-ns/missing: secret not found in store".to_string(),
+        };
+        assert!(gateway_needs_status_patch(
+            &gw,
+            &health_with_backend(desired)
+        ));
+    }
+
+    #[test]
+    fn no_patch_when_backend_resolvedrefs_resolved_and_present() {
+        let gw = gateway(
+            1,
+            Some(vec![
+                condition("Accepted", 1),
+                condition("Programmed", 1),
+                condition("ResolvedRefs", 1),
+            ]),
+            Some(vec![listener_status("http", 1)]),
+        );
+        assert!(!gateway_needs_status_patch(
+            &gw,
+            &health_with_backend(BackendClientCertOutcome::Resolved)
+        ));
+    }
+
+    #[test]
+    fn needs_patch_when_backend_resolvedrefs_removed() {
+        // Status still carries ResolvedRefs but the ref is no longer configured.
+        let gw = gateway(
+            1,
+            Some(vec![
+                condition("Accepted", 1),
+                condition("Programmed", 1),
+                condition("ResolvedRefs", 1),
+            ]),
+            Some(vec![listener_status("http", 1)]),
+        );
+        assert!(gateway_needs_status_patch(&gw, &default_health()));
+    }
+
+    #[test]
+    fn patch_emits_resolvedrefs_false_keeping_accepted_true() {
+        let gw = gateway(1, None, None);
+        let health = health_with_backend(BackendClientCertOutcome::InvalidClientCertificateRef {
+            message: "Secret gw-ns/missing: secret not found in store".to_string(),
+        });
+        let patch =
+            build_gateway_status_patch(&gw, &health, 1, &epoch(), None, IngressPorts::default());
+        let conds = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions array");
+        let accepted = conds
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted present");
+        assert_eq!(accepted["status"], "True");
+        assert_eq!(accepted["reason"], "Accepted");
+        let rr = conds
+            .iter()
+            .find(|c| c["type"] == "ResolvedRefs")
+            .expect("ResolvedRefs present");
+        assert_eq!(rr["status"], "False");
+        assert_eq!(rr["reason"], "InvalidClientCertificateRef");
+    }
+
+    #[test]
+    fn patch_emits_resolvedrefs_true_when_resolved() {
+        let gw = gateway(1, None, None);
+        let health = health_with_backend(BackendClientCertOutcome::Resolved);
+        let patch =
+            build_gateway_status_patch(&gw, &health, 1, &epoch(), None, IngressPorts::default());
+        let rr = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions array")
+            .iter()
+            .find(|c| c["type"] == "ResolvedRefs")
+            .expect("ResolvedRefs present")
+            .clone();
+        assert_eq!(rr["status"], "True");
+        assert_eq!(rr["reason"], "ResolvedRefs");
+    }
+
+    #[test]
+    fn patch_omits_resolvedrefs_when_ref_absent() {
+        let gw = gateway(1, None, None);
+        let patch = build_gateway_status_patch(
+            &gw,
+            &default_health(),
+            1,
+            &epoch(),
+            None,
+            IngressPorts::default(),
+        );
+        let conds = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions array");
+        assert!(conds.iter().all(|c| c["type"] != "ResolvedRefs"));
     }
 }

@@ -14,6 +14,7 @@
 
 use super::route_builder::{
     build_client_certs, build_gateway_routes, build_routes, build_tls, count_attached_routes,
+    merge_backend_client_cert_health, resolve_backend_client_certs,
 };
 use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
 use crate::gateway_api::{
@@ -40,7 +41,9 @@ use coxswain_core::fleet::{self, SharedFleet};
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::naming::gep1762_resource_name;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
-use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
+use coxswain_core::routing::{
+    BackendClientCert, SharedGatewayRoutingTable, SharedIngressRoutingTable,
+};
 use coxswain_core::shared::Shared;
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedTlsStore};
 use futures::StreamExt;
@@ -572,6 +575,10 @@ pub(super) struct Ownership<'a> {
     /// `build_routes` and the per-route `reconcile` both need it on the same
     /// borrow pass — folding it in here keeps the function arities clippy-clean.
     pub(super) policy_index: &'a BackendTlsIndex,
+    /// Resolved GEP-3155 backend client certs, keyed by `ObjectKey(ns, gw_name)`.
+    /// Populated from `resolve_backend_client_certs` before the route build. Folded
+    /// into `Ownership` (same rationale as `policy_index`) to keep arities clean.
+    pub(super) backend_client_certs: &'a HashMap<ObjectKey, Arc<BackendClientCert>>,
 }
 
 /// Per-reflector side-effect channels: rebuild notification, readiness flip,
@@ -1151,6 +1158,12 @@ fn rebuild(
     let (policy_index, mut policy_health_map) =
         build_backend_tls_index(stores.policies, stores.configmaps, stores.services);
 
+    // GEP-3155: resolve each Gateway's backend client cert once. `certs` is attached
+    // to UpstreamTls during the route build; `health` feeds the gateway-level
+    // ResolvedRefs condition merged into `gateway_tls_health` below.
+    let backend_client_certs =
+        resolve_backend_client_certs(stores, &owned_gateway_classes, &cert_grants, true);
+
     let ownership = Ownership {
         ingress_classes: &owned_ingress_classes,
         default_ingress_class: owned_default_ingress_class.as_deref(),
@@ -1160,6 +1173,7 @@ fn rebuild(
         cert_grants: &cert_grants,
         ca_grants: &ca_grants,
         policy_index: &policy_index,
+        backend_client_certs: &backend_client_certs.certs,
     };
 
     let routes_published = build_routes(
@@ -1191,6 +1205,7 @@ fn rebuild(
         &mut gateway_tls_health,
         true,
     );
+    merge_backend_client_cert_health(&mut gateway_tls_health, &backend_client_certs.health);
 
     count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
 
@@ -1311,6 +1326,13 @@ fn rebuild(
     // clobber each other's routing cells.  A Gateway that is no longer cut-over
     // simply does not appear in the new map — automatic teardown with no explicit
     // delete path.
+    // GEP-3155: resolve backend client certs for the dedicated path once, outside
+    // the per-Gateway loop. `skip_cut_over=false` — cut-over Gateways are included
+    // (each IS the target Gateway for its dedicated proxy). The result is a HashMap
+    // keyed by Gateway ObjectKey; each iteration below looks up its own entry.
+    let dedicated_backend_client_certs =
+        resolve_backend_client_certs(stores, &owned_gateway_classes, &cert_grants, false);
+
     let empty_ingress_classes: HashSet<String> = HashSet::new();
     let mut registry_map: HashMap<ObjectKey, Arc<DedicatedRoutingSnapshot>> = HashMap::new();
     for gw in stores.gateways.state() {
@@ -1339,6 +1361,7 @@ fn rebuild(
             cert_grants: &cert_grants,
             ca_grants: &ca_grants,
             policy_index: &policy_index,
+            backend_client_certs: &dedicated_backend_client_certs.certs,
         };
 
         let gw_routes_cell: SharedGatewayRoutingTable = Shared::new();
@@ -1376,6 +1399,10 @@ fn rebuild(
             &client_certs_cell,
             &mut dedicated_tls_health,
             false,
+        );
+        merge_backend_client_cert_health(
+            &mut dedicated_tls_health,
+            &dedicated_backend_client_certs.health,
         );
 
         // Retain only the health entry for the owning Gateway.

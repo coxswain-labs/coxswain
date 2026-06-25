@@ -1,0 +1,78 @@
+# Gateway backend client-certificate (GEP-3155, #87): happy path.
+#
+# Gateway HTTP listener + HTTPRoute → echo-mtls backend (port 8443, requires client cert)
+# + BackendTLSPolicy for server verification + spec.tls.backend.clientCertificateRef
+# pointing to a kubernetes.io/tls Secret.  The proxy presents the client cert during
+# upstream TLS; the echo-mtls backend requires and validates it.
+#
+# Placeholders (see gateway_api::BACKEND_CLIENT_CERT callers):
+#   TLS_HOSTNAME       — hostname in the backend TLS cert's SAN (and BackendTLSPolicy)
+#   CA_PEM             — PEM of the CA for the backend server cert (indented block scalar)
+#   CLIENT_CERT_B64    — base64-encoded PEM of the client certificate (tls.crt)
+#   CLIENT_KEY_B64     — base64-encoded PEM of the client private key (tls.key)
+#   GATEWAY_HTTP_PORT  — filled by Harness::apply
+#   TESTNS             — filled by Harness::apply
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-cc-ca
+data:
+  ca.crt: |
+    ${CA_PEM}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backend-client-cert
+type: kubernetes.io/tls
+data:
+  tls.crt: ${CLIENT_CERT_B64}
+  tls.key: ${CLIENT_KEY_B64}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: backend-cc-gw
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+  tls:
+    backend:
+      clientCertificateRef:
+        group: ""
+        kind: Secret
+        name: backend-client-cert
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend-cc-route
+spec:
+  parentRefs:
+    - name: backend-cc-gw
+  hostnames:
+    - backend-cc.${TESTNS}.local
+  rules:
+    - backendRefs:
+        - name: echo-mtls
+          port: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1alpha3
+kind: BackendTLSPolicy
+metadata:
+  name: backend-cc-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-mtls
+  validation:
+    hostname: ${TLS_HOSTNAME}
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: backend-cc-ca

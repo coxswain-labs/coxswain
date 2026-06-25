@@ -2354,3 +2354,108 @@ async fn gateway_frontend_mtls_insecure_fallback_admits_missing_cert() -> anyhow
     resp_with_cert.assert_backend("echo-a");
     Ok(())
 }
+
+// ── GEP-3155: Gateway backend client certificate ──────────────────────────────
+
+/// GEP-3155 happy path: proxy presents client cert to mTLS upstream.
+///
+/// Sequence:
+/// 1. Generate a server cert + a client CA + client cert (two independent CAs).
+/// 2. Deploy `echo-mtls` backend (requires a client cert signed by the client CA).
+/// 3. Apply Gateway with `spec.tls.backend.clientCertificateRef` + BackendTLSPolicy.
+/// 4. Poll until the route returns 200 — proves the proxy presented a valid client cert.
+/// 5. Verify Gateway `ResolvedRefs=True`.
+#[tokio::test]
+async fn backend_mtls_presents_client_cert_when_gateway_configures_ref() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-backend-cc").await?;
+
+    // Server cert: TLS termination at the backend.
+    let tls_hostname = format!("echo-mtls.{}.local", ns.name);
+    let server_cert = GeneratedCert::for_host(&tls_hostname);
+
+    // Client CA + leaf: proxy presents this to the mTLS backend.
+    let client_certs = MtlsCerts::generate();
+
+    // Deploy echo-mtls (requires client cert signed by the client CA).
+    fixtures::apply_fixture(
+        backends::ECHO_MTLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", server_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", server_cert.key_b64())
+            .with("TLS_CLIENT_CA_B64", client_certs.ca_cert_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-mtls"]).await?;
+
+    let host = format!("backend-cc.{}.local", ns.name);
+
+    // Apply Gateway (clientCertificateRef) + HTTPRoute + BackendTLSPolicy.
+    fixtures::apply_fixture(
+        gwa::BACKEND_CLIENT_CERT,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", server_cert.cert_pem.clone())
+            .with("CLIENT_CERT_B64", client_certs.client_cert_b64())
+            .with("CLIENT_KEY_B64", client_certs.client_key_b64()),
+    )
+    .await?;
+
+    // Traffic must succeed: proxy presents the client cert, backend validates it.
+    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(90)).await?;
+    resp.assert_backend("echo-mtls");
+
+    // Gateway must report ResolvedRefs=True (client cert Secret resolved OK).
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "backend-cc-gw",
+        &ns.name,
+        "ResolvedRefs",
+        "True",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// GEP-3155 sad path: proxy WITHOUT a client cert → mTLS backend rejects the
+/// handshake → 502.
+///
+/// Same `echo-mtls` backend (requires client cert), but the Gateway has no
+/// `spec.tls.backend.clientCertificateRef`.  Proxy connects without a client
+/// cert → upstream TLS handshake fails → 502.
+#[tokio::test]
+async fn backend_mtls_handshake_fails_when_client_cert_absent() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-backend-cc-nocert").await?;
+
+    let tls_hostname = format!("echo-mtls-nc.{}.local", ns.name);
+    let server_cert = GeneratedCert::for_host(&tls_hostname);
+    let client_ca = MtlsCerts::generate(); // CA used by the backend — proxy has no matching cert
+
+    fixtures::apply_fixture(
+        backends::ECHO_MTLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", server_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", server_cert.key_b64())
+            .with("TLS_CLIENT_CA_B64", client_ca.ca_cert_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-mtls"]).await?;
+
+    // Gateway without clientCertificateRef + BackendTLSPolicy only.
+    fixtures::apply_fixture(
+        gwa::BACKEND_TLS_POLICY,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", server_cert.cert_pem.clone()),
+    )
+    .await?;
+
+    // Backend requires a client cert the proxy doesn't present → handshake fails → 502.
+    let host = format!("backend-tls.{}.local", ns.name);
+    wait::wait_for_route_status(&h.gateway_http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}

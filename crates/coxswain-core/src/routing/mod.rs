@@ -40,7 +40,9 @@ pub use common::predicate::{
 pub use common::rate_limit::{RateLimitConfig, RateLimitKey};
 pub use common::retry::{RetryOn, RetryPolicy};
 pub use common::table::{RouteOutcome, RouterError, RoutingTable, RoutingTableBuilder};
-pub use common::upstream_tls::{BackendProtocol, UpstreamCa, UpstreamTls, parse_app_protocol};
+pub use common::upstream_tls::{
+    BackendClientCert, BackendProtocol, UpstreamCa, UpstreamTls, parse_app_protocol,
+};
 
 pub use gateway::{
     Gateway, GatewayRoutingTable, GatewayRoutingTableBuilder, SharedGatewayRoutingTable,

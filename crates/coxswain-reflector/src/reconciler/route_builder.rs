@@ -18,11 +18,13 @@ use crate::gw_types::{GrpcRoute, HttpRoute};
 use crate::ingress::annotations::AnnotationIssue;
 use crate::ingress::{IngressClassContext, IngressPorts, IngressReconciler, resolve_class_params};
 use crate::keys::ListenerKey;
-use crate::tls::GatewayListenerHealth;
+use crate::tls::{BackendClientCertOutcome, GatewayListenerHealth};
 use coxswain_core::ownership::ObjectKey;
+use coxswain_core::reference_grants::ReferenceGrantKey;
 use coxswain_core::routing::{
-    BackendGroup, GatewayRoutingTableBuilder, IngressRoutingTableBuilder, RouteEntry, RoutingTable,
-    RoutingTableBuilder, SharedGatewayRoutingTable, SharedIngressRoutingTable,
+    BackendClientCert, BackendGroup, GatewayRoutingTableBuilder, IngressRoutingTableBuilder,
+    RouteEntry, RoutingTable, RoutingTableBuilder, SharedGatewayRoutingTable,
+    SharedIngressRoutingTable,
 };
 use coxswain_core::shared::Shared;
 use coxswain_core::tls::{
@@ -68,6 +70,58 @@ pub(super) fn build_routes(
         outputs.ingress_event_tx,
     );
     gateway_published && ingress_published
+}
+
+/// Per-rebuild resolution of every owned Gateway's GEP-3155 backend client cert.
+///
+/// `certs` feeds the routing build (attached to `UpstreamTls`); `health` feeds the
+/// controller's gateway-level `ResolvedRefs` condition. Resolved once so both views
+/// stay consistent. `skip_cut_over` mirrors [`build_tls`]'s semantics.
+pub(super) struct BackendClientCertResolution {
+    /// Gateways that resolved a usable client cert, keyed by `ObjectKey(ns, name)`.
+    pub certs: HashMap<ObjectKey, Arc<BackendClientCert>>,
+    /// Per-Gateway resolution outcome (only Gateways with the ref set appear here).
+    pub health: HashMap<ObjectKey, BackendClientCertOutcome>,
+}
+
+/// Resolve `spec.tls.backend.clientCertificateRef` for every owned Gateway.
+///
+/// Takes the two fields from `Ownership` it actually needs (`gateway_classes` and
+/// `cert_grants`) so it can be called *before* `Ownership` is constructed — the
+/// resolution result is then folded into `Ownership.backend_client_certs`.
+pub(super) fn resolve_backend_client_certs(
+    stores: &ReflectorStores<'_>,
+    gateway_classes: &HashSet<String>,
+    cert_grants: &HashSet<ReferenceGrantKey>,
+    skip_cut_over: bool,
+) -> BackendClientCertResolution {
+    let mut certs = HashMap::new();
+    let mut health = HashMap::new();
+    for gw in stores.gateways.state() {
+        if !gateway_classes.contains(&gw.spec.gateway_class_name) {
+            continue;
+        }
+        if skip_cut_over && gateway_is_cut_over(&gw) {
+            continue;
+        }
+        let Some((outcome, cert)) =
+            crate::gateway_api::backend_client_cert::reconcile_backend_client_cert(
+                &gw,
+                stores.secrets,
+                cert_grants,
+            )
+        else {
+            continue;
+        };
+        let ns = gw.metadata.namespace.clone().unwrap_or_default();
+        let name = gw.metadata.name.clone().unwrap_or_default();
+        let key = ObjectKey::new(ns, name);
+        if let Some(cert) = cert {
+            certs.insert(key.clone(), cert);
+        }
+        health.insert(key, outcome);
+    }
+    BackendClientCertResolution { certs, health }
 }
 
 /// Build the Gateway-API routing table from `HTTPRoute` resources and publish
@@ -124,6 +178,7 @@ pub(super) fn build_gateway_routes(
                 policy_index: ownership.policy_index,
                 rate_limits: stores.rate_limits,
                 path_rewrites: stores.path_rewrites,
+                backend_client_certs: ownership.backend_client_certs,
             },
             &mut builder,
         );
@@ -501,6 +556,23 @@ pub(super) fn build_client_certs(
         client_certs_shared.store(Arc::new(store));
     } else {
         tracing::trace!(count, "Client-cert store unchanged, skip swap");
+    }
+}
+
+/// Fold per-Gateway GEP-3155 backend client-cert outcomes into `gateway_tls_health`
+/// so the controller can emit the gateway-level `ResolvedRefs` condition.
+///
+/// Creates a health entry for a Gateway that resolved a backend client cert but has no
+/// TLS listeners (the invalid-config conformance gateways have only an HTTP listener).
+pub(super) fn merge_backend_client_cert_health(
+    gateway_tls_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
+    health: &HashMap<ObjectKey, BackendClientCertOutcome>,
+) {
+    for (key, outcome) in health {
+        gateway_tls_health
+            .entry(key.clone())
+            .or_default()
+            .backend_client_cert = Some(outcome.clone());
     }
 }
 

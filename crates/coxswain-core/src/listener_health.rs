@@ -228,6 +228,77 @@ pub struct FrontendValidationHealth {
     pub message: String,
 }
 
+/// Outcome of resolving the Gateway-wide backend client-certificate ref
+/// (GEP-3155, `spec.tls.backend.clientCertificateRef`).
+///
+/// Produced during each reconciler rebuild and consumed by the controller's status
+/// writer to emit the **gateway-level** `ResolvedRefs` condition. This is a single
+/// gateway-scoped outcome (not per-listener): the ref applies to all backend TLS
+/// connections the Gateway makes. The group/kind/missing/malformed failures all map
+/// to the spec's `InvalidClientCertificateRef`; a denied cross-namespace ref maps to
+/// `RefNotPermitted`. `None` on a [`GatewayListenerHealth`] means the ref is absent and
+/// no `ResolvedRefs` condition is emitted.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum BackendClientCertOutcome {
+    /// The ref is absent — no condition. (Default so the enum has a sensible zero.)
+    #[default]
+    NotApplicable,
+    /// The Secret resolved with `tls.crt` + `tls.key` — `ResolvedRefs=True/ResolvedRefs`.
+    Resolved,
+    /// Unsupported group/kind, missing Secret, or a Secret without `tls.crt`/`tls.key` —
+    /// `ResolvedRefs=False/InvalidClientCertificateRef`.
+    InvalidClientCertificateRef {
+        /// Human-readable description of why the ref is invalid.
+        message: String,
+    },
+    /// A cross-namespace ref with no permitting `ReferenceGrant` —
+    /// `ResolvedRefs=False/RefNotPermitted`.
+    RefNotPermitted {
+        /// Human-readable description of the denied cross-namespace ref.
+        message: String,
+    },
+}
+
+impl BackendClientCertOutcome {
+    /// `true` when the ref was configured but could not be resolved — the Gateway
+    /// surfaces `ResolvedRefs=False`.
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidClientCertificateRef { .. } | Self::RefNotPermitted { .. }
+        )
+    }
+
+    /// Status string for the `ResolvedRefs` condition (`"True"` / `"False"`).
+    #[must_use]
+    pub fn resolved_refs_status(&self) -> &'static str {
+        if self.is_failed() { "False" } else { "True" }
+    }
+
+    /// Stable reason string for the `ResolvedRefs` condition.
+    #[must_use]
+    pub fn resolved_refs_reason(&self) -> &'static str {
+        match self {
+            Self::InvalidClientCertificateRef { .. } => "InvalidClientCertificateRef",
+            Self::RefNotPermitted { .. } => "RefNotPermitted",
+            Self::NotApplicable | Self::Resolved => "ResolvedRefs",
+        }
+    }
+
+    /// Human-readable message attached to the failed condition; empty otherwise.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::InvalidClientCertificateRef { message } | Self::RefNotPermitted { message } => {
+                message.as_str()
+            }
+            Self::NotApplicable | Self::Resolved => "",
+        }
+    }
+}
+
 /// Per-listener health for one Gateway, keyed by listener name.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
@@ -239,6 +310,13 @@ pub struct GatewayListenerHealth {
     /// `None` when `spec.tls.frontend.default.validation` is absent.
     /// `Some` when the field is present, regardless of whether refs resolved.
     pub frontend_validation: Option<FrontendValidationHealth>,
+    /// Backend client-certificate resolution outcome for this Gateway (GEP-3155, #87).
+    ///
+    /// `None` when `spec.tls.backend.clientCertificateRef` is absent (no condition).
+    /// `Some` when the ref is present — the controller emits a gateway-level
+    /// `ResolvedRefs` condition from it. Like [`ListenerInfo::frontend_outcome`] it is
+    /// controller-only (never transported over the discovery wire).
+    pub backend_client_cert: Option<BackendClientCertOutcome>,
 }
 
 // ── SharedGatewayListenerHealth ───────────────────────────────────────────────
@@ -384,6 +462,62 @@ mod tests {
         assert_eq!(FrontendValidationOutcome::NotApplicable.message(), "");
         assert_eq!(
             FrontendValidationOutcome::RefNotPermitted {
+                message: "denied".to_string()
+            }
+            .message(),
+            "denied"
+        );
+    }
+
+    #[test]
+    fn backend_client_cert_outcome_reason_and_failed_flags() {
+        let msg = || "bad".to_string();
+        let cases = [
+            (
+                BackendClientCertOutcome::NotApplicable,
+                false,
+                "ResolvedRefs",
+            ),
+            (BackendClientCertOutcome::Resolved, false, "ResolvedRefs"),
+            (
+                BackendClientCertOutcome::InvalidClientCertificateRef { message: msg() },
+                true,
+                "InvalidClientCertificateRef",
+            ),
+            (
+                BackendClientCertOutcome::RefNotPermitted { message: msg() },
+                true,
+                "RefNotPermitted",
+            ),
+        ];
+        for (outcome, failed, reason) in cases {
+            assert_eq!(outcome.is_failed(), failed, "is_failed for {outcome:?}");
+            assert_eq!(
+                outcome.resolved_refs_reason(),
+                reason,
+                "reason for {outcome:?}"
+            );
+            assert_eq!(
+                outcome.resolved_refs_status(),
+                if failed { "False" } else { "True" },
+                "status for {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_client_cert_outcome_message_only_on_failures() {
+        assert_eq!(BackendClientCertOutcome::Resolved.message(), "");
+        assert_eq!(BackendClientCertOutcome::NotApplicable.message(), "");
+        assert_eq!(
+            BackendClientCertOutcome::InvalidClientCertificateRef {
+                message: "bad ref".to_string()
+            }
+            .message(),
+            "bad ref"
+        );
+        assert_eq!(
+            BackendClientCertOutcome::RefNotPermitted {
                 message: "denied".to_string()
             }
             .message(),
