@@ -335,9 +335,23 @@ message FilterAction {
     HeaderMod response_header_modifier = 2;
     RequestRedirect request_redirect = 3;
     UrlRewrite url_rewrite = 4;
-    BackendGroup mirror = 5; // Mirror { backend }
-    CorsFilter cors = 6; // Cors(Arc<CorsConfig>)
+    MirrorFilter mirror = 5; // Mirror { backend, fraction }
+    CorsFilter cors = 6;     // Cors(Arc<CorsConfig>)
   }
+}
+
+// Mirrors FilterAction::Mirror — carries the pre-resolved backend and an optional
+// GEP-3171 sampling fraction.  fraction absent ≡ 100% (mirror every request).
+message MirrorFilter {
+  BackendGroup backend = 1;
+  optional MirrorFractionProto fraction = 2;
+}
+
+// Mirrors MirrorFraction — normalised numerator/denominator.
+// Invariants: denominator > 0, numerator ≤ denominator.
+message MirrorFractionProto {
+  uint32 numerator = 1;
+  uint32 denominator = 2;
 }
 
 // Mirrors CorsConfig — from_wire parses these back into pre-rendered HeaderValues.

@@ -42,8 +42,9 @@ use crate::upstream_ca::UpstreamCaCache;
 use bytes::Bytes;
 use coxswain_cache::ResponseCache;
 use coxswain_core::routing::{
-    BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HashSource, RateLimitKey,
-    RequestContext, RetryOn, SessionAffinity, UpstreamCa, affinity_hash, affinity_hash_parts,
+    BackendGroup, BackendProtocol, CompressionConfig, FilterAction, ForwardedForConfig, HashSource,
+    MirrorFraction, RateLimitKey, RequestContext, RetryOn, SessionAffinity, UpstreamCa,
+    affinity_hash, affinity_hash_parts,
 };
 use coxswain_core::tls::ClientCertConfigState;
 use http::header;
@@ -95,7 +96,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             affinity_pin: None,
             affinity_set_cookie: false,
             auth_response_headers: None,
-            mirror: None,
+            mirrors: Vec::new(),
             mirror_body: Vec::new(),
             compression_encoder: None,
             client_cert_pem: None,
@@ -409,90 +410,112 @@ pub(crate) async fn request_filter<K>(
         circuit_breaker: m.circuit_breaker,
     });
 
-    // ── Mirror setup (#283) ─────────────────────────────────────────────────
-    // Scan the resolved filters for a Mirror variant. Non-mirror routes pay nothing:
-    // the find_map short-circuits on the first non-Mirror variant without allocating.
-    let mirror_backend = ctx.resolved.as_ref().and_then(|r| {
-        r.filters.iter().find_map(|f| {
-            if let FilterAction::Mirror { backend } = f {
-                Some(Arc::clone(backend))
-            } else {
-                None
-            }
-        })
-    });
-
-    if let Some(mirror_backend) = mirror_backend {
-        let method;
-        let headers: Vec<(http::header::HeaderName, http::header::HeaderValue)>;
-        {
-            // Re-borrow req_header to capture method + forwardable headers.
-            // The mutable session borrows above (auth, rate-limit, redirect) have already
-            // completed; this is a fresh immutable borrow, released before the ctx mutation.
-            let req = session.req_header();
-            method = req.method.clone();
-            headers = req
-                .headers
+    // ── Mirror setup (#283, #261) ───────────────────────────────────────────
+    // Collect all Mirror filters, applying per-filter sampling gates (GEP-3171).
+    // Non-mirror routes pay nothing — the filter() short-circuits immediately when
+    // no Mirror variant is present and no Vec is allocated (the iterator is lazy).
+    let mirror_backends: Vec<(Arc<BackendGroup>, Option<MirrorFraction>)> = ctx
+        .resolved
+        .as_ref()
+        .map(|r| {
+            r.filters
                 .iter()
-                .filter_map(|(name, value)| {
-                    let lower = name.as_str().to_ascii_lowercase();
-                    if lower == "host"
-                        || auth::HOP_BY_HOP.contains(&lower.as_str())
-                        || MIRROR_CREDENTIAL_HEADERS.contains(&lower.as_str())
-                    {
-                        return None;
+                .filter_map(|f| {
+                    if let FilterAction::Mirror { backend, fraction } = f {
+                        Some((Arc::clone(backend), *fraction))
+                    } else {
+                        None
                     }
-                    Some((name.clone(), value.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !mirror_backends.is_empty() {
+        // Apply GEP-3171 sampling: draw one random u32 per mirror candidate and
+        // discard candidates whose fraction gate rejects the draw.
+        // `None` fraction == 100% — never filtered out.
+        let surviving: Vec<Arc<BackendGroup>> = mirror_backends
+            .into_iter()
+            .filter(|(_, fraction)| fraction.is_none_or(|f| f.should_sample(rand::random::<u32>())))
+            .map(|(b, _)| b)
+            .collect();
+
+        if !surviving.is_empty() {
+            let method;
+            let headers: Vec<(http::header::HeaderName, http::header::HeaderValue)>;
+            {
+                // Re-borrow req_header to capture method + forwardable headers.
+                // The mutable session borrows above (auth, rate-limit, redirect) have already
+                // completed; this is a fresh immutable borrow, released before the ctx mutation.
+                let req = session.req_header();
+                method = req.method.clone();
+                headers = req
+                    .headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        let lower = name.as_str().to_ascii_lowercase();
+                        if lower == "host"
+                            || auth::HOP_BY_HOP.contains(&lower.as_str())
+                            || MIRROR_CREDENTIAL_HEADERS.contains(&lower.as_str())
+                        {
+                            return None;
+                        }
+                        Some((name.clone(), value.clone()))
+                    })
+                    .collect();
+            } // req borrow released
+
+            let resolved = ctx
+                .resolved
+                .as_ref()
+                .unwrap_or_else(|| panic!("invariant: resolved is Some after assignment above"));
+            let host = resolved.original_host.clone();
+            let original_path = resolved.original_path.clone();
+            let metric_route_id = Arc::clone(&resolved.metric_route_id);
+            // Reuse the captured `Arc<str>` when there is no query to append — only the
+            // query arm allocates (#397).
+            let path_and_query: Arc<str> = match query.as_deref() {
+                Some(q) => {
+                    let mut pq = String::with_capacity(original_path.len() + 1 + q.len());
+                    pq.push_str(&original_path);
+                    pq.push('?');
+                    pq.push_str(q);
+                    Arc::from(pq)
+                }
+                None => Arc::clone(&original_path),
+            };
+
+            // Build one MirrorDispatch per surviving backend, sharing immutable
+            // captures via Arc clone (no data copy).
+            let dispatches: Vec<MirrorDispatch> = surviving
+                .into_iter()
+                .map(|backend| MirrorDispatch {
+                    backend,
+                    method: method.clone(),
+                    host: Arc::clone(&host),
+                    path_and_query: Arc::clone(&path_and_query),
+                    headers: headers.clone(),
+                    metric_route_id: Arc::clone(&metric_route_id),
                 })
                 .collect();
-        } // req borrow released
 
-        let host = ctx
-            .resolved
-            .as_ref()
-            .unwrap_or_else(|| panic!("invariant: resolved is Some after assignment above"))
-            .original_host
-            .clone();
-        let original_path = ctx
-            .resolved
-            .as_ref()
-            .unwrap_or_else(|| panic!("invariant: resolved is Some after assignment above"))
-            .original_path
-            .clone();
-        // Reuse the captured `Arc<str>` when there is no query to append — only the
-        // query arm allocates (#397).
-        let path_and_query: Arc<str> = match query.as_deref() {
-            Some(q) => {
-                let mut pq = String::with_capacity(original_path.len() + 1 + q.len());
-                pq.push_str(&original_path);
-                pq.push('?');
-                pq.push_str(q);
-                Arc::from(pq)
+            if ctx.max_body_size.is_none() {
+                // Header-only mode: no body will be buffered; dispatch all now.
+                // Covers bodyless methods (GET, HEAD) and routes without max-body-size.
+                for dispatch in dispatches {
+                    spawn_mirror_dispatch(
+                        dispatch,
+                        cfg.auth_client.clone(),
+                        Bytes::new(),
+                        &cfg.mirror_tracker,
+                    );
+                }
+            } else {
+                // Body-buffering mode: stash dispatches; request_body_filter accumulates
+                // chunks and dispatches all on end_of_stream.
+                ctx.mirrors = dispatches;
             }
-            None => Arc::clone(&original_path),
-        };
-
-        let dispatch = MirrorDispatch {
-            backend: mirror_backend,
-            method,
-            host,
-            path_and_query,
-            headers,
-        };
-
-        if ctx.max_body_size.is_none() {
-            // Header-only mode: no body will be buffered; dispatch now.
-            // Covers bodyless methods (GET, HEAD) and routes without max-body-size.
-            spawn_mirror_dispatch(
-                dispatch,
-                cfg.auth_client.clone(),
-                Bytes::new(),
-                &cfg.mirror_tracker,
-            );
-        } else {
-            // Body-buffering mode: stash the dispatch; request_body_filter accumulates
-            // chunks and dispatches on end_of_stream.
-            ctx.mirror = Some(dispatch);
         }
     }
 
@@ -814,7 +837,7 @@ pub(crate) fn record_cache_miss(ctx: &ProxyCtx) {
 /// into [`ProxyCtx::mirror_body`] (a [`Bytes`] refcount clone — no data copy). On
 /// `end_of_stream` the mirror dispatch fires fire-and-forget via [`spawn_mirror_dispatch`].
 /// The `auth_client` is only cloned when a mirror dispatch is triggered (i.e., when
-/// `ctx.mirror.is_some()` and `end_of_stream` is true).
+/// `ctx.mirrors.is_empty()` is false and `end_of_stream` is true).
 ///
 /// # Errors
 /// Returns `Error::explain(413, …)` once the cumulative body size exceeds the limit.
@@ -837,16 +860,16 @@ pub(crate) fn request_body_filter(
         }
 
         // ── Mirror body tee ──────────────────────────────────────────────────
-        // Only active when a mirror dispatch is pending and body buffering is configured
+        // Only active when mirror dispatches are pending and body buffering is configured
         // (max-body-size implies a bounded buffer; #263 rejects over-cap bodies above,
         // so the mirror buffer is inherently bounded at the same cap).
-        if ctx.mirror.is_some() {
+        if !ctx.mirrors.is_empty() {
             if let Some(chunk) = body
                 && !chunk.is_empty()
             {
                 ctx.mirror_body.push(chunk.clone()); // refcount bump, no data copy
             }
-            if end_of_stream && let Some(dispatch) = ctx.mirror.take() {
+            if end_of_stream {
                 let body_bytes: Bytes = if ctx.mirror_body.is_empty() {
                     Bytes::new()
                 } else {
@@ -857,12 +880,16 @@ pub(crate) fn request_body_filter(
                     }
                     buf.freeze()
                 };
-                spawn_mirror_dispatch(
-                    dispatch,
-                    cfg.auth_client.clone(),
-                    body_bytes,
-                    &cfg.mirror_tracker,
-                );
+                // Dispatch all pending mirrors, sharing the assembled body via
+                // Bytes refcount clone (no extra data copy per mirror).
+                for dispatch in ctx.mirrors.drain(..) {
+                    spawn_mirror_dispatch(
+                        dispatch,
+                        cfg.auth_client.clone(),
+                        body_bytes.clone(),
+                        &cfg.mirror_tracker,
+                    );
+                }
             }
         }
     }
@@ -889,6 +916,15 @@ fn spawn_mirror_dispatch(
     body: Bytes,
     tracker: &tokio_util::task::TaskTracker,
 ) {
+    // Bump synchronously before spawning so the counter is updated by the time
+    // the primary request returns — enables deterministic negative assertions in
+    // tests without requiring an async poll.  The upstream label uses the backend
+    // group name (ns/service) rather than the resolved addr because addr
+    // selection is round-robin inside the spawned task.
+    crate::metrics::mirror_requests_total()
+        .with_label_values(&[dispatch.metric_route_id.as_ref(), dispatch.backend.name()])
+        .inc();
+
     tracker.spawn(async move {
         let Some((addr, _)) = dispatch.backend.next_endpoint_with_filters() else {
             tracing::warn!(

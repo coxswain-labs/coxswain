@@ -1,0 +1,71 @@
+# HTTPRoute RequestMirror filter fixture — GEP-3171 (#261).
+# TESTNS is substituted with the test namespace at runtime.
+#
+# Routes:
+#   PathPrefix /mirror/single       → echo-a  (mirror: echo-b, 100%)
+#   PathPrefix /mirror/percent-zero → echo-a  (mirror: echo-b, percent=0 — never mirrors)
+#   Exact      /mirror/probe        → echo-a  (readiness probe, no filter)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mirror-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "mirror.${TESTNS}.local"
+  rules:
+    # Rule 1: single mirror at 100%.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mirror/single
+      filters:
+        - type: RequestMirror
+          requestMirror:
+            backendRef:
+              name: echo-b
+              port: 3000
+      backendRefs:
+        - name: echo-a
+          port: 3000
+
+    # Rule 2: mirror with percent=0 — mirror must never fire.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mirror/percent-zero
+      filters:
+        - type: RequestMirror
+          requestMirror:
+            backendRef:
+              name: echo-b
+              port: 3000
+            percent: 0
+      backendRefs:
+        - name: echo-a
+          port: 3000
+
+    # Probe rule — used by wait_for_route to detect when the HTTPRoute is live.
+    - matches:
+        - path:
+            type: Exact
+            value: /mirror/probe
+      backendRefs:
+        - name: echo-a
+          port: 3000

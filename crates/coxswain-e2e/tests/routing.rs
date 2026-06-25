@@ -2151,3 +2151,309 @@ async fn cors_actual_request_injects_allow_origin_header() -> anyhow::Result<()>
 
     Ok(())
 }
+
+// ── RequestMirror tests (#261) ────────────────────────────────────────────────
+
+/// Sum all `coxswain_proxy_mirror_requests_total{…}` counter values from a raw
+/// Prometheus metrics body.  Returns `0.0` when the metric is absent (not yet
+/// incremented).
+fn mirror_dispatch_count(metrics_body: &str) -> f64 {
+    metrics_body
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let rest = l.strip_prefix("coxswain_proxy_mirror_requests_total{")?;
+            let (_, value) = rest.split_once('}')?;
+            value.trim().parse::<f64>().ok()
+        })
+        .sum()
+}
+
+async fn fetch_proxy_metrics(client: &reqwest::Client, metrics_url: &str) -> anyhow::Result<f64> {
+    let body = client
+        .get(metrics_url)
+        .send()
+        .await
+        .context("fetch /metrics")?
+        .text()
+        .await
+        .context("read /metrics body")?;
+    Ok(mirror_dispatch_count(&body))
+}
+
+#[tokio::test]
+async fn mirrored_request_reaches_shadow_while_client_sees_primary() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-mirror-single").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::MIRROR, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("mirror.{}.local", ns.name);
+    wait::wait_for_route(
+        &h.gateway_http,
+        &host,
+        "/mirror/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let metrics_url = h.admin_url("/metrics");
+    let metrics_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("build metrics client")?;
+
+    let before = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+
+    // Send a request through the mirrored rule.
+    let (status, body) = h
+        .gateway_http
+        .request(Method::GET, &host, "/mirror/single", &[])
+        .await?;
+    assert_eq!(status, 200, "primary backend must return 200");
+    body.unwrap().assert_backend("echo-a");
+
+    // Poll until the mirror counter increments — the fire-and-forget task is
+    // asynchronous so it may not have run yet at the time of the assert.
+    wait::poll_until(
+        Duration::from_secs(15),
+        Duration::from_millis(250),
+        || async {
+            "mirror_requests_total to increment after mirrored GET /mirror/single".to_string()
+        },
+        || async {
+            let count = fetch_proxy_metrics(&metrics_client, &metrics_url)
+                .await
+                .unwrap_or(0.0);
+            (count > before).then_some(())
+        },
+    )
+    .await?;
+
+    // Negative: a sibling route without a mirror filter must not bump the counter.
+    // The counter is bumped synchronously before spawn, so a simple before/after
+    // check across the request is sufficient.
+    let before2 = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    let (status2, body2) = h
+        .gateway_http
+        .request(Method::GET, &host, "/mirror/probe", &[])
+        .await?;
+    assert_eq!(status2, 200, "probe route must return 200");
+    body2.unwrap().assert_backend("echo-a");
+    let after2 = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    assert_eq!(
+        before2, after2,
+        "non-mirrored route must not increment mirror_requests_total"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn percent_zero_mirror_never_dispatches() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-mirror-pct0").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::MIRROR, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("mirror.{}.local", ns.name);
+    wait::wait_for_route(
+        &h.gateway_http,
+        &host,
+        "/mirror/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let metrics_url = h.admin_url("/metrics");
+    let metrics_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("build metrics client")?;
+
+    let before = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+
+    // Send several requests through the percent=0 rule.
+    for _ in 0..5u8 {
+        let (status, _) = h
+            .gateway_http
+            .request(Method::GET, &host, "/mirror/percent-zero", &[])
+            .await?;
+        assert_eq!(
+            status, 200,
+            "percent-zero route must still serve primary 200"
+        );
+    }
+
+    // Counter is bumped synchronously before spawn, so checking right after the
+    // requests return is deterministic.
+    let after = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    assert_eq!(
+        before, after,
+        "percent=0 mirror must never increment mirror_requests_total"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn multiple_mirrors_each_receive_a_copy() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-mirror-multi").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::MIRROR_MULTIPLE, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("mirror-multi.{}.local", ns.name);
+    wait::wait_for_route(
+        &h.gateway_http,
+        &host,
+        "/mirror-multi/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let metrics_url = h.admin_url("/metrics");
+    let metrics_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("build metrics client")?;
+
+    let before = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+
+    // Send a request through the two-mirror rule.
+    let (status, body) = h
+        .gateway_http
+        .request(Method::GET, &host, "/mirror-multi/both", &[])
+        .await?;
+    assert_eq!(status, 200, "primary backend must return 200");
+    body.unwrap().assert_backend("echo-a");
+
+    // Poll until the counter has incremented by at least 2 (one per mirror).
+    wait::poll_until(
+        Duration::from_secs(15),
+        Duration::from_millis(250),
+        || async {
+            "mirror_requests_total to reach before+2 after two-mirror GET /mirror-multi/both"
+                .to_string()
+        },
+        || async {
+            let count = fetch_proxy_metrics(&metrics_client, &metrics_url)
+                .await
+                .unwrap_or(0.0);
+            (count >= before + 2.0).then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cross_namespace_mirror_requires_reference_grant() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-mirror-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "rt-mirror-xns-tenant").await?;
+
+    // Deploy echo-a in the primary namespace.
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Deploy echo-d + ReferenceGrant in the tenant namespace.
+    fixtures::apply_fixture(
+        gwa::CROSS_NAMESPACE_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-d"]).await?;
+
+    // Apply the mirror route (cross-namespace mirror → echo-d in tenant ns).
+    fixtures::apply_fixture(
+        gwa::MIRROR_XNS,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let host = format!("mirror-xns.{}.local", ns.name);
+    wait::wait_for_route(
+        &h.gateway_http,
+        &host,
+        "/mirror-xns/probe",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let metrics_url = h.admin_url("/metrics");
+    let metrics_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("build metrics client")?;
+
+    let before = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+
+    // With the grant in place: mirror must fire.
+    let (status, body) = h
+        .gateway_http
+        .request(Method::GET, &host, "/mirror-xns/path", &[])
+        .await?;
+    assert_eq!(status, 200, "primary must return 200");
+    body.unwrap().assert_backend("echo-a");
+
+    wait::poll_until(
+        Duration::from_secs(15),
+        Duration::from_millis(250),
+        || async { "mirror_requests_total to increment after cross-ns GET".to_string() },
+        || async {
+            let count = fetch_proxy_metrics(&metrics_client, &metrics_url)
+                .await
+                .unwrap_or(0.0);
+            (count > before).then_some(())
+        },
+    )
+    .await?;
+
+    // Sad path: delete the ReferenceGrant → mirror must stop dispatching.
+    tokio::process::Command::new("kubectl")
+        .args([
+            "delete",
+            "referencegrant",
+            &format!("allow-httproute-from-{}", ns.name),
+            "-n",
+            &tenant.name,
+            "--ignore-not-found",
+        ])
+        .status()
+        .await
+        .context("delete ReferenceGrant")?;
+
+    // Wait for the controller to reconcile (the grant deletion is a watch event).
+    wait::wait_for_controller_reconciled(
+        &h.controller_admin_url("/metrics"),
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    let before_denied = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    let (status2, body2) = h
+        .gateway_http
+        .request(Method::GET, &host, "/mirror-xns/path", &[])
+        .await?;
+    assert_eq!(
+        status2, 200,
+        "primary must still return 200 after grant removal"
+    );
+    body2.unwrap().assert_backend("echo-a");
+
+    let after_denied = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    assert_eq!(
+        before_denied, after_denied,
+        "mirror to denied cross-ns backend must not fire after ReferenceGrant is removed"
+    );
+
+    Ok(())
+}

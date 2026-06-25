@@ -14,7 +14,7 @@ Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io
 | `BackendTLSPolicy` | `gateway.networking.k8s.io/v1` | Upstream TLS configuration referencing a CA `ConfigMap` or `Secret` |
 
 !!! warning "Not supported"
-    `TCPRoute`, `TLSRoute`, and `UDPRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected. The `RequestMirror` filter is skipped with a WARN log line.
+    `TCPRoute`, `TLSRoute`, and `UDPRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected.
 
 ## GatewayClass
 
@@ -242,7 +242,7 @@ spec:
 | `ResponseHeaderModifier` | Supported (rule-level and per-backendRef) |
 | `URLRewrite` | Supported (hostname and path rewrite) |
 | `RequestRedirect` | Supported (scheme, hostname, port, path, status code) |
-| `RequestMirror` | Not supported — skipped with a WARN log line |
+| `RequestMirror` | Supported — GEP-3171 fire-and-forget shadow traffic with optional `percent` or `fraction` sampling; multiple filters per rule for multiple mirrors |
 | `ExtensionRef` | Supported (for `RateLimit` and `PathRewriteRegex` Coxswain extensions) |
 | `CORS` | Supported — GEP-1767 preflight short-circuit and response-header injection |
 
@@ -409,6 +409,55 @@ spec:
 
 Routes that reference a backend without a matching `ReferenceGrant` are rejected with a `ResolvedRefs: False` condition.
 
+### Request mirroring
+
+The `RequestMirror` filter (GEP-3171) sends a fire-and-forget copy of every matched request to a secondary backend while the primary response is returned normally to the client. The mirror response is discarded — mirror failures (connect error, timeout, bad response) are logged at `WARN` level and do not affect the primary.
+
+```yaml
+rules:
+  - filters:
+      - type: RequestMirror
+        requestMirror:
+          backendRef:
+            name: echo-mirror
+            port: 3000
+    backendRefs:
+      - name: echo-primary
+        port: 3000
+```
+
+**Multiple mirrors per rule** — add one `RequestMirror` filter per shadow backend; each fires independently:
+
+```yaml
+filters:
+  - type: RequestMirror
+    requestMirror:
+      backendRef: {name: shadow-a, port: 3000}
+  - type: RequestMirror
+    requestMirror:
+      backendRef: {name: shadow-b, port: 3000}
+```
+
+**Sampling** — use `percent` (integer, 0–100) or `fraction` (`numerator` / `denominator`) to mirror only a subset of requests:
+
+```yaml
+requestMirror:
+  backendRef: {name: echo-mirror, port: 3000}
+  percent: 20          # mirror 20% of requests
+```
+
+```yaml
+requestMirror:
+  backendRef: {name: echo-mirror, port: 3000}
+  fraction:
+    numerator: 1
+    denominator: 5     # equivalent to 20%
+```
+
+**Cross-namespace mirror backends** require a `ReferenceGrant` in the target namespace, just like primary backends (see [Cross-namespace backends](#cross-namespace-backends)).
+
+Mirror traffic is visible in the proxy access log (`mirror: true` field) and counted by the `coxswain_proxy_mirror_requests_total{route, upstream}` Prometheus counter.
+
 ### Status conditions
 
 | Condition | True when |
@@ -493,7 +542,7 @@ Header matching uses the same `Exact` and `RegularExpression` semantics as `HTTP
 | `spec.rules[].backendRefs` | Service backends only |
 | `spec.rules[].backendRefs[].weight` | Full |
 
-`RequestMirror` and `ExtensionRef` filters are skipped with a WARN log line.
+`ExtensionRef` filters not matching the `RateLimit` or `PathRewriteRegex` Coxswain resources are skipped with a WARN log line.
 
 ### Status conditions
 
