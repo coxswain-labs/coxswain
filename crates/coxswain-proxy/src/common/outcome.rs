@@ -130,20 +130,26 @@ pub(crate) async fn try_cors_preflight(
     let Some(origin_str) = cors_origin else {
         return Ok(false);
     };
-    {
+    // Capture the preflight request values up front so the session is free to be
+    // borrowed mutably for the response write below. A wildcard `allowMethods` /
+    // `allowHeaders` reflects these (GEP-1767): `*` is invalid when credentials are
+    // allowed, so browsers require the concrete requested method/headers echoed back.
+    let (req_method, req_headers) = {
         let req = session.req_header();
         if req.method != http::Method::OPTIONS {
             return Ok(false);
         }
-        if req
-            .headers
-            .get(header::ACCESS_CONTROL_REQUEST_METHOD)
-            .is_none()
-        {
+        let Some(acrm) = req.headers.get(header::ACCESS_CONTROL_REQUEST_METHOD) else {
             // Not a real preflight (OPTIONS without ACRM is a regular request).
             return Ok(false);
-        }
-    }
+        };
+        (
+            acrm.clone(),
+            req.headers
+                .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+                .cloned(),
+        )
+    };
     for f in filters {
         if let FilterAction::Cors(cfg) = f {
             // Cap of 6 covers origin + credentials + methods + headers + expose + max-age.
@@ -157,10 +163,27 @@ pub(crate) async fn try_cors_preflight(
                     )?;
                 }
                 if let Some(methods) = &cfg.allow_methods {
-                    resp.insert_header(header::ACCESS_CONTROL_ALLOW_METHODS, methods.clone())?;
+                    // Wildcard reflects the requested method; otherwise echo the config.
+                    let value = if methods.as_bytes() == b"*" {
+                        req_method.clone()
+                    } else {
+                        methods.clone()
+                    };
+                    resp.insert_header(header::ACCESS_CONTROL_ALLOW_METHODS, value)?;
                 }
                 if let Some(headers) = &cfg.allow_headers {
-                    resp.insert_header(header::ACCESS_CONTROL_ALLOW_HEADERS, headers.clone())?;
+                    // Wildcard reflects the requested headers; if none were requested,
+                    // omit the header entirely (nothing to allow).
+                    if headers.as_bytes() == b"*" {
+                        if let Some(req_hdrs) = &req_headers {
+                            resp.insert_header(
+                                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                                req_hdrs.clone(),
+                            )?;
+                        }
+                    } else {
+                        resp.insert_header(header::ACCESS_CONTROL_ALLOW_HEADERS, headers.clone())?;
+                    }
                 }
                 if let Some(expose) = &cfg.expose_headers {
                     resp.insert_header(header::ACCESS_CONTROL_EXPOSE_HEADERS, expose.clone())?;
