@@ -95,6 +95,12 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         ListenerTlsOutcome::ResolvedPartial { message } => {
             (p::ListenerTlsOutcome::ResolvedPartial, message.clone())
         }
+        ListenerTlsOutcome::TlsPassthrough => {
+            (p::ListenerTlsOutcome::TlsPassthrough, String::new())
+        }
+        ListenerTlsOutcome::Unsupported { message } => {
+            (p::ListenerTlsOutcome::Unsupported, message.clone())
+        }
         &_ => unreachable!(
             "invariant: all ListenerTlsOutcome variants handled; \
              add a new arm when the core type gains a variant"
@@ -179,6 +185,27 @@ mod tests {
         https_info.port = 443;
         health.listeners.insert("https".to_string(), https_info);
 
+        // GEP-2643 (#70): a TLS/Terminate listener resolves to Unsupported, and a
+        // TLS/Passthrough listener to TlsPassthrough. Both must survive the wire
+        // round-trip — encoding an Unsupported listener previously hit an
+        // `unreachable!()` in `listener_info_to_wire` and crashed the controller's
+        // discovery server, starving the proxy of every snapshot.
+        let mut terminate_info = ListenerInfo::default();
+        terminate_info.tls_outcome = ListenerTlsOutcome::Unsupported {
+            message: "tls.mode: Terminate is not supported".to_string(),
+        };
+        terminate_info.port = 8443;
+        health
+            .listeners
+            .insert("tls-terminate".to_string(), terminate_info);
+
+        let mut passthrough_info = ListenerInfo::default();
+        passthrough_info.tls_outcome = ListenerTlsOutcome::TlsPassthrough;
+        passthrough_info.port = 8444;
+        health
+            .listeners
+            .insert("tls-passthrough".to_string(), passthrough_info);
+
         map.insert(ObjectKey::new("default", "my-gw"), health);
 
         let dto = listener_health_to_wire(&map);
@@ -187,7 +214,7 @@ mod tests {
         let h2 = map2
             .get(&ObjectKey::new("default", "my-gw"))
             .expect("key found");
-        assert_eq!(h2.listeners.len(), 2, "listener count preserved");
+        assert_eq!(h2.listeners.len(), 4, "listener count preserved");
         assert_eq!(
             h2.listeners["http"].attached_routes, 3,
             "attached_routes preserved"
@@ -198,6 +225,21 @@ mod tests {
                 ListenerTlsOutcome::Resolved
             ),
             "tls_outcome preserved"
+        );
+        assert!(
+            matches!(
+                &h2.listeners["tls-terminate"].tls_outcome,
+                ListenerTlsOutcome::Unsupported { message }
+                    if message == "tls.mode: Terminate is not supported"
+            ),
+            "Unsupported outcome + message preserved"
+        );
+        assert!(
+            matches!(
+                h2.listeners["tls-passthrough"].tls_outcome,
+                ListenerTlsOutcome::TlsPassthrough
+            ),
+            "TlsPassthrough outcome preserved"
         );
     }
 }

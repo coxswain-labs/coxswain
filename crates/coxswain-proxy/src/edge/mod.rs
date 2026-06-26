@@ -7,5 +7,6 @@
 //! before a request reaches the routing layer.
 
 pub(crate) mod accept;
+pub(crate) mod passthrough;
 pub(crate) mod tls;
 pub(crate) mod upstream_ca;

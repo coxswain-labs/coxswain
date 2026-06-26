@@ -29,7 +29,8 @@ pub(crate) mod routing;
 pub use config::{AccessLogPathMode, SharedProxyConfig};
 pub use ctx::{ProxyCtx, ResolvedRoute};
 pub use edge::accept::{
-    AcceptorBuildError, ListenerProtocol, ListenerSpec, ProxyAcceptor, TrustedSources,
+    AcceptorBuildError, ListenerProtocol, ListenerSpec, PassthroughConfig, ProxyAcceptor,
+    TrustedSources,
 };
 pub use edge::tls::SniCertSelector;
 pub use edge::upstream_ca::UpstreamCaCache;

@@ -13,18 +13,24 @@ use crate::endpoints;
 use crate::gateway_api::hostnames_intersect;
 use crate::gateway_api::{
     GatewayApiReconciler, GrpcRouteReconciler, GrpcRouteResolution, ListenerBinding,
+    TlsRouteReconciler,
+};
+use crate::gw_types::v::gateways::{
+    GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode,
 };
 use crate::gw_types::{GrpcRoute, HttpRoute};
 use crate::ingress::annotations::AnnotationIssue;
 use crate::ingress::{IngressClassContext, IngressPorts, IngressReconciler, resolve_class_params};
 use crate::keys::ListenerKey;
-use crate::tls::{BackendClientCertOutcome, GatewayListenerHealth};
+use crate::tls::{
+    BackendClientCertOutcome, GatewayListenerHealth, ListenerTlsOutcome, RouteHealthMap,
+};
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::reference_grants::ReferenceGrantKey;
+use coxswain_core::reference_grants::{self as reference_grants, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendClientCert, BackendGroup, GatewayRoutingTableBuilder, IngressRoutingTableBuilder,
     RouteEntry, RoutingTable, RoutingTableBuilder, SharedGatewayRoutingTable,
-    SharedIngressRoutingTable,
+    SharedIngressRoutingTable, SharedTlsPassthroughTable, TlsPassthroughTableBuilder,
 };
 use coxswain_core::shared::Shared;
 use coxswain_core::tls::{
@@ -627,6 +633,11 @@ pub(super) fn count_attached_routes(
                     {
                         continue;
                     }
+                    // Passthrough listeners only accept TLSRoutes; never count an
+                    // HTTPRoute against them (allowedRoutes.kinds restriction).
+                    if matches!(info.tls_outcome, ListenerTlsOutcome::TlsPassthrough) {
+                        continue;
+                    }
                     if hostnames_intersect(&route_hostnames, &info.hostname) {
                         info.attached_routes += 1;
                     }
@@ -644,6 +655,11 @@ pub(super) fn count_attached_routes(
                         if gw_ns != route_ns && !info.allows_all_namespaces {
                             continue;
                         }
+                        // Passthrough listeners only accept TLSRoutes; never count an
+                        // HTTPRoute against them (allowedRoutes.kinds restriction).
+                        if matches!(info.tls_outcome, ListenerTlsOutcome::TlsPassthrough) {
+                            continue;
+                        }
                         if hostnames_intersect(&route_hostnames, &info.hostname) {
                             info.attached_routes += 1;
                         }
@@ -652,4 +668,187 @@ pub(super) fn count_attached_routes(
             }
         }
     }
+}
+
+/// Build and publish the SNI-keyed TLS passthrough routing table from `TLSRoute`
+/// resources bound to `protocol: TLS, tls.mode: Passthrough` Gateway listeners.
+///
+/// The proxy uses this table to route raw, still-encrypted TCP streams by the
+/// ClientHello SNI — TLS is never terminated at the proxy on this path.
+///
+/// Returns per-(TLSRoute, parentRef) health so the controller can write
+/// `Accepted` / `ResolvedRefs` status conditions on each route.
+pub(super) fn build_passthrough_routes(
+    stores: &ReflectorStores<'_>,
+    owned_gateways: &HashSet<ObjectKey>,
+    backend_grants: &HashSet<ReferenceGrantKey>,
+    out: &SharedTlsPassthroughTable,
+) -> RouteHealthMap {
+    let tls_routes = stores.tls_routes.state();
+    let gateways = stores.gateways.state();
+
+    let mut builder = TlsPassthroughTableBuilder::new();
+
+    for gw in &gateways {
+        let gw_ns = gw.metadata.namespace.as_deref().unwrap_or("default");
+        let gw_name = gw.metadata.name.as_deref().unwrap_or("");
+        let gw_key = ObjectKey::new(gw_ns, gw_name);
+        if !owned_gateways.contains(&gw_key) {
+            continue;
+        }
+
+        for listener in &gw.spec.listeners {
+            if listener.protocol != "TLS" {
+                continue;
+            }
+            let is_passthrough = listener
+                .tls
+                .as_ref()
+                .and_then(|t| t.mode.as_ref())
+                .is_some_and(|m| matches!(m, GatewayListenersTlsMode::Passthrough));
+            if !is_passthrough {
+                continue;
+            }
+
+            let listener_port = listener.port as u16;
+            let listener_hostname = listener.hostname.as_deref().unwrap_or("");
+            let allows_all_ns = listener
+                .allowed_routes
+                .as_ref()
+                .and_then(|ar| ar.namespaces.as_ref())
+                .and_then(|ns| ns.from.as_ref())
+                .is_some_and(|f| !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same));
+
+            for route in &tls_routes {
+                let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+
+                if !allows_all_ns && route_ns != gw_ns {
+                    continue;
+                }
+
+                let parent_refs = route.spec.parent_refs.as_deref().unwrap_or(&[]);
+                let binds = parent_refs.iter().any(|pr| {
+                    let pr_ns = pr.namespace.as_deref().unwrap_or(route_ns);
+                    if pr_ns != gw_ns || pr.name != gw_name {
+                        return false;
+                    }
+                    if let Some(sn) = pr.section_name.as_deref()
+                        && sn != listener.name
+                    {
+                        return false;
+                    }
+                    if let Some(port) = pr.port
+                        && port as u16 != listener_port
+                    {
+                        return false;
+                    }
+                    true
+                });
+                if !binds {
+                    continue;
+                }
+
+                let route_hostnames: Vec<&str> =
+                    route.spec.hostnames.iter().map(String::as_str).collect();
+                if !hostnames_intersect(&route_hostnames, listener_hostname) {
+                    continue;
+                }
+
+                // Effective SNI patterns: intersection of route hostnames and listener hostname.
+                let effective: Vec<String> = if route_hostnames.is_empty() {
+                    if listener_hostname.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        vec![listener_hostname.to_string()]
+                    }
+                } else if listener_hostname.is_empty() {
+                    route_hostnames.iter().map(|s| s.to_string()).collect()
+                } else {
+                    route_hostnames
+                        .iter()
+                        .filter(|rh| hostnames_intersect(&[rh], listener_hostname))
+                        .map(|rh| {
+                            // The more-specific hostname is the effective SNI pattern.
+                            if rh.starts_with("*.") && !listener_hostname.starts_with("*.") {
+                                listener_hostname.to_string()
+                            } else if rh.starts_with("*.")
+                                && listener_hostname.starts_with("*.")
+                                && listener_hostname.len() > rh.len()
+                            {
+                                // Both wildcards: the listener is more specific
+                                // (longer suffix) → use the listener hostname.
+                                listener_hostname.to_string()
+                            } else {
+                                rh.to_string()
+                            }
+                        })
+                        .collect()
+                };
+
+                for rule in &route.spec.rules {
+                    let weighted: Vec<(Vec<std::net::SocketAddr>, u16)> = rule
+                        .backend_refs
+                        .iter()
+                        .filter_map(|b| {
+                            let port = b.port?;
+                            let weight = b.weight.unwrap_or(1);
+                            if weight <= 0 {
+                                return None;
+                            }
+                            let b_kind = b.kind.as_deref().unwrap_or("Service");
+                            let b_group = b.group.as_deref().unwrap_or("");
+                            if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
+                                return None;
+                            }
+                            let ns = b.namespace.as_deref().unwrap_or(route_ns);
+                            if ns != route_ns
+                                && !reference_grants::backend_ref_allowed(
+                                    route_ns,
+                                    ns,
+                                    &b.name,
+                                    backend_grants,
+                                )
+                            {
+                                tracing::warn!(
+                                    route_ns,
+                                    backend_ns = ns,
+                                    backend_svc = %b.name,
+                                    "TLSRoute cross-namespace backendRef denied — no ReferenceGrant"
+                                );
+                                return None;
+                            }
+                            let resolved = endpoints::resolve(
+                                ns,
+                                &b.name,
+                                port,
+                                stores.slices,
+                                stores.services,
+                            );
+                            Some((resolved.addrs, weight as u16))
+                        })
+                        .collect();
+
+                    let group_name = rule
+                        .backend_refs
+                        .first()
+                        .map(|b| b.name.clone())
+                        .unwrap_or_default();
+                    let bg = Arc::new(BackendGroup::weighted(group_name, weighted));
+
+                    for hostname in &effective {
+                        builder = builder.add_route(listener_port, hostname, Arc::clone(&bg));
+                    }
+                }
+            }
+        }
+    }
+
+    out.store(Arc::new(builder.build()));
+    TlsRouteReconciler::compute_route_health(
+        &tls_routes,
+        &gateways,
+        owned_gateways,
+        backend_grants,
+        stores.services,
+    )
 }

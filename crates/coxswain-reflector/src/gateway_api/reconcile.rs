@@ -713,8 +713,11 @@ impl GatewayApiReconciler {
     /// listeners, and registers them in `builder`. Returns a per-listener health
     /// map so the controller can set accurate Gateway status conditions.
     ///
-    /// Only `protocol: HTTPS` with `tls.mode: Terminate` (the default) is handled.
-    /// `Passthrough` is recorded as `Invalid`. Non-HTTPS listeners are `NotApplicable`.
+    /// Only `protocol: HTTPS` with `tls.mode: Terminate` (the default) is handled here.
+    /// `protocol: TLS, tls.mode: Passthrough` listeners are handled by `build_passthrough_routes`
+    /// in the route builder and are returned as `NotApplicable` by this function.
+    /// The rejection in `resolve_listener_tls` only fires for the invalid combination
+    /// `protocol: HTTPS, tls.mode: Passthrough`. Non-HTTPS listeners are `NotApplicable`.
     /// Cross-namespace `certificateRefs` require a matching entry in `cert_grants`.
     pub fn reconcile_tls(
         gateway: &Gateway,
@@ -727,7 +730,23 @@ impl GatewayApiReconciler {
         let mut listeners = BTreeMap::new();
 
         for listener in &gateway.spec.listeners {
-            let tls_outcome = if listener.protocol != "HTTPS" {
+            let tls_outcome = if listener.protocol == "TLS"
+                && listener
+                    .tls
+                    .as_ref()
+                    .and_then(|t| t.mode.as_ref())
+                    .is_some_and(|m| matches!(m, GatewayListenersTlsMode::Passthrough))
+            {
+                // TLS passthrough: proxy peeks SNI and forwards raw stream; no cert needed.
+                ListenerTlsOutcome::TlsPassthrough
+            } else if listener.protocol == "TLS" {
+                // TLS/Terminate is not supported — only tls.mode: Passthrough is (GEP-2643).
+                ListenerTlsOutcome::Unsupported {
+                    message: "TLS listeners require tls.mode: Passthrough; \
+                              tls.mode: Terminate is not supported by this implementation"
+                        .to_string(),
+                }
+            } else if listener.protocol != "HTTPS" {
                 ListenerTlsOutcome::NotApplicable
             } else {
                 resolve_listener_tls(gw_ns, gw_name, listener, secrets, cert_grants, builder)

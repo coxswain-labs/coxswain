@@ -15,10 +15,11 @@
 //! `crate::`.
 
 use coxswain_reflector::gw_types::v::gateways::{
-    GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
+    GatewayListeners, GatewayListenersTlsMode, GatewayStatusListeners,
+    GatewayStatusListenersSupportedKinds,
 };
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::tls::{FrontendValidationOutcome, ListenerInfo};
+use coxswain_reflector::tls::{FrontendValidationOutcome, ListenerInfo, ListenerTlsOutcome};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Conditions whose `type` starts with this prefix are owned by the
@@ -62,43 +63,68 @@ pub(crate) fn make_condition(
 ///   controller. When true, `ResolvedRefs: False, reason: InvalidRouteKinds`
 ///   must be set on the listener.
 /// - `supported_kinds`: intersection of the listed kinds with what we support
-///   (currently only `HTTPRoute`). Empty list when all listed kinds are
-///   unsupported. When `allowedRoutes.kinds` is absent or empty, returns
-///   `[HTTPRoute]` with `has_any_invalid=false`.
+///   (`HTTPRoute`, and `TLSRoute` on TLS/Passthrough listeners). Empty list
+///   when all listed kinds are unsupported. When `allowedRoutes.kinds` is
+///   absent or empty, returns the default kind for the listener protocol
+///   (`TLSRoute` for TLS/Passthrough, `HTTPRoute` otherwise) with
+///   `has_any_invalid=false`.
 pub(crate) fn listener_route_kind_info(
     listener: &GatewayListeners,
 ) -> (bool, Vec<GatewayStatusListenersSupportedKinds>) {
-    const HTTP_ROUTE_GROUP: &str = "gateway.networking.k8s.io";
+    const GW_GROUP: &str = "gateway.networking.k8s.io";
     let http_route_kind = || GatewayStatusListenersSupportedKinds {
-        group: Some(HTTP_ROUTE_GROUP.to_string()),
+        group: Some(GW_GROUP.to_string()),
         kind: "HTTPRoute".to_string(),
     };
+    let tls_route_kind = || GatewayStatusListenersSupportedKinds {
+        group: Some(GW_GROUP.to_string()),
+        kind: "TLSRoute".to_string(),
+    };
+    // Determine whether this is a TLS/Passthrough listener. That listener's
+    // natural default route kind is TLSRoute rather than HTTPRoute.
+    let is_passthrough = listener.protocol == "TLS"
+        && listener
+            .tls
+            .as_ref()
+            .and_then(|t| t.mode.as_ref())
+            .is_some_and(|m| matches!(m, GatewayListenersTlsMode::Passthrough));
+
     let allowed = match listener
         .allowed_routes
         .as_ref()
         .and_then(|ar| ar.kinds.as_deref())
     {
         Some(k) if !k.is_empty() => k,
-        _ => return (false, vec![http_route_kind()]),
+        _ => {
+            if is_passthrough {
+                return (false, vec![tls_route_kind()]);
+            }
+            return (false, vec![http_route_kind()]);
+        }
     };
     let mut has_invalid = false;
     let mut includes_http_route = false;
+    let mut includes_tls_route = false;
     for k in allowed {
-        let is_http_route = k.kind == "HTTPRoute"
-            && k.group
-                .as_deref()
-                .is_none_or(|g| g.is_empty() || g == HTTP_ROUTE_GROUP);
-        if is_http_route {
+        let group_ok = k
+            .group
+            .as_deref()
+            .is_none_or(|g| g.is_empty() || g == GW_GROUP);
+        if k.kind == "HTTPRoute" && group_ok {
             includes_http_route = true;
+        } else if k.kind == "TLSRoute" && group_ok && is_passthrough {
+            includes_tls_route = true;
         } else {
             has_invalid = true;
         }
     }
-    let supported = if includes_http_route {
-        vec![http_route_kind()]
-    } else {
-        vec![]
-    };
+    let mut supported = Vec::new();
+    if includes_http_route {
+        supported.push(http_route_kind());
+    }
+    if includes_tls_route {
+        supported.push(tls_route_kind());
+    }
     (has_invalid, supported)
 }
 
@@ -168,10 +194,13 @@ pub(crate) fn build_listener_status(
     } else {
         ("False", outcome.reason(), outcome.message())
     };
-    // Accepted is True/Accepted unless the frontend CA failed, in which case the
-    // HTTPS listener has no valid CA to terminate mutual TLS with.
+    // Accepted is False when the listener uses an unsupported protocol/mode combination
+    // (e.g. TLS/Terminate — only TLS/Passthrough is supported), when the frontend CA
+    // failed to resolve, or True/Accepted otherwise.
     let (accepted_status, accepted_reason, accepted_msg) = if frontend_ca_failed {
         ("False", "NoValidCACertificate", frontend_msg)
+    } else if let ListenerTlsOutcome::Unsupported { message } = &outcome {
+        ("False", "UnsupportedValue", message.as_str())
     } else {
         ("True", "Accepted", "")
     };

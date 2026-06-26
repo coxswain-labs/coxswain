@@ -28,6 +28,8 @@ pub(crate) const COXSWAIN_NAMESPACE: &str = "coxswain-system";
 pub const GATEWAY_HTTP_PORT: u16 = 8000;
 /// Fixed port the shared-proxy Service exposes for Gateway HTTPS listeners.
 pub const GATEWAY_HTTPS_PORT: u16 = 8443;
+/// Port pre-declared in the gateway Service for TLS-passthrough listeners (TLSRoute, GEP-2643).
+pub const GATEWAY_TLS_PASSTHROUGH_PORT: u16 = 8444;
 
 /// The local Kubernetes cluster distribution detected from the current context.
 #[derive(Debug, Clone)]
@@ -262,6 +264,10 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         "--set".into(),
         format!(
             "service.gateway.additionalPorts[1].name=gw-https,service.gateway.additionalPorts[1].port={GATEWAY_HTTPS_PORT},service.gateway.additionalPorts[1].targetPort={GATEWAY_HTTPS_PORT},service.gateway.additionalPorts[1].protocol=TCP"
+        ),
+        "--set".into(),
+        format!(
+            "service.gateway.additionalPorts[2].name=gw-passthrough,service.gateway.additionalPorts[2].port={GATEWAY_TLS_PASSTHROUGH_PORT},service.gateway.additionalPorts[2].targetPort={GATEWAY_TLS_PASSTHROUGH_PORT},service.gateway.additionalPorts[2].protocol=TCP"
         ),
         "--skip-crds".into(), // CRDs are pre-applied with SSA above
         "--wait".into(),

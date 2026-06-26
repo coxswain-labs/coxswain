@@ -1,13 +1,13 @@
-//! Kubernetes API calls that write `GRPCRoute` status patches.
+//! Kubernetes API calls that write `TLSRoute` status patches.
 //!
-//! Sibling of `route_events.rs` — forked for the `GRPCRoute` concrete type per the
+//! Sibling of `grpc_route_events.rs` — forked for the `TLSRoute` concrete type per the
 //! no-generic-reconciler constraint in issue #33.
 
 use super::conditions::make_condition;
 use coxswain_core::ownership::{self, ObjectKey};
 use coxswain_reflector::gw_types::{
-    GrpcRoute,
-    v::grpcroutes::{GrpcRouteParentRefs, GrpcRouteStatusParents, GrpcRouteStatusParentsParentRef},
+    TlsRoute,
+    v::tlsroutes::{TlsRouteParentRefs, TlsRouteStatusParents, TlsRouteStatusParentsParentRef},
 };
 use coxswain_reflector::keys::RouteParentKey;
 use coxswain_reflector::tls::{RouteHealthMap, RouteParentHealth};
@@ -18,9 +18,13 @@ use kube::{
 };
 use std::collections::HashSet;
 
-pub(super) async fn mark_grpc_route_programmed(
+/// Write `Accepted`, `Programmed`, and `ResolvedRefs` conditions on a `TLSRoute`
+/// for every owned parentRef (Gateway) the route is bound to.
+///
+/// Idempotent: skips the API call when the desired status is already present.
+pub(super) async fn mark_tls_route_programmed(
     client: &Client,
-    route: &GrpcRoute,
+    route: &TlsRoute,
     controller_name: &str,
     owned_gateways: &HashSet<ObjectKey>,
     route_health: &RouteHealthMap,
@@ -35,25 +39,25 @@ pub(super) async fn mark_grpc_route_programmed(
         _ => return,
     };
 
-    let owned_refs = filter_owned_grpc_parent_refs(parent_refs, ns, owned_gateways);
+    let owned_refs = filter_owned_tls_parent_refs(parent_refs, ns, owned_gateways);
     if owned_refs.is_empty() {
         tracing::debug!(name, ns, "Skipping status patch — no owned parentRefs");
         return;
     }
 
-    let api: Api<GrpcRoute> = Api::namespaced(client.clone(), ns);
+    let api: Api<TlsRoute> = Api::namespaced(client.clone(), ns);
     let now = Time(k8s_openapi::jiff::Timestamp::now());
     let Some(observed_gen) = route.metadata.generation else {
         tracing::warn!(
             name,
             ns,
-            "Skipping GrpcRoute status patch: metadata.generation is unset"
+            "Skipping TlsRoute status patch: metadata.generation is unset"
         );
         return;
     };
 
     let default_health = RouteParentHealth::default();
-    let parents: Vec<GrpcRouteStatusParents> = owned_refs
+    let parents: Vec<TlsRouteStatusParents> = owned_refs
         .iter()
         .map(|p| {
             let gw_ns = p.namespace.as_deref().unwrap_or(ns);
@@ -102,9 +106,9 @@ pub(super) async fn mark_grpc_route_programmed(
                 now.clone(),
             );
 
-            GrpcRouteStatusParents {
+            TlsRouteStatusParents {
                 controller_name: controller_name.to_string(),
-                parent_ref: GrpcRouteStatusParentsParentRef {
+                parent_ref: TlsRouteStatusParentsParentRef {
                     group: p.group.clone(),
                     kind: p.kind.clone(),
                     name: p.name.clone(),
@@ -121,11 +125,7 @@ pub(super) async fn mark_grpc_route_programmed(
         &parents,
         route.status.as_ref().map(|s| s.parents.as_slice()),
     ) {
-        tracing::debug!(
-            name,
-            ns,
-            "GrpcRoute status already current — skipping patch"
-        );
+        tracing::debug!(name, ns, "TlsRoute status already current — skipping patch");
         return;
     }
 
@@ -134,18 +134,18 @@ pub(super) async fn mark_grpc_route_programmed(
     let result = api
         .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
         .await;
-    crate::metrics::observe_status_patch("grpcroute", started, &result);
+    crate::metrics::observe_status_patch("tls_route", started, &result);
     match result {
-        Ok(_) => tracing::info!(name, ns, "GrpcRoute programmed"),
-        Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch GrpcRoute status"),
+        Ok(_) => tracing::info!(name, ns, "TlsRoute programmed"),
+        Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch TlsRoute status"),
     }
 }
 
-fn filter_owned_grpc_parent_refs(
-    parent_refs: &[GrpcRouteParentRefs],
+fn filter_owned_tls_parent_refs(
+    parent_refs: &[TlsRouteParentRefs],
     default_ns: &str,
     owned_gateways: &HashSet<ObjectKey>,
-) -> Vec<GrpcRouteParentRefs> {
+) -> Vec<TlsRouteParentRefs> {
     parent_refs
         .iter()
         .filter(|p| {
@@ -163,8 +163,8 @@ fn filter_owned_grpc_parent_refs(
 }
 
 fn route_status_unchanged(
-    desired: &[GrpcRouteStatusParents],
-    existing: Option<&[GrpcRouteStatusParents]>,
+    desired: &[TlsRouteStatusParents],
+    existing: Option<&[TlsRouteStatusParents]>,
 ) -> bool {
     let Some(existing) = existing else {
         return desired.is_empty();
@@ -179,7 +179,7 @@ fn route_status_unchanged(
         })
 }
 
-fn parent_ref_eq(a: &GrpcRouteStatusParentsParentRef, b: &GrpcRouteStatusParentsParentRef) -> bool {
+fn parent_ref_eq(a: &TlsRouteStatusParentsParentRef, b: &TlsRouteStatusParentsParentRef) -> bool {
     a.name == b.name
         && a.namespace == b.namespace
         && a.group == b.group

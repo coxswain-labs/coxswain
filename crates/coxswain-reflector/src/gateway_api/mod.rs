@@ -13,6 +13,7 @@ mod reconcile;
 mod route_health;
 mod status;
 mod timeouts;
+mod tls_status;
 
 pub use backend_tls::{BackendTlsIndex, build_backend_tls_index};
 pub use bindings::ListenerBinding;
@@ -24,8 +25,8 @@ pub use reconcile::RouteResolution;
 mod tests;
 
 use crate::gw_types::v::gateways::Gateway;
-use crate::gw_types::{GrpcRoute, HttpRoute};
-use crate::tls::{BackendTlsPolicyHealthMap, HttpRouteHealthMap};
+use crate::gw_types::{GrpcRoute, HttpRoute, TlsRoute};
+use crate::tls::{BackendTlsPolicyHealthMap, RouteHealthMap};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::ReferenceGrantKey;
 use k8s_openapi::api::core::v1::Service;
@@ -51,13 +52,14 @@ impl GatewayApiReconciler {
         owned_gateways: &HashSet<ObjectKey>,
         backend_grants: &HashSet<ReferenceGrantKey>,
         service_store: &reflector::Store<Service>,
-    ) -> HttpRouteHealthMap {
+    ) -> RouteHealthMap {
         route_health::compute_route_health(
             routes,
             gateways,
             owned_gateways,
             backend_grants,
             service_store,
+            "HTTPRoute",
         )
     }
 
@@ -112,8 +114,8 @@ impl GrpcRouteReconciler {
 
     /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` health for `GRPCRoute`s.
     ///
-    /// Returns an [`HttpRouteHealthMap`] keyed by [`crate::keys::RouteParentKey`] — the map
-    /// type is kind-neutral. Use a **separate** `SharedHttpRouteHealth` instance for grpc health
+    /// Returns an [`RouteHealthMap`] keyed by [`crate::keys::RouteParentKey`] — the map
+    /// type is kind-neutral. Use a **separate** `SharedRouteHealth` instance for grpc health
     /// to avoid `RouteParentKey` collisions with HTTPRoute health (same key shape, different kind).
     pub fn compute_route_health(
         routes: &[Arc<GrpcRoute>],
@@ -121,13 +123,47 @@ impl GrpcRouteReconciler {
         owned_gateways: &HashSet<ObjectKey>,
         backend_grants: &HashSet<ReferenceGrantKey>,
         service_store: &reflector::Store<Service>,
-    ) -> HttpRouteHealthMap {
+    ) -> RouteHealthMap {
         route_health::compute_route_health(
             routes,
             gateways,
             owned_gateways,
             backend_grants,
             service_store,
+            "GRPCRoute",
+        )
+    }
+}
+
+/// Zero-sized handle namespacing the `TLSRoute` reconciliation entry points.
+///
+/// Parallel sibling to [`GatewayApiReconciler`] and [`GrpcRouteReconciler`] — not a trait,
+/// not a generic, just a concrete handle. Consumes only protocol-filtered listeners
+/// (`protocol: TLS, tls.mode: Passthrough`).
+#[non_exhaustive]
+pub struct TlsRouteReconciler;
+
+impl TlsRouteReconciler {
+    /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` health for `TLSRoute`s.
+    ///
+    /// Only `protocol: TLS` listeners are considered — routes attached to HTTP/HTTPS
+    /// listeners receive `Accepted=False, NotAllowedByListeners`. Use a **separate**
+    /// [`crate::tls::SharedRouteHealth`] instance to avoid key collisions with
+    /// HTTP/GRPC route health (same key shape, different kind).
+    pub fn compute_route_health(
+        routes: &[Arc<TlsRoute>],
+        gateways: &[Arc<Gateway>],
+        owned_gateways: &HashSet<ObjectKey>,
+        backend_grants: &HashSet<ReferenceGrantKey>,
+        service_store: &reflector::Store<Service>,
+    ) -> RouteHealthMap {
+        route_health::compute_route_health(
+            routes,
+            gateways,
+            owned_gateways,
+            backend_grants,
+            service_store,
+            "TLSRoute",
         )
     }
 }

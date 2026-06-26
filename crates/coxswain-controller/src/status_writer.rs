@@ -20,7 +20,7 @@ use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames};
 use coxswain_reflector::{
     ControllerReconciler, IngressEvent, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
-    SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
+    SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedRouteHealth,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -124,6 +124,7 @@ pub fn spawn_status_writer(
         &[
             "httproute",
             "grpcroute",
+            "tls_route",
             "ingress",
             "ingress_class",
             "ingress_class_parameters",
@@ -145,6 +146,7 @@ pub fn spawn_status_writer(
     );
     let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
+    let passthrough_routes = coxswain_core::routing::SharedTlsPassthroughTable::new();
     let outputs = ReconcilerOutputs {
         ingress_routes,
         gateway_routes,
@@ -154,6 +156,7 @@ pub fn spawn_status_writer(
         tls_health: gateway_tls_health.clone(),
         cluster_summary,
         dedicated_registry,
+        passthrough_routes: passthrough_routes.clone(),
     };
 
     // Create the ingress-event channel before the reconciler, so the sender can
@@ -172,6 +175,7 @@ pub fn spawn_status_writer(
             tls_health: outputs.tls_health.clone(),
             cluster_summary: outputs.cluster_summary.clone(),
             dedicated_registry: outputs.dedicated_registry.clone(),
+            passthrough_routes: passthrough_routes.clone(),
         },
         owned_gateways.clone(),
         Arc::clone(&leader),
@@ -193,8 +197,9 @@ pub fn spawn_status_writer(
         },
     );
 
-    let route_health: SharedHttpRouteHealth = reconciler.route_health();
-    let grpc_route_health: SharedHttpRouteHealth = reconciler.grpc_route_health();
+    let route_health: SharedRouteHealth = reconciler.route_health();
+    let grpc_route_health: SharedRouteHealth = reconciler.grpc_route_health();
+    let tls_route_health: SharedRouteHealth = reconciler.tls_route_health();
     let policy_health: SharedBackendTlsPolicyHealth = reconciler.policy_health();
 
     // Take the shared-informer subscriptions the reconciler created (it must
@@ -211,6 +216,7 @@ pub fn spawn_status_writer(
             tls: gateway_tls_health,
             route: route_health,
             grpc_route: grpc_route_health,
+            tls_route: tls_route_health,
             policy: policy_health,
         },
         subscriptions,

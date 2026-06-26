@@ -65,6 +65,21 @@ impl SniCertSelector {
     pub fn new(tls: SharedTlsStore, client_certs: SharedClientCertStore) -> Self {
         Self { tls, client_certs }
     }
+
+    /// Returns `true` when a **specific** (exact or wildcard) terminate cert is
+    /// registered for `sni` — the hostname-less default/catch-all bucket does
+    /// **not** count.
+    ///
+    /// The hybrid-port accept path uses this when no passthrough route matches:
+    /// a specific HTTPS listener claims this SNI (`true`) → fall through to TLS
+    /// terminate; no specific listener claims it (`false`) → reject the
+    /// connection rather than answer with a catch-all/default cert (GEP-2643 /
+    /// #70). A connection with no SNI can never match a hostname'd listener, so
+    /// `None` returns `false`.
+    #[must_use]
+    pub fn has_cert_for(&self, sni: Option<&str>) -> bool {
+        sni.is_some_and(|s| self.tls.load().has_specific_cert(s))
+    }
 }
 
 #[async_trait]
@@ -235,4 +250,65 @@ fn build_ca_store(
         })?;
     }
     Ok(builder.build())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore, TlsCert, TlsStoreBuilder};
+    use std::sync::Arc;
+
+    fn selector_with(host_pattern: &str) -> SniCertSelector {
+        let mut builder = TlsStoreBuilder::new();
+        builder.add_cert(
+            host_pattern,
+            Arc::new(TlsCert::new(
+                b"cert".to_vec(),
+                b"key".to_vec(),
+                "test".into(),
+            )),
+        );
+        let tls = SharedTlsStore::new();
+        tls.store(Arc::new(builder.build()));
+        SniCertSelector::new(tls, SharedClientCertStore::new())
+    }
+
+    #[test]
+    fn has_cert_for_matches_exact_and_wildcard() {
+        let sel = selector_with("abc.example.com");
+        assert!(sel.has_cert_for(Some("abc.example.com")), "exact match");
+
+        let wc = selector_with("*.example.com");
+        assert!(wc.has_cert_for(Some("foo.example.com")), "wildcard match");
+    }
+
+    #[test]
+    fn has_cert_for_rejects_unmatched_and_missing_sni() {
+        let sel = selector_with("abc.example.com");
+        // GEP-2643 (#70): a non-matching SNI on a hybrid port has no terminate
+        // cert, so the accept path rejects the connection instead of answering
+        // with the context default cert.
+        assert!(
+            !sel.has_cert_for(Some("non.matching.com")),
+            "no matching cert"
+        );
+        assert!(
+            !sel.has_cert_for(None),
+            "no SNI cannot match a hostname'd listener"
+        );
+    }
+
+    #[test]
+    fn has_cert_for_ignores_catchall_default_cert() {
+        // A hostname-less ("") listener populates the default/catch-all bucket.
+        // On a hybrid port it must NOT rescue an arbitrary SNI: the connection
+        // was destined for the port's passthrough routes, so a non-matching SNI
+        // is rejected even though a default cert exists (GEP-2643 / #70 —
+        // TLSRouteHostnameIntersection "should not reach backend").
+        let sel = selector_with("");
+        assert!(
+            !sel.has_cert_for(Some("non.matching.com")),
+            "default/catch-all cert must not count as a specific match"
+        );
+    }
 }

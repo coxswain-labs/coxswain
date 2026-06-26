@@ -1,0 +1,54 @@
+//! [`RouteLike`] impl for `TLSRoute` — the TLSRoute-specific projections.
+//! The kind-generic `Accepted`/`ResolvedRefs` algorithm lives in [`super::route_health`].
+
+use super::route_health::{BackendRefView, ParentRefView, RouteLike};
+use crate::gw_types::TlsRoute;
+
+impl RouteLike for TlsRoute {
+    fn route_namespace(&self) -> Option<&str> {
+        self.metadata.namespace.as_deref()
+    }
+
+    fn route_name(&self) -> Option<&str> {
+        self.metadata.name.as_deref()
+    }
+
+    fn route_hostnames(&self) -> Vec<&str> {
+        self.spec.hostnames.iter().map(String::as_str).collect()
+    }
+
+    fn route_parent_refs(&self) -> Vec<ParentRefView<'_>> {
+        self.spec
+            .parent_refs
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|pr| ParentRefView {
+                namespace: pr.namespace.as_deref(),
+                name: pr.name.as_str(),
+                section_name: pr.section_name.as_deref(),
+                port: pr.port.map(|p| p as u16),
+            })
+            .collect()
+    }
+
+    fn has_unsupported_filter(&self) -> bool {
+        false
+    }
+
+    fn health_backend_refs(&self) -> Vec<BackendRefView<'_>> {
+        self.spec
+            .rules
+            .iter()
+            .flat_map(|rule| {
+                rule.backend_refs.iter().map(|b| BackendRefView {
+                    kind: b.kind.as_deref().unwrap_or("Service"),
+                    group: b.group.as_deref().unwrap_or(""),
+                    namespace: b.namespace.as_deref(),
+                    name: &b.name,
+                    has_port: b.port.is_some(),
+                })
+            })
+            .collect()
+    }
+}

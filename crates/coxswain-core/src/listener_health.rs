@@ -39,6 +39,15 @@ pub enum ListenerTlsOutcome {
         /// Human-readable description of the configuration error.
         message: String,
     },
+    /// Listener uses an unsupported protocol/mode combination.
+    ///
+    /// Surfaces `Accepted=False, reason=UnsupportedValue` on the Gateway listener.
+    /// Currently emitted for `protocol: TLS, tls.mode: Terminate` listeners — only
+    /// `tls.mode: Passthrough` is supported for TLS listeners (GEP-2643).
+    Unsupported {
+        /// Human-readable description of what is not supported.
+        message: String,
+    },
     /// HTTPS listener; at least one `certificateRef` resolved but at least one
     /// failed (e.g. Secret missing, wrong type, or a denied `ReferenceGrant`).
     ///
@@ -52,6 +61,12 @@ pub enum ListenerTlsOutcome {
         /// Human-readable description naming the failed ref(s) and why they failed.
         message: String,
     },
+    /// `protocol: TLS, tls.mode: Passthrough` listener (GEP-2643 / TLSRoute).
+    ///
+    /// The proxy peeks the ClientHello SNI and forwards the raw encrypted stream
+    /// to the backend — no TLS is terminated at the proxy. The data plane creates
+    /// a `ListenerProtocol::TlsPassthrough` listener on this port.
+    TlsPassthrough,
 }
 
 impl ListenerTlsOutcome {
@@ -69,12 +84,16 @@ impl ListenerTlsOutcome {
 
     /// Returns `true` for outcomes the controller should treat as healthy.
     ///
-    /// `NotApplicable` (non-HTTPS listener) and `Resolved` (all refs resolved)
-    /// are healthy. `ResolvedPartial` is **not** healthy — it carries a degraded
+    /// `NotApplicable` (non-HTTPS listener), `Resolved` (all refs resolved),
+    /// and `TlsPassthrough` (SNI-peek path, no cert needed) are healthy.
+    /// `ResolvedPartial` is **not** healthy — it carries a degraded
     /// `ResolvedRefs=False` condition — even though the listener is still serving.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
-        matches!(self, Self::NotApplicable | Self::Resolved)
+        matches!(
+            self,
+            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough
+        )
     }
 
     /// Stable reason string for the `Programmed` listener condition.
@@ -86,7 +105,8 @@ impl ListenerTlsOutcome {
                 "InvalidCertificateRef"
             }
             Self::Invalid { .. } => "Invalid",
-            Self::NotApplicable | Self::Resolved => "Resolved",
+            Self::Unsupported { .. } => "UnsupportedValue",
+            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough => "Resolved",
         }
     }
 
@@ -98,9 +118,19 @@ impl ListenerTlsOutcome {
             Self::RefNotPermitted { message }
             | Self::InvalidCertificateRef { message }
             | Self::Invalid { message }
+            | Self::Unsupported { message }
             | Self::ResolvedPartial { message } => message.as_str(),
-            Self::NotApplicable | Self::Resolved => "",
+            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough => "",
         }
+    }
+
+    /// Returns `true` when this is a `TLS/Passthrough` listener (GEP-2643).
+    ///
+    /// Used by the bin layer to create a `ListenerProtocol::TlsPassthrough`
+    /// listener spec for these ports instead of `Http` or `Https`.
+    #[must_use]
+    pub fn is_tls_passthrough(&self) -> bool {
+        matches!(self, Self::TlsPassthrough)
     }
 }
 

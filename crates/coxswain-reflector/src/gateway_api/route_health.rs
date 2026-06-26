@@ -15,7 +15,7 @@
 use crate::gateway_api::hostnames::hostnames_intersect;
 use crate::gw_types::v::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom};
 use crate::keys::RouteParentKey;
-use crate::tls::{HttpRouteHealthMap, RouteParentHealth};
+use crate::tls::{RouteHealthMap, RouteParentHealth};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use k8s_openapi::api::core::v1::Service;
@@ -28,15 +28,13 @@ struct ListenerEntry {
     hostname: String,
     allows_all: bool,
     port: u16,
+    /// Pre-computed: does this listener allow the route kind being evaluated?
+    ///
+    /// Uses explicit `allowedRoutes.kinds` when present; falls back to the
+    /// implicit protocol→kind mapping (HTTP/HTTPS→HTTPRoute+GRPCRoute,
+    /// TLS→TLSRoute) defined by the Gateway API spec.
+    allows_kind: bool,
 }
-
-struct ListenerHnEntry {
-    name: String,
-    hostname: String,
-    port: u16,
-}
-
-type ListenerHnMap = HashMap<ObjectKey, Vec<ListenerHnEntry>>;
 
 /// Normalized view of one of a route's `parentRefs`, projected by the per-kind
 /// [`RouteLike`] impl so the shared algorithm need not know the concrete type.
@@ -80,13 +78,20 @@ pub(super) trait RouteLike {
 
 /// Computes `Accepted` and `ResolvedRefs` health for every (route, parent) pair
 /// that references an owned gateway.
+///
+/// `route_kind` is the route's API kind string (e.g. `"HTTPRoute"`, `"GRPCRoute"`,
+/// `"TLSRoute"`).  It is used to check each listener's `allowedRoutes.kinds`
+/// (explicit) and the implicit protocol→kind default mapping.  Routes attached to
+/// listeners that do not allow the kind receive `Accepted=False,
+/// Reason=NotAllowedByListeners`.
 pub(super) fn compute_route_health<R: RouteLike>(
     routes: &[Arc<R>],
     gateways: &[Arc<Gateway>],
     owned_gateways: &HashSet<ObjectKey>,
     backend_grants: &HashSet<ReferenceGrantKey>,
     service_store: &reflector::Store<Service>,
-) -> HttpRouteHealthMap {
+    route_kind: &str,
+) -> RouteHealthMap {
     let gw_listeners: HashMap<ObjectKey, Vec<ListenerEntry>> = gateways
         .iter()
         .filter_map(|gw| {
@@ -108,11 +113,21 @@ pub(super) fn compute_route_health<R: RouteLike>(
                         .and_then(|ns| ns.from.as_ref())
                         .map(|f| !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same))
                         .unwrap_or(false);
+                    // Explicit allowedRoutes.kinds takes precedence; fall back to the
+                    // implicit protocol→kind mapping when none are declared.
+                    let allows_kind = l
+                        .allowed_routes
+                        .as_ref()
+                        .and_then(|ar| ar.kinds.as_ref())
+                        .filter(|kinds| !kinds.is_empty())
+                        .map(|kinds| kinds.iter().any(|k| k.kind == route_kind))
+                        .unwrap_or_else(|| implicit_allows_kind(&l.protocol, route_kind));
                     ListenerEntry {
                         name: l.name.clone(),
                         hostname: l.hostname.as_deref().unwrap_or("").to_string(),
                         allows_all,
                         port: l.port as u16,
+                        allows_kind,
                     }
                 })
                 .collect();
@@ -120,7 +135,7 @@ pub(super) fn compute_route_health<R: RouteLike>(
         })
         .collect();
 
-    let mut map = HttpRouteHealthMap::new();
+    let mut map = RouteHealthMap::new();
 
     for route in routes {
         let route: &R = route.as_ref();
@@ -144,9 +159,11 @@ pub(super) fn compute_route_health<R: RouteLike>(
             if gw_ns != route_ns {
                 let blocked = gw_listeners.get(&gw_key).is_some_and(|ls| {
                     let relevant: Vec<_> = if section.is_empty() {
-                        ls.iter().collect()
+                        ls.iter().filter(|l| l.allows_kind).collect()
                     } else {
-                        ls.iter().filter(|l| l.name.as_str() == section).collect()
+                        ls.iter()
+                            .filter(|l| l.name.as_str() == section && l.allows_kind)
+                            .collect()
                     };
                     !relevant.is_empty() && relevant.iter().all(|l| !l.allows_all)
                 });
@@ -164,25 +181,8 @@ pub(super) fn compute_route_health<R: RouteLike>(
                 }
             }
 
-            let listeners_hn: ListenerHnMap = std::iter::once((
-                gw_key.clone(),
-                gw_listeners
-                    .get(&gw_key)
-                    .map(|ls| {
-                        ls.iter()
-                            .map(|l| ListenerHnEntry {
-                                name: l.name.clone(),
-                                hostname: l.hostname.clone(),
-                                port: l.port,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            ))
-            .collect();
-
             let (mut accepted, mut accepted_reason) =
-                compute_accepted(&route_hostnames, &section, pr.port, &gw_key, &listeners_hn);
+                compute_accepted(&route_hostnames, &section, pr.port, &gw_key, &gw_listeners);
 
             if accepted && route.has_unsupported_filter() {
                 accepted = false;
@@ -210,32 +210,56 @@ pub(super) fn compute_route_health<R: RouteLike>(
     map
 }
 
+/// Implicit protocol → allowed route kind mapping per Gateway API spec defaults.
+///
+/// Used when a listener carries no explicit `allowedRoutes.kinds`.
+fn implicit_allows_kind(protocol: &str, route_kind: &str) -> bool {
+    match protocol {
+        "HTTP" | "HTTPS" => matches!(route_kind, "HTTPRoute" | "GRPCRoute"),
+        "TLS" => route_kind == "TLSRoute",
+        _ => false,
+    }
+}
+
 fn compute_accepted(
     route_hostnames: &[&str],
     section_name: &str,
     port: Option<u16>,
     gw_key: &ObjectKey,
-    gw_listeners: &ListenerHnMap,
+    gw_listeners: &HashMap<ObjectKey, Vec<ListenerEntry>>,
 ) -> (bool, &'static str) {
     let Some(listeners) = gw_listeners.get(gw_key) else {
         return (true, "Accepted");
     };
 
+    // Gateway has zero listeners — route cannot attach.
+    if listeners.is_empty() {
+        return (false, "NoMatchingParent");
+    }
+
     if !section_name.is_empty() {
-        let matching: Vec<&ListenerHnEntry> = listeners
+        let matching: Vec<&ListenerEntry> = listeners
             .iter()
             .filter(|l| l.name == section_name)
             .collect();
         if matching.is_empty() {
             return (false, "NoMatchingParent");
         }
+        // Section exists but none of its listeners allow this route kind.
+        if !matching.iter().any(|l| l.allows_kind) {
+            return (false, "NotAllowedByListeners");
+        }
         if let Some(p) = port
-            && !matching.iter().any(|l| l.port == p)
+            && !matching
+                .iter()
+                .filter(|l| l.allows_kind)
+                .any(|l| l.port == p)
         {
             return (false, "NoMatchingParent");
         }
         let intersects = matching
             .iter()
+            .filter(|l| l.allows_kind)
             .any(|l| hostnames_intersect(route_hostnames, &l.hostname));
         return if intersects {
             (true, "Accepted")
@@ -244,10 +268,17 @@ fn compute_accepted(
         };
     }
 
-    let port_filtered: Vec<&ListenerHnEntry> = if let Some(p) = port {
-        listeners.iter().filter(|l| l.port == p).collect()
+    // No section name: consider only listeners that allow this route kind.
+    let kind_allowed: Vec<&ListenerEntry> = listeners.iter().filter(|l| l.allows_kind).collect();
+
+    if kind_allowed.is_empty() {
+        return (false, "NotAllowedByListeners");
+    }
+
+    let port_filtered: Vec<&ListenerEntry> = if let Some(p) = port {
+        kind_allowed.into_iter().filter(|l| l.port == p).collect()
     } else {
-        listeners.iter().collect()
+        kind_allowed
     };
 
     if port.is_some() && port_filtered.is_empty() {

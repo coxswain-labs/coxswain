@@ -1,20 +1,21 @@
 # Gateway API guide
 
-Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) standard channel. It supports `GatewayClass`, `Gateway`, `HTTPRoute`, and `GRPCRoute` resources.
+Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) standard channel. It supports `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, and `TLSRoute` resources.
 
 ## Supported resources
 
 | Resource | API version | Support |
 |----------|-------------|---------|
 | `GatewayClass` | `gateway.networking.k8s.io/v1` | Full |
-| `Gateway` | `gateway.networking.k8s.io/v1` | HTTP and HTTPS listeners only |
+| `Gateway` | `gateway.networking.k8s.io/v1` | HTTP, HTTPS, and TLS passthrough listeners |
 | `HTTPRoute` | `gateway.networking.k8s.io/v1` | Path, header, method, and query matching; weighted traffic split |
 | `GRPCRoute` | `gateway.networking.k8s.io/v1` | Service and method matching; cleartext h2c backends |
+| `TLSRoute` | `gateway.networking.k8s.io/v1alpha2` | SNI-keyed L4 passthrough; no TLS termination at proxy |
 | `ReferenceGrant` | `gateway.networking.k8s.io/v1beta1` | Cross-namespace backend and certificate access |
 | `BackendTLSPolicy` | `gateway.networking.k8s.io/v1` | Upstream TLS configuration referencing a CA `ConfigMap` or `Secret` |
 
 !!! warning "Not supported"
-    `TCPRoute`, `TLSRoute`, and `UDPRoute` are not implemented. `tls.mode: Passthrough` on a listener is rejected.
+    `TCPRoute` and `UDPRoute` are not implemented.
 
 ## GatewayClass
 
@@ -52,7 +53,7 @@ Implementation-specific capabilities — such as `RegularExpression` path, heade
 
 ## Gateway
 
-A `Gateway` object defines one or more listeners, each binding a port and protocol to a set of allowed routes. Only `HTTP` and `HTTPS` listeners are processed; other protocol values are ignored.
+A `Gateway` object defines one or more listeners, each binding a port and protocol to a set of allowed routes. `HTTP`, `HTTPS`, and `TLS` listeners are processed; other protocol values are ignored.
 
 !!! tip "Dedicated proxy per Gateway"
     A `Gateway` can be opted into its own isolated proxy pool via `spec.infrastructure.parametersRef`. See [Dedicated proxy pools](dedicated-mode.md) for the full walkthrough.
@@ -95,14 +96,14 @@ Controls which namespaces may attach `HTTPRoute`s to this listener.
 | `spec.gatewayClassName` | Full |
 | `spec.listeners[].name` | Full |
 | `spec.listeners[].port` | Full |
-| `spec.listeners[].protocol` | `HTTP`, `HTTPS` only |
+| `spec.listeners[].protocol` | `HTTP`, `HTTPS`, `TLS` |
 | `spec.listeners[].hostname` | Full (wildcard: any number of labels) |
 | `spec.listeners[].allowedRoutes` | Full |
-| `spec.listeners[].tls` | `mode: Terminate` only; `Passthrough` rejected |
+| `spec.listeners[].tls` | `mode: Terminate` (HTTPS) and `mode: Passthrough` (TLS) |
 
 ### TLS
 
-Add an `HTTPS` listener and reference a `kubernetes.io/tls` Secret in the same namespace. Coxswain only supports `tls.mode: Terminate` — `Passthrough` is rejected with a status condition. Coxswain reloads the certificate automatically when the Secret changes. See the [TLS guide](tls.md) for cert-manager integration.
+Add an `HTTPS` listener and reference a `kubernetes.io/tls` Secret in the same namespace. Coxswain reloads the certificate automatically when the Secret changes. See the [TLS guide](tls.md) for cert-manager integration. For TLS passthrough (no termination at the proxy), see [TLSRoute](#tlsroute) below.
 
 ```yaml
 spec:
@@ -112,7 +113,7 @@ spec:
       port: 443
       protocol: HTTPS
       tls:
-        mode: Terminate     # Passthrough is not supported
+        mode: Terminate
         certificateRefs:
           - kind: Secret
             name: my-gateway-tls   # must exist in the same namespace
@@ -554,4 +555,86 @@ Header matching uses the same `Exact` and `RegularExpression` semantics as `HTTP
 
 ```bash
 kubectl describe grpcroute my-grpc-route
+```
+
+## TLSRoute
+
+A `TLSRoute` routes raw TLS connections by SNI without terminating TLS at the proxy (GEP-2643). The proxy peeks the ClientHello SNI and splices the still-encrypted byte stream directly to the backend. TLS is terminated at the backend pod.
+
+### Gateway listener
+
+Use `protocol: TLS` with `tls.mode: Passthrough` on the listener. No `certificateRefs` are needed — the proxy never holds or inspects a certificate on this path.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+  namespace: default
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: passthrough
+      port: 443
+      protocol: TLS
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        namespaces:
+          from: Same
+```
+
+### Example
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata:
+  name: my-tls-route
+  namespace: default
+spec:
+  parentRefs:
+    - name: my-gateway
+      sectionName: passthrough
+  hostnames:
+    - app.example.com       # matched against the TLS ClientHello SNI
+  rules:
+    - backendRefs:
+        - name: my-tls-service
+          port: 443
+```
+
+The backend Service receives the unmodified TLS stream; its pod terminates TLS and sees the client's original handshake.
+
+### SNI matching
+
+| Hostname format | Behaviour |
+|-----------------|-----------|
+| `app.example.com` | Exact SNI match |
+| `*.example.com` | Wildcard: matches any number of labels (`foo.example.com`, `a.b.example.com`) |
+| _(omitted)_ | Catch-all: matches any SNI that no other rule handles |
+
+Matching follows Gateway API hostname precedence: exact before wildcard before catch-all.
+
+!!! note
+    Wildcard hostname semantics here are routing-only (not RFC 6125 cert validation — no cert is involved at the proxy). Any number of DNS labels are matched by `*`, consistent with Gateway API's HTTPRoute wildcard semantics.
+
+### Supported fields
+
+| Field | Support |
+|-------|---------|
+| `spec.parentRefs` | Full (including `sectionName` and `port`) |
+| `spec.hostnames` | Full (exact, wildcard, omitted catch-all) |
+| `spec.rules[].backendRefs` | Service backends only |
+| `spec.rules[].backendRefs[].weight` | Full |
+
+### Status conditions
+
+| Condition | True when |
+|-----------|-----------|
+| `Accepted` | The route is attached to a `TLS/Passthrough` listener |
+| `ResolvedRefs` | All `backendRefs` resolve to a reachable Service |
+
+```bash
+kubectl describe tlsroute my-tls-route
 ```

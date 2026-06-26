@@ -19,7 +19,7 @@ use coxswain_e2e::{
     ControllerOptions, ControllerProcess, FixtureVars, GeneratedCert, Harness, MtlsCerts,
     NamespaceGuard, StaticRsaCert, bootstrap,
     fixtures::{self, backends, gateway_api as gwa, ingress},
-    harness::{http, wait},
+    harness::{GATEWAY_TLS_PASSTHROUGH_PORT, http, wait},
 };
 use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::Secret;
@@ -2528,4 +2528,299 @@ async fn backend_mtls_invalid_client_cert_ref_fails_closed() -> anyhow::Result<(
     .await?;
 
     Ok(())
+}
+
+// ── TLS passthrough (TLSRoute / GEP-2643, #70) ────────────────────────────────
+
+/// Happy path: TLSRoute on a `TLS/Passthrough` listener routes raw TLS by SNI.
+///
+/// The backend terminates TLS (proxy never sees plaintext). The TLS handshake
+/// succeeds using the backend's cert as the trusted root — if the proxy were
+/// terminating TLS itself, it would present a different cert not in our root
+/// store, and the handshake would fail, causing the test to fail.
+#[tokio::test]
+async fn tls_passthrough_routes_by_sni_without_termination() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-passthrough-happy").await?;
+
+    let hostname = format!("passthrough.{}.local", ns.name);
+    let backend_cert = GeneratedCert::for_host(&hostname);
+
+    // Deploy the TLS echo backend (terminates TLS itself using backend_cert).
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", backend_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", backend_cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    // Apply the passthrough Gateway + TLSRoute.
+    fixtures::apply_fixture(
+        gwa::TLS_PASSTHROUGH,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("PASSTHROUGH_HOSTNAME", &hostname),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-passthrough-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Open a raw TLS connection to the passthrough port using backend_cert's DER
+    // as the trusted root.  If the proxy terminated TLS, it would present a
+    // different cert that isn't in our root store, making the handshake fail.
+    let passthrough_addr = h.gateway_passthrough_addr;
+    let trusted_ca_der = backend_cert.cert_der();
+    let body = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("TLS passthrough route for {hostname} to become live") },
+        || async {
+            try_tls_passthrough(
+                &passthrough_addr,
+                &hostname,
+                &trusted_ca_der,
+                "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+
+    assert!(
+        body.contains("namespace"),
+        "expected echo-tls JSON body with 'namespace' field, got: {body}",
+    );
+
+    Ok(())
+}
+
+/// Sad path: unknown SNI on a Passthrough listener → connection dropped, no backend reached.
+///
+/// The proxy has a TLSRoute for `hostname` but none for `unknown`. A TLS connect
+/// with `unknown` as the SNI must fail — the proxy closes the connection before
+/// the handshake can complete.
+#[tokio::test]
+async fn tls_passthrough_unknown_sni_is_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-passthrough-nosni").await?;
+
+    let hostname = format!("passthrough.{}.local", ns.name);
+    let backend_cert = GeneratedCert::for_host(&hostname);
+
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", backend_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", backend_cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    fixtures::apply_fixture(
+        gwa::TLS_PASSTHROUGH,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("PASSTHROUGH_HOSTNAME", &hostname),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-passthrough-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Pre-condition: confirm the happy-path hostname is routed before probing the
+    // negative, so the test can't pass vacuously due to the proxy not being ready.
+    let passthrough_addr = h.gateway_passthrough_addr;
+    let trusted_ca_der = backend_cert.cert_der();
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("TLS passthrough route for {hostname} to become live (pre-condition)") },
+        || async {
+            try_tls_passthrough(
+                &passthrough_addr,
+                &hostname,
+                &trusted_ca_der,
+                "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+
+    // Connect with an SNI that has no matching TLSRoute → proxy drops the connection.
+    let unknown = format!("unknown.{}.local", ns.name);
+    let result = try_tls_passthrough(
+        &h.gateway_passthrough_addr,
+        &unknown,
+        &trusted_ca_der,
+        "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "expected connection error for unknown SNI, got success",
+    );
+
+    Ok(())
+}
+
+/// Sad path: `TLS/Passthrough` listener exists but zero TLSRoutes are attached.
+///
+/// The Gateway should still become `Programmed=True` (the listener configuration
+/// is valid even with no routes attached), and any incoming connection is dropped
+/// (no backend to forward to).
+#[tokio::test]
+async fn tls_passthrough_listener_without_route_is_programmed_but_drops() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-passthrough-noroute").await?;
+
+    let hostname = format!("passthrough.{}.local", ns.name);
+
+    // Apply only the Gateway (no TLSRoute).
+    fixtures::apply_fixture(
+        gwa::TLS_PASSTHROUGH_GW_ONLY,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("PASSTHROUGH_HOSTNAME", &hostname),
+    )
+    .await?;
+
+    // Gateway should become Programmed even with no routes.
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-passthrough-gw-only",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Any TLS connection to the passthrough port is dropped (no backend to forward to).
+    // We use a self-signed cert for the hostname, but verification is expected to
+    // fail before the handshake completes — the proxy closes the connection.
+    let dummy_cert = GeneratedCert::for_host(&hostname);
+    let result = try_tls_passthrough(
+        &h.gateway_passthrough_addr,
+        &hostname,
+        &dummy_cert.cert_der(),
+        "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "expected connection error with no TLSRoute attached, got success",
+    );
+
+    Ok(())
+}
+
+/// Open a raw TLS connection to `addr` with `sni` as the ClientHello server_name.
+///
+/// Verifies the TLS handshake against `trusted_ca_der` (the backend's cert in DER
+/// form — use [`GeneratedCert::cert_der`] to obtain it).  Sends `http_req` through
+/// the encrypted tunnel and returns the HTTP response body.
+///
+/// Returns an error if the TCP connect fails, the TLS handshake fails (e.g. the
+/// proxy dropped the connection or presented an untrusted cert), or the HTTP
+/// response status is not 200.
+///
+/// # Errors
+///
+/// Returns an error if the TCP connect, TLS handshake, write, or read fails, or
+/// if the HTTP response status is not 200.
+async fn try_tls_passthrough(
+    addr: &std::net::SocketAddr,
+    sni: &str,
+    trusted_ca_der: &[u8],
+    http_req: &str,
+) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    use rustls::ClientConfig;
+    use rustls::RootCertStore;
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsConnector;
+
+    let mut roots = RootCertStore::empty();
+    let cert_der = CertificateDer::from(trusted_ca_der.to_vec());
+    roots
+        .add(cert_der)
+        .map_err(|e| anyhow::anyhow!("add root cert: {e}"))?;
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .context("TCP connect")?;
+    let server_name =
+        ServerName::try_from(sni.to_owned()).map_err(|e| anyhow::anyhow!("invalid SNI: {e}"))?;
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .context("TLS handshake")?;
+
+    tls.write_all(http_req.as_bytes())
+        .await
+        .context("write HTTP request")?;
+    tls.flush().await.context("flush")?;
+
+    // Pingora closes the connection without a TLS close_notify — mirror what
+    // the existing TLS helper tests do: accept UnexpectedEof as end-of-stream.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tls.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(anyhow::Error::new(e)).context("read HTTP response"),
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf).to_string();
+    anyhow::ensure!(
+        text.starts_with("HTTP/1.1 200"),
+        "unexpected HTTP status: {}",
+        text.lines().next().unwrap_or("")
+    );
+
+    Ok(text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default())
 }

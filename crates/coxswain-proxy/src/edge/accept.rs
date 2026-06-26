@@ -47,8 +47,11 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use coxswain_core::routing::SharedTlsPassthroughTable;
+
 use crate::SniCertSelector;
 use crate::ctx::{CONN_INFO, ConnectionInfo};
+use crate::edge::passthrough::{handle_passthrough, peek_sni};
 use crate::metrics;
 
 /// Maximum number of in-flight per-connection tasks per listener.
@@ -87,6 +90,21 @@ pub(crate) enum ProxyHeaderError {
     UnknownProtocol(String),
 }
 
+/// Groups the TLS-passthrough parameters for [`ProxyAcceptor::new`].
+///
+/// Extracted into a struct so `ProxyAcceptor::new` stays under the 7-argument
+/// workspace limit enforced by `clippy::too_many_arguments`.
+// intentionally open: callers construct this directly in coxswain-bin.
+pub struct PassthroughConfig {
+    /// SNI-keyed routing table for `TlsPassthrough` listeners.
+    ///
+    /// An empty table causes all passthrough connections to be closed
+    /// immediately (no matching backend).
+    pub table: SharedTlsPassthroughTable,
+    /// How long to wait when connecting to a passthrough backend.
+    pub dial_timeout: Duration,
+}
+
 /// CIDR allow-list for peers permitted to send PROXY protocol headers.
 #[non_exhaustive]
 pub struct TrustedSources {
@@ -105,7 +123,7 @@ impl TrustedSources {
     }
 }
 
-/// Whether a listener speaks plain HTTP or HTTPS.
+/// Whether a listener speaks plain HTTP, HTTPS, or TLS passthrough.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ListenerProtocol {
@@ -113,6 +131,15 @@ pub enum ListenerProtocol {
     Http,
     /// HTTPS with SNI-based certificate selection.
     Https,
+    /// Raw TLS passthrough: route by SNI without terminating TLS (TLSRoute / GEP-2643).
+    TlsPassthrough,
+    /// Port shared between TLS passthrough (TLSRoute) and HTTPS terminate listeners.
+    ///
+    /// On accept: peek the ClientHello SNI via MSG_PEEK. If the SNI matches a
+    /// `TlsPassthrough` route, splice to that backend (bytes stay in the kernel
+    /// queue — no replay needed). If not, fall through to standard TLS-terminate
+    /// processing (`Https`).
+    TlsHybrid,
 }
 
 /// One listen address with its associated protocol.
@@ -121,7 +148,7 @@ pub enum ListenerProtocol {
 pub struct ListenerSpec {
     /// The socket address to bind.
     pub addr: SocketAddr,
-    /// Whether this listener speaks HTTP or HTTPS.
+    /// Whether this listener speaks HTTP, HTTPS, or TLS passthrough.
     pub protocol: ListenerProtocol,
 }
 
@@ -141,6 +168,25 @@ impl ListenerSpec {
             protocol: ListenerProtocol::Https,
         }
     }
+
+    /// Create a TLS passthrough listener spec for the given address (TLSRoute / GEP-2643).
+    pub fn tls_passthrough(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            protocol: ListenerProtocol::TlsPassthrough,
+        }
+    }
+
+    /// Create a hybrid TLS listener spec for a port shared between TLS passthrough and HTTPS.
+    ///
+    /// Peeks the ClientHello SNI on accept: routes to passthrough if matched,
+    /// falls through to TLS-terminate otherwise.
+    pub fn tls_hybrid(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            protocol: ListenerProtocol::TlsHybrid,
+        }
+    }
 }
 
 /// Dynamically-managed proxy acceptor for a single [`ProxyHttp`] implementation.
@@ -154,6 +200,10 @@ impl ListenerSpec {
 /// valid HAProxy PROXY-protocol header from the allow-listed CIDR set.  When
 /// it is `None` (the common case), standard Pingora connection handling is
 /// used, supporting both HTTP/1.1 and HTTP/2 via ALPN.
+///
+/// TLS passthrough listeners (`ListenerProtocol::TlsPassthrough`) bypass the
+/// HTTP proxy entirely and forward raw encrypted streams by SNI, using the
+/// [`SharedTlsPassthroughTable`] snapshot.
 #[non_exhaustive]
 pub struct ProxyAcceptor<P>
 where
@@ -169,6 +219,10 @@ where
     trusted: Option<Arc<TrustedSources>>,
     tls_selector: SniCertSelector,
     drain_timeout: Duration,
+    /// SNI-keyed passthrough routing table for `TlsPassthrough` listeners.
+    passthrough_table: SharedTlsPassthroughTable,
+    /// Timeout for dialling a passthrough backend.
+    passthrough_dial_timeout: Duration,
 }
 
 impl<P> ProxyAcceptor<P>
@@ -183,6 +237,8 @@ where
     /// * `specs_rx` — if `Some`, the acceptor watches this receiver for
     ///   desired-set changes and reconciles dynamically.  Pass `None` for a
     ///   static listener set.
+    /// * `passthrough` — routing table and dial timeout for
+    ///   `TlsPassthrough` listeners; see [`PassthroughConfig`].
     ///
     /// # Errors
     ///
@@ -197,6 +253,7 @@ where
         trusted: Option<Arc<TrustedSources>>,
         tls_selector: SniCertSelector,
         drain_timeout: Duration,
+        passthrough: PassthroughConfig,
     ) -> Result<Self, AcceptorBuildError> {
         // Validate the TLS acceptor eagerly so bind failures surface before runtime.
         // ALPN h2 advertisement only applies to the standard path (`handle_standard`);
@@ -217,6 +274,8 @@ where
             trusted,
             tls_selector,
             drain_timeout,
+            passthrough_table: passthrough.table,
+            passthrough_dial_timeout: passthrough.dial_timeout,
         })
     }
 }
@@ -242,6 +301,8 @@ where
             trusted: self.trusted.clone(),
             tls_selector: self.tls_selector.clone(),
             drain_timeout: self.drain_timeout,
+            passthrough_table: self.passthrough_table.clone(),
+            passthrough_dial_timeout: self.passthrough_dial_timeout,
         };
 
         // Bind the initial desired set.
@@ -315,6 +376,16 @@ struct ListenerHandle {
     /// current request completes (Pingora will stop keepalive and close idle
     /// connections on the next loop iteration).
     conn_shutdown_tx: watch::Sender<bool>,
+    /// Current dispatch protocol for new connections on this listener.
+    ///
+    /// A Gateway-listener change can flip a port's protocol in place — e.g. a
+    /// port serving `Https` terminate becomes `TlsHybrid` once a `TLSRoute`
+    /// passthrough listener is added to the same port. The reconciler pushes the
+    /// new protocol here so the running accept loop applies it to subsequent
+    /// connections without rebinding the socket (which would race the draining
+    /// old listener for the address). The current value also records the
+    /// listener's protocol for the next reconcile's delta.
+    proto_tx: watch::Sender<ListenerProtocol>,
 }
 
 /// Shared proxy + trust + TLS configuration used when spawning a new listener
@@ -329,6 +400,8 @@ where
     trusted: Option<Arc<TrustedSources>>,
     tls_selector: SniCertSelector,
     drain_timeout: Duration,
+    passthrough_table: SharedTlsPassthroughTable,
+    passthrough_dial_timeout: Duration,
 }
 
 /// Per-connection handler state: the proxy, trust policy, and TLS selector
@@ -344,12 +417,59 @@ where
     tls_selector: SniCertSelector,
     local_addr: SocketAddr,
     protocol: ListenerProtocol,
+    passthrough_table: SharedTlsPassthroughTable,
+    passthrough_dial_timeout: Duration,
 }
 
 // ── Reconcile helpers ─────────────────────────────────────────────────────────
 
+/// The three disjoint actions a reconcile pass must take to converge the active
+/// listener set to the desired set. Pure output of [`plan_listener_changes`] so
+/// the delta logic is unit-testable without binding sockets.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ListenerPlan {
+    /// Addresses to drain and stop accepting on (gone from desired).
+    remove: Vec<SocketAddr>,
+    /// Addresses already bound whose protocol changed — switch in place, no rebind.
+    reprotocol: Vec<ListenerSpec>,
+    /// Newly-desired addresses to bind and spawn.
+    add: Vec<ListenerSpec>,
+}
+
+/// Partition `desired` against the currently-bound `active` protocols into a
+/// [`ListenerPlan`].
+///
+/// An address present in both with a *different* protocol lands in `reprotocol`,
+/// not `remove`+`add`: the socket stays bound and the running listener switches
+/// protocol for new connections. Rebinding instead would race the draining old
+/// listener for the address (the socket is held through its drain window, and no
+/// `SO_REUSEPORT` is set), dropping the port entirely — the exact failure that
+/// left `protocol: TLS` passthrough listeners stuck terminating on a port first
+/// bound as `Https` (GEP-2643 / #70).
+fn plan_listener_changes(
+    active: &HashMap<SocketAddr, ListenerProtocol>,
+    desired: &HashSet<ListenerSpec>,
+) -> ListenerPlan {
+    let desired_addrs: HashSet<SocketAddr> = desired.iter().map(|s| s.addr).collect();
+    let mut plan = ListenerPlan::default();
+    for addr in active.keys() {
+        if !desired_addrs.contains(addr) {
+            plan.remove.push(*addr);
+        }
+    }
+    for spec in desired {
+        match active.get(&spec.addr) {
+            None => plan.add.push(spec.clone()),
+            Some(&proto) if proto != spec.protocol => plan.reprotocol.push(spec.clone()),
+            Some(_) => {}
+        }
+    }
+    plan
+}
+
 /// Compute the delta between `active` and `desired` and apply it:
 /// - Spawn a listener task for each added spec.
+/// - Switch protocol in place for each spec whose port is already bound.
 /// - Signal drain for each removed spec.
 async fn reconcile_listeners<P>(
     active: &mut HashMap<SocketAddr, ListenerHandle>,
@@ -361,11 +481,14 @@ async fn reconcile_listeners<P>(
     P: ProxyHttp + Send + Sync + 'static,
     <P as ProxyHttp>::CTX: Send + Sync,
 {
-    let desired_addrs: HashSet<SocketAddr> = desired.iter().map(|s| s.addr).collect();
-    let current_addrs: HashSet<SocketAddr> = active.keys().copied().collect();
+    let active_protos: HashMap<SocketAddr, ListenerProtocol> = active
+        .iter()
+        .map(|(addr, h)| (*addr, *h.proto_tx.borrow()))
+        .collect();
+    let plan = plan_listener_changes(&active_protos, &desired);
 
     // Signal drain for removed listeners.
-    for addr in current_addrs.difference(&desired_addrs) {
+    for addr in &plan.remove {
         if let Some(handle) = active.remove(addr) {
             tracing::info!(addr = %addr, "Removing listener; draining in-flight connections");
             metrics::lifecycle().with_label_values(&["removed"]).inc();
@@ -384,11 +507,22 @@ async fn reconcile_listeners<P>(
         }
     }
 
+    // Switch protocol in place for ports that stayed bound but changed protocol.
+    for spec in &plan.reprotocol {
+        if let Some(handle) = active.get(&spec.addr) {
+            tracing::info!(
+                addr = %spec.addr,
+                protocol = ?spec.protocol,
+                "Switching listener protocol in place"
+            );
+            // `watch::Sender::send` only errors when every receiver is gone; the
+            // listener task holds one, so a live listener always applies this.
+            let _ = handle.proto_tx.send(spec.protocol);
+        }
+    }
+
     // Spawn tasks for newly-desired listeners.
-    for spec in desired
-        .into_iter()
-        .filter(|s| !current_addrs.contains(&s.addr))
-    {
+    for spec in plan.add {
         let tcp = match tokio::net::TcpListener::bind(spec.addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -402,15 +536,17 @@ async fn reconcile_listeners<P>(
         };
         let drain_token = CancellationToken::new();
         let (conn_shutdown_tx, conn_shutdown_rx) = watch::channel(false);
+        let (proto_tx, proto_rx) = watch::channel(spec.protocol);
 
         let listener_cfg = ListenerConfig {
             proxy: Arc::clone(&cfg.proxy),
             trusted: cfg.trusted.clone(),
             tls_selector: cfg.tls_selector.clone(),
             drain_timeout: cfg.drain_timeout,
+            passthrough_table: cfg.passthrough_table.clone(),
+            passthrough_dial_timeout: cfg.passthrough_dial_timeout,
         };
         let addr = spec.addr;
-        let protocol = spec.protocol;
 
         tracing::info!(addr = %addr, "Binding new listener");
         metrics::lifecycle().with_label_values(&["added"]).inc();
@@ -421,7 +557,7 @@ async fn reconcile_listeners<P>(
         all_tasks.spawn(run_listener(
             tcp,
             addr,
-            protocol,
+            proto_rx,
             listener_cfg,
             drain_token.clone(),
             conn_shutdown_rx,
@@ -433,6 +569,7 @@ async fn reconcile_listeners<P>(
             ListenerHandle {
                 drain_token,
                 conn_shutdown_tx,
+                proto_tx,
             },
         );
     }
@@ -455,7 +592,7 @@ fn signal_all_drain(active: &HashMap<SocketAddr, ListenerHandle>) {
 async fn run_listener<P>(
     tcp: tokio::net::TcpListener,
     addr: SocketAddr,
-    protocol: ListenerProtocol,
+    proto_rx: watch::Receiver<ListenerProtocol>,
     cfg: ListenerConfig<P>,
     drain_token: CancellationToken,
     conn_shutdown_rx: watch::Receiver<bool>,
@@ -485,12 +622,18 @@ async fn run_listener<P>(
                     Ok((stream, peer)) => {
                         match Arc::clone(&sem).try_acquire_owned() {
                             Ok(permit) => {
+                                // Read the live protocol: a reconcile may have
+                                // switched this port (e.g. Https → TlsHybrid) since
+                                // the listener was bound, without rebinding it.
+                                let protocol = *proto_rx.borrow();
                                 let handler = ConnHandler {
                                     proxy: Arc::clone(&cfg.proxy),
                                     trusted: cfg.trusted.as_ref().map(Arc::clone),
                                     tls_selector: cfg.tls_selector.clone(),
                                     local_addr: addr,
                                     protocol,
+                                    passthrough_table: cfg.passthrough_table.clone(),
+                                    passthrough_dial_timeout: cfg.passthrough_dial_timeout,
                                 };
                                 let conn_sd = conn_shutdown_rx.clone();
                                 conn_set.spawn(async move {
@@ -560,16 +703,10 @@ async fn run_listener<P>(
 
 /// Handle one accepted TCP connection.
 ///
-/// Dispatches to either the **PROXY-protocol path** (when `trusted` is
-/// `Some`) or the **standard Pingora path** (when `trusted` is `None`).
-///
-/// Standard path: calls [`ServerApp::process_new`] which handles ALPN,
-/// supports HTTP/1.1 and HTTP/2, and manages keepalive internally.
-///
-/// PROXY-protocol path: reads the PROXY header, then runs an HTTP/1.1
-/// keepalive loop via [`HttpServerApp::process_new_http`].  HTTP/2 is not
-/// supported on this path (existing behaviour, not regressed by this
-/// rewrite).
+/// Dispatches based on protocol and trust configuration:
+/// - `TlsPassthrough`: peek SNI, match routing table, splice to backend — no HTTP involved.
+/// - PROXY-protocol path (when `trusted` is `Some`): read PROXY header, run HTTP/1.1 loop.
+/// - Standard Pingora path (when `trusted` is `None`): ALPN, HTTP/1.1 and HTTP/2.
 async fn handle_connection<P>(
     tcp: TcpStream,
     peer_addr: SocketAddr,
@@ -580,12 +717,73 @@ async fn handle_connection<P>(
     <P as ProxyHttp>::CTX: Send + Sync,
 {
     let _conn_guard = ConnectionGuard::new(handler.local_addr.port());
+
+    // TLS passthrough is independent of the PROXY-protocol setting — it never runs
+    // through the HTTP proxy layer.
+    if handler.protocol == ListenerProtocol::TlsPassthrough {
+        handle_passthrough(
+            tcp,
+            peer_addr,
+            &handler.passthrough_table,
+            handler.local_addr.port(),
+            handler.passthrough_dial_timeout,
+        )
+        .await;
+        return;
+    }
+
+    // Hybrid port: peek SNI (MSG_PEEK — bytes stay in kernel queue) and route to
+    // passthrough if a TLSRoute matches. Otherwise fall through as HTTPS terminate.
+    if handler.protocol == ListenerProtocol::TlsHybrid {
+        let port = handler.local_addr.port();
+        let sni = peek_sni(&tcp).await.ok().flatten();
+        let snapshot = handler.passthrough_table.load();
+        let has_passthrough_match = snapshot
+            .port(port)
+            .is_some_and(|router| router.match_sni(sni.as_deref()).is_some());
+        if has_passthrough_match {
+            handle_passthrough(
+                tcp,
+                peer_addr,
+                &handler.passthrough_table,
+                port,
+                handler.passthrough_dial_timeout,
+            )
+            .await;
+            return;
+        }
+        // No passthrough route matched. Fall through to TLS terminate only if a
+        // real HTTPS listener serves this SNI; otherwise no Gateway listener on
+        // this hybrid port accepts the connection, so reject it by dropping the
+        // socket (the client observes a connection reset / EOF). Answering with
+        // the TLS context's default cert instead would leave a non-matching SNI
+        // looking "connectable", which GEP-2643 hostname-intersection forbids
+        // (TLSRoute-standard: a request must reach a backend only for an
+        // intersecting hostname).
+        if !handler.tls_selector.has_cert_for(sni.as_deref()) {
+            tracing::debug!(
+                port,
+                sni = ?sni,
+                "Hybrid port: no passthrough route and no terminate cert for SNI — rejecting connection"
+            );
+            return;
+        }
+        // SNI has a terminate cert: fall through to TLS terminate.
+        // Peeked bytes are still in the kernel queue — no replay needed.
+    }
+
+    // For TlsHybrid that fell through (no passthrough match), treat as Https.
+    let effective_protocol = match handler.protocol {
+        ListenerProtocol::TlsHybrid => ListenerProtocol::Https,
+        p => p,
+    };
+
     if let Some(trusted) = handler.trusted {
         handle_proxy_protocol(
             tcp,
             peer_addr,
             handler.local_addr,
-            handler.protocol,
+            effective_protocol,
             ProxyProtocolConn {
                 proxy: handler.proxy,
                 trusted,
@@ -597,7 +795,7 @@ async fn handle_connection<P>(
     } else {
         handle_standard(
             tcp,
-            handler.protocol,
+            effective_protocol,
             handler.proxy,
             handler.tls_selector,
             conn_shutdown,
@@ -754,6 +952,8 @@ async fn handle_standard<P>(
             // works correctly), ALPN, keepalive, and shutdown.
             let _ = proxy.process_new(stream, &conn_shutdown).await;
         }
+        // Passthrough and hybrid connections are dispatched before reaching this function.
+        ListenerProtocol::TlsPassthrough | ListenerProtocol::TlsHybrid => {}
     }
 }
 
@@ -807,6 +1007,8 @@ async fn handle_proxy_protocol<P>(
     let proto_str = match protocol {
         ListenerProtocol::Http => "http",
         ListenerProtocol::Https => "https",
+        // Passthrough / hybrid connections are dispatched before reaching this function.
+        ListenerProtocol::TlsPassthrough | ListenerProtocol::TlsHybrid => return,
     };
     let conn_info = ConnectionInfo {
         real_addr,
@@ -841,6 +1043,8 @@ async fn handle_proxy_protocol<P>(
             }
         }
         ListenerProtocol::Http => Box::new(L4Stream::from(tcp)),
+        // Passthrough / hybrid connections are dispatched before reaching this function.
+        ListenerProtocol::TlsPassthrough | ListenerProtocol::TlsHybrid => return,
     };
 
     let mut session = ServerSession::new_http1(stream);
@@ -1058,28 +1262,50 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_delta_add_and_remove() {
+    fn plan_listener_changes_add_and_remove() {
         let addr_a: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:8081".parse().unwrap();
 
-        let current: HashSet<SocketAddr> = [addr_a].into_iter().collect();
-        let desired: HashSet<ListenerSpec> = [
-            ListenerSpec::http(addr_b), // new
-        ]
-        .into_iter()
-        .collect();
+        let active: HashMap<SocketAddr, ListenerProtocol> =
+            [(addr_a, ListenerProtocol::Http)].into_iter().collect();
+        let desired: HashSet<ListenerSpec> = [ListenerSpec::http(addr_b)].into_iter().collect();
 
-        let desired_addrs: HashSet<SocketAddr> = desired.iter().map(|s| s.addr).collect();
+        let plan = plan_listener_changes(&active, &desired);
 
-        let to_remove: Vec<SocketAddr> = current.difference(&desired_addrs).copied().collect();
-        let to_add: Vec<&ListenerSpec> = desired
-            .iter()
-            .filter(|s| !current.contains(&s.addr))
-            .collect();
+        assert_eq!(plan.remove, vec![addr_a]);
+        assert!(plan.reprotocol.is_empty());
+        assert_eq!(plan.add, vec![ListenerSpec::http(addr_b)]);
+    }
 
-        assert_eq!(to_remove, vec![addr_a]);
-        assert_eq!(to_add.len(), 1);
-        assert_eq!(to_add[0].addr, addr_b);
+    #[test]
+    fn plan_listener_changes_detects_in_place_protocol_switch() {
+        // GEP-2643 (#70): a port first bound as `Https` terminate becomes
+        // `TlsHybrid` once a passthrough listener is added on the same port. The
+        // address is unchanged, so it must be a `reprotocol` (switch in place),
+        // never a no-op (which left passthrough stuck terminating) nor a
+        // remove+add (which races the draining old listener for the socket).
+        let addr: SocketAddr = "0.0.0.0:443".parse().unwrap();
+        let active: HashMap<SocketAddr, ListenerProtocol> =
+            [(addr, ListenerProtocol::Https)].into_iter().collect();
+        let desired: HashSet<ListenerSpec> = [ListenerSpec::tls_hybrid(addr)].into_iter().collect();
+
+        let plan = plan_listener_changes(&active, &desired);
+
+        assert!(plan.remove.is_empty(), "socket must stay bound");
+        assert!(plan.add.is_empty(), "no rebind");
+        assert_eq!(plan.reprotocol, vec![ListenerSpec::tls_hybrid(addr)]);
+    }
+
+    #[test]
+    fn plan_listener_changes_noop_when_protocol_unchanged() {
+        let addr: SocketAddr = "0.0.0.0:443".parse().unwrap();
+        let active: HashMap<SocketAddr, ListenerProtocol> =
+            [(addr, ListenerProtocol::TlsHybrid)].into_iter().collect();
+        let desired: HashSet<ListenerSpec> = [ListenerSpec::tls_hybrid(addr)].into_iter().collect();
+
+        let plan = plan_listener_changes(&active, &desired);
+
+        assert_eq!(plan, ListenerPlan::default(), "stable set: no churn");
     }
 
     use std::net::{IpAddr, Ipv4Addr};

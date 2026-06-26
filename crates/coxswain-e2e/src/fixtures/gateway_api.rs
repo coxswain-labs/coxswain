@@ -208,3 +208,17 @@ pub const BACKEND_CLIENT_CERT_MISSING_SECRET: &str =
 /// Placeholders: `TLS_HOSTNAME`, `CA_PEM`.
 pub const BACKEND_CLIENT_CERT_FAILS_CLOSED: &str =
     fixture!("backend_client_cert_fails_closed.yaml");
+
+// ── TLS passthrough (TLSRoute / GEP-2643, #70) ───────────────────────────────
+
+/// Gateway with `protocol: TLS, tls.mode: Passthrough` + TLSRoute (GEP-2643, #70).
+/// The proxy peeks the ClientHello SNI and forwards the raw encrypted stream to
+/// the backend — no TLS termination at the proxy.
+/// Placeholders: `GATEWAY_TLS_PASSTHROUGH_PORT`, `PASSTHROUGH_HOSTNAME`.
+pub const TLS_PASSTHROUGH: &str = fixture!("tls_passthrough.yaml");
+
+/// Gateway with `protocol: TLS, tls.mode: Passthrough` listener only (no TLSRoute).
+/// Used to verify the Gateway becomes `Programmed=True` even with zero routes,
+/// and that incoming connections are dropped (no backend to forward to).
+/// Placeholders: `GATEWAY_TLS_PASSTHROUGH_PORT`, `PASSTHROUGH_HOSTNAME`.
+pub const TLS_PASSTHROUGH_GW_ONLY: &str = fixture!("tls_passthrough_gw_only.yaml");

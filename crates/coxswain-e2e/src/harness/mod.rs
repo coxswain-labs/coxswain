@@ -9,7 +9,10 @@ pub mod tls;
 pub mod wait;
 
 use anyhow::Context as _;
-pub use bootstrap::{GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, bootstrap, bootstrap_cluster};
+pub use bootstrap::{
+    GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, GATEWAY_TLS_PASSTHROUGH_PORT, bootstrap,
+    bootstrap_cluster,
+};
 pub use controller::{ControllerOptions, ControllerProcess, INGRESS_HTTP_PORT, INGRESS_HTTPS_PORT};
 pub use http::HttpClient;
 pub use namespace::{IngressClassGuard, NamespaceGuard};
@@ -18,10 +21,10 @@ pub use tls::{GeneratedCert, MtlsCerts, StaticRsaCert};
 /// Top-level test harness: wraps the in-cluster coxswain installation with a
 /// Kubernetes client, an HTTP test client, and fixture application helpers.
 ///
-/// `http` and `tls_addr` point at the Ingress data plane; `gateway_http` and
-/// `gateway_tls_addr` point at the Gateway data plane. Both are backed by the
-/// shared-proxy pod's LoadBalancer Service IP — the two listener sets simply
-/// bind different ports on the same pod.
+/// `http` and `tls_addr` point at the Ingress data plane; `gateway_http`,
+/// `gateway_tls_addr`, and `gateway_passthrough_addr` point at the Gateway data
+/// plane. All are backed by the shared-proxy pod's LoadBalancer Service IP —
+/// the listener sets bind different ports on the same pod.
 pub struct Harness {
     /// Kubernetes client pre-configured from the default kubeconfig.
     pub client: kube::Client,
@@ -35,6 +38,8 @@ pub struct Harness {
     pub gateway_http: HttpClient,
     /// Address of the Gateway HTTPS port (`<lb_ip>:8443`).
     pub gateway_tls_addr: std::net::SocketAddr,
+    /// Address of the Gateway TLS-passthrough port for TLSRoute tests (GEP-2643, #70).
+    pub gateway_passthrough_addr: std::net::SocketAddr,
 }
 
 impl Harness {
@@ -59,6 +64,7 @@ impl Harness {
         let gateway_http =
             HttpClient::new(controller.gateway_http_addr).context("gateway http client")?;
         let gateway_tls_addr = controller.gateway_https_addr;
+        let gateway_passthrough_addr = controller.gateway_passthrough_addr;
         Ok(Self {
             client,
             controller,
@@ -66,6 +72,7 @@ impl Harness {
             tls_addr,
             gateway_http,
             gateway_tls_addr,
+            gateway_passthrough_addr,
         })
     }
 

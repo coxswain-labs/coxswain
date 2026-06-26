@@ -1,0 +1,25 @@
+# TLS-passthrough Gateway fixture (no TLSRoute) for GEP-2643 / #70 sad-path e2e test.
+# Verifies that a Passthrough listener becomes Programmed=True even with zero routes,
+# and that incoming connections are dropped when no TLSRoute is attached.
+#
+# Substitutions (via FixtureVars::with):
+#   GATEWAY_TLS_PASSTHROUGH_PORT - port for the passthrough listener (8444)
+#   PASSTHROUGH_HOSTNAME         - SNI hostname for the listener
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-passthrough-gw-only
+  namespace: ${TESTNS}
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: tls-passthrough
+      port: ${GATEWAY_TLS_PASSTHROUGH_PORT}
+      protocol: TLS
+      hostname: "${PASSTHROUGH_HOSTNAME}"
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        namespaces:
+          from: Same

@@ -20,3 +20,4 @@ pub use gateway_api::apis::experimental as v;
 pub use v::backendtlspolicies::BackendTLSPolicy as BackendTlsPolicy;
 pub use v::grpcroutes::GRPCRoute as GrpcRoute;
 pub use v::httproutes::HTTPRoute as HttpRoute;
+pub use v::tlsroutes::TLSRoute as TlsRoute;

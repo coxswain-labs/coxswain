@@ -6,7 +6,7 @@ use crate::status_common::{
     OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
 };
 use coxswain_reflector::gw_types::v::gateways::{Gateway, GatewayStatusListeners};
-use coxswain_reflector::tls::GatewayListenerHealth;
+use coxswain_reflector::tls::{GatewayListenerHealth, ListenerTlsOutcome};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Returns true when the Gateway's current status does not yet reflect the
@@ -86,6 +86,20 @@ pub(super) fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerH
             .map(|sl| has_condition(Some(sl.conditions.as_slice()), "ResolvedRefs"))
             .unwrap_or(false);
         if desired_healthy != current_resolved {
+            return true;
+        }
+        // GEP-2643: a TLS/Terminate listener is computed Unsupported only after the
+        // reflector processes the Gateway, *after* the controller's first reconcile
+        // wrote Accepted=True from an empty health. Mirror build_listener_status'
+        // Accepted logic (frontend CA failure or an Unsupported outcome → False) so
+        // the transition True→False is detected and patched, not left stuck.
+        let desired_accepted_false = frontend_impacts
+            || info
+                .is_some_and(|i| matches!(i.tls_outcome, ListenerTlsOutcome::Unsupported { .. }));
+        let current_accepted_false = current_listener
+            .and_then(|sl| sl.conditions.iter().find(|c| c.type_ == "Accepted"))
+            .is_some_and(|c| c.status != "True");
+        if desired_accepted_false != current_accepted_false {
             return true;
         }
         let desired_attached = info.map(|i| i.attached_routes).unwrap_or(0);

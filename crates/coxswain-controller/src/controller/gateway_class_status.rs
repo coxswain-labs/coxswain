@@ -45,6 +45,7 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteResponseHeaderModification",
     "HTTPRouteSchemeRedirect",
     "ReferenceGrant",
+    "TLSRoute",
 ];
 
 /// Returns true when the GatewayClass status needs to be (re-)patched.
