@@ -406,6 +406,110 @@ impl TlsStoreBuilder {
 /// independently of route edits) and are swapped independently.
 pub type SharedTlsStore = Shared<TlsStore>;
 
+/// Per-port partition of the HTTPS-terminate cert store (#472).
+///
+/// In shared mode every Gateway terminates HTTPS on its own internal port (its
+/// VIP maps `:443 → that internal port`), so cert selection is keyed by the
+/// **accepted local port**: Gateway A's port can only present the certs A
+/// configured, never a sibling Gateway's overlapping-SNI cert. This is the
+/// HTTPS-terminate half of the cross-Gateway isolation the passthrough table
+/// provides for TLSRoute — without it, two Gateways with overlapping HTTPS
+/// hostnames would share one global cert namespace.
+///
+/// Keys are bind ports: Ingress and dedicated-mode listeners key by their spec
+/// port (internal == spec); shared-mode Gateway listeners key by their allocated
+/// internal port. A port with no entry presents no terminate cert.
+#[non_exhaustive]
+#[derive(Debug, Default, PartialEq)]
+pub struct PortTlsStore {
+    by_port: HashMap<u16, TlsStore>,
+}
+
+impl PortTlsStore {
+    /// The [`TlsStore`] serving `port`, if any.
+    #[must_use]
+    pub fn port(&self, port: u16) -> Option<&TlsStore> {
+        self.by_port.get(&port)
+    }
+
+    /// Number of ports with registered certs.
+    #[must_use]
+    pub fn port_count(&self) -> usize {
+        self.by_port.len()
+    }
+
+    /// Iterate `(port, TlsStore)` pairs in arbitrary order (wire serialisation).
+    pub fn ports_iter(&self) -> impl Iterator<Item = (u16, &TlsStore)> {
+        self.by_port.iter().map(|(p, s)| (*p, s))
+    }
+
+    /// Assemble from pre-built per-port [`TlsStore`]s — the wire-reconstruction
+    /// path, where each port's store is rebuilt by `tls_from_wire` directly.
+    #[must_use]
+    pub fn from_port_stores(stores: impl IntoIterator<Item = (u16, TlsStore)>) -> Self {
+        Self {
+            by_port: stores.into_iter().collect(),
+        }
+    }
+
+    /// Aggregate `(exact, wildcard, default)` cert counts across all ports —
+    /// feeds the `*_tls_certs_loaded{bucket}` gauge.
+    #[must_use]
+    pub fn cert_counts(&self) -> (usize, usize, usize) {
+        self.by_port.values().fold((0, 0, 0), |(e, w, d), s| {
+            let (se, sw, sd) = s.cert_counts();
+            (e + se, w + sw, d + sd)
+        })
+    }
+
+    /// All `(pattern, source, notAfter)` cert expiries across every port —
+    /// feeds the `*_tls_cert_expiry_seconds` gauge.
+    #[must_use]
+    pub fn expiries(&self) -> Vec<(String, String, std::time::SystemTime)> {
+        self.by_port.values().flat_map(TlsStore::expiries).collect()
+    }
+}
+
+/// Builder for [`PortTlsStore`]: accumulates certs into a per-port
+/// [`TlsStoreBuilder`], compiled together at [`Self::build`].
+#[non_exhaustive]
+#[derive(Default)]
+pub struct PortTlsStoreBuilder {
+    by_port: HashMap<u16, TlsStoreBuilder>,
+}
+
+impl PortTlsStoreBuilder {
+    /// Construct an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a cert for `host_pattern` on `port` (see
+    /// [`TlsStoreBuilder::add_cert`] for pattern semantics).
+    pub fn add_cert(&mut self, port: u16, host_pattern: &str, cert: Arc<TlsCert>) {
+        self.by_port
+            .entry(port)
+            .or_default()
+            .add_cert(host_pattern, cert);
+    }
+
+    /// Compile into an immutable [`PortTlsStore`].
+    #[must_use]
+    pub fn build(self) -> PortTlsStore {
+        PortTlsStore {
+            by_port: self
+                .by_port
+                .into_iter()
+                .map(|(port, b)| (port, b.build()))
+                .collect(),
+        }
+    }
+}
+
+/// A cheaply-cloneable handle to the active per-port TLS terminate cert store (#472).
+pub type SharedPortTlsStore = Shared<PortTlsStore>;
+
 // ---------------------------------------------------------------------------
 // Client-certificate mTLS store (#267)
 // ---------------------------------------------------------------------------

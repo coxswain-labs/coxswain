@@ -17,6 +17,8 @@
 //! Bare `coxswain serve` (no role) parses with `role = None`; the dispatch in
 //! `lib.rs` rejects it, since production must pick a role explicitly.
 
+use coxswain_core::crd::ServiceType;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -423,6 +425,56 @@ fn parse_cache_size(s: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("cache size {s:?} overflows usize"))
 }
 
+/// Parse a comma-separated `key=value` label selector into a map (#472).
+///
+/// An empty string yields an empty map (shared-mode per-Gateway addressing
+/// disabled). Whitespace around keys/values is trimmed.
+///
+/// # Errors
+///
+/// Returns a human-readable message when a pair lacks `=` or has an empty key.
+fn parse_label_selector(s: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut map = BTreeMap::new();
+    for pair in s.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("invalid label selector entry {pair:?}: expected key=value"))?;
+        let k = k.trim();
+        if k.is_empty() {
+            return Err(format!("invalid label selector entry {pair:?}: empty key"));
+        }
+        map.insert(k.to_string(), v.trim().to_string());
+    }
+    Ok(map)
+}
+
+/// Parse the `--shared-vip-service-type` value into a [`ServiceType`] (#472).
+///
+/// `NodePort` is intentionally rejected: a shared-VIP NodePort maps the
+/// advertised listener port (`:443`) to a random high node port, so it cannot
+/// preserve per-Gateway addressing on the spec port, and the shared status
+/// writer has no Node store to resolve a node IP from — the Gateway would
+/// report no address forever. `LoadBalancer` (external) and `ClusterIP`
+/// (in-cluster / on-prem / test) both yield a stable per-Gateway address.
+///
+/// # Errors
+///
+/// Returns a human-readable message for any value other than `LoadBalancer`
+/// or `ClusterIP` (case-insensitive).
+fn parse_service_type(s: &str) -> Result<ServiceType, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "loadbalancer" => Ok(ServiceType::LoadBalancer),
+        "clusterip" => Ok(ServiceType::ClusterIp),
+        other => Err(format!(
+            "invalid shared VIP service type {other:?}: expected LoadBalancer or ClusterIP"
+        )),
+    }
+}
+
 /// Flags specific to roles that run the status writer (`controller`, `dev`).
 #[derive(Args, Debug)]
 pub(crate) struct ControllerArgs {
@@ -461,6 +513,37 @@ pub(crate) struct ControllerArgs {
     /// not patched (backward-compatible default).
     #[arg(long, env = "COXSWAIN_STATUS_ADDRESS")]
     pub status_address: Option<String>,
+
+    /// Label selector targeting the shared proxy pod, used as the `selector` of
+    /// every per-Gateway shared-mode VIP Service (#472).
+    ///
+    /// Comma-separated `key=value` pairs. The Helm chart supplies the install's
+    /// selector — typically
+    /// `app.kubernetes.io/name=coxswain,app.kubernetes.io/instance=<release>,app.kubernetes.io/component=shared-proxy`
+    /// — because the controller cannot derive the release name
+    /// (`app.kubernetes.io/instance`) itself. Empty (the default) disables
+    /// shared-mode per-Gateway addressing, leaving Gateways on the fixed shared
+    /// listeners (Ingress-style); set it to enable cross-Gateway isolation.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_SELECTOR",
+        default_value = "",
+        value_parser = parse_label_selector,
+    )]
+    pub shared_proxy_selector: BTreeMap<String, String>,
+
+    /// Service type for the per-Gateway shared-mode VIP Services (#472).
+    ///
+    /// `LoadBalancer` (default) gives each Gateway its own external address;
+    /// `ClusterIP` gives a stable in-cluster address for on-prem or test
+    /// clusters. `NodePort` is rejected — see [`parse_service_type`].
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_VIP_SERVICE_TYPE",
+        default_value = "LoadBalancer",
+        value_parser = parse_service_type,
+    )]
+    pub shared_vip_service_type: ServiceType,
 
     /// Port the discovery gRPC server binds to.
     ///

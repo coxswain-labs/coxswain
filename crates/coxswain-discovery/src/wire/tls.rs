@@ -46,7 +46,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use coxswain_core::tls::{
     ClientCertConfig, ClientCertConfigState, ClientCertStore, ClientCertStoreBuilder, KeyAlgorithm,
-    TlsCert, TlsStore, TlsStoreBuilder,
+    PortTlsStore, TlsCert, TlsStore, TlsStoreBuilder,
 };
 
 use crate::error::WireError;
@@ -86,6 +86,46 @@ pub fn tls_to_wire(store: &TlsStore) -> p::TlsStore {
             .map(|c| tls_cert_to_wire(c))
             .collect(),
     }
+}
+
+/// Serialise a [`PortTlsStore`] to its wire DTO (#472), ports ascending for
+/// hash determinism.
+#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
+pub fn port_tls_to_wire(store: &PortTlsStore) -> p::PortTlsStore {
+    let mut ports: Vec<(u16, &TlsStore)> = store.ports_iter().collect();
+    ports.sort_by_key(|(p, _)| *p);
+    p::PortTlsStore {
+        ports: ports
+            .into_iter()
+            .map(|(port, s)| p::PortTlsEntry {
+                port: u32::from(port),
+                store: Some(tls_to_wire(s)),
+            })
+            .collect(),
+    }
+}
+
+/// Reconstruct a [`PortTlsStore`] from its wire DTO (#472).
+///
+/// # Errors
+///
+/// Returns [`WireError`] if a per-port `store` sub-message is missing.
+#[must_use = "the rebuilt per-port TLS store must be stored for the proxy to use it"]
+pub fn port_tls_from_wire(dto: &p::PortTlsStore) -> Result<PortTlsStore, WireError> {
+    let stores = dto
+        .ports
+        .iter()
+        .map(|entry| {
+            let store_dto = entry
+                .store
+                .as_ref()
+                .ok_or(WireError::MissingRequiredField {
+                    field: "port_tls_entry.store",
+                })?;
+            Ok((entry.port as u16, tls_from_wire(store_dto)?))
+        })
+        .collect::<Result<Vec<(u16, TlsStore)>, WireError>>()?;
+    Ok(PortTlsStore::from_port_stores(stores))
 }
 
 fn tls_cert_to_wire(c: &TlsCert) -> p::TlsCert {

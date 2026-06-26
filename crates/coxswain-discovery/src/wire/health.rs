@@ -113,6 +113,7 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         hostname: info.hostname.clone(),
         allows_all_namespaces: info.allows_all_namespaces,
         port: u32::from(info.port),
+        internal_port: u32::from(info.internal_port),
     }
 }
 
@@ -183,6 +184,10 @@ mod tests {
         https_info.hostname = "example.com".to_string();
         https_info.allows_all_namespaces = true;
         https_info.port = 443;
+        // Shared-mode per-Gateway addressing (#472): advertised :443 binds an
+        // allocated internal targetPort — it must survive the wire round-trip so
+        // the proxy binds and keys routing on the right port.
+        https_info.internal_port = 30007;
         health.listeners.insert("https".to_string(), https_info);
 
         // GEP-2643 (#70): a TLS/Terminate listener resolves to Unsupported, and a
@@ -225,6 +230,20 @@ mod tests {
                 ListenerTlsOutcome::Resolved
             ),
             "tls_outcome preserved"
+        );
+        assert_eq!(
+            h2.listeners["https"].internal_port, 30007,
+            "internal_port preserved (#472)"
+        );
+        assert_eq!(
+            h2.listeners["https"].bind_port(),
+            30007,
+            "bind_port honours the allocated internal port"
+        );
+        assert_eq!(
+            h2.listeners["http"].bind_port(),
+            80,
+            "bind_port falls back to spec port when internal_port unset"
         );
         assert!(
             matches!(

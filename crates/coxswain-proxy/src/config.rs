@@ -9,7 +9,9 @@ use crate::policy::circuit_breaker::CircuitBreakerRegistry;
 use crate::policy::rate_limit::RateLimiterRegistry;
 use coxswain_cache::ResponseCache;
 use coxswain_core::routing::RouteTimeouts;
+use coxswain_core::shared::Shared;
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Startup-time collaborators shared between both proxy types.
@@ -56,6 +58,19 @@ pub struct SharedProxyConfig {
     /// on the correct listener. Defaults to an empty snapshot (check inactive)
     /// until the reflector's first Gateway reconcile completes.
     pub listener_hostnames: SharedListenerHostnames,
+    /// Per-Gateway-listener `internal bind port → advertised listener port` map
+    /// (#472). In shared mode the proxy accepts on an internal port (e.g. 30000)
+    /// that a per-Gateway VIP maps the advertised port (e.g. 80/443) onto; this
+    /// recovers the advertised port from the local accept port.
+    ///
+    /// Consumed by `request_filter` for `RequestRedirect` filters that preserve
+    /// the incoming port: the `Location` must echo the advertised port the client
+    /// connected to, never the internal accept port. Built from the same
+    /// per-listener health snapshot that drives listener binding, so HTTP and
+    /// HTTPS listeners are both covered. Empty until the first Gateway reconcile;
+    /// a miss (Ingress / dedicated, where advertised == accept) falls back to the
+    /// accept port, which is correct.
+    pub advertised_ports: Shared<HashMap<u16, u16>>,
     /// Per-process per-endpoint circuit-breaker registry (#282).
     ///
     /// Keyed by `(metric_route_id, SocketAddr)`. Built once at startup; gated in
@@ -91,6 +106,7 @@ impl SharedProxyConfig {
             auth_client,
             client_certs: SharedClientCertStore::new(),
             listener_hostnames: SharedListenerHostnames::new(),
+            advertised_ports: Shared::new(),
             circuit_breakers: CircuitBreakerRegistry::new(),
             mirror_tracker: tokio_util::task::TaskTracker::new(),
         }

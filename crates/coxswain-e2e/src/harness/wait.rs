@@ -11,7 +11,10 @@ use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::Api;
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 use tokio::time;
 
 /// Default poll interval — tight enough to keep total wall-clock low, loose
@@ -283,6 +286,72 @@ pub async fn wait_for_gateway_programmed(
                     gateway_has_condition(gw, "Accepted") && gateway_has_condition(gw, "Programmed")
                 })
                 .map(|_| ())
+        },
+    )
+    .await
+}
+
+/// Poll until the Gateway's own `status.addresses[0]` is populated, returning a
+/// [`SocketAddr`] on `port` at that address.
+///
+/// Shared-mode Gateways each advertise their OWN per-Gateway VIP (#472), not the
+/// shared proxy Service — so a Gateway data-plane test resolves the address from
+/// the Gateway's status here instead of using the shared `gateway_*_addr`
+/// fields. `port` is the advertised listener (spec) port; the VIP maps it to the
+/// proxy's internal target port transparently.
+pub async fn wait_for_gateway_address(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    port: u16,
+    timeout: Duration,
+) -> anyhow::Result<SocketAddr> {
+    let api: Api<Gateway> = Api::namespaced(client.clone(), namespace);
+    poll_until(
+        timeout,
+        POLL,
+        || async {
+            format!("Gateway {namespace}/{name} status.addresses[0] to be populated with its VIP")
+        },
+        || async {
+            let gw = api.get(name).await.ok()?;
+            let value = gw.status?.addresses?.into_iter().next()?.value;
+            let ip: IpAddr = value.parse().ok()?;
+            Some(SocketAddr::new(ip, port))
+        },
+    )
+    .await
+}
+
+/// Poll until the single Gateway in `namespace` has its `status.addresses[0]`
+/// populated, returning a [`SocketAddr`] on `port` at that VIP (#472).
+///
+/// Convenience over [`wait_for_gateway_address`] for the common case of a test
+/// that owns exactly one Gateway in its fresh namespace: the caller need not
+/// name the Gateway. Errors if the namespace ever holds more than one Gateway
+/// (use the by-name form for multi-Gateway tests) or if none appears in time.
+pub async fn wait_for_single_gateway_address(
+    client: &kube::Client,
+    namespace: &str,
+    port: u16,
+    timeout: Duration,
+) -> anyhow::Result<SocketAddr> {
+    let api: Api<Gateway> = Api::namespaced(client.clone(), namespace);
+    poll_until(
+        timeout,
+        POLL,
+        || async {
+            format!("the single Gateway in {namespace} to have status.addresses[0] populated with its VIP")
+        },
+        || async {
+            let list = api.list(&Default::default()).await.ok()?;
+            // Fail loud rather than silently address one of several Gateways.
+            let [gw] = list.items.as_slice() else {
+                return None;
+            };
+            let value = gw.status.as_ref()?.addresses.as_ref()?.first()?.value.clone();
+            let ip: IpAddr = value.parse().ok()?;
+            Some(SocketAddr::new(ip, port))
         },
     )
     .await

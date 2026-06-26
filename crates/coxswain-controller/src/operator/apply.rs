@@ -126,3 +126,35 @@ pub(super) async fn apply_rendered(
 
     Ok(())
 }
+
+/// Server-side-apply a single shared-mode per-Gateway VIP Service (#472).
+///
+/// Idempotent under the same `force=true` field-manager contract as
+/// [`apply_rendered`]: an unchanged Service is a no-op, so this can run on
+/// every shared-Gateway reconcile without churning `resourceVersion`.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::Service`] if the apiserver rejects the patch.
+///
+/// # Panics
+///
+/// Panics if `service` has no `metadata.name` — a rendering invariant whose
+/// absence indicates a controller bug.
+pub(super) async fn apply_shared_vip_service(
+    client: &Client,
+    namespace: &str,
+    service: &Service,
+) -> Result<(), ApplyError> {
+    let name = service
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or_else(|| panic!("invariant: rendered shared VIP Service has no name"));
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+    let api: Api<Service> = Api::namespaced(client.clone(), namespace);
+    api.patch(name, &params, &Patch::Apply(service))
+        .await
+        .map_err(ApplyError::Service)?;
+    Ok(())
+}

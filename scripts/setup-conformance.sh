@@ -81,12 +81,21 @@ echo ">>> install Gateway API CRDs $GATEWAY_API_VERSION"
 kubectl apply -f \
   "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
 
-echo ">>> helm install coxswain (conformance overrides)"
+# Per-Gateway VIP Service type (#472). Each conformance Gateway gets its own VIP
+# whose advertised listener port maps to a distinct internal port on the shared
+# proxy — this is what makes cross-Gateway isolation (TLSRouteHostnameIntersection)
+# pass. Default LoadBalancer suits CI (kind + cloud-provider-kind assigns a
+# distinct IP per Service). On host-port-binding LBs (k3s/OrbStack klipper-lb)
+# two VIPs sharing a port collide and stay <pending>, so run with
+# VIP_SERVICE_TYPE=ClusterIP locally (OrbStack routes ClusterIPs to the host).
+VIP_SERVICE_TYPE="${VIP_SERVICE_TYPE:-LoadBalancer}"
+echo ">>> helm install coxswain (conformance overrides, vipServiceType=$VIP_SERVICE_TYPE)"
 helm install coxswain charts/coxswain \
   --namespace coxswain-system --create-namespace \
   --set image.repository=coxswain \
   --set image.tag=e2e \
   --set image.pullPolicy=IfNotPresent \
+  --set "proxy.shared.vipServiceType=$VIP_SERVICE_TYPE" \
   --set proxy.http.enabled=false \
   --set proxy.https.enabled=false \
   --set 'service.gateway.additionalPorts[0].name=gw-http,service.gateway.additionalPorts[0].port=80,service.gateway.additionalPorts[0].targetPort=80,service.gateway.additionalPorts[0].protocol=TCP' \

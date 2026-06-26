@@ -12,11 +12,25 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 /// Returns true when the Gateway's current status does not yet reflect the
 /// desired state computed from `health`. Prevents redundant patches and
 /// watch-feedback loops.
-pub(super) fn gateway_needs_status_patch(gw: &Gateway, health: &GatewayListenerHealth) -> bool {
+pub(super) fn gateway_needs_status_patch(
+    gw: &Gateway,
+    health: &GatewayListenerHealth,
+    addr: Option<&StatusAddress>,
+) -> bool {
     if !accepted_is_true(gw) {
         return true;
     }
     if !super::conditions::gateway_programmed(gw) {
+        return true;
+    }
+    // The per-Gateway VIP address (#472) is provisioned asynchronously and lands
+    // AFTER conditions have already settled. A Gateway whose conditions/listeners
+    // are otherwise up to date but whose `status.addresses` does not yet reflect
+    // the resolved VIP still needs a patch — without this, a Gateway with stable
+    // health (e.g. a TLS-passthrough listener whose conditions never flip after
+    // the first reconcile) would never get its address written once the VIP
+    // resolves on a later reconcile.
+    if !gateway_address_up_to_date(gw, addr) {
         return true;
     }
     // GEP-91: a mode flip to/from AllowInsecureFallback must add/remove the
@@ -153,6 +167,29 @@ fn accepted_is_true(gw: &Gateway) -> bool {
         .and_then(|s| s.conditions.as_ref())
         .and_then(|cs| cs.iter().find(|c| c.type_ == "Accepted"))
         .is_some_and(|c| c.status == "True" && c.reason == "Accepted")
+}
+
+/// True iff `gw.status.addresses[0]` already matches the desired `addr`.
+///
+/// `addr == None` (feature off, or VIP address still pending) never forces a
+/// patch on address grounds — the status writer simply leaves the address
+/// untouched until the VIP resolves. A `Some` desired address that differs from
+/// (or is absent in) the current status returns false so the patch lands.
+fn gateway_address_up_to_date(gw: &Gateway, addr: Option<&StatusAddress>) -> bool {
+    let Some(desired) = addr else {
+        return true;
+    };
+    let (desired_type, desired_value) = match desired {
+        StatusAddress::Ip(ip) => ("IPAddress", ip.to_string()),
+        StatusAddress::Hostname(h) => ("Hostname", h.clone()),
+    };
+    gw.status
+        .as_ref()
+        .and_then(|s| s.addresses.as_ref())
+        .and_then(|a| a.first())
+        .is_some_and(|cur| {
+            cur.value == desired_value && cur.r#type.as_deref() == Some(desired_type)
+        })
 }
 
 pub(super) fn build_gateway_status_patch(
@@ -326,19 +363,19 @@ mod tests {
             status: None,
             ..Default::default()
         };
-        assert!(gateway_needs_status_patch(&gw, &default_health()));
+        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
     }
 
     #[test]
     fn needs_patch_when_accepted_missing() {
         let gw = gateway(1, Some(vec![condition("Programmed", 1)]), None);
-        assert!(gateway_needs_status_patch(&gw, &default_health()));
+        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
     }
 
     #[test]
     fn needs_patch_when_programmed_missing() {
         let gw = gateway(1, Some(vec![condition("Accepted", 1)]), None);
-        assert!(gateway_needs_status_patch(&gw, &default_health()));
+        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
     }
 
     #[test]
@@ -349,7 +386,7 @@ mod tests {
             Some(vec![condition("Accepted", 0), condition("Programmed", 0)]),
             Some(vec![listener_status("http", 2)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health()));
+        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
     }
 
     #[test]
@@ -360,7 +397,7 @@ mod tests {
             Some(vec![condition("Accepted", 2), condition("Programmed", 2)]),
             Some(vec![listener_status("http", 0)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health()));
+        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
     }
 
     #[test]
@@ -371,7 +408,7 @@ mod tests {
             Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
             Some(vec![]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health()));
+        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
     }
 
     #[test]
@@ -381,7 +418,51 @@ mod tests {
             Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
             Some(vec![listener_status("http", 1)]),
         );
-        assert!(!gateway_needs_status_patch(&gw, &default_health()));
+        assert!(!gateway_needs_status_patch(&gw, &default_health(), None));
+    }
+
+    // ── #472 per-Gateway VIP address divergence ──────────────────────────────
+
+    #[test]
+    fn needs_patch_when_vip_address_not_yet_written() {
+        use super::super::config::StatusAddress;
+        // Conditions + listeners fully up to date, but status.addresses is empty
+        // while the resolved VIP address is Some — the patch must still fire so
+        // the address lands (the TLS-passthrough convergence bug, #472).
+        let gw = gateway(
+            1,
+            Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
+            Some(vec![listener_status("http", 1)]),
+        );
+        let addr = StatusAddress::Ip(std::net::IpAddr::from([10, 0, 0, 5]));
+        assert!(gateway_needs_status_patch(
+            &gw,
+            &default_health(),
+            Some(&addr)
+        ));
+    }
+
+    #[test]
+    fn no_patch_when_vip_address_already_matches() {
+        use super::super::config::StatusAddress;
+        use coxswain_reflector::gw_types::v::gateways::GatewayStatusAddresses;
+        let mut gw = gateway(
+            1,
+            Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
+            Some(vec![listener_status("http", 1)]),
+        );
+        if let Some(st) = gw.status.as_mut() {
+            st.addresses = Some(vec![GatewayStatusAddresses {
+                r#type: Some("IPAddress".to_string()),
+                value: "10.0.0.5".to_string(),
+            }]);
+        }
+        let addr = StatusAddress::Ip(std::net::IpAddr::from([10, 0, 0, 5]));
+        assert!(!gateway_needs_status_patch(
+            &gw,
+            &default_health(),
+            Some(&addr)
+        ));
     }
 
     // ── GEP-3155 gateway-level ResolvedRefs (backend client cert) ─────────────
@@ -406,7 +487,8 @@ mod tests {
         );
         assert!(gateway_needs_status_patch(
             &gw,
-            &health_with_backend(BackendClientCertOutcome::Resolved)
+            &health_with_backend(BackendClientCertOutcome::Resolved),
+            None
         ));
     }
 
@@ -427,7 +509,8 @@ mod tests {
         };
         assert!(gateway_needs_status_patch(
             &gw,
-            &health_with_backend(desired)
+            &health_with_backend(desired),
+            None
         ));
     }
 
@@ -444,7 +527,8 @@ mod tests {
         );
         assert!(!gateway_needs_status_patch(
             &gw,
-            &health_with_backend(BackendClientCertOutcome::Resolved)
+            &health_with_backend(BackendClientCertOutcome::Resolved),
+            None
         ));
     }
 
@@ -460,7 +544,7 @@ mod tests {
             ]),
             Some(vec![listener_status("http", 1)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health()));
+        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
     }
 
     #[test]

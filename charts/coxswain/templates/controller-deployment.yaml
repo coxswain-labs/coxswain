@@ -119,6 +119,17 @@ spec:
             - name: COXSWAIN_IMAGE
               value: {{ .Values.controller.coxswainImage | quote }}
             {{- end }}
+            {{- if .Values.proxy.shared.enabled }}
+            # Shared-mode per-Gateway addressing (#472): the controller provisions
+            # one VIP Service per owned shared Gateway, selecting the shared proxy
+            # pod. The selector must match the shared-proxy Deployment's labels;
+            # the chart supplies it here because the controller cannot derive the
+            # release name (app.kubernetes.io/instance) itself.
+            - name: COXSWAIN_SHARED_PROXY_SELECTOR
+              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component=shared-proxy" (include "coxswain.name" .) .Release.Name | quote }}
+            - name: COXSWAIN_SHARED_VIP_SERVICE_TYPE
+              value: {{ .Values.proxy.shared.vipServiceType | quote }}
+            {{- end }}
             # Discovery control-plane / CA (#423). COXSWAIN_DISCOVERY_PORT is set
             # above with the other bound ports.
             - name: COXSWAIN_DISCOVERY_BOOTSTRAP_PORT

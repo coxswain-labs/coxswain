@@ -640,15 +640,16 @@ async fn gateway_route_rate_limited_via_extensionref() -> anyhow::Result<()> {
     let ns = NamespaceGuard::create(&h.client, "rl-gw-cr").await?;
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(gwa::RATE_LIMIT_EXTENSIONREF, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
     let host = format!("gwratelimit.{}.local", ns.name);
 
     // Wait until the Gateway route is live (first request admits within the 1-cell budget).
-    wait::wait_for_route(&h.gateway_http, &host, "/rl/", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&gw, &host, "/rl/", Duration::from_secs(60)).await?;
 
     // Rapid-fire — bucket is drained; at least one must return 429 + Retry-After.
     let mut got_429_with_retry_after = false;
     for _ in 0..20 {
-        let (status, headers, _) = h.gateway_http.get_full(&host, "/rl/").await?;
+        let (status, headers, _) = gw.get_full(&host, "/rl/").await?;
         if status == 429 && headers.contains_key("retry-after") {
             got_429_with_retry_after = true;
             break;
@@ -670,15 +671,16 @@ async fn gateway_route_unthrottled_when_ratelimit_cr_missing() -> anyhow::Result
     let ns = NamespaceGuard::create(&h.client, "rl-gw-norl").await?;
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(gwa::RATE_LIMIT_MISSING_CR, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
     let host = format!("gwnorl.{}.local", ns.name);
 
     // Route must be live; missing CR → fail-open → all requests admitted.
-    wait::wait_for_route(&h.gateway_http, &host, "/rl/", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&gw, &host, "/rl/", Duration::from_secs(60)).await?;
 
     // 10 rapid requests — no rate limiter was installed, so all must be 200.
     let mut statuses: Vec<u16> = Vec::new();
     for _ in 0..10 {
-        let (status, _, _) = h.gateway_http.get_full(&host, "/rl/").await?;
+        let (status, _, _) = gw.get_full(&host, "/rl/").await?;
         statuses.push(status);
     }
     anyhow::ensure!(
@@ -1265,18 +1267,13 @@ async fn request_header_modifier_cannot_inject_blocked_forwarding_header() -> an
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
     fixtures::apply_fixture(gwa::FILTERS, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/filter/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    wait::wait_for_route(&gw, &host, "/filter/probe", Duration::from_secs(60)).await?;
 
     // `get` fails on non-2xx, so receiving an EchoResponse confirms the backend replied 200.
-    let echo = h.gateway_http.get(&host, "/filter/blocked-header").await?;
+    let echo = gw.get(&host, "/filter/blocked-header").await?;
 
     // X-Forwarded-For injected by the RequestHeaderModifier must be absent —
     // the proxy denies operator-set forwarding headers to prevent trust-signal spoofing.

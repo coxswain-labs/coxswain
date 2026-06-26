@@ -351,12 +351,24 @@ pub(crate) async fn request_filter<K>(
         return Ok(true);
     }
 
+    // A `RequestRedirect` that preserves the incoming port must echo the
+    // ADVERTISED listener port (what the client connected to), not the internal
+    // port the proxy accepted on behind a per-Gateway VIP (#472). Recover it from
+    // the accept port; a miss (Ingress / dedicated, advertised == accept) falls
+    // back to `port`, which is correct. `port` itself stays the internal accept
+    // port for the SNI-isolation and metric paths that key on it.
+    let advertised_port = cfg
+        .advertised_ports
+        .load()
+        .get(&port)
+        .copied()
+        .unwrap_or(port);
     if try_redirect(
         session,
         &m.filters,
         proto,
         &host,
-        port,
+        advertised_port,
         &effective_path,
         query.as_deref(),
     )

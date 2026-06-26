@@ -7,8 +7,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::harness::bootstrap::{
-    COXSWAIN_NAMESPACE, E2E_IMAGE, GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT,
-    GATEWAY_TLS_PASSTHROUGH_PORT, HelmOverrides, helm_install, workspace_root,
+    COXSWAIN_NAMESPACE, E2E_IMAGE, GATEWAY_HTTP_PORT, HelmOverrides, helm_install, workspace_root,
 };
 
 /// Fixed port the Helm chart sets for HTTP ingress (`proxy.http.port`).
@@ -51,11 +50,11 @@ pub struct ControllerOptions {
 
 /// Handle to the in-cluster coxswain installation for one test.
 ///
-/// The shared-proxy data-plane is reachable at `proxy_addr` (HTTP),
-/// `tls_addr` (HTTPS), `gateway_http_addr`, `gateway_https_addr`, and
-/// `gateway_passthrough_addr` — all addresses on the Service's LoadBalancer IP.
-/// Health and admin are port-forwarded to `127.0.0.1:<ephemeral>` for the
-/// duration of the test.
+/// The shared-proxy Ingress data-plane is reachable at `proxy_addr` (HTTP) and
+/// `tls_addr` (HTTPS) on the Service's LoadBalancer IP. Gateway data-plane
+/// addresses are NOT fixed here: each shared-mode Gateway advertises its OWN
+/// per-Gateway VIP (#472), resolved per-test via `Harness::gateway_*`. Health
+/// and admin are port-forwarded to `127.0.0.1:<ephemeral>` for the test.
 pub struct ControllerProcess {
     /// LoadBalancer IP assigned to the shared-proxy external Service.
     pub lb_ip: IpAddr,
@@ -63,15 +62,17 @@ pub struct ControllerProcess {
     pub proxy_addr: SocketAddr,
     /// Bound address for Ingress HTTPS/TLS traffic (`<lb_ip>:443`).
     pub tls_addr: SocketAddr,
-    /// Bound address for Gateway HTTP traffic (`<lb_ip>:GATEWAY_HTTP_PORT`).
-    pub gateway_http_addr: SocketAddr,
-    /// Bound address for Gateway HTTPS traffic (`<lb_ip>:GATEWAY_HTTPS_PORT`).
-    pub gateway_https_addr: SocketAddr,
-    /// Address of the Gateway TLS-passthrough port (`<lb_ip>:8444`).
+    /// The shared proxy's FIXED Gateway-HTTP port on the shared-proxy
+    /// LoadBalancer IP (`<lb_ip>:GATEWAY_HTTP_PORT`).
     ///
-    /// The proxy binds this port as `ListenerProtocol::TlsPassthrough` whenever ≥1
-    /// `TLS/Passthrough` Gateway listener is reconciled on this port.
-    pub gateway_passthrough_addr: SocketAddr,
+    /// This is NOT a per-Gateway VIP (#472) — it is the shared pool's own
+    /// listener. Almost every Gateway test must use `Harness::gateway_http`
+    /// (the per-Gateway VIP) instead. The sole legitimate user is a white-box
+    /// dedicated-crash-loop test that asserts the SHARED pool keeps serving a
+    /// dedicated Gateway (whose own advertised address points at the NotReady
+    /// dedicated Service) until cut-over — it must address the shared pool
+    /// directly, not the Gateway's VIP.
+    pub gateway_http_addr: SocketAddr,
     /// Local port-forwarded address for `/healthz` / `/readyz`.
     pub health_addr: SocketAddr,
     /// Local port-forwarded address for `/metrics` / `/api/v1/routes` /
@@ -175,8 +176,6 @@ impl ControllerProcess {
             proxy_addr: SocketAddr::new(lb_ip, INGRESS_HTTP_PORT),
             tls_addr: SocketAddr::new(lb_ip, INGRESS_HTTPS_PORT),
             gateway_http_addr: SocketAddr::new(lb_ip, GATEWAY_HTTP_PORT),
-            gateway_https_addr: SocketAddr::new(lb_ip, GATEWAY_HTTPS_PORT),
-            gateway_passthrough_addr: SocketAddr::new(lb_ip, GATEWAY_TLS_PASSTHROUGH_PORT),
             health_addr,
             admin_addr,
             controller_admin_addr,

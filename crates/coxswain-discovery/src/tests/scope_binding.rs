@@ -24,7 +24,9 @@ use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{
     GatewayRoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable,
 };
-use coxswain_core::tls::{ClientCertStore, SharedClientCertStore, SharedTlsStore, TlsStore};
+use coxswain_core::tls::{
+    ClientCertStore, PortTlsStore, SharedClientCertStore, SharedPortTlsStore,
+};
 
 use crate::auth::tests::gen_certs_with_client_svid;
 use crate::auth::{DiscoveryClientTls, DiscoveryServerTls, SpiffeMatcher};
@@ -53,9 +55,9 @@ fn source_with_two_gateways() -> SnapshotSource {
     let source = SnapshotSource {
         ingress: SharedIngressRoutingTable::new(),
         gateway: SharedGatewayRoutingTable::new(),
-        tls: SharedTlsStore::new(),
+        tls: SharedPortTlsStore::new(),
         client_certs: SharedClientCertStore::new(),
-        tls_health: SharedGatewayListenerHealth::new(),
+        listener_health: SharedGatewayListenerHealth::new(),
         dedicated: DedicatedRoutingRegistry::new(),
         passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
     };
@@ -71,7 +73,7 @@ fn source_with_two_gateways() -> SnapshotSource {
         gw_a_key,
         Arc::new(DedicatedRoutingSnapshot {
             gateway: Arc::new(GatewayRoutingTable::default()),
-            tls: Arc::new(TlsStore::default()),
+            tls: Arc::new(PortTlsStore::default()),
             client_certs: Arc::new(ClientCertStore::default()),
             listener_health: lh_a,
             expected_proxy_sa: "gw-a-coxswain".to_owned(),
@@ -84,7 +86,7 @@ fn source_with_two_gateways() -> SnapshotSource {
         other_key,
         Arc::new(DedicatedRoutingSnapshot {
             gateway: Arc::new(GatewayRoutingTable::default()),
-            tls: Arc::new(TlsStore::default()),
+            tls: Arc::new(PortTlsStore::default()),
             client_certs: Arc::new(ClientCertStore::default()),
             listener_health: lh_other,
             expected_proxy_sa: "other-gw-coxswain".to_owned(),

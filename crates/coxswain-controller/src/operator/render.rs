@@ -69,7 +69,9 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash as _, Hasher as _};
 
 /// Label keys that the controller owns unconditionally. User-supplied
 /// `Gateway.spec.infrastructure.labels` collisions on any of these keys are
@@ -421,6 +423,144 @@ fn service_ports(gateway: &Gateway) -> Vec<ServicePort> {
             port,
             target_port: Some(IntOrString::Int(port)),
             protocol: Some(protocol.to_string()),
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// `app.kubernetes.io/component` value stamped on the per-Gateway shared-mode
+/// VIP Service (#472) — distinct from the dedicated proxy's `dedicated-proxy`
+/// so the controller can label-scope its Services watch to exactly these.
+/// Single source of truth in the reflector (also read by `build_tls`).
+pub(super) use coxswain_reflector::port_alloc::SHARED_GATEWAY_VIP_COMPONENT;
+
+/// Name of the per-Gateway shared-mode VIP Service (#472).
+///
+/// Deliberately distinct from the GEP-1762 dedicated resource name
+/// ([`gep1762_resource_name`]) so the shared Service's lifecycle never entangles
+/// with the dedicated `Deployment`/`Service`/`ServiceAccount` during a
+/// dedicated↔shared migration. The `-shared-gw` suffix is preserved when the
+/// Gateway name is long enough to need truncation to the 63-char DNS limit.
+#[must_use]
+pub(crate) fn shared_gateway_service_name(gw_ns: &str, gw_name: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    format!("{gw_ns}/{gw_name}").hash(&mut hasher);
+    let hash = hasher.finish() & 0xffff_ffff;
+    // Readable, truncated prefix + a hash for collision-free uniqueness across
+    // namespaces, kept well within the 63-char DNS limit. ns/name are RFC 1123
+    // labels (ASCII), so char-truncation is byte-safe.
+    let prefix: String = format!("{gw_ns}-{gw_name}").chars().take(40).collect();
+    let prefix = prefix.trim_end_matches('-');
+    format!("{prefix}-{hash:08x}-shared-gw")
+}
+
+/// Inputs to [`render_shared_gateway_service`].
+#[non_exhaustive]
+pub(super) struct SharedServiceInputs<'a> {
+    /// The shared-mode Gateway getting its own VIP.
+    pub(super) gateway: &'a Gateway,
+    /// Namespace the shared proxy pod lives in — the VIP Service is created here
+    /// (#472) so its selector resolves to the proxy pod (a selector only matches
+    /// same-namespace pods, and selectorless `LoadBalancer` Services are
+    /// unreliable across cloud providers — kubernetes/kubernetes#105937).
+    pub(super) controller_namespace: &'a str,
+    /// Label selector targeting the shared proxy pod.
+    pub(super) shared_proxy_selector: &'a BTreeMap<String, String>,
+    /// `listenerPort → internalPort` (the allocated `targetPort` the shared
+    /// proxy binds and keys routing on). A listener port absent from this map
+    /// got no internal port (range exhausted) and is omitted from the Service.
+    pub(super) internal_ports: &'a BTreeMap<u16, u16>,
+    /// Service type for the VIP — `LoadBalancer` by default so each Gateway
+    /// gets its own externally-reachable address.
+    pub(super) service_type: ServiceType,
+}
+
+/// Render the per-Gateway Service that exposes a shared-mode Gateway on its own
+/// VIP (#472), selecting the one shared proxy pod and mapping each advertised
+/// listener `port` to the allocated internal `targetPort`.
+///
+/// Created in the **controller's namespace** (alongside the shared proxy pod) so
+/// the selector resolves and the cloud LB assigns a real address — a selector
+/// matches only same-namespace pods, and selectorless `LoadBalancer` Services
+/// are unreliable across providers. It therefore carries **no owner reference**
+/// (cross-namespace owner refs are illegal); the serialized VIP reconciler
+/// orphan-prunes it instead. The owning Gateway is recorded in the
+/// `gateway-name`/`gateway-namespace` labels.
+#[must_use]
+pub(super) fn render_shared_gateway_service(inputs: &SharedServiceInputs<'_>) -> Service {
+    let gw = inputs.gateway;
+    let gw_name =
+        gw.metadata.name.as_deref().unwrap_or_else(|| {
+            panic!("invariant: Gateway has no name; the API server requires it")
+        });
+    let gw_ns = gw.metadata.namespace.as_deref().unwrap_or_else(|| {
+        panic!("invariant: Gateway has no namespace; the API server requires it")
+    });
+
+    let mut labels = BTreeMap::new();
+    labels.insert("app.kubernetes.io/name".to_string(), "coxswain".to_string());
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        "coxswain".to_string(),
+    );
+    labels.insert(
+        "app.kubernetes.io/component".to_string(),
+        SHARED_GATEWAY_VIP_COMPONENT.to_string(),
+    );
+    // The owning Gateway (ns + name) — the VIP lives out-of-namespace, so these
+    // labels are how the reflector and status writer map it back.
+    labels.insert(
+        coxswain_reflector::port_alloc::VIP_GATEWAY_NAME_LABEL.to_string(),
+        gw_name.to_string(),
+    );
+    labels.insert(
+        coxswain_reflector::port_alloc::VIP_GATEWAY_NAMESPACE_LABEL.to_string(),
+        gw_ns.to_string(),
+    );
+
+    Service {
+        metadata: ObjectMeta {
+            name: Some(shared_gateway_service_name(gw_ns, gw_name)),
+            namespace: Some(inputs.controller_namespace.to_string()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            type_: Some(service_type_to_k8s_string(inputs.service_type)),
+            selector: Some(inputs.shared_proxy_selector.clone()),
+            ports: Some(shared_service_ports(gw, inputs.internal_ports)),
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+/// One `ServicePort` per unique listener `(port, TCP)`, mapping the advertised
+/// `port` to its allocated internal `targetPort`. Listener ports without an
+/// allocation (range exhausted) are skipped.
+fn shared_service_ports(
+    gateway: &Gateway,
+    internal_ports: &BTreeMap<u16, u16>,
+) -> Vec<ServicePort> {
+    let mut seen: BTreeSet<i32> = BTreeSet::new();
+    let mut out = Vec::new();
+    for listener in &gateway.spec.listeners {
+        let port = listener.port;
+        let Ok(listener_port) = u16::try_from(port) else {
+            continue;
+        };
+        if !seen.insert(port) {
+            continue;
+        }
+        let Some(&internal) = internal_ports.get(&listener_port) else {
+            continue;
+        };
+        out.push(ServicePort {
+            name: Some(listener.name.clone()),
+            port,
+            target_port: Some(IntOrString::Int(i32::from(internal))),
+            protocol: Some("TCP".to_string()),
             ..Default::default()
         });
     }
@@ -1161,5 +1301,73 @@ mod tests {
                 Some("nlb")
             );
         }
+    }
+
+    // ── Shared-mode VIP Service (#472) ───────────────────────────────────────
+
+    #[test]
+    fn shared_vip_service_lives_in_controller_ns_with_selector_and_maps_ports() {
+        let gw = make_gateway("team-a", "gw", vec![("https", 443, "HTTPS")]);
+        let internal: BTreeMap<u16, u16> = [(443u16, 30001u16)].into_iter().collect();
+        let mut selector = BTreeMap::new();
+        selector.insert(
+            "app.kubernetes.io/component".to_string(),
+            "shared-proxy".to_string(),
+        );
+        let svc = render_shared_gateway_service(&SharedServiceInputs {
+            gateway: &gw,
+            controller_namespace: "coxswain-system",
+            shared_proxy_selector: &selector,
+            internal_ports: &internal,
+            service_type: ServiceType::LoadBalancer,
+        });
+        // Lives WITH the shared proxy pod so the selector resolves + the cloud LB
+        // assigns a real address.
+        assert_eq!(svc.metadata.namespace.as_deref(), Some("coxswain-system"));
+        let spec = svc.spec.expect("spec");
+        assert_eq!(
+            spec.selector.as_ref(),
+            Some(&selector),
+            "selects the shared proxy pod"
+        );
+        let ports = spec.ports.expect("ports");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, 443, "advertised spec port");
+        assert_eq!(
+            ports[0].target_port,
+            Some(IntOrString::Int(30001)),
+            "maps to the allocated internal target port"
+        );
+        // No cross-namespace owner ref; the Gateway is recorded via labels.
+        assert!(
+            svc.metadata.owner_references.is_none(),
+            "no cross-namespace owner ref"
+        );
+        let labels = svc.metadata.labels.expect("labels");
+        assert_eq!(
+            labels
+                .get("gateway.networking.k8s.io/gateway-name")
+                .map(String::as_str),
+            Some("gw")
+        );
+        assert_eq!(
+            labels
+                .get("gateway.coxswain-labs.dev/gateway-namespace")
+                .map(String::as_str),
+            Some("team-a")
+        );
+    }
+
+    #[test]
+    fn shared_vip_service_name_is_namespace_qualified_and_unique() {
+        // Same Gateway name in different namespaces → distinct Service names
+        // (the VIP Services all live in one namespace, so names must not collide).
+        let a = shared_gateway_service_name("team-a", "gw");
+        let b = shared_gateway_service_name("team-b", "gw");
+        assert_ne!(a, b, "same name, different namespace → distinct VIP names");
+        assert!(a.ends_with("-shared-gw"));
+        assert!(a.len() <= 63, "within the DNS label limit");
+        // Deterministic (the status writer recomputes it).
+        assert_eq!(a, shared_gateway_service_name("team-a", "gw"));
     }
 }

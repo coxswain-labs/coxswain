@@ -27,6 +27,8 @@
 //!   reflector store snapshots.
 //! - [`reference_grants`] — `ReferenceGrant` flattening consumed by the
 //!   proxy reconciler (shared-pool and dedicated-mode snapshots alike).
+//! - [`port_alloc`] — internal target-port allocator for shared-mode
+//!   per-Gateway addressing (#472).
 //! - [`crds`] — startup probe for Gateway API CRD presence.
 
 pub mod cluster;
@@ -39,6 +41,7 @@ pub mod ingress;
 pub mod k8s_utils;
 pub mod keys;
 pub mod metrics;
+pub mod port_alloc;
 pub mod reconciler;
 pub mod reference_grants;
 pub mod tls;

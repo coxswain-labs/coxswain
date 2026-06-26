@@ -242,8 +242,12 @@ async fn listener_add_does_not_drop_requests_on_survivor() -> anyhow::Result<()>
 
     fixtures::apply_fixture(gwa::LISTENER_DRAIN, FixtureVars::new(&ns.name)).await?;
 
-    let addr_a = h.controller.gateway_http_addr;
-    let port_b = h.controller.gateway_https_addr.port();
+    // Resolve THIS Gateway's own per-Gateway VIP (#472) now that the fixture is
+    // applied; the fixed shared address no longer carries Gateway traffic.
+    let gw_http = h.gateway_http_addr(&ns.name).await?;
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
+    let addr_a = gw_http;
+    let port_b = gw_tls.port();
     let host = format!("drain.{}.local", ns.name);
 
     wait_for_listener(addr_a, &host, Duration::from_secs(30)).await?;
@@ -324,19 +328,24 @@ async fn listener_remove_does_not_drop_requests_on_survivor() -> anyhow::Result<
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
-    let addr_a = h.controller.gateway_http_addr;
-    let port_a = addr_a.port();
-    let port_b = h.controller.gateway_https_addr.port();
     let host = format!("drain.{}.local", ns.name);
-
-    // Start with TWO listeners.
     let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // Create the single-listener Gateway (http-a on GATEWAY_HTTP_PORT) and its
+    // HTTPRoute via the shared fixture, then resolve this Gateway's own VIP
+    // (#472) — the fixed shared address no longer carries Gateway traffic.
+    fixtures::apply_fixture(gwa::LISTENER_DRAIN, FixtureVars::new(&ns.name)).await?;
+
+    let gw_http = h.gateway_http_addr(&ns.name).await?;
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
+    let addr_a = gw_http;
+    let port_a = gw_http.port();
+    let port_b = gw_tls.port();
+
+    // Add a second listener (http-b) so the baseline has TWO listeners; the
+    // mid-flight patch below removes it under sustained load.
     let patch_two = json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "Gateway",
-        "metadata": { "name": "drain-gw", "namespace": &ns.name },
         "spec": {
-            "gatewayClassName": "coxswain",
             "listeners": [
                 { "name": "http-a", "port": port_a, "protocol": "HTTP",
                   "allowedRoutes": { "namespaces": { "from": "Same" } } },
@@ -349,14 +358,10 @@ async fn listener_remove_does_not_drop_requests_on_survivor() -> anyhow::Result<
         .patch(
             "drain-gw",
             &PatchParams::apply("e2e-test"),
-            &Patch::Apply(&patch_two),
+            &Patch::Merge(&patch_two),
         )
         .await
-        .context("create two-listener Gateway")?;
-
-    // Apply the HTTPRoute (reuse the LISTENER_DRAIN fixture for the route; the
-    // Gateway already exists, so kubectl apply is idempotent for the Gateway part).
-    fixtures::apply_fixture(gwa::LISTENER_DRAIN, FixtureVars::new(&ns.name)).await?;
+        .context("add second listener to Gateway")?;
 
     wait_for_listener(addr_a, &host, Duration::from_secs(30)).await?;
 
@@ -436,6 +441,11 @@ async fn dedicated_crash_loop_keeps_serving_via_shared() -> anyhow::Result<()> {
 
     fixtures::apply_fixture(gwa::CUTOVER_CRASH_LOOP, FixtureVars::new(&ns.name)).await?;
 
+    // White-box: address the SHARED pool's fixed Gateway-HTTP port directly, NOT
+    // this Gateway's own VIP (#472). The Gateway is dedicated-mode, so its
+    // advertised address points at the NotReady (crash-looping) dedicated
+    // Service; the invariant under test is that the SHARED pool keeps serving
+    // the route until cut-over, which is only observable on the shared listener.
     let addr = h.controller.gateway_http_addr;
     let host = format!("crash.{}.local", ns.name);
 
@@ -560,8 +570,11 @@ async fn lifecycle_mode_migration_shared_to_dedicated() -> anyhow::Result<()> {
 
     let host = format!("migrate.{}.local", ns.name);
 
+    // Resolve this Gateway's own per-Gateway VIP (#472) while it is still shared.
+    let gw = h.gateway_http(&ns.name).await?;
+
     // Baseline: shared subprocess serves the Gateway in shared mode.
-    let pre = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
+    let pre = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
     pre.assert_backend("echo-a");
 
     // Patch in the parametersRef → controller provisions a dedicated pod and
@@ -595,7 +608,7 @@ async fn lifecycle_mode_migration_shared_to_dedicated() -> anyhow::Result<()> {
     // Negative: cut-over (DedicatedProxyReady=True) means the shared pool dropped
     // the Gateway from its routing table, so the shared proxy must now return 404
     // for the migrated host — the claim the docstring makes is asserted here.
-    wait::wait_for_route_status(&h.gateway_http, &host, "/", 404, Duration::from_secs(30)).await?;
+    wait::wait_for_route_status(&gw, &host, "/", 404, Duration::from_secs(30)).await?;
 
     Ok(())
 }
@@ -646,8 +659,10 @@ async fn lifecycle_mode_migration_dedicated_to_shared() -> anyhow::Result<()> {
 
     // Shared subprocess re-adopts the Gateway once the controller clears the
     // status. The ~1s race window between status-clear and shared re-bind
-    // (where neither subprocess serves) is absorbed by this poll.
-    let post = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(30)).await?;
+    // (where neither subprocess serves) is absorbed by this poll. Re-resolve the
+    // VIP post-migration: the Gateway's effective address moves dedicated→shared.
+    let gw = h.gateway_http(&ns.name).await?;
+    let post = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(30)).await?;
     post.assert_backend("echo-a");
 
     // Assert the negative for teardown: the dedicated proxy is torn down on

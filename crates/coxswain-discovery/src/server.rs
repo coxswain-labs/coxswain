@@ -38,7 +38,7 @@ use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
 };
-use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
+use coxswain_core::tls::{SharedClientCertStore, SharedPortTlsStore};
 
 use crate::auth::{PeerSvid, svid_matches_dedicated_gateway};
 use crate::subscription::Scope;
@@ -50,7 +50,7 @@ use crate::proto::v1::{
 use crate::version::{ContentHash, WIRE_VERSION};
 use crate::wire::{
     client_cert_to_wire, gateway_to_wire, ingress_to_wire, listener_health_to_wire,
-    passthrough_to_wire, scope_from_wire, tls_to_wire,
+    passthrough_to_wire, port_tls_to_wire, scope_from_wire,
 };
 
 // ── SnapshotSource ────────────────────────────────────────────────────────────
@@ -68,13 +68,13 @@ pub struct SnapshotSource {
     /// Gateway-API routing table shared cell.
     pub gateway: SharedGatewayRoutingTable,
     /// TLS certificate store shared cell.
-    pub tls: SharedTlsStore,
+    pub tls: SharedPortTlsStore,
     /// Client-certificate mTLS config store shared cell.
     pub client_certs: SharedClientCertStore,
     /// Per-Gateway listener TLS-health map. Serialised into the
     /// `listener_health` wire field so proxy nodes can drive dynamic
     /// Gateway listener port bind/unbind without Kubernetes API access.
-    pub tls_health: SharedGatewayListenerHealth,
+    pub listener_health: SharedGatewayListenerHealth,
     /// Per-cut-over-Gateway routing snapshots, keyed by Gateway [`ObjectKey`].
     /// Read when a client subscribes with [`Scope::Gateway`]; the five cells
     /// above serve [`Scope::SharedPool`] (and deliberately exclude cut-over
@@ -93,7 +93,7 @@ impl Clone for SnapshotSource {
             gateway: self.gateway.clone(),
             tls: self.tls.clone(),
             client_certs: self.client_certs.clone(),
-            tls_health: self.tls_health.clone(),
+            listener_health: self.listener_health.clone(),
             dedicated: self.dedicated.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
         }
@@ -164,7 +164,7 @@ struct SnapshotContent {
     version: String,
     ingress_routing: p::RoutingTable,
     gateway_routing: p::RoutingTable,
-    tls_store: p::TlsStore,
+    tls_store: p::PortTlsStore,
     client_cert_store: p::ClientCertStore,
     listener_health: p::GatewayListenerHealth,
     tls_passthrough: p::TlsPassthroughTable,
@@ -211,15 +211,15 @@ fn build_snapshot(
             let gateway = source.gateway.load();
             let tls = source.tls.load();
             let client_certs = source.client_certs.load();
-            let tls_health = source.tls_health.load();
+            let listener_health = source.listener_health.load();
             let passthrough = source.passthrough_routes.load();
 
             assemble_snapshot(
                 ingress_to_wire(&ingress),
                 gateway_to_wire(&gateway),
-                tls_to_wire(&tls),
+                port_tls_to_wire(&tls),
                 client_cert_to_wire(&client_certs),
-                listener_health_to_wire(&tls_health),
+                listener_health_to_wire(&listener_health),
                 passthrough_to_wire(&passthrough),
             )
         }
@@ -242,7 +242,7 @@ fn build_snapshot(
                         return assemble_snapshot(
                             p::RoutingTable::default(),
                             p::RoutingTable::default(),
-                            p::TlsStore::default(),
+                            p::PortTlsStore::default(),
                             p::ClientCertStore::default(),
                             p::GatewayListenerHealth::default(),
                             // Dedicated proxies never serve TLS passthrough routes.
@@ -253,7 +253,7 @@ fn build_snapshot(
                         // A dedicated proxy never serves Ingress resources.
                         p::RoutingTable::default(),
                         gateway_to_wire(&snap.gateway),
-                        tls_to_wire(&snap.tls),
+                        port_tls_to_wire(&snap.tls),
                         client_cert_to_wire(&snap.client_certs),
                         listener_health_to_wire(&snap.listener_health),
                         // Dedicated proxies never serve TLS passthrough routes.
@@ -265,7 +265,7 @@ fn build_snapshot(
                 None => assemble_snapshot(
                     p::RoutingTable::default(),
                     p::RoutingTable::default(),
-                    p::TlsStore::default(),
+                    p::PortTlsStore::default(),
                     p::ClientCertStore::default(),
                     p::GatewayListenerHealth::default(),
                     p::TlsPassthroughTable::default(),
@@ -282,7 +282,7 @@ fn build_snapshot(
 fn assemble_snapshot(
     ingress_dto: p::RoutingTable,
     gateway_dto: p::RoutingTable,
-    tls_dto: p::TlsStore,
+    tls_dto: p::PortTlsStore,
     client_certs_dto: p::ClientCertStore,
     listener_health_dto: p::GatewayListenerHealth,
     tls_passthrough_dto: p::TlsPassthroughTable,
@@ -702,7 +702,9 @@ mod tests {
     use coxswain_core::routing::{
         GatewayRoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable,
     };
-    use coxswain_core::tls::{ClientCertStore, SharedClientCertStore, SharedTlsStore, TlsStore};
+    use coxswain_core::tls::{
+        ClientCertStore, PortTlsStore, SharedClientCertStore, SharedPortTlsStore,
+    };
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -724,9 +726,9 @@ mod tests {
         SnapshotSource {
             ingress: SharedIngressRoutingTable::new(),
             gateway: SharedGatewayRoutingTable::new(),
-            tls: SharedTlsStore::new(),
+            tls: SharedPortTlsStore::new(),
             client_certs: SharedClientCertStore::new(),
-            tls_health: SharedGatewayListenerHealth::new(),
+            listener_health: SharedGatewayListenerHealth::new(),
             dedicated: DedicatedRoutingRegistry::new(),
             passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         }
@@ -1129,7 +1131,7 @@ mod tests {
         lh.insert(key.clone(), GatewayListenerHealth::default());
         let snap = Arc::new(DedicatedRoutingSnapshot {
             gateway: Arc::new(GatewayRoutingTable::default()),
-            tls: Arc::new(TlsStore::default()),
+            tls: Arc::new(PortTlsStore::default()),
             client_certs: Arc::new(ClientCertStore::default()),
             listener_health: lh,
             // Test value; scope-binding tests in tests/scope_binding.rs set the

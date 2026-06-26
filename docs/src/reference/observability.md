@@ -41,6 +41,8 @@ Route id formats:
 
 The following listener-lifecycle metrics are also exposed: `coxswain_proxy_listeners_active`, `coxswain_proxy_listener_lifecycle_total`, `coxswain_proxy_listener_drain_duration_seconds`, `coxswain_proxy_requests_force_closed_total`.
 
+The `listener` label is the **local port the proxy accepted the connection on**. For Ingress and dedicated-mode Gateway traffic this is the advertised port (e.g. `80`/`443`). For shared-mode Gateway listeners it is the **internal accept port** the controller allocates per Gateway (in the `30000–32767` range), *not* the advertised port: a per-Gateway VIP Service maps the advertised port onto that internal port, and the proxy keys routing, TLS, and metrics on the port it accepts on so cross-Gateway hostname namespaces stay isolated (see [Architecture → per-Gateway addressing](../architecture.md)). To slice a shared-mode Gateway's series by its advertised port, join on the VIP Service rather than reading it from the `listener` label.
+
 ### Controller-pod metrics (`coxswain_controller_*`)
 
 | Metric | Type | Labels |

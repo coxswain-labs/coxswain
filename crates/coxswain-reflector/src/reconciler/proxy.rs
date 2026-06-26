@@ -47,7 +47,7 @@ use coxswain_core::routing::{
     SharedTlsPassthroughTable,
 };
 use coxswain_core::shared::Shared;
-use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedTlsStore};
+use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -252,12 +252,12 @@ impl ReconcilerHealth {
 pub struct SharedProxyReconciler {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
-    tls: SharedTlsStore,
+    tls: SharedPortTlsStore,
     /// Per-Ingress client-certificate mTLS config (#267). Keyed by SNI host, parallel to `tls`.
     client_certs: SharedClientCertStore,
     /// Per-port HTTPS Gateway-listener hostname snapshot (GEP-3567, #96).
     listener_hostnames: SharedListenerHostnames,
-    tls_health: SharedGatewayListenerHealth,
+    listener_health: SharedGatewayListenerHealth,
     cluster_summary: SharedClusterSummary,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
@@ -300,14 +300,14 @@ pub struct ReconcilerOutputs {
     /// Gateway-API-flavored routing table snapshot, updated on every successful Gateway build.
     pub gateway_routes: SharedGatewayRoutingTable,
     /// TLS certificate store snapshot, updated whenever a `kubernetes.io/tls` Secret changes.
-    pub tls: SharedTlsStore,
+    pub tls: SharedPortTlsStore,
     /// Per-Ingress client-certificate mTLS config snapshot, updated whenever an
     /// `auth-tls`-labelled Secret changes (#267). Keyed by SNI host, parallel to `tls`.
     pub client_certs: SharedClientCertStore,
     /// Per-port HTTPS Gateway-listener hostname snapshot (GEP-3567, #96).
     pub listener_hostnames: SharedListenerHostnames,
     /// Per-listener Gateway health used by status writes and the hot-reloader.
-    pub tls_health: SharedGatewayListenerHealth,
+    pub listener_health: SharedGatewayListenerHealth,
     /// Cluster aggregate (per-Gateway / per-Ingress summary) consumed by the
     /// controller's `/cluster` admin endpoint. Updated on every rebuild.
     pub cluster_summary: SharedClusterSummary,
@@ -386,7 +386,7 @@ impl SharedProxyReconciler {
             tls,
             client_certs,
             listener_hostnames,
-            tls_health,
+            listener_health,
             cluster_summary,
             dedicated_registry,
             passthrough_routes,
@@ -457,7 +457,7 @@ impl SharedProxyReconciler {
             tls,
             client_certs,
             listener_hostnames,
-            tls_health,
+            listener_health,
             cluster_summary,
             dedicated_registry,
             passthrough_routes,
@@ -556,6 +556,11 @@ pub(super) struct ReflectorStores<'a> {
     pub(super) gateway_classes: &'a reflector::Store<GatewayClass>,
     pub(super) slices: &'a reflector::Store<EndpointSlice>,
     pub(super) services: &'a reflector::Store<Service>,
+    /// `(Gateway, listenerPort) → internalPort` map (#472), read ONCE per rebuild
+    /// from the VIP Services so the routing/TLS/passthrough/listener-bind keyings
+    /// all agree on one Service snapshot. A per-builder re-read could observe a
+    /// mid-rebuild Service mutation and disagree (bound on port X, routed under Y).
+    pub(super) vip_internal: &'a super::route_builder::VipInternalPorts,
     pub(super) grants: &'a reflector::Store<ReferenceGrant>,
     pub(super) secrets: &'a reflector::Store<Secret>,
     /// Label-scoped htpasswd Secrets (`ingress.coxswain-labs.dev/auth-basic=true`) used
@@ -586,10 +591,10 @@ pub(super) struct ReflectorStores<'a> {
 pub(super) struct SharedOutputs<'a> {
     pub(super) ingress_routes: &'a SharedIngressRoutingTable,
     pub(super) gateway_routes: &'a SharedGatewayRoutingTable,
-    pub(super) tls: &'a SharedTlsStore,
+    pub(super) tls: &'a SharedPortTlsStore,
     pub(super) client_certs: &'a SharedClientCertStore,
     pub(super) listener_hostnames: &'a SharedListenerHostnames,
-    pub(super) tls_health: &'a SharedGatewayListenerHealth,
+    pub(super) listener_health: &'a SharedGatewayListenerHealth,
     pub(super) cluster_summary: &'a SharedClusterSummary,
     pub(super) dedicated_registry: &'a DedicatedRoutingRegistry,
     pub(super) route_health: &'a SharedRouteHealth,
@@ -736,7 +741,7 @@ impl BackgroundService for SharedProxyReconciler {
             tls: self.tls.clone(),
             client_certs: self.client_certs.clone(),
             listener_hostnames: self.listener_hostnames.clone(),
-            tls_health: self.tls_health.clone(),
+            listener_health: self.listener_health.clone(),
             cluster_summary: self.cluster_summary.clone(),
             dedicated_registry: self.dedicated_registry.clone(),
             route_health: self.route_health.clone(),
@@ -775,10 +780,10 @@ impl BackgroundService for SharedProxyReconciler {
 struct SharedHandles {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
-    tls: SharedTlsStore,
+    tls: SharedPortTlsStore,
     client_certs: SharedClientCertStore,
     listener_hostnames: SharedListenerHostnames,
-    tls_health: SharedGatewayListenerHealth,
+    listener_health: SharedGatewayListenerHealth,
     cluster_summary: SharedClusterSummary,
     dedicated_registry: DedicatedRoutingRegistry,
     route_health: SharedRouteHealth,
@@ -826,7 +831,7 @@ async fn spawn_tasks(
         tls,
         client_certs,
         listener_hostnames,
-        tls_health,
+        listener_health,
         cluster_summary,
         dedicated_registry,
         route_health,
@@ -1108,6 +1113,8 @@ async fn spawn_tasks(
                     _ = tokio::time::sleep(Duration::from_millis(500)) => break,
                 }
             }
+            // One VIP-Service read per rebuild (#472), shared by every builder.
+            let vip_internal = crate::port_alloc::read_vip_internal_ports(&service_reader.state());
             let stores = ReflectorStores {
                 routes: &route_reader,
                 grpc_routes: &grpc_route_reader,
@@ -1119,6 +1126,7 @@ async fn spawn_tasks(
                 gateway_classes: &gateway_class_reader,
                 slices: &slice_reader,
                 services: &service_reader,
+                vip_internal: &vip_internal,
                 grants: &grant_reader,
                 secrets: &secret_reader,
                 auth_secrets: &auth_secret_reader,
@@ -1134,7 +1142,7 @@ async fn spawn_tasks(
                 tls: &tls,
                 client_certs: &client_certs,
                 listener_hostnames: &listener_hostnames,
-                tls_health: &tls_health,
+                listener_health: &listener_health,
                 cluster_summary: &cluster_summary,
                 dedicated_registry: &dedicated_registry,
                 route_health: &route_health,
@@ -1228,7 +1236,7 @@ fn rebuild(
 
     // GEP-3155: resolve each Gateway's backend client cert once. `certs` is attached
     // to UpstreamTls during the route build; `health` feeds the gateway-level
-    // ResolvedRefs condition merged into `gateway_tls_health` below.
+    // ResolvedRefs condition merged into `gateway_listener_health` below.
     let backend_client_certs =
         resolve_backend_client_certs(stores, &owned_gateway_classes, &cert_grants, true);
 
@@ -1258,25 +1266,26 @@ fn rebuild(
         outputs,
     );
 
-    let mut gateway_tls_health = build_tls(
+    let mut gateway_listener_health = build_tls(
         stores,
         &ingresses,
         &ownership,
         outputs.tls,
         outputs.listener_hostnames,
         true,
+        ingress_ports.https.unwrap_or(443),
     );
     build_client_certs(
         stores,
         &ingresses,
         &ownership,
         outputs.client_certs,
-        &mut gateway_tls_health,
+        &mut gateway_listener_health,
         true,
     );
-    merge_backend_client_cert_health(&mut gateway_tls_health, &backend_client_certs.health);
+    merge_backend_client_cert_health(&mut gateway_listener_health, &backend_client_certs.health);
 
-    count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
+    count_attached_routes(&routes, &owned_gateways, &mut gateway_listener_health);
 
     let gateways = stores.gateways.state();
 
@@ -1332,8 +1341,8 @@ fn rebuild(
         stores.services,
     );
 
-    // Publish the cluster summary while we still have access to gateway_tls_health
-    // (it's moved into `tls_health.store_and_notify` next). Reads from already-
+    // Publish the cluster summary while we still have access to gateway_listener_health
+    // (it's moved into `listener_health.store_and_notify` next). Reads from already-
     // materialised state: nothing kube-side, no allocations beyond the summary.
     // Routing-table conflicts/dead-routes are overlaid in the UI from the
     // cross-proxy `/api/v1/problems` aggregate (the controller's table excludes
@@ -1347,7 +1356,7 @@ fn rebuild(
             dedicated_gateway_class_names: &dedicated_gateway_class_names,
             owned_ingress_classes: &owned_ingress_classes,
             default_ingress_class: owned_default_ingress_class.as_deref(),
-            gateway_tls_health: &gateway_tls_health,
+            gateway_listener_health: &gateway_listener_health,
             routes: &routes,
             route_health: &route_health_map,
             leader,
@@ -1368,8 +1377,8 @@ fn rebuild(
         })
         .collect();
     outputs
-        .tls_health
-        .update_scoped(gateway_tls_health, |k| !cut_over_keys.contains(k));
+        .listener_health
+        .update_scoped(gateway_listener_health, |k| !cut_over_keys.contains(k));
     outputs.route_health.store_and_notify(route_health_map);
     outputs
         .grpc_route_health
@@ -1435,7 +1444,7 @@ fn rebuild(
         };
 
         let gw_routes_cell: SharedGatewayRoutingTable = Shared::new();
-        let tls_cell: SharedTlsStore = Shared::new();
+        let tls_cell: SharedPortTlsStore = Shared::new();
         let client_certs_cell: SharedClientCertStore = Shared::new();
         // Listener-hostnames for the dedicated proxy are not yet wired into the
         // DedicatedRoutingSnapshot / discovery wire format; the throwaway cell
@@ -1460,23 +1469,26 @@ fn rebuild(
             &tls_cell,
             &listener_hostnames_cell,
             false,
+            // Dedicated proxies never serve Ingress (empty ingress_classes above),
+            // so no Ingress cert is keyed; the port is immaterial here (#472).
+            443,
         );
-        let mut dedicated_tls_health = gw_listener_health;
+        let mut dedicated_listener_health = gw_listener_health;
         build_client_certs(
             stores,
             &ingresses,
             &dedicated_ownership,
             &client_certs_cell,
-            &mut dedicated_tls_health,
+            &mut dedicated_listener_health,
             false,
         );
         merge_backend_client_cert_health(
-            &mut dedicated_tls_health,
+            &mut dedicated_listener_health,
             &dedicated_backend_client_certs.health,
         );
 
         // Retain only the health entry for the owning Gateway.
-        let listener_health: HashMap<ObjectKey, GatewayListenerHealth> = dedicated_tls_health
+        let listener_health: HashMap<ObjectKey, GatewayListenerHealth> = dedicated_listener_health
             .into_iter()
             .filter(|(k, _)| k == &key)
             .collect();

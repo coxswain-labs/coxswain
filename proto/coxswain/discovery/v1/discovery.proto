@@ -127,7 +127,9 @@ message Snapshot {
   // nested DTO extensions
   RoutingTable ingress_routing = 10;
   RoutingTable gateway_routing = 11;
-  TlsStore tls_store = 12;
+  // Per-port (#472): keyed by the bind port the proxy accepts HTTPS on, so each
+  // shared-mode Gateway's terminate certs are isolated to its own internal port.
+  PortTlsStore tls_store = 12;
   ClientCertStore client_cert_store = 13;
   GatewayListenerHealth listener_health = 14;
   TlsPassthroughTable tls_passthrough = 15;
@@ -560,6 +562,17 @@ message CircuitBreakerConfig {
 // 2b  TLS store DTO
 // ────────────────────────────────────────────────────────────────────────────
 
+// Mirrors PortTlsStore (#472): per-bind-port partition of the terminate cert
+// store. Sorted by port ascending for hash determinism.
+message PortTlsStore {
+  repeated PortTlsEntry ports = 1;
+}
+
+message PortTlsEntry {
+  uint32 port = 1; // u16 bind port (internal port for shared-mode Gateways)
+  TlsStore store = 2;
+}
+
 // Mirrors TlsStore.  Sorted by host pattern ascending.
 message TlsStore {
   repeated TlsCert default_certs = 1; // absent / empty = no default cert
@@ -655,7 +668,12 @@ message ListenerInfo {
   string hostname = 3;
   bool allows_all_namespaces = 4;
   int32 attached_routes = 5;
-  uint32 port = 6; // u16
+  uint32 port = 6; // u16 — the listener spec port clients connect to and status reports (#472)
+  // u16 — the internal targetPort the shared proxy binds and keys routing on, so
+  // each shared-mode Gateway is isolated on its own VIP:port → internal port
+  // (#472). 0 means "not separately allocated; bind the spec port" (dedicated
+  // mode, Ingress-derived listeners) — decode falls back to `port`.
+  uint32 internal_port = 7;
 }
 
 // Mirrors ListenerTlsOutcome.

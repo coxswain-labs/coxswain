@@ -15,8 +15,13 @@ use std::collections::{HashMap, HashSet};
 pub struct ListenerBinding {
     /// Listener `hostname` (empty string = match all).
     pub hostname: String,
-    /// Listener port number.
+    /// Listener **spec** port — the advertised port a route's `parentRef.port`
+    /// is matched against.
     pub port: u16,
+    /// Listener **bind** port — the local port the proxy accepts on and keys its
+    /// routing table by (#472). Equals the allocated internal port for shared-mode
+    /// Gateways, else the spec port. Routes are inserted under this port.
+    pub bind_port: u16,
 }
 
 /// Returns one entry per (listener hostname, listener port) binding derived from the
@@ -57,7 +62,7 @@ pub(super) fn compute_listener_bindings(
                 let key = ListenerKey::new(gw_ns, gw_name, sn);
                 match listener_info.get(&key) {
                     Some(info) if pr_port_filter.is_none_or(|pp| pp == info.port) => {
-                        vec![(info.port, info.hostname.as_str())]
+                        vec![(info.bind_port, info.hostname.as_str())]
                     }
                     _ => vec![],
                 }
@@ -69,7 +74,7 @@ pub(super) fn compute_listener_bindings(
                             return None;
                         }
                         if pr_port_filter.is_none_or(|pp| pp == info.port) {
-                            Some((info.port, info.hostname.as_str()))
+                            Some((info.bind_port, info.hostname.as_str()))
                         } else {
                             None
                         }
@@ -197,7 +202,7 @@ pub(super) fn compute_grpc_listener_bindings(
                 let key = ListenerKey::new(gw_ns, gw_name, sn);
                 match listener_info.get(&key) {
                     Some(info) if pr_port_filter.is_none_or(|pp| pp == info.port) => {
-                        vec![(info.port, info.hostname.as_str())]
+                        vec![(info.bind_port, info.hostname.as_str())]
                     }
                     _ => vec![],
                 }
@@ -209,7 +214,7 @@ pub(super) fn compute_grpc_listener_bindings(
                             return None;
                         }
                         if pr_port_filter.is_none_or(|pp| pp == info.port) {
-                            Some((info.port, info.hostname.as_str()))
+                            Some((info.bind_port, info.hostname.as_str()))
                         } else {
                             None
                         }

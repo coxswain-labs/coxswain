@@ -135,7 +135,8 @@ async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
 
     // Bump .metadata.generation with a harmless spec change (allowedRoutes.namespaces.from
     // changes from Same to All — the HTTPRoute is in the same namespace so it still attaches).
-    let http_port = h.controller.gateway_http_addr.port();
+    let gw_http = h.gateway_http_addr(&ns.name).await?;
+    let http_port = gw_http.port();
     let bump_patch = serde_json::json!({
         "spec": {
             "listeners": [{"name": "http", "port": http_port, "protocol": "HTTP",
@@ -835,11 +836,18 @@ fn route_parent_condition(route: &HTTPRoute, type_: &str) -> Option<(String, Str
     })
 }
 
-/// Verifies that a Gateway with no `addresses` field provided is still correctly processed
-/// and its status correctly reflects whatever IP is allocated by the Service.
+/// Verifies that a Gateway with no `addresses` field is still correctly
+/// processed and its status reflects the IP dynamically allocated for it.
+///
+/// With per-Gateway addressing (#472) that IP is the Gateway's OWN VIP Service
+/// address, allocated by the cluster's LB controller — and it overrides the
+/// global `--status-address`: a shared Gateway never advertises the global
+/// address (whose fixed 80/443 serve Ingress only). So the controller is given
+/// a global address here precisely to prove the VIP wins over it.
 #[tokio::test]
 async fn gateway_address_empty_allocates_dynamically() -> anyhow::Result<()> {
-    // Start controller with a specific status address representing the LB IP
+    // A global --status-address the Gateway must NOT end up advertising: its own
+    // per-Gateway VIP takes precedence (#472).
     let h = Harness::start_with_options(ControllerOptions {
         status_address: Some("203.0.113.8".to_string()),
         ..Default::default()
@@ -851,9 +859,11 @@ async fn gateway_address_empty_allocates_dynamically() -> anyhow::Result<()> {
 
     let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
 
-    // Wait for the gateway to become Accepted=True and get its addresses populated
+    // Wait for the gateway to become Accepted=True and get its addresses
+    // populated. The window matches the harness VIP wait: provisioning the VIP
+    // Service and resolving its LB IP is a multi-step async chain.
     let (addresses, _) = wait::poll_until(
-        Duration::from_secs(30),
+        Duration::from_secs(120),
         Duration::from_secs(1),
         || async {
             let gw = gw_api.get("coxswain-test").await.unwrap();
@@ -876,7 +886,17 @@ async fn gateway_address_empty_allocates_dynamically() -> anyhow::Result<()> {
 
     assert_eq!(addresses.len(), 1, "expected exactly one address");
     assert_eq!(addresses[0].0, "IPAddress");
-    assert_eq!(addresses[0].1, "203.0.113.8");
+    // The Gateway advertises its OWN dynamically-allocated VIP (#472), a real
+    // cluster IP — never the global --status-address fallback.
+    let addr = &addresses[0].1;
+    assert!(
+        addr.parse::<std::net::Ipv4Addr>().is_ok(),
+        "expected a dynamically-allocated IPv4 VIP, got {addr:?}"
+    );
+    assert_ne!(
+        addr, "203.0.113.8",
+        "shared Gateway must advertise its own VIP, not the global --status-address"
+    );
 
     Ok(())
 }
