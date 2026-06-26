@@ -70,6 +70,25 @@ impl ClusterKind {
             Ok(Self::Kind { name: ctx })
         }
     }
+
+    /// Service type for the per-Gateway shared-mode VIPs (#472), chosen by
+    /// reachability from the host the test process runs on.
+    ///
+    /// - **kind** (CI): `LoadBalancer`. cloud-provider-kind assigns each
+    ///   LoadBalancer Service a distinct, host-reachable IP, so per-Gateway VIPs
+    ///   sharing an advertised port (e.g. `443`) never collide. ClusterIPs
+    ///   (`10.96.0.0/12`) are NOT routable from the kind host, so a ClusterIP VIP
+    ///   would make every Gateway test time out.
+    /// - **OrbStack** (local): `ClusterIP`. OrbStack's klipper-lb host-binds each
+    ///   LoadBalancer Service's port, so two VIPs sharing a port stay `<pending>`
+    ///   forever — but OrbStack routes ClusterIPs straight to the host, so a
+    ///   distinct in-cluster VIP per Gateway is reachable and collision-free.
+    pub(crate) fn vip_service_type(&self) -> &'static str {
+        match self {
+            Self::Kind { .. } => "LoadBalancer",
+            Self::Orbstack => "ClusterIP",
+        }
+    }
 }
 
 /// Ensure the cluster is ready for e2e tests.
@@ -232,6 +251,12 @@ pub(crate) struct HelmOverrides {
 /// Returns an error if `helm upgrade` exits non-zero or times out.
 pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyhow::Result<()> {
     let chart = root.join("charts/coxswain");
+    // Per-Gateway shared-mode VIP Service type (#472) is reachability-dependent on
+    // the cluster distribution — LoadBalancer on kind/CI, ClusterIP on OrbStack.
+    let vip_service_type = ClusterKind::detect()
+        .await
+        .context("detect cluster kind for VIP service type")?
+        .vip_service_type();
     let mut args: Vec<String> = vec![
         "upgrade".into(),
         "--install".into(),
@@ -253,14 +278,10 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         "image.pullPolicy=Never".into(),
         "--set".into(),
         "service.gateway.type=LoadBalancer".into(),
-        // Per-Gateway shared-mode VIPs (#472) use ClusterIP, not LoadBalancer:
-        // OrbStack/kind klipper-lb binds each LoadBalancer Service's port on the
-        // host, so two VIPs sharing the advertised port (e.g. 8443) collide and
-        // stay <pending> forever. ClusterIP gives each Gateway a distinct
-        // in-cluster VIP that OrbStack/kind route to the host. Production clouds
-        // and MetalLB handle LoadBalancer VIPs (distinct IP per Service) natively.
+        // Per-Gateway shared-mode VIP Service type (#472), reachability-selected
+        // per cluster distribution — see `ClusterKind::vip_service_type`.
         "--set".into(),
-        "proxy.shared.vipServiceType=ClusterIP".into(),
+        format!("proxy.shared.vipServiceType={vip_service_type}"),
         "--set".into(),
         format!("controller.coxswainImage={E2E_IMAGE}"),
         // Pre-declare the fixed gateway ports on the Service so they're reachable
