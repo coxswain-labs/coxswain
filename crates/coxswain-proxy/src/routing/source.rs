@@ -8,7 +8,9 @@
 //! `coxswain-discovery` can implement it for `DiscoveryClient` without a
 //! circular dependency. It is re-exported here for backwards compatibility.
 
-use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
+use coxswain_core::routing::{
+    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
+};
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedTlsStore};
 
 pub use coxswain_core::RoutingSource;
@@ -27,6 +29,7 @@ pub struct KubernetesSource {
     tls_store: SharedTlsStore,
     client_cert_store: SharedClientCertStore,
     listener_hostnames: SharedListenerHostnames,
+    passthrough_routes: SharedTlsPassthroughTable,
 }
 
 impl KubernetesSource {
@@ -38,6 +41,7 @@ impl KubernetesSource {
         tls_store: SharedTlsStore,
         client_cert_store: SharedClientCertStore,
         listener_hostnames: SharedListenerHostnames,
+        passthrough_routes: SharedTlsPassthroughTable,
     ) -> Self {
         Self {
             ingress_routes,
@@ -45,6 +49,7 @@ impl KubernetesSource {
             tls_store,
             client_cert_store,
             listener_hostnames,
+            passthrough_routes,
         }
     }
 }
@@ -68,5 +73,9 @@ impl RoutingSource for KubernetesSource {
 
     fn listener_hostnames(&self) -> SharedListenerHostnames {
         self.listener_hostnames.clone()
+    }
+
+    fn passthrough_routes(&self) -> SharedTlsPassthroughTable {
+        self.passthrough_routes.clone()
     }
 }

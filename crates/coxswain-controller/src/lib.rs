@@ -29,7 +29,7 @@ pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writ
 pub use coxswain_core::cluster::SharedClusterSummary;
 pub use coxswain_reflector::{
     GatewayListenerHealth, IngressPorts, ListenerInfo, ListenerTlsOutcome,
-    SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
+    SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedRouteHealth,
     gateway_api_crds_present,
 };
 

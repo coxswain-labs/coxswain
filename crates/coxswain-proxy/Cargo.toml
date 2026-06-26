@@ -34,6 +34,7 @@ pingora-http = { workspace = true }
 pingora-proxy = { workspace = true, features = ["boringssl"] }
 prometheus = { workspace = true }
 thiserror = { workspace = true }
+tls-parser = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

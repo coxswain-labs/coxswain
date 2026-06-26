@@ -34,7 +34,7 @@
 //! writer of `Gateway.status` on dedicated-mode Gateways (the shared-pool
 //! writer skips them via a `parametersRef` group/kind check). Health-channel
 //! retriggers wire [`SharedGatewayListenerHealth`] and
-//! [`SharedHttpRouteHealth`] into [`Controller::reconcile_all_on`] so a
+//! [`SharedRouteHealth`] into [`Controller::reconcile_all_on`] so a
 //! cert-ref or route-resolution flip kicks every owned Gateway through the
 //! patch path within watch latency.
 
@@ -46,7 +46,7 @@ use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::ingress::IngressPorts;
 use coxswain_reflector::tls::{
-    GatewayListenerHealth, SharedGatewayListenerHealth, SharedHttpRouteHealth,
+    GatewayListenerHealth, SharedGatewayListenerHealth, SharedRouteHealth,
 };
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
@@ -140,7 +140,7 @@ pub struct OperatorConfig {
     /// derives from TLS health alone — see the issue-211 grilling notes),
     /// but a route-health flip still warrants re-checking listener
     /// `attached_routes` counts.
-    pub route_health: SharedHttpRouteHealth,
+    pub route_health: SharedRouteHealth,
     /// Ports reserved for the Ingress data plane via `--proxy-http-port` /
     /// `--proxy-https-port`. Forwarded to the listener-status helper so a
     /// dedicated-mode listener whose port collides with the Ingress

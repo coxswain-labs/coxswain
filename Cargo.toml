@@ -66,10 +66,6 @@ humantime          = { version = "2" }
 ipnet              = { version = "2" }
 itoa               = { version = "1" }
 dashmap            = { version = "6.2.1" }
-# Enable the "experimental" feature to expose alpha Gateway API resources
-# (GRPCRoute, TCPRoute, BackendTLSPolicy, etc.) and experimental fields on
-# stable CRDs. This feature is for contributor/CI/preview builds ONLY —
-# release images are always built without it. See docs/guides/gateway-api.md.
 k8s-openapi        = { version = "0.27", features = ["latest", "schemars"] }
 # `unstable-runtime` exposes the shared-store API (`store_shared`,
 # `Writer::subscribe`, `Controller::for_shared_stream`) the controller's
@@ -108,6 +104,7 @@ smallvec           = { version = "1.13", features = ["union"] }
 static_assertions  = { version = "1.1" }
 tempfile           = { version = "3" }
 thiserror          = { version = "2.0" }
+tls-parser         = { version = "0.12" }
 time               = { version = "0.3" }
 tokio              = { version = "1", features = ["full"] }
 tokio-rustls       = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

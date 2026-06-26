@@ -266,6 +266,34 @@ pub(crate) struct ProxyArgs {
     #[arg(long, env = "COXSWAIN_PROXY_BIND_ADDRESS", default_value = "0.0.0.0")]
     pub proxy_bind_address: IpAddr,
 
+    /// Port for the TLS-passthrough listener (TLSRoute / GEP-2643).
+    ///
+    /// Gateway listeners with `protocol: TLS, tls.mode: Passthrough` are served
+    /// on this port. The proxy peeks the SNI from the ClientHello and forwards
+    /// the raw encrypted stream to the backend — no TLS termination occurs.
+    /// Set to `0` to disable the passthrough listener entirely.
+    #[arg(
+        long,
+        env = "COXSWAIN_PROXY_TLS_PASSTHROUGH_PORT",
+        default_value_t = 8444
+    )]
+    pub proxy_tls_passthrough_port: u16,
+
+    /// Timeout for dialling a TLS passthrough backend.
+    ///
+    /// When a TLS-passthrough connection matches a TLSRoute, the proxy opens a
+    /// TCP connection to the selected backend within this window.  If the
+    /// backend does not accept within the timeout the client connection is closed.
+    ///
+    /// Accepts human-readable durations: `5s`, `30s`.
+    #[arg(
+        long,
+        env = "COXSWAIN_PROXY_TLS_PASSTHROUGH_DIAL_TIMEOUT",
+        default_value = "10s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub proxy_tls_passthrough_dial_timeout: Duration,
+
     /// Enable HAProxy PROXY protocol v1/v2 on the proxy listeners.
     ///
     /// When set, every accepted connection MUST carry a valid PROXY header.

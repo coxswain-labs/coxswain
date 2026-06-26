@@ -94,6 +94,13 @@ pub(super) fn compute_listener_bindings(
                         if hostnames::hostname_matches(rh, lh) {
                             let effective = if rh.starts_with("*.") && !lh.starts_with("*.") {
                                 lh.to_string()
+                            } else if rh.starts_with("*.")
+                                && lh.starts_with("*.")
+                                && lh.len() > rh.len()
+                            {
+                                // Both wildcards: the listener is more specific
+                                // (longer suffix) → use the listener hostname.
+                                lh.to_string()
                             } else {
                                 rh.to_string()
                             };
@@ -225,6 +232,13 @@ pub(super) fn compute_grpc_listener_bindings(
                     for rh in route_hostnames {
                         if hostnames::hostname_matches(rh, lh) {
                             let effective = if rh.starts_with("*.") && !lh.starts_with("*.") {
+                                lh.to_string()
+                            } else if rh.starts_with("*.")
+                                && lh.starts_with("*.")
+                                && lh.len() > rh.len()
+                            {
+                                // Both wildcards: the listener is more specific
+                                // (longer suffix) → use the listener hostname.
                                 lh.to_string()
                             } else {
                                 rh.to_string()

@@ -90,7 +90,7 @@ mod tests {
         HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteSpec,
     };
     use crate::keys::RouteParentKey;
-    use crate::tls::HttpRouteHealthMap;
+    use crate::tls::RouteHealthMap;
     use coxswain_core::ownership::ObjectKey;
     use coxswain_core::reference_grants::ReferenceGrantKey;
     use k8s_openapi::api::core::v1::Service;
@@ -182,12 +182,12 @@ mod tests {
         owned: &[(&str, &str)],
         grants: &HashSet<ReferenceGrantKey>,
         services: &reflector::Store<Service>,
-    ) -> HttpRouteHealthMap {
+    ) -> RouteHealthMap {
         let owned_set: HashSet<ObjectKey> = owned
             .iter()
             .map(|(ns, name)| ObjectKey::new(*ns, *name))
             .collect();
-        compute_route_health(routes, gateways, &owned_set, grants, services)
+        compute_route_health(routes, gateways, &owned_set, grants, services, "HTTPRoute")
     }
 
     fn key(route_ns: &str, route_name: &str, gw_ns: &str, gw_name: &str) -> RouteParentKey {

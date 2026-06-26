@@ -57,6 +57,7 @@ fn source_with_two_gateways() -> SnapshotSource {
         client_certs: SharedClientCertStore::new(),
         tls_health: SharedGatewayListenerHealth::new(),
         dedicated: DedicatedRoutingRegistry::new(),
+        passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
     };
 
     let gw_a_key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());

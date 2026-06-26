@@ -49,7 +49,8 @@ use coxswain_core::routing::{
     HostRouter, HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable,
     LoadBalance, MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier,
     PortRoutingTable, QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry, RouteKind,
-    RouteTimeouts, RouterError, SessionAffinity, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
+    RouteTimeouts, RouterError, SessionAffinity, TlsPassthroughTable, TlsPassthroughTableBuilder,
+    UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
 };
 
 use crate::error::WireError;
@@ -1397,6 +1398,92 @@ fn protocol_from_wire(v: i32) -> Result<BackendProtocol, WireError> {
         p::BackendProtocol::Https => Ok(BackendProtocol::Https),
         p::BackendProtocol::WebSocketTls => Ok(BackendProtocol::WebSocketTls),
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TLS passthrough table
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Encode a [`TlsPassthroughTable`] as a protobuf DTO.
+///
+/// Ports are emitted in ascending order for content-hash stability.
+/// Within each port, exact entries come first (sorted), then wildcard entries
+/// (sorted by suffix), then the catch-all if present.
+#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
+pub fn passthrough_to_wire(t: &TlsPassthroughTable) -> p::TlsPassthroughTable {
+    let mut ports: Vec<p::TlsPassthroughPort> = t
+        .ports_iter()
+        .map(|(port, router)| {
+            let mut exact_entries: Vec<(&str, &Arc<BackendGroup>)> = router.exact_iter().collect();
+            exact_entries.sort_by_key(|(sni, _)| *sni);
+
+            let mut wildcard_entries: Vec<(&str, &Arc<BackendGroup>)> =
+                router.wildcard_iter().collect();
+            wildcard_entries.sort_by_key(|(suffix, _)| *suffix);
+
+            let mut entries: Vec<p::TlsPassthroughEntry> = Vec::new();
+
+            for (sni, bg) in exact_entries {
+                entries.push(p::TlsPassthroughEntry {
+                    pattern: Some(p::tls_passthrough_entry::Pattern::Exact(sni.to_string())),
+                    backend_group: Some(backend_group_to_wire(bg, 0)),
+                });
+            }
+            for (suffix, bg) in wildcard_entries {
+                entries.push(p::TlsPassthroughEntry {
+                    pattern: Some(p::tls_passthrough_entry::Pattern::WildcardSuffix(
+                        suffix.to_string(),
+                    )),
+                    backend_group: Some(backend_group_to_wire(bg, 0)),
+                });
+            }
+            if let Some(bg) = router.catchall() {
+                entries.push(p::TlsPassthroughEntry {
+                    pattern: Some(p::tls_passthrough_entry::Pattern::Catchall(true)),
+                    backend_group: Some(backend_group_to_wire(bg, 0)),
+                });
+            }
+
+            p::TlsPassthroughPort {
+                port: u32::from(port),
+                entries,
+            }
+        })
+        .collect();
+    ports.sort_by_key(|e| e.port);
+    p::TlsPassthroughTable { ports }
+}
+
+/// Decode a [`TlsPassthroughTable`] from a protobuf DTO.
+///
+/// # Errors
+///
+/// Returns [`WireError`] if any backend group fails to decode (bad address,
+/// missing required field, etc.).
+#[must_use = "the rebuilt passthrough table must be stored for the proxy to use it"]
+pub fn passthrough_from_wire(
+    dto: &p::TlsPassthroughTable,
+) -> Result<TlsPassthroughTable, WireError> {
+    let mut builder = TlsPassthroughTableBuilder::new();
+    for port_entry in &dto.ports {
+        let port = port_entry.port as u16;
+        for entry in &port_entry.entries {
+            let bg = match &entry.backend_group {
+                Some(bg) => Arc::new(bg_from_wire(bg, 0)?),
+                None => continue,
+            };
+            let pattern = match &entry.pattern {
+                Some(p::tls_passthrough_entry::Pattern::Exact(s)) => s.clone(),
+                Some(p::tls_passthrough_entry::Pattern::WildcardSuffix(s)) => {
+                    format!("*.{s}")
+                }
+                Some(p::tls_passthrough_entry::Pattern::Catchall(_)) => String::new(),
+                None => continue,
+            };
+            builder = builder.add_route(port, &pattern, bg);
+        }
+    }
+    Ok(builder.build())
 }
 
 #[cfg(test)]

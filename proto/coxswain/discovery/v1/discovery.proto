@@ -130,6 +130,7 @@ message Snapshot {
   TlsStore tls_store = 12;
   ClientCertStore client_cert_store = 13;
   GatewayListenerHealth listener_health = 14;
+  TlsPassthroughTable tls_passthrough = 15;
   // repeated (reserved for v0.6 delta streaming)
   reserved 40;
   reserved "removed_resources";
@@ -668,4 +669,32 @@ enum ListenerTlsOutcome {
   // Some certificateRefs loaded, ≥1 failed.  Listener serves the good certs
   // (is_https_terminate = true) but ResolvedRefs=False in GW status.
   LISTENER_TLS_OUTCOME_RESOLVED_PARTIAL = 6;
+  // protocol: TLS, tls.mode: Passthrough — proxy peeks SNI and splices raw TCP;
+  // no TLS termination, no certificateRef needed (GEP-2643 / TLSRoute, #70).
+  LISTENER_TLS_OUTCOME_TLS_PASSTHROUGH = 7;
+  // Unsupported protocol/mode combination (e.g. protocol: TLS, tls.mode:
+  // Terminate). Surfaces Accepted=False/UnsupportedValue (GEP-2643 / TLSRoute, #70).
+  LISTENER_TLS_OUTCOME_UNSUPPORTED = 8;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 2e  TLS passthrough routing table (GEP-2643, #70)
+// ────────────────────────────────────────────────────────────────────────────
+
+message TlsPassthroughTable {
+  repeated TlsPassthroughPort ports = 1;
+}
+
+message TlsPassthroughPort {
+  uint32 port = 1;
+  repeated TlsPassthroughEntry entries = 2;
+}
+
+message TlsPassthroughEntry {
+  oneof pattern {
+    string exact = 1;
+    string wildcard_suffix = 2; // e.g. "example.com" for "*.example.com"
+    bool   catchall = 3;         // true = match any SNI (or no SNI)
+  }
+  BackendGroup backend_group = 4;
 }

@@ -633,7 +633,7 @@ pub enum WildcardKind {
 /// longest-suffix-first: the more specific `*.foo.example.com` is checked
 /// before `*.example.com`, so `bar.foo.example.com` hits the more-specific
 /// entry first and never falls through to the less-specific one.
-pub(super) fn wildcard_matches(host: &str, suffix: &str, kind: WildcardKind) -> bool {
+pub(crate) fn wildcard_matches(host: &str, suffix: &str, kind: WildcardKind) -> bool {
     if let Some(rest) = host.strip_suffix(suffix)
         && let Some(prefix) = rest.strip_suffix('.')
         && !prefix.is_empty()

@@ -35,7 +35,9 @@ use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
 use coxswain_core::listener_health::SharedGatewayListenerHealth;
 use coxswain_core::node_registry::{NodeScope, SharedNodeRegistry};
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
+use coxswain_core::routing::{
+    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
+};
 use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore};
 
 use crate::auth::{PeerSvid, svid_matches_dedicated_gateway};
@@ -48,7 +50,7 @@ use crate::proto::v1::{
 use crate::version::{ContentHash, WIRE_VERSION};
 use crate::wire::{
     client_cert_to_wire, gateway_to_wire, ingress_to_wire, listener_health_to_wire,
-    scope_from_wire, tls_to_wire,
+    passthrough_to_wire, scope_from_wire, tls_to_wire,
 };
 
 // ── SnapshotSource ────────────────────────────────────────────────────────────
@@ -78,6 +80,10 @@ pub struct SnapshotSource {
     /// above serve [`Scope::SharedPool`] (and deliberately exclude cut-over
     /// Gateways). The shared reconciler is the sole writer.
     pub dedicated: DedicatedRoutingRegistry,
+    /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
+    /// Only populated for [`Scope::SharedPool`] subscribers; dedicated proxies
+    /// receive an empty table (TLSRoutes are shared-pool only).
+    pub passthrough_routes: SharedTlsPassthroughTable,
 }
 
 impl Clone for SnapshotSource {
@@ -89,6 +95,7 @@ impl Clone for SnapshotSource {
             client_certs: self.client_certs.clone(),
             tls_health: self.tls_health.clone(),
             dedicated: self.dedicated.clone(),
+            passthrough_routes: self.passthrough_routes.clone(),
         }
     }
 }
@@ -160,6 +167,7 @@ struct SnapshotContent {
     tls_store: p::TlsStore,
     client_cert_store: p::ClientCertStore,
     listener_health: p::GatewayListenerHealth,
+    tls_passthrough: p::TlsPassthroughTable,
 }
 
 impl SnapshotContent {
@@ -173,6 +181,7 @@ impl SnapshotContent {
             tls_store: Some(self.tls_store),
             client_cert_store: Some(self.client_cert_store),
             listener_health: Some(self.listener_health),
+            tls_passthrough: Some(self.tls_passthrough),
         }
     }
 }
@@ -203,6 +212,7 @@ fn build_snapshot(
             let tls = source.tls.load();
             let client_certs = source.client_certs.load();
             let tls_health = source.tls_health.load();
+            let passthrough = source.passthrough_routes.load();
 
             assemble_snapshot(
                 ingress_to_wire(&ingress),
@@ -210,6 +220,7 @@ fn build_snapshot(
                 tls_to_wire(&tls),
                 client_cert_to_wire(&client_certs),
                 listener_health_to_wire(&tls_health),
+                passthrough_to_wire(&passthrough),
             )
         }
         Scope::Gateway { name, namespace } => {
@@ -234,6 +245,8 @@ fn build_snapshot(
                             p::TlsStore::default(),
                             p::ClientCertStore::default(),
                             p::GatewayListenerHealth::default(),
+                            // Dedicated proxies never serve TLS passthrough routes.
+                            p::TlsPassthroughTable::default(),
                         );
                     }
                     assemble_snapshot(
@@ -243,6 +256,8 @@ fn build_snapshot(
                         tls_to_wire(&snap.tls),
                         client_cert_to_wire(&snap.client_certs),
                         listener_health_to_wire(&snap.listener_health),
+                        // Dedicated proxies never serve TLS passthrough routes.
+                        p::TlsPassthroughTable::default(),
                     )
                 }
                 // Fail closed: the Gateway is not (yet) cut over, so this proxy
@@ -253,6 +268,7 @@ fn build_snapshot(
                     p::TlsStore::default(),
                     p::ClientCertStore::default(),
                     p::GatewayListenerHealth::default(),
+                    p::TlsPassthroughTable::default(),
                 ),
             }
         }
@@ -269,6 +285,7 @@ fn assemble_snapshot(
     tls_dto: p::TlsStore,
     client_certs_dto: p::ClientCertStore,
     listener_health_dto: p::GatewayListenerHealth,
+    tls_passthrough_dto: p::TlsPassthroughTable,
 ) -> SnapshotContent {
     let hashes = vec![
         ContentHash::compute(&ingress_dto.encode_to_vec())
@@ -286,6 +303,9 @@ fn assemble_snapshot(
         ContentHash::compute(&listener_health_dto.encode_to_vec())
             .as_str()
             .to_owned(),
+        ContentHash::compute(&tls_passthrough_dto.encode_to_vec())
+            .as_str()
+            .to_owned(),
     ];
     let version = ContentHash::from_per_resource(hashes).as_str().to_owned();
 
@@ -296,6 +316,7 @@ fn assemble_snapshot(
         tls_store: tls_dto,
         client_cert_store: client_certs_dto,
         listener_health: listener_health_dto,
+        tls_passthrough: tls_passthrough_dto,
     }
 }
 
@@ -707,6 +728,7 @@ mod tests {
             client_certs: SharedClientCertStore::new(),
             tls_health: SharedGatewayListenerHealth::new(),
             dedicated: DedicatedRoutingRegistry::new(),
+            passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         }
     }
 

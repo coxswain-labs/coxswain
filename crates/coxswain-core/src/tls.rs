@@ -136,6 +136,24 @@ impl TlsStore {
         self.find_certs(sni).first().map(Arc::clone)
     }
 
+    /// Returns `true` when an **exact or wildcard** cert is registered for `sni`,
+    /// ignoring the hostname-less default/catch-all bucket.
+    ///
+    /// Unlike [`Self::find_certs`] (which falls back to `default`), this answers
+    /// "does a *specific* HTTPS listener claim this hostname?". The hybrid
+    /// TLS-passthrough accept path uses it to decide a non-passthrough SNI:
+    /// terminate when a specific listener claims it, otherwise reject — a
+    /// catch-all default listener must not silently terminate an SNI destined
+    /// for the port's passthrough routes (GEP-2643 / #70).
+    #[must_use]
+    pub fn has_specific_cert(&self, sni: &str) -> bool {
+        self.exact.get(sni).is_some_and(|c| !c.is_empty())
+            || self
+                .wildcard
+                .iter()
+                .any(|(suffix, certs)| !certs.is_empty() && wildcard_matches(sni, suffix))
+    }
+
     /// Total number of certificates across all buckets (exact + wildcard + default).
     pub fn cert_count(&self) -> usize {
         self.exact.values().map(Vec::len).sum::<usize>()
@@ -868,6 +886,31 @@ mod tests {
         let store = TlsStoreBuilder::new().build();
         assert!(store.find_cert("example.com").is_none());
         assert!(store.find_certs("example.com").is_empty());
+    }
+
+    #[test]
+    fn has_specific_cert_ignores_default_bucket() {
+        // A hostname-less ("") cert lands in the default/catch-all bucket. It
+        // satisfies `find_certs` (fallback) but NOT `has_specific_cert`, which
+        // only counts a hostname-claiming exact/wildcard listener (GEP-2643/#70).
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert("", cert("ns/default"));
+        b.add_cert("abc.example.com", cert("ns/exact"));
+        b.add_cert("*.wild.com", cert("ns/wild"));
+        let store = b.build();
+
+        assert!(store.has_specific_cert("abc.example.com"), "exact match");
+        assert!(store.has_specific_cert("api.wild.com"), "wildcard match");
+        // Default cert exists, so find_certs falls back — but no specific listener
+        // claims `non.matching.com`.
+        assert!(
+            !store.find_certs("non.matching.com").is_empty(),
+            "find_certs falls back to default"
+        );
+        assert!(
+            !store.has_specific_cert("non.matching.com"),
+            "default cert must not count as a specific match"
+        );
     }
 
     #[test]

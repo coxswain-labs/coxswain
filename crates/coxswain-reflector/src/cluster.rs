@@ -13,7 +13,7 @@ use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gateways::Gateway;
 use crate::ingress::claimed_ingress_class;
 use crate::keys::RouteParentKey;
-use crate::tls::{GatewayListenerHealth, HttpRouteHealthMap};
+use crate::tls::{GatewayListenerHealth, RouteHealthMap};
 use coxswain_core::cluster::{
     ClusterSummary, ControllerSummary, GatewayCondition, GatewaySummary, HttpRouteSummary,
     IngressSummary, PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, ProxyAssignment, Severity,
@@ -60,7 +60,7 @@ pub struct ClusterSummaryInputs<'a> {
     pub routes: &'a [Arc<HttpRoute>],
     /// Per-(route, parent) health produced by `compute_route_health` — supplies
     /// each route's own `Accepted`/`ResolvedRefs` for the traffic-served status.
-    pub http_route_health: &'a HttpRouteHealthMap,
+    pub route_health: &'a RouteHealthMap,
     /// Whether this controller pod currently holds the leader-election lease.
     pub leader: bool,
 }
@@ -271,7 +271,7 @@ fn httproute_severity(
         // Gateways; a dedicated/cut-over Gateway has no entry, so an absent entry
         // defers to the Gateway's binding health rather than counting as dark.
         let own_ok = inputs
-            .http_route_health
+            .route_health
             .get(&RouteParentKey::new(
                 route_ns, route_name, gw_ns, gw_name, section,
             ))
@@ -435,7 +435,7 @@ mod tests {
         Gateway, GatewayInfrastructure, GatewayInfrastructureParametersRef, GatewaySpec,
         GatewayStatus, GatewayStatusAddresses,
     };
-    use crate::tls::{GatewayListenerHealth, HttpRouteHealthMap, ListenerInfo};
+    use crate::tls::{GatewayListenerHealth, ListenerInfo, RouteHealthMap};
     use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, ProxyPool};
     use coxswain_core::ownership::ObjectKey;
     use k8s_openapi::api::networking::v1::{
@@ -610,7 +610,7 @@ mod tests {
             default_ingress_class: None,
             gateway_tls_health: &health,
             routes: &[],
-            http_route_health: &HttpRouteHealthMap::new(),
+            route_health: &RouteHealthMap::new(),
             leader: false,
         });
 
@@ -652,7 +652,7 @@ mod tests {
             default_ingress_class: None,
             gateway_tls_health: &health,
             routes: &[],
-            http_route_health: &HttpRouteHealthMap::new(),
+            route_health: &RouteHealthMap::new(),
             leader: false,
         });
 
@@ -679,7 +679,7 @@ mod tests {
             default_ingress_class: None,
             gateway_tls_health: &empty_health(),
             routes: &[],
-            http_route_health: &HttpRouteHealthMap::new(),
+            route_health: &RouteHealthMap::new(),
             leader: true,
         });
 
@@ -728,7 +728,7 @@ mod tests {
             default_ingress_class: None,
             gateway_tls_health: &health,
             routes: &[],
-            http_route_health: &HttpRouteHealthMap::new(),
+            route_health: &RouteHealthMap::new(),
             leader: false,
         });
 
@@ -774,7 +774,7 @@ mod tests {
             default_ingress_class: None,
             gateway_tls_health: &empty_health(),
             routes: &[],
-            http_route_health: &HttpRouteHealthMap::new(),
+            route_health: &RouteHealthMap::new(),
             leader: false,
         });
         assert_eq!(summary.gateways.len(), 0);
@@ -795,7 +795,7 @@ mod tests {
             default_ingress_class: None,
             gateway_tls_health: &empty_health(),
             routes: &[],
-            http_route_health: &HttpRouteHealthMap::new(),
+            route_health: &RouteHealthMap::new(),
             leader: false,
         });
         assert_eq!(summary.ingresses.len(), 0);
@@ -816,7 +816,7 @@ mod tests {
             default_ingress_class: Some("coxswain"),
             gateway_tls_health: &empty_health(),
             routes: &[],
-            http_route_health: &HttpRouteHealthMap::new(),
+            route_health: &RouteHealthMap::new(),
             leader: false,
         });
         assert_eq!(summary.ingresses.len(), 1);
@@ -860,7 +860,7 @@ mod tests {
             default_ingress_class: None,
             gateway_tls_health: &empty_health(),
             routes: &[],
-            http_route_health: &HttpRouteHealthMap::new(),
+            route_health: &RouteHealthMap::new(),
             leader: false,
         });
         assert_eq!(summary.ingresses[0].load_balancer, "lb.example.com");
@@ -904,7 +904,7 @@ mod tests {
             default_ingress_class: None,
             gateway_tls_health: &empty_health(),
             routes: &[],
-            http_route_health: &HttpRouteHealthMap::new(),
+            route_health: &RouteHealthMap::new(),
             leader: false,
         });
         assert_eq!(summary.gateways[0].proxy.pool, ProxyPool::Shared);

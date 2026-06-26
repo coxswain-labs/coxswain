@@ -53,6 +53,17 @@ pub(super) fn hostname_matches(route_host: &str, listener_host: &str) -> bool {
     {
         return true;
     }
+    // Both wildcards: `*.A` and `*.B` intersect when one suffix is a subdomain of the
+    // other — e.g. `*.example.com` and `*.com` intersect because any host matching the
+    // narrower pattern also matches the wider one.
+    if let Some(rs) = route_host.strip_prefix("*.")
+        && let Some(ls) = listener_host.strip_prefix("*.")
+        && (rs == ls
+            || (rs.ends_with(ls) && rs[..rs.len() - ls.len()].ends_with('.'))
+            || (ls.ends_with(rs) && ls[..ls.len() - rs.len()].ends_with('.')))
+    {
+        return true;
+    }
     false
 }
 
@@ -185,5 +196,34 @@ mod tests {
     #[test]
     fn listener_wildcard_does_not_match_partial_label() {
         assert!(!hostname_matches("anotherwildcard.io", "*.wildcard.io"));
+    }
+
+    #[test]
+    fn wildcard_wildcard_same_suffix_intersects() {
+        assert!(hostname_matches("*.example.com", "*.example.com"));
+    }
+
+    #[test]
+    fn wildcard_wildcard_route_more_specific_intersects() {
+        // *.example.com (route) is a subdomain of *.com (listener) — they intersect.
+        assert!(hostname_matches("*.example.com", "*.com"));
+    }
+
+    #[test]
+    fn wildcard_wildcard_listener_more_specific_intersects() {
+        // *.com (route) overlaps with *.example.com (listener).
+        assert!(hostname_matches("*.com", "*.example.com"));
+    }
+
+    #[test]
+    fn wildcard_wildcard_unrelated_does_not_intersect() {
+        assert!(!hostname_matches("*.foo.com", "*.bar.com"));
+        assert!(!hostname_matches("*.foo.com", "*.com.bar"));
+    }
+
+    #[test]
+    fn wildcard_wildcard_partial_suffix_boundary_does_not_intersect() {
+        // "*.examplefoo.com" must NOT intersect "*.foo.com" — suffix matches but no dot boundary.
+        assert!(!hostname_matches("*.examplefoo.com", "*.foo.com"));
     }
 }

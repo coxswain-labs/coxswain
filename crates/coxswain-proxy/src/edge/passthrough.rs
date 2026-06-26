@@ -1,0 +1,407 @@
+//! Raw-TCP TLS-passthrough handler for TLSRoute / GEP-2643.
+//!
+//! The proxy **never** terminates TLS on this path.  A bounded [`TcpStream::peek`]
+//! reads the ClientHello without consuming it (bytes stay in the kernel queue),
+//! [`tls_parser`] extracts the SNI, and the matched backend receives the
+//! full original stream via [`tokio::io::copy_bidirectional_with_sizes`].
+//!
+//! All failure paths close the connection and return — nothing on this path
+//! may panic or call `unwrap` (data-plane zero-crash bar).
+
+use std::io;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use thiserror::Error;
+use tls_parser::{
+    TlsExtension, TlsMessage, TlsMessageHandshake, TlsPlaintext, parse_tls_plaintext,
+};
+use tokio::io::copy_bidirectional_with_sizes;
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+use tracing::debug;
+
+use coxswain_core::routing::{Selected, SharedTlsPassthroughTable};
+
+/// Buffer size for each direction of the TCP splice (~16 KiB).
+const SPLICE_BUF: usize = 16 * 1024;
+
+/// Maximum bytes read when peeking the TLS ClientHello.
+///
+/// A standard ClientHello fits in ~300 bytes; this cap guards against
+/// slowloris-style exhaustion of the peek buffer.
+const MAX_PEEK: usize = 16 * 1024;
+
+/// Timeout on the initial ClientHello peek.
+const PEEK_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ── SNI extraction ────────────────────────────────────────────────────────────
+
+/// Result of parsing bytes peeked from a TLS ClientHello.
+#[derive(Debug)]
+pub(crate) enum SniPeek {
+    /// Need more bytes — caller should grow the peek buffer and retry.
+    Incomplete,
+    /// SNI extension found; `host` is borrowed from the peeked buffer so the
+    /// caller converts it to owned.
+    Found(String),
+    /// A complete ClientHello was parsed but it carried no SNI extension.
+    NoSni,
+}
+
+/// Error variants for [`client_hello_sni`].
+#[non_exhaustive]
+#[derive(Debug, Error)]
+pub(crate) enum SniParseError {
+    /// The record is not a TLS handshake / ClientHello.
+    #[error("not a TLS ClientHello record")]
+    NotClientHello,
+    /// The SNI hostname is not valid UTF-8.
+    #[error("SNI hostname contains invalid UTF-8")]
+    InvalidUtf8,
+}
+
+/// Inspect a peeked byte slice and attempt to extract the SNI server_name.
+///
+/// Returns [`SniPeek::Incomplete`] when `buf` does not yet contain a full TLS
+/// record — the caller should expand the peek buffer and retry.  Returns an
+/// error only when the bytes are definitively *not* a TLS ClientHello;
+/// a missing SNI extension is not an error (returns [`SniPeek::NoSni`]).
+///
+/// # Errors
+///
+/// Returns [`SniParseError::NotClientHello`] when the bytes are a complete TLS
+/// record that is not a ClientHello handshake.
+/// Returns [`SniParseError::InvalidUtf8`] when the SNI hostname bytes are not
+/// valid UTF-8.
+pub(crate) fn client_hello_sni(buf: &[u8]) -> Result<SniPeek, SniParseError> {
+    use tls_parser::nom::Err as NomErr;
+
+    // A TLS ClientHello is always carried in a Handshake record (content type 0x16).
+    // Guard before calling tls-parser: garbage input (e.g. HTTP) may have a first
+    // byte that makes nom interpret following bytes as a huge record length,
+    // returning a spurious Incomplete instead of an error.
+    match buf.first().copied() {
+        None => return Ok(SniPeek::Incomplete),
+        Some(b) if b != 0x16 => return Err(SniParseError::NotClientHello),
+        Some(_) => {}
+    }
+
+    let record: TlsPlaintext = match parse_tls_plaintext(buf) {
+        Ok((_, r)) => r,
+        Err(NomErr::Incomplete(_)) => return Ok(SniPeek::Incomplete),
+        Err(_) => return Err(SniParseError::NotClientHello),
+    };
+
+    // Walk the messages in the record looking for the ClientHello.
+    let hello = record.msg.into_iter().find_map(|msg| {
+        if let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(ch)) = msg {
+            Some(ch)
+        } else {
+            None
+        }
+    });
+    let hello = match hello {
+        Some(h) => h,
+        None => return Err(SniParseError::NotClientHello),
+    };
+
+    // Walk the extensions looking for SNI.
+    let ext_bytes = match hello.ext {
+        Some(b) => b,
+        None => return Ok(SniPeek::NoSni),
+    };
+
+    let mut remaining = ext_bytes;
+    while !remaining.is_empty() {
+        match tls_parser::parse_tls_extension(remaining) {
+            Ok((rest, TlsExtension::SNI(names))) => {
+                // Only the `host_name` (type 0) name type is defined by RFC 6066.
+                if let Some((_, name)) = names.into_iter().next() {
+                    let host = std::str::from_utf8(name)
+                        .map_err(|_| SniParseError::InvalidUtf8)?
+                        .to_owned();
+                    return Ok(SniPeek::Found(host));
+                }
+                remaining = rest;
+            }
+            Ok((rest, _)) => {
+                remaining = rest;
+            }
+            Err(_) => break,
+        }
+    }
+
+    Ok(SniPeek::NoSni)
+}
+
+// ── Connection handler ────────────────────────────────────────────────────────
+
+/// Handle one accepted TCP connection on a TLS-passthrough listener.
+///
+/// Peeks the ClientHello via [`TcpStream::peek`] (MSG_PEEK — bytes stay in the
+/// kernel queue), extracts the SNI, matches against the passthrough routing
+/// table, dials the backend, and splices bytes bidirectionally.
+///
+/// All failure paths log at `debug` level and return — the connection is closed
+/// when the `TcpStream` is dropped.
+pub(crate) async fn handle_passthrough(
+    tcp: TcpStream,
+    peer_addr: SocketAddr,
+    table: &SharedTlsPassthroughTable,
+    listener_port: u16,
+    dial_timeout: Duration,
+) {
+    let sni = match peek_sni(&tcp).await {
+        Ok(s) => s,
+        Err(e) => {
+            debug!(
+                peer = %peer_addr,
+                error = %e,
+                "TLS passthrough: failed to read ClientHello SNI"
+            );
+            return;
+        }
+    };
+
+    let snapshot = table.load();
+    let router = match snapshot.port(listener_port) {
+        Some(r) => r,
+        None => {
+            debug!(
+                peer = %peer_addr,
+                port = listener_port,
+                "TLS passthrough: no routes for listener port"
+            );
+            return;
+        }
+    };
+
+    let backend = match router.match_sni(sni.as_deref()) {
+        Some(bg) => bg,
+        None => {
+            debug!(
+                peer = %peer_addr,
+                sni = ?sni,
+                "TLS passthrough: no backend matched SNI"
+            );
+            return;
+        }
+    };
+
+    let Selected {
+        addr: backend_addr, ..
+    } = match backend.select_upstream(None) {
+        Some(s) => s,
+        None => {
+            debug!(
+                peer = %peer_addr,
+                sni = ?sni,
+                "TLS passthrough: backend group is empty"
+            );
+            return;
+        }
+    };
+
+    let mut upstream = match timeout(dial_timeout, TcpStream::connect(backend_addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            debug!(
+                peer = %peer_addr,
+                backend = %backend_addr,
+                error = %e,
+                "TLS passthrough: failed to connect to backend"
+            );
+            return;
+        }
+        Err(_) => {
+            debug!(
+                peer = %peer_addr,
+                backend = %backend_addr,
+                timeout = ?dial_timeout,
+                "TLS passthrough: backend connect timed out"
+            );
+            return;
+        }
+    };
+
+    // The peeked bytes are still in the kernel queue — the backend connection
+    // receives the intact ClientHello as the first bytes of the splice.
+    let mut downstream = tcp;
+    if let Err(e) =
+        copy_bidirectional_with_sizes(&mut downstream, &mut upstream, SPLICE_BUF, SPLICE_BUF).await
+    {
+        // Connection-reset and EOF errors are normal on TLS connections.
+        debug!(
+            peer = %peer_addr,
+            backend = %backend_addr,
+            error = %e,
+            "TLS passthrough: splice ended"
+        );
+    }
+}
+
+/// Peek the TLS ClientHello off `tcp` (MSG_PEEK — data stays in the kernel
+/// queue) and return the SNI server_name if present.
+///
+/// Grows the peek buffer until [`client_hello_sni`] reports a complete parse,
+/// or until [`MAX_PEEK`] bytes have been read, or until a timeout fires.
+///
+/// # Errors
+///
+/// Returns an IO error on socket failure or when the ClientHello times out or
+/// exceeds the size cap.
+pub(crate) async fn peek_sni(tcp: &TcpStream) -> io::Result<Option<String>> {
+    let mut buf = vec![0u8; 512];
+    let deadline = timeout(PEEK_TIMEOUT, async {
+        loop {
+            let n = tcp.peek(&mut buf).await?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed during peek",
+                ));
+            }
+            match client_hello_sni(&buf[..n]) {
+                Ok(SniPeek::Incomplete) => {
+                    if buf.len() >= MAX_PEEK {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ClientHello exceeds peek cap",
+                        ));
+                    }
+                    // Double the buffer and retry; peek will block until more data arrives.
+                    buf.resize(buf.len() * 2, 0);
+                }
+                Ok(SniPeek::Found(host)) => return Ok(Some(host)),
+                Ok(SniPeek::NoSni) => return Ok(None),
+                Err(e) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+                }
+            }
+        }
+    });
+    deadline
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ClientHello peek timed out"))?
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sni_from_client_hello() {
+        // Verify that tls_parser can parse SNI extension bytes directly.
+        // minimal known-good one from tls-parser's own test suite approach:
+        // just verify that tls_parser can parse the SNI extension bytes directly.
+
+        // Minimal ClientHello: ContentType=0x16, version=0x0301,
+        // record length contains exactly the SNI extension.
+        let sni_ext: &[u8] = &[
+            // extension type SNI = 0x0000
+            0x00, 0x00, // extension length = 13
+            0x00, 0x0d, // ServerNameList length = 11
+            0x00, 0x0b, // name_type = host_name (0)
+            0x00, // name length = 8
+            0x00, 0x08, // "app.test"
+            b'a', b'p', b'p', b'.', b't', b'e', b's', b't',
+        ];
+
+        match tls_parser::parse_tls_extension(sni_ext) {
+            Ok((_, TlsExtension::SNI(names))) => {
+                let host = std::str::from_utf8(names[0].1).unwrap();
+                assert_eq!(host, "app.test");
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incomplete_returns_incomplete() {
+        // Just the first few bytes of a TLS record — definitely incomplete.
+        let partial = &[0x16u8, 0x03, 0x01, 0x00, 0x50];
+        match client_hello_sni(partial) {
+            Ok(SniPeek::Incomplete) => {}
+            other => panic!("expected Incomplete, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn garbage_returns_not_client_hello() {
+        let garbage = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        match client_hello_sni(garbage) {
+            Err(SniParseError::NotClientHello) => {}
+            other => panic!("expected NotClientHello, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_client_hello_with_sni_extracted() {
+        // Build a minimal but complete TLS ClientHello with SNI.
+        // Record: ContentType=22 (handshake), version=0x0301, then body.
+        // Handshake: type=1 (ClientHello), length (3 bytes), then:
+        //   version (2), random (32), session_id_len (1), cipher_suites_len (2),
+        //   cipher_suites (2), compression_len (1), compression (1),
+        //   extensions_len (2), extensions...
+        let sni_host = b"sni.example.com";
+        let sni_host_len = sni_host.len() as u16;
+        // SNI extension wire format
+        let sni_ext_body: Vec<u8> = {
+            let mut v = Vec::new();
+            // ServerNameList length = 1 + 2 + sni_host_len
+            let list_len = (3 + sni_host_len) as u16;
+            v.extend_from_slice(&list_len.to_be_bytes());
+            v.push(0x00); // name_type = host_name
+            v.extend_from_slice(&sni_host_len.to_be_bytes());
+            v.extend_from_slice(sni_host);
+            v
+        };
+        let ext_body_len = sni_ext_body.len() as u16;
+
+        let mut extensions: Vec<u8> = Vec::new();
+        extensions.extend_from_slice(&0x0000u16.to_be_bytes()); // type = SNI
+        extensions.extend_from_slice(&ext_body_len.to_be_bytes());
+        extensions.extend_from_slice(&sni_ext_body);
+
+        let extensions_len = extensions.len() as u16;
+
+        // ClientHello body (fixed fields + extensions)
+        let mut ch_body: Vec<u8> = Vec::new();
+        ch_body.extend_from_slice(&[0x03, 0x03]); // version = TLS 1.2 compat
+        ch_body.extend_from_slice(&[0u8; 32]); // random
+        ch_body.push(0x00); // session_id_len = 0
+        ch_body.extend_from_slice(&[0x00, 0x02]); // cipher_suites_len = 2
+        ch_body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        ch_body.push(0x01); // compression_methods_len = 1
+        ch_body.push(0x00); // null compression
+        ch_body.extend_from_slice(&extensions_len.to_be_bytes());
+        ch_body.extend_from_slice(&extensions);
+
+        let ch_len = ch_body.len() as u32;
+
+        // Handshake record
+        let mut hs: Vec<u8> = Vec::new();
+        hs.push(0x01); // type = ClientHello
+        hs.push(((ch_len >> 16) & 0xff) as u8);
+        hs.push(((ch_len >> 8) & 0xff) as u8);
+        hs.push((ch_len & 0xff) as u8);
+        hs.extend_from_slice(&ch_body);
+
+        let hs_len = hs.len() as u16;
+
+        // TLS record
+        let mut record: Vec<u8> = Vec::new();
+        record.push(0x16); // ContentType = handshake
+        record.extend_from_slice(&[0x03, 0x01]); // version
+        record.extend_from_slice(&hs_len.to_be_bytes());
+        record.extend_from_slice(&hs);
+
+        match client_hello_sni(&record) {
+            Ok(SniPeek::Found(host)) => assert_eq!(host, "sni.example.com"),
+            other => panic!("expected Found, got: {other:?}"),
+        }
+    }
+}

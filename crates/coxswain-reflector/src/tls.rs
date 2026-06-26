@@ -60,10 +60,10 @@ impl Default for RouteParentHealth {
 }
 
 /// Map from `(route, parent)` key to per-parent health status.
-pub type HttpRouteHealthMap = HashMap<RouteParentKey, RouteParentHealth>;
+pub type RouteHealthMap = HashMap<RouteParentKey, RouteParentHealth>;
 
-struct SharedHttpRouteHealthInner {
-    map: ArcSwap<HttpRouteHealthMap>,
+struct SharedRouteHealthInner {
+    map: ArcSwap<RouteHealthMap>,
     tx: watch::Sender<u64>,
 }
 
@@ -74,31 +74,31 @@ struct SharedHttpRouteHealthInner {
 /// notification scheme.
 #[non_exhaustive]
 #[derive(Clone)]
-pub struct SharedHttpRouteHealth(Arc<SharedHttpRouteHealthInner>);
+pub struct SharedRouteHealth(Arc<SharedRouteHealthInner>);
 
-impl Default for SharedHttpRouteHealth {
+impl Default for SharedRouteHealth {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SharedHttpRouteHealth {
+impl SharedRouteHealth {
     /// Construct a new shared route health map (initially empty, generation 0).
     pub fn new() -> Self {
         let (tx, _) = watch::channel(0u64);
-        Self(Arc::new(SharedHttpRouteHealthInner {
+        Self(Arc::new(SharedRouteHealthInner {
             map: ArcSwap::from_pointee(HashMap::new()),
             tx,
         }))
     }
 
     /// Load the current route health map snapshot.
-    pub fn load(&self) -> arc_swap::Guard<Arc<HttpRouteHealthMap>> {
+    pub fn load(&self) -> arc_swap::Guard<Arc<RouteHealthMap>> {
         self.0.map.load()
     }
 
     /// Store a new health map and notify subscribers via the generation counter.
-    pub fn store_and_notify(&self, map: HttpRouteHealthMap) {
+    pub fn store_and_notify(&self, map: RouteHealthMap) {
         self.0.map.store(Arc::new(map));
         self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
     }

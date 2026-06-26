@@ -58,5 +58,5 @@ pub use reconciler::{
 };
 pub use tls::{
     GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, SharedBackendTlsPolicyHealth,
-    SharedGatewayListenerHealth, SharedHttpRouteHealth,
+    SharedGatewayListenerHealth, SharedRouteHealth,
 };

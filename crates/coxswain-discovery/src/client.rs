@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::listener_health::SharedGatewayListenerHealth;
-use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
+use coxswain_core::routing::{
+    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
+};
 use coxswain_core::tls::{
     ListenerHostnamesBuilder, SharedClientCertStore, SharedListenerHostnames, SharedTlsStore,
 };
@@ -35,7 +37,7 @@ use crate::svid::SharedSvid;
 use crate::version::WIRE_VERSION;
 use crate::wire::{
     client_cert_from_wire, gateway_from_wire, ingress_from_wire, listener_health_from_wire,
-    tls_from_wire,
+    passthrough_from_wire, tls_from_wire,
 };
 
 /// Configuration for the discovery gRPC client supervisor.
@@ -133,6 +135,8 @@ pub struct DiscoveryClient {
     client_cert_store: SharedClientCertStore,
     listener_health: SharedGatewayListenerHealth,
     listener_hostnames: SharedListenerHostnames,
+    /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
+    passthrough_routes: SharedTlsPassthroughTable,
 }
 
 impl DiscoveryClient {
@@ -184,6 +188,7 @@ impl DiscoveryClient {
         let client_cert_store = SharedClientCertStore::new();
         let listener_health = SharedGatewayListenerHealth::new();
         let listener_hostnames = SharedListenerHostnames::new();
+        let passthrough_routes = SharedTlsPassthroughTable::new();
 
         let supervisor = Supervisor {
             config,
@@ -193,6 +198,7 @@ impl DiscoveryClient {
             client_certs: client_cert_store.clone(),
             listener_health: listener_health.clone(),
             listener_hostnames: listener_hostnames.clone(),
+            passthrough: passthrough_routes.clone(),
             health,
             health_check: health_check.to_owned(),
             has_snapshot: false,
@@ -205,6 +211,7 @@ impl DiscoveryClient {
             client_cert_store,
             listener_health,
             listener_hostnames,
+            passthrough_routes,
         };
 
         Ok((client, supervisor))
@@ -279,6 +286,14 @@ impl DiscoveryClient {
     pub fn listener_hostnames(&self) -> SharedListenerHostnames {
         self.listener_hostnames.clone()
     }
+
+    /// Handle to the TLS passthrough routing table snapshot for TLSRoute / GEP-2643 (#70).
+    ///
+    /// Updated atomically with every applied snapshot from the controller.
+    #[must_use]
+    pub fn passthrough_routes(&self) -> SharedTlsPassthroughTable {
+        self.passthrough_routes.clone()
+    }
 }
 
 impl coxswain_core::RoutingSource for DiscoveryClient {
@@ -301,6 +316,10 @@ impl coxswain_core::RoutingSource for DiscoveryClient {
     fn listener_hostnames(&self) -> SharedListenerHostnames {
         self.listener_hostnames.clone()
     }
+
+    fn passthrough_routes(&self) -> SharedTlsPassthroughTable {
+        self.passthrough_routes.clone()
+    }
 }
 
 // ── supervisor ──────────────────────────────────────────────────────────────
@@ -320,6 +339,7 @@ pub struct Supervisor {
     client_certs: SharedClientCertStore,
     listener_health: SharedGatewayListenerHealth,
     listener_hostnames: SharedListenerHostnames,
+    passthrough: SharedTlsPassthroughTable,
     health: SubsystemHandle,
     health_check: String,
     has_snapshot: bool,
@@ -490,12 +510,15 @@ impl Supervisor {
 
             match apply_snapshot(
                 &snapshot,
-                &self.ingress,
-                &self.gateway,
-                &self.tls,
-                &self.client_certs,
-                &self.listener_health,
-                &self.listener_hostnames,
+                SnapshotCells {
+                    ingress: &self.ingress,
+                    gateway: &self.gateway,
+                    tls: &self.tls,
+                    client_certs: &self.client_certs,
+                    health: &self.listener_health,
+                    listener_hostnames: &self.listener_hostnames,
+                    passthrough: &self.passthrough,
+                },
             ) {
                 Ok(()) => {
                     debug!(version, "discovery snapshot applied; sending Ack");
@@ -539,9 +562,25 @@ impl Supervisor {
     }
 }
 
+/// Write handles for all routing [`Shared`] cells that [`apply_snapshot`] updates.
+///
+/// Groups the seven cell references into one parameter so [`apply_snapshot`]
+/// stays within the workspace's 7-argument function limit.
+///
+/// [`Shared`]: coxswain_core::Shared
+struct SnapshotCells<'a> {
+    ingress: &'a SharedIngressRoutingTable,
+    gateway: &'a SharedGatewayRoutingTable,
+    tls: &'a SharedTlsStore,
+    client_certs: &'a SharedClientCertStore,
+    health: &'a SharedGatewayListenerHealth,
+    listener_hostnames: &'a SharedListenerHostnames,
+    passthrough: &'a SharedTlsPassthroughTable,
+}
+
 /// Decode all routing cells from a snapshot DTO and atomically publish them.
 ///
-/// All five DTOs are decoded first; only on total success are the [`Shared`]
+/// All DTOs are decoded first; only on total success are the [`Shared`]
 /// cells updated, preventing a partial-failure from leaving cells inconsistent.
 ///
 /// # Errors
@@ -552,12 +591,7 @@ impl Supervisor {
 /// [`Shared`]: coxswain_core::Shared
 fn apply_snapshot(
     snapshot: &p::Snapshot,
-    ingress: &SharedIngressRoutingTable,
-    gateway: &SharedGatewayRoutingTable,
-    tls: &SharedTlsStore,
-    client_certs: &SharedClientCertStore,
-    health: &SharedGatewayListenerHealth,
-    listener_hostnames: &SharedListenerHostnames,
+    cells: SnapshotCells<'_>,
 ) -> Result<(), crate::WireError> {
     let ingress_table = ingress_from_wire(
         snapshot
@@ -589,6 +623,12 @@ fn apply_snapshot(
             .as_ref()
             .unwrap_or(&p::GatewayListenerHealth::default()),
     )?;
+    let passthrough_table = passthrough_from_wire(
+        snapshot
+            .tls_passthrough
+            .as_ref()
+            .unwrap_or(&p::TlsPassthroughTable::default()),
+    )?;
 
     // Derive the per-port HTTPS listener-hostname snapshot from the health map
     // (same data the reflector uses in build_tls) so GEP-3567 misdirected-request
@@ -599,13 +639,14 @@ fn apply_snapshot(
             lh_builder.add_listener(li.port, &li.hostname, li.tls_outcome.is_https_terminate());
         }
     }
-    listener_hostnames.store(Arc::new(lh_builder.build()));
+    cells.listener_hostnames.store(Arc::new(lh_builder.build()));
 
-    ingress.store(Arc::new(ingress_table));
-    gateway.store(Arc::new(gateway_table));
-    tls.store(Arc::new(tls_store));
-    client_certs.store(Arc::new(client_cert_store));
-    health.store_and_notify(listener_health_map);
+    cells.ingress.store(Arc::new(ingress_table));
+    cells.gateway.store(Arc::new(gateway_table));
+    cells.tls.store(Arc::new(tls_store));
+    cells.client_certs.store(Arc::new(client_cert_store));
+    cells.health.store_and_notify(listener_health_map);
+    cells.passthrough.store(Arc::new(passthrough_table));
 
     Ok(())
 }
@@ -853,6 +894,7 @@ mod tests {
                 tls_store: Some(TlsStore::default()),
                 client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
                 listener_health: Some(GatewayListenerHealth::default()),
+                tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
             })),
         }
     }
@@ -882,6 +924,7 @@ mod tests {
                 tls_store: Some(TlsStore::default()),
                 client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
                 listener_health: Some(GatewayListenerHealth::default()),
+                tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
             })),
         }
     }

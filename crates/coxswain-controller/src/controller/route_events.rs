@@ -7,7 +7,7 @@ use coxswain_reflector::gw_types::{
     v::httproutes::{HttpRouteStatusParents, HttpRouteStatusParentsParentRef},
 };
 use coxswain_reflector::keys::RouteParentKey;
-use coxswain_reflector::tls::{HttpRouteHealthMap, RouteParentHealth};
+use coxswain_reflector::tls::{RouteHealthMap, RouteParentHealth};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::{
     Client,
@@ -20,7 +20,7 @@ pub(super) async fn mark_http_route_programmed(
     route: &HttpRoute,
     controller_name: &str,
     owned_gateways: &HashSet<ObjectKey>,
-    route_health: &HttpRouteHealthMap,
+    route_health: &RouteHealthMap,
 ) {
     let name = match route.metadata.name.as_deref() {
         Some(n) => n,

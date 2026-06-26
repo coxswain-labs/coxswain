@@ -29,6 +29,7 @@ func TestConformance(t *testing.T) {
 	opts.ConformanceProfiles = sets.New[suite.ConformanceProfileName](
 		suite.GatewayHTTPConformanceProfileName,
 		suite.GatewayGRPCConformanceProfileName,
+		suite.GatewayTLSConformanceProfileName,
 	)
 
 	// Declare only features that are currently implemented.
@@ -94,6 +95,8 @@ func TestConformance(t *testing.T) {
 		features.SupportReferenceGrant,
 		// Standard: GRPCRoute — GEP-1016 (#33)
 		features.SupportGRPCRoute,
+		// Standard: TLSRoute passthrough — GEP-2643 (#70)
+		features.SupportTLSRoute,
 	)
 
 	conformance.RunConformanceWithOptions(t, opts)

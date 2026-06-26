@@ -21,9 +21,9 @@ use coxswain_discovery::{
     SpiffeMatcher, Supervisor, serve_discovery_with_tls,
 };
 use coxswain_proxy::{
-    GatewayProxy, IngressProxy, ListenerProtocol, ListenerSpec, ProxyAcceptor, RateLimiterRegistry,
-    RoutingEngine, RoutingSource, SharedProxyConfig, SniCertSelector, TrustedSources,
-    UpstreamCaCache,
+    GatewayProxy, IngressProxy, ListenerProtocol, ListenerSpec, PassthroughConfig, ProxyAcceptor,
+    RateLimiterRegistry, RoutingEngine, RoutingSource, SharedProxyConfig, SniCertSelector,
+    TrustedSources, UpstreamCaCache,
 };
 use coxswain_reflector::{GatewayListenerHealth, ListenerTlsOutcome};
 use pingora_core::apps::HttpServerOptions;
@@ -152,6 +152,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         client_certs: status_writer.outputs.client_certs.clone(),
         tls_health: tls_health.clone(),
         dedicated: status_writer.outputs.dedicated_registry.clone(),
+        passthrough_routes: status_writer.outputs.passthrough_routes.clone(),
     };
     let discovery_service = coxswain_discovery::DiscoveryService::new(
         discovery_source,
@@ -503,6 +504,10 @@ fn wire_gateway_only_proxy_services(
                 Some(trusted),
                 selector,
                 proxy.proxy_listener_drain_timeout,
+                PassthroughConfig {
+                    table: source.passthrough_routes(),
+                    dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+                },
             )
             .context("build dedicated GatewayProxy acceptor (PROXY protocol)")?,
         );
@@ -516,6 +521,10 @@ fn wire_gateway_only_proxy_services(
                 None,
                 selector,
                 proxy.proxy_listener_drain_timeout,
+                PassthroughConfig {
+                    table: source.passthrough_routes(),
+                    dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+                },
             )
             .context("build dedicated GatewayProxy acceptor")?,
         );
@@ -644,6 +653,10 @@ fn wire_proxy_services(
                     Some(Arc::clone(&trusted)),
                     selector,
                     proxy.proxy_listener_drain_timeout,
+                    PassthroughConfig {
+                        table: source.passthrough_routes(),
+                        dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+                    },
                 )
                 .context("build IngressProxy acceptor (PROXY protocol)")?,
             );
@@ -665,6 +678,10 @@ fn wire_proxy_services(
                 Some(trusted),
                 selector,
                 proxy.proxy_listener_drain_timeout,
+                PassthroughConfig {
+                    table: source.passthrough_routes(),
+                    dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+                },
             )
             .context("build GatewayProxy acceptor (PROXY protocol)")?,
         );
@@ -686,6 +703,10 @@ fn wire_proxy_services(
                     None,
                     selector,
                     proxy.proxy_listener_drain_timeout,
+                    PassthroughConfig {
+                        table: source.passthrough_routes(),
+                        dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+                    },
                 )
                 .context("build IngressProxy acceptor")?,
             );
@@ -707,6 +728,10 @@ fn wire_proxy_services(
                 None,
                 selector,
                 proxy.proxy_listener_drain_timeout,
+                PassthroughConfig {
+                    table: source.passthrough_routes(),
+                    dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+                },
             )
             .context("build GatewayProxy acceptor")?,
         );
@@ -1122,28 +1147,52 @@ impl pingora_core::services::background::BackgroundService for RateLimiterGcServ
 ///
 /// Excludes ports already in `excluded_ports` (used to prevent the gateway
 /// acceptor from binding ports already owned by the static ingress acceptor).
+///
+/// When a port appears with both `TlsPassthrough` (TLSRoute) and HTTPS terminate
+/// listeners, it gets a single `TlsHybrid` spec: on accept the handler peeks SNI
+/// and routes to passthrough if matched, otherwise falls through to TLS terminate.
 fn derive_gateway_specs(
     health: &std::collections::HashMap<ObjectKey, GatewayListenerHealth>,
     bind_addr: IpAddr,
     excluded_ports: &HashSet<u16>,
 ) -> HashSet<ListenerSpec> {
-    let mut seen: HashSet<u16> = excluded_ports.clone();
-    let mut specs = HashSet::new();
+    use std::collections::HashMap;
+    // Accumulate the effective protocol per port: upgrade to TlsHybrid when the
+    // same port carries both TlsPassthrough and Https outcomes.
+    let mut port_proto: HashMap<u16, ListenerProtocol> = HashMap::new();
     for gw_health in health.values() {
         for info in gw_health.listeners.values() {
             let port = info.port;
-            if !seen.insert(port) {
+            if excluded_ports.contains(&port) {
                 continue;
             }
-            let addr = SocketAddr::new(bind_addr, port);
-            let protocol = match info.tls_outcome {
+            let new_proto = match info.tls_outcome {
                 ListenerTlsOutcome::NotApplicable => ListenerProtocol::Http,
+                ListenerTlsOutcome::TlsPassthrough => ListenerProtocol::TlsPassthrough,
                 _ => ListenerProtocol::Https,
             };
-            specs.insert(ListenerSpec { addr, protocol });
+            port_proto
+                .entry(port)
+                .and_modify(|existing| {
+                    // Upgrade to TlsHybrid when both passthrough and HTTPS terminate share a port.
+                    if (*existing == ListenerProtocol::TlsPassthrough
+                        && new_proto == ListenerProtocol::Https)
+                        || (*existing == ListenerProtocol::Https
+                            && new_proto == ListenerProtocol::TlsPassthrough)
+                    {
+                        *existing = ListenerProtocol::TlsHybrid;
+                    }
+                })
+                .or_insert(new_proto);
         }
     }
-    specs
+    port_proto
+        .into_iter()
+        .map(|(port, protocol)| ListenerSpec {
+            addr: SocketAddr::new(bind_addr, port),
+            protocol,
+        })
+        .collect()
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────

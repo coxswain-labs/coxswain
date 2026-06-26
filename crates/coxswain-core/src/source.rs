@@ -5,7 +5,9 @@
 //! `coxswain-discovery` implement it for [`crate::client::DiscoveryClient`]
 //! without creating a circular dependency between the two crates.
 
-use crate::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
+use crate::routing::{
+    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
+};
 use crate::tls::{SharedClientCertStore, SharedListenerHostnames, SharedTlsStore};
 
 /// Source of routing snapshots for the proxy data plane.
@@ -42,5 +44,15 @@ pub trait RoutingSource: Send + Sync {
     #[must_use]
     fn listener_hostnames(&self) -> SharedListenerHostnames {
         SharedListenerHostnames::new()
+    }
+
+    /// Handle to the TLS passthrough routing table snapshot for TLSRoute / GEP-2643.
+    ///
+    /// The default returns an empty table (no passthrough routes, all connections
+    /// on the passthrough port are dropped) so wire-backed implementations compile
+    /// unchanged until the discovery wire format is extended to carry passthrough data.
+    #[must_use]
+    fn passthrough_routes(&self) -> SharedTlsPassthroughTable {
+        SharedTlsPassthroughTable::new()
     }
 }

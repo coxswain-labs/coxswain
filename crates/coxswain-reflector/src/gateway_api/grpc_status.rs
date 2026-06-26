@@ -156,6 +156,7 @@ mod tests {
             &owned,
             &HashSet::<ReferenceGrantKey>::new(),
             &services,
+            "GRPCRoute",
         );
 
         let h = map
