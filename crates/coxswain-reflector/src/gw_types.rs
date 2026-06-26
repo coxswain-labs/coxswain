@@ -13,11 +13,12 @@ pub use gateway_api::apis::standard as v;
 #[cfg(feature = "experimental")]
 pub use gateway_api::apis::experimental as v;
 
-// Project-canonical aliases: the codegen emits uppercase acronyms (`HTTPRoute`,
-// `BackendTLSPolicy`); we use PascalCase everywhere internally to satisfy
-// `upper_case_acronyms`. Keep the all-caps forms only in literal strings sent to
-// the Kubernetes API server.
-pub use v::backendtlspolicies::BackendTLSPolicy as BackendTlsPolicy;
-pub use v::grpcroutes::GRPCRoute as GrpcRoute;
-pub use v::httproutes::HTTPRoute as HttpRoute;
-pub use v::tlsroutes::TLSRoute as TlsRoute;
+// The fork (coxswain-labs/gateway-api-rs) already emits PascalCase type names
+// (`GrpcRoute`, `HttpRoute`, `BackendTlsPolicy`, `TlsRoute`). These re-exports
+// exist for a stable import path; the K8s API Kind strings ("GRPCRoute",
+// "HTTPRoute", "BackendTLSPolicy", "TLSRoute") are kept verbatim only in
+// literal strings.
+pub use v::backendtlspolicies::BackendTlsPolicy;
+pub use v::grpcroutes::GrpcRoute;
+pub use v::httproutes::HttpRoute;
+pub use v::tlsroutes::TlsRoute;

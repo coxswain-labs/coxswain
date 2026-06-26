@@ -60,22 +60,25 @@ flate2             = { version = "1" }
 form_urlencoded    = { version = "1.2" }
 governor           = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
 futures            = { version = "0.3" }
-gateway-api        = { version = "0.21" }
+# Sourced from a coxswain-labs fork that rebuilds 0.21.0 against kube 4 (#350).
+# Pin to a specific commit for reproducible builds.
+gateway-api        = { version = "0.21", git = "https://github.com/coxswain-labs/gateway-api-rs", rev = "9c1238557eaff3060fb649a6426f9d04054fa022" }
 http               = { version = "1" }
 humantime          = { version = "2" }
 ipnet              = { version = "2" }
 itoa               = { version = "1" }
 dashmap            = { version = "6.2.1" }
-k8s-openapi        = { version = "0.27", features = ["latest", "schemars"] }
+# Pinned to v1_36 (Kubernetes 1.36 types). The compiled API version is decoupled
+# from the minimum supported cluster — our floor is 1.30+ (VAP GA). See
+# docs/src/installation/index.md.
+k8s-openapi        = { version = "0.28", features = ["v1_36", "schemars"] }
 # `unstable-runtime` exposes the shared-store API (`store_shared`,
 # `Writer::subscribe`, `Controller::for_shared_stream`) the controller's
 # status-writer uses to drive its reconcile work-queues off the reflector's
-# informers without duplicating watches (#347). It is an unstable kube surface
-# pinned to the 3.1 line (kube 4 is currently blocked by gateway-api lacking a
-# kube-4 release — tracked in #350). kube-leader-election is held at 0.43 for
-# the same reason: 0.44 requires kube 4.
-kube               = { version = "3.1", features = ["runtime", "derive", "client", "unstable-runtime"] }
-kube-leader-election = { version = "0.43" }
+# informers without duplicating watches (#347). This API remains unstable in
+# kube 4 (still gated behind `unstable-runtime-subscribe` in kube-runtime).
+kube               = { version = "4.0", features = ["runtime", "derive", "client", "unstable-runtime"] }
+kube-leader-election = { version = "0.44" }
 matchit            = { version = "0.9" }
 nix                = { version = "0.31", features = ["signal", "process"] }
 parking_lot        = { version = "0.12" }

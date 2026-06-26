@@ -1,11 +1,11 @@
 //! Polling helpers that retry until Kubernetes resources reach the desired state.
 
 use anyhow::Context as _;
-use gateway_api::apis::standard::backendtlspolicies::BackendTLSPolicy;
+use gateway_api::apis::standard::backendtlspolicies::BackendTlsPolicy;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
-use gateway_api::apis::standard::grpcroutes::GRPCRoute;
-use gateway_api::apis::standard::httproutes::HTTPRoute;
+use gateway_api::apis::standard::grpcroutes::GrpcRoute;
+use gateway_api::apis::standard::httproutes::HttpRoute;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::Ingress;
@@ -208,7 +208,7 @@ pub async fn wait_for_httproute_programmed(
     namespace: &str,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let api: Api<HTTPRoute> = Api::namespaced(client.clone(), namespace);
+    let api: Api<HttpRoute> = Api::namespaced(client.clone(), namespace);
     poll_until(
         timeout,
         POLL,
@@ -240,7 +240,7 @@ pub async fn wait_for_grpcroute_programmed(
     namespace: &str,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let api: Api<GRPCRoute> = Api::namespaced(client.clone(), namespace);
+    let api: Api<GrpcRoute> = Api::namespaced(client.clone(), namespace);
     poll_until(
         timeout,
         POLL,
@@ -1152,7 +1152,7 @@ fn gateway_has_condition(gw: &Gateway, type_: &str) -> bool {
         .is_some_and(|conds| has_condition(conds, type_))
 }
 
-fn route_has_condition(route: &HTTPRoute, type_: &str) -> bool {
+fn route_has_condition(route: &HttpRoute, type_: &str) -> bool {
     route.status.as_ref().is_some_and(|s| {
         s.parents
             .iter()
@@ -1160,7 +1160,7 @@ fn route_has_condition(route: &HTTPRoute, type_: &str) -> bool {
     })
 }
 
-fn grpcroute_has_condition(route: &GRPCRoute, type_: &str) -> bool {
+fn grpcroute_has_condition(route: &GrpcRoute, type_: &str) -> bool {
     route.status.as_ref().is_some_and(|s| {
         s.parents
             .iter()
@@ -1225,7 +1225,7 @@ async fn gateway_listener_state(api: &Api<Gateway>, gw_name: &str, listener_name
 }
 
 /// Fetch and summarize a GRPCRoute's per-parent conditions for a timeout dump.
-async fn grpcroute_state(api: &Api<GRPCRoute>, name: &str) -> String {
+async fn grpcroute_state(api: &Api<GrpcRoute>, name: &str) -> String {
     match api.get(name).await {
         Ok(route) => match route.status.as_ref() {
             Some(s) => {
@@ -1249,7 +1249,7 @@ async fn grpcroute_state(api: &Api<GRPCRoute>, name: &str) -> String {
 }
 
 /// Fetch and summarize an HTTPRoute's per-parent conditions for a timeout dump.
-async fn route_state(api: &Api<HTTPRoute>, name: &str) -> String {
+async fn route_state(api: &Api<HttpRoute>, name: &str) -> String {
     match api.get(name).await {
         Ok(route) => match route.status.as_ref() {
             Some(s) => {
@@ -1361,7 +1361,7 @@ pub async fn wait_for_backend_tls_policy_condition(
     status: &str,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let api: Api<BackendTLSPolicy> = Api::namespaced(client.clone(), namespace);
+    let api: Api<BackendTlsPolicy> = Api::namespaced(client.clone(), namespace);
     poll_until(
         timeout,
         POLL,
@@ -1417,7 +1417,7 @@ pub async fn wait_for_backend_tls_policy_condition_with_reason(
     expected: ExpectedCondition<'_>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let api: Api<BackendTLSPolicy> = Api::namespaced(client.clone(), namespace);
+    let api: Api<BackendTlsPolicy> = Api::namespaced(client.clone(), namespace);
     let ExpectedCondition {
         type_,
         status,
@@ -1511,7 +1511,7 @@ pub async fn wait_for_ingress_warning_event(
 }
 
 /// Fetch and summarize a `BackendTLSPolicy`'s ancestor conditions for a timeout dump.
-async fn backend_tls_policy_state(api: &Api<BackendTLSPolicy>, name: &str) -> String {
+async fn backend_tls_policy_state(api: &Api<BackendTlsPolicy>, name: &str) -> String {
     match api.get(name).await {
         Ok(p) => {
             let ancestors: Vec<String> = p

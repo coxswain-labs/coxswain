@@ -24,7 +24,7 @@ use coxswain_e2e::{
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::{http, wait},
 };
-use gateway_api::apis::standard::httproutes::HTTPRoute;
+use gateway_api::apis::standard::httproutes::HttpRoute;
 
 // Minimal prost message types for the GrpcEcho conformance service.
 // Service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
@@ -200,7 +200,7 @@ async fn gateway_deleted_route_stops_serving() -> anyhow::Result<()> {
     wait::wait_for_backend(&gw, &host, "/a", "echo-a", Duration::from_secs(60)).await?;
 
     // Delete the HTTPRoute object — leave the Gateway in place.
-    let routes: Api<HTTPRoute> = Api::namespaced(h.client.clone(), &ns.name);
+    let routes: Api<HttpRoute> = Api::namespaced(h.client.clone(), &ns.name);
     routes
         .delete("echo-route", &DeleteParams::default())
         .await?;
@@ -1116,7 +1116,7 @@ async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
             ..Default::default()
         },
         address_type: "IPv4".to_string(),
-        endpoints: vec![Endpoint {
+        endpoints: Some(vec![Endpoint {
             addresses: vec!["192.0.2.1".to_string()],
             conditions: Some(EndpointConditions {
                 serving: Some(false),
@@ -1124,7 +1124,7 @@ async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
                 ..Default::default()
             }),
             ..Default::default()
-        }],
+        }]),
         ports: None,
     };
     slice_api.create(&PostParams::default(), &orphan).await?;

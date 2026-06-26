@@ -38,7 +38,7 @@ pub(crate) fn make_slice_with_all_conditions(
             ..Default::default()
         },
         address_type: "IPv4".to_string(),
-        endpoints: vec![Endpoint {
+        endpoints: Some(vec![Endpoint {
             addresses: vec![ip.to_string()],
             conditions: Some(EndpointConditions {
                 serving,
@@ -47,7 +47,7 @@ pub(crate) fn make_slice_with_all_conditions(
                 ..Default::default()
             }),
             ..Default::default()
-        }],
+        }]),
         ports: None,
     }
 }
