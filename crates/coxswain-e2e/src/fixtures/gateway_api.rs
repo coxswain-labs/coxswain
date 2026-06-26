@@ -201,3 +201,10 @@ pub const BACKEND_CLIENT_CERT: &str = fixture!("backend_client_cert.yaml");
 /// Sad path for GEP-3155 (#87).  No backend deployment needed.
 pub const BACKEND_CLIENT_CERT_MISSING_SECRET: &str =
     fixture!("backend_client_cert_missing_secret.yaml");
+
+/// Gateway with an unresolvable `clientCertificateRef` (missing Secret), routing to
+/// echo-tls under a BackendTLSPolicy.  The proxy must fail closed (502) rather than
+/// connect to the TLS upstream without the configured client identity (GEP-3155, #87).
+/// Placeholders: `TLS_HOSTNAME`, `CA_PEM`.
+pub const BACKEND_CLIENT_CERT_FAILS_CLOSED: &str =
+    fixture!("backend_client_cert_fails_closed.yaml");

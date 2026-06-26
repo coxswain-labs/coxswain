@@ -1,0 +1,68 @@
+# Gateway backend client-certificate fail-closed (GEP-3155, #87): data plane.
+#
+# Gateway with spec.tls.backend.clientCertificateRef pointing to a Secret that
+# does NOT exist, routing to the echo-tls backend under a BackendTLSPolicy. The
+# controller marks ResolvedRefs=False/InvalidClientCertificateRef; the proxy must
+# fail closed — every request to the BackendTLSPolicy-selected upstream returns 502
+# rather than connecting without the operator-configured client identity.
+#
+# Placeholders (see gateway_api::BACKEND_CLIENT_CERT_FAILS_CLOSED callers):
+#   TLS_HOSTNAME       — hostname in the backend TLS cert's SAN (and BackendTLSPolicy)
+#   CA_PEM             — PEM of the CA for the backend server cert (indented block scalar)
+#   GATEWAY_HTTP_PORT  — filled by Harness::apply
+#   TESTNS             — filled by Harness::apply
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-cc-fc-ca
+data:
+  ca.crt: |
+    ${CA_PEM}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: backend-cc-fc-gw
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+  tls:
+    backend:
+      clientCertificateRef:
+        group: ""
+        kind: Secret
+        name: backend-cc-fc-does-not-exist
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend-cc-fc-route
+spec:
+  parentRefs:
+    - name: backend-cc-fc-gw
+  hostnames:
+    - backend-tls.${TESTNS}.local
+  rules:
+    - backendRefs:
+        - name: echo-tls
+          port: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: backend-cc-fc-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-tls
+  validation:
+    hostname: ${TLS_HOSTNAME}
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: backend-cc-fc-ca

@@ -579,6 +579,13 @@ pub(super) struct Ownership<'a> {
     /// Populated from `resolve_backend_client_certs` before the route build. Folded
     /// into `Ownership` (same rationale as `policy_index`) to keep arities clean.
     pub(super) backend_client_certs: &'a HashMap<ObjectKey, Arc<BackendClientCert>>,
+    /// Gateways whose `spec.tls.backend.clientCertificateRef` is configured but
+    /// failed to resolve (missing Secret / wrong type / RefNotPermitted), keyed by
+    /// `ObjectKey(ns, gw_name)`. Routes inheriting from such a Gateway fail closed
+    /// (502) on BackendTLSPolicy-driven upstreams rather than connecting without the
+    /// proxy's configured identity (GEP-3155, matching the project's fail-closed
+    /// posture for every other cert path).
+    pub(super) backend_client_cert_failures: &'a HashSet<ObjectKey>,
 }
 
 /// Per-reflector side-effect channels: rebuild notification, readiness flip,
@@ -1174,6 +1181,7 @@ fn rebuild(
         ca_grants: &ca_grants,
         policy_index: &policy_index,
         backend_client_certs: &backend_client_certs.certs,
+        backend_client_cert_failures: &backend_client_certs.failures,
     };
 
     let routes_published = build_routes(
@@ -1362,6 +1370,7 @@ fn rebuild(
             ca_grants: &ca_grants,
             policy_index: &policy_index,
             backend_client_certs: &dedicated_backend_client_certs.certs,
+            backend_client_cert_failures: &dedicated_backend_client_certs.failures,
         };
 
         let gw_routes_cell: SharedGatewayRoutingTable = Shared::new();

@@ -317,7 +317,7 @@ kubectl create secret tls proxy-client-cert \
 Pair with a `BackendTLSPolicy` that selects the upstream pods — the policy establishes the upstream TLS context in which the client cert is presented:
 
 ```yaml
-apiVersion: gateway.networking.k8s.io/v1alpha3
+apiVersion: gateway.networking.k8s.io/v1
 kind: BackendTLSPolicy
 metadata:
   name: my-service-tls

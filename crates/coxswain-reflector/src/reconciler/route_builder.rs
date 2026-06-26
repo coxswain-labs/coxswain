@@ -82,6 +82,9 @@ pub(super) struct BackendClientCertResolution {
     pub certs: HashMap<ObjectKey, Arc<BackendClientCert>>,
     /// Per-Gateway resolution outcome (only Gateways with the ref set appear here).
     pub health: HashMap<ObjectKey, BackendClientCertOutcome>,
+    /// Gateways whose ref is configured but failed to resolve. Drives the
+    /// data-plane fail-closed (502) on their routes' BackendTLSPolicy upstreams.
+    pub failures: HashSet<ObjectKey>,
 }
 
 /// Resolve `spec.tls.backend.clientCertificateRef` for every owned Gateway.
@@ -97,6 +100,7 @@ pub(super) fn resolve_backend_client_certs(
 ) -> BackendClientCertResolution {
     let mut certs = HashMap::new();
     let mut health = HashMap::new();
+    let mut failures = HashSet::new();
     for gw in stores.gateways.state() {
         if !gateway_classes.contains(&gw.spec.gateway_class_name) {
             continue;
@@ -119,9 +123,16 @@ pub(super) fn resolve_backend_client_certs(
         if let Some(cert) = cert {
             certs.insert(key.clone(), cert);
         }
+        if outcome.is_failed() {
+            failures.insert(key.clone());
+        }
         health.insert(key, outcome);
     }
-    BackendClientCertResolution { certs, health }
+    BackendClientCertResolution {
+        certs,
+        health,
+        failures,
+    }
 }
 
 /// Build the Gateway-API routing table from `HTTPRoute` resources and publish
@@ -179,6 +190,7 @@ pub(super) fn build_gateway_routes(
                 rate_limits: stores.rate_limits,
                 path_rewrites: stores.path_rewrites,
                 backend_client_certs: ownership.backend_client_certs,
+                backend_client_cert_failures: ownership.backend_client_cert_failures,
             },
             &mut builder,
         );
