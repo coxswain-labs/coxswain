@@ -257,7 +257,7 @@ pub struct SharedProxyReconciler {
     client_certs: SharedClientCertStore,
     /// Per-port HTTPS Gateway-listener hostname snapshot (GEP-3567, #96).
     listener_hostnames: SharedListenerHostnames,
-    tls_health: SharedGatewayListenerHealth,
+    listener_health: SharedGatewayListenerHealth,
     cluster_summary: SharedClusterSummary,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
@@ -307,7 +307,7 @@ pub struct ReconcilerOutputs {
     /// Per-port HTTPS Gateway-listener hostname snapshot (GEP-3567, #96).
     pub listener_hostnames: SharedListenerHostnames,
     /// Per-listener Gateway health used by status writes and the hot-reloader.
-    pub tls_health: SharedGatewayListenerHealth,
+    pub listener_health: SharedGatewayListenerHealth,
     /// Cluster aggregate (per-Gateway / per-Ingress summary) consumed by the
     /// controller's `/cluster` admin endpoint. Updated on every rebuild.
     pub cluster_summary: SharedClusterSummary,
@@ -386,7 +386,7 @@ impl SharedProxyReconciler {
             tls,
             client_certs,
             listener_hostnames,
-            tls_health,
+            listener_health,
             cluster_summary,
             dedicated_registry,
             passthrough_routes,
@@ -457,7 +457,7 @@ impl SharedProxyReconciler {
             tls,
             client_certs,
             listener_hostnames,
-            tls_health,
+            listener_health,
             cluster_summary,
             dedicated_registry,
             passthrough_routes,
@@ -594,7 +594,7 @@ pub(super) struct SharedOutputs<'a> {
     pub(super) tls: &'a SharedPortTlsStore,
     pub(super) client_certs: &'a SharedClientCertStore,
     pub(super) listener_hostnames: &'a SharedListenerHostnames,
-    pub(super) tls_health: &'a SharedGatewayListenerHealth,
+    pub(super) listener_health: &'a SharedGatewayListenerHealth,
     pub(super) cluster_summary: &'a SharedClusterSummary,
     pub(super) dedicated_registry: &'a DedicatedRoutingRegistry,
     pub(super) route_health: &'a SharedRouteHealth,
@@ -741,7 +741,7 @@ impl BackgroundService for SharedProxyReconciler {
             tls: self.tls.clone(),
             client_certs: self.client_certs.clone(),
             listener_hostnames: self.listener_hostnames.clone(),
-            tls_health: self.tls_health.clone(),
+            listener_health: self.listener_health.clone(),
             cluster_summary: self.cluster_summary.clone(),
             dedicated_registry: self.dedicated_registry.clone(),
             route_health: self.route_health.clone(),
@@ -783,7 +783,7 @@ struct SharedHandles {
     tls: SharedPortTlsStore,
     client_certs: SharedClientCertStore,
     listener_hostnames: SharedListenerHostnames,
-    tls_health: SharedGatewayListenerHealth,
+    listener_health: SharedGatewayListenerHealth,
     cluster_summary: SharedClusterSummary,
     dedicated_registry: DedicatedRoutingRegistry,
     route_health: SharedRouteHealth,
@@ -831,7 +831,7 @@ async fn spawn_tasks(
         tls,
         client_certs,
         listener_hostnames,
-        tls_health,
+        listener_health,
         cluster_summary,
         dedicated_registry,
         route_health,
@@ -1142,7 +1142,7 @@ async fn spawn_tasks(
                 tls: &tls,
                 client_certs: &client_certs,
                 listener_hostnames: &listener_hostnames,
-                tls_health: &tls_health,
+                listener_health: &listener_health,
                 cluster_summary: &cluster_summary,
                 dedicated_registry: &dedicated_registry,
                 route_health: &route_health,
@@ -1236,7 +1236,7 @@ fn rebuild(
 
     // GEP-3155: resolve each Gateway's backend client cert once. `certs` is attached
     // to UpstreamTls during the route build; `health` feeds the gateway-level
-    // ResolvedRefs condition merged into `gateway_tls_health` below.
+    // ResolvedRefs condition merged into `gateway_listener_health` below.
     let backend_client_certs =
         resolve_backend_client_certs(stores, &owned_gateway_classes, &cert_grants, true);
 
@@ -1266,7 +1266,7 @@ fn rebuild(
         outputs,
     );
 
-    let mut gateway_tls_health = build_tls(
+    let mut gateway_listener_health = build_tls(
         stores,
         &ingresses,
         &ownership,
@@ -1280,12 +1280,12 @@ fn rebuild(
         &ingresses,
         &ownership,
         outputs.client_certs,
-        &mut gateway_tls_health,
+        &mut gateway_listener_health,
         true,
     );
-    merge_backend_client_cert_health(&mut gateway_tls_health, &backend_client_certs.health);
+    merge_backend_client_cert_health(&mut gateway_listener_health, &backend_client_certs.health);
 
-    count_attached_routes(&routes, &owned_gateways, &mut gateway_tls_health);
+    count_attached_routes(&routes, &owned_gateways, &mut gateway_listener_health);
 
     let gateways = stores.gateways.state();
 
@@ -1341,8 +1341,8 @@ fn rebuild(
         stores.services,
     );
 
-    // Publish the cluster summary while we still have access to gateway_tls_health
-    // (it's moved into `tls_health.store_and_notify` next). Reads from already-
+    // Publish the cluster summary while we still have access to gateway_listener_health
+    // (it's moved into `listener_health.store_and_notify` next). Reads from already-
     // materialised state: nothing kube-side, no allocations beyond the summary.
     // Routing-table conflicts/dead-routes are overlaid in the UI from the
     // cross-proxy `/api/v1/problems` aggregate (the controller's table excludes
@@ -1356,7 +1356,7 @@ fn rebuild(
             dedicated_gateway_class_names: &dedicated_gateway_class_names,
             owned_ingress_classes: &owned_ingress_classes,
             default_ingress_class: owned_default_ingress_class.as_deref(),
-            gateway_tls_health: &gateway_tls_health,
+            gateway_listener_health: &gateway_listener_health,
             routes: &routes,
             route_health: &route_health_map,
             leader,
@@ -1377,8 +1377,8 @@ fn rebuild(
         })
         .collect();
     outputs
-        .tls_health
-        .update_scoped(gateway_tls_health, |k| !cut_over_keys.contains(k));
+        .listener_health
+        .update_scoped(gateway_listener_health, |k| !cut_over_keys.contains(k));
     outputs.route_health.store_and_notify(route_health_map);
     outputs
         .grpc_route_health
@@ -1473,22 +1473,22 @@ fn rebuild(
             // so no Ingress cert is keyed; the port is immaterial here (#472).
             443,
         );
-        let mut dedicated_tls_health = gw_listener_health;
+        let mut dedicated_listener_health = gw_listener_health;
         build_client_certs(
             stores,
             &ingresses,
             &dedicated_ownership,
             &client_certs_cell,
-            &mut dedicated_tls_health,
+            &mut dedicated_listener_health,
             false,
         );
         merge_backend_client_cert_health(
-            &mut dedicated_tls_health,
+            &mut dedicated_listener_health,
             &dedicated_backend_client_certs.health,
         );
 
         // Retain only the health entry for the owning Gateway.
-        let listener_health: HashMap<ObjectKey, GatewayListenerHealth> = dedicated_tls_health
+        let listener_health: HashMap<ObjectKey, GatewayListenerHealth> = dedicated_listener_health
             .into_iter()
             .filter(|(k, _)| k == &key)
             .collect();

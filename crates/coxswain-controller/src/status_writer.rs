@@ -113,7 +113,7 @@ pub fn spawn_status_writer(
     let tls_store = coxswain_core::tls::SharedPortTlsStore::new();
     let client_cert_store = SharedClientCertStore::new();
     let listener_hostnames = SharedListenerHostnames::new();
-    let gateway_tls_health = SharedGatewayListenerHealth::new();
+    let gateway_listener_health = SharedGatewayListenerHealth::new();
     let cluster_summary = SharedClusterSummary::new();
     let leader = Arc::new(AtomicBool::new(false));
     let owned_gateways = OwnedGateways::new();
@@ -153,7 +153,7 @@ pub fn spawn_status_writer(
         tls: tls_store,
         client_certs: client_cert_store,
         listener_hostnames,
-        tls_health: gateway_tls_health.clone(),
+        listener_health: gateway_listener_health.clone(),
         cluster_summary,
         dedicated_registry,
         passthrough_routes: passthrough_routes.clone(),
@@ -172,7 +172,7 @@ pub fn spawn_status_writer(
             tls: outputs.tls.clone(),
             client_certs: outputs.client_certs.clone(),
             listener_hostnames: outputs.listener_hostnames.clone(),
-            tls_health: outputs.tls_health.clone(),
+            listener_health: outputs.listener_health.clone(),
             cluster_summary: outputs.cluster_summary.clone(),
             dedicated_registry: outputs.dedicated_registry.clone(),
             passthrough_routes: passthrough_routes.clone(),
@@ -213,7 +213,7 @@ pub fn spawn_status_writer(
         leader.clone(),
         owned_gateways,
         StatusHealthChannels {
-            tls: gateway_tls_health,
+            tls: gateway_listener_health,
             route: route_health,
             grpc_route: grpc_route_health,
             tls_route: tls_route_health,

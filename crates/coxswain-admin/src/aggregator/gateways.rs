@@ -313,7 +313,7 @@ mod tests {
     use http::StatusCode;
 
     #[test]
-    fn listener_tls_health_maps_conditions_to_severity() {
+    fn listener_listener_health_maps_conditions_to_severity() {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
         let cond = |t: &str, s: &str| Condition {
             last_transition_time: Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH),

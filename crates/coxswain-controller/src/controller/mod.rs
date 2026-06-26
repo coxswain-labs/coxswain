@@ -83,7 +83,7 @@ const ERROR_REQUEUE: Duration = Duration::from_secs(15);
 /// because the `controller` subsystem has not finished its first data-plane
 /// rebuild. Replaces the old `STATUS_RESYNC_INTERVAL` backstop: instead of a
 /// process-wide periodic scan, only the Gateways actually waiting on readiness
-/// requeue, and only until the subsystem flips ready (then the `tls_health`
+/// requeue, and only until the subsystem flips ready (then the `listener_health`
 /// re-drive and normal events take over).
 const DEFERRED_PROGRAMMED_REQUEUE: Duration = Duration::from_secs(2);
 
@@ -219,7 +219,7 @@ impl Controller {
             controller_namespace: self.config.pod_namespace.clone(),
             ingress_ports: self.config.ingress_ports,
             owned_gateways: self.owned_gateways.clone(),
-            tls_health: self.channels.tls.clone(),
+            listener_health: self.channels.tls.clone(),
             route_health: self.channels.route.clone(),
             grpc_route_health: self.channels.grpc_route.clone(),
             tls_route_health: self.channels.tls_route.clone(),
@@ -494,7 +494,7 @@ struct ReconcileContext {
     controller_namespace: String,
     ingress_ports: coxswain_reflector::ingress::IngressPorts,
     owned_gateways: OwnedGateways,
-    tls_health: SharedGatewayListenerHealth,
+    listener_health: SharedGatewayListenerHealth,
     route_health: SharedRouteHealth,
     grpc_route_health: SharedRouteHealth,
     tls_route_health: SharedRouteHealth,
@@ -570,7 +570,7 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         gw.metadata.name.clone().unwrap_or_default(),
     );
     if ctx.health.is_subsystem_ready("controller") {
-        let health_map = ctx.tls_health.load();
+        let health_map = ctx.listener_health.load();
         let health = health_map.get(&key).cloned().unwrap_or_default();
         if gateway_needs_status_patch(gw, &health, status_addr) {
             gateway_events::patch_gateway_status(

@@ -57,7 +57,7 @@ fn source_with_two_gateways() -> SnapshotSource {
         gateway: SharedGatewayRoutingTable::new(),
         tls: SharedPortTlsStore::new(),
         client_certs: SharedClientCertStore::new(),
-        tls_health: SharedGatewayListenerHealth::new(),
+        listener_health: SharedGatewayListenerHealth::new(),
         dedicated: DedicatedRoutingRegistry::new(),
         passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
     };

@@ -74,7 +74,7 @@ pub struct SnapshotSource {
     /// Per-Gateway listener TLS-health map. Serialised into the
     /// `listener_health` wire field so proxy nodes can drive dynamic
     /// Gateway listener port bind/unbind without Kubernetes API access.
-    pub tls_health: SharedGatewayListenerHealth,
+    pub listener_health: SharedGatewayListenerHealth,
     /// Per-cut-over-Gateway routing snapshots, keyed by Gateway [`ObjectKey`].
     /// Read when a client subscribes with [`Scope::Gateway`]; the five cells
     /// above serve [`Scope::SharedPool`] (and deliberately exclude cut-over
@@ -93,7 +93,7 @@ impl Clone for SnapshotSource {
             gateway: self.gateway.clone(),
             tls: self.tls.clone(),
             client_certs: self.client_certs.clone(),
-            tls_health: self.tls_health.clone(),
+            listener_health: self.listener_health.clone(),
             dedicated: self.dedicated.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
         }
@@ -211,7 +211,7 @@ fn build_snapshot(
             let gateway = source.gateway.load();
             let tls = source.tls.load();
             let client_certs = source.client_certs.load();
-            let tls_health = source.tls_health.load();
+            let listener_health = source.listener_health.load();
             let passthrough = source.passthrough_routes.load();
 
             assemble_snapshot(
@@ -219,7 +219,7 @@ fn build_snapshot(
                 gateway_to_wire(&gateway),
                 port_tls_to_wire(&tls),
                 client_cert_to_wire(&client_certs),
-                listener_health_to_wire(&tls_health),
+                listener_health_to_wire(&listener_health),
                 passthrough_to_wire(&passthrough),
             )
         }
@@ -728,7 +728,7 @@ mod tests {
             gateway: SharedGatewayRoutingTable::new(),
             tls: SharedPortTlsStore::new(),
             client_certs: SharedClientCertStore::new(),
-            tls_health: SharedGatewayListenerHealth::new(),
+            listener_health: SharedGatewayListenerHealth::new(),
             dedicated: DedicatedRoutingRegistry::new(),
             passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         }

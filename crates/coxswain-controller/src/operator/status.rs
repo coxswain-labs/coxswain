@@ -156,7 +156,7 @@ pub(crate) struct DedicatedGatewayStatusInputs<'a> {
     /// `SharedGatewayListenerHealth.load().get(&object_key)`. Pass
     /// `&GatewayListenerHealth::default()` when the reflector hasn't yet
     /// computed an entry; per-listener helpers degrade to healthy defaults.
-    pub(crate) tls_health: &'a GatewayListenerHealth,
+    pub(crate) listener_health: &'a GatewayListenerHealth,
     /// Ports reserved for the Ingress data plane via the controller's CLI.
     /// Forwarded to `build_listener_status` to detect `PortUnavailable`.
     pub(crate) ingress_ports: IngressPorts,
@@ -241,7 +241,7 @@ pub(crate) fn build_dedicated_gateway_status_patch(
         .listeners
         .iter()
         .map(|l| {
-            let info = inputs.tls_health.listeners.get(&l.name);
+            let info = inputs.listener_health.listeners.get(&l.name);
             build_listener_status(l, info, inputs.ingress_ports, generation, now)
         })
         .collect();
@@ -324,7 +324,7 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
     }
     for listener in &inputs.gw.spec.listeners {
         let (has_invalid_kinds, _) = listener_route_kind_info(listener);
-        let info = inputs.tls_health.listeners.get(&listener.name);
+        let info = inputs.listener_health.listeners.get(&listener.name);
         let desired_healthy =
             !has_invalid_kinds && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true);
         let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);
@@ -812,7 +812,7 @@ mod tests {
             gw,
             service,
             nodes,
-            tls_health: health,
+            listener_health: health,
             ingress_ports: IngressPorts::new(None, None),
             accepted,
             ready_pod_count: ready_pods,

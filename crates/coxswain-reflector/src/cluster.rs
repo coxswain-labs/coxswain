@@ -55,7 +55,7 @@ pub struct ClusterSummaryInputs<'a> {
     pub default_ingress_class: Option<&'a str>,
     /// Per-Gateway listener health, used to sum `attached_routes` for route counts
     /// and (via each listener's TLS outcome) to compute listener-precise health.
-    pub gateway_tls_health: &'a HashMap<ObjectKey, GatewayListenerHealth>,
+    pub gateway_listener_health: &'a HashMap<ObjectKey, GatewayListenerHealth>,
     /// Snapshot of all HTTPRoutes in scope (from `Store<HttpRoute>::state()`).
     pub routes: &'a [Arc<HttpRoute>],
     /// Per-(route, parent) health produced by `compute_route_health` — supplies
@@ -101,7 +101,7 @@ fn gateway_severity_map(inputs: &ClusterSummaryInputs<'_>) -> HashMap<ObjectKey,
             if !inputs.owned_gateways.contains(&key) {
                 return None;
             }
-            let sev = gateway_severity(gw, inputs.gateway_tls_health.get(&key));
+            let sev = gateway_severity(gw, inputs.gateway_listener_health.get(&key));
             Some((key, sev))
         })
         .collect()
@@ -131,7 +131,7 @@ fn build_gateways(
                 ProxyAssignment::shared()
             };
             let route_count = inputs
-                .gateway_tls_health
+                .gateway_listener_health
                 .get(&key)
                 .map(|h| {
                     h.listeners
@@ -283,7 +283,7 @@ fn httproute_severity(
         } else {
             // Binding is up and the route is accepted: the path's health is the
             // health of the listener(s) it binds (listener-precise).
-            listener_path_severity(inputs.gateway_tls_health.get(&gw_key), section)
+            listener_path_severity(inputs.gateway_listener_health.get(&gw_key), section)
         };
         path_severities.push(path);
     }
@@ -608,7 +608,7 @@ mod tests {
             owned_gateways: &owned,
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: None,
-            gateway_tls_health: &health,
+            gateway_listener_health: &health,
             routes: &[],
             route_health: &RouteHealthMap::new(),
             leader: false,
@@ -650,7 +650,7 @@ mod tests {
             owned_gateways: &owned,
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: None,
-            gateway_tls_health: &health,
+            gateway_listener_health: &health,
             routes: &[],
             route_health: &RouteHealthMap::new(),
             leader: false,
@@ -677,7 +677,7 @@ mod tests {
             owned_gateways: &HashSet::new(),
             owned_ingress_classes: &owned_classes,
             default_ingress_class: None,
-            gateway_tls_health: &empty_health(),
+            gateway_listener_health: &empty_health(),
             routes: &[],
             route_health: &RouteHealthMap::new(),
             leader: true,
@@ -726,7 +726,7 @@ mod tests {
             owned_gateways: &owned,
             owned_ingress_classes: &owned_classes,
             default_ingress_class: None,
-            gateway_tls_health: &health,
+            gateway_listener_health: &health,
             routes: &[],
             route_health: &RouteHealthMap::new(),
             leader: false,
@@ -772,7 +772,7 @@ mod tests {
             owned_gateways: &owned,
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: None,
-            gateway_tls_health: &empty_health(),
+            gateway_listener_health: &empty_health(),
             routes: &[],
             route_health: &RouteHealthMap::new(),
             leader: false,
@@ -793,7 +793,7 @@ mod tests {
             owned_gateways: &HashSet::new(),
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: None,
-            gateway_tls_health: &empty_health(),
+            gateway_listener_health: &empty_health(),
             routes: &[],
             route_health: &RouteHealthMap::new(),
             leader: false,
@@ -814,7 +814,7 @@ mod tests {
             owned_gateways: &HashSet::new(),
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: Some("coxswain"),
-            gateway_tls_health: &empty_health(),
+            gateway_listener_health: &empty_health(),
             routes: &[],
             route_health: &RouteHealthMap::new(),
             leader: false,
@@ -858,7 +858,7 @@ mod tests {
             owned_gateways: &HashSet::new(),
             owned_ingress_classes: &owned_classes,
             default_ingress_class: None,
-            gateway_tls_health: &empty_health(),
+            gateway_listener_health: &empty_health(),
             routes: &[],
             route_health: &RouteHealthMap::new(),
             leader: false,
@@ -902,7 +902,7 @@ mod tests {
             owned_gateways: &owned,
             owned_ingress_classes: &HashSet::new(),
             default_ingress_class: None,
-            gateway_tls_health: &empty_health(),
+            gateway_listener_health: &empty_health(),
             routes: &[],
             route_health: &RouteHealthMap::new(),
             leader: false,

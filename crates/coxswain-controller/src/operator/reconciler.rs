@@ -128,15 +128,18 @@ pub struct OperatorConfig {
     /// Shared leader-election flag the status writer flips on `Acquire`.
     /// Reconcile is a no-op (re-queue) when this is `false`.
     pub leader: Arc<AtomicBool>,
-    /// Per-listener TLS-resolution health channel. Read on every reconcile
-    /// (the patch builder maps each listener to its `(tls_outcome,
-    /// attached_routes)` snapshot) and subscribed via
-    /// [`SharedGatewayListenerHealth::subscribe`] so a TLS-cert resolution
-    /// flip kicks every owned Gateway through
+    /// Per-listener health channel for every listener of every owned Gateway —
+    /// HTTP, HTTPS, and TLS alike, each carrying its TLS-resolution outcome,
+    /// attached-route count, and advertised/internal port mapping (#472). Named
+    /// for listeners, not TLS: HTTP listeners are present too (with a
+    /// `NotApplicable` TLS outcome). Read on every reconcile (the patch builder
+    /// maps each listener to its `(tls_outcome, attached_routes)` snapshot) and
+    /// subscribed via [`SharedGatewayListenerHealth::subscribe`] so any health
+    /// flip (e.g. a TLS-cert resolution change) kicks every owned Gateway through
     /// [`Controller::reconcile_all_on`].
-    pub tls_health: SharedGatewayListenerHealth,
+    pub listener_health: SharedGatewayListenerHealth,
     /// Per-route ResolvedRefs/Accepted health channel. Subscribed for the
-    /// same retrigger reason as [`Self::tls_health`]; the patch builder does
+    /// same retrigger reason as [`Self::listener_health`]; the patch builder does
     /// not consume the snapshot directly (per-listener `ResolvedRefs`
     /// derives from TLS health alone — see the issue-211 grilling notes),
     /// but a route-health flip still warrants re-checking listener
@@ -224,7 +227,7 @@ struct ReconcileContext {
     nodes_store: Store<Node>,
     /// Shared per-listener TLS-health channel — read-only snapshot at each
     /// reconcile.
-    tls_health: SharedGatewayListenerHealth,
+    listener_health: SharedGatewayListenerHealth,
     /// Ports reserved for the Ingress data plane via the controller's CLI.
     /// Forwarded to [`super::status::build_dedicated_gateway_status_patch`]
     /// for the listener `PortUnavailable` precedence check.
@@ -457,7 +460,7 @@ impl BackgroundService for Operator {
             params_store: params_reader,
             pods_store: pods_reader,
             nodes_store: nodes_reader,
-            tls_health: self.config.tls_health.clone(),
+            listener_health: self.config.listener_health.clone(),
             ingress_ports: self.config.ingress_ports,
             admin_port: self.config.admin_port,
             discovery_endpoint: self.config.discovery_endpoint.clone(),
@@ -498,7 +501,7 @@ impl BackgroundService for Operator {
         // reconcile-all before any health flip has actually occurred.
         let (trigger_tx, trigger_rx) = futures::channel::mpsc::unbounded::<()>();
         {
-            let mut tls_rx = self.config.tls_health.subscribe();
+            let mut tls_rx = self.config.listener_health.subscribe();
             let tx = trigger_tx.clone();
             tasks.spawn(async move {
                 let _ = tls_rx.borrow_and_update();
@@ -804,7 +807,7 @@ async fn reconcile_inner(
                 gw: &gw,
                 service: None,
                 nodes: &[],
-                tls_health: &GatewayListenerHealth::default(),
+                listener_health: &GatewayListenerHealth::default(),
                 ingress_ports: ctx.ingress_ports,
                 accepted: status::AcceptedOutcome::InvalidParameters,
                 ready_pod_count: 0,
@@ -879,13 +882,13 @@ async fn reconcile_inner(
         Err(e) => return Err(ReconcileError::Kube(e)),
     };
     let nodes: Vec<Arc<Node>> = ctx.nodes_store.state();
-    let tls_health_map = ctx.tls_health.load();
-    let gateway_health = tls_health_map.get(&key).cloned().unwrap_or_default();
+    let listener_health_map = ctx.listener_health.load();
+    let gateway_health = listener_health_map.get(&key).cloned().unwrap_or_default();
     let inputs = status::DedicatedGatewayStatusInputs {
         gw: &gw,
         service: service.as_ref(),
         nodes: &nodes,
-        tls_health: &gateway_health,
+        listener_health: &gateway_health,
         ingress_ports: ctx.ingress_ports,
         accepted: status::AcceptedOutcome::Accepted,
         ready_pod_count,

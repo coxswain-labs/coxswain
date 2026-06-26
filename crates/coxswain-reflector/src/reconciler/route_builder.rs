@@ -472,7 +472,7 @@ pub(super) fn build_tls(
     }
 
     let mut lh_builder = ListenerHostnamesBuilder::new();
-    let mut gateway_tls_health: HashMap<ObjectKey, GatewayListenerHealth> = HashMap::new();
+    let mut gateway_listener_health: HashMap<ObjectKey, GatewayListenerHealth> = HashMap::new();
     for gw in stores.gateways.state() {
         if !ownership
             .gateway_classes
@@ -513,7 +513,7 @@ pub(super) fn build_tls(
                 li.tls_outcome.is_https_terminate(),
             );
         }
-        gateway_tls_health.insert(gw_key, health);
+        gateway_listener_health.insert(gw_key, health);
     }
 
     let tls_store = tls_builder.build();
@@ -535,7 +535,7 @@ pub(super) fn build_tls(
         tracing::trace!("listener-hostnames snapshot unchanged, skip swap");
     }
 
-    gateway_tls_health
+    gateway_listener_health
 }
 
 /// Build and publish the per-host client-certificate mTLS config store.
@@ -547,7 +547,7 @@ pub(super) fn build_tls(
 /// 2. **Gateway** `spec.tls.frontend.default.validation` (GEP-91, #86) — gateway-wide CA
 ///    sourced from a ConfigMap, keyed by listener hostname.
 ///
-/// The function also annotates `gateway_tls_health` with
+/// The function also annotates `gateway_listener_health` with
 /// [`coxswain_core::listener_health::FrontendValidationHealth`] so the controller can emit
 /// the `InsecureFrontendValidationMode` condition required by GEP-91.
 ///
@@ -559,7 +559,7 @@ pub(super) fn build_client_certs(
     ingresses: &[Arc<Ingress>],
     ownership: &Ownership<'_>,
     client_certs_shared: &SharedClientCertStore,
-    gateway_tls_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
+    gateway_listener_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
     skip_cut_over: bool,
 ) {
     let mut builder = ClientCertStoreBuilder::new();
@@ -591,7 +591,7 @@ pub(super) fn build_client_certs(
         let key = ObjectKey::new(ns, name);
         // Update the health entry that was created by build_tls for this Gateway.
         // If no entry exists yet (race on first rebuild) create a default one.
-        let health = gateway_tls_health.entry(key).or_default();
+        let health = gateway_listener_health.entry(key).or_default();
         crate::gateway_api::frontend_tls::reconcile_frontend_validation(
             &gw,
             stores.configmaps,
@@ -612,17 +612,17 @@ pub(super) fn build_client_certs(
     }
 }
 
-/// Fold per-Gateway GEP-3155 backend client-cert outcomes into `gateway_tls_health`
+/// Fold per-Gateway GEP-3155 backend client-cert outcomes into `gateway_listener_health`
 /// so the controller can emit the gateway-level `ResolvedRefs` condition.
 ///
 /// Creates a health entry for a Gateway that resolved a backend client cert but has no
 /// TLS listeners (the invalid-config conformance gateways have only an HTTP listener).
 pub(super) fn merge_backend_client_cert_health(
-    gateway_tls_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
+    gateway_listener_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
     health: &HashMap<ObjectKey, BackendClientCertOutcome>,
 ) {
     for (key, outcome) in health {
-        gateway_tls_health
+        gateway_listener_health
             .entry(key.clone())
             .or_default()
             .backend_client_cert = Some(outcome.clone());
@@ -634,7 +634,7 @@ pub(super) fn merge_backend_client_cert_health(
 pub(super) fn count_attached_routes(
     routes: &[Arc<HttpRoute>],
     owned_gateways: &HashSet<ObjectKey>,
-    gateway_tls_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
+    gateway_listener_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
 ) {
     for route in routes {
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -654,7 +654,7 @@ pub(super) fn count_attached_routes(
             if !owned_gateways.contains(&key) {
                 continue;
             }
-            if let Some(health) = gateway_tls_health.get_mut(&key) {
+            if let Some(health) = gateway_listener_health.get_mut(&key) {
                 let pr_port = pr.port.map(|p| p as u16);
                 if let Some(sn) = pr.section_name.as_deref() {
                     let Some(info) = health.listeners.get_mut(sn) else {
