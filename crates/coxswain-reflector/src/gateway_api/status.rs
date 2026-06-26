@@ -3,9 +3,9 @@
 //! in [`super::route_health`].
 
 use super::route_health::{BackendRefView, ParentRefView, RouteLike};
-use crate::gw_types::v::httproutes::{HTTPRoute, HttpRouteRulesFiltersType};
+use crate::gw_types::v::httproutes::{HttpRoute, HttpRouteRulesFiltersType};
 
-impl RouteLike for HTTPRoute {
+impl RouteLike for HttpRoute {
     fn route_namespace(&self) -> Option<&str> {
         self.metadata.namespace.as_deref()
     }

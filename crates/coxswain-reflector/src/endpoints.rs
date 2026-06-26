@@ -106,7 +106,7 @@ pub(crate) fn resolve(
         if slice_svc != Some(svc) {
             continue;
         }
-        for ep in &slice.endpoints {
+        for ep in slice.endpoints.iter().flatten() {
             let cond = ep.conditions.as_ref();
 
             // Exclude terminating endpoints unconditionally — they must not

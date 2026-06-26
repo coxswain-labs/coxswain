@@ -10,6 +10,4 @@
 
 pub use gateway_api::apis::standard as v;
 
-/// Project-canonical alias for `HTTPRoute` — avoids the `upper_case_acronyms`
-/// clippy lint at every call site.
-pub use v::httproutes::HTTPRoute as HttpRoute;
+pub use v::httproutes::HttpRoute;

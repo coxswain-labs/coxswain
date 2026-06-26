@@ -56,7 +56,7 @@ impl TokenAuthenticator for KubeTokenAuthenticator {
 
         let tr = TokenReview {
             spec: TokenReviewSpec {
-                token: Some(token.to_owned()),
+                token: token.to_owned(),
                 audiences: Some(vec![self.audience.clone()]),
             },
             ..Default::default()

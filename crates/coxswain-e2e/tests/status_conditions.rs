@@ -21,8 +21,8 @@ use coxswain_e2e::{
     harness::wait,
 };
 use gateway_api::apis::standard::gateways::Gateway;
-use gateway_api::apis::standard::grpcroutes::GRPCRoute;
-use gateway_api::apis::standard::httproutes::HTTPRoute;
+use gateway_api::apis::standard::grpcroutes::GrpcRoute;
+use gateway_api::apis::standard::httproutes::HttpRoute;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::Ingress;
@@ -579,7 +579,7 @@ async fn route_status_reports_resolved_refs_per_backend() -> anyhow::Result<()> 
     wait::wait_for_httproute_programmed(&h.client, "good-route", &ns.name, Duration::from_secs(30))
         .await?;
 
-    let routes: Api<HTTPRoute> = Api::namespaced(h.client.clone(), &ns.name);
+    let routes: Api<HttpRoute> = Api::namespaced(h.client.clone(), &ns.name);
 
     // Happy: good-route attaches and resolves.
     let good = routes.get("good-route").await?;
@@ -707,7 +707,7 @@ async fn status_writes_are_idempotent_no_condition_churn() -> anyhow::Result<()>
         .await?;
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
-    let routes: Api<HTTPRoute> = Api::namespaced(h.client.clone(), &ns.name);
+    let routes: Api<HttpRoute> = Api::namespaced(h.client.clone(), &ns.name);
 
     // Snapshot the (type → lastTransitionTime, observedGeneration) fingerprint of
     // every condition the writer owns. A churning writer re-stamps
@@ -803,7 +803,7 @@ fn gateway_condition_stamps(gw: &Gateway) -> Vec<(String, Time, Option<i64>)> {
 }
 
 /// Same fingerprint across every parent's conditions of an HTTPRoute.
-fn route_condition_stamps(route: &HTTPRoute) -> Vec<(String, Time, Option<i64>)> {
+fn route_condition_stamps(route: &HttpRoute) -> Vec<(String, Time, Option<i64>)> {
     let mut out: Vec<(String, Time, Option<i64>)> = route
         .status
         .as_ref()
@@ -827,7 +827,7 @@ fn route_condition_stamps(route: &HTTPRoute) -> Vec<(String, Time, Option<i64>)>
 }
 
 /// `(status, reason)` of the first parent condition of `type_`, or `None`.
-fn route_parent_condition(route: &HTTPRoute, type_: &str) -> Option<(String, String)> {
+fn route_parent_condition(route: &HttpRoute, type_: &str) -> Option<(String, String)> {
     route.status.as_ref()?.parents.iter().find_map(|p| {
         p.conditions
             .iter()
@@ -1155,7 +1155,7 @@ async fn grpc_route_accepted_and_programmed_when_valid() -> anyhow::Result<()> {
     )
     .await?;
 
-    let routes: kube::Api<GRPCRoute> = kube::Api::namespaced(h.client.clone(), &ns.name);
+    let routes: kube::Api<GrpcRoute> = kube::Api::namespaced(h.client.clone(), &ns.name);
     let good = routes.get("good-grpc-route").await?;
 
     assert_eq!(
@@ -1201,7 +1201,7 @@ async fn grpc_route_resolvedrefs_false_when_backend_missing() -> anyhow::Result<
     )
     .await?;
 
-    let routes: kube::Api<GRPCRoute> = kube::Api::namespaced(h.client.clone(), &ns.name);
+    let routes: kube::Api<GrpcRoute> = kube::Api::namespaced(h.client.clone(), &ns.name);
 
     wait::poll_until(
         Duration::from_secs(30),
@@ -1234,7 +1234,7 @@ async fn grpc_route_resolvedrefs_false_when_backend_missing() -> anyhow::Result<
 }
 
 /// `(status, reason)` of the first parent condition of `type_` on a GRPCRoute, or `None`.
-fn grpcroute_parent_condition(route: &GRPCRoute, type_: &str) -> Option<(String, String)> {
+fn grpcroute_parent_condition(route: &GrpcRoute, type_: &str) -> Option<(String, String)> {
     route.status.as_ref()?.parents.iter().find_map(|p| {
         p.conditions
             .iter()

@@ -4,9 +4,9 @@
 //! until the second concrete route kind existed.
 
 use super::route_health::{BackendRefView, ParentRefView, RouteLike};
-use crate::gw_types::v::grpcroutes::{GRPCRoute, GrpcRouteRulesFiltersType};
+use crate::gw_types::v::grpcroutes::{GrpcRoute, GrpcRouteRulesFiltersType};
 
-impl RouteLike for GRPCRoute {
+impl RouteLike for GrpcRoute {
     fn route_namespace(&self) -> Option<&str> {
         self.metadata.namespace.as_deref()
     }
