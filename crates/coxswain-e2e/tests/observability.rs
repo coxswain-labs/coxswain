@@ -679,10 +679,13 @@ async fn routing_api_surfaces_gateways_routes_and_problems() -> anyhow::Result<(
     wait::wait_for_backends(&ns.name).await?;
     fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
+    // Resolve this Gateway's own per-Gateway VIP once, after the fixture apply.
+    let gw = h.gateway_http(&ns.name).await?;
+
     // First wait for the route to be live so we know the reconciler has built
     // the routing table at least once after our Gateway was applied.
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.gateway_http, &host, "/a", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&gw, &host, "/a", Duration::from_secs(60)).await?;
 
     let gateways_url = h.controller_admin_url("/api/v1/routing/gateways");
     let client = reqwest::Client::new();

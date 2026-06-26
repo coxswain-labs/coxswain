@@ -135,7 +135,8 @@ async fn gateway_status_tracks_generation_bumps() -> anyhow::Result<()> {
 
     // Bump .metadata.generation with a harmless spec change (allowedRoutes.namespaces.from
     // changes from Same to All — the HTTPRoute is in the same namespace so it still attaches).
-    let http_port = h.controller.gateway_http_addr.port();
+    let gw_http = h.gateway_http_addr(&ns.name).await?;
+    let http_port = gw_http.port();
     let bump_patch = serde_json::json!({
         "spec": {
             "listeners": [{"name": "http", "port": http_port, "protocol": "HTTP",

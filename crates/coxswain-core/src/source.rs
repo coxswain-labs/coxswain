@@ -8,7 +8,7 @@
 use crate::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
 };
-use crate::tls::{SharedClientCertStore, SharedListenerHostnames, SharedTlsStore};
+use crate::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 
 /// Source of routing snapshots for the proxy data plane.
 ///
@@ -26,9 +26,9 @@ pub trait RoutingSource: Send + Sync {
     #[must_use]
     fn gateway_routes(&self) -> SharedGatewayRoutingTable;
 
-    /// Handle to the TLS certificate store snapshot.
+    /// Handle to the per-port TLS terminate cert store snapshot (#472).
     #[must_use]
-    fn tls_store(&self) -> SharedTlsStore;
+    fn tls_store(&self) -> SharedPortTlsStore;
 
     /// Handle to the per-Ingress client-certificate mTLS config store (#267).
     #[must_use]

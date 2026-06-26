@@ -32,6 +32,9 @@ pub const COMBINED_MATCHING: &str = fixture!("combined_matching.yaml");
 pub const TLS_TERMINATION: &str = fixture!("tls_termination.yaml");
 /// Gateway HTTPS listener with no `certificateRefs` (tests error status).
 pub const TLS_GATEWAY_NO_CERTS: &str = fixture!("tls_gateway_no_certs.yaml");
+/// Two shared-mode Gateways terminating the SAME hostname with different certs,
+/// each on its own per-Gateway VIP — cross-Gateway TLS isolation (#472).
+pub const TLS_ISOLATION_CROSS_GATEWAY: &str = fixture!("tls_isolation_cross_gateway.yaml");
 /// Gateway HTTPS listener with two `certificateRefs` (ECDSA + RSA) — GEP-851 dual-cert.
 /// Requires `HOSTNAME`, `ECDSA_SECRET`, `RSA_SECRET`, `ECDSA_CRT_B64`, `ECDSA_KEY_B64`,
 /// `RSA_CRT_B64`, `RSA_KEY_B64` substitutions.

@@ -11,7 +11,7 @@
 use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
 };
-use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedTlsStore};
+use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 
 pub use coxswain_core::RoutingSource;
 
@@ -26,7 +26,7 @@ pub use coxswain_core::RoutingSource;
 pub struct KubernetesSource {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
-    tls_store: SharedTlsStore,
+    tls_store: SharedPortTlsStore,
     client_cert_store: SharedClientCertStore,
     listener_hostnames: SharedListenerHostnames,
     passthrough_routes: SharedTlsPassthroughTable,
@@ -38,7 +38,7 @@ impl KubernetesSource {
     pub fn new(
         ingress_routes: SharedIngressRoutingTable,
         gateway_routes: SharedGatewayRoutingTable,
-        tls_store: SharedTlsStore,
+        tls_store: SharedPortTlsStore,
         client_cert_store: SharedClientCertStore,
         listener_hostnames: SharedListenerHostnames,
         passthrough_routes: SharedTlsPassthroughTable,
@@ -63,7 +63,7 @@ impl RoutingSource for KubernetesSource {
         self.gateway_routes.clone()
     }
 
-    fn tls_store(&self) -> SharedTlsStore {
+    fn tls_store(&self) -> SharedPortTlsStore {
         self.tls_store.clone()
     }
 

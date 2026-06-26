@@ -760,7 +760,11 @@ async fn handle_connection<P>(
         // looking "connectable", which GEP-2643 hostname-intersection forbids
         // (TLSRoute-standard: a request must reach a backend only for an
         // intersecting hostname).
-        if !handler.tls_selector.has_cert_for(sni.as_deref()) {
+        if !handler
+            .tls_selector
+            .for_port(port)
+            .has_cert_for(sni.as_deref())
+        {
             tracing::debug!(
                 port,
                 sni = ?sni,
@@ -778,6 +782,9 @@ async fn handle_connection<P>(
         p => p,
     };
 
+    // Scope the cert selector to the bind port this connection arrived on (#472)
+    // so TLS-terminate only consults that port's certs.
+    let scoped_selector = handler.tls_selector.for_port(handler.local_addr.port());
     if let Some(trusted) = handler.trusted {
         handle_proxy_protocol(
             tcp,
@@ -787,7 +794,7 @@ async fn handle_connection<P>(
             ProxyProtocolConn {
                 proxy: handler.proxy,
                 trusted,
-                tls_selector: handler.tls_selector,
+                tls_selector: scoped_selector,
             },
             conn_shutdown,
         )
@@ -797,7 +804,7 @@ async fn handle_connection<P>(
             tcp,
             effective_protocol,
             handler.proxy,
-            handler.tls_selector,
+            scoped_selector,
             conn_shutdown,
         )
         .await;

@@ -6,7 +6,7 @@ use super::annotations::client_cert::{ClientCertAnnotation, parse_client_cert};
 use super::class::claimed_ingress_class;
 use crate::tls::load_tls_cert;
 use coxswain_core::tls::{
-    ClientCertConfig, ClientCertConfigState, ClientCertStoreBuilder, TlsStoreBuilder,
+    ClientCertConfig, ClientCertConfigState, ClientCertStoreBuilder, PortTlsStoreBuilder,
 };
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::api::networking::v1::Ingress;
@@ -22,12 +22,17 @@ impl IngressReconciler {
     /// have the wrong type, or contain malformed PEM are warned-about and
     /// skipped; the Ingress's HTTP routes (installed by `reconcile()`) are
     /// unaffected.
+    /// `https_port` is the fixed Ingress data-plane HTTPS bind port (#472): all
+    /// Ingress TLS certs key under it in the per-port store, since Ingresses
+    /// share the one fixed HTTPS listener (they merge by host, not per-Ingress
+    /// addressing). The proxy's per-port `SniCertSelector` on that port finds them.
     pub fn reconcile_tls(
         ingress: &Ingress,
         secrets: &reflector::Store<Secret>,
         owned_classes: &HashSet<String>,
         owned_default_class: Option<&str>,
-        builder: &mut TlsStoreBuilder,
+        builder: &mut PortTlsStoreBuilder,
+        https_port: u16,
     ) {
         let claimed_class = claimed_ingress_class(ingress);
         match claimed_class {
@@ -88,11 +93,11 @@ impl IngressReconciler {
                     "spec.tls[].hosts is empty or omitted — applying cert to rule hosts as fallback"
                 );
                 for host in &fallback {
-                    builder.add_cert(host, Arc::clone(&cert));
+                    builder.add_cert(https_port, host, Arc::clone(&cert));
                 }
             } else {
                 for host in hosts {
-                    builder.add_cert(host, Arc::clone(&cert));
+                    builder.add_cert(https_port, host, Arc::clone(&cert));
                 }
             }
         }
@@ -308,7 +313,7 @@ mod tests {
     use super::*;
     use crate::ingress::tests::*;
     use coxswain_core::routing::{RequestContext, RoutingTableBuilder};
-    use coxswain_core::tls::{ClientCertStoreBuilder, TlsStoreBuilder};
+    use coxswain_core::tls::ClientCertStoreBuilder;
     use k8s_openapi::ByteString;
     use k8s_openapi::api::core::v1::Secret;
     use k8s_openapi::api::networking::v1::{
@@ -399,10 +404,10 @@ mod tests {
                 secret_name: Some("my-cert".to_string()),
             }],
         );
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         let store = builder.build();
-        assert!(store.find_cert("example.com").is_some());
+        assert!(pcert(&store, "example.com").is_some());
     }
 
     #[test]
@@ -416,9 +421,9 @@ mod tests {
                 secret_name: Some("my-cert".to_string()),
             }],
         );
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().find_cert("example.com").is_none());
+        assert!(pcert(&builder.build(), "example.com").is_none());
     }
 
     #[test]
@@ -434,9 +439,9 @@ mod tests {
                 secret_name: Some("my-cert".to_string()),
             }],
         );
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().find_cert("example.com").is_none());
+        assert!(pcert(&builder.build(), "example.com").is_none());
     }
 
     #[test]
@@ -452,9 +457,9 @@ mod tests {
                 secret_name: Some("my-cert".to_string()),
             }],
         );
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().find_cert("example.com").is_none());
+        assert!(pcert(&builder.build(), "example.com").is_none());
     }
 
     #[test]
@@ -470,9 +475,9 @@ mod tests {
                 secret_name: Some("my-cert".to_string()),
             }],
         );
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().find_cert("example.com").is_none());
+        assert!(pcert(&builder.build(), "example.com").is_none());
     }
 
     #[test]
@@ -486,9 +491,9 @@ mod tests {
                 secret_name: Some("my-cert".to_string()),
             }],
         );
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().find_cert("example.com").is_none());
+        assert!(pcert(&builder.build(), "example.com").is_none());
     }
 
     #[test]
@@ -520,9 +525,9 @@ mod tests {
         );
 
         // And TLS store ends up empty
-        let mut tls_builder = TlsStoreBuilder::new();
+        let mut tls_builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut tls_builder);
-        assert!(tls_builder.build().find_cert("example.com").is_none());
+        assert!(pcert(&tls_builder.build(), "example.com").is_none());
     }
 
     #[test]
@@ -539,11 +544,11 @@ mod tests {
                 secret_name: Some("wildcard-cert".to_string()),
             }],
         );
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         let store = builder.build();
-        assert!(store.find_cert("a.example.com").is_some());
-        assert!(store.find_cert("b.example.com").is_some());
+        assert!(pcert(&store, "a.example.com").is_some());
+        assert!(pcert(&store, "b.example.com").is_some());
     }
 
     // -------------------------------------------------------------------------
@@ -562,11 +567,11 @@ mod tests {
                 secret_name: Some("my-cert".to_string()),
             }],
         );
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         let store = builder.build();
         // make_ingress_with_tls has spec.rules[0].host = "example.com"
-        assert!(store.find_cert("example.com").is_some());
+        assert!(pcert(&store, "example.com").is_some());
         assert!(logs_contain("my-cert"));
         assert!(logs_contain("hosts is empty or omitted"));
     }
@@ -583,10 +588,10 @@ mod tests {
                 secret_name: Some("my-cert".to_string()),
             }],
         );
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         let store = builder.build();
-        assert!(store.find_cert("example.com").is_some());
+        assert!(pcert(&store, "example.com").is_some());
         assert!(logs_contain("my-cert"));
         assert!(logs_contain("hosts is empty or omitted"));
     }
@@ -613,7 +618,7 @@ mod tests {
             .unwrap()[0]
             .host = Some("*.example.com".to_string());
 
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(
             &wildcard_ingress,
             &secrets,
@@ -621,7 +626,7 @@ mod tests {
             &mut builder,
         );
         let store = builder.build();
-        assert!(store.find_cert("api.example.com").is_some());
+        assert!(pcert(&store, "api.example.com").is_some());
     }
 
     #[tracing_test::traced_test]
@@ -664,11 +669,11 @@ mod tests {
             }),
             status: None,
         };
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         reconcile_tls_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         let store = builder.build();
         // No named rule hosts → no cert should be registered
-        assert!(store.find_cert("any.host.com").is_none());
+        assert!(pcert(&store, "any.host.com").is_none());
         assert!(logs_contain("hosts is empty or omitted"));
     }
 

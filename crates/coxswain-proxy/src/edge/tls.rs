@@ -1,7 +1,7 @@
 //! SNI-driven certificate selector and per-SNI client-certificate mTLS for the Pingora TLS listener.
 
 use async_trait::async_trait;
-use coxswain_core::tls::{ClientCertConfigState, SharedClientCertStore, SharedTlsStore};
+use coxswain_core::tls::{ClientCertConfigState, SharedClientCertStore, SharedPortTlsStore};
 use pingora_core::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
 use pingora_core::tls::{
@@ -53,22 +53,49 @@ pub(crate) struct ConnTlsInfo {
 ///    handshake to that host is rejected.
 ///
 /// Cheaply clonable: the underlying stores are `Arc`-backed.
+///
+/// The selector is scoped to the **bind port** the connection was accepted on
+/// (#472): cert selection only consults that port's [`coxswain_core::tls::TlsStore`],
+/// so a shared-mode Gateway's VIP port can never present a sibling Gateway's
+/// overlapping-SNI cert. The acceptor builds an unscoped selector once and calls
+/// [`Self::for_port`] per connection.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct SniCertSelector {
-    tls: SharedTlsStore,
+    tls: SharedPortTlsStore,
     client_certs: SharedClientCertStore,
+    /// Bind port whose per-port store this selector consults. `0` (the unscoped
+    /// default) never matches a real listener, so it presents no cert — correct
+    /// for the acceptor's eager build-time validation, which never handshakes.
+    port: u16,
 }
 
 impl SniCertSelector {
-    /// Wrap a [`SharedTlsStore`] and [`SharedClientCertStore`] in an SNI certificate selector.
-    pub fn new(tls: SharedTlsStore, client_certs: SharedClientCertStore) -> Self {
-        Self { tls, client_certs }
+    /// Wrap a [`SharedPortTlsStore`] and [`SharedClientCertStore`] in an
+    /// (initially unscoped) SNI certificate selector. Scope it to a connection's
+    /// accepted port with [`Self::for_port`] before serving a handshake.
+    pub fn new(tls: SharedPortTlsStore, client_certs: SharedClientCertStore) -> Self {
+        Self {
+            tls,
+            client_certs,
+            port: 0,
+        }
+    }
+
+    /// Return a clone of this selector scoped to bind `port` (#472). Cert lookups
+    /// then consult only that port's per-port store.
+    #[must_use]
+    pub fn for_port(&self, port: u16) -> Self {
+        Self {
+            tls: self.tls.clone(),
+            client_certs: self.client_certs.clone(),
+            port,
+        }
     }
 
     /// Returns `true` when a **specific** (exact or wildcard) terminate cert is
-    /// registered for `sni` — the hostname-less default/catch-all bucket does
-    /// **not** count.
+    /// registered for `sni` on this selector's bind port — the hostname-less
+    /// default/catch-all bucket does **not** count.
     ///
     /// The hybrid-port accept path uses this when no passthrough route matches:
     /// a specific HTTPS listener claims this SNI (`true`) → fall through to TLS
@@ -78,7 +105,12 @@ impl SniCertSelector {
     /// `None` returns `false`.
     #[must_use]
     pub fn has_cert_for(&self, sni: Option<&str>) -> bool {
-        sni.is_some_and(|s| self.tls.load().has_specific_cert(s))
+        sni.is_some_and(|s| {
+            self.tls
+                .load()
+                .port(self.port)
+                .is_some_and(|store| store.has_specific_cert(s))
+        })
     }
 }
 
@@ -93,7 +125,17 @@ impl TlsAccept for SniCertSelector {
         };
 
         // ── Server certificate ────────────────────────────────────────────────
-        let store = self.tls.load();
+        // Scoped to this connection's bind port (#472): only that port's certs
+        // are eligible, so cross-Gateway SNI overlap can't present a sibling's cert.
+        let port_store = self.tls.load();
+        let Some(store) = port_store.port(self.port) else {
+            tracing::debug!(
+                sni,
+                port = self.port,
+                "No TLS certs on this port — handshake will fail"
+            );
+            return;
+        };
         let certs = store.find_certs(&sni);
         if certs.is_empty() {
             tracing::debug!(sni, "No TLS cert for SNI — handshake will fail");
@@ -255,12 +297,17 @@ fn build_ca_store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coxswain_core::tls::{SharedClientCertStore, SharedTlsStore, TlsCert, TlsStoreBuilder};
+    use coxswain_core::tls::{
+        PortTlsStoreBuilder, SharedClientCertStore, SharedPortTlsStore, TlsCert,
+    };
     use std::sync::Arc;
 
+    const TEST_PORT: u16 = 443;
+
     fn selector_with(host_pattern: &str) -> SniCertSelector {
-        let mut builder = TlsStoreBuilder::new();
+        let mut builder = PortTlsStoreBuilder::new();
         builder.add_cert(
+            TEST_PORT,
             host_pattern,
             Arc::new(TlsCert::new(
                 b"cert".to_vec(),
@@ -268,9 +315,10 @@ mod tests {
                 "test".into(),
             )),
         );
-        let tls = SharedTlsStore::new();
+        let tls = SharedPortTlsStore::new();
         tls.store(Arc::new(builder.build()));
-        SniCertSelector::new(tls, SharedClientCertStore::new())
+        // Scope to the port the certs were registered on (#472).
+        SniCertSelector::new(tls, SharedClientCertStore::new()).for_port(TEST_PORT)
     }
 
     #[test]
@@ -295,6 +343,32 @@ mod tests {
         assert!(
             !sel.has_cert_for(None),
             "no SNI cannot match a hostname'd listener"
+        );
+    }
+
+    #[test]
+    fn has_cert_for_is_isolated_per_port() {
+        // #472: a cert registered on TEST_PORT must NOT be visible to a selector
+        // scoped to a different bind port — this is the HTTPS-terminate half of
+        // cross-Gateway isolation. Reusing the same store, only the port differs.
+        let mut builder = PortTlsStoreBuilder::new();
+        builder.add_cert(
+            TEST_PORT,
+            "abc.example.com",
+            Arc::new(TlsCert::new(b"c".to_vec(), b"k".to_vec(), "test".into())),
+        );
+        let tls = SharedPortTlsStore::new();
+        tls.store(Arc::new(builder.build()));
+        let base = SniCertSelector::new(tls, SharedClientCertStore::new());
+
+        assert!(
+            base.for_port(TEST_PORT)
+                .has_cert_for(Some("abc.example.com")),
+            "cert visible on its own port"
+        );
+        assert!(
+            !base.for_port(30001).has_cert_for(Some("abc.example.com")),
+            "cert NOT visible on a sibling Gateway's internal port"
         );
     }
 

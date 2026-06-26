@@ -92,6 +92,12 @@ pub struct ControllerConfig {
     /// are surfaced as `Programmed=False, reason=PortUnavailable` since the
     /// `GatewayProxy` cannot bind a port already claimed by the `IngressProxy`.
     pub ingress_ports: IngressPorts,
+    /// Whether shared-mode per-Gateway VIP addressing is enabled (#472), i.e.
+    /// `--shared-proxy-selector` is non-empty. When `true` the status writer
+    /// resolves each shared Gateway's own VIP Service address; when `false` it
+    /// skips that per-reconcile lookup entirely and uses the global
+    /// `status_address`.
+    pub shared_vip_addressing: bool,
 }
 
 impl ControllerConfig {
@@ -141,7 +147,18 @@ impl ControllerConfig {
             watch_namespace,
             status_address,
             ingress_ports,
+            // Off by default; the bin layer opts in via
+            // [`Self::with_shared_vip_addressing`] when `--shared-proxy-selector`
+            // is set. Kept out of `new`'s arg list to respect the 7-arg ceiling.
+            shared_vip_addressing: false,
         })
+    }
+
+    /// Enable shared-mode per-Gateway VIP addressing (#472) on a built config.
+    #[must_use = "with_shared_vip_addressing returns the updated config"]
+    pub fn with_shared_vip_addressing(mut self, enabled: bool) -> Self {
+        self.shared_vip_addressing = enabled;
+        self
     }
 }
 

@@ -253,6 +253,14 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         "image.pullPolicy=Never".into(),
         "--set".into(),
         "service.gateway.type=LoadBalancer".into(),
+        // Per-Gateway shared-mode VIPs (#472) use ClusterIP, not LoadBalancer:
+        // OrbStack/kind klipper-lb binds each LoadBalancer Service's port on the
+        // host, so two VIPs sharing the advertised port (e.g. 8443) collide and
+        // stay <pending> forever. ClusterIP gives each Gateway a distinct
+        // in-cluster VIP that OrbStack/kind route to the host. Production clouds
+        // and MetalLB handle LoadBalancer VIPs (distinct IP per Service) natively.
+        "--set".into(),
+        "proxy.shared.vipServiceType=ClusterIP".into(),
         "--set".into(),
         format!("controller.coxswainImage={E2E_IMAGE}"),
         // Pre-declare the fixed gateway ports on the Service so they're reachable

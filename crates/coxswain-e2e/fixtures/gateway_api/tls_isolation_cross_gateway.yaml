@@ -1,0 +1,139 @@
+# Cross-Gateway TLS-termination isolation fixture (#472).
+#
+# Two shared-mode Gateways in ONE namespace, each with its OWN per-Gateway VIP,
+# BOTH terminating the SAME hostname with DIFFERENT certs and routing to
+# DIFFERENT backends. Gateway B additionally serves a hostname Gateway A does
+# not. Proves the proxy's terminate cert store is scoped per internal port:
+#   - A's VIP presents A's cert for the shared hostname (never B's).
+#   - B's VIP presents B's cert for the same hostname.
+#   - A's VIP cannot complete a handshake for B's exclusive hostname (no leak).
+#
+# Placeholders replaced at test runtime:
+#   TESTNS            - test namespace
+#   GATEWAY_HTTPS_PORT- advertised HTTPS listener port (mapped to each VIP)
+#   SHARED_HOSTNAME   - hostname served by BOTH Gateways (the overlap)
+#   B_ONLY_HOSTNAME   - hostname served only by Gateway B
+#   SECRET_A_NAME / TLS_CRT_A_B64 / TLS_KEY_A_B64       - A's cert for SHARED_HOSTNAME
+#   SECRET_B_NAME / TLS_CRT_B_B64 / TLS_KEY_B_B64       - B's cert for SHARED_HOSTNAME
+#   SECRET_B2_NAME / TLS_CRT_B2_B64 / TLS_KEY_B2_B64    - B's cert for B_ONLY_HOSTNAME
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SECRET_A_NAME}
+type: kubernetes.io/tls
+data:
+  tls.crt: ${TLS_CRT_A_B64}
+  tls.key: ${TLS_KEY_A_B64}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SECRET_B_NAME}
+type: kubernetes.io/tls
+data:
+  tls.crt: ${TLS_CRT_B_B64}
+  tls.key: ${TLS_KEY_B_B64}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SECRET_B2_NAME}
+type: kubernetes.io/tls
+data:
+  tls.crt: ${TLS_CRT_B2_B64}
+  tls.key: ${TLS_KEY_B2_B64}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-iso-a
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: https
+      port: ${GATEWAY_HTTPS_PORT}
+      protocol: HTTPS
+      hostname: "${SHARED_HOSTNAME}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: ${SECRET_A_NAME}
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-iso-b
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: https-shared
+      port: ${GATEWAY_HTTPS_PORT}
+      protocol: HTTPS
+      hostname: "${SHARED_HOSTNAME}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: ${SECRET_B_NAME}
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https-bonly
+      port: ${GATEWAY_HTTPS_PORT}
+      protocol: HTTPS
+      hostname: "${B_ONLY_HOSTNAME}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: ${SECRET_B2_NAME}
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: iso-route-a
+spec:
+  parentRefs:
+    - name: coxswain-iso-a
+  hostnames:
+    - "${SHARED_HOSTNAME}"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: iso-route-b-shared
+spec:
+  parentRefs:
+    - name: coxswain-iso-b
+  hostnames:
+    - "${SHARED_HOSTNAME}"
+  rules:
+    - backendRefs:
+        - name: echo-b
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: iso-route-b-only
+spec:
+  parentRefs:
+    - name: coxswain-iso-b
+  hostnames:
+    - "${B_ONLY_HOSTNAME}"
+  rules:
+    - backendRefs:
+        - name: echo-b
+          port: 3000

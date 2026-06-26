@@ -216,6 +216,8 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt".to_string(),
             discovery_trust_domain: args.controller.discovery_trust_domain.clone(),
             controller_namespace: args.common.pod_namespace.clone(),
+            shared_proxy_selector: args.controller.shared_proxy_selector.clone(),
+            shared_vip_service_type: args.controller.shared_vip_service_type,
         }),
     ));
 
@@ -1162,7 +1164,10 @@ fn derive_gateway_specs(
     let mut port_proto: HashMap<u16, ListenerProtocol> = HashMap::new();
     for gw_health in health.values() {
         for info in gw_health.listeners.values() {
-            let port = info.port;
+            // Bind the allocated internal port for shared-mode Gateways (#472):
+            // the VIP maps the advertised :443 → this internal port, and the
+            // proxy keys routing/passthrough/TLS on the local port it accepts on.
+            let port = info.bind_port();
             if excluded_ports.contains(&port) {
                 continue;
             }
@@ -1213,6 +1218,7 @@ fn build_controller_config(
         controller.status_address.clone(),
         IngressPorts::new(common.ingress_http_port, common.ingress_https_port),
     )
+    .map(|c| c.with_shared_vip_addressing(!controller.shared_proxy_selector.is_empty()))
     .map_err(Into::into)
 }
 

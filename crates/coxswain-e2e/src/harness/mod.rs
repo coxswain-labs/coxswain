@@ -21,10 +21,13 @@ pub use tls::{GeneratedCert, MtlsCerts, StaticRsaCert};
 /// Top-level test harness: wraps the in-cluster coxswain installation with a
 /// Kubernetes client, an HTTP test client, and fixture application helpers.
 ///
-/// `http` and `tls_addr` point at the Ingress data plane; `gateway_http`,
-/// `gateway_tls_addr`, and `gateway_passthrough_addr` point at the Gateway data
-/// plane. All are backed by the shared-proxy pod's LoadBalancer Service IP —
-/// the listener sets bind different ports on the same pod.
+/// `http` and `tls_addr` point at the Ingress data plane (the shared-proxy
+/// pod's fixed `80`/`443`). Gateway data-plane addresses are NOT fixed fields:
+/// each shared-mode Gateway advertises its OWN per-Gateway VIP (#472), so a
+/// Gateway test resolves its address from the Gateway's own `status.addresses`
+/// via [`Harness::gateway_http`] / [`Harness::gateway_tls_addr`] /
+/// [`Harness::gateway_passthrough_addr`] (single-Gateway namespaces) or
+/// [`wait::wait_for_gateway_address`] (multi-Gateway namespaces).
 pub struct Harness {
     /// Kubernetes client pre-configured from the default kubeconfig.
     pub client: kube::Client,
@@ -34,12 +37,6 @@ pub struct Harness {
     pub http: HttpClient,
     /// Address of the Ingress HTTPS/TLS proxy port (`<lb_ip>:443`).
     pub tls_addr: std::net::SocketAddr,
-    /// HTTP test client pre-pointed at the Gateway HTTP port (`<lb_ip>:8000`).
-    pub gateway_http: HttpClient,
-    /// Address of the Gateway HTTPS port (`<lb_ip>:8443`).
-    pub gateway_tls_addr: std::net::SocketAddr,
-    /// Address of the Gateway TLS-passthrough port for TLSRoute tests (GEP-2643, #70).
-    pub gateway_passthrough_addr: std::net::SocketAddr,
 }
 
 impl Harness {
@@ -61,19 +58,82 @@ impl Harness {
             .context("readyz timeout")?;
         let http = HttpClient::new(controller.proxy_addr).context("http client")?;
         let tls_addr = controller.tls_addr;
-        let gateway_http =
-            HttpClient::new(controller.gateway_http_addr).context("gateway http client")?;
-        let gateway_tls_addr = controller.gateway_https_addr;
-        let gateway_passthrough_addr = controller.gateway_passthrough_addr;
         Ok(Self {
             client,
             controller,
             http,
             tls_addr,
-            gateway_http,
-            gateway_tls_addr,
-            gateway_passthrough_addr,
         })
+    }
+
+    /// Resolve the per-Gateway VIP (#472) of the single Gateway in `namespace`
+    /// and return an [`HttpClient`] bound to its HTTP listener
+    /// ([`GATEWAY_HTTP_PORT`]).
+    ///
+    /// Shared-mode Gateways each advertise their own VIP rather than the fixed
+    /// shared listeners, so a data-plane test addresses the Gateway it created.
+    /// Use [`wait::wait_for_gateway_address`] for namespaces with >1 Gateway.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the namespace holds zero or more than one Gateway, the VIP
+    /// never gets an address, or the client cannot be built.
+    pub async fn gateway_http(&self, namespace: &str) -> anyhow::Result<HttpClient> {
+        let addr = self.gateway_vip(namespace, GATEWAY_HTTP_PORT).await?;
+        HttpClient::new(addr).context("gateway http client")
+    }
+
+    /// Resolve the per-Gateway VIP (#472) of the single Gateway in `namespace`
+    /// as a [`SocketAddr`] on its HTTP listener ([`GATEWAY_HTTP_PORT`]) — for
+    /// callers that need the raw address (e.g. a `ws://` URL) rather than an
+    /// [`HttpClient`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Harness::gateway_http`].
+    pub async fn gateway_http_addr(&self, namespace: &str) -> anyhow::Result<std::net::SocketAddr> {
+        self.gateway_vip(namespace, GATEWAY_HTTP_PORT).await
+    }
+
+    /// Resolve the per-Gateway VIP (#472) of the single Gateway in `namespace`
+    /// as a [`SocketAddr`] on its HTTPS listener ([`GATEWAY_HTTPS_PORT`]).
+    ///
+    /// # Errors
+    ///
+    /// See [`Harness::gateway_http`].
+    pub async fn gateway_tls_addr(&self, namespace: &str) -> anyhow::Result<std::net::SocketAddr> {
+        self.gateway_vip(namespace, GATEWAY_HTTPS_PORT).await
+    }
+
+    /// Resolve the per-Gateway VIP (#472) of the single Gateway in `namespace`
+    /// as a [`SocketAddr`] on its TLS-passthrough listener
+    /// ([`GATEWAY_TLS_PASSTHROUGH_PORT`], GEP-2643 / #70).
+    ///
+    /// # Errors
+    ///
+    /// See [`Harness::gateway_http`].
+    pub async fn gateway_passthrough_addr(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<std::net::SocketAddr> {
+        self.gateway_vip(namespace, GATEWAY_TLS_PASSTHROUGH_PORT)
+            .await
+    }
+
+    /// Resolve the single owned Gateway's VIP in `namespace` on `port`, waiting
+    /// up to 120 s for its `status.addresses` to populate.
+    async fn gateway_vip(
+        &self,
+        namespace: &str,
+        port: u16,
+    ) -> anyhow::Result<std::net::SocketAddr> {
+        wait::wait_for_single_gateway_address(
+            &self.client,
+            namespace,
+            port,
+            std::time::Duration::from_secs(120),
+        )
+        .await
     }
 
     /// Build an admin endpoint URL targeting the shared-proxy pod

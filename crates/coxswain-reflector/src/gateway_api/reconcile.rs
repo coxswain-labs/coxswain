@@ -24,7 +24,7 @@ use coxswain_core::routing::{
     HostRouterBuilder, MatchPredicates, RateLimitConfig, RouteEntry, RouteTimeouts, UpstreamTls,
     WildcardKind,
 };
-use coxswain_core::tls::TlsStoreBuilder;
+use coxswain_core::tls::PortTlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
@@ -719,17 +719,32 @@ impl GatewayApiReconciler {
     /// The rejection in `resolve_listener_tls` only fires for the invalid combination
     /// `protocol: HTTPS, tls.mode: Passthrough`. Non-HTTPS listeners are `NotApplicable`.
     /// Cross-namespace `certificateRefs` require a matching entry in `cert_grants`.
+    /// `internal_ports` maps this Gateway's `listenerPort → internalPort` (#472):
+    /// in shared mode each listener binds an allocated internal port, so its
+    /// terminate certs key under that port in the per-port store and the proxy's
+    /// per-port `SniCertSelector` finds them. Listeners absent from the map
+    /// (dedicated mode, Ingress) key under their spec port (internal == spec).
     pub fn reconcile_tls(
         gateway: &Gateway,
         secrets: &reflector::Store<Secret>,
         cert_grants: &HashSet<ReferenceGrantKey>,
-        builder: &mut TlsStoreBuilder,
+        builder: &mut PortTlsStoreBuilder,
+        internal_ports: &HashMap<u16, u16>,
     ) -> GatewayListenerHealth {
         let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
         let gw_name = gateway.metadata.name.as_deref().unwrap_or("unknown");
         let mut listeners = BTreeMap::new();
 
         for listener in &gateway.spec.listeners {
+            let listener_port = listener.port as u16;
+            let internal_port = internal_ports.get(&listener_port).copied().unwrap_or(0);
+            // Bind port the proxy accepts this listener on (= internal port when
+            // allocated, else the spec port); the cert store keys on it.
+            let bind_port = if internal_port != 0 {
+                internal_port
+            } else {
+                listener_port
+            };
             let tls_outcome = if listener.protocol == "TLS"
                 && listener
                     .tls
@@ -749,7 +764,15 @@ impl GatewayApiReconciler {
             } else if listener.protocol != "HTTPS" {
                 ListenerTlsOutcome::NotApplicable
             } else {
-                resolve_listener_tls(gw_ns, gw_name, listener, secrets, cert_grants, builder)
+                resolve_listener_tls(
+                    gw_ns,
+                    gw_name,
+                    listener,
+                    secrets,
+                    cert_grants,
+                    builder,
+                    bind_port,
+                )
             };
             let hostname = listener.hostname.as_deref().unwrap_or("").to_string();
             let allows_all_namespaces = listener
@@ -764,7 +787,8 @@ impl GatewayApiReconciler {
             li.attached_routes = 0;
             li.hostname = hostname;
             li.allows_all_namespaces = allows_all_namespaces;
-            li.port = listener.port as u16;
+            li.port = listener_port;
+            li.internal_port = internal_port;
             listeners.insert(listener.name.clone(), li);
         }
 
@@ -780,7 +804,8 @@ fn resolve_listener_tls(
     listener: &crate::gw_types::v::gateways::GatewayListeners,
     secrets: &reflector::Store<Secret>,
     cert_grants: &HashSet<ReferenceGrantKey>,
-    builder: &mut TlsStoreBuilder,
+    builder: &mut PortTlsStoreBuilder,
+    bind_port: u16,
 ) -> ListenerTlsOutcome {
     let tls = match &listener.tls {
         Some(t) => t,
@@ -851,7 +876,7 @@ fn resolve_listener_tls(
 
         match load_tls_cert(ref_ns, &cert_ref.name, secrets) {
             Ok(cert) => {
-                builder.add_cert(hostname, Arc::new(cert));
+                builder.add_cert(bind_port, hostname, Arc::new(cert));
                 resolved_count += 1;
                 tracing::debug!(
                     gateway = %format!("{gw_ns}/{gw_name}"),

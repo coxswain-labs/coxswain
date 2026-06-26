@@ -34,9 +34,18 @@ use coxswain_core::routing::{
 };
 use coxswain_core::shared::Shared;
 use coxswain_core::tls::{
-    ClientCertStoreBuilder, ListenerHostnamesBuilder, SharedClientCertStore,
-    SharedListenerHostnames, SharedTlsStore, TlsStoreBuilder,
+    ClientCertStoreBuilder, ListenerHostnamesBuilder, PortTlsStoreBuilder, SharedClientCertStore,
+    SharedListenerHostnames, SharedPortTlsStore,
 };
+
+use crate::port_alloc::ListenerKey as VipListenerKey;
+
+/// `(Gateway, listenerPort) → internalPort` map read once per rebuild from the
+/// VIP Services (#472) and threaded into every route/TLS/passthrough builder, so
+/// all four keyings agree within one reconcile (a fresh `.state()` read per
+/// builder could otherwise observe a mid-rebuild Service mutation and disagree).
+pub(super) type VipInternalPorts = std::collections::HashMap<VipListenerKey, u16>;
+
 use k8s_openapi::api::networking::v1::Ingress;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -156,8 +165,9 @@ pub(super) fn build_gateway_routes(
     shared: &SharedGatewayRoutingTable,
     skip_cut_over: bool,
 ) -> bool {
-    // Precompute ListenerKey → (hostname, port) from all owned gateway
-    // listeners.
+    let vip_internal = stores.vip_internal;
+    // Precompute ListenerKey → (hostname, spec port, bind port) from all owned
+    // gateway listeners.
     let listener_info: HashMap<ListenerKey, ListenerBinding> = stores
         .gateways
         .state()
@@ -171,11 +181,19 @@ pub(super) fn build_gateway_routes(
         .flat_map(|g| {
             let ns = g.metadata.namespace.clone().unwrap_or_default();
             let name = g.metadata.name.clone().unwrap_or_default();
+            let gw_key = ObjectKey::new(ns.clone(), name.clone());
+            let vip = vip_internal.clone();
             g.spec.listeners.clone().into_iter().map(move |l| {
                 let key = ListenerKey::new(ns.clone(), name.clone(), l.name);
+                let spec_port = l.port as u16;
+                let bind_port = vip
+                    .get(&(gw_key.clone(), spec_port))
+                    .copied()
+                    .unwrap_or(spec_port);
                 let binding = ListenerBinding {
                     hostname: l.hostname.unwrap_or_default(),
-                    port: l.port as u16,
+                    port: spec_port,
+                    bind_port,
                 };
                 (key, binding)
             })
@@ -433,11 +451,15 @@ pub(super) fn build_tls(
     stores: &ReflectorStores<'_>,
     ingresses: &[Arc<Ingress>],
     ownership: &Ownership<'_>,
-    tls_shared: &SharedTlsStore,
+    tls_shared: &SharedPortTlsStore,
     listener_hostnames_shared: &SharedListenerHostnames,
     skip_cut_over: bool,
+    ingress_https_port: u16,
 ) -> HashMap<ObjectKey, GatewayListenerHealth> {
-    let mut tls_builder = TlsStoreBuilder::new();
+    let vip_internal = stores.vip_internal;
+    // Per-port cert store (#472): the bind port keys each cert so the proxy's
+    // per-port SniCertSelector — scoped to the accepted local port — finds it.
+    let mut tls_builder = PortTlsStoreBuilder::new();
     for ingress in ingresses {
         IngressReconciler::reconcile_tls(
             ingress,
@@ -445,6 +467,7 @@ pub(super) fn build_tls(
             ownership.ingress_classes,
             ownership.default_ingress_class,
             &mut tls_builder,
+            ingress_https_port,
         );
     }
 
@@ -466,29 +489,41 @@ pub(super) fn build_tls(
         }
         let ns = gw.metadata.namespace.clone().unwrap_or_default();
         let name = gw.metadata.name.clone().unwrap_or_default();
+        let gw_key = ObjectKey::new(ns.clone(), name.clone());
+        // This Gateway's listenerPort → internalPort slice of the global map.
+        let gw_internal: std::collections::HashMap<u16, u16> = vip_internal
+            .iter()
+            .filter(|((k, _), _)| k == &gw_key)
+            .map(|((_, lp), ip)| (*lp, *ip))
+            .collect();
         let health = GatewayApiReconciler::reconcile_tls(
             &gw,
             stores.secrets,
             ownership.cert_grants,
             &mut tls_builder,
+            &gw_internal,
         );
         // Populate the per-port listener-hostname snapshot for
-        // misdirected-request detection (GEP-3567, #96). Only
-        // HTTPS-terminating listeners (Resolved cert) contribute.
+        // misdirected-request detection (GEP-3567, #96). Keyed by BIND port so
+        // the proxy (which checks by the accepted local port) matches it (#472).
         for li in health.listeners.values() {
-            lh_builder.add_listener(li.port, &li.hostname, li.tls_outcome.is_https_terminate());
+            lh_builder.add_listener(
+                li.bind_port(),
+                &li.hostname,
+                li.tls_outcome.is_https_terminate(),
+            );
         }
-        gateway_tls_health.insert(ObjectKey::new(ns, name), health);
+        gateway_tls_health.insert(gw_key, health);
     }
 
     let tls_store = tls_builder.build();
-    let certs = tls_store.cert_count();
+    let ports = tls_store.port_count();
     let current = tls_shared.load();
     if *current != tls_store {
-        tracing::debug!(certs, "TLS cert store swapped");
+        tracing::debug!(ports, "per-port TLS cert store swapped");
         tls_shared.store(Arc::new(tls_store));
     } else {
-        tracing::trace!(certs, "TLS cert store unchanged, skip swap");
+        tracing::trace!(ports, "per-port TLS cert store unchanged, skip swap");
     }
 
     let lh = lh_builder.build();
@@ -686,6 +721,7 @@ pub(super) fn build_passthrough_routes(
 ) -> RouteHealthMap {
     let tls_routes = stores.tls_routes.state();
     let gateways = stores.gateways.state();
+    let vip_internal = stores.vip_internal;
 
     let mut builder = TlsPassthroughTableBuilder::new();
 
@@ -711,6 +747,12 @@ pub(super) fn build_passthrough_routes(
             }
 
             let listener_port = listener.port as u16;
+            // Spec port (above) matches the TLSRoute's parentRef.port; the bind
+            // port (below) is what the proxy accepts on and keys routing by (#472).
+            let bind_port = vip_internal
+                .get(&(gw_key.clone(), listener_port))
+                .copied()
+                .unwrap_or(listener_port);
             let listener_hostname = listener.hostname.as_deref().unwrap_or("");
             let allows_all_ns = listener
                 .allowed_routes
@@ -836,7 +878,7 @@ pub(super) fn build_passthrough_routes(
                     let bg = Arc::new(BackendGroup::weighted(group_name, weighted));
 
                     for hostname in &effective {
-                        builder = builder.add_route(listener_port, hostname, Arc::clone(&bg));
+                        builder = builder.add_route(bind_port, hostname, Arc::clone(&bg));
                     }
                 }
             }

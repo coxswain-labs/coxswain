@@ -237,6 +237,21 @@ proxy:
     # proxy provisioned by the controller.
     enabled: true
 
+    # Service type for the per-Gateway VIP Services the controller provisions
+    # in shared mode (#472). Each owned Gateway gets its OWN Service mapping its
+    # advertised listener port (e.g. 443) to a distinct internal port on the
+    # shared proxy, so cross-Gateway hostname isolation falls out of port keying.
+    #
+    # LoadBalancer (default) gives each Gateway its own external address — works
+    # on cloud LBs and MetalLB, which assign a distinct IP per Service and route
+    # IP:port independently. NOT supported by host-port-binding LBs (k3s/OrbStack
+    # klipper-lb), where multiple Services sharing port 443 collide on the host —
+    # use ClusterIP there (a stable in-cluster VIP per Gateway, typically fronted
+    # by an external ingress/LB). NodePort is rejected (cannot preserve the
+    # advertised port). Independent of `service.gateway.type` (the shared-proxy
+    # Service, which always stays a single LoadBalancer for the Ingress plane).
+    vipServiceType: LoadBalancer
+
     # Number of shared-proxy replicas. Read-only data plane; scaling is
     # horizontal and stateless (each replica independently receives routing
     # snapshots from the controller via gRPC discovery). Set to 0 to keep

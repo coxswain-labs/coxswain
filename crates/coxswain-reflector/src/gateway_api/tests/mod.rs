@@ -49,6 +49,8 @@ pub(super) fn make_listener_info(
                 ListenerBinding {
                     hostname: hostname.to_string(),
                     port: *port,
+                    // Tests don't allocate internal ports; bind == spec.
+                    bind_port: *port,
                 },
             )
         })

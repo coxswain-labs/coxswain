@@ -47,7 +47,7 @@ use coxswain_core::routing::{
     SharedTlsPassthroughTable,
 };
 use coxswain_core::shared::Shared;
-use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedTlsStore};
+use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -252,7 +252,7 @@ impl ReconcilerHealth {
 pub struct SharedProxyReconciler {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
-    tls: SharedTlsStore,
+    tls: SharedPortTlsStore,
     /// Per-Ingress client-certificate mTLS config (#267). Keyed by SNI host, parallel to `tls`.
     client_certs: SharedClientCertStore,
     /// Per-port HTTPS Gateway-listener hostname snapshot (GEP-3567, #96).
@@ -300,7 +300,7 @@ pub struct ReconcilerOutputs {
     /// Gateway-API-flavored routing table snapshot, updated on every successful Gateway build.
     pub gateway_routes: SharedGatewayRoutingTable,
     /// TLS certificate store snapshot, updated whenever a `kubernetes.io/tls` Secret changes.
-    pub tls: SharedTlsStore,
+    pub tls: SharedPortTlsStore,
     /// Per-Ingress client-certificate mTLS config snapshot, updated whenever an
     /// `auth-tls`-labelled Secret changes (#267). Keyed by SNI host, parallel to `tls`.
     pub client_certs: SharedClientCertStore,
@@ -556,6 +556,11 @@ pub(super) struct ReflectorStores<'a> {
     pub(super) gateway_classes: &'a reflector::Store<GatewayClass>,
     pub(super) slices: &'a reflector::Store<EndpointSlice>,
     pub(super) services: &'a reflector::Store<Service>,
+    /// `(Gateway, listenerPort) → internalPort` map (#472), read ONCE per rebuild
+    /// from the VIP Services so the routing/TLS/passthrough/listener-bind keyings
+    /// all agree on one Service snapshot. A per-builder re-read could observe a
+    /// mid-rebuild Service mutation and disagree (bound on port X, routed under Y).
+    pub(super) vip_internal: &'a super::route_builder::VipInternalPorts,
     pub(super) grants: &'a reflector::Store<ReferenceGrant>,
     pub(super) secrets: &'a reflector::Store<Secret>,
     /// Label-scoped htpasswd Secrets (`ingress.coxswain-labs.dev/auth-basic=true`) used
@@ -586,7 +591,7 @@ pub(super) struct ReflectorStores<'a> {
 pub(super) struct SharedOutputs<'a> {
     pub(super) ingress_routes: &'a SharedIngressRoutingTable,
     pub(super) gateway_routes: &'a SharedGatewayRoutingTable,
-    pub(super) tls: &'a SharedTlsStore,
+    pub(super) tls: &'a SharedPortTlsStore,
     pub(super) client_certs: &'a SharedClientCertStore,
     pub(super) listener_hostnames: &'a SharedListenerHostnames,
     pub(super) tls_health: &'a SharedGatewayListenerHealth,
@@ -775,7 +780,7 @@ impl BackgroundService for SharedProxyReconciler {
 struct SharedHandles {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
-    tls: SharedTlsStore,
+    tls: SharedPortTlsStore,
     client_certs: SharedClientCertStore,
     listener_hostnames: SharedListenerHostnames,
     tls_health: SharedGatewayListenerHealth,
@@ -1108,6 +1113,8 @@ async fn spawn_tasks(
                     _ = tokio::time::sleep(Duration::from_millis(500)) => break,
                 }
             }
+            // One VIP-Service read per rebuild (#472), shared by every builder.
+            let vip_internal = crate::port_alloc::read_vip_internal_ports(&service_reader.state());
             let stores = ReflectorStores {
                 routes: &route_reader,
                 grpc_routes: &grpc_route_reader,
@@ -1119,6 +1126,7 @@ async fn spawn_tasks(
                 gateway_classes: &gateway_class_reader,
                 slices: &slice_reader,
                 services: &service_reader,
+                vip_internal: &vip_internal,
                 grants: &grant_reader,
                 secrets: &secret_reader,
                 auth_secrets: &auth_secret_reader,
@@ -1265,6 +1273,7 @@ fn rebuild(
         outputs.tls,
         outputs.listener_hostnames,
         true,
+        ingress_ports.https.unwrap_or(443),
     );
     build_client_certs(
         stores,
@@ -1435,7 +1444,7 @@ fn rebuild(
         };
 
         let gw_routes_cell: SharedGatewayRoutingTable = Shared::new();
-        let tls_cell: SharedTlsStore = Shared::new();
+        let tls_cell: SharedPortTlsStore = Shared::new();
         let client_certs_cell: SharedClientCertStore = Shared::new();
         // Listener-hostnames for the dedicated proxy are not yet wired into the
         // DedicatedRoutingSnapshot / discovery wire format; the throwaway cell
@@ -1460,6 +1469,9 @@ fn rebuild(
             &tls_cell,
             &listener_hostnames_cell,
             false,
+            // Dedicated proxies never serve Ingress (empty ingress_classes above),
+            // so no Ingress cert is keyed; the port is immaterial here (#472).
+            443,
         );
         let mut dedicated_tls_health = gw_listener_health;
         build_client_certs(

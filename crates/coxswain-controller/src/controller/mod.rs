@@ -215,6 +215,8 @@ impl Controller {
             health: self.health.clone(),
             controller_name: self.config.controller_name.clone(),
             status_address: self.config.status_address.clone(),
+            shared_vip_addressing: self.config.shared_vip_addressing,
+            controller_namespace: self.config.pod_namespace.clone(),
             ingress_ports: self.config.ingress_ports,
             owned_gateways: self.owned_gateways.clone(),
             tls_health: self.channels.tls.clone(),
@@ -483,6 +485,13 @@ struct ReconcileContext {
     health: HealthRegistry,
     controller_name: String,
     status_address: Option<StatusAddress>,
+    /// Whether shared-mode per-Gateway VIP addressing is enabled (#472). Gates
+    /// the per-reconcile VIP Service lookup so a feature-off install does zero
+    /// extra apiserver GETs.
+    shared_vip_addressing: bool,
+    /// Controller namespace — where shared-mode VIP Services live (#472), so the
+    /// status writer can resolve a Gateway's own address from there.
+    controller_namespace: String,
     ingress_ports: coxswain_reflector::ingress::IngressPorts,
     owned_gateways: OwnedGateways,
     tls_health: SharedGatewayListenerHealth,
@@ -536,6 +545,35 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         return Action::await_change();
     }
 
+    // Shared-mode Gateways advertise their OWN per-Gateway VIP Service address
+    // (#472). The three VIP states map to distinct address choices so a
+    // provisioned-but-pending VIP is NOT masked by the global address:
+    //   - Resolved(a)   → the Gateway's own VIP address.
+    //   - Pending       → the VIP Service exists but has no address yet; report
+    //                     NONE (Programmed stays address-less for THIS Gateway
+    //                     until its own VIP lands — never the global address).
+    //   - NotProvisioned→ feature off / no VIP Service; use the global address.
+    let vip = resolve_shared_vip_address(
+        &ctx.client,
+        gw,
+        &ctx.controller_namespace,
+        ctx.shared_vip_addressing,
+    )
+    .await;
+    let owned_status_addr: Option<StatusAddress> = match &vip {
+        VipAddress::Resolved(a) => Some(a.clone()),
+        VipAddress::Pending => None,
+        VipAddress::NotProvisioned => ctx.status_address.clone(),
+    };
+    let status_addr = owned_status_addr.as_ref();
+
+    // The per-Gateway VIP Service and its LoadBalancer IP are provisioned
+    // asynchronously by the separate `run_vip_reconciler` task, which fires no
+    // Gateway event — so a shared Gateway reconciled before its own VIP resolves
+    // must REQUEUE (not `await_change`) or `status.addresses` would stay stale
+    // until an unrelated Gateway edit. Only a `Resolved` own-VIP is terminal.
+    let awaiting_own_vip = ctx.shared_vip_addressing && !matches!(vip, VipAddress::Resolved(_));
+
     let key = ObjectKey::new(
         gw.metadata.namespace.clone().unwrap_or_default(),
         gw.metadata.name.clone().unwrap_or_default(),
@@ -543,28 +581,32 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     if ctx.health.is_subsystem_ready("controller") {
         let health_map = ctx.tls_health.load();
         let health = health_map.get(&key).cloned().unwrap_or_default();
-        if gateway_needs_status_patch(gw, &health) {
+        if gateway_needs_status_patch(gw, &health, status_addr) {
             gateway_events::patch_gateway_status(
                 &ctx.client,
                 gw,
                 &health,
-                ctx.status_address.as_ref(),
+                status_addr,
                 ctx.ingress_ports,
             )
             .await;
         }
-        Action::await_change()
+        if awaiting_own_vip {
+            Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
+        } else {
+            Action::await_change()
+        }
     } else if !gateway_accepted(gw) {
         // Before the data plane is synced, write the minimal Accepted-oriented
         // status and requeue to revisit `Programmed` once ready. This requeue
         // replaces the old process-wide resync backstop.
         let empty_health = GatewayListenerHealth::default();
-        if gateway_needs_status_patch(gw, &empty_health) {
+        if gateway_needs_status_patch(gw, &empty_health, status_addr) {
             gateway_events::patch_gateway_status(
                 &ctx.client,
                 gw,
                 &empty_health,
-                ctx.status_address.as_ref(),
+                status_addr,
                 ctx.ingress_ports,
             )
             .await;
@@ -574,6 +616,103 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         // Accepted already set, but the subsystem is not ready yet: revisit
         // shortly so `Programmed` lands without waiting for the next event.
         Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
+    }
+}
+
+/// Provisioning/address state of a shared-mode Gateway's own VIP Service (#472).
+///
+/// Distinguishing `Pending` from `NotProvisioned` is what stops a
+/// provisioned-but-address-pending VIP from being masked by the global
+/// `--status-address`: the caller reports no address for `Pending`, but the
+/// global address for `NotProvisioned`.
+enum VipAddress {
+    /// No VIP Service exists — feature off, or not yet provisioned at all
+    /// (Service 404), or a transient API error (degrade to the global address).
+    NotProvisioned,
+    /// The VIP Service exists but has no externally-reachable address yet
+    /// (e.g. LoadBalancer IP still pending), or is NodePort/unknown-typed.
+    Pending,
+    /// The VIP Service has a resolved address.
+    Resolved(StatusAddress),
+}
+
+/// Read a shared-mode Gateway's own VIP Service and classify its address state.
+///
+/// Best-effort: a 404 (no Service) and any API error both map to
+/// [`VipAddress::NotProvisioned`] so a transient apiserver hiccup degrades to
+/// the global address rather than dropping the Gateway's address. Gated on
+/// `enabled` so a feature-off install issues no apiserver GET at all.
+async fn resolve_shared_vip_address(
+    client: &kube::Client,
+    gw: &Gateway,
+    controller_namespace: &str,
+    enabled: bool,
+) -> VipAddress {
+    use k8s_openapi::api::core::v1::Service;
+    if !enabled {
+        return VipAddress::NotProvisioned;
+    }
+    let (Some(ns), Some(gw_name)) = (
+        gw.metadata.namespace.as_deref(),
+        gw.metadata.name.as_deref(),
+    ) else {
+        return VipAddress::NotProvisioned;
+    };
+    // The VIP Service lives in the controller namespace (with the shared proxy
+    // pod) under a namespace-qualified name (#472).
+    let svc_name = crate::operator::render::shared_gateway_service_name(ns, gw_name);
+    let api: kube::Api<Service> = kube::Api::namespaced(client.clone(), controller_namespace);
+    match api.get_opt(&svc_name).await {
+        Ok(Some(svc)) => match service_vip_address(&svc) {
+            Some(addr) => VipAddress::Resolved(addr),
+            None => VipAddress::Pending,
+        },
+        Ok(None) => VipAddress::NotProvisioned,
+        Err(e) => {
+            tracing::debug!(
+                gateway = %format!("{ns}/{gw_name}"),
+                error = %e,
+                "shared VIP Service lookup failed; using global status address"
+            );
+            VipAddress::NotProvisioned
+        }
+    }
+}
+
+/// Derive a single [`StatusAddress`] from a VIP Service by its type:
+/// `LoadBalancer` ingress (IP preferred, else hostname) or `ClusterIP`.
+/// `NodePort`/unknown yields `None` (node-IP resolution lives on the dedicated
+/// path, which has a Node store; the shared status writer falls back instead).
+fn service_vip_address(svc: &k8s_openapi::api::core::v1::Service) -> Option<StatusAddress> {
+    use std::net::IpAddr;
+    let spec = svc.spec.as_ref()?;
+    match spec.type_.as_deref() {
+        Some("LoadBalancer") => {
+            let ingress = svc
+                .status
+                .as_ref()?
+                .load_balancer
+                .as_ref()?
+                .ingress
+                .as_ref()?;
+            ingress.iter().find_map(|e| {
+                if let Some(ip) = e.ip.as_deref().filter(|s| !s.is_empty()) {
+                    ip.parse::<IpAddr>().ok().map(StatusAddress::Ip)
+                } else {
+                    e.hostname
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(|h| StatusAddress::Hostname(h.to_string()))
+                }
+            })
+        }
+        Some("ClusterIP") | Some("") | None => spec
+            .cluster_ip
+            .as_deref()
+            .filter(|s| !s.is_empty() && *s != "None")
+            .and_then(|s| s.parse::<IpAddr>().ok())
+            .map(StatusAddress::Ip),
+        _ => None,
     }
 }
 

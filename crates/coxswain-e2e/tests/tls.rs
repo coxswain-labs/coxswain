@@ -19,7 +19,7 @@ use coxswain_e2e::{
     ControllerOptions, ControllerProcess, FixtureVars, GeneratedCert, Harness, MtlsCerts,
     NamespaceGuard, StaticRsaCert, bootstrap,
     fixtures::{self, backends, gateway_api as gwa, ingress},
-    harness::{GATEWAY_TLS_PASSTHROUGH_PORT, http, wait},
+    harness::{GATEWAY_HTTPS_PORT, GATEWAY_TLS_PASSTHROUGH_PORT, http, wait},
 };
 use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::Secret;
@@ -563,22 +563,136 @@ async fn gateway_tls_termination_with_sni() -> anyhow::Result<()> {
     )
     .await?;
 
-    let resp_a =
-        wait::wait_for_https_route(h.gateway_tls_addr, &host_a, "/", Duration::from_secs(60))
-            .await?;
+    // Shared-mode Gateways advertise their OWN VIP (#472) — resolve it from the
+    // Gateway's status instead of using the shared proxy Service address.
+    let gw_addr = wait::wait_for_gateway_address(
+        &h.client,
+        "coxswain-tls-test",
+        &ns.name,
+        GATEWAY_HTTPS_PORT,
+        Duration::from_secs(120),
+    )
+    .await?;
+
+    let resp_a = wait::wait_for_https_route(gw_addr, &host_a, "/", Duration::from_secs(60)).await?;
     resp_a.assert_backend("echo-a");
 
-    let resp_b =
-        wait::wait_for_https_route(h.gateway_tls_addr, &host_b, "/", Duration::from_secs(60))
-            .await?;
+    let resp_b = wait::wait_for_https_route(gw_addr, &host_b, "/", Duration::from_secs(60)).await?;
     resp_b.assert_backend("echo-b");
 
     // Unknown SNI must cause a TLS handshake failure (no cert installed).
     let unknown = format!("unknown.{}.local", ns.name);
-    let result = http::https_get(&unknown, "/", h.gateway_tls_addr).await;
+    let result = http::https_get(&unknown, "/", gw_addr).await;
     assert!(
         result.is_err(),
         "expected TLS error for unknown SNI, got: {result:?}"
+    );
+
+    Ok(())
+}
+
+/// Cross-Gateway TLS-termination isolation (#472): two shared-mode Gateways in
+/// one namespace BOTH terminate the SAME hostname with DIFFERENT certs, each on
+/// its OWN per-Gateway VIP. Because the proxy keys its terminate cert store by
+/// the internal port each VIP maps to, the two Gateways never share a cert
+/// namespace:
+///   - A's VIP presents A's cert for the shared hostname and routes to echo-a.
+///   - B's VIP presents B's (different) cert for the same hostname → echo-b.
+///   - A's VIP cannot complete a handshake for a hostname only B serves, even
+///     though B holds a valid cert for it — proving no cross-Gateway cert leak.
+#[tokio::test]
+async fn https_terminate_cert_isolated_per_gateway() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-iso").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let shared_host = format!("iso-shared.{}.local", ns.name);
+    let b_only_host = format!("iso-b-only.{}.local", ns.name);
+    // A and B both hold a cert for `shared_host`, but distinct key pairs — so a
+    // served-leaf-DER comparison proves which Gateway answered.
+    let cert_a = GeneratedCert::for_host(&shared_host);
+    let cert_b = GeneratedCert::for_host(&shared_host);
+    let cert_b2 = GeneratedCert::for_host(&b_only_host);
+
+    fixtures::apply_fixture(
+        gwa::TLS_ISOLATION_CROSS_GATEWAY,
+        FixtureVars::new(&ns.name)
+            .with("SHARED_HOSTNAME", &shared_host)
+            .with("B_ONLY_HOSTNAME", &b_only_host)
+            .with("SECRET_A_NAME", "iso-cert-a")
+            .with("SECRET_B_NAME", "iso-cert-b")
+            .with("SECRET_B2_NAME", "iso-cert-b-only")
+            .with("TLS_CRT_A_B64", cert_a.cert_b64())
+            .with("TLS_KEY_A_B64", cert_a.key_b64())
+            .with("TLS_CRT_B_B64", cert_b.cert_b64())
+            .with("TLS_KEY_B_B64", cert_b.key_b64())
+            .with("TLS_CRT_B2_B64", cert_b2.cert_b64())
+            .with("TLS_KEY_B2_B64", cert_b2.key_b64()),
+    )
+    .await?;
+
+    // Each Gateway advertises its OWN VIP (#472) — resolve both from status.
+    let a_vip = wait::wait_for_gateway_address(
+        &h.client,
+        "coxswain-iso-a",
+        &ns.name,
+        GATEWAY_HTTPS_PORT,
+        Duration::from_secs(120),
+    )
+    .await?;
+    let b_vip = wait::wait_for_gateway_address(
+        &h.client,
+        "coxswain-iso-b",
+        &ns.name,
+        GATEWAY_HTTPS_PORT,
+        Duration::from_secs(120),
+    )
+    .await?;
+    assert_ne!(
+        a_vip.ip(),
+        b_vip.ip(),
+        "each shared-mode Gateway must get a distinct VIP, got A={a_vip} B={b_vip}"
+    );
+
+    // A's VIP serves the shared hostname → A's backend.
+    let resp_a =
+        wait::wait_for_https_route(a_vip, &shared_host, "/", Duration::from_secs(60)).await?;
+    resp_a.assert_backend("echo-a");
+    // B's VIP serves the same hostname → B's backend.
+    let resp_b =
+        wait::wait_for_https_route(b_vip, &shared_host, "/", Duration::from_secs(60)).await?;
+    resp_b.assert_backend("echo-b");
+
+    // The decisive assertion: SAME SNI, each VIP presents its OWN Gateway's cert.
+    let der_a = http::https_peer_leaf_der(&shared_host, "/", a_vip).await?;
+    let der_b = http::https_peer_leaf_der(&shared_host, "/", b_vip).await?;
+    assert_eq!(
+        der_a,
+        cert_a.cert_der(),
+        "Gateway A's VIP must present A's cert for the shared hostname"
+    );
+    assert_eq!(
+        der_b,
+        cert_b.cert_der(),
+        "Gateway B's VIP must present B's cert for the shared hostname"
+    );
+    assert_ne!(
+        der_a, der_b,
+        "same SNI on the two VIPs must yield different certs — cert store is per-Gateway"
+    );
+
+    // B genuinely serves `b_only_host` on its VIP (positive control for the negative below).
+    wait::wait_for_https_route(b_vip, &b_only_host, "/", Duration::from_secs(60)).await?;
+
+    // Negative — no cross-Gateway leak: A's VIP must NOT complete a handshake for
+    // a hostname only B holds a cert/listener for. A's port-scoped cert store
+    // never sees B's cert.
+    let leaked = http::https_get(&b_only_host, "/", a_vip).await;
+    assert!(
+        leaked.is_err(),
+        "A's VIP must reject a hostname only Gateway B serves (no cross-Gateway cert leak), got: {leaked:?}"
     );
 
     Ok(())
@@ -712,8 +826,8 @@ async fn tls_cross_namespace_grant_serves_https() -> anyhow::Result<()> {
     )
     .await?;
 
-    let resp =
-        wait::wait_for_https_route(h.gateway_tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
+    let resp = wait::wait_for_https_route(gw_tls, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
     Ok(())
@@ -754,11 +868,12 @@ async fn gateway_tls_certificate_hot_rotation() -> anyhow::Result<()> {
     )
     .await?;
 
-    wait::wait_for_https_route(h.gateway_tls_addr, &host_a, "/", Duration::from_secs(60)).await?;
-    wait::wait_for_https_route(h.gateway_tls_addr, &host_b, "/", Duration::from_secs(60)).await?;
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
+    wait::wait_for_https_route(gw_tls, &host_a, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_https_route(gw_tls, &host_b, "/", Duration::from_secs(60)).await?;
 
-    let old_der_a = http::https_peer_leaf_der(&host_a, "/", h.gateway_tls_addr).await?;
-    let old_der_b = http::https_peer_leaf_der(&host_b, "/", h.gateway_tls_addr).await?;
+    let old_der_a = http::https_peer_leaf_der(&host_a, "/", gw_tls).await?;
+    let old_der_b = http::https_peer_leaf_der(&host_b, "/", gw_tls).await?;
 
     // Rotate only Secret A; Secret B data is unchanged.
     fixtures::apply_fixture(
@@ -776,27 +891,21 @@ async fn gateway_tls_certificate_hot_rotation() -> anyhow::Result<()> {
     .await?;
 
     // Listener A must pick up the new cert.
-    wait::wait_for_tls_cert_rotation(
-        h.gateway_tls_addr,
-        &host_a,
-        &old_der_a,
-        Duration::from_secs(15),
-    )
-    .await?;
+    wait::wait_for_tls_cert_rotation(gw_tls, &host_a, &old_der_a, Duration::from_secs(15)).await?;
 
     // Listener B must still serve the original cert (no spurious swap).
-    let new_der_b = http::https_peer_leaf_der(&host_b, "/", h.gateway_tls_addr).await?;
+    let new_der_b = http::https_peer_leaf_der(&host_b, "/", gw_tls).await?;
     assert_eq!(old_der_b, new_der_b, "listener B cert must not change");
 
     // Both listeners must still route correctly.
-    let resp_a = http::https_get(&host_a, "/", h.gateway_tls_addr).await?;
+    let resp_a = http::https_get(&host_a, "/", gw_tls).await?;
     assert!(
         resp_a.1.is_some(),
         "expected response from listener A after rotation"
     );
     resp_a.1.unwrap().assert_backend("echo-a");
 
-    let resp_b = http::https_get(&host_b, "/", h.gateway_tls_addr).await?;
+    let resp_b = http::https_get(&host_b, "/", gw_tls).await?;
     assert!(
         resp_b.1.is_some(),
         "expected response from listener B after rotation"
@@ -835,8 +944,8 @@ async fn cert_manager_gateway_provisioning() -> anyhow::Result<()> {
     wait::wait_for_tls_secret(&h.client, secret_name, &ns.name, Duration::from_secs(120)).await?;
 
     // Coxswain picks up the Secret via its Secret watch; wait for HTTPS to become live.
-    let resp =
-        wait::wait_for_https_route(h.gateway_tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
+    let resp = wait::wait_for_https_route(gw_tls, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
     Ok(())
@@ -857,17 +966,13 @@ async fn websocket_passthrough() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::WEBSOCKET, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("ws.{}.local", ns.name);
+    let gw_http = h.gateway_http_addr(&ns.name).await?;
 
     // Poll until the proxy returns a 101 for this virtual host.
-    wait::wait_for_ws_route(
-        h.controller.gateway_http_addr,
-        &host,
-        Duration::from_secs(60),
-    )
-    .await?;
+    wait::wait_for_ws_route(gw_http, &host, Duration::from_secs(60)).await?;
 
     // Open a fresh WebSocket connection and verify the echo round-trip.
-    let uri = format!("ws://{}/", h.controller.gateway_http_addr);
+    let uri = format!("ws://{gw_http}/");
     let req = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(&uri)
         .header("Host", &host)
@@ -923,8 +1028,9 @@ async fn backend_protocol_h2c() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::BACKEND_PROTOCOL_H2C, FixtureVars::new(&ns.name)).await?;
 
     // Positive: appProtocol h2c → h2c → the h2c-only port serves.
+    let gw = h.gateway_http(&ns.name).await?;
     let host = format!("h2c.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("h2c-echo");
 
     // Negative: no appProtocol → HTTP/1.1 → the h2c-only port rejects the request.
@@ -932,8 +1038,7 @@ async fn backend_protocol_h2c() -> anyhow::Result<()> {
     // wire protocol differs. The rejection surfaces as 400 or 502 depending on how the
     // h2c/HTTP-1.1 mismatch fails, so assert the rejection class rather than a single code.
     let plain_host = format!("h2c-plain.{}.local", ns.name);
-    wait::wait_for_route_rejected(&h.gateway_http, &plain_host, "/", Duration::from_secs(60))
-        .await?;
+    wait::wait_for_route_rejected(&gw, &plain_host, "/", Duration::from_secs(60)).await?;
 
     Ok(())
 }
@@ -1008,8 +1113,9 @@ async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
 
     // Wait until the probe path is reachable over HTTPS (confirms TLS is set up and
     // the route is programmed).
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
     wait::wait_for_https_route(
-        h.gateway_tls_addr,
+        gw_tls,
         &host,
         "/tls-redirect/probe",
         Duration::from_secs(60),
@@ -1021,14 +1127,10 @@ async fn tls_redirect_preserves_https_scheme() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(5))
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none())
-        .resolve(&host, h.gateway_tls_addr)
+        .resolve(&host, gw_tls)
         .build()?;
 
-    let url = format!(
-        "https://{}:{}/tls-redirect",
-        host,
-        h.gateway_tls_addr.port()
-    );
+    let url = format!("https://{}:{}/tls-redirect", host, gw_tls.port());
     let resp = client.get(&url).send().await?;
 
     assert_eq!(resp.status().as_u16(), 302, "expected 302 redirect");
@@ -1086,7 +1188,8 @@ async fn backend_tls_policy_configmap_ca_verifies_upstream() -> anyhow::Result<(
     .await?;
 
     // The route should come up once the controller reconciles and the proxy verifies the cert.
-    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-tls");
 
     // Controller must have written Accepted=True / ResolvedRefs=True on the policy.
@@ -1143,7 +1246,8 @@ async fn backend_tls_policy_invalid_ca_rejects_with_502() -> anyhow::Result<()> 
 
     let host = format!("backend-tls.{}.local", ns.name);
     // Traffic MUST return 5xx — never plain-HTTP-fallthrough success.
-    wait::wait_for_route_status(&h.gateway_http, &host, "/", 502, Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route_status(&gw, &host, "/", 502, Duration::from_secs(60)).await?;
 
     let controller_name = "coxswain-labs.dev/gateway-controller";
     wait::wait_for_backend_tls_policy_condition_with_reason(
@@ -1212,24 +1316,13 @@ async fn backend_tls_policy_section_name_selects_per_port_sni() -> anyhow::Resul
     .await?;
 
     let host = format!("backend-tls.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
 
     // Both routes must succeed. The section-name policy applies to port 443; the
     // catch-all to port 8443. If per-port lookup is broken, one of these returns 5xx.
-    let resp = wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/port-443/",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let resp = wait::wait_for_route(&gw, &host, "/port-443/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-tls");
-    let resp = wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/port-8443/",
-        Duration::from_secs(30),
-    )
-    .await?;
+    let resp = wait::wait_for_route(&gw, &host, "/port-8443/", Duration::from_secs(30)).await?;
     resp.assert_backend("echo-tls");
 
     Ok(())
@@ -1329,7 +1422,8 @@ async fn backend_tls_policy_configmap_mutation_reloads_ca() -> anyhow::Result<()
     .await?;
 
     let host = format!("backend-tls.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-tls");
 
     // Swap the ConfigMap's ca.crt for an unrelated self-signed CA. The backend's cert
@@ -1349,7 +1443,7 @@ async fn backend_tls_policy_configmap_mutation_reloads_ca() -> anyhow::Result<()
 
     // The controller should observe the CM change, rebuild, and the proxy's UpstreamCaCache
     // will surface a fresh CA. The cert no longer chains → 502.
-    wait::wait_for_route_status(&h.gateway_http, &host, "/", 502, Duration::from_secs(60)).await?;
+    wait::wait_for_route_status(&gw, &host, "/", 502, Duration::from_secs(60)).await?;
 
     Ok(())
 }
@@ -1389,7 +1483,8 @@ async fn backend_tls_policy_hostname_mismatch_fails_handshake() -> anyhow::Resul
 
     // Wait for the route to appear in the routing table (reconciler must have processed it).
     // Then assert that requests fail with 5xx (TLS verification error from Pingora).
-    wait::wait_for_route_status(&h.gateway_http, &host, "/", 502, Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route_status(&gw, &host, "/", 502, Duration::from_secs(60)).await?;
 
     Ok(())
 }
@@ -1551,7 +1646,8 @@ async fn backend_tls_policy_cross_namespace_ca_fails_gracefully() -> anyhow::Res
 
     // Once implemented, this test should assert a successful 200 response from echo-tls.
     // Right now, it'll fail or result in 502 Bad Gateway due to missing CA bundle resolution.
-    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns_primary.name).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-tls");
 
     Ok(())
@@ -1590,11 +1686,11 @@ async fn h2_negotiated_over_tls_via_alpn() -> anyhow::Result<()> {
     .await?;
 
     // Wait for the HTTPS route to be live (uses a plain h1 client internally).
-    wait::wait_for_https_route(h.gateway_tls_addr, &host_a, "/", Duration::from_secs(60)).await?;
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
+    wait::wait_for_https_route(gw_tls, &host_a, "/", Duration::from_secs(60)).await?;
 
     // Build an h2-capable TLS client (no .http1_only()) — reqwest with rustls will
     // negotiate h2 via ALPN when the server offers it.
-    let gw_tls = h.gateway_tls_addr;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .danger_accept_invalid_certs(true)
@@ -1649,10 +1745,10 @@ async fn h1_over_tls_served_when_client_prefers_h1() -> anyhow::Result<()> {
     )
     .await?;
 
-    wait::wait_for_https_route(h.gateway_tls_addr, &host_a, "/", Duration::from_secs(60)).await?;
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
+    wait::wait_for_https_route(gw_tls, &host_a, "/", Duration::from_secs(60)).await?;
 
     // Force h1: the ALPN callback must not select h2 when the client doesn't offer it.
-    let gw_tls = h.gateway_tls_addr;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .danger_accept_invalid_certs(true)
@@ -1823,16 +1919,11 @@ async fn gateway_https_coalescing_returns_421_for_cross_listener_host() -> anyho
 
     // Verify both routes are live with normal (matching SNI+Host) requests before
     // probing the mismatch cases.
-    wait::wait_for_https_route(
-        h.gateway_tls_addr,
-        &exact_host,
-        "/",
-        Duration::from_secs(60),
-    )
-    .await?;
-    wait::wait_for_https_route(h.gateway_tls_addr, &wild_a, "/", Duration::from_secs(60)).await?;
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
+    wait::wait_for_https_route(gw_tls, &exact_host, "/", Duration::from_secs(60)).await?;
+    wait::wait_for_https_route(gw_tls, &wild_a, "/", Duration::from_secs(60)).await?;
 
-    let proxy = h.gateway_tls_addr;
+    let proxy = gw_tls;
 
     // ── Sad paths: cross-listener → 421 ─────────────────────────────────────
 
@@ -1905,12 +1996,12 @@ async fn https_listener_serves_ecdsa_cert_when_dual_cert_configured() -> anyhow:
     .await?;
 
     // HTTPS routing must work via the dual-cert listener.
-    let resp =
-        wait::wait_for_https_route(h.gateway_tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
+    let resp = wait::wait_for_https_route(gw_tls, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
     // The proxy must serve the ECDSA cert (sorted first by TlsStoreBuilder::build()).
-    let served_der = http::https_peer_leaf_der(&host, "/", h.gateway_tls_addr).await?;
+    let served_der = http::https_peer_leaf_der(&host, "/", gw_tls).await?;
     assert_eq!(
         served_der,
         ecdsa_cert.cert_der(),
@@ -1972,8 +2063,8 @@ async fn https_listener_degrades_when_one_certificate_ref_is_invalid() -> anyhow
     .await?;
 
     // The valid cert is still served → HTTPS routing must succeed (best-effort).
-    let resp =
-        wait::wait_for_https_route(h.gateway_tls_addr, &host, "/", Duration::from_secs(60)).await?;
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
+    let resp = wait::wait_for_https_route(gw_tls, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
     Ok(())
@@ -2009,6 +2100,7 @@ async fn gateway_frontend_mtls_accepts_valid_client_cert() -> anyhow::Result<()>
 
     // Poll until the route is live and the CA is reconciled into the ClientCertStore:
     // a valid client cert must be admitted (200 echo body).
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
     let resp = wait::poll_until(
         Duration::from_secs(90),
         wait::POLL,
@@ -2021,7 +2113,7 @@ async fn gateway_frontend_mtls_accepts_valid_client_cert() -> anyhow::Result<()>
             match http::https_get_with_client_cert(
                 &host,
                 "/",
-                h.gateway_tls_addr,
+                gw_tls,
                 &mtls.client_cert_pem,
                 &mtls.client_key_pem,
             )
@@ -2065,6 +2157,7 @@ async fn gateway_frontend_mtls_rejects_missing_client_cert() -> anyhow::Result<(
     .await?;
 
     // Pre-condition: wait until mTLS is active — a valid cert must be accepted.
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
     wait::poll_until(
         Duration::from_secs(90),
         wait::POLL,
@@ -2075,7 +2168,7 @@ async fn gateway_frontend_mtls_rejects_missing_client_cert() -> anyhow::Result<(
             match http::https_get_with_client_cert(
                 &host,
                 "/",
-                h.gateway_tls_addr,
+                gw_tls,
                 &mtls.client_cert_pem,
                 &mtls.client_key_pem,
             )
@@ -2091,7 +2184,7 @@ async fn gateway_frontend_mtls_rejects_missing_client_cert() -> anyhow::Result<(
     // Now attempt without a client certificate.  The server must abort the TLS
     // handshake (FAIL_IF_NO_PEER_CERT) so reqwest returns an error before any
     // HTTP response is decoded.
-    let result = http::https_get(&host, "/", h.gateway_tls_addr).await;
+    let result = http::https_get(&host, "/", gw_tls).await;
     anyhow::ensure!(
         result.is_err(),
         "expected TLS handshake failure when no client cert is presented on \
@@ -2157,10 +2250,11 @@ async fn gateway_frontend_mtls_fails_closed_when_ca_configmap_missing() -> anyho
     // Every connection attempt must fail at the TLS layer — the CA is Unavailable
     // so the proxy installs PEER | FAIL_IF_NO_PEER_CERT with no CA store, which
     // causes BoringSSL to reject every cert (including valid ones).
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
     let with_cert = http::https_get_with_client_cert(
         &host,
         "/",
-        h.gateway_tls_addr,
+        gw_tls,
         &mtls.client_cert_pem,
         &mtls.client_key_pem,
     )
@@ -2172,7 +2266,7 @@ async fn gateway_frontend_mtls_fails_closed_when_ca_configmap_missing() -> anyho
         with_cert.ok()
     );
 
-    let without_cert = http::https_get(&host, "/", h.gateway_tls_addr).await;
+    let without_cert = http::https_get(&host, "/", gw_tls).await;
     anyhow::ensure!(
         without_cert.is_err(),
         "expected TLS failure without a client cert when CA ConfigMap is missing \
@@ -2215,6 +2309,7 @@ async fn gateway_frontend_mtls_reloads_ca_on_configmap_change() -> anyhow::Resul
     .await?;
 
     // Wait until the old CA is active: old client cert is admitted.
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
     wait::poll_until(
         Duration::from_secs(90),
         wait::POLL,
@@ -2223,7 +2318,7 @@ async fn gateway_frontend_mtls_reloads_ca_on_configmap_change() -> anyhow::Resul
             match http::https_get_with_client_cert(
                 &host,
                 "/",
-                h.gateway_tls_addr,
+                gw_tls,
                 &old_mtls.client_cert_pem,
                 &old_mtls.client_key_pem,
             )
@@ -2264,7 +2359,7 @@ async fn gateway_frontend_mtls_reloads_ca_on_configmap_change() -> anyhow::Resul
             match http::https_get_with_client_cert(
                 &host,
                 "/",
-                h.gateway_tls_addr,
+                gw_tls,
                 &new_mtls.client_cert_pem,
                 &new_mtls.client_key_pem,
             )
@@ -2281,7 +2376,7 @@ async fn gateway_frontend_mtls_reloads_ca_on_configmap_change() -> anyhow::Resul
     let old_result = http::https_get_with_client_cert(
         &host,
         "/",
-        h.gateway_tls_addr,
+        gw_tls,
         &old_mtls.client_cert_pem,
         &old_mtls.client_key_pem,
     )
@@ -2323,8 +2418,8 @@ async fn gateway_frontend_mtls_insecure_fallback_admits_missing_cert() -> anyhow
 
     // AllowInsecureFallback: a plain HTTPS connection (no client cert) must reach
     // the backend — the proxy must not abort the handshake.
-    let resp =
-        wait::wait_for_https_route(h.gateway_tls_addr, &host, "/", Duration::from_secs(90)).await?;
+    let gw_tls = h.gateway_tls_addr(&ns.name).await?;
+    let resp = wait::wait_for_https_route(gw_tls, &host, "/", Duration::from_secs(90)).await?;
     resp.assert_backend("echo-a");
 
     // A valid client cert must also be accepted (fallback ≠ cert rejection).
@@ -2338,7 +2433,7 @@ async fn gateway_frontend_mtls_insecure_fallback_admits_missing_cert() -> anyhow
             match http::https_get_with_client_cert(
                 &host,
                 "/",
-                h.gateway_tls_addr,
+                gw_tls,
                 &mtls.client_cert_pem,
                 &mtls.client_key_pem,
             )
@@ -2402,7 +2497,8 @@ async fn backend_mtls_presents_client_cert_when_gateway_configures_ref() -> anyh
     .await?;
 
     // Traffic must succeed: proxy presents the client cert, backend validates it.
-    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(90)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(90)).await?;
     resp.assert_backend("echo-mtls");
 
     // Gateway must report ResolvedRefs=True (client cert Secret resolved OK).
@@ -2471,7 +2567,8 @@ async fn backend_mtls_rejects_untrusted_client_cert() -> anyhow::Result<()> {
     .await?;
 
     // Proxy presents an untrusted client cert → backend aborts handshake → 502.
-    wait::wait_for_route_status(&h.gateway_http, &host, "/", 502, Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route_status(&gw, &host, "/", 502, Duration::from_secs(60)).await?;
 
     Ok(())
 }
@@ -2514,7 +2611,8 @@ async fn backend_mtls_invalid_client_cert_ref_fails_closed() -> anyhow::Result<(
 
     // Unresolvable client cert ref → proxy fails closed → 502 (never connects).
     let host = format!("backend-tls.{}.local", ns.name);
-    wait::wait_for_route_status(&h.gateway_http, &host, "/", 502, Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route_status(&gw, &host, "/", 502, Duration::from_secs(60)).await?;
 
     // Controller surfaces the resolution failure on the Gateway.
     wait::wait_for_gateway_condition(
@@ -2581,7 +2679,7 @@ async fn tls_passthrough_routes_by_sni_without_termination() -> anyhow::Result<(
     // Open a raw TLS connection to the passthrough port using backend_cert's DER
     // as the trusted root.  If the proxy terminated TLS, it would present a
     // different cert that isn't in our root store, making the handshake fail.
-    let passthrough_addr = h.gateway_passthrough_addr;
+    let passthrough_addr = h.gateway_passthrough_addr(&ns.name).await?;
     let trusted_ca_der = backend_cert.cert_der();
     let body = wait::poll_until(
         Duration::from_secs(60),
@@ -2653,7 +2751,7 @@ async fn tls_passthrough_unknown_sni_is_rejected() -> anyhow::Result<()> {
 
     // Pre-condition: confirm the happy-path hostname is routed before probing the
     // negative, so the test can't pass vacuously due to the proxy not being ready.
-    let passthrough_addr = h.gateway_passthrough_addr;
+    let passthrough_addr = h.gateway_passthrough_addr(&ns.name).await?;
     let trusted_ca_der = backend_cert.cert_der();
     wait::poll_until(
         Duration::from_secs(60),
@@ -2675,7 +2773,7 @@ async fn tls_passthrough_unknown_sni_is_rejected() -> anyhow::Result<()> {
     // Connect with an SNI that has no matching TLSRoute → proxy drops the connection.
     let unknown = format!("unknown.{}.local", ns.name);
     let result = try_tls_passthrough(
-        &h.gateway_passthrough_addr,
+        &passthrough_addr,
         &unknown,
         &trusted_ca_der,
         "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
@@ -2729,8 +2827,9 @@ async fn tls_passthrough_listener_without_route_is_programmed_but_drops() -> any
     // We use a self-signed cert for the hostname, but verification is expected to
     // fail before the handshake completes — the proxy closes the connection.
     let dummy_cert = GeneratedCert::for_host(&hostname);
+    let gw_pt = h.gateway_passthrough_addr(&ns.name).await?;
     let result = try_tls_passthrough(
-        &h.gateway_passthrough_addr,
+        &gw_pt,
         &hostname,
         &dummy_cert.cert_der(),
         "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",

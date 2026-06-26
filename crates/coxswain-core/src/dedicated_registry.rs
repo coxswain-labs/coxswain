@@ -31,7 +31,7 @@ use crate::listener_health::GatewayListenerHealth;
 use crate::ownership::ObjectKey;
 use crate::routing::GatewayRoutingTable;
 use crate::shared::Shared;
-use crate::tls::{ClientCertStore, TlsStore};
+use crate::tls::{ClientCertStore, PortTlsStore};
 
 /// The routing world for a single dedicated Gateway's proxy.
 ///
@@ -51,8 +51,10 @@ use crate::tls::{ClientCertStore, TlsStore};
 pub struct DedicatedRoutingSnapshot {
     /// Gateway-API routing table for this Gateway only.
     pub gateway: Arc<GatewayRoutingTable>,
-    /// TLS certificate store scoped to this Gateway's listeners.
-    pub tls: Arc<TlsStore>,
+    /// Per-port TLS certificate store scoped to this Gateway's listeners (#472):
+    /// keyed by the listener bind ports the dedicated proxy accepts HTTPS on, so
+    /// cert selection matches the proxy's per-port `SniCertSelector`.
+    pub tls: Arc<PortTlsStore>,
     /// Client-certificate mTLS config store scoped to this Gateway.
     pub client_certs: Arc<ClientCertStore>,
     /// Listener-health map containing exactly the owning Gateway's entry.
@@ -93,7 +95,7 @@ mod tests {
     fn make_snapshot() -> Arc<DedicatedRoutingSnapshot> {
         Arc::new(DedicatedRoutingSnapshot {
             gateway: Arc::new(GatewayRoutingTable::default()),
-            tls: Arc::new(TlsStore::default()),
+            tls: Arc::new(PortTlsStore::default()),
             client_certs: Arc::new(ClientCertStore::default()),
             listener_health: HashMap::new(),
             expected_proxy_sa: "gw-a-coxswain".to_owned(),

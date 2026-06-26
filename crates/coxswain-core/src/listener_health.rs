@@ -230,8 +230,37 @@ pub struct ListenerInfo {
     /// Whether routes from any namespace are allowed (`true`) or only from
     /// the same namespace as the Gateway (`false`, the spec default).
     pub allows_all_namespaces: bool,
-    /// Listener port number.
+    /// Listener spec port number — what clients connect to and what
+    /// `status.addresses`/listener conditions report.
     pub port: u16,
+    /// Internal `targetPort` the shared proxy binds and keys its routing,
+    /// passthrough, and TLS tables on (#472).
+    ///
+    /// In shared mode every owned Gateway gets its own Service/VIP that maps the
+    /// advertised [`Self::port`] to a distinct internal port on the one shared
+    /// proxy pod; the proxy distinguishes Gateways by the local port it accepted
+    /// on, so isolation falls out of the existing port-keyed structures. `0`
+    /// (the default) means "not separately allocated; bind the spec port" —
+    /// dedicated mode and Ingress-derived listeners keep spec == bind. Read
+    /// through [`Self::bind_port`], never directly, so the fallback is honoured.
+    pub internal_port: u16,
+}
+
+impl ListenerInfo {
+    /// Port the proxy actually binds and keys routing on: the allocated
+    /// [`Self::internal_port`] when non-zero, else the spec [`Self::port`].
+    ///
+    /// The `0 → port` fallback keeps dedicated mode and Ingress-derived
+    /// listeners (which never allocate an internal port) binding their spec
+    /// port unchanged.
+    #[must_use]
+    pub fn bind_port(&self) -> u16 {
+        if self.internal_port != 0 {
+            self.internal_port
+        } else {
+            self.port
+        }
+    }
 }
 
 /// Outcome of resolving the Gateway-wide frontend client-certificate validation

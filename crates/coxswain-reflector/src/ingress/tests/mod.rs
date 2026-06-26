@@ -1,6 +1,17 @@
 use super::*;
 pub(super) use coxswain_core::routing::IngressRoutingTableBuilder;
-pub(super) use coxswain_core::tls::{ClientCertStoreBuilder, TlsStoreBuilder};
+pub(super) use coxswain_core::tls::{
+    ClientCertStoreBuilder, PortTlsStore, PortTlsStoreBuilder, TlsCert,
+};
+
+/// Fixed Ingress HTTPS bind port used in tests (#472): all Ingress certs key
+/// under it in the per-port store.
+pub(super) const TEST_HTTPS_PORT: u16 = 443;
+
+/// Look up a cert on the test HTTPS port of a per-port store.
+pub(super) fn pcert(store: &PortTlsStore, host: &str) -> Option<std::sync::Arc<TlsCert>> {
+    store.port(TEST_HTTPS_PORT).and_then(|s| s.find_cert(host))
+}
 pub(super) use k8s_openapi::api::core::v1::{Secret, Service};
 pub(super) use k8s_openapi::api::discovery::v1::EndpointSlice;
 pub(super) use k8s_openapi::api::networking::v1::{
@@ -63,9 +74,9 @@ pub(super) fn reconcile_tls_no_default(
     ing: &Ingress,
     secrets: &reflector::Store<Secret>,
     owned: &HashSet<String>,
-    b: &mut TlsStoreBuilder,
+    b: &mut PortTlsStoreBuilder,
 ) {
-    IngressReconciler::reconcile_tls(ing, secrets, owned, None, b);
+    IngressReconciler::reconcile_tls(ing, secrets, owned, None, b, TEST_HTTPS_PORT);
 }
 
 pub(super) fn reconcile_client_certs_no_default(

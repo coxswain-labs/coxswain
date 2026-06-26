@@ -40,17 +40,18 @@
 
 use super::{apply, params, render, status};
 use async_trait::async_trait;
-use coxswain_core::crd::CoxswainGatewayParameters;
+use coxswain_core::crd::{CoxswainGatewayParameters, ServiceType};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::ingress::IngressPorts;
+use coxswain_reflector::port_alloc::{DEFAULT_INTERNAL_PORT_RANGE, allocate_internal_ports};
 use coxswain_reflector::tls::{
     GatewayListenerHealth, SharedGatewayListenerHealth, SharedRouteHealth,
 };
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Node, Pod, Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{ConfigMap, Node, ObjectReference, Pod, Service, ServiceAccount};
 use kube::{
     Api, Client, Resource as _,
     api::{DeleteParams, ObjectMeta, Patch, PatchParams},
@@ -63,7 +64,7 @@ use kube::{
 };
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash as _, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,6 +172,15 @@ pub struct OperatorConfig {
     /// controller namespace the publisher's own ConfigMap is reused and no copy
     /// is made (the publisher is its sole writer).
     pub controller_namespace: String,
+    /// Label selector targeting the one shared proxy pod, used as the `selector`
+    /// of every per-Gateway shared-mode VIP Service (#472). Supplied by the
+    /// chart via `--shared-proxy-selector` because the controller cannot derive
+    /// the install's `app.kubernetes.io/instance` (release name) itself.
+    /// Empty disables shared-mode per-Gateway addressing (Ingress-only / tests).
+    pub shared_proxy_selector: BTreeMap<String, String>,
+    /// Service type for the per-Gateway shared-mode VIP Services (#472).
+    /// `LoadBalancer` by default so each Gateway gets its own external address.
+    pub shared_vip_service_type: ServiceType,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -234,6 +244,22 @@ struct ReconcileContext {
     /// Controller namespace; source of the trust-bundle ConfigMap copied into
     /// out-of-namespace dedicated proxies.
     controller_namespace: String,
+    /// All Gateways, cluster-wide. Enumerated on a shared-mode reconcile to
+    /// compute the *global* internal-port allocation (#472) so concurrent
+    /// per-Gateway reconciles agree on the same deterministic map.
+    gateways_store: Store<Gateway>,
+    /// The per-Gateway shared-mode VIP Services we provision, label-scoped to
+    /// the shared-VIP component. Their `targetPort`s are the durable source of
+    /// truth for the internal-port allocation across reconciles/restarts (#472).
+    services_store: Store<Service>,
+    /// Shared proxy pod selector + VIP service type for shared-mode Service
+    /// provisioning (#472). See [`OperatorConfig::shared_proxy_selector`].
+    shared_proxy_selector: BTreeMap<String, String>,
+    shared_vip_service_type: ServiceType,
+    /// Signals the serialized [`run_vip_reconciler`] task to run a whole-VIP
+    /// pass (#472). Per-Gateway reconciles only *signal* here — they never
+    /// provision VIP Services themselves, so the allocation stays single-writer.
+    vip_trigger: Arc<tokio::sync::Notify>,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
 
@@ -339,6 +365,37 @@ impl BackgroundService for Operator {
                 while stream.next().await.is_some() {}
             }
         });
+        // Gateway reflector — cluster-wide. Enumerated on each shared-mode
+        // reconcile to compute the global internal-port allocation (#472).
+        let (gateways_reader, gateways_writer) = reflector::store::<Gateway>();
+        tasks.spawn({
+            let api = Api::<Gateway>::all(client.clone());
+            async move {
+                let stream = reflector::reflector(
+                    gateways_writer,
+                    watcher(api, watcher::Config::default()).default_backoff(),
+                );
+                tokio::pin!(stream);
+                while stream.next().await.is_some() {}
+            }
+        });
+        // Service reflector — cluster-wide, narrowed to the per-Gateway
+        // shared-mode VIP Services we provision (#472). Their `targetPort`s are
+        // the durable source of truth for the internal-port allocation.
+        let (services_reader, services_writer) = reflector::store::<Service>();
+        tasks.spawn({
+            let api = Api::<Service>::all(client.clone());
+            let config = watcher::Config::default().labels(&format!(
+                "app.kubernetes.io/component={}",
+                render::SHARED_GATEWAY_VIP_COMPONENT
+            ));
+            async move {
+                let stream =
+                    reflector::reflector(services_writer, watcher(api, config).default_backoff());
+                tokio::pin!(stream);
+                while stream.next().await.is_some() {}
+            }
+        });
 
         // Wait for every dependency reflector to complete its initial sync
         // before exposing the stores to the reconcile loop, so the first
@@ -368,7 +425,7 @@ impl BackgroundService for Operator {
         // operator is shutting down. We treat those as "synced" because there
         // is nothing left for this reader to deliver; the controller will
         // exit on the next iteration anyway.
-        let (a, b, c, d) = tokio::join!(
+        let (a, b, c, d, e, f) = tokio::join!(
             wait_or_name("GatewayClass", class_reader.wait_until_ready(), deadline),
             wait_or_name(
                 "CoxswainGatewayParameters",
@@ -377,8 +434,10 @@ impl BackgroundService for Operator {
             ),
             wait_or_name("Pod", pods_reader.wait_until_ready(), deadline),
             wait_or_name("Node", nodes_reader.wait_until_ready(), deadline),
+            wait_or_name("Gateway", gateways_reader.wait_until_ready(), deadline),
+            wait_or_name("Service", services_reader.wait_until_ready(), deadline),
         );
-        let unsynced: Vec<&'static str> = [a, b, c, d].into_iter().flatten().collect();
+        let unsynced: Vec<&'static str> = [a, b, c, d, e, f].into_iter().flatten().collect();
         if !unsynced.is_empty() {
             tracing::warn!(
                 timeout = ?sync_timeout,
@@ -407,8 +466,18 @@ impl BackgroundService for Operator {
             discovery_ca_bundle_path: self.config.discovery_ca_bundle_path.clone(),
             discovery_trust_domain: self.config.discovery_trust_domain.clone(),
             controller_namespace: self.config.controller_namespace.clone(),
+            gateways_store: gateways_reader,
+            services_store: services_reader,
+            shared_proxy_selector: self.config.shared_proxy_selector.clone(),
+            shared_vip_service_type: self.config.shared_vip_service_type,
+            vip_trigger: Arc::new(tokio::sync::Notify::new()),
             last_hashes: Mutex::new(HashMap::new()),
         });
+
+        // Single serialized VIP reconciler (#472): the sole writer of shared-mode
+        // per-Gateway VIP Services. Per-Gateway reconciles signal it via
+        // `ctx.vip_trigger`; it never runs on the concurrent work-queue.
+        tasks.spawn(run_vip_reconciler(Arc::clone(&ctx), shutdown.clone()));
 
         // Build the kube-rs Controller. We don't `.owns(Deployment)` yet —
         // Step 8 writes nothing, so there are no owned Deployments to
@@ -591,6 +660,14 @@ async fn reconcile_inner(
         return Ok(Action::requeue(NON_LEADER_REQUEUE));
     }
 
+    // Any Gateway change (create/spec edit/mode switch/delete) may shift the
+    // shared-mode VIP map — signal the single serialized reconciler to recompute
+    // it. Cheap and coalesced; the actual provisioning never runs here (#472).
+    // Skipped when the feature is off (no VIP task is consuming the signal).
+    if !ctx.shared_proxy_selector.is_empty() {
+        ctx.vip_trigger.notify_one();
+    }
+
     let key = gateway_key(&gw);
     let gw_namespace = gw.metadata.namespace.as_deref().unwrap_or("");
     let gw_name = gw.metadata.name.as_deref().unwrap_or("");
@@ -708,6 +785,9 @@ async fn reconcile_inner(
                 remove_finalizer(&ctx.client, &gw).await?;
                 ctx.last_hashes.lock().remove(&key);
             }
+            // Shared-mode Gateway (no parametersRef): its VIP Service is owned by
+            // the serialized `run_vip_reconciler` task (signalled at the top of
+            // this fn), not provisioned here — see #472. Nothing per-Gateway to do.
             return Ok(Action::await_change());
         }
         Err(params::ParamsError::NotFound(ns, name)) => {
@@ -987,6 +1067,253 @@ fn has_dedicated_proxy_ready_condition(gw: &Gateway) -> bool {
 /// the dedicated proxy down. The generation check (mirroring the shared pool's
 /// own `gateway_is_cut_over` gate) rejects a stale `Programmed` left over from
 /// before the spec edit that triggered the migration.
+/// Whether `gw` is owned by this controller AND served by the shared pool
+/// (no `parametersRef` → not dedicated mode). Mirrors the per-Gateway
+/// classification in [`reconcile_inner`], applied across the whole Gateway set
+/// so the shared-mode allocation sees every owned shared Gateway.
+fn is_owned_shared_mode(
+    gw: &Gateway,
+    classes: &[Arc<GatewayClass>],
+    params_store: &Store<CoxswainGatewayParameters>,
+    controller_name: &str,
+) -> bool {
+    if gw.metadata.deletion_timestamp.is_some() {
+        return false;
+    }
+    let Some(class) = classes
+        .iter()
+        .find(|gc| gc.meta().name.as_deref() == Some(gw.spec.gateway_class_name.as_str()))
+    else {
+        return false;
+    };
+    if class.spec.controller_name != controller_name {
+        return false;
+    }
+    matches!(
+        params::resolve(gw, class, |r: &params::ParamsRef| {
+            params_store
+                .state()
+                .iter()
+                .find(|p| {
+                    p.meta().namespace.as_deref() == Some(r.namespace.as_str())
+                        && p.meta().name.as_deref() == Some(r.name.as_str())
+                })
+                .map(|p| p.spec.clone())
+        }),
+        Ok(None)
+    )
+}
+
+/// Backstop resync interval for the serialized VIP reconciler (#472). Events
+/// make the common case prompt; this catches a Gateway missed on an
+/// event-driven pass because a reflector store had not yet caught up.
+const VIP_RESYNC_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The single serialized background task that owns every shared-mode per-Gateway
+/// VIP Service (#472).
+///
+/// Running the whole-map reconcile from ONE task — never the concurrent
+/// per-Gateway work-queue — is what makes the internal-port allocation safe:
+/// each pass reads one consistent snapshot, computes one collision-free global
+/// map, and applies it atomically, so no two reconciles can diverge and
+/// double-book a port. Per-Gateway reconciles only *signal* this task via
+/// [`ReconcileContext::vip_trigger`]; the periodic tick is a store-lag backstop.
+async fn run_vip_reconciler(ctx: Arc<ReconcileContext>, mut shutdown: ShutdownWatch) {
+    if ctx.shared_proxy_selector.is_empty() {
+        // Shared-mode per-Gateway addressing disabled (Ingress-only install).
+        return;
+    }
+    let mut interval = tokio::time::interval(VIP_RESYNC_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            _ = ctx.vip_trigger.notified() => {}
+            _ = interval.tick() => {}
+        }
+        // Only the leader writes; followers idle until promotion.
+        if ctx.leader.load(Ordering::Acquire) {
+            reconcile_all_vips(&ctx).await;
+        }
+    }
+}
+
+/// One serialized whole-VIP reconcile pass (#472). Computes the global
+/// internal-port allocation, SSA-applies every owned shared Gateway's VIP
+/// Service, and prunes the VIP Service of any Gateway that has left shared mode.
+///
+/// Best-effort: a single Service apply/delete failure is logged and the pass
+/// continues — the next tick retries from current cluster state.
+async fn reconcile_all_vips(ctx: &ReconcileContext) {
+    let gateways = ctx.gateways_store.state();
+    let services = ctx.services_store.state();
+    let classes = ctx.class_store.state();
+
+    let is_shared =
+        |g: &Gateway| is_owned_shared_mode(g, &classes, &ctx.params_store, &ctx.controller_name);
+
+    let desired = super::shared_alloc::desired_listener_keys(&gateways, is_shared);
+    let existing = super::shared_alloc::existing_internal_ports(&services);
+    let allocation = allocate_internal_ports(&desired, &existing, DEFAULT_INTERNAL_PORT_RANGE);
+
+    // Apply each owned shared Gateway's VIP Service into the CONTROLLER namespace
+    // (alongside the shared proxy pod) so its selector resolves and the cloud LB
+    // assigns a real address (#472).
+    let ctrl_ns = ctx.controller_namespace.as_str();
+    for gw in gateways.iter().filter(|g| is_shared(g)) {
+        let key = gateway_key(gw);
+        if allocation.is_gateway_exhausted(&key) {
+            emit_port_exhaustion_event(&ctx.client, gw, &ctx.controller_name).await;
+        }
+        let internal_ports = allocation.for_gateway(&key);
+        if internal_ports.is_empty() {
+            continue;
+        }
+        let service = render::render_shared_gateway_service(&render::SharedServiceInputs {
+            gateway: gw,
+            controller_namespace: ctrl_ns,
+            shared_proxy_selector: &ctx.shared_proxy_selector,
+            internal_ports: &internal_ports,
+            service_type: ctx.shared_vip_service_type,
+        });
+        if let Err(e) = apply::apply_shared_vip_service(&ctx.client, ctrl_ns, &service).await {
+            log_vip_apply_failure(gw, &e, "Service");
+        }
+    }
+
+    // Orphan-prune: the VIP Services live in the controller namespace and carry
+    // NO owner reference (a cross-namespace owner ref to the Gateway is illegal),
+    // so this serialized reconciler — the single writer over the synced Gateway
+    // store — deletes any VIP Service whose owning Gateway no longer exists OR has
+    // left shared mode (migrated to dedicated). Reading the full *synced* store
+    // makes the "Gateway absent" verdict reliable, so there is no store-lag
+    // false-positive (the hazard that applied only to the old per-Gateway path).
+    let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), ctrl_ns);
+    for svc in &services {
+        if !vip_service_should_prune(svc, &gateways, is_shared) {
+            continue;
+        }
+        let Some(name) = svc.metadata.name.as_deref() else {
+            continue;
+        };
+        match ignore_not_found(svc_api.delete(name, &DeleteParams::default()).await) {
+            Ok(()) => tracing::info!(
+                service = %format!("{ctrl_ns}/{name}"),
+                "operator: pruned orphan VIP Service (Gateway gone or no longer shared)"
+            ),
+            Err(e) => tracing::warn!(
+                service = %format!("{ctrl_ns}/{name}"),
+                error = %e,
+                "operator: failed to prune VIP Service; will retry"
+            ),
+        }
+    }
+}
+
+/// Log a VIP Service apply failure. A `NamespaceTerminating` 403 (mid-deletion)
+/// is expected and self-heals, so it is logged at debug to avoid a retry-spam of
+/// warnings; everything else warns and is retried next pass.
+fn log_vip_apply_failure(gw: &Gateway, err: &apply::ApplyError, kind: &str) {
+    if err.to_string().contains("being terminated") {
+        tracing::debug!(
+            gateway = %gateway_id(gw),
+            kind,
+            "operator: VIP apply skipped — namespace is terminating"
+        );
+    } else {
+        tracing::warn!(
+            gateway = %gateway_id(gw),
+            error = %err,
+            kind,
+            "operator: failed to apply shared-mode VIP resource; will retry"
+        );
+    }
+}
+
+/// Whether `svc` is an orphan shared-mode VIP Service to delete (#472): one whose
+/// owning Gateway (recorded in its `gateway-name`/`gateway-namespace` labels) no
+/// longer exists, or exists but has left shared mode (migrated to dedicated).
+/// Returns false for non-VIP Services. Safe to prune on "absent" because the
+/// caller reads the *synced* Gateway store as the single writer — there is no
+/// owner-ref GC for these (the Service lives out-of-namespace), so this is the
+/// only path that reclaims them.
+fn vip_service_should_prune(
+    svc: &Service,
+    gateways: &[Arc<Gateway>],
+    is_shared: impl Fn(&Gateway) -> bool,
+) -> bool {
+    let labels = match svc.metadata.labels.as_ref() {
+        Some(l) => l,
+        None => return false,
+    };
+    // Only our shared-VIP Services are candidates.
+    if labels
+        .get("app.kubernetes.io/component")
+        .map(String::as_str)
+        != Some(coxswain_reflector::port_alloc::SHARED_GATEWAY_VIP_COMPONENT)
+    {
+        return false;
+    }
+    let (Some(gw_ns), Some(gw_name)) = (
+        labels.get(coxswain_reflector::port_alloc::VIP_GATEWAY_NAMESPACE_LABEL),
+        labels.get(coxswain_reflector::port_alloc::VIP_GATEWAY_NAME_LABEL),
+    ) else {
+        return false;
+    };
+    match gateways.iter().find(|g| {
+        g.metadata.namespace.as_deref() == Some(gw_ns.as_str())
+            && g.metadata.name.as_deref() == Some(gw_name.as_str())
+    }) {
+        Some(gw) => !is_shared(gw), // exists but migrated out of shared mode → prune
+        None => true,               // Gateway gone (no GC for an out-of-ns Service) → prune
+    }
+}
+
+/// Emit a `Warning` Event on the Gateway when the internal target-port range is
+/// exhausted (#472). Controller is the sole diagnostic emitter; the unallocated
+/// listeners simply get no VIP port. Best-effort — a publish failure is logged,
+/// never propagated (it must not block provisioning of the ports that DID fit).
+async fn emit_port_exhaustion_event(client: &Client, gw: &Gateway, controller_name: &str) {
+    use kube::runtime::events::{Event, EventType, Recorder, Reporter};
+
+    tracing::warn!(
+        gateway = %gateway_id(gw),
+        "operator: internal target-port range (30000-32767) exhausted; \
+         some shared-mode listeners have no VIP port and will not be addressed"
+    );
+    let reference = ObjectReference {
+        api_version: Some("gateway.networking.k8s.io/v1".into()),
+        kind: Some("Gateway".into()),
+        name: gw.metadata.name.clone(),
+        namespace: gw.metadata.namespace.clone(),
+        uid: gw.metadata.uid.clone(),
+        ..Default::default()
+    };
+    let reporter = Reporter {
+        controller: controller_name.to_string(),
+        instance: None,
+    };
+    let recorder = Recorder::new(client.clone(), reporter);
+    if let Err(e) = recorder
+        .publish(
+            &Event {
+                action: "AllocateInternalPort".into(),
+                reason: "NoInternalPortAvailable".into(),
+                note: Some(
+                    "Internal target-port range exhausted; some listeners have no VIP port".into(),
+                ),
+                type_: EventType::Warning,
+                secondary: None,
+            },
+            &reference,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "Failed to publish NoInternalPortAvailable Event");
+    }
+}
+
 fn shared_pool_is_serving(gw: &Gateway) -> bool {
     let expected_gen = gw.metadata.generation.unwrap_or(0);
     gw.status
@@ -1355,5 +1682,87 @@ mod tests {
         let r1 = render::render(&inputs);
         let r2 = render::render(&inputs);
         assert_eq!(hash_rendered(&r1), hash_rendered(&r2));
+    }
+
+    // ── Shared-mode VIP Service pruning (#472) ───────────────────────────────
+
+    fn gw_named(ns: &str, name: &str) -> Arc<Gateway> {
+        use coxswain_reflector::gw_types::v::gateways::GatewaySpec;
+        Arc::new(Gateway {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some(ns.into()),
+                name: Some(name.into()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "coxswain".into(),
+                listeners: vec![],
+                ..Default::default()
+            },
+            status: None,
+        })
+    }
+
+    /// A VIP Service for Gateway `gw_ns/gw_name` — it lives in the controller
+    /// namespace and records the owning Gateway via labels (#472).
+    fn vip_svc(gw_ns: &str, gw_name: &str) -> Service {
+        use coxswain_reflector::port_alloc::{
+            SHARED_GATEWAY_VIP_COMPONENT, VIP_GATEWAY_NAME_LABEL, VIP_GATEWAY_NAMESPACE_LABEL,
+        };
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "app.kubernetes.io/component".into(),
+            SHARED_GATEWAY_VIP_COMPONENT.into(),
+        );
+        labels.insert(VIP_GATEWAY_NAME_LABEL.into(), gw_name.into());
+        labels.insert(VIP_GATEWAY_NAMESPACE_LABEL.into(), gw_ns.into());
+        Service {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some("coxswain-system".into()),
+                name: Some(format!("{gw_ns}-{gw_name}-shared-gw")),
+                labels: Some(labels),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prune_targets_migrated_and_deleted_gateways() {
+        let gateways = vec![gw_named("default", "shared"), gw_named("default", "dedi")];
+        let is_shared = |g: &Gateway| g.metadata.name.as_deref() == Some("shared");
+
+        // Exists but migrated out of shared mode → prune.
+        assert!(
+            vip_service_should_prune(&vip_svc("default", "dedi"), &gateways, is_shared),
+            "VIP Service of a Gateway that left shared mode is pruned"
+        );
+        // Gateway gone entirely → prune (no owner-ref GC for an out-of-ns Service;
+        // the single-writer reconciler over the synced store is the only reclaimer).
+        assert!(
+            vip_service_should_prune(&vip_svc("default", "ghost"), &gateways, is_shared),
+            "VIP Service whose Gateway no longer exists is pruned"
+        );
+        // Still shared → kept.
+        assert!(
+            !vip_service_should_prune(&vip_svc("default", "shared"), &gateways, is_shared),
+            "VIP Service of a still-shared Gateway is kept"
+        );
+    }
+
+    #[test]
+    fn prune_ignores_non_vip_services() {
+        let gateways = vec![gw_named("default", "shared")];
+        let is_shared = |_: &Gateway| true;
+        // A Service without our component label is never our concern.
+        let foreign = Service {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some("coxswain-system".into()),
+                name: Some("other".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!vip_service_should_prune(&foreign, &gateways, is_shared));
     }
 }

@@ -195,15 +195,9 @@ async fn gateway_deleted_route_stops_serving() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
     // Baseline: the route serves echo-a while the HTTPRoute exists.
-    wait::wait_for_backend(
-        &h.gateway_http,
-        &host,
-        "/a",
-        "echo-a",
-        Duration::from_secs(60),
-    )
-    .await?;
+    wait::wait_for_backend(&gw, &host, "/a", "echo-a", Duration::from_secs(60)).await?;
 
     // Delete the HTTPRoute object — leave the Gateway in place.
     let routes: Api<HTTPRoute> = Api::namespaced(h.client.clone(), &ns.name);
@@ -212,7 +206,7 @@ async fn gateway_deleted_route_stops_serving() -> anyhow::Result<()> {
         .await?;
 
     // With no attached route the Gateway listener 404s for the host.
-    wait::wait_for_route_status(&h.gateway_http, &host, "/a", 404, Duration::from_secs(30)).await?;
+    wait::wait_for_route_status(&gw, &host, "/a", 404, Duration::from_secs(30)).await?;
 
     Ok(())
 }
@@ -583,16 +577,17 @@ async fn gateway_path_match_routes_to_backend() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
 
     // Wait for the route to become live before asserting individual paths.
-    let resp = wait::wait_for_route(&h.gateway_http, &host, "/a", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/a", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
-    let resp = h.gateway_http.get(&host, "/b").await?;
+    let resp = gw.get(&host, "/b").await?;
     resp.assert_backend("echo-b");
 
     // Catch-all rule routes to echo-a.
-    let resp = h.gateway_http.get(&host, "/").await?;
+    let resp = gw.get(&host, "/").await?;
     resp.assert_backend("echo-a");
 
     Ok(())
@@ -608,13 +603,14 @@ async fn host_pool_round_robins_across_backends() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::HOST_POOL, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("pool.{}.local", ns.name);
-    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/probe", Duration::from_secs(60)).await?;
 
     // Round-robin across echo-a and echo-b — collect enough responses to see both.
     let mut saw_a = false;
     let mut saw_b = false;
     for _ in 0..20 {
-        let resp = h.gateway_http.get(&host, "/").await?;
+        let resp = gw.get(&host, "/").await?;
         let pod = resp.pod.as_deref().unwrap_or("");
         if pod.starts_with("echo-a-") {
             saw_a = true;
@@ -643,17 +639,18 @@ async fn gateway_wildcard_host_matches_multi_label_subdomains() -> anyhow::Resul
 
     // Any subdomain of *.wildcard.TESTNS.local should reach echo-c.
     let host = format!("foo.wildcard.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-c");
 
     let host2 = format!("bar.wildcard.{}.local", ns.name);
-    let resp2 = h.gateway_http.get(&host2, "/").await?;
+    let resp2 = gw.get(&host2, "/").await?;
     resp2.assert_backend("echo-c");
 
     // Gateway API spec: `*` matches any number of subdomain labels, so multi-label
     // subdomains must also reach echo-c.
     let multi = format!("a.b.foo.wildcard.{}.local", ns.name);
-    let resp3 = h.gateway_http.get(&multi, "/").await?;
+    let resp3 = gw.get(&multi, "/").await?;
     resp3.assert_backend("echo-c");
 
     Ok(())
@@ -681,7 +678,8 @@ async fn cross_namespace_grant_allows_backend_routing() -> anyhow::Result<()> {
     .await?;
 
     let host = format!("cross-ns.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-d");
 
     Ok(())
@@ -723,11 +721,12 @@ async fn cross_namespace_without_grant_blocks_backend() -> anyhow::Result<()> {
     .await?;
 
     let host = format!("cross-ns.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
 
     // Without the grant the backend cannot be resolved so an error-sentinel
     // route is installed, returning 500. Poll until the route is live —
     // a fixed sleep raced HotReloader's restart cycle on slow runs.
-    wait::wait_for_route_status(&h.gateway_http, &host, "/", 500, Duration::from_secs(60)).await?;
+    wait::wait_for_route_status(&gw, &host, "/", 500, Duration::from_secs(60)).await?;
 
     Ok(())
 }
@@ -742,29 +741,25 @@ async fn header_match_routes_only_matching_requests() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::HEADER_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/probe", Duration::from_secs(60)).await?;
 
     // Exact header match → echo-a
-    let (status, body) = h
-        .gateway_http
+    let (status, body) = gw
         .request(Method::GET, &host, "/hdr", &[("X-Tenant", "a")])
         .await?;
     assert_eq!(status, 200, "expected 200 for exact header match");
     body.unwrap().assert_backend("echo-a");
 
     // Regex header match → echo-b
-    let (status, body) = h
-        .gateway_http
+    let (status, body) = gw
         .request(Method::GET, &host, "/hdr", &[("X-Tenant", "beta")])
         .await?;
     assert_eq!(status, 200, "expected 200 for regex header match");
     body.unwrap().assert_backend("echo-b");
 
     // No matching header → no route
-    let (status, _) = h
-        .gateway_http
-        .request(Method::GET, &host, "/hdr", &[])
-        .await?;
+    let (status, _) = gw.request(Method::GET, &host, "/hdr", &[]).await?;
     assert_eq!(
         status, 404,
         "expected 404 (no matching route) when header predicate not satisfied"
@@ -783,21 +778,16 @@ async fn method_match_routes_by_method() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::METHOD_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/probe", Duration::from_secs(60)).await?;
 
     // GET → echo-a
-    let (status, body) = h
-        .gateway_http
-        .request(Method::GET, &host, "/method", &[])
-        .await?;
+    let (status, body) = gw.request(Method::GET, &host, "/method", &[]).await?;
     assert_eq!(status, 200, "expected 200 for GET");
     body.unwrap().assert_backend("echo-a");
 
     // POST → echo-b
-    let (status, body) = h
-        .gateway_http
-        .request(Method::POST, &host, "/method", &[])
-        .await?;
+    let (status, body) = gw.request(Method::POST, &host, "/method", &[]).await?;
     assert_eq!(status, 200, "expected 200 for POST");
     body.unwrap().assert_backend("echo-b");
 
@@ -814,29 +804,25 @@ async fn query_param_match_routes_only_matching_requests() -> anyhow::Result<()>
     fixtures::apply_fixture(gwa::QUERY_PARAM_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/probe", Duration::from_secs(60)).await?;
 
     // Exact query param match → echo-a
-    let (status, body) = h
-        .gateway_http
+    let (status, body) = gw
         .request(Method::GET, &host, "/query?version=v1", &[])
         .await?;
     assert_eq!(status, 200, "expected 200 for exact query param match");
     body.unwrap().assert_backend("echo-a");
 
     // Regex query param match → echo-b
-    let (status, body) = h
-        .gateway_http
+    let (status, body) = gw
         .request(Method::GET, &host, "/query?version=v2.5", &[])
         .await?;
     assert_eq!(status, 200, "expected 200 for regex query param match");
     body.unwrap().assert_backend("echo-b");
 
     // No matching query param → no route
-    let (status, _) = h
-        .gateway_http
-        .request(Method::GET, &host, "/query", &[])
-        .await?;
+    let (status, _) = gw.request(Method::GET, &host, "/query", &[]).await?;
     assert_eq!(
         status, 404,
         "expected 404 (no matching route) when query predicate not satisfied"
@@ -855,27 +841,25 @@ async fn combined_match_applies_and_or_semantics() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::COMBINED_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/probe", Duration::from_secs(60)).await?;
 
     // AND semantics: GET + X-Env: prod → echo-a
-    let (status, body) = h
-        .gateway_http
+    let (status, body) = gw
         .request(Method::GET, &host, "/combined", &[("X-Env", "prod")])
         .await?;
     assert_eq!(status, 200, "expected 200 for GET + X-Env: prod");
     body.unwrap().assert_backend("echo-a");
 
     // OR semantics: second match (POST + X-Env: staging) also routes to echo-a
-    let (status, body) = h
-        .gateway_http
+    let (status, body) = gw
         .request(Method::POST, &host, "/combined", &[("X-Env", "staging")])
         .await?;
     assert_eq!(status, 200, "expected 200 for POST + X-Env: staging");
     body.unwrap().assert_backend("echo-a");
 
     // AND semantics failure: correct method, wrong header value → no match
-    let (status, _) = h
-        .gateway_http
+    let (status, _) = gw
         .request(Method::GET, &host, "/combined", &[("X-Env", "dev")])
         .await?;
     assert_eq!(
@@ -896,17 +880,12 @@ async fn request_header_modifier_injects_request_header() -> anyhow::Result<()> 
     fixtures::apply_fixture(gwa::FILTERS, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/filter/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/filter/probe", Duration::from_secs(60)).await?;
 
     // The echo backend reflects request headers in the response body JSON;
     // echo-basic returns headers as Title-Case keys with JSON array values.
-    let resp = h.gateway_http.get(&host, "/filter/req-header").await?;
+    let resp = gw.get(&host, "/filter/req-header").await?;
     let injected = resp
         .headers
         .get("X-Test-Set")
@@ -930,18 +909,10 @@ async fn response_header_modifier_sets_response_header() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::FILTERS, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/filter/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/filter/probe", Duration::from_secs(60)).await?;
 
-    let (status, resp_headers, _) = h
-        .gateway_http
-        .get_full(&host, "/filter/resp-header")
-        .await?;
+    let (status, resp_headers, _) = gw.get_full(&host, "/filter/resp-header").await?;
     assert_eq!(status, 200, "ResponseHeaderModifier: expected 200");
     let hdr_val = resp_headers
         .get("x-test-response")
@@ -965,16 +936,11 @@ async fn request_redirect_returns_302_to_target() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::FILTERS, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/filter/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/filter/probe", Duration::from_secs(60)).await?;
 
     // The default reqwest client follows redirects; disable that to observe the 302.
-    let url = format!("http://{}{}", h.gateway_http.proxy_addr, "/filter/redirect");
+    let url = format!("http://{}{}", gw.proxy_addr, "/filter/redirect");
     let redirect_resp = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
@@ -1011,16 +977,11 @@ async fn url_rewrite_replaces_request_path() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::FILTERS, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/filter/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/filter/probe", Duration::from_secs(60)).await?;
 
     // The echo backend returns the path it received; expect the rewritten path.
-    let resp = h.gateway_http.get(&host, "/filter/old/resource").await?;
+    let resp = gw.get(&host, "/filter/old/resource").await?;
     let echo_path = resp.path.as_deref().unwrap_or("");
     assert_eq!(
         echo_path, "/filter/new/resource",
@@ -1040,19 +1001,14 @@ async fn timeouts_request_returns_504() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::TIMEOUTS, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("timeout.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
 
     // Wait until the route is programmed. /request-timeout always returns 504 so we
     // can't use it as a readiness probe; use /backend-timeout (also 504) instead.
-    wait::wait_for_route_status(
-        &h.gateway_http,
-        &host,
-        "/backend-timeout",
-        504,
-        Duration::from_secs(60),
-    )
-    .await?;
+    wait::wait_for_route_status(&gw, &host, "/backend-timeout", 504, Duration::from_secs(60))
+        .await?;
 
-    let status = h.gateway_http.get_status(&host, "/request-timeout").await?;
+    let status = gw.get_status(&host, "/request-timeout").await?;
     assert_eq!(
         status, 504,
         "expected 504 from request timeout, got {status}"
@@ -1071,19 +1027,14 @@ async fn timeouts_backend_request_returns_504() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::TIMEOUTS, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("timeout.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
 
     // Wait until the route is registered. Both rules time out so we cannot use
     // wait_for_route; instead we poll until the 504 appears.
-    wait::wait_for_route_status(
-        &h.gateway_http,
-        &host,
-        "/backend-timeout",
-        504,
-        Duration::from_secs(60),
-    )
-    .await?;
+    wait::wait_for_route_status(&gw, &host, "/backend-timeout", 504, Duration::from_secs(60))
+        .await?;
 
-    let status = h.gateway_http.get_status(&host, "/backend-timeout").await?;
+    let status = gw.get_status(&host, "/backend-timeout").await?;
     assert_eq!(
         status, 504,
         "expected 504 from backend request timeout, got {status}"
@@ -1102,10 +1053,11 @@ async fn weighted_split_distributes_by_weight() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::WEIGHTED_SPLIT, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("weighted.{}.local", ns.name);
-    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/probe", Duration::from_secs(60)).await?;
 
     // /zero: echo-a has weight 0 → all traffic must go to echo-b.
-    let counts = http::count_backends(&h.gateway_http, &host, "/zero", 40).await?;
+    let counts = http::count_backends(&gw, &host, "/zero", 40).await?;
     assert_eq!(
         counts.get("echo-a").copied().unwrap_or(0),
         0,
@@ -1119,7 +1071,7 @@ async fn weighted_split_distributes_by_weight() -> anyhow::Result<()> {
     // /skewed: echo-a weight 4, echo-b weight 1 → ~80% to echo-a.
     // Send 200 requests; allow ±10pp tolerance to stay robust under scheduling noise.
     let n = 200usize;
-    let counts = http::count_backends(&h.gateway_http, &host, "/skewed", n).await?;
+    let counts = http::count_backends(&gw, &host, "/skewed", n).await?;
     let a = counts.get("echo-a").copied().unwrap_or(0);
     let ratio = a as f64 / n as f64;
     assert!(
@@ -1179,12 +1131,13 @@ async fn endpoint_serving_false_is_excluded() -> anyhow::Result<()> {
 
     fixtures::apply_fixture(gwa::SERVING_DRAIN, FixtureVars::new(&ns.name)).await?;
     let host = format!("serving.{}.local", ns.name);
-    wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(60)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
 
     // All 30 requests must reach echo-a. If the serving:false endpoint were
     // selected, ~50% of requests would fail with a connection error to 192.0.2.1,
     // causing count_backends to return Err and the test to fail.
-    let counts = http::count_backends(&h.gateway_http, &host, "/", 30).await?;
+    let counts = http::count_backends(&gw, &host, "/", 30).await?;
     assert_eq!(
         counts.get("echo-a").copied().unwrap_or(0),
         30,
@@ -1216,30 +1169,19 @@ async fn parent_ref_port_match_binds_only_pinned_listener() -> anyhow::Result<()
 
     // route-pinned (parentRef.port=HTTP_PORT) must attach only to the HTTP listener.
     let pinned_host = format!("pinned.{}.local", ns.name);
-    let resp = wait::wait_for_route(
-        &h.gateway_http,
-        &pinned_host,
-        "/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let resp = wait::wait_for_route(&gw, &pinned_host, "/probe", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
     // route-unpinned (no parentRef.port) must attach to BOTH listeners.
     let both_host = format!("both.{}.local", ns.name);
-    let resp = wait::wait_for_route(
-        &h.gateway_http,
-        &both_host,
-        "/probe",
-        Duration::from_secs(30),
-    )
-    .await?;
+    let resp = wait::wait_for_route(&gw, &both_host, "/probe", Duration::from_secs(30)).await?;
     resp.assert_backend("echo-a");
 
     // route-wrong-port (parentRef.port=WRONG_PORT) must NOT be routable on HTTP_PORT:
     // the route is scoped to the alt listener, which coxswain doesn't bind.
     let wrong_host = format!("wrong.{}.local", ns.name);
-    let status = h.gateway_http.get_status(&wrong_host, "/").await?;
+    let status = gw.get_status(&wrong_host, "/").await?;
     assert_eq!(
         status, 404,
         "route-wrong-port must not be routable on HTTP_PORT (no attached route → 404)"
@@ -1258,9 +1200,6 @@ async fn parent_ref_port_match_binds_only_pinned_listener() -> anyhow::Result<()
         .as_array()
         .expect("gateway.hosts array");
 
-    let http_port = u64::from(h.controller.gateway_http_addr.port());
-    let wrong_port_u64: u64 = wrong_port.parse().unwrap();
-
     let ports_for = |host: &str| -> std::collections::BTreeSet<u64> {
         hosts
             .iter()
@@ -1269,23 +1208,37 @@ async fn parent_ref_port_match_binds_only_pinned_listener() -> anyhow::Result<()
             .collect()
     };
 
-    // pinned.* appears under http_port only.
-    assert_eq!(
-        ports_for(&pinned_host),
-        [http_port].into(),
-        "pinned.* must appear only under HTTP_PORT in the routing table"
-    );
-    // wrong.* appears under wrong_port only (installed by controller; proxy doesn't bind that port).
-    assert_eq!(
-        ports_for(&wrong_host),
-        [wrong_port_u64].into(),
-        "wrong.* must appear only under WRONG_PORT in the routing table"
-    );
-    // both.* appears under both ports (no port filter → all listeners).
+    // The routing table is keyed by the per-Gateway internal target port (#472),
+    // not the advertised listener port — each of the two listeners (HTTP_PORT and
+    // WRONG_PORT) maps to a distinct internal port. Assert the parentRef.port
+    // isolation PROPERTY structurally rather than by literal port number:
+    //   - a pinned route attaches to exactly one listener,
+    //   - the two pinned routes attach to *different* listeners,
+    //   - the unpinned route spans both.
+    let pinned_ports = ports_for(&pinned_host);
+    let wrong_ports = ports_for(&wrong_host);
     let both_ports = ports_for(&both_host);
-    assert!(
-        both_ports.contains(&http_port) && both_ports.contains(&wrong_port_u64),
-        "both.* must appear under both HTTP_PORT and WRONG_PORT, got {both_ports:?}"
+
+    assert_eq!(
+        pinned_ports.len(),
+        1,
+        "pinned.* must attach to exactly one listener, got {pinned_ports:?}"
+    );
+    assert_eq!(
+        wrong_ports.len(),
+        1,
+        "wrong.* must attach to exactly one listener, got {wrong_ports:?}"
+    );
+    assert_ne!(
+        pinned_ports, wrong_ports,
+        "pinned.* and wrong.* are pinned to different listeners, so must occupy \
+         distinct internal ports (got pinned={pinned_ports:?}, wrong={wrong_ports:?})"
+    );
+    assert_eq!(
+        both_ports,
+        &pinned_ports | &wrong_ports,
+        "both.* (no parentRef.port) must span both listeners' internal ports; \
+         got both={both_ports:?}, pinned={pinned_ports:?}, wrong={wrong_ports:?}"
     );
 
     Ok(())
@@ -1495,12 +1448,12 @@ async fn url_rewrite_replaces_request_host() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::HOST_REWRITE, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("rewrite.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
 
-    let resp =
-        wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/probe", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
-    let resp = h.gateway_http.get(&host, "/test").await?;
+    let resp = gw.get(&host, "/test").await?;
     resp.assert_backend("echo-a");
 
     let echo_host = resp.host.as_deref().expect("missing or invalid host echo");
@@ -1525,19 +1478,16 @@ async fn request_redirect_returns_various_status_codes() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::REDIRECT_STATUS_CODES, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("redirect.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
 
-    let _ = wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+    let _ = wait::wait_for_route(&gw, &host, "/probe", Duration::from_secs(60)).await?;
 
     // HTTP 303
     let req = reqwest::Request::new(
         Method::GET,
-        format!(
-            "http://{}:{}/303",
-            h.gateway_http.proxy_addr.ip(),
-            h.gateway_http.proxy_addr.port()
-        )
-        .parse()
-        .unwrap(),
+        format!("http://{}:{}/303", gw.proxy_addr.ip(), gw.proxy_addr.port())
+            .parse()
+            .unwrap(),
     );
     let mut req = req;
     req.headers_mut().insert("Host", host.parse().unwrap());
@@ -1553,13 +1503,9 @@ async fn request_redirect_returns_various_status_codes() -> anyhow::Result<()> {
     // HTTP 307
     let req = reqwest::Request::new(
         Method::GET,
-        format!(
-            "http://{}:{}/307",
-            h.gateway_http.proxy_addr.ip(),
-            h.gateway_http.proxy_addr.port()
-        )
-        .parse()
-        .unwrap(),
+        format!("http://{}:{}/307", gw.proxy_addr.ip(), gw.proxy_addr.port())
+            .parse()
+            .unwrap(),
     );
     let mut req = req;
     req.headers_mut().insert("Host", host.parse().unwrap());
@@ -1569,13 +1515,9 @@ async fn request_redirect_returns_various_status_codes() -> anyhow::Result<()> {
     // HTTP 308
     let req = reqwest::Request::new(
         Method::GET,
-        format!(
-            "http://{}:{}/308",
-            h.gateway_http.proxy_addr.ip(),
-            h.gateway_http.proxy_addr.port()
-        )
-        .parse()
-        .unwrap(),
+        format!("http://{}:{}/308", gw.proxy_addr.ip(), gw.proxy_addr.port())
+            .parse()
+            .unwrap(),
     );
     let mut req = req;
     req.headers_mut().insert("Host", host.parse().unwrap());
@@ -1764,11 +1706,12 @@ async fn gateway_route_encoded_dot_segment_resolved_by_default() -> anyhow::Resu
     fixtures::apply_fixture(gwa::PATH_NORMALIZE_DEFAULT, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("pn-gw.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
     // Wait for the probe path to confirm the Gateway + HTTPRoute are live.
-    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&gw, &host, "/probe", Duration::from_secs(60)).await?;
 
     // Send /api/%2E%2E/v1 — proxy must normalise and route to /v1.
-    let resp = h.gateway_http.get(&host, "/api/%2E%2E/v1").await?;
+    let resp = gw.get(&host, "/api/%2E%2E/v1").await?;
     assert_eq!(
         resp.path.as_deref(),
         Some("/v1"),
@@ -1794,11 +1737,12 @@ async fn h2c_prior_knowledge_request_reaches_backend() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
     // Wait for the route to be live before issuing the h2c request.
-    wait::wait_for_route(&h.gateway_http, &host, "/probe", Duration::from_secs(60)).await?;
+    wait::wait_for_route(&gw, &host, "/probe", Duration::from_secs(60)).await?;
 
     // Build a client that sends h2c prior-knowledge (PRI * HTTP/2.0... preface).
-    let gw_addr = h.controller.gateway_http_addr;
+    let gw_addr = gw.proxy_addr;
     let client = reqwest::Client::builder()
         .http2_prior_knowledge()
         .timeout(Duration::from_secs(5))
@@ -1838,8 +1782,9 @@ async fn h1_client_unaffected_when_h2c_active() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("echo.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
     // Standard HTTP/1.1 client — same path as all other routing tests.
-    let resp = wait::wait_for_route(&h.gateway_http, &host, "/a", Duration::from_secs(60)).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/a", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
 
     Ok(())
@@ -1871,7 +1816,7 @@ async fn grpc_route_forwards_to_matched_service_method() -> anyhow::Result<()> {
     .await?;
 
     let host = format!("grpc-echo.{}.local", ns.name);
-    let gw_addr = h.controller.gateway_http_addr;
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
     let origin: tonic::transport::Uri = format!("http://{}:{}", host, gw_addr.port()).parse()?;
     let endpoint =
         tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))?.origin(origin);
@@ -1937,7 +1882,7 @@ async fn grpc_route_unmatched_method_is_not_served() -> anyhow::Result<()> {
     .await?;
 
     let host = format!("grpc-echo.{}.local", ns.name);
-    let gw_addr = h.controller.gateway_http_addr;
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
     let origin: tonic::transport::Uri = format!("http://{}:{}", host, gw_addr.port()).parse()?;
     let endpoint =
         tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))?.origin(origin);
@@ -2003,18 +1948,13 @@ async fn cors_preflight_returns_204_with_allow_headers() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::CORS, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("cors.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/cors/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/cors/probe", Duration::from_secs(60)).await?;
 
     let url = format!(
         "http://{}:{}/cors/preflight",
-        h.gateway_http.proxy_addr.ip(),
-        h.gateway_http.proxy_addr.port()
+        gw.proxy_addr.ip(),
+        gw.proxy_addr.port()
     );
     let resp = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -2067,18 +2007,13 @@ async fn cors_disallowed_origin_omits_allow_origin_header() -> anyhow::Result<()
     fixtures::apply_fixture(gwa::CORS, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("cors.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/cors/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/cors/probe", Duration::from_secs(60)).await?;
 
     let url = format!(
         "http://{}:{}/cors/actual",
-        h.gateway_http.proxy_addr.ip(),
-        h.gateway_http.proxy_addr.port()
+        gw.proxy_addr.ip(),
+        gw.proxy_addr.port()
     );
     let resp = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -2115,16 +2050,10 @@ async fn cors_actual_request_injects_allow_origin_header() -> anyhow::Result<()>
     fixtures::apply_fixture(gwa::CORS, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("cors.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/cors/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/cors/probe", Duration::from_secs(60)).await?;
 
-    let (status, resp_headers, body) = h
-        .gateway_http
+    let (status, resp_headers, body) = gw
         .get_full_with_headers(
             &host,
             "/cors/actual",
@@ -2191,13 +2120,8 @@ async fn mirrored_request_reaches_shadow_while_client_sees_primary() -> anyhow::
     fixtures::apply_fixture(gwa::MIRROR, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("mirror.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/mirror/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/mirror/probe", Duration::from_secs(60)).await?;
 
     let metrics_url = h.admin_url("/metrics");
     let metrics_client = reqwest::Client::builder()
@@ -2208,8 +2132,7 @@ async fn mirrored_request_reaches_shadow_while_client_sees_primary() -> anyhow::
     let before = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
 
     // Send a request through the mirrored rule.
-    let (status, body) = h
-        .gateway_http
+    let (status, body) = gw
         .request(Method::GET, &host, "/mirror/single", &[])
         .await?;
     assert_eq!(status, 200, "primary backend must return 200");
@@ -2236,10 +2159,7 @@ async fn mirrored_request_reaches_shadow_while_client_sees_primary() -> anyhow::
     // The counter is bumped synchronously before spawn, so a simple before/after
     // check across the request is sufficient.
     let before2 = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
-    let (status2, body2) = h
-        .gateway_http
-        .request(Method::GET, &host, "/mirror/probe", &[])
-        .await?;
+    let (status2, body2) = gw.request(Method::GET, &host, "/mirror/probe", &[]).await?;
     assert_eq!(status2, 200, "probe route must return 200");
     body2.unwrap().assert_backend("echo-a");
     let after2 = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
@@ -2261,13 +2181,8 @@ async fn percent_zero_mirror_never_dispatches() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::MIRROR, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("mirror.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/mirror/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/mirror/probe", Duration::from_secs(60)).await?;
 
     let metrics_url = h.admin_url("/metrics");
     let metrics_client = reqwest::Client::builder()
@@ -2279,8 +2194,7 @@ async fn percent_zero_mirror_never_dispatches() -> anyhow::Result<()> {
 
     // Send several requests through the percent=0 rule.
     for _ in 0..5u8 {
-        let (status, _) = h
-            .gateway_http
+        let (status, _) = gw
             .request(Method::GET, &host, "/mirror/percent-zero", &[])
             .await?;
         assert_eq!(
@@ -2310,13 +2224,8 @@ async fn multiple_mirrors_each_receive_a_copy() -> anyhow::Result<()> {
     fixtures::apply_fixture(gwa::MIRROR_MULTIPLE, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("mirror-multi.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/mirror-multi/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/mirror-multi/probe", Duration::from_secs(60)).await?;
 
     let metrics_url = h.admin_url("/metrics");
     let metrics_client = reqwest::Client::builder()
@@ -2327,8 +2236,7 @@ async fn multiple_mirrors_each_receive_a_copy() -> anyhow::Result<()> {
     let before = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
 
     // Send a request through the two-mirror rule.
-    let (status, body) = h
-        .gateway_http
+    let (status, body) = gw
         .request(Method::GET, &host, "/mirror-multi/both", &[])
         .await?;
     assert_eq!(status, 200, "primary backend must return 200");
@@ -2380,13 +2288,8 @@ async fn cross_namespace_mirror_requires_reference_grant() -> anyhow::Result<()>
     .await?;
 
     let host = format!("mirror-xns.{}.local", ns.name);
-    wait::wait_for_route(
-        &h.gateway_http,
-        &host,
-        "/mirror-xns/probe",
-        Duration::from_secs(60),
-    )
-    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/mirror-xns/probe", Duration::from_secs(60)).await?;
 
     let metrics_url = h.admin_url("/metrics");
     let metrics_client = reqwest::Client::builder()
@@ -2397,8 +2300,7 @@ async fn cross_namespace_mirror_requires_reference_grant() -> anyhow::Result<()>
     let before = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
 
     // With the grant in place: mirror must fire.
-    let (status, body) = h
-        .gateway_http
+    let (status, body) = gw
         .request(Method::GET, &host, "/mirror-xns/path", &[])
         .await?;
     assert_eq!(status, 200, "primary must return 200");
@@ -2439,8 +2341,7 @@ async fn cross_namespace_mirror_requires_reference_grant() -> anyhow::Result<()>
     .await?;
 
     let before_denied = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
-    let (status2, body2) = h
-        .gateway_http
+    let (status2, body2) = gw
         .request(Method::GET, &host, "/mirror-xns/path", &[])
         .await?;
     assert_eq!(

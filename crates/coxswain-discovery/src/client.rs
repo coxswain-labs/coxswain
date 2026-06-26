@@ -17,7 +17,7 @@ use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
 };
 use coxswain_core::tls::{
-    ListenerHostnamesBuilder, SharedClientCertStore, SharedListenerHostnames, SharedTlsStore,
+    ListenerHostnamesBuilder, SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -37,7 +37,7 @@ use crate::svid::SharedSvid;
 use crate::version::WIRE_VERSION;
 use crate::wire::{
     client_cert_from_wire, gateway_from_wire, ingress_from_wire, listener_health_from_wire,
-    passthrough_from_wire, tls_from_wire,
+    passthrough_from_wire, port_tls_from_wire,
 };
 
 /// Configuration for the discovery gRPC client supervisor.
@@ -131,7 +131,7 @@ impl DiscoveryClientConfig {
 pub struct DiscoveryClient {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
-    tls_store: SharedTlsStore,
+    tls_store: SharedPortTlsStore,
     client_cert_store: SharedClientCertStore,
     listener_health: SharedGatewayListenerHealth,
     listener_hostnames: SharedListenerHostnames,
@@ -184,7 +184,7 @@ impl DiscoveryClient {
 
         let ingress_routes = SharedIngressRoutingTable::new();
         let gateway_routes = SharedGatewayRoutingTable::new();
-        let tls_store = SharedTlsStore::new();
+        let tls_store = SharedPortTlsStore::new();
         let client_cert_store = SharedClientCertStore::new();
         let listener_health = SharedGatewayListenerHealth::new();
         let listener_hostnames = SharedListenerHostnames::new();
@@ -257,7 +257,7 @@ impl DiscoveryClient {
     ///
     /// [`Shared`]: coxswain_core::Shared
     #[must_use]
-    pub fn tls_store(&self) -> SharedTlsStore {
+    pub fn tls_store(&self) -> SharedPortTlsStore {
         self.tls_store.clone()
     }
 
@@ -305,7 +305,7 @@ impl coxswain_core::RoutingSource for DiscoveryClient {
         self.gateway_routes.clone()
     }
 
-    fn tls_store(&self) -> SharedTlsStore {
+    fn tls_store(&self) -> SharedPortTlsStore {
         self.tls_store.clone()
     }
 
@@ -335,7 +335,7 @@ pub struct Supervisor {
     config: DiscoveryClientConfig,
     ingress: SharedIngressRoutingTable,
     gateway: SharedGatewayRoutingTable,
-    tls: SharedTlsStore,
+    tls: SharedPortTlsStore,
     client_certs: SharedClientCertStore,
     listener_health: SharedGatewayListenerHealth,
     listener_hostnames: SharedListenerHostnames,
@@ -571,7 +571,7 @@ impl Supervisor {
 struct SnapshotCells<'a> {
     ingress: &'a SharedIngressRoutingTable,
     gateway: &'a SharedGatewayRoutingTable,
-    tls: &'a SharedTlsStore,
+    tls: &'a SharedPortTlsStore,
     client_certs: &'a SharedClientCertStore,
     health: &'a SharedGatewayListenerHealth,
     listener_hostnames: &'a SharedListenerHostnames,
@@ -605,11 +605,11 @@ fn apply_snapshot(
             .as_ref()
             .unwrap_or(&p::RoutingTable::default()),
     )?;
-    let tls_store = tls_from_wire(
+    let tls_store = port_tls_from_wire(
         snapshot
             .tls_store
             .as_ref()
-            .unwrap_or(&p::TlsStore::default()),
+            .unwrap_or(&p::PortTlsStore::default()),
     )?;
     let client_cert_store = client_cert_from_wire(
         snapshot
@@ -636,7 +636,13 @@ fn apply_snapshot(
     let mut lh_builder = ListenerHostnamesBuilder::new();
     for gw_health in listener_health_map.values() {
         for li in gw_health.listeners.values() {
-            lh_builder.add_listener(li.port, &li.hostname, li.tls_outcome.is_https_terminate());
+            // Keyed by BIND port (internal port for shared-mode Gateways) so the
+            // proxy's misdirected-request check matches by the accepted port (#472).
+            lh_builder.add_listener(
+                li.bind_port(),
+                &li.hostname,
+                li.tls_outcome.is_https_terminate(),
+            );
         }
     }
     cells.listener_hostnames.store(Arc::new(lh_builder.build()));
@@ -784,8 +790,8 @@ fn splitmix64(mut x: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::proto::v1::{
-        ClientMessage, GatewayListenerHealth, HostEntry, PortEntry, RouteEntry, RouteKind,
-        RoutingTable, ServerMessage, Snapshot, TlsStore,
+        ClientMessage, GatewayListenerHealth, HostEntry, PortEntry, PortTlsStore, RouteEntry,
+        RouteKind, RoutingTable, ServerMessage, Snapshot,
         discovery_server::{Discovery, DiscoveryServer},
         host_entry::Pattern,
         server_message::Kind as SrvKind,
@@ -891,7 +897,7 @@ mod tests {
                 nonce,
                 ingress_routing: Some(RoutingTable::default()),
                 gateway_routing: Some(RoutingTable::default()),
-                tls_store: Some(TlsStore::default()),
+                tls_store: Some(PortTlsStore::default()),
                 client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
                 listener_health: Some(GatewayListenerHealth::default()),
                 tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
@@ -921,7 +927,7 @@ mod tests {
                 nonce,
                 ingress_routing: Some(RoutingTable { ports: vec![port] }),
                 gateway_routing: Some(RoutingTable::default()),
-                tls_store: Some(TlsStore::default()),
+                tls_store: Some(PortTlsStore::default()),
                 client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
                 listener_health: Some(GatewayListenerHealth::default()),
                 tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),

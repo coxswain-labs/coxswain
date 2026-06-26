@@ -110,7 +110,7 @@ pub fn spawn_status_writer(
 
     let ingress_routes = coxswain_core::routing::SharedIngressRoutingTable::new();
     let gateway_routes = coxswain_core::routing::SharedGatewayRoutingTable::new();
-    let tls_store = coxswain_core::tls::SharedTlsStore::new();
+    let tls_store = coxswain_core::tls::SharedPortTlsStore::new();
     let client_cert_store = SharedClientCertStore::new();
     let listener_hostnames = SharedListenerHostnames::new();
     let gateway_tls_health = SharedGatewayListenerHealth::new();
