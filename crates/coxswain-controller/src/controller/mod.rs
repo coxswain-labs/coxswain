@@ -546,13 +546,7 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     }
 
     // Shared-mode Gateways advertise their OWN per-Gateway VIP Service address
-    // (#472). The three VIP states map to distinct address choices so a
-    // provisioned-but-pending VIP is NOT masked by the global address:
-    //   - Resolved(a)   → the Gateway's own VIP address.
-    //   - Pending       → the VIP Service exists but has no address yet; report
-    //                     NONE (Programmed stays address-less for THIS Gateway
-    //                     until its own VIP lands — never the global address).
-    //   - NotProvisioned→ feature off / no VIP Service; use the global address.
+    // (#472) — see [`select_shared_gateway_address`] for the state→address map.
     let vip = resolve_shared_vip_address(
         &ctx.client,
         gw,
@@ -560,11 +554,8 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         ctx.shared_vip_addressing,
     )
     .await;
-    let owned_status_addr: Option<StatusAddress> = match &vip {
-        VipAddress::Resolved(a) => Some(a.clone()),
-        VipAddress::Pending => None,
-        VipAddress::NotProvisioned => ctx.status_address.clone(),
-    };
+    let owned_status_addr =
+        select_shared_gateway_address(&vip, ctx.shared_vip_addressing, ctx.status_address.as_ref());
     let status_addr = owned_status_addr.as_ref();
 
     // The per-Gateway VIP Service and its LoadBalancer IP are provisioned
@@ -616,6 +607,32 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         // Accepted already set, but the subsystem is not ready yet: revisit
         // shortly so `Programmed` lands without waiting for the next event.
         Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
+    }
+}
+
+/// Map a shared Gateway's VIP state to the address it should advertise (#472).
+///
+/// The subtle case is `NotProvisioned`. When per-Gateway addressing is ON, the
+/// global `--status-address` points at the shared proxy's fixed `80`/`443`,
+/// which post-#472 serve **Ingress only** — a Gateway that advertised it would
+/// send its own clients to the Ingress listener (404/reset). So a shared Gateway
+/// must NEVER fall back to the global address: it reports no address (and the
+/// caller requeues via `awaiting_own_vip`) until its own VIP is provisioned and
+/// resolved. The global address is the Gateway's address only when the feature
+/// is OFF — the legacy single-shared-IP model where every Gateway shares it.
+///
+/// `Pending` (Service exists, address not yet assigned) always reports `None`:
+/// wait for the real VIP rather than mask it with anything else.
+fn select_shared_gateway_address(
+    vip: &VipAddress,
+    shared_vip_addressing: bool,
+    global_status_address: Option<&StatusAddress>,
+) -> Option<StatusAddress> {
+    match vip {
+        VipAddress::Resolved(a) => Some(a.clone()),
+        VipAddress::Pending => None,
+        VipAddress::NotProvisioned if shared_vip_addressing => None,
+        VipAddress::NotProvisioned => global_status_address.cloned(),
     }
 }
 
@@ -975,6 +992,59 @@ mod tests {
     use coxswain_reflector::gw_types::v::gatewayclasses::{GatewayClass, GatewayClassSpec};
     use k8s_openapi::api::networking::v1::{IngressClass, IngressClassSpec};
     use kube::api::ObjectMeta;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ip(b: u8) -> StatusAddress {
+        StatusAddress::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, b)))
+    }
+
+    fn addr_ip(a: &StatusAddress) -> Option<IpAddr> {
+        match a {
+            StatusAddress::Ip(i) => Some(*i),
+            StatusAddress::Hostname(_) => None,
+        }
+    }
+
+    #[test]
+    fn shared_gateway_advertises_its_own_resolved_vip() {
+        let global = ip(3);
+        let got = select_shared_gateway_address(&VipAddress::Resolved(ip(7)), true, Some(&global));
+        assert_eq!(got.as_ref().and_then(addr_ip), addr_ip(&ip(7)));
+    }
+
+    #[test]
+    fn shared_gateway_reports_no_address_while_vip_pending() {
+        let global = ip(3);
+        let got = select_shared_gateway_address(&VipAddress::Pending, true, Some(&global));
+        assert!(
+            got.is_none(),
+            "pending VIP must not borrow the global address"
+        );
+    }
+
+    #[test]
+    fn shared_gateway_never_falls_back_to_global_when_feature_on() {
+        // The regression behind the conformance GatewayHTTPListenerIsolation /
+        // HTTPRoute*Redirect failures: with per-Gateway addressing ON, the global
+        // --status-address points at the shared proxy's Ingress-only 80/443, so a
+        // Gateway whose VIP isn't provisioned yet must report NO address (and
+        // requeue) rather than advertise an address that resets its own traffic.
+        let global = ip(3);
+        let got = select_shared_gateway_address(&VipAddress::NotProvisioned, true, Some(&global));
+        assert!(
+            got.is_none(),
+            "feature-on Gateway must never advertise the global shared address"
+        );
+    }
+
+    #[test]
+    fn unprovisioned_gateway_uses_global_address_when_feature_off() {
+        // Legacy single-shared-IP model: with the feature OFF there are no
+        // per-Gateway VIPs, so the global address IS the Gateway's address.
+        let global = ip(3);
+        let got = select_shared_gateway_address(&VipAddress::NotProvisioned, false, Some(&global));
+        assert_eq!(got.as_ref().and_then(addr_ip), addr_ip(&ip(3)));
+    }
 
     fn gateway_class(name: &str, controller: &str, dedicated: bool) -> Arc<GatewayClass> {
         use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClassParametersRef;
