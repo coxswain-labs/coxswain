@@ -1318,3 +1318,47 @@ async fn gateway_signals_insecure_frontend_validation_mode_condition() -> anyhow
     )
     .await
 }
+
+// ── GEP-3155: Gateway backend client-cert status conditions ───────────────────
+
+/// GEP-3155 sad path: Gateway `spec.tls.backend.clientCertificateRef` points to
+/// a Secret that does not exist.
+///
+/// Expected: gateway-level `ResolvedRefs=False/InvalidClientCertificateRef`.
+/// `Accepted=True` must remain (invalid ref ≠ invalid config, per GEP-3155).
+#[tokio::test]
+async fn gateway_resolvedrefs_false_when_backend_client_cert_secret_missing() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-backend-cc-missing").await?;
+
+    fixtures::apply_fixture(
+        gwa::BACKEND_CLIENT_CERT_MISSING_SECRET,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    // ResolvedRefs must go False because the referenced Secret does not exist.
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "backend-cc-missing-gw",
+        &ns.name,
+        "ResolvedRefs",
+        "False",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Accepted must stay True — the ref failure only affects ResolvedRefs, not Accepted.
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "backend-cc-missing-gw",
+        &ns.name,
+        "Accepted",
+        "True",
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    Ok(())
+}

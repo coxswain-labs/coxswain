@@ -851,6 +851,8 @@ mod tests {
                 policy_index: &index,
                 rate_limits: &crate::tests::fixtures::empty_rate_limit_store(),
                 path_rewrites: &crate::tests::fixtures::empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );

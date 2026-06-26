@@ -43,13 +43,13 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use coxswain_core::routing::{
-    BackendGroup, BackendProtocol, BasicCredential, CircuitBreakerConfig, CompressionConfig,
-    CorsConfig, CorsOrigin, ExtAuthConfig, ExtAuthTransport, FilterAction, ForwardedForConfig,
-    GatewayRoutingTable, HashSource, HeaderMod, HeaderPredicate, HostPattern, HostRouter,
-    HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable, LoadBalance,
-    MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier, PortRoutingTable,
-    QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts,
-    RouterError, SessionAffinity, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
+    BackendClientCert, BackendGroup, BackendProtocol, BasicCredential, CircuitBreakerConfig,
+    CompressionConfig, CorsConfig, CorsOrigin, ExtAuthConfig, ExtAuthTransport, FilterAction,
+    ForwardedForConfig, GatewayRoutingTable, HashSource, HeaderMod, HeaderPredicate, HostPattern,
+    HostRouter, HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable,
+    LoadBalance, MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier,
+    PortRoutingTable, QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry, RouteKind,
+    RouteTimeouts, RouterError, SessionAffinity, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
 };
 
 use crate::error::WireError;
@@ -253,10 +253,21 @@ fn upstream_tls_to_wire(tls: &UpstreamTls) -> p::UpstreamTls {
             "invariant: all UpstreamCa variants handled; update wire.rs when adding new variants"
         ),
     };
+    let (client_cert_pem, client_cert_key, client_cert_source) = match tls.client_cert() {
+        Some(cc) => (
+            cc.cert_pem.to_vec(),
+            cc.key_pem.to_vec(),
+            cc.source.to_string(),
+        ),
+        None => (Vec::new(), Vec::new(), String::new()),
+    };
     p::UpstreamTls {
         sni: tls.sni.to_string(),
         ca: Some(ca),
         group_key: tls.group_key,
+        client_cert_pem,
+        client_cert_key,
+        client_cert_source,
     }
 }
 
@@ -906,11 +917,18 @@ fn upstream_tls_from_wire(dto: &p::UpstreamTls) -> Result<UpstreamTls, WireError
         p::upstream_tls::Ca::System(_) => UpstreamCa::System,
         p::upstream_tls::Ca::Bundle(pem) => UpstreamCa::Bundle(Arc::from(pem.clone())),
     };
-    Ok(UpstreamTls::new(
-        Arc::from(dto.sni.as_str()),
-        ca,
-        dto.group_key,
-    ))
+    let mut tls = UpstreamTls::new(Arc::from(dto.sni.as_str()), ca, dto.group_key);
+    // An empty source means no client cert; cert/key bytes are only meaningful when
+    // a source is present. Set the field directly to preserve the wire `group_key`
+    // (`with_client_cert` would re-mix the identity and diverge from the sender).
+    if !dto.client_cert_source.is_empty() {
+        tls.client_cert = Some(Arc::new(BackendClientCert::new(
+            Arc::from(dto.client_cert_pem.as_slice()),
+            Arc::from(dto.client_cert_key.as_slice()),
+            Arc::from(dto.client_cert_source.as_str()),
+        )));
+    }
+    Ok(tls)
 }
 
 fn retry_from_wire(dto: &p::RetryPolicy) -> coxswain_core::routing::RetryPolicy {
@@ -1425,6 +1443,42 @@ mod tests {
         let t = builder.build().expect("build");
         let dto = gateway_to_wire(&t);
         gateway_from_wire(&dto).expect("from_wire")
+    }
+
+    // ── UpstreamTls client cert (GEP-3155) ────────────────────────────────────
+
+    #[test]
+    fn upstream_tls_client_cert_round_trips() {
+        let tls = UpstreamTls::new(Arc::from("backend.example.com"), UpstreamCa::System, 0x1234)
+            .with_client_cert(Arc::new(BackendClientCert::new(
+                Arc::from(&b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----"[..]),
+                Arc::from(&b"-----BEGIN PRIVATE KEY-----\nBBBB\n-----END PRIVATE KEY-----"[..]),
+                Arc::from("ns/client-cert"),
+            )));
+        // with_client_cert re-mixed group_key away from the base 0x1234.
+        let mixed_key = tls.group_key;
+        assert_ne!(mixed_key, 0x1234, "client cert must perturb group_key");
+
+        let back = upstream_tls_from_wire(&upstream_tls_to_wire(&tls)).expect("from_wire");
+        let cc = back.client_cert().expect("client cert survives round-trip");
+        assert_eq!(&*cc.cert_pem, &*tls.client_cert().unwrap().cert_pem);
+        assert_eq!(&*cc.key_pem, &*tls.client_cert().unwrap().key_pem);
+        assert_eq!(&*cc.source, "ns/client-cert");
+        assert_eq!(
+            back.group_key, mixed_key,
+            "from_wire must preserve the sender's group_key, not re-mix it"
+        );
+    }
+
+    #[test]
+    fn upstream_tls_without_client_cert_round_trips() {
+        let tls = UpstreamTls::new(Arc::from("backend.example.com"), UpstreamCa::System, 0x99);
+        let back = upstream_tls_from_wire(&upstream_tls_to_wire(&tls)).expect("from_wire");
+        assert!(
+            back.client_cert().is_none(),
+            "absent client cert must stay absent (empty source)"
+        );
+        assert_eq!(back.group_key, 0x99);
     }
 
     // ── 1. Ingress exact route ────────────────────────────────────────────────

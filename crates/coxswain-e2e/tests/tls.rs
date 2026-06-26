@@ -2354,3 +2354,178 @@ async fn gateway_frontend_mtls_insecure_fallback_admits_missing_cert() -> anyhow
     resp_with_cert.assert_backend("echo-a");
     Ok(())
 }
+
+// ── GEP-3155: Gateway backend client certificate ──────────────────────────────
+
+/// GEP-3155 happy path: proxy presents client cert to mTLS upstream.
+///
+/// Sequence:
+/// 1. Generate a server cert + a client CA + client cert (two independent CAs).
+/// 2. Deploy `echo-mtls` backend (requires a client cert signed by the client CA).
+/// 3. Apply Gateway with `spec.tls.backend.clientCertificateRef` + BackendTLSPolicy.
+/// 4. Poll until the route returns 200 — proves the proxy presented a valid client cert.
+/// 5. Verify Gateway `ResolvedRefs=True`.
+#[tokio::test]
+async fn backend_mtls_presents_client_cert_when_gateway_configures_ref() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-backend-cc").await?;
+
+    // Server cert: TLS termination at the backend.
+    let tls_hostname = format!("echo-mtls.{}.local", ns.name);
+    let server_cert = GeneratedCert::for_host(&tls_hostname);
+
+    // Client CA + leaf: proxy presents this to the mTLS backend.
+    let client_certs = MtlsCerts::generate();
+
+    // Deploy echo-mtls (requires client cert signed by the client CA).
+    fixtures::apply_fixture(
+        backends::ECHO_MTLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", server_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", server_cert.key_b64())
+            .with("TLS_CLIENT_CA_B64", client_certs.ca_cert_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-mtls"]).await?;
+
+    let host = format!("backend-cc.{}.local", ns.name);
+
+    // Apply Gateway (clientCertificateRef) + HTTPRoute + BackendTLSPolicy.
+    fixtures::apply_fixture(
+        gwa::BACKEND_CLIENT_CERT,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", server_cert.cert_pem.clone())
+            .with("CLIENT_CERT_B64", client_certs.client_cert_b64())
+            .with("CLIENT_KEY_B64", client_certs.client_key_b64()),
+    )
+    .await?;
+
+    // Traffic must succeed: proxy presents the client cert, backend validates it.
+    let resp = wait::wait_for_route(&h.gateway_http, &host, "/", Duration::from_secs(90)).await?;
+    resp.assert_backend("echo-mtls");
+
+    // Gateway must report ResolvedRefs=True (client cert Secret resolved OK).
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "backend-cc-gw",
+        &ns.name,
+        "ResolvedRefs",
+        "True",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// GEP-3155 sad path: proxy presents a client cert the backend does NOT trust
+/// → upstream mTLS handshake fails → 502.
+///
+/// `echo-mtls` (echo-basic) uses `VerifyClientCertIfGiven`: it accepts a
+/// no-cert connection, but a cert that is presented MUST chain to its configured
+/// client CA.  The backend trusts CA "A"; the Gateway's `clientCertificateRef`
+/// presents a leaf from an independent CA "B".  The proxy presents B's cert →
+/// echo-basic rejects it → handshake aborts → 502.
+///
+/// This is the load-bearing proof that the proxy actually presents the
+/// configured cert: had it presented nothing, the connection would have
+/// succeeded (200), not failed closed.  Paired with the happy path above (a
+/// trusted cert → 200), the two together prove presentation + validation.
+#[tokio::test]
+async fn backend_mtls_rejects_untrusted_client_cert() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-backend-cc-untrusted").await?;
+
+    let tls_hostname = format!("echo-mtls-ut.{}.local", ns.name);
+    let server_cert = GeneratedCert::for_host(&tls_hostname);
+
+    // Two independent client CAs. The backend trusts A; the proxy presents B.
+    let backend_trusted_ca = MtlsCerts::generate();
+    let proxy_untrusted = MtlsCerts::generate();
+
+    fixtures::apply_fixture(
+        backends::ECHO_MTLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", server_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", server_cert.key_b64())
+            .with("TLS_CLIENT_CA_B64", backend_trusted_ca.ca_cert_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-mtls"]).await?;
+
+    let host = format!("backend-cc.{}.local", ns.name);
+
+    // Gateway clientCertificateRef = a cert from the UNTRUSTED CA "B".  The
+    // Secret itself is a valid kubernetes.io/tls Secret, so the controller
+    // resolves it (ResolvedRefs=True) and pushes it to the proxy; the rejection
+    // happens at the upstream TLS handshake, not at ref resolution.
+    fixtures::apply_fixture(
+        gwa::BACKEND_CLIENT_CERT,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", server_cert.cert_pem.clone())
+            .with("CLIENT_CERT_B64", proxy_untrusted.client_cert_b64())
+            .with("CLIENT_KEY_B64", proxy_untrusted.client_key_b64()),
+    )
+    .await?;
+
+    // Proxy presents an untrusted client cert → backend aborts handshake → 502.
+    wait::wait_for_route_status(&h.gateway_http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
+/// GEP-3155 fail-closed: a configured-but-unresolvable `clientCertificateRef`
+/// makes the proxy fail closed (502) on BackendTLSPolicy upstreams — it must not
+/// silently connect without the operator-configured client identity.
+///
+/// The Gateway's `clientCertificateRef` points to a Secret that does not exist.
+/// The controller surfaces `ResolvedRefs=False/InvalidClientCertificateRef`; the
+/// proxy returns 502 for every request to the BackendTLSPolicy-selected backend,
+/// matching the project's fail-closed posture for every other cert path (and the
+/// GEP-1897 invalid-BackendTLSPolicy 502).
+#[tokio::test]
+async fn backend_mtls_invalid_client_cert_ref_fails_closed() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-backend-cc-failclosed").await?;
+
+    let tls_hostname = format!("echo-tls-fc.{}.local", ns.name);
+    let server_cert = GeneratedCert::for_host(&tls_hostname);
+
+    // Plain TLS backend — fail-closed returns 502 before the proxy ever connects.
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", server_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", server_cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    // Gateway clientCertificateRef → a Secret that does not exist.
+    fixtures::apply_fixture(
+        gwa::BACKEND_CLIENT_CERT_FAILS_CLOSED,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", server_cert.cert_pem.clone()),
+    )
+    .await?;
+
+    // Unresolvable client cert ref → proxy fails closed → 502 (never connects).
+    let host = format!("backend-tls.{}.local", ns.name);
+    wait::wait_for_route_status(&h.gateway_http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    // Controller surfaces the resolution failure on the Gateway.
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "backend-cc-fc-gw",
+        &ns.name,
+        "ResolvedRefs",
+        "False",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    Ok(())
+}

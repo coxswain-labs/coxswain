@@ -327,6 +327,115 @@ pub async fn wait_for_backends(namespace: &str) -> anyhow::Result<()> {
     wait_for_deployments(namespace, &["echo-a", "echo-b", "echo-c"]).await
 }
 
+/// Poll the proxy until at least `expected` distinct backend pods answer 200 on
+/// `host``path`, returning the set of pod names observed.
+///
+/// Load-balancing and session-affinity tests must not start asserting until the
+/// *full* replica set's EndpointSlices have propagated into the proxy routing
+/// snapshot. [`wait_for_route`] only proves **one** endpoint is live; the rest of
+/// the set can still be landing, and a still-growing set breaks two ways:
+/// round-robin distribution sees fewer pods than expected, and consistent-hash
+/// rings rebalance (a "pinned" key jumps to a different pod) the instant a new
+/// endpoint is added. Waiting for the set to reach its full size makes it stable,
+/// so the subsequent pinning / distribution assertions are deterministic.
+///
+/// Each poll iteration fans out `expected * 5` requests so round-robin visits
+/// every endpoint within one pass; failures and non-200s are simply not counted.
+///
+/// # Errors
+///
+/// Returns an error if fewer than `expected` distinct pods are seen before
+/// `timeout` elapses.
+pub async fn wait_for_distinct_backends(
+    client: &crate::harness::http::HttpClient,
+    host: &str,
+    path: &str,
+    expected: usize,
+    timeout: Duration,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    poll_until(
+        timeout,
+        POLL,
+        || async { format!("at least {expected} distinct backend pods to answer on {host}{path}") },
+        || async {
+            let mut pods = std::collections::HashSet::new();
+            for _ in 0..(expected * 5) {
+                if let Ok((200, _, Some(body))) = client.get_full(host, path).await
+                    && let Some(p) = body.pod
+                {
+                    pods.insert(p);
+                }
+            }
+            (pods.len() >= expected).then_some(pods)
+        },
+    )
+    .await
+}
+
+/// Poll the proxy admin `/api/v1/routes` until the route serving `host` exposes
+/// at least `expected` compiled endpoints, returning the count observed.
+///
+/// Mode-independent companion to [`wait_for_distinct_backends`] for load-balancing
+/// tests whose client cannot distribute requests across the backend set — e.g.
+/// `ip_hash`, where a single source IP always pins to one pod, so request sampling
+/// can never observe more than one endpoint. Reading the proxy's own compiled
+/// endpoint set confirms the full EndpointSlice has propagated before the test
+/// pins a baseline, closing the same propagation race without needing
+/// distribution.
+///
+/// # Errors
+///
+/// Returns an error if the route exposes fewer than `expected` endpoints before
+/// `timeout` elapses.
+pub async fn wait_for_route_endpoints(
+    routes_url: &str,
+    host: &str,
+    expected: usize,
+    timeout: Duration,
+) -> anyhow::Result<usize> {
+    let client = reqwest::Client::new();
+    // Largest endpoint count across any compiled route (ingress or gateway
+    // surface) whose host group matches `host`.
+    let count_for = |json: &serde_json::Value, host: &str| -> usize {
+        ["ingress", "gateway"]
+            .iter()
+            .filter_map(|surface| json[surface]["hosts"].as_array())
+            .flatten()
+            .filter(|hg| hg["host"].as_str() == Some(host))
+            .flat_map(|hg| hg["routes"].as_array().into_iter().flatten())
+            .map(|r| r["endpoints"].as_array().map_or(0, Vec::len))
+            .max()
+            .unwrap_or(0)
+    };
+    poll_until(
+        timeout,
+        POLL,
+        || async {
+            let state = match client.get(routes_url).send().await {
+                Ok(r) => match r.json::<serde_json::Value>().await {
+                    Ok(j) => format!("observed {} endpoints", count_for(&j, host)),
+                    Err(e) => format!("routes body parse error: {e}"),
+                },
+                Err(e) => format!("routes request error: {e}"),
+            };
+            format!("route '{host}' to expose >= {expected} endpoints; {state}")
+        },
+        || async {
+            let json = client
+                .get(routes_url)
+                .send()
+                .await
+                .ok()?
+                .json::<serde_json::Value>()
+                .await
+                .ok()?;
+            let n = count_for(&json, host);
+            (n >= expected).then_some(n)
+        },
+    )
+    .await
+}
+
 /// Poll until the named Deployments in `namespace` have `condition=Available`.
 pub async fn wait_for_deployments(namespace: &str, names: &[&str]) -> anyhow::Result<()> {
     let deployments: Vec<String> = names.iter().map(|n| format!("deployment/{n}")).collect();

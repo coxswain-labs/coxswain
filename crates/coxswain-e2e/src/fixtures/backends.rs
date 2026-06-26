@@ -28,6 +28,14 @@ pub const ECHO_TLS: &str = concat!(
     "/fixtures/backends/echo_tls.yaml"
 );
 
+/// mTLS echo server deployment (HTTPS on port 8443, requires client certificate from callers).
+/// Used for GEP-3155 backend-client-cert e2e tests (#87).
+/// Requires `TLS_SERVER_CERT_B64`, `TLS_SERVER_KEY_B64`, `TLS_CLIENT_CA_B64` substitutions.
+pub const ECHO_MTLS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/echo_mtls.yaml"
+);
+
 /// TLS echo server exposing TWO named Service ports (`https-1`/443 and `https-2`/8443)
 /// — both targeting the same container — used for BackendTLSPolicy section-name routing tests.
 /// Requires `TLS_SERVER_CERT_B64`, `TLS_SERVER_KEY_B64` substitutions.

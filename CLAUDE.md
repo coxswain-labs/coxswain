@@ -113,6 +113,21 @@ Proxy request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet
 - Use `Shared<T>` (the `ArcSwap`-backed wrapper in `coxswain-core`) for lock-free routing/TLS snapshot reads.
 - Never hold a `Mutex` or `RwLock` guard across `.await`.
 
+### Proxy module structure
+
+`crates/coxswain-proxy/src/hooks.rs` is a **thin orchestrator** — it sequences the Pingora hook calls and delegates to focused modules. Do not inline feature logic there. The established layout:
+
+| Module | Responsibility |
+|--------|---------------|
+| `edge/upstream_ca.rs` | Upstream TLS material: CA-bundle cache (`UpstreamCaCache`), backend client-cert cache (`BackendClientCertCache`), and `apply_upstream_tls()` which configures both on an `HttpPeer` |
+| `edge/tls.rs` | Downstream (frontend) TLS: SNI cert selection, `SniCertSelector`, mTLS verify callback |
+| `edge/accept.rs` | PROXY-protocol accept, `ConnInfo` extraction |
+| `policy/` | Auth, circuit-breaker, access-control, affinity |
+| `filters/` | Request/response filter execution (`FilterSet`) |
+| `routing/` | Routing engine + outcome resolution |
+
+When adding a new upstream TLS feature (e.g. a new peer option driven by a `BackendTLSPolicy` field), extend `apply_upstream_tls` in `edge/upstream_ca.rs` — not `upstream_peer` in `hooks.rs`.
+
 ## GitHub issue workflow
 
 1. Invoke `/rust-skills` to load Rust coding guidelines.
@@ -136,3 +151,12 @@ Source of truth for scope and status: the [Coxswain Roadmap Project](https://git
 Milestones are plain version numbers (`v0.1`, `v0.2`, …); use `gh issue edit N --milestone vX.Y`. Never use special characters (em dashes, colons, `&`) — they break GitHub's filter URL parser.
 
 Labels: discover the live taxonomy with `gh label list --repo coxswain-labs/coxswain`. Every issue carries at least one `type:` and one `area:` or `api:`. `status: backlog` only on issues with no milestone; `priority:` is per-milestone; `type:` and `area:`/`api:` are required everywhere.
+
+## CodeGraph
+
+In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
+
+- **MCP tool** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
+- **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
+
+If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.

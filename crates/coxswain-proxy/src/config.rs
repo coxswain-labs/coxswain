@@ -4,7 +4,7 @@
 //! `coxswain-bin`) and stored on the proxy instances. They are intentionally
 //! independent of the bin crate so the proxy crate remains self-contained.
 
-use crate::edge::upstream_ca::UpstreamCaCache;
+use crate::edge::upstream_ca::{BackendClientCertCache, UpstreamCaCache};
 use crate::policy::circuit_breaker::CircuitBreakerRegistry;
 use crate::policy::rate_limit::RateLimiterRegistry;
 use coxswain_cache::ResponseCache;
@@ -27,6 +27,9 @@ pub struct SharedProxyConfig {
     pub default_timeouts: RouteTimeouts,
     /// Parse cache for upstream CA bundles from `BackendTLSPolicy` attachments.
     pub ca_cache: Arc<UpstreamCaCache>,
+    /// Parse cache for GEP-3155 backend client certificates from
+    /// `Gateway.spec.tls.backend.clientCertificateRef` (one entry per distinct cert identity).
+    pub backend_client_cert_cache: Arc<BackendClientCertCache>,
     /// Whether to emit one access-log event per request.
     pub access_log_enabled: bool,
     /// Controls what the access log emits for the `path` field.
@@ -80,6 +83,7 @@ impl SharedProxyConfig {
         Self {
             default_timeouts,
             ca_cache,
+            backend_client_cert_cache: Arc::new(BackendClientCertCache::new()),
             access_log_enabled,
             access_log_path_mode,
             cache,

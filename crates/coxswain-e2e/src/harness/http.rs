@@ -36,6 +36,7 @@ impl EchoResponse {
 }
 
 /// HTTP test client pre-configured to send requests to the coxswain proxy.
+#[derive(Clone)]
 pub struct HttpClient {
     inner: reqwest::Client,
     /// Address of the proxy's HTTP listener.
@@ -56,6 +57,43 @@ impl HttpClient {
         Ok(Self { inner, proxy_addr })
     }
 
+    /// Send the request produced by `build`, retrying a bounded number of
+    /// transient transport blips (connect/timeout/request-send) before giving up.
+    ///
+    /// Under the parallel e2e profile, connection churn through the proxy's
+    /// LoadBalancer IP occasionally surfaces a one-off "error sending request"
+    /// (a pooled connection reset mid-reuse, or a connect that loses the 5 s
+    /// budget under concurrent load). A real client retries such a blip; only a
+    /// SUSTAINED inability to reach the proxy is a routing gap, which still
+    /// exhausts the retries and surfaces as an error. HTTP error *responses* are
+    /// returned as `Ok` and never retried, so this can never mask a routing or
+    /// status-code failure. Mirrors the rationale in [`count_backends`].
+    ///
+    /// `build` is a factory (not a single `RequestBuilder`) because `reqwest`
+    /// consumes the builder on `send`; each attempt rebuilds the request.
+    async fn send_transient_retry<F>(&self, build: F) -> reqwest::Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        const MAX_RETRIES: u32 = 3;
+        let mut attempt = 0u32;
+        loop {
+            match build().send().await {
+                Ok(resp) => return Ok(resp),
+                Err(e)
+                    if attempt < MAX_RETRIES
+                        && (e.is_timeout() || e.is_connect() || e.is_request()) =>
+                {
+                    attempt += 1;
+                    tracing::debug!(attempt, error = %e, "transient transport error; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)))
+                        .await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Send an arbitrary request. `path` may include a `?query=...` suffix.
     /// Returns `(status_code, Some(body))` when the response is JSON, or
     /// `(status_code, None)` for non-2xx or non-JSON responses.
@@ -67,11 +105,19 @@ impl HttpClient {
         extra_headers: &[(&str, &str)],
     ) -> anyhow::Result<(u16, Option<EchoResponse>)> {
         let url = format!("http://{}{path}", self.proxy_addr);
-        let mut req = self.inner.request(method, &url).header("Host", host);
-        for (k, v) in extra_headers {
-            req = req.header(*k, *v);
-        }
-        let resp = req.send().await.context("send request")?;
+        let resp = self
+            .send_transient_retry(|| {
+                let mut req = self
+                    .inner
+                    .request(method.clone(), &url)
+                    .header("Host", host);
+                for (k, v) in extra_headers {
+                    req = req.header(*k, *v);
+                }
+                req
+            })
+            .await
+            .context("send request")?;
         let status = resp.status().as_u16();
         if resp.status().is_success() {
             let body = resp
@@ -97,11 +143,12 @@ impl HttpClient {
     ) -> anyhow::Result<(u16, Option<EchoResponse>)> {
         let url = format!("http://{}{path}", self.proxy_addr);
         let resp = self
-            .inner
-            .request(method, &url)
-            .header("Host", host)
-            .body(body)
-            .send()
+            .send_transient_retry(|| {
+                self.inner
+                    .request(method.clone(), &url)
+                    .header("Host", host)
+                    .body(body.clone())
+            })
             .await
             .context("send request with body")?;
         let status = resp.status().as_u16();
@@ -170,10 +217,7 @@ impl HttpClient {
     ) -> anyhow::Result<(u16, reqwest::header::HeaderMap, Option<EchoResponse>)> {
         let url = format!("http://{}{path}", self.proxy_addr);
         let resp = self
-            .inner
-            .get(&url)
-            .header("Host", host)
-            .send()
+            .send_transient_retry(|| self.inner.get(&url).header("Host", host))
             .await
             .context("send request")?;
         let status = resp.status().as_u16();
@@ -205,11 +249,16 @@ impl HttpClient {
     ) -> anyhow::Result<(u16, reqwest::header::HeaderMap, bytes::Bytes)> {
         use anyhow::Context as _;
         let url = format!("http://{}{path}", self.proxy_addr);
-        let mut req = self.inner.get(&url).header("Host", host);
-        for (k, v) in extra_headers {
-            req = req.header(*k, *v);
-        }
-        let resp = req.send().await.context("send request")?;
+        let resp = self
+            .send_transient_retry(|| {
+                let mut req = self.inner.get(&url).header("Host", host);
+                for (k, v) in extra_headers {
+                    req = req.header(*k, *v);
+                }
+                req
+            })
+            .await
+            .context("send request")?;
         let status = resp.status().as_u16();
         let resp_headers = resp.headers().clone();
         let body = resp.bytes().await.context("read response bytes")?;
@@ -227,11 +276,16 @@ impl HttpClient {
         extra_headers: &[(&str, &str)],
     ) -> anyhow::Result<(u16, reqwest::header::HeaderMap, Option<EchoResponse>)> {
         let url = format!("http://{}{path}", self.proxy_addr);
-        let mut req = self.inner.get(&url).header("Host", host);
-        for (k, v) in extra_headers {
-            req = req.header(*k, *v);
-        }
-        let resp = req.send().await.context("send request")?;
+        let resp = self
+            .send_transient_retry(|| {
+                let mut req = self.inner.get(&url).header("Host", host);
+                for (k, v) in extra_headers {
+                    req = req.header(*k, *v);
+                }
+                req
+            })
+            .await
+            .context("send request")?;
         let status = resp.status().as_u16();
         let resp_headers = resp.headers().clone();
         let body = if resp.status().is_success() {

@@ -32,7 +32,7 @@
 use crate::config::AccessLogPathMode;
 use crate::ctx::{CONN_INFO, MirrorDispatch, ProxyCtx, ResolvedRoute};
 use crate::edge::tls::ConnTlsInfo;
-use crate::edge::upstream_ca::UpstreamCaCache;
+use crate::edge::upstream_ca::{BackendClientCertCache, UpstreamCaCache, apply_upstream_tls};
 use crate::filters::TrafficFilter;
 use crate::filters::cors::try_cors_preflight;
 use crate::filters::redirect::{extract_host, try_redirect};
@@ -44,7 +44,7 @@ use crate::routing::outcome::{merge_timeouts, resolve_outcome};
 use bytes::Bytes;
 use coxswain_core::routing::{
     BackendGroup, FilterAction, HashSource, MirrorFraction, RateLimitKey, RequestContext, RetryOn,
-    SessionAffinity, UpstreamCa, affinity_hash, affinity_hash_parts,
+    SessionAffinity, affinity_hash, affinity_hash_parts,
 };
 use coxswain_core::tls::ClientCertConfigState;
 use http::header;
@@ -663,6 +663,7 @@ pub(crate) fn request_body_filter(
 /// `BackendTLSPolicy` CA bundle).
 pub(crate) async fn upstream_peer(
     ca_cache: &UpstreamCaCache,
+    backend_client_cert_cache: &BackendClientCertCache,
     circuit_breakers: &crate::policy::circuit_breaker::CircuitBreakerRegistry,
     ctx: &mut ProxyCtx,
 ) -> Result<Box<HttpPeer>> {
@@ -727,41 +728,27 @@ pub(crate) async fn upstream_peer(
     let protocol = resolved.backend_group.protocol();
 
     // BackendTLSPolicy overrides appProtocol-derived TLS decisions.
-    let (is_tls, sni_host, group_key, ca_override) =
-        if let Some(btls) = resolved.backend_group.upstream_tls() {
-            let ca = match &btls.ca {
-                UpstreamCa::System => None,
-                UpstreamCa::Bundle(pem) => {
-                    let parsed = ca_cache.get_or_parse(btls.group_key, pem);
-                    if parsed.is_none() {
-                        return Err(pingora_core::Error::explain(
-                            HTTPStatus(502),
-                            "BackendTLSPolicy CA bundle parse failed",
-                        ));
-                    }
-                    parsed
-                }
-                _ => None, // non-exhaustive guard
-            };
-            // SNI must be an owned `String`: `HttpPeer::new` takes ownership, so a
-            // fresh allocation is unavoidable here regardless of any cache (#397).
-            // This is once per outbound TLS connection, not per request.
-            (true, btls.sni.to_string(), btls.group_key, ca)
-        } else if protocol.is_tls() {
-            // appProtocol-driven TLS: use the request Host as SNI (existing behaviour).
-            // Owned for the same `HttpPeer::new` reason as the BackendTLSPolicy arm.
-            (true, resolved.original_host.to_string(), 0u64, None)
-        } else {
-            (false, String::new(), 0u64, None)
-        };
+    let btls_opt = resolved.backend_group.upstream_tls();
+    let (is_tls, sni_host, group_key) = if let Some(btls) = btls_opt {
+        // SNI must be an owned `String`: `HttpPeer::new` takes ownership, so a
+        // fresh allocation is unavoidable here regardless of any cache (#397).
+        // This is once per outbound TLS connection, not per request.
+        (true, btls.sni.to_string(), btls.group_key)
+    } else if protocol.is_tls() {
+        // appProtocol-driven TLS: use the request Host as SNI (existing behaviour).
+        // Owned for the same `HttpPeer::new` reason as the BackendTLSPolicy arm.
+        (true, resolved.original_host.to_string(), 0u64)
+    } else {
+        (false, String::new(), 0u64)
+    };
 
     // Pass SocketAddr directly — avoids the per-request addr.to_string() allocation.
     let mut peer = HttpPeer::new(addr, is_tls, sni_host);
     peer.group_key = group_key;
     peer.options.verify_cert = is_tls;
     peer.options.verify_hostname = is_tls;
-    if let Some(ca) = ca_override {
-        peer.options.ca = Some(ca);
+    if let Some(btls) = btls_opt {
+        apply_upstream_tls(&mut peer, btls, ca_cache, backend_client_cert_cache)?;
     }
     if protocol.is_h2() {
         peer.options.set_http_version(2, 2);

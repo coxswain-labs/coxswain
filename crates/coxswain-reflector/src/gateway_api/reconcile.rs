@@ -20,8 +20,9 @@ use coxswain_core::crd::{PathRewriteRegex, RateLimit};
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
-    BackendGroup, BackendProtocol, FilterAction, GatewayRoutingTableBuilder, HostRouterBuilder,
-    MatchPredicates, RateLimitConfig, RouteEntry, RouteTimeouts, UpstreamTls, WildcardKind,
+    BackendClientCert, BackendGroup, BackendProtocol, FilterAction, GatewayRoutingTableBuilder,
+    HostRouterBuilder, MatchPredicates, RateLimitConfig, RouteEntry, RouteTimeouts, UpstreamTls,
+    WildcardKind,
 };
 use coxswain_core::tls::TlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -54,6 +55,17 @@ pub struct RouteResolution<'a> {
     /// `PathRewriteRegex` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s.
     pub path_rewrites: &'a reflector::Store<PathRewriteRegex>,
+    /// `ObjectKey(gw_ns, gw_name) → BackendClientCert` for Gateways that resolved a
+    /// `spec.tls.backend.clientCertificateRef` (GEP-3155). A route's effective client
+    /// cert comes from its owned parent Gateway; it is attached to any `UpstreamTls`
+    /// the route's backends carry (BackendTLSPolicy-driven TLS).
+    pub backend_client_certs: &'a HashMap<ObjectKey, Arc<BackendClientCert>>,
+    /// `ObjectKey(gw_ns, gw_name)` for Gateways whose `clientCertificateRef` is
+    /// configured but failed to resolve. A route inheriting from such a Gateway
+    /// fails closed (502) on BackendTLSPolicy-driven upstreams (GEP-3155): the proxy
+    /// must not connect without the configured client identity. Empty when no owned
+    /// Gateway has a broken ref.
+    pub backend_client_cert_failures: &'a HashSet<ObjectKey>,
 }
 
 impl GatewayApiReconciler {
@@ -80,6 +92,8 @@ impl GatewayApiReconciler {
             policy_index,
             rate_limits,
             path_rewrites,
+            backend_client_certs,
+            backend_client_cert_failures,
         } = resolution;
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
@@ -111,6 +125,45 @@ impl GatewayApiReconciler {
                 "Skipping HTTPRoute — no parentRef to a Coxswain-managed Gateway"
             );
             return;
+        }
+
+        // GEP-3155: the backend client cert the Gateway presents on upstream TLS is
+        // gateway-scoped. A route inherits it from its first owned parent Gateway that
+        // resolved a `spec.tls.backend.clientCertificateRef`. Attached below to any
+        // `UpstreamTls` the route's backends carry (BackendTLSPolicy-driven TLS).
+        //
+        // A route attached to multiple owned Gateways with *different* backend client
+        // certs resolves to the first such parentRef in declaration order: the cert
+        // rides the route's single shared `BackendGroup`, so per-parent divergence
+        // cannot be expressed. Deterministic (parentRefs is an ordered list); the
+        // single-Gateway case (and conformance) is unambiguous.
+        // Single pass over owned parents in declaration order: the first one that
+        // has a `clientCertificateRef` — resolved OR failed — wins. A resolved cert
+        // is attached to the route's UpstreamTls; a failed ref fails the route's
+        // BackendTLSPolicy upstreams closed (502) below, so the proxy never connects
+        // without the proxy identity the operator configured.
+        let mut route_client_cert: Option<&Arc<BackendClientCert>> = None;
+        let mut route_client_cert_failed = false;
+        for p in route.spec.parent_refs.as_deref().unwrap_or(&[]).iter() {
+            if !parent_ref_owned(
+                p.group.as_deref(),
+                p.kind.as_deref(),
+                p.namespace.as_deref(),
+                &p.name,
+                route_ns,
+                owned_gateways,
+            ) {
+                continue;
+            }
+            let key = ObjectKey::new(p.namespace.as_deref().unwrap_or(route_ns), p.name.as_str());
+            if let Some(cc) = backend_client_certs.get(&key) {
+                route_client_cert = Some(cc);
+                break;
+            }
+            if backend_client_cert_failures.contains(&key) {
+                route_client_cert_failed = true;
+                break;
+            }
         }
 
         let rules = match route.spec.rules.as_deref() {
@@ -213,18 +266,33 @@ impl GatewayApiReconciler {
                     // Policy presence forces TLS regardless of appProtocol.
                     protocol = BackendProtocol::Https;
                 }
+                // GEP-3155 fail-closed: this backend speaks upstream TLS (BackendTLSPolicy)
+                // AND an owned parent Gateway's `clientCertificateRef` is configured but
+                // unresolvable. The proxy must present the operator-configured identity or
+                // not connect at all — return 502 rather than silently dropping the cert.
+                let client_cert_fail_closed = route_client_cert_failed && policy_tls.is_some();
 
                 let mut group = BackendGroup::weighted(group_name, weighted)
                     .with_protocol(protocol)
                     .with_per_backend_filters(per_backend_filters);
                 if let Some(tls) = policy_tls {
+                    // Attach the gateway's GEP-3155 client cert to the policy-derived
+                    // UpstreamTls so the proxy presents it for upstream mTLS. Clones the
+                    // shared Arc'd UpstreamTls only on the rare route that has both a
+                    // BackendTLSPolicy and a gateway backend client cert.
+                    let tls = match route_client_cert {
+                        Some(cc) => Arc::new((*tls).clone().with_client_cert(Arc::clone(cc))),
+                        None => tls,
+                    };
                     group = group.with_tls(tls);
                 }
                 let group = Arc::new(group);
-                if invalid_policy {
+                if invalid_policy || client_cert_fail_closed {
                     // GEP-1897: a backend covered by an invalid BackendTLSPolicy MUST
                     // return 5xx, not silently fall back to plain HTTP. 502 reads as
-                    // "upstream not reachable" which matches the spec intent.
+                    // "upstream not reachable" which matches the spec intent. GEP-3155
+                    // applies the same fail-closed 502 when the gateway client cert ref
+                    // is configured but unresolvable.
                     (Some(group), Some(502u16))
                 } else if group.endpoints().is_empty() {
                     // HTTPRoute spec: a valid Service with zero ready endpoints
@@ -854,6 +922,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -890,6 +960,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -926,6 +998,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -954,6 +1028,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -981,6 +1057,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -1048,6 +1126,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -1090,6 +1170,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -1158,6 +1240,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -1237,6 +1321,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -1290,6 +1376,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -1377,6 +1465,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -1420,6 +1510,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -1455,6 +1547,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -1492,6 +1586,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -1521,6 +1617,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );
@@ -1556,6 +1654,8 @@ mod tests {
                 policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
             },
             &mut builder,
         );

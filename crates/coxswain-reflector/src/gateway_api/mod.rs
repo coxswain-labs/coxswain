@@ -1,6 +1,7 @@
 //! Gateway API reconciler: routes `HTTPRoute`, `GRPCRoute`, and `Gateway` resources into the
 //! routing table and TLS store.
 
+pub(crate) mod backend_client_cert;
 mod backend_tls;
 mod bindings;
 mod filters;

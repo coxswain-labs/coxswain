@@ -15,8 +15,8 @@ use tokio::sync::watch;
 // discovery wire layer can import them without pulling in the reflector crate.
 pub use coxswain_core::listener_health::SharedGatewayListenerHealth;
 pub use coxswain_core::listener_health::{
-    FrontendValidationHealth, FrontendValidationOutcome, GatewayListenerHealth, ListenerInfo,
-    ListenerTlsOutcome,
+    BackendClientCertOutcome, FrontendValidationHealth, FrontendValidationOutcome,
+    GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome,
 };
 
 #[derive(Debug, Error)]

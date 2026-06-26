@@ -534,6 +534,10 @@ async fn session_affinity_cookie_pins_client_to_same_backend_when_cookie_replaye
     wait::wait_for_deployments(&ns.name, &["echo-aff"]).await?;
     let host = format!("affinity.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    // All 3 endpoints must be propagated before establishing the cookie pin:
+    // the cookie encodes the chosen endpoint, and a set that grows afterwards
+    // shifts that mapping. Un-keyed requests round-robin to confirm the full set.
+    wait::wait_for_distinct_backends(&h.http, &host, "/", 3, Duration::from_secs(60)).await?;
 
     // First request carries no cookie → the proxy round-robins to a pod and pins it
     // by injecting the (custom-named) SESSIONID cookie.
@@ -625,6 +629,10 @@ async fn session_affinity_header_pins_same_header_value_to_same_backend() -> any
     wait::wait_for_deployments(&ns.name, &["echo-aff"]).await?;
     let host = format!("affinity.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    // All 3 endpoints must be propagated before pinning a session: adding an
+    // endpoint mid-test rebalances the affinity hash and moves the pinned pod.
+    // Un-keyed requests round-robin, so this confirms the full set is live.
+    wait::wait_for_distinct_backends(&h.http, &host, "/", 3, Duration::from_secs(60)).await?;
 
     // A fixed header value pins to one pod and never sets a cookie.
     let (_, _, body) = h
@@ -771,25 +779,21 @@ async fn request_mirrored_to_secondary_backend_when_mirror_target_set() -> anyho
     body.expect("primary response must carry echo JSON")
         .assert_backend("echo-a");
 
-    // Mirror dispatch is fire-and-forget; poll the shared-proxy access log until
-    // a mirror=true row for this host appears.  30 s is ample given the 5 s
-    // per-mirror timeout configured in spawn_mirror_dispatch.
+    // Mirror dispatch is fire-and-forget and best-effort: a single request's mirror
+    // copy can be lost if the mirror backend's endpoints are still propagating into
+    // the proxy snapshot or under parallel load. Re-drive a POST on every poll
+    // iteration so the mirror has repeated chances to fire; the test passes as soon
+    // as one mirror=true access-log row for this host appears.
     wait::poll_until(
         Duration::from_secs(30),
         wait::POLL,
+        || async { format!("a mirror=true access-log row to appear for host={host}") },
         || async {
-            match h.controller.shared_proxy_access_logs().await {
-                Ok(logs) => {
-                    let found = logs.iter().any(|row| {
-                        row.get("mirror").and_then(|v| v.as_bool()) == Some(true)
-                            && row.get("host").and_then(|v| v.as_str()) == Some(host.as_str())
-                    });
-                    format!("mirror access-log row; found={found}, host={host}")
-                }
-                Err(e) => format!("mirror access-log row; log fetch failed: {e}"),
-            }
-        },
-        || async {
+            // Re-drive the mirrored request, then look for its access-log row.
+            let _ = h
+                .http
+                .request_with_body(Method::POST, &host, "/", b"hello mirror".to_vec())
+                .await;
             let logs = h.controller.shared_proxy_access_logs().await.ok()?;
             logs.into_iter().find(|row| {
                 row.get("mirror").and_then(|v| v.as_bool()) == Some(true)
@@ -863,6 +867,10 @@ async fn requests_round_robin_across_backends_when_no_affinity_annotation() -> a
     wait::wait_for_deployments(&ns.name, &["echo-aff"]).await?;
     let host = format!("affinity.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    // All 3 echo-aff endpoints must be live in the proxy before asserting
+    // distribution — EndpointSlice propagation lags the Deployment Available
+    // condition, so a single pass right after route-live can see only one pod.
+    wait::wait_for_distinct_backends(&h.http, &host, "/", 3, Duration::from_secs(60)).await?;
 
     let mut pods = std::collections::HashSet::new();
     for i in 0..30 {
@@ -1193,11 +1201,25 @@ async fn least_conn_sends_more_requests_to_the_fast_upstream() -> anyhow::Result
     let host = format!("lb.{}.local", ns.name);
     // Route readiness: both backends return 200 for /delay/1 (echo instantly, httpbin after 1s).
     wait::wait_for_route_status(&h.http, &host, "/delay/1", 200, Duration::from_secs(90)).await?;
+    // BOTH lb-pool endpoints (lb-fast + lb-slow) must be compiled into the route
+    // before the burst: if only one is propagated, the distribution assertions
+    // (fast > slow, slow >= 1) are decided by which endpoint happened to land
+    // first. lb-slow (go-httpbin) sets no POD_NAME, so count endpoints via the
+    // admin route table rather than by sampling distinct pod names.
+    wait::wait_for_route_endpoints(
+        &h.admin_url("/api/v1/routes"),
+        &host,
+        2,
+        Duration::from_secs(60),
+    )
+    .await?;
 
     // Pipelined concurrency: 20 requests with up to 4 in-flight at a time.
     // `lb-slow` holds each connection for 1 s; new selections see lb-slow.active ≥ 1
-    // and route to lb-fast instead. A standalone reqwest client is used so the
-    // futures can be spawned as independent tokio tasks (no lifetime conflict with &h.http).
+    // and route to lb-fast instead. A standalone reqwest client (10 s timeout — the
+    // slow backend needs headroom under load) is spawned per task; each send routes
+    // through `get_with_transient_retry` so a one-off connection blip under the
+    // parallel profile is retried rather than failing the distribution count.
     let client = Arc::new(
         reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -1217,12 +1239,10 @@ async fn least_conn_sends_more_requests_to_the_fast_upstream() -> anyhow::Result
                     .acquire_owned()
                     .await
                     .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
-                let resp = client
-                    .get(&url)
-                    .header("Host", &host)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("send: {e}"))?;
+                let resp =
+                    coxswain_e2e::harness::http::get_with_transient_retry(&client, &url, &host, 3)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("send: {e}"))?;
                 let status = resp.status().as_u16();
                 anyhow::ensure!(status == 200, "expected 200, got {status}");
                 let body = resp
@@ -1284,8 +1304,22 @@ async fn ip_hash_pins_a_client_to_one_upstream() -> anyhow::Result<()> {
     .await?;
 
     let host = format!("lb.{}.local", ns.name);
-    let first = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
-    let pinned_pod = first
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    // Consistent-hash pins a single key (client IP / URI) to one pod; an endpoint
+    // set that grows after the baseline rebalances the ring and moves the pin.
+    // A single hash key can't sample the whole set, so confirm both endpoints are
+    // compiled into the proxy route table before pinning the baseline.
+    wait::wait_for_route_endpoints(
+        &h.admin_url("/api/v1/routes"),
+        &host,
+        2,
+        Duration::from_secs(60),
+    )
+    .await?;
+    let pinned_pod = h
+        .http
+        .get(&host, "/")
+        .await?
         .pod
         .expect("echo body must report the serving pod on first request");
 
@@ -1343,8 +1377,22 @@ async fn same_uri_always_reaches_the_same_upstream() -> anyhow::Result<()> {
     .await?;
 
     let host = format!("lb.{}.local", ns.name);
-    let first = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
-    let pinned_pod = first
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    // Consistent-hash pins a single key (client IP / URI) to one pod; an endpoint
+    // set that grows after the baseline rebalances the ring and moves the pin.
+    // A single hash key can't sample the whole set, so confirm both endpoints are
+    // compiled into the proxy route table before pinning the baseline.
+    wait::wait_for_route_endpoints(
+        &h.admin_url("/api/v1/routes"),
+        &host,
+        2,
+        Duration::from_secs(60),
+    )
+    .await?;
+    let pinned_pod = h
+        .http
+        .get(&host, "/")
+        .await?
         .pod
         .expect("echo body must report the serving pod on first request");
 
@@ -1397,6 +1445,10 @@ async fn same_hash_header_value_pins_the_upstream() -> anyhow::Result<()> {
     // wait_for_route polls with a plain GET; only after 200 do we know the
     // route is installed and pods are ready.
     wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    // Both endpoints must be propagated before we pin a hash key: adding an
+    // endpoint mid-test rebalances the hash ring and moves the pinned pod.
+    // Un-keyed requests fall back to round-robin, so this sees the full set.
+    wait::wait_for_distinct_backends(&h.http, &host, "/", 2, Duration::from_secs(60)).await?;
 
     let (_, _, first_body) = h
         .http
@@ -1466,6 +1518,9 @@ async fn missing_hash_attribute_falls_back_to_round_robin() -> anyhow::Result<()
 
     let host = format!("lb.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    // Both endpoints must be live before asserting the fallback distributes —
+    // an un-keyed request round-robins, so this also confirms full propagation.
+    wait::wait_for_distinct_backends(&h.http, &host, "/", 2, Duration::from_secs(60)).await?;
 
     let mut pods = std::collections::HashSet::new();
     for i in 0..30u32 {
