@@ -60,13 +60,8 @@ flate2             = { version = "1" }
 form_urlencoded    = { version = "1.2" }
 governor           = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
 futures            = { version = "0.3" }
-# gateway-api 0.21 sourced from our fork to pull in kube 4 support (#350).
-# The fork preserves the same public API surface (apis::standard / experimental);
-# pin to a specific commit for reproducible builds.
-# Enable the workspace "experimental" feature to expose alpha Gateway API resources
-# (GRPCRoute, TCPRoute, BackendTLSPolicy, etc.) and experimental fields on
-# stable CRDs. This feature is for contributor/CI/preview builds ONLY —
-# release images are always built without it. See docs/guides/gateway-api.md.
+# Sourced from a coxswain-labs fork that rebuilds 0.21.0 against kube 4 (#350).
+# Pin to a specific commit for reproducible builds.
 gateway-api        = { version = "0.21", git = "https://github.com/coxswain-labs/gateway-api-rs", rev = "9c1238557eaff3060fb649a6426f9d04054fa022" }
 http               = { version = "1" }
 humantime          = { version = "2" }
