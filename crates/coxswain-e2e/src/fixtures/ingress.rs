@@ -54,10 +54,11 @@ pub const ANNOTATION_CONNECT_TIMEOUT: &str = fixture!("annotation_connect_timeou
 /// TCP, never responds). Used to verify the annotation shortens the upstream-read
 /// deadline (prompt 502).
 pub const ANNOTATION_READ_TIMEOUT: &str = fixture!("annotation_read_timeout.yaml");
-/// Two Ingresses sharing an appProtocol-less Service on the h2c-only port 3001:
-/// one with `backend-protocol: GRPC` (proxy speaks h2c → serves), one with no
-/// annotation (proxy speaks HTTP/1.1 → rejected). Reuses the h2c-echo Deployment.
-pub const ANNOTATION_BACKEND_PROTOCOL: &str = fixture!("annotation_backend_protocol.yaml");
+/// Two Ingresses on the h2c-only port 3001 backed by Services that differ only in
+/// `appProtocol` (GEP-1911): one with `kubernetes.io/h2c` (proxy speaks h2c →
+/// serves), one with none (proxy speaks HTTP/1.1 → rejected). Reuses the h2c-echo
+/// Deployment.
+pub const INGRESS_APP_PROTOCOL_H2C: &str = fixture!("ingress_app_protocol_h2c.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/request-header-{set,add,remove}` annotations.
 /// Used to verify that request headers are set, added, and removed before forwarding.
 pub const ANNOTATION_REQUEST_HEADERS: &str = fixture!("annotation_request_headers.yaml");
@@ -355,7 +356,7 @@ pub const ANNOTATION_CIRCUIT_BREAKER: &str = fixture!("annotation_circuit_breake
 /// Ingress with `use-regex: "yep"` — invalid boolean value rejected by the VAP.
 pub const VAP_REJECT_BOOLEAN: &str = fixture!("vap_reject_boolean.yaml");
 
-/// Ingress with `backend-protocol: "websocket"` — invalid enum value rejected by the VAP.
+/// Ingress with `session-affinity: "invalid"` — invalid enum value rejected by the VAP.
 pub const VAP_REJECT_ENUM: &str = fixture!("vap_reject_enum.yaml");
 
 /// Ingress with `allow-source-range: "not-a-cidr"` — invalid CIDR rejected by the VAP.

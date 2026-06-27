@@ -1,13 +1,13 @@
 # VAP rejection fixture: invalid enum annotation value.
 #
-# `backend-protocol: "websocket"` is not a valid enum member (valid values:
-# http, https, h2c, grpc, grpcs). The VAP must reject this Ingress at admission.
+# `session-affinity: "invalid"` is not a valid enum member (valid values:
+# cookie, header). The VAP must reject this Ingress at admission.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: vap-reject-enum
   annotations:
-    ingress.coxswain-labs.dev/backend-protocol: "websocket"
+    ingress.coxswain-labs.dev/session-affinity: "invalid"
 spec:
   ingressClassName: coxswain
   rules:

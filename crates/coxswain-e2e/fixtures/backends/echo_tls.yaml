@@ -74,4 +74,7 @@ spec:
     - port: 8443
       targetPort: 8443
       name: https
+      # appProtocol: https no longer originates upstream TLS (#466) — TLS comes
+      # only from a BackendTLSPolicy. Kept deliberately inert here so the
+      # no-policy negative test can prove it does not trigger TLS.
       appProtocol: https

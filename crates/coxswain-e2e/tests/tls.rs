@@ -1007,8 +1007,8 @@ async fn websocket_passthrough() -> anyhow::Result<()> {
 
 /// Verifies the Gateway-API `appProtocol: kubernetes.io/h2c` path (GEP-1911, #367):
 /// a Service port declaring h2c makes the proxy speak HTTP/2 cleartext on the
-/// upstream leg (distinct from the Ingress annotation path in
-/// [`annotation_backend_protocol_grpc_selects_h2c`]).
+/// upstream leg (the Ingress equivalent is
+/// [`ingress_app_protocol_h2c_selects_h2c`]).
 ///
 /// Two HTTPRoutes point at the same h2c-only port 3001 through two Services that
 /// differ only in `appProtocol`, so the upstream wire protocol is governed solely
@@ -1019,13 +1019,13 @@ async fn websocket_passthrough() -> anyhow::Result<()> {
 ///   h2c-only port rejects it (non-2xx). This is the negative that proves the
 ///   `appProtocol` field — not the Service identity — flipped the protocol.
 #[tokio::test]
-async fn backend_protocol_h2c() -> anyhow::Result<()> {
+async fn gateway_app_protocol_h2c_selects_h2c() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "tls-gw-h2c").await?;
 
     fixtures::apply_fixture(backends::H2C_ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["h2c-echo"]).await?;
-    fixtures::apply_fixture(gwa::BACKEND_PROTOCOL_H2C, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::GATEWAY_APP_PROTOCOL_H2C, FixtureVars::new(&ns.name)).await?;
 
     // Positive: appProtocol h2c → h2c → the h2c-only port serves.
     let gw = h.gateway_http(&ns.name).await?;
@@ -1043,44 +1043,40 @@ async fn backend_protocol_h2c() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Verifies the Ingress `ingress.coxswain-labs.dev/backend-protocol` annotation
-/// (distinct from the Gateway-API `appProtocol` path in [`backend_protocol_h2c`]).
+/// Verifies the Ingress upstream wire protocol is governed by the Service
+/// `appProtocol` (GEP-1911) — the only mechanism, since coxswain has no
+/// `backend-protocol` annotation (#466).
 ///
-/// Both Ingresses point at the same appProtocol-less Service on the h2c-only port
-/// 3001, so the upstream wire protocol is governed solely by the annotation:
-/// - `GRPC` → `BackendProtocol::H2c` → the proxy speaks h2c → the port serves (2xx).
-/// - no annotation → `BackendProtocol::Http1` → the proxy speaks HTTP/1.1 → the
+/// Two Ingresses target the h2c-only port 3001 via Services differing only in
+/// `appProtocol`, so the wire protocol is governed solely by that field:
+/// - `kubernetes.io/h2c` → `BackendProtocol::H2c` → the proxy speaks h2c → 2xx.
+/// - no `appProtocol` → `BackendProtocol::Http1` → the proxy speaks HTTP/1.1 → the
 ///   h2c-only port rejects it (non-2xx). This is the negative that proves the
-///   annotation — not the Service — flipped the protocol.
-///
-/// The HTTPS value isn't exercised here: an Ingress `backend-protocol: HTTPS` makes
-/// the proxy verify the upstream cert against the system trust store with no CA
-/// injection path (Ingress has no `BackendTLSPolicy` equivalent), so a self-signed
-/// e2e upstream can never complete the handshake. h2c needs no upstream cert.
+///   Service field flipped the protocol.
 #[tokio::test]
-async fn annotation_backend_protocol_grpc_selects_h2c() -> anyhow::Result<()> {
+async fn ingress_app_protocol_h2c_selects_h2c() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "tls-ing-backend-protocol").await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-ing-app-protocol").await?;
 
     fixtures::apply_fixture(backends::H2C_ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["h2c-echo"]).await?;
     fixtures::apply_fixture(
-        ingress::ANNOTATION_BACKEND_PROTOCOL,
+        ingress::INGRESS_APP_PROTOCOL_H2C,
         FixtureVars::new(&ns.name),
     )
     .await?;
 
-    // Positive: GRPC annotation → h2c → the h2c-only port serves.
-    let grpc_host = format!("backend-protocol-grpc.{}.local", ns.name);
-    let resp = wait::wait_for_route(&h.http, &grpc_host, "/", Duration::from_secs(60)).await?;
+    // Positive: Service appProtocol h2c → h2c → the h2c-only port serves.
+    let h2c_host = format!("appproto-h2c.{}.local", ns.name);
+    let resp = wait::wait_for_route(&h.http, &h2c_host, "/", Duration::from_secs(60)).await?;
     resp.assert_backend("h2c-echo");
 
-    // Negative: no annotation → HTTP/1.1 → the h2c-only port rejects the request.
+    // Negative: no appProtocol → HTTP/1.1 → the h2c-only port rejects the request.
     // The route is programmed (the positive proved the fixture reconciled); only the
     // wire protocol differs. The rejection surfaces as 400 or 502 depending on how the
     // h2c/HTTP-1.1 mismatch fails (upstream protocol error vs. no valid upstream
     // response), so assert the rejection class rather than a single hardcoded code.
-    let http1_host = format!("backend-protocol-http1.{}.local", ns.name);
+    let http1_host = format!("appproto-http1.{}.local", ns.name);
     wait::wait_for_route_rejected(&h.http, &http1_host, "/", Duration::from_secs(60)).await?;
 
     Ok(())
@@ -1214,6 +1210,87 @@ async fn backend_tls_policy_configmap_ca_verifies_upstream() -> anyhow::Result<(
         Duration::from_secs(10),
     )
     .await?;
+
+    Ok(())
+}
+
+/// Upstream TLS requires a `BackendTLSPolicy`, NOT `appProtocol` (#466).
+///
+/// The backend Service declares `appProtocol: https` — the former coxswain
+/// convention that originated upstream TLS. That path was removed: TLS to the
+/// upstream is now originated solely by a `BackendTLSPolicy` (GEP-1897). With no
+/// policy attached, the proxy connects in CLEARTEXT to the TLS-only port 8443, so
+/// the handshake-less request fails (5xx). This is the negative proving the
+/// deviation is gone; the positive (policy → TLS → 2xx) is
+/// [`backend_tls_policy_configmap_ca_verifies_upstream`].
+#[tokio::test]
+async fn upstream_tls_requires_backend_tls_policy_not_app_protocol() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-no-policy").await?;
+
+    // Deploy the TLS-only echo backend (HTTPS on 8443, appProtocol: https).
+    let tls_hostname = format!("echo-tls.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&tls_hostname);
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    // Gateway + HTTPRoute to the TLS port, but NO BackendTLSPolicy.
+    fixtures::apply_fixture(gwa::BACKEND_TLS_NO_POLICY, FixtureVars::new(&ns.name)).await?;
+
+    // appProtocol: https must NOT originate TLS → cleartext to the TLS-only port fails.
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("no-policy.{}.local", ns.name);
+    wait::wait_for_route_rejected(&gw, &host, "/", Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
+/// A gRPC/h2 backend (`appProtocol: kubernetes.io/h2c`) behind a `BackendTLSPolicy`
+/// gets **h2-over-TLS** (#466).
+///
+/// Removing the `protocol = Https` policy-force means the backend protocol stays
+/// `H2c`, so the proxy both originates TLS (from the policy) and negotiates HTTP/2
+/// on that connection — whereas the old force produced http/1.1-over-TLS, broken
+/// for real gRPC. The echo server reports the upstream wire protocol it observed,
+/// so asserting `HTTP/2.0` pins that h2 (not h1.1) was spoken over TLS.
+#[tokio::test]
+async fn grpc_over_tls_via_backend_tls_policy_negotiates_h2() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-h2-over-tls").await?;
+
+    // Backend serves HTTP/2 over TLS on 8443 (Go auto-h2 ALPN).
+    let tls_hostname = format!("echo-tls.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&tls_hostname);
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    // h2c-appProtocol Service over those pods + BackendTLSPolicy.
+    fixtures::apply_fixture(
+        gwa::BACKEND_TLS_H2,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", cert.cert_pem.clone()), // self-signed: cert IS the CA
+    )
+    .await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("h2-tls.{}.local", ns.name);
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-tls");
+    // The crux: the proxy spoke HTTP/2 over the TLS upstream connection.
+    resp.assert_upstream_proto("HTTP/2.0");
 
     Ok(())
 }

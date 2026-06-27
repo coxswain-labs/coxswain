@@ -169,17 +169,12 @@ pub(super) fn reconcile(
             .map(|(r, w)| (r.addrs, w))
             .collect();
 
-        let policy_match =
-            pick_backend_tls(backend_refs, route_ns, protocol, policy_index, &group_name);
+        let policy_match = pick_backend_tls(backend_refs, route_ns, policy_index, &group_name);
         let invalid_policy = matches!(policy_match, PolicyMatch::Invalid);
         let policy_tls = match policy_match {
             PolicyMatch::Valid(tls) => Some(tls),
             PolicyMatch::None | PolicyMatch::Invalid => None,
         };
-        let mut protocol = protocol;
-        if policy_tls.is_some() {
-            protocol = BackendProtocol::Https;
-        }
 
         let mut group = BackendGroup::weighted(group_name, weighted)
             .with_protocol(protocol)
@@ -696,7 +691,6 @@ fn pick_route_protocol(protocols: &[BackendProtocol], group_name: &str) -> Backe
 fn pick_backend_tls(
     backend_refs: &[GrpcRouteRulesBackendRefs],
     route_ns: &str,
-    current_protocol: BackendProtocol,
     policy_index: &BackendTlsIndex,
     group_name: &str,
 ) -> PolicyMatch {
@@ -749,13 +743,11 @@ fn pick_backend_tls(
     }
 
     if let Some((ref tls, _)) = best {
-        if !current_protocol.is_tls() {
-            tracing::debug!(
-                backend_group = group_name,
-                sni = %tls.sni,
-                "BackendTLSPolicy attached to GRPCRoute — forcing TLS to upstream"
-            );
-        }
+        tracing::debug!(
+            backend_group = group_name,
+            sni = %tls.sni,
+            "BackendTLSPolicy attached to GRPCRoute — originating TLS to upstream"
+        );
         let distinct = backend_refs
             .iter()
             .filter_map(|b| {

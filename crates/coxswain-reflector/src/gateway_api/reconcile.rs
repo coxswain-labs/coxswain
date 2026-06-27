@@ -224,7 +224,7 @@ impl GatewayApiReconciler {
                 let group_name = backend_group_name(backend_refs, route_ns);
                 let protocols: Vec<BackendProtocol> =
                     resolved.iter().map(|(r, _)| r.app_protocol).collect();
-                let mut protocol = pick_route_protocol(&protocols, &group_name);
+                let protocol = pick_route_protocol(&protocols, &group_name);
                 // Per-backend filters from `backendRefs[].filters` — index-aligned
                 // with the `resolved` list so they match the order `BackendGroup`
                 // stores backends in. Backends that were dropped from `resolved`
@@ -256,16 +256,12 @@ impl GatewayApiReconciler {
                 // Look up BackendTLSPolicy for this rule's backends. Highest-weight ref
                 // wins on conflicts (ties break by backendRefs array order).
                 let policy_match =
-                    pick_backend_tls(backend_refs, route_ns, protocol, policy_index, &group_name);
+                    pick_backend_tls(backend_refs, route_ns, policy_index, &group_name);
                 let invalid_policy = matches!(policy_match, PolicyMatch::Invalid);
                 let policy_tls = match policy_match {
                     PolicyMatch::Valid(tls) => Some(tls),
                     PolicyMatch::None | PolicyMatch::Invalid => None,
                 };
-                if policy_tls.is_some() {
-                    // Policy presence forces TLS regardless of appProtocol.
-                    protocol = BackendProtocol::Https;
-                }
                 // GEP-3155 fail-closed: this backend speaks upstream TLS (BackendTLSPolicy)
                 // AND an owned parent Gateway's `clientCertificateRef` is configured but
                 // unresolvable. The proxy must present the operator-configured identity or
@@ -617,7 +613,6 @@ enum PolicyMatch {
 fn pick_backend_tls(
     backend_refs: &[HttpRouteRulesBackendRefs],
     route_ns: &str,
-    current_protocol: BackendProtocol,
     policy_index: &BackendTlsIndex,
     group_name: &str,
 ) -> PolicyMatch {
@@ -674,13 +669,11 @@ fn pick_backend_tls(
     }
 
     if let Some((ref tls, _)) = best {
-        if !current_protocol.is_tls() {
-            tracing::debug!(
-                backend_group = group_name,
-                sni = %tls.sni,
-                "BackendTLSPolicy attached — forcing TLS to upstream"
-            );
-        }
+        tracing::debug!(
+            backend_group = group_name,
+            sni = %tls.sni,
+            "BackendTLSPolicy attached — originating TLS to upstream"
+        );
         let distinct = backend_refs
             .iter()
             .filter_map(|b| {

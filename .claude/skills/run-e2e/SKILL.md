@@ -9,10 +9,11 @@ Run one or more of the project's e2e suites against a freshly-reset local Kubern
 
 Use `AskUserQuestion` with `multiSelect: true` and these options (omit "Other"; the harness manages it):
 
-Suites are organized by **behavior plane** (see each `tests/*.rs` header). `security.rs` carries no tests yet, so it is not offered.
+Suites are organized by **behavior plane** (see each `tests/*.rs` header).
 
 - **routing** — data-plane: path/host/header/method/query/weighted matching, wildcard, named-port, default-backend, cross-namespace, timeouts, endpoint-serving exclusion, parent-ref port (Ingress + Gateway API). `two-pass run (see step 4) on `binary(routing)``
 - **tls** — data-plane: SNI termination, cert rotation/fallback, cert-manager, BackendTLSPolicy, PROXY protocol, h2c, WebSocket (Ingress + Gateway API). `two-pass run (see step 4) on `binary(tls)``
+- **security** — data-plane: source-IP allow/deny ranges, forwarded-header trust, rate limiting, ext-authz, basic-auth, and frontend client-cert mTLS (Ingress + Gateway API). `two-pass run (see step 4) on `binary(security)``
 - **traffic_policy** — data-plane: per-route/backend knobs (currently the connect-retry annotation; v0.3 knobs land here). `two-pass run (see step 4) on `binary(traffic_policy)``
 - **status_conditions** — control-plane: Ingress LB status, Gateway Accepted/Programmed/observedGeneration, GatewayClass features, dedicated-mode (#211) status writer. `two-pass run (see step 4) on `binary(status_conditions)``
 - **provisioning** — control-plane: dedicated-proxy provisioning + GC, `CoxswainGatewayParameters` field rendering, ReferenceGrant-gated cross-namespace backends, dedicated traffic, and per-proxy scope isolation. `two-pass run (see step 4) on `binary(provisioning)``

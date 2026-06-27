@@ -51,9 +51,10 @@ impl BackendClientCert {
 
 /// TLS configuration for upstream connections derived from a `BackendTLSPolicy` attachment.
 ///
-/// When present on a [`BackendGroup`](super::backend::BackendGroup), the proxy
-/// overrides `appProtocol`-based TLS decisions and uses these settings for every
-/// connection to that backend.
+/// Presence of this struct on a [`BackendGroup`](super::backend::BackendGroup) is
+/// the **sole** trigger for upstream TLS origination (GEP-1897): the proxy speaks
+/// TLS to the backend if and only if the group carries an `UpstreamTls`. The
+/// `appProtocol`-derived [`BackendProtocol`] carries no TLS semantics.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct UpstreamTls {
@@ -111,6 +112,12 @@ impl UpstreamTls {
 
 /// Wire protocol spoken by a backend, derived from `Service.spec.ports[].appProtocol`
 /// per [GEP-1911](https://gateway-api.sigs.k8s.io/geps/gep-1911/).
+///
+/// This is a **pure wire-protocol hint** — it carries no TLS semantics. Upstream
+/// TLS is originated solely by a `BackendTLSPolicy` (GEP-1897), surfaced as an
+/// [`UpstreamTls`] on the [`BackendGroup`](super::backend::BackendGroup); see that
+/// type. `appProtocol` values that imply TLS (`https`, `kubernetes.io/wss`) have no
+/// Gateway API basis and map to [`Http1`](Self::Http1) (cleartext).
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BackendProtocol {
@@ -121,42 +128,29 @@ pub enum BackendProtocol {
     H2c,
     /// HTTP/1.1 with WebSocket upgrade — `kubernetes.io/ws`.
     WebSocket,
-    /// HTTPS (TLS to upstream) — `https`.
-    Https,
-    /// WebSocket over TLS — `kubernetes.io/wss`.
-    WebSocketTls,
 }
 
 impl BackendProtocol {
-    /// Returns `true` for protocols that require TLS to the upstream.
-    #[must_use]
-    pub fn is_tls(self) -> bool {
-        match self {
-            Self::Https | Self::WebSocketTls => true,
-            Self::Http1 | Self::H2c | Self::WebSocket => false,
-        }
-    }
-
     /// Returns `true` for protocols using HTTP/2 cleartext prior knowledge.
     #[must_use]
     pub fn is_h2(self) -> bool {
         match self {
             Self::H2c => true,
-            Self::Http1 | Self::Https | Self::WebSocket | Self::WebSocketTls => false,
+            Self::Http1 | Self::WebSocket => false,
         }
     }
 }
 
 /// Parse a raw `appProtocol` string into a `BackendProtocol`.
 ///
-/// Unknown or absent values map to `Http1` (the safe default).
+/// Unknown or absent values map to `Http1` (the safe default). Note that `https`
+/// and `kubernetes.io/wss` map to `Http1`: they imply upstream TLS, which has no
+/// Gateway API basis via `appProtocol` — use a `BackendTLSPolicy` instead.
 #[must_use]
 pub fn parse_app_protocol(raw: &str) -> BackendProtocol {
     match raw {
         "kubernetes.io/h2c" => BackendProtocol::H2c,
         "kubernetes.io/ws" => BackendProtocol::WebSocket,
-        "kubernetes.io/wss" => BackendProtocol::WebSocketTls,
-        "https" => BackendProtocol::Https,
         _ => BackendProtocol::Http1,
     }
 }
@@ -176,11 +170,6 @@ mod tests {
             parse_app_protocol("kubernetes.io/ws"),
             BackendProtocol::WebSocket
         );
-        assert_eq!(
-            parse_app_protocol("kubernetes.io/wss"),
-            BackendProtocol::WebSocketTls
-        );
-        assert_eq!(parse_app_protocol("https"), BackendProtocol::Https);
     }
 
     #[test]
@@ -189,6 +178,17 @@ mod tests {
         assert_eq!(parse_app_protocol("http"), BackendProtocol::Http1);
         assert_eq!(
             parse_app_protocol("example.com/custom"),
+            BackendProtocol::Http1
+        );
+    }
+
+    // TLS-implying appProtocol values have no Gateway API basis — they map to
+    // cleartext Http1, not upstream TLS. Upstream TLS requires a BackendTLSPolicy.
+    #[test]
+    fn parse_app_protocol_tls_values_map_to_cleartext_http1() {
+        assert_eq!(parse_app_protocol("https"), BackendProtocol::Http1);
+        assert_eq!(
+            parse_app_protocol("kubernetes.io/wss"),
             BackendProtocol::Http1
         );
     }

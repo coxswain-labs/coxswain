@@ -30,7 +30,6 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/redirect-status-code` | integer | `302` | `"301"` |
 | `ingress.coxswain-labs.dev/ssl-redirect` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/ssl-redirect-code` | integer | `308` | `"301"` |
-| `ingress.coxswain-labs.dev/backend-protocol` | string | `HTTP` | `"GRPC"` |
 | `ingress.coxswain-labs.dev/max-body-size` | size | _none_ | `"8m"` |
 | `ingress.coxswain-labs.dev/mirror-target` | `svc.ns[:port]` | _none_ | `"echo-b.default.svc:3000"` |
 | `ingress.coxswain-labs.dev/allow-source-range` | cidr-list | _none_ | `"10.0.0.0/8,192.168.1.0/24"` |
@@ -75,7 +74,6 @@ metadata:
     ingress.coxswain-labs.dev/max-retries: "2"
     ingress.coxswain-labs.dev/retry-on: "connect-failure,timeout"
     ingress.coxswain-labs.dev/rewrite-target: "/v2"
-    ingress.coxswain-labs.dev/backend-protocol: "GRPC"
 ```
 
 ## Timeouts
@@ -346,18 +344,31 @@ ingress.coxswain-labs.dev/ssl-redirect-code: "301"
 !!! note
     `ssl-redirect` is a shortcut for a scheme-only `RequestRedirect` filter scoped to the HTTP listener port. It is equivalent to setting `redirect-scheme: https` with `redirect-status-code: 308`, but only fires on port 80 (or whichever HTTP port the controller is configured with). Requests already arriving on the TLS listener are not redirected, regardless of the annotation.
 
-## `backend-protocol`
+## Backend wire protocol (`appProtocol`)
 
-Overrides the upstream wire protocol derived from the Service `appProtocol` field. Explicit operator intent always wins over `appProtocol` inference.
+Coxswain has no `backend-protocol` annotation. The upstream wire protocol is taken
+from the backend **Service port `appProtocol`** field — the Gateway API mechanism
+([GEP-1911](https://gateway-api.sigs.k8s.io/geps/gep-1911/)), which applies to both
+Ingress and Gateway API backends:
 
-| Value | Behaviour |
-|-------|-----------|
-| `HTTP` | Cleartext HTTP/1.1 (the default) |
-| `HTTPS` | TLS to the upstream pod; reuses the same SNI and CA-bundle lookup path as `BackendTLSPolicy` |
-| `GRPC` | Cleartext HTTP/2 prior-knowledge (`h2c`); suitable for gRPC without TLS |
+| `appProtocol` | Behaviour |
+|---------------|-----------|
+| _absent_ | Cleartext HTTP/1.1 (the default) |
+| `kubernetes.io/h2c` | Cleartext HTTP/2 prior-knowledge (`h2c`); suitable for gRPC without TLS |
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: grpc-backend
+spec:
+  ports:
+    - port: 50051
+      appProtocol: kubernetes.io/h2c   # cleartext HTTP/2 for gRPC backends
+```
 
 !!! note
-    `GRPC` maps to cleartext HTTP/2 (`h2c`). For gRPC over TLS, use `backend-protocol: HTTPS` — gRPC-over-TLS support via a single annotation value is tracked separately.
+    **Upstream TLS** is configured with a `BackendTLSPolicy` ([GEP-1897](gateway-api.md)), the sole Gateway API mechanism for originating TLS to a backend. There is no protocol-hint shortcut for upstream TLS.
 
 ## `max-body-size`
 

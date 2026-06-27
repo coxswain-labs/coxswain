@@ -930,7 +930,7 @@ async fn vap_rejects_invalid_boolean_annotation() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// VAP rejects an enum annotation with an invalid value (`backend-protocol: "websocket"`) (#29).
+/// VAP rejects an enum annotation with an invalid value (`session-affinity: "invalid"`) (#29).
 #[tokio::test]
 async fn vap_rejects_invalid_enum_annotation() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -941,7 +941,7 @@ async fn vap_rejects_invalid_enum_annotation() -> anyhow::Result<()> {
     )
     .await?;
     anyhow::ensure!(
-        msg.contains("backend-protocol"),
+        msg.contains("session-affinity"),
         "VAP rejection message must name the offending annotation, got: {msg}"
     );
     Ok(())

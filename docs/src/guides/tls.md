@@ -280,7 +280,7 @@ A listener whose effective CA ref cannot be resolved fails closed and surfaces t
 Coxswain implements **GEP-3155**: when a Gateway carries `spec.tls.backend.clientCertificateRef`, the proxy presents that certificate as its client identity when opening TLS connections to upstream pods. This enables backend mutual TLS — the upstream can verify the proxy's identity in addition to the proxy verifying the upstream's certificate.
 
 !!! important
-    The backend client cert is **only applied on connections driven by a `BackendTLSPolicy`**. `BackendTLSPolicy` is the Gateway API mechanism for configuring upstream TLS; without it the connection to the backend is cleartext (or appProtocol-derived TLS without policy), and `clientCertificateRef` has no effect.
+    The backend client cert is **only applied on connections driven by a `BackendTLSPolicy`**. `BackendTLSPolicy` is the sole Gateway API mechanism for originating upstream TLS; without it the connection to the backend is cleartext, and `clientCertificateRef` has no effect.
 
 ### Configuration
 

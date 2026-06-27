@@ -322,8 +322,8 @@ impl IngressReconciler {
                         "No ready endpoints — installing dead route (503)"
                     );
                 }
-                // Annotation backend-protocol overrides appProtocol-derived default.
-                let protocol = ann.backend_protocol.unwrap_or(resolved.app_protocol);
+                // Backend wire protocol comes from the Service port `appProtocol` (GEP-1911).
+                let protocol = resolved.app_protocol;
                 let group = Arc::new(
                     BackendGroup::new(format!("{ns}/{}", svc.name), resolved.addrs)
                         .with_protocol(protocol)
@@ -484,8 +484,8 @@ impl IngressReconciler {
                             "No ready endpoints for defaultBackend — skipping"
                         );
                     } else {
-                        // Annotation backend-protocol overrides appProtocol-derived default.
-                        let protocol = ann.backend_protocol.unwrap_or(resolved.app_protocol);
+                        // Backend wire protocol comes from the Service port `appProtocol` (GEP-1911).
+                        let protocol = resolved.app_protocol;
                         let group = Arc::new(
                             BackendGroup::new(format!("{ns}/{}", default_svc.name), resolved.addrs)
                                 .with_protocol(protocol)
@@ -2125,52 +2125,6 @@ mod tests {
             t.backend_request.is_none(),
             "backend_request is gateway-api only"
         );
-    }
-
-    #[test]
-    fn annotation_backend_protocol_https_sets_upstream_tls() {
-        use crate::ingress::annotations::BACKEND_PROTOCOL;
-        use coxswain_core::routing::BackendProtocol;
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let ing = make_ingress_with_annotations(
-            "default",
-            Some("example.com"),
-            "/",
-            "svc",
-            &[(BACKEND_PROTOCOL, "HTTPS")],
-        );
-        let svcs = empty_svc_store();
-        let mut builder = IngressRoutingTableBuilder::new();
-        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
-        let table = builder.build().unwrap();
-        let ctx = RequestContext::default();
-        let group = table
-            .route(80, "example.com", "/", &ctx)
-            .expect("route not found");
-        assert_eq!(group.protocol(), BackendProtocol::Https);
-    }
-
-    #[test]
-    fn annotation_backend_protocol_grpc_sets_h2c() {
-        use crate::ingress::annotations::BACKEND_PROTOCOL;
-        use coxswain_core::routing::BackendProtocol;
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        let ing = make_ingress_with_annotations(
-            "default",
-            Some("example.com"),
-            "/",
-            "svc",
-            &[(BACKEND_PROTOCOL, "GRPC")],
-        );
-        let svcs = empty_svc_store();
-        let mut builder = IngressRoutingTableBuilder::new();
-        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
-        let table = builder.build().unwrap();
-        let ctx = RequestContext::default();
-        let group = table
-            .route(80, "example.com", "/", &ctx)
-            .expect("route not found");
-        assert_eq!(group.protocol(), BackendProtocol::H2c);
     }
 
     #[test]

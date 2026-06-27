@@ -705,8 +705,9 @@ pub async fn wait_for_route_status(
 
 /// Poll until the route returns an upstream-rejection status — `400` or any `5xx`.
 ///
-/// For negative backend-protocol assertions where the proxy cannot speak the
-/// upstream's wire protocol (e.g. HTTP/1.1 to an h2c-only port), the rejection
+/// For negative wire-protocol assertions where the proxy cannot speak the
+/// upstream's wire protocol (e.g. HTTP/1.1 to an h2c-only port, or cleartext to a
+/// TLS-only port), the rejection
 /// surfaces as a `502` (the proxy got no valid upstream response) or a `400` (the
 /// upstream replied with a protocol error) depending on how the handshake fails —
 /// both prove the request did not succeed. A `404` (route not yet programmed) or any

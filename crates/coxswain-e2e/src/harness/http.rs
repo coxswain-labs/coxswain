@@ -13,6 +13,9 @@ pub struct EchoResponse {
     pub host: Option<String>,
     /// HTTP method of the request.
     pub method: Option<String>,
+    /// HTTP protocol version seen by the echo server on the proxy→backend leg
+    /// (e.g. `"HTTP/1.1"`, `"HTTP/2.0"`). Reports the *upstream* wire protocol.
+    pub proto: Option<String>,
     /// Kubernetes namespace of the pod that responded.
     pub namespace: Option<String>,
     /// Kubernetes pod name that responded.
@@ -31,6 +34,16 @@ impl EchoResponse {
         assert!(
             pod.starts_with(&format!("{deployment_name}-")),
             "expected backend pod starting with '{deployment_name}-', got '{pod}'"
+        );
+    }
+
+    /// Assert the upstream (proxy→backend) wire protocol the echo server observed,
+    /// e.g. `"HTTP/2.0"` to prove h2 was negotiated on the upstream leg.
+    pub fn assert_upstream_proto(&self, expected: &str) {
+        let proto = self.proto.as_deref().unwrap_or("");
+        assert_eq!(
+            proto, expected,
+            "expected upstream protocol '{expected}', got '{proto}'"
         );
     }
 }
