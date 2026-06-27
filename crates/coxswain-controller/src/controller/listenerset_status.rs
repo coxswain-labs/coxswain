@@ -123,6 +123,7 @@ fn route_kind_info(l: &ListenerSetListeners) -> (bool, Vec<(Option<String>, Stri
 fn listener_conditions(
     l: &ListenerSetListeners,
     info: Option<&ListenerInfo>,
+    accepted: bool,
     has_invalid_kinds: bool,
     ingress_ports: IngressPorts,
     generation: i64,
@@ -137,6 +138,20 @@ fn listener_conditions(
         generation,
         now,
     );
+    // A rejected ListenerSet (parent `allowedListeners` denied it) has no entry in
+    // the parent's effective set, so `info` is `None` and the shared triplet would
+    // optimistically read Accepted/Programmed=True. The listener is neither
+    // attached nor programmed — force both False so the status doesn't claim a
+    // listener the data plane never serves.
+    if !accepted {
+        for c in conds.iter_mut() {
+            if c.type_ == "Accepted" || c.type_ == "Programmed" {
+                c.status = "False".to_string();
+                c.reason = "Pending".to_string();
+                c.message = "ListenerSet not accepted by the parent Gateway".to_string();
+            }
+        }
+    }
     let conflicted = info.is_some_and(|i| i.conflicted);
     let (status, reason, msg) = if conflicted {
         (
@@ -191,8 +206,15 @@ pub(super) fn build_listenerset_status_patch(
         .map(|l| {
             let info = listener_info(parent_health, &ls_key, &l.name);
             let (has_invalid_kinds, supported_kinds) = route_kind_info(l);
-            let conds =
-                listener_conditions(l, info, has_invalid_kinds, ingress_ports, generation, now);
+            let conds = listener_conditions(
+                l,
+                info,
+                accepted,
+                has_invalid_kinds,
+                ingress_ports,
+                generation,
+                now,
+            );
             let programmed = conds
                 .iter()
                 .find(|c| c.type_ == "Programmed")
@@ -312,9 +334,14 @@ pub(super) fn listenerset_needs_status_patch(
         // and only changes on a generation-bumping edit, so it is covered by the
         // observedGeneration check above and omitted here — matching the Gateway path).
         let desired_resolved = !has_invalid_kinds && healthy;
-        let desired_accepted_listener =
-            !info.is_some_and(|i| matches!(i.tls_outcome, ListenerTlsOutcome::Unsupported { .. }));
-        let desired_programmed = !conflicted && healthy;
+        // Mirror `listener_conditions`: a rejected ListenerSet forces every
+        // listener's Accepted/Programmed to False (its listeners are neither
+        // attached nor programmed). Without this the staleness check's desired
+        // state would diverge from the written patch and loop forever.
+        let desired_accepted_listener = accepted
+            && !info
+                .is_some_and(|i| matches!(i.tls_outcome, ListenerTlsOutcome::Unsupported { .. }));
+        let desired_programmed = accepted && !conflicted && healthy;
         if !desired_programmed {
             all_programmed = false;
         }
@@ -453,6 +480,42 @@ mod tests {
         assert_eq!(patch["status"]["conditions"][0]["status"], "False");
         assert_eq!(patch["status"]["conditions"][0]["reason"], "NotAllowed");
         assert_eq!(patch["status"]["conditions"][1]["status"], "False");
+
+        // The rejected ListenerSet's listener must NOT be programmed (its listeners
+        // are never served). The shared triplet would optimistically read True with
+        // no health info — the `accepted=false` override must force it False.
+        let listener_conds = &patch["status"]["listeners"][0]["conditions"];
+        let prog = listener_conds
+            .as_array()
+            .expect("listener conditions")
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed condition");
+        assert_eq!(
+            prog["status"], "False",
+            "rejected LS listener must not program"
+        );
+        let acc = listener_conds
+            .as_array()
+            .expect("listener conditions")
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted condition");
+        assert_eq!(
+            acc["status"], "False",
+            "rejected LS listener is not accepted"
+        );
+
+        // Idempotency: after writing this patch back as the ListenerSet's status,
+        // `needs_patch` must be false — otherwise the desired/current divergence
+        // would drive an infinite patch loop.
+        let mut applied = set.clone();
+        applied.status =
+            Some(serde_json::from_value(patch["status"].clone()).expect("status deserializes"));
+        assert!(
+            !listenerset_needs_status_patch(&applied, None, false),
+            "rejected-LS status must be stable (no patch loop)"
+        );
     }
 
     #[test]
