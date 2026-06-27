@@ -302,7 +302,14 @@ fn listener_path_severity(
         return Severity::Ok; // no TLS detail (e.g. cleartext) — treat as healthy
     };
     if !section.is_empty() {
-        return match health.listeners.get(section) {
+        // The listener name is unique only within a source (GEP-1713), but this is
+        // an observability heuristic, not routing: match by name across sources.
+        return match health
+            .listeners
+            .iter()
+            .find(|(k, _)| k.name == section)
+            .map(|(_, li)| li)
+        {
             Some(li) if li.tls_outcome.is_healthy() => Severity::Ok,
             Some(_) => Severity::Error,
             None => Severity::Ok, // unmatched section is reflected in own_ok, not here
@@ -435,7 +442,7 @@ mod tests {
         Gateway, GatewayInfrastructure, GatewayInfrastructureParametersRef, GatewaySpec,
         GatewayStatus, GatewayStatusAddresses,
     };
-    use crate::tls::{GatewayListenerHealth, ListenerInfo, RouteHealthMap};
+    use crate::tls::{GatewayListenerHealth, ListenerHealthKey, ListenerInfo, RouteHealthMap};
     use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, ProxyPool};
     use coxswain_core::ownership::ObjectKey;
     use k8s_openapi::api::networking::v1::{
@@ -510,7 +517,7 @@ mod tests {
         li.hostname = String::new();
         li.allows_all_namespaces = true;
         li.port = 80;
-        listeners.insert("default".to_string(), li);
+        listeners.insert(ListenerHealthKey::gateway("default"), li);
         let mut glh = GatewayListenerHealth::default();
         glh.listeners = listeners;
         glh
@@ -916,13 +923,13 @@ mod tests {
     use crate::tls::ListenerTlsOutcome;
     use coxswain_core::cluster::Severity;
 
-    fn listener(name: &str, outcome: ListenerTlsOutcome) -> (String, ListenerInfo) {
+    fn listener(name: &str, outcome: ListenerTlsOutcome) -> (ListenerHealthKey, ListenerInfo) {
         let mut li = ListenerInfo::default();
         li.tls_outcome = outcome;
-        (name.to_string(), li)
+        (ListenerHealthKey::gateway(name), li)
     }
 
-    fn health_with(listeners: Vec<(String, ListenerInfo)>) -> GatewayListenerHealth {
+    fn health_with(listeners: Vec<(ListenerHealthKey, ListenerInfo)>) -> GatewayListenerHealth {
         let mut glh = GatewayListenerHealth::default();
         glh.listeners = listeners.into_iter().collect();
         glh

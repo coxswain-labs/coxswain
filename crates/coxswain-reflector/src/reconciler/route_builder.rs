@@ -5,6 +5,7 @@
 //! ([`ReflectorStores`], [`Ownership`], [`SharedOutputs`], [`IngressBuildConfig`])
 //! defined alongside the loop.
 
+use super::listener_merge::EffectiveListener;
 use super::proxy::{
     IngressBuildConfig, IngressDefaultBackend, IngressEvent, Ownership, ReflectorStores,
     SharedOutputs, gateway_is_cut_over,
@@ -23,8 +24,8 @@ use crate::ingress::annotations::AnnotationIssue;
 use crate::ingress::{IngressClassContext, IngressPorts, IngressReconciler, resolve_class_params};
 use crate::keys::ListenerKey;
 use crate::tls::{
-    BackendClientCertOutcome, GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome,
-    RouteHealthMap,
+    BackendClientCertOutcome, GatewayListenerHealth, ListenerHealthKey, ListenerInfo,
+    ListenerSource, ListenerTlsOutcome, RouteHealthMap,
 };
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self as reference_grants, ReferenceGrantKey};
@@ -167,37 +168,37 @@ pub(super) fn build_gateway_routes(
     skip_cut_over: bool,
 ) -> bool {
     let vip_internal = stores.vip_internal;
-    // Precompute ListenerKey → (hostname, spec port, bind port) from all owned
-    // gateway listeners.
-    let listener_info: HashMap<ListenerKey, ListenerBinding> = stores
-        .gateways
-        .state()
-        .into_iter()
-        .filter(|g| {
-            ownership
-                .gateway_classes
-                .contains(&g.spec.gateway_class_name)
-        })
-        .filter(|g| !(skip_cut_over && gateway_is_cut_over(g)))
-        .flat_map(|g| {
-            let ns = g.metadata.namespace.clone().unwrap_or_default();
-            let name = g.metadata.name.clone().unwrap_or_default();
+    // Precompute ListenerKey → (hostname, spec port, bind port) from every owned
+    // Gateway's EFFECTIVE listeners (its own plus those merged from attached
+    // ListenerSets, GEP-1713). `effective_gateways` already excludes unowned
+    // classes; conflicted listeners (lost a port conflict) are not programmed.
+    let listener_info: HashMap<ListenerKey, ListenerBinding> = ownership
+        .effective_gateways
+        .values()
+        .filter(|e| !(skip_cut_over && gateway_is_cut_over(&e.gateway)))
+        .flat_map(|e| {
+            let ns = e.gateway.metadata.namespace.clone().unwrap_or_default();
+            let name = e.gateway.metadata.name.clone().unwrap_or_default();
             let gw_key = ObjectKey::new(ns.clone(), name.clone());
             let vip = vip_internal.clone();
-            g.spec.listeners.clone().into_iter().map(move |l| {
-                let key = ListenerKey::new(ns.clone(), name.clone(), l.name);
-                let spec_port = l.port as u16;
-                let bind_port = vip
-                    .get(&(gw_key.clone(), spec_port))
-                    .copied()
-                    .unwrap_or(spec_port);
-                let binding = ListenerBinding {
-                    hostname: l.hostname.unwrap_or_default(),
-                    port: spec_port,
-                    bind_port,
-                };
-                (key, binding)
-            })
+            e.listeners
+                .iter()
+                .filter(|l| !l.conflicted)
+                .map(move |l| {
+                    let key = ListenerKey::new(ns.clone(), name.clone(), l.name.clone());
+                    let spec_port = l.port as u16;
+                    let bind_port = vip
+                        .get(&(gw_key.clone(), spec_port))
+                        .copied()
+                        .unwrap_or(spec_port);
+                    let binding = ListenerBinding {
+                        hostname: l.hostname.clone().unwrap_or_default(),
+                        port: spec_port,
+                        bind_port,
+                    };
+                    (key, binding)
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -497,8 +498,17 @@ pub(super) fn build_tls(
             .filter(|((k, _), _)| k == &gw_key)
             .map(|((_, lp), ip)| (*lp, *ip))
             .collect();
+        // GEP-1713: reconcile the Gateway's EFFECTIVE listeners (its own plus those
+        // merged from attached ListenerSets), each resolving its certs in its own
+        // namespace. Falls back to an empty slice for a Gateway not in the map.
+        let listeners: &[EffectiveListener] = ownership
+            .effective_gateways
+            .get(&gw_key)
+            .map(|e| e.listeners.as_slice())
+            .unwrap_or(&[]);
         let health = GatewayApiReconciler::reconcile_tls(
-            &gw,
+            &name,
+            listeners,
             stores.secrets,
             ownership.cert_grants,
             &mut tls_builder,
@@ -507,7 +517,11 @@ pub(super) fn build_tls(
         // Populate the per-port listener-hostname snapshot for
         // misdirected-request detection (GEP-3567, #96). Keyed by BIND port so
         // the proxy (which checks by the accepted local port) matches it (#472).
+        // Conflicted listeners (GEP-1713) are not programmed — skip them.
         for li in health.listeners.values() {
+            if li.conflicted {
+                continue;
+            }
             lh_builder.add_listener(
                 li.bind_port(),
                 &li.hostname,
@@ -662,8 +676,13 @@ pub(super) fn count_attached_routes<R: RouteLike>(
                 continue;
             }
             if let Some(health) = gateway_listener_health.get_mut(&key) {
+                // This parentRef targets the Gateway itself, so it attaches only to
+                // the Gateway's own listeners (source = Gateway), never to listeners
+                // contributed by an attached ListenerSet — those require a
+                // `parentRef.kind: ListenerSet` (handled separately, GEP-1713).
                 if let Some(sn) = pr.section_name {
-                    let Some(info) = health.listeners.get_mut(sn) else {
+                    let Some(info) = health.listeners.get_mut(&ListenerHealthKey::gateway(sn))
+                    else {
                         continue;
                     };
                     if gw_ns != route_ns && !info.allows_all_namespaces {
@@ -681,8 +700,13 @@ pub(super) fn count_attached_routes<R: RouteLike>(
                         info.attached_routes += 1;
                     }
                 } else {
-                    let listener_names: Vec<String> = health.listeners.keys().cloned().collect();
-                    for ln in listener_names {
+                    let gateway_listeners: Vec<ListenerHealthKey> = health
+                        .listeners
+                        .keys()
+                        .filter(|k| matches!(k.source, ListenerSource::Gateway))
+                        .cloned()
+                        .collect();
+                    for ln in gateway_listeners {
                         let Some(info) = health.listeners.get_mut(&ln) else {
                             continue;
                         };
@@ -906,16 +930,22 @@ mod tests {
     use crate::gw_types::v::tlsroutes::{TlsRouteParentRefs, TlsRouteSpec};
     use kube::api::ObjectMeta;
 
-    /// One listener entry; `hostname == ""` matches all route hostnames.
-    fn listener(name: &str, tls_outcome: ListenerTlsOutcome, port: u16) -> (String, ListenerInfo) {
+    /// One Gateway-owned listener entry; `hostname == ""` matches all route hostnames.
+    fn listener(
+        name: &str,
+        tls_outcome: ListenerTlsOutcome,
+        port: u16,
+    ) -> (ListenerHealthKey, ListenerInfo) {
         let mut info = ListenerInfo::default();
         info.tls_outcome = tls_outcome;
         info.port = port;
-        (name.to_string(), info)
+        (ListenerHealthKey::gateway(name), info)
     }
 
     /// A single-Gateway health map keyed `default/gw`.
-    fn health(listeners: Vec<(String, ListenerInfo)>) -> HashMap<ObjectKey, GatewayListenerHealth> {
+    fn health(
+        listeners: Vec<(ListenerHealthKey, ListenerInfo)>,
+    ) -> HashMap<ObjectKey, GatewayListenerHealth> {
         let mut gw = GatewayListenerHealth::default();
         gw.listeners = listeners.into_iter().collect();
         std::iter::once((ObjectKey::new("default", "gw"), gw)).collect()
@@ -983,7 +1013,8 @@ mod tests {
     }
 
     fn attached(map: &HashMap<ObjectKey, GatewayListenerHealth>, name: &str) -> i32 {
-        map[&ObjectKey::new("default", "gw")].listeners[name].attached_routes
+        map[&ObjectKey::new("default", "gw")].listeners[&ListenerHealthKey::gateway(name)]
+            .attached_routes
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::gateway_api::{
 use crate::gw_types::BackendTlsPolicy;
 use crate::gw_types::GrpcRoute;
 use crate::gw_types::HttpRoute;
+use crate::gw_types::ListenerSet;
 use crate::gw_types::TlsRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
@@ -49,7 +50,7 @@ use coxswain_core::routing::{
 use coxswain_core::shared::Shared;
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::{
@@ -554,6 +555,14 @@ pub(super) struct ReflectorStores<'a> {
     pub(super) ingress_class_parameters: &'a reflector::Store<CoxswainIngressClassParameters>,
     pub(super) gateways: &'a reflector::Store<Gateway>,
     pub(super) gateway_classes: &'a reflector::Store<GatewayClass>,
+    /// `ListenerSet` resources in scope (GEP-1713). Merged into each parent
+    /// Gateway's effective listener set during rebuild, gated by the parent's
+    /// `spec.allowedListeners`.
+    pub(super) listener_sets: &'a reflector::Store<ListenerSet>,
+    /// All `Namespace` objects (cluster-wide). Read only to evaluate a Gateway's
+    /// `allowedListeners.namespaces.from: Selector` against the ListenerSet's
+    /// namespace labels; nothing else consumes it.
+    pub(super) namespaces: &'a reflector::Store<Namespace>,
     pub(super) slices: &'a reflector::Store<EndpointSlice>,
     pub(super) services: &'a reflector::Store<Service>,
     /// `(Gateway, listenerPort) → internalPort` map (#472), read ONCE per rebuild
@@ -631,6 +640,11 @@ pub(super) struct Ownership<'a> {
     /// proxy's configured identity (GEP-3155, matching the project's fail-closed
     /// posture for every other cert path).
     pub(super) backend_client_cert_failures: &'a HashSet<ObjectKey>,
+    /// Per-Gateway effective listener sets (own listeners + those merged from
+    /// attached ListenerSets, GEP-1713), computed once per rebuild. Folded into
+    /// `Ownership` (same rationale as `policy_index`) so the route/TLS builders
+    /// read one consistent merged view without an extra arg.
+    pub(super) effective_gateways: &'a HashMap<ObjectKey, super::listener_merge::EffectiveGateway>,
 }
 
 /// Per-reflector side-effect channels: rebuild notification, readiness flip,
@@ -899,6 +913,8 @@ async fn spawn_tasks(
     let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
     let (path_rewrite_reader, path_rewrite_writer) = reflector::store::<PathRewriteRegex>();
     let (tls_route_reader, tls_route_writer) = reader_writer::<TlsRoute>(pre_tls_routes);
+    let (listener_set_reader, listener_set_writer) = reflector::store::<ListenerSet>();
+    let (namespace_reader, namespace_writer) = reflector::store::<Namespace>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
     let ns = watch_namespace.as_deref();
@@ -1068,6 +1084,30 @@ async fn spawn_tasks(
         ReflectorEffects::new(&notify, &controller_health, "tls_route", metrics),
         "TlsRoute",
     );
+    // GEP-1713: ListenerSets are namespaced and merged into their parent Gateway's
+    // effective listener set during rebuild; scoped to `--watch-namespace` like the
+    // other Gateway-API resources.
+    spawn_reflector(
+        &mut set,
+        listener_set_writer,
+        scoped_api::<ListenerSet>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(&notify, &controller_health, "listener_set", metrics),
+        "ListenerSet",
+    );
+    // Namespaces are cluster-scoped and watched only so a Gateway's
+    // `allowedListeners.namespaces.from: Selector` can be matched against the
+    // ListenerSet's namespace labels (GEP-1713). Like IngressClass it must be
+    // cluster-wide — a `--watch-namespace` scope can't observe label changes on a
+    // ListenerSet's namespace object. Read-only; the proxy SA holds no write verb.
+    spawn_reflector(
+        &mut set,
+        namespace_writer,
+        Api::<Namespace>::all(client.clone()),
+        watcher::Config::default(),
+        ReflectorEffects::new(&notify, &controller_health, "namespace", metrics),
+        "Namespace",
+    );
 
     // --- Fleet pod watch (controller role only) ---
     //
@@ -1124,6 +1164,8 @@ async fn spawn_tasks(
                 ingress_class_parameters: &class_params_reader,
                 gateways: &gateway_reader,
                 gateway_classes: &gateway_class_reader,
+                listener_sets: &listener_set_reader,
+                namespaces: &namespace_reader,
                 slices: &slice_reader,
                 services: &service_reader,
                 vip_internal: &vip_internal,
@@ -1240,6 +1282,17 @@ fn rebuild(
     let backend_client_certs =
         resolve_backend_client_certs(stores, &owned_gateway_classes, &cert_grants, true);
 
+    // GEP-1713: compute every owned Gateway's effective listener set (its own plus
+    // the listeners merged from attached ListenerSets, gated by each Gateway's
+    // `allowedListeners`) ONCE, before both the shared and dedicated build paths,
+    // so they consume one consistent source of truth.
+    let effective = super::listener_merge::merge_effective_gateways(
+        &stores.gateways.state(),
+        &stores.listener_sets.state(),
+        &owned_gateway_classes,
+        stores.namespaces,
+    );
+
     let ownership = Ownership {
         ingress_classes: &owned_ingress_classes,
         default_ingress_class: owned_default_ingress_class.as_deref(),
@@ -1251,6 +1304,7 @@ fn rebuild(
         policy_index: &policy_index,
         backend_client_certs: &backend_client_certs.certs,
         backend_client_cert_failures: &backend_client_certs.failures,
+        effective_gateways: &effective,
     };
 
     let routes_published = build_routes(
@@ -1459,6 +1513,9 @@ fn rebuild(
             policy_index: &policy_index,
             backend_client_certs: &dedicated_backend_client_certs.certs,
             backend_client_cert_failures: &dedicated_backend_client_certs.failures,
+            // Same merged map: the dedicated proxy serves its Gateway's effective
+            // listeners (own + ListenerSet-merged), consistent with the shared path.
+            effective_gateways: &effective,
         };
 
         let gw_routes_cell: SharedGatewayRoutingTable = Shared::new();

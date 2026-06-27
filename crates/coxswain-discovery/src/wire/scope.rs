@@ -119,6 +119,7 @@ pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerI
     li.allows_all_namespaces = dto.allows_all_namespaces;
     li.port = dto.port as u16;
     li.internal_port = dto.internal_port as u16;
+    li.conflicted = dto.conflicted;
     Ok(li)
 }
 

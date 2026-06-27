@@ -1400,11 +1400,17 @@ mod tests {
         let mut http = coxswain_reflector::tls::ListenerInfo::default();
         http.port = 80;
         http.internal_port = 30000;
-        listeners.insert("http".to_string(), http);
+        listeners.insert(
+            coxswain_reflector::tls::ListenerHealthKey::gateway("http"),
+            http,
+        );
         let mut https = coxswain_reflector::tls::ListenerInfo::default();
         https.port = 443;
         https.internal_port = 30001;
-        listeners.insert("https".to_string(), https);
+        listeners.insert(
+            coxswain_reflector::tls::ListenerHealthKey::gateway("https"),
+            https,
+        );
         let mut glh = GatewayListenerHealth::default();
         glh.listeners = listeners;
 
@@ -1432,7 +1438,10 @@ mod tests {
         let mut li = coxswain_reflector::tls::ListenerInfo::default();
         li.port = 8080;
         li.internal_port = 0;
-        listeners.insert("http".to_string(), li);
+        listeners.insert(
+            coxswain_reflector::tls::ListenerHealthKey::gateway("http"),
+            li,
+        );
         let mut glh = GatewayListenerHealth::default();
         glh.listeners = listeners;
 

@@ -7,7 +7,6 @@ use super::bindings::{ListenerBinding, compute_listener_bindings};
 use crate::endpoints;
 use crate::gw_types::{
     HttpRoute,
-    v::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode},
     v::httproutes::{
         HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesFiltersType,
         HttpRouteRulesMatchesPathType,
@@ -15,7 +14,10 @@ use crate::gw_types::{
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
-use crate::tls::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, load_tls_cert};
+use crate::reconciler::listener_merge::EffectiveListener;
+use crate::tls::{
+    GatewayListenerHealth, ListenerHealthKey, ListenerInfo, ListenerTlsOutcome, load_tls_cert,
+};
 use coxswain_core::crd::{PathRewriteRegex, RateLimit};
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
@@ -717,18 +719,35 @@ impl GatewayApiReconciler {
     /// terminate certs key under that port in the per-port store and the proxy's
     /// per-port `SniCertSelector` finds them. Listeners absent from the map
     /// (dedicated mode, Ingress) key under their spec port (internal == spec).
-    pub fn reconcile_tls(
-        gateway: &Gateway,
+    /// Walks a Gateway's **effective** listeners (its own plus those merged from
+    /// attached ListenerSets, GEP-1713), resolves TLS certificates for HTTPS
+    /// listeners, and registers them in `builder`. Returns a per-listener health
+    /// map keyed by [`ListenerHealthKey`] so the controller can attribute each
+    /// listener's status to the resource that declared it.
+    ///
+    /// `gw_name` is the parent Gateway's name (for log context); each listener's
+    /// `certificateRefs` resolve in its OWN `owning_namespace` — the Gateway's
+    /// namespace for a Gateway listener, the ListenerSet's for a ListenerSet
+    /// listener. A `conflicted` listener (lost a port-compatibility conflict) is
+    /// recorded with `conflicted=true` but installs no cert and is not programmed.
+    ///
+    /// Only `protocol: HTTPS` with `tls.mode: Terminate` (the default) installs a
+    /// cert here. `protocol: TLS, tls.mode: Passthrough` listeners are handled by
+    /// `build_passthrough_routes`; `TLS/Terminate` is `Unsupported`. Non-HTTPS
+    /// listeners are `NotApplicable`. Cross-namespace `certificateRefs` require a
+    /// matching entry in `cert_grants`. `internal_ports` maps `listenerPort →
+    /// internalPort` (#472) for shared-mode VIP isolation.
+    pub(crate) fn reconcile_tls(
+        gw_name: &str,
+        listeners: &[EffectiveListener],
         secrets: &reflector::Store<Secret>,
         cert_grants: &HashSet<ReferenceGrantKey>,
         builder: &mut PortTlsStoreBuilder,
         internal_ports: &HashMap<u16, u16>,
     ) -> GatewayListenerHealth {
-        let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
-        let gw_name = gateway.metadata.name.as_deref().unwrap_or("unknown");
-        let mut listeners = BTreeMap::new();
+        let mut map = BTreeMap::new();
 
-        for listener in &gateway.spec.listeners {
+        for listener in listeners {
             let listener_port = listener.port as u16;
             let internal_port = internal_ports.get(&listener_port).copied().unwrap_or(0);
             // Bind port the proxy accepts this listener on (= internal port when
@@ -738,12 +757,12 @@ impl GatewayApiReconciler {
             } else {
                 listener_port
             };
-            let tls_outcome = if listener.protocol == "TLS"
-                && listener
-                    .tls
-                    .as_ref()
-                    .and_then(|t| t.mode.as_ref())
-                    .is_some_and(|m| matches!(m, GatewayListenersTlsMode::Passthrough))
+            let tls_outcome = if listener.conflicted {
+                // Lost a port-compatibility conflict to a higher-precedence
+                // listener (GEP-1713) — not programmed, no cert installed.
+                ListenerTlsOutcome::NotApplicable
+            } else if listener.protocol == "TLS"
+                && listener.tls.as_ref().is_some_and(|t| t.passthrough)
             {
                 // TLS passthrough: proxy peeks SNI and forwards raw stream; no cert needed.
                 ListenerTlsOutcome::TlsPassthrough
@@ -757,49 +776,43 @@ impl GatewayApiReconciler {
             } else if listener.protocol != "HTTPS" {
                 ListenerTlsOutcome::NotApplicable
             } else {
-                resolve_listener_tls(
-                    gw_ns,
-                    gw_name,
-                    listener,
-                    secrets,
-                    cert_grants,
-                    builder,
-                    bind_port,
-                )
+                resolve_listener_tls(gw_name, listener, secrets, cert_grants, builder, bind_port)
             };
-            let hostname = listener.hostname.as_deref().unwrap_or("").to_string();
-            let allows_all_namespaces = listener
-                .allowed_routes
-                .as_ref()
-                .and_then(|ar| ar.namespaces.as_ref())
-                .and_then(|ns| ns.from.as_ref())
-                .map(|f| !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same))
-                .unwrap_or(false); // default per spec is Same
             let mut li = ListenerInfo::default();
             li.tls_outcome = tls_outcome;
             li.attached_routes = 0;
-            li.hostname = hostname;
-            li.allows_all_namespaces = allows_all_namespaces;
+            li.hostname = listener.hostname.clone().unwrap_or_default();
+            li.allows_all_namespaces = listener.allows_all_namespaces;
             li.port = listener_port;
             li.internal_port = internal_port;
-            listeners.insert(listener.name.clone(), li);
+            li.conflicted = listener.conflicted;
+            map.insert(
+                ListenerHealthKey {
+                    source: listener.source.clone(),
+                    name: listener.name.clone(),
+                },
+                li,
+            );
         }
 
         let mut glh = GatewayListenerHealth::default();
-        glh.listeners = listeners;
+        glh.listeners = map;
         glh
     }
 }
 
 fn resolve_listener_tls(
-    gw_ns: &str,
     gw_name: &str,
-    listener: &crate::gw_types::v::gateways::GatewayListeners,
+    listener: &EffectiveListener,
     secrets: &reflector::Store<Secret>,
     cert_grants: &HashSet<ReferenceGrantKey>,
     builder: &mut PortTlsStoreBuilder,
     bind_port: u16,
 ) -> ListenerTlsOutcome {
+    // ListenerSet listeners resolve their certificateRefs in the ListenerSet's own
+    // namespace (GEP-1713), not the parent Gateway's; Gateway listeners use the
+    // Gateway namespace. Both are carried as `owning_namespace`.
+    let owning_ns = listener.owning_namespace.as_str();
     let tls = match &listener.tls {
         Some(t) => t,
         None => {
@@ -809,7 +822,7 @@ fn resolve_listener_tls(
         }
     };
 
-    if matches!(tls.mode, Some(GatewayListenersTlsMode::Passthrough)) {
+    if tls.passthrough {
         return ListenerTlsOutcome::Invalid {
             message: "tls.mode: Passthrough is not supported; use Terminate".to_string(),
         };
@@ -822,7 +835,7 @@ fn resolve_listener_tls(
         .filter(|h| !h.is_empty())
         .unwrap_or("");
 
-    let refs = tls.certificate_refs.as_deref().unwrap_or(&[]);
+    let refs = tls.certificate_refs.as_slice();
     if refs.is_empty() {
         return ListenerTlsOutcome::InvalidCertificateRef {
             message: "tls.certificateRefs is empty".to_string(),
@@ -848,13 +861,18 @@ fn resolve_listener_tls(
             continue;
         }
 
-        let ref_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
+        let ref_ns = cert_ref.namespace.as_deref().unwrap_or(owning_ns);
 
-        if ref_ns != gw_ns
-            && !reference_grants::backend_ref_allowed(gw_ns, ref_ns, &cert_ref.name, cert_grants)
+        if ref_ns != owning_ns
+            && !reference_grants::backend_ref_allowed(
+                owning_ns,
+                ref_ns,
+                &cert_ref.name,
+                cert_grants,
+            )
         {
             tracing::warn!(
-                gateway = %format!("{gw_ns}/{gw_name}"),
+                gateway = %format!("{gw_name}"),
                 listener = %listener.name,
                 secret = %format!("{ref_ns}/{}", cert_ref.name),
                 "Cross-namespace certificateRef denied — no matching ReferenceGrant"
@@ -872,7 +890,7 @@ fn resolve_listener_tls(
                 builder.add_cert(bind_port, hostname, Arc::new(cert));
                 resolved_count += 1;
                 tracing::debug!(
-                    gateway = %format!("{gw_ns}/{gw_name}"),
+                    gateway = %format!("{gw_name}"),
                     listener = %listener.name,
                     secret = %format!("{ref_ns}/{}", cert_ref.name),
                     hostname,
@@ -881,7 +899,7 @@ fn resolve_listener_tls(
             }
             Err(e) => {
                 tracing::warn!(
-                    gateway = %format!("{gw_ns}/{gw_name}"),
+                    gateway = %format!("{gw_name}"),
                     listener = %listener.name,
                     secret = %format!("{ref_ns}/{}", cert_ref.name),
                     error = %e,
@@ -916,7 +934,7 @@ fn resolve_listener_tls(
             messages.join("; ")
         );
         tracing::warn!(
-            gateway = %format!("{gw_ns}/{gw_name}"),
+            gateway = %format!("{gw_name}"),
             listener = %listener.name,
             ?message,
             "Listener is serving only a subset of its certificateRefs (ResolvedPartial)"

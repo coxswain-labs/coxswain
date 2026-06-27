@@ -21,4 +21,8 @@ pub use gateway_api::apis::experimental as v;
 pub use v::backendtlspolicies::BackendTlsPolicy;
 pub use v::grpcroutes::GrpcRoute;
 pub use v::httproutes::HttpRoute;
+// GEP-1713: ListenerSet is a standard-channel resource (no experimental gate). Re-exported
+// for a stable import path alongside the route kinds; its listeners are merged into the
+// parent Gateway's effective listener set during reconcile.
+pub use v::listenersets::ListenerSet;
 pub use v::tlsroutes::TlsRoute;

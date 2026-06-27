@@ -9,10 +9,67 @@
 //! `coxswain-discovery` can implement [`crate::RoutingSource`] without
 //! depending on `coxswain-reflector`.
 
+use crate::ownership::ObjectKey;
 use arc_swap::ArcSwap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::watch;
+
+/// Origin of a listener in a Gateway's effective listener set (GEP-1713).
+///
+/// A Gateway's effective listeners concatenate its own `spec.listeners` with the
+/// listeners contributed by attached `ListenerSet`s. The spec permits the same
+/// listener *name* on a Gateway and on its ListenerSets, and requires both to be
+/// programmed — so per-listener health is keyed by source+name (see [`ListenerHealthKey`])
+/// rather than name alone. The source also lets the controller attribute each
+/// per-listener status back to the resource that declared it.
+// intentionally open: constructed via literal by the reflector merge and the
+// controller status writer, and matched exhaustively in both — a third origin
+// would be a deliberate, breaking model change, not a silently-added variant.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ListenerSource {
+    /// Declared in the parent Gateway's own `spec.listeners`.
+    Gateway,
+    /// Contributed by a `ListenerSet`, identified by its `{namespace}/{name}` key.
+    ListenerSet(ObjectKey),
+}
+
+/// Provenance-aware identity of one listener within a [`GatewayListenerHealth`].
+///
+/// Replaces a bare listener-name key: `(source, name)` is unique across a Gateway
+/// and all its attached ListenerSets even when names collide. The derived `Ord`
+/// (Gateway before ListenerSet, then by [`ObjectKey`], then by name) only fixes a
+/// deterministic map/wire iteration order — it is **not** the GEP-1713 merge
+/// precedence (creationTimestamp-first), which is computed explicitly in the merge.
+// intentionally open: constructed via field literal at every producer and lookup
+// site; it carries no invariant a constructor would need to enforce.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ListenerHealthKey {
+    /// The resource that declared this listener.
+    pub source: ListenerSource,
+    /// The listener's `name`, unique only within its own `source`.
+    pub name: String,
+}
+
+impl ListenerHealthKey {
+    /// Key for a listener declared directly on the parent Gateway.
+    #[must_use]
+    pub fn gateway(name: impl Into<String>) -> Self {
+        Self {
+            source: ListenerSource::Gateway,
+            name: name.into(),
+        }
+    }
+
+    /// Key for a listener contributed by the `ListenerSet` identified by `key`.
+    #[must_use]
+    pub fn listener_set(key: ObjectKey, name: impl Into<String>) -> Self {
+        Self {
+            source: ListenerSource::ListenerSet(key),
+            name: name.into(),
+        }
+    }
+}
 
 /// Outcome of resolving one HTTPS listener's TLS configuration during a rebuild.
 #[non_exhaustive]
@@ -244,6 +301,12 @@ pub struct ListenerInfo {
     /// dedicated mode and Ingress-derived listeners keep spec == bind. Read
     /// through [`Self::bind_port`], never directly, so the fallback is honoured.
     pub internal_port: u16,
+    /// GEP-1713: `true` when this listener lost a port-compatibility conflict to a
+    /// higher-precedence listener in the Gateway's effective set and was therefore
+    /// not programmed. Drives the `Conflicted=True` condition on the owning resource
+    /// (the Gateway or the contributing `ListenerSet`). Always `false` for Gateways
+    /// without attached ListenerSets.
+    pub conflicted: bool,
 }
 
 impl ListenerInfo {
@@ -358,12 +421,14 @@ impl BackendClientCertOutcome {
     }
 }
 
-/// Per-listener health for one Gateway, keyed by listener name.
+/// Per-listener health for one Gateway, keyed by [`ListenerHealthKey`] (source + name).
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct GatewayListenerHealth {
-    /// All listeners for this Gateway. Keyed by listener name.
-    pub listeners: BTreeMap<String, ListenerInfo>,
+    /// The Gateway's effective listeners (its own plus those merged from attached
+    /// ListenerSets), keyed by [`ListenerHealthKey`] so same-named listeners from
+    /// different sources stay distinct (GEP-1713).
+    pub listeners: BTreeMap<ListenerHealthKey, ListenerInfo>,
     /// Frontend client-certificate validation health for this Gateway (GEP-91, #86).
     ///
     /// `None` when `spec.tls.frontend.default.validation` is absent.
@@ -379,8 +444,6 @@ pub struct GatewayListenerHealth {
 }
 
 // ── SharedGatewayListenerHealth ───────────────────────────────────────────────
-
-use crate::ownership::ObjectKey;
 
 struct GatewayListenerHealthInner {
     map: ArcSwap<HashMap<ObjectKey, GatewayListenerHealth>>,

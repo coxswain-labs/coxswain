@@ -16,7 +16,7 @@ use tokio::sync::watch;
 pub use coxswain_core::listener_health::SharedGatewayListenerHealth;
 pub use coxswain_core::listener_health::{
     BackendClientCertOutcome, FrontendValidationHealth, FrontendValidationOutcome,
-    GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome,
+    GatewayListenerHealth, ListenerHealthKey, ListenerInfo, ListenerSource, ListenerTlsOutcome,
 };
 
 #[derive(Debug, Error)]

@@ -60,6 +60,6 @@ pub use reconciler::{
     StatusSubscriptions,
 };
 pub use tls::{
-    GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, SharedBackendTlsPolicyHealth,
-    SharedGatewayListenerHealth, SharedRouteHealth,
+    GatewayListenerHealth, ListenerHealthKey, ListenerInfo, ListenerSource, ListenerTlsOutcome,
+    SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedRouteHealth,
 };

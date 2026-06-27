@@ -670,7 +670,7 @@ message GatewayHealthEntry {
 }
 
 // Mirrors GatewayListenerHealth.
-// BTreeMap<String, ListenerInfo> → already sorted by listener name.
+// BTreeMap<ListenerHealthKey, ListenerInfo> → already sorted by (source, name).
 message ListenerHealth {
   repeated ListenerInfoEntry listeners = 1;
 }
@@ -678,6 +678,12 @@ message ListenerHealth {
 message ListenerInfoEntry {
   string name = 1;
   ListenerInfo info = 2;
+  // GEP-1713 listener provenance. Empty string = declared on the parent Gateway
+  // itself; otherwise the contributing ListenerSet's "{namespace}/{name}" key.
+  // Listener names are unique only within a source, so (source, name) is the
+  // decode key — without it two same-named listeners from different sources
+  // would collapse to one entry. Additive field; pre-1713 proxies ignore it.
+  string source = 3;
 }
 
 // Mirrors ListenerInfo.
@@ -693,6 +699,11 @@ message ListenerInfo {
   // (#472). 0 means "not separately allocated; bind the spec port" (dedicated
   // mode, Ingress-derived listeners) — decode falls back to `port`.
   uint32 internal_port = 7;
+  // GEP-1713 — true when this listener lost a port-compatibility conflict to a
+  // higher-precedence listener in the Gateway's effective set. The proxy must NOT
+  // bind a conflicted listener; it is retained only so the controller can emit the
+  // Conflicted condition. Additive field; pre-1713 proxies decode it as false.
+  bool conflicted = 8;
 }
 
 // Mirrors ListenerTlsOutcome.

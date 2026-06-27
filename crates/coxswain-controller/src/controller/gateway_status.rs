@@ -6,7 +6,7 @@ use crate::status_common::{
     OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
 };
 use coxswain_reflector::gw_types::v::gateways::{Gateway, GatewayStatusListeners};
-use coxswain_reflector::tls::{GatewayListenerHealth, ListenerTlsOutcome};
+use coxswain_reflector::tls::{GatewayListenerHealth, ListenerHealthKey, ListenerTlsOutcome};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Returns true when the Gateway's current status does not yet reflect the
@@ -90,7 +90,9 @@ pub(super) fn gateway_needs_status_patch(
     // desired-health comparison or a frontend-only failure would never patch.
     for listener in &gw.spec.listeners {
         let (has_invalid_kinds, _) = listener_route_kind_info(listener);
-        let info = health.listeners.get(&listener.name);
+        let info = health
+            .listeners
+            .get(&ListenerHealthKey::gateway(&listener.name));
         let frontend_impacts = info.is_some_and(|i| i.frontend_outcome.is_failed());
         let desired_healthy = !has_invalid_kinds
             && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true)
@@ -261,7 +263,7 @@ pub(super) fn build_gateway_status_patch(
         .listeners
         .iter()
         .map(|l| {
-            let info = health.listeners.get(&l.name);
+            let info = health.listeners.get(&ListenerHealthKey::gateway(&l.name));
             build_listener_status(l, info, ingress_ports, generation, now)
         })
         .collect();

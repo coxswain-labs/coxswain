@@ -37,7 +37,9 @@
 //! [`RoutingTable`]: coxswain_core::routing::RoutingTable
 //! [`Snapshot`]: crate::proto::v1::Snapshot
 
-use coxswain_core::listener_health::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome};
+use coxswain_core::listener_health::{
+    GatewayListenerHealth, ListenerHealthKey, ListenerInfo, ListenerSource, ListenerTlsOutcome,
+};
 use coxswain_core::ownership::ObjectKey;
 
 use crate::error::WireError;
@@ -63,13 +65,14 @@ pub fn listener_health_to_wire(
             .map(|(key, health)| p::GatewayHealthEntry {
                 object_key: key.to_string(),
                 health: Some(p::ListenerHealth {
-                    // BTreeMap<String, ListenerInfo> is already sorted by key.
+                    // BTreeMap<ListenerHealthKey, ListenerInfo> is already sorted by (source, name).
                     listeners: health
                         .listeners
                         .iter()
-                        .map(|(name, info)| p::ListenerInfoEntry {
-                            name: name.clone(),
+                        .map(|(key, info)| p::ListenerInfoEntry {
+                            name: key.name.clone(),
                             info: Some(listener_info_to_wire(info)),
+                            source: listener_source_to_wire(&key.source),
                         })
                         .collect(),
                 }),
@@ -114,6 +117,31 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         allows_all_namespaces: info.allows_all_namespaces,
         port: u32::from(info.port),
         internal_port: u32::from(info.internal_port),
+        conflicted: info.conflicted,
+    }
+}
+
+/// Encode a [`ListenerSource`] as its wire string: empty for the parent Gateway,
+/// the ListenerSet's `"{namespace}/{name}"` key otherwise (GEP-1713).
+fn listener_source_to_wire(source: &ListenerSource) -> String {
+    match source {
+        ListenerSource::Gateway => String::new(),
+        ListenerSource::ListenerSet(key) => key.to_string(),
+    }
+}
+
+/// Decode a wire `source` string back into a [`ListenerSource`]: empty → the
+/// parent Gateway, else parse the ListenerSet `"{namespace}/{name}"` key.
+fn listener_source_from_wire(source: &str) -> Result<ListenerSource, WireError> {
+    if source.is_empty() {
+        Ok(ListenerSource::Gateway)
+    } else {
+        source
+            .parse::<ObjectKey>()
+            .map(ListenerSource::ListenerSet)
+            .map_err(|()| WireError::MissingRequiredField {
+                field: "listener_info_entry.source",
+            })
     }
 }
 
@@ -155,7 +183,14 @@ fn listener_health_from_dto(dto: &p::ListenerHealth) -> Result<GatewayListenerHe
             field: "listener_info_entry.info",
         })?;
         let li = crate::wire::listener_info_from_wire(info)?;
-        glh.listeners.insert(entry.name.clone(), li);
+        let source = listener_source_from_wire(&entry.source)?;
+        glh.listeners.insert(
+            ListenerHealthKey {
+                source,
+                name: entry.name.clone(),
+            },
+            li,
+        );
     }
     Ok(glh)
 }
@@ -176,7 +211,9 @@ mod tests {
         http_info.attached_routes = 3;
         http_info.hostname = "example.com".to_string();
         http_info.port = 80;
-        health.listeners.insert("http".to_string(), http_info);
+        health
+            .listeners
+            .insert(ListenerHealthKey::gateway("http"), http_info);
 
         let mut https_info = ListenerInfo::default();
         https_info.tls_outcome = ListenerTlsOutcome::Resolved;
@@ -188,7 +225,9 @@ mod tests {
         // allocated internal targetPort — it must survive the wire round-trip so
         // the proxy binds and keys routing on the right port.
         https_info.internal_port = 30007;
-        health.listeners.insert("https".to_string(), https_info);
+        health
+            .listeners
+            .insert(ListenerHealthKey::gateway("https"), https_info);
 
         // GEP-2643 (#70): a TLS/Terminate listener resolves to Unsupported, and a
         // TLS/Passthrough listener to TlsPassthrough. Both must survive the wire
@@ -202,14 +241,30 @@ mod tests {
         terminate_info.port = 8443;
         health
             .listeners
-            .insert("tls-terminate".to_string(), terminate_info);
+            .insert(ListenerHealthKey::gateway("tls-terminate"), terminate_info);
 
         let mut passthrough_info = ListenerInfo::default();
         passthrough_info.tls_outcome = ListenerTlsOutcome::TlsPassthrough;
         passthrough_info.port = 8444;
-        health
-            .listeners
-            .insert("tls-passthrough".to_string(), passthrough_info);
+        health.listeners.insert(
+            ListenerHealthKey::gateway("tls-passthrough"),
+            passthrough_info,
+        );
+
+        // GEP-1713: a listener contributed by a ListenerSet shares the name "http"
+        // with the Gateway's own listener but lives under a distinct ListenerSource
+        // and on a different port. It must survive the round-trip as its own entry,
+        // and a conflicted listener must carry `conflicted=true` across the wire.
+        let ls_key = ObjectKey::new("apps", "team-a");
+        let mut ls_http = ListenerInfo::default();
+        ls_http.tls_outcome = ListenerTlsOutcome::NotApplicable;
+        ls_http.attached_routes = 7;
+        ls_http.port = 8080;
+        ls_http.conflicted = true;
+        health.listeners.insert(
+            ListenerHealthKey::listener_set(ls_key.clone(), "http"),
+            ls_http,
+        );
 
         map.insert(ObjectKey::new("default", "my-gw"), health);
 
@@ -219,35 +274,37 @@ mod tests {
         let h2 = map2
             .get(&ObjectKey::new("default", "my-gw"))
             .expect("key found");
-        assert_eq!(h2.listeners.len(), 4, "listener count preserved");
+        assert_eq!(h2.listeners.len(), 5, "listener count preserved");
+        let gw_http = ListenerHealthKey::gateway("http");
+        let gw_https = ListenerHealthKey::gateway("https");
         assert_eq!(
-            h2.listeners["http"].attached_routes, 3,
+            h2.listeners[&gw_http].attached_routes, 3,
             "attached_routes preserved"
         );
         assert!(
             matches!(
-                h2.listeners["https"].tls_outcome,
+                h2.listeners[&gw_https].tls_outcome,
                 ListenerTlsOutcome::Resolved
             ),
             "tls_outcome preserved"
         );
         assert_eq!(
-            h2.listeners["https"].internal_port, 30007,
+            h2.listeners[&gw_https].internal_port, 30007,
             "internal_port preserved (#472)"
         );
         assert_eq!(
-            h2.listeners["https"].bind_port(),
+            h2.listeners[&gw_https].bind_port(),
             30007,
             "bind_port honours the allocated internal port"
         );
         assert_eq!(
-            h2.listeners["http"].bind_port(),
+            h2.listeners[&gw_http].bind_port(),
             80,
             "bind_port falls back to spec port when internal_port unset"
         );
         assert!(
             matches!(
-                &h2.listeners["tls-terminate"].tls_outcome,
+                &h2.listeners[&ListenerHealthKey::gateway("tls-terminate")].tls_outcome,
                 ListenerTlsOutcome::Unsupported { message }
                     if message == "tls.mode: Terminate is not supported"
             ),
@@ -255,10 +312,21 @@ mod tests {
         );
         assert!(
             matches!(
-                h2.listeners["tls-passthrough"].tls_outcome,
+                h2.listeners[&ListenerHealthKey::gateway("tls-passthrough")].tls_outcome,
                 ListenerTlsOutcome::TlsPassthrough
             ),
             "TlsPassthrough outcome preserved"
+        );
+        // GEP-1713: the ListenerSet-sourced "http" is a distinct entry from the
+        // Gateway's own "http", proving (source, name) keying survives the wire.
+        let ls_http_key = ListenerHealthKey::listener_set(ls_key, "http");
+        assert_eq!(
+            h2.listeners[&ls_http_key].attached_routes, 7,
+            "ListenerSet listener round-trips under its own source"
+        );
+        assert!(
+            h2.listeners[&ls_http_key].conflicted,
+            "conflicted flag preserved across the wire"
         );
     }
 }

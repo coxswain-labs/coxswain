@@ -54,7 +54,7 @@ use coxswain_reflector::gw_types::v::gateways::{
     Gateway, GatewayStatusAddresses, GatewayStatusListeners,
 };
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::tls::GatewayListenerHealth;
+use coxswain_reflector::tls::{GatewayListenerHealth, ListenerHealthKey};
 use k8s_openapi::api::core::v1::{Node, Service, ServiceSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::Client;
@@ -241,7 +241,10 @@ pub(crate) fn build_dedicated_gateway_status_patch(
         .listeners
         .iter()
         .map(|l| {
-            let info = inputs.listener_health.listeners.get(&l.name);
+            let info = inputs
+                .listener_health
+                .listeners
+                .get(&ListenerHealthKey::gateway(&l.name));
             build_listener_status(l, info, inputs.ingress_ports, generation, now)
         })
         .collect();
@@ -324,7 +327,10 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
     }
     for listener in &inputs.gw.spec.listeners {
         let (has_invalid_kinds, _) = listener_route_kind_info(listener);
-        let info = inputs.listener_health.listeners.get(&listener.name);
+        let info = inputs
+            .listener_health
+            .listeners
+            .get(&ListenerHealthKey::gateway(&listener.name));
         let desired_healthy =
             !has_invalid_kinds && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true);
         let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);

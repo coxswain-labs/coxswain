@@ -21,7 +21,7 @@ use crate::gw_types::v::gateways::{
     GatewayTlsFrontendPerPortTlsValidationMode,
 };
 use coxswain_core::listener_health::{
-    FrontendValidationHealth, FrontendValidationOutcome, GatewayListenerHealth,
+    FrontendValidationHealth, FrontendValidationOutcome, GatewayListenerHealth, ListenerHealthKey,
 };
 use coxswain_core::reference_grants::{ReferenceGrantKey, backend_ref_allowed};
 use coxswain_core::tls::{ClientCertConfig, ClientCertConfigState, ClientCertStoreBuilder};
@@ -135,7 +135,7 @@ pub(crate) fn reconcile_frontend_validation(
         // or_default() keeps this robust if the ordering ever changes.
         health
             .listeners
-            .entry(listener.name.clone())
+            .entry(ListenerHealthKey::gateway(listener.name.clone()))
             .or_default()
             .frontend_outcome = outcome;
     }
@@ -509,7 +509,11 @@ mod tests {
 
         let fv = health.frontend_validation.as_ref().unwrap();
         assert!(!fv.resolved_refs);
-        let outcome = &health.listeners.get("l1").unwrap().frontend_outcome;
+        let outcome = &health
+            .listeners
+            .get(&ListenerHealthKey::gateway("l1"))
+            .unwrap()
+            .frontend_outcome;
         assert!(
             matches!(
                 outcome,
@@ -631,7 +635,11 @@ mod tests {
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         // The listener resolved against the perPort CA (which exists), not the default.
-        let outcome = &health.listeners.get("l1").unwrap().frontend_outcome;
+        let outcome = &health
+            .listeners
+            .get(&ListenerHealthKey::gateway("l1"))
+            .unwrap()
+            .frontend_outcome;
         assert!(
             matches!(outcome, FrontendValidationOutcome::Resolved),
             "perPort CA should resolve, got {outcome:?}"
@@ -661,7 +669,11 @@ mod tests {
         let mut health = GatewayListenerHealth::default();
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
-        let outcome = &health.listeners.get("l1").unwrap().frontend_outcome;
+        let outcome = &health
+            .listeners
+            .get(&ListenerHealthKey::gateway("l1"))
+            .unwrap()
+            .frontend_outcome;
         assert!(
             matches!(outcome, FrontendValidationOutcome::RefNotPermitted { .. }),
             "cross-ns ref without grant → RefNotPermitted, got {outcome:?}"
@@ -686,7 +698,11 @@ mod tests {
         let mut health = GatewayListenerHealth::default();
         reconcile_frontend_validation(&gw, &cms, &grants, &mut builder, &mut health);
 
-        let outcome = &health.listeners.get("l1").unwrap().frontend_outcome;
+        let outcome = &health
+            .listeners
+            .get(&ListenerHealthKey::gateway("l1"))
+            .unwrap()
+            .frontend_outcome;
         assert!(
             matches!(outcome, FrontendValidationOutcome::Resolved),
             "cross-ns ref with grant should resolve, got {outcome:?}"
@@ -708,7 +724,11 @@ mod tests {
         let mut health = GatewayListenerHealth::default();
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
-        let outcome = &health.listeners.get("l1").unwrap().frontend_outcome;
+        let outcome = &health
+            .listeners
+            .get(&ListenerHealthKey::gateway("l1"))
+            .unwrap()
+            .frontend_outcome;
         assert!(
             matches!(
                 outcome,
