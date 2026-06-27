@@ -133,6 +133,14 @@ pub const REDIRECT_STATUS_CODES: &str = fixture!("redirect_status_codes.yaml");
 /// Gateway empty address.
 pub const EMPTY_ADDRESS: &str = fixture!("empty_address.yaml");
 
+/// GatewayStaticAddresses (#260): a shared Gateway requesting a single static
+/// address. Templated `ADDR_TYPE`/`ADDR_VALUE` cover the unsupported-type,
+/// out-of-CIDR-IP, and probed-free-clusterIP cases.
+pub const STATIC_ADDRESS: &str = fixture!("gateway_static_address.yaml");
+/// GatewayStaticAddresses (#260): a shared Gateway requesting two distinct
+/// static IPs (`ADDR_ONE`/`ADDR_TWO`) — never all satisfiable by one Service.
+pub const STATIC_ADDRESSES_PAIR: &str = fixture!("gateway_static_addresses_pair.yaml");
+
 /// BackendTLSPolicy cross-namespace.
 pub const BACKEND_TLS_POLICY_CROSS_NAMESPACE_ROUTE: &str =
     fixture!("backend_tls_policy_cross_namespace_route.yaml");

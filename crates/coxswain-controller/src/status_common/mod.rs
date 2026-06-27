@@ -14,6 +14,8 @@
 //! constructing condition objects, and the two consumers are siblings under
 //! `crate::`.
 
+pub(crate) mod addresses;
+
 use coxswain_reflector::gw_types::v::gateways::{
     GatewayListeners, GatewayListenersTlsMode, GatewayStatusListeners,
     GatewayStatusListenersSupportedKinds,

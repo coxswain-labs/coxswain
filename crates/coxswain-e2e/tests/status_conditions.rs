@@ -25,7 +25,7 @@ use gateway_api::apis::standard::grpcroutes::GrpcRoute;
 use gateway_api::apis::standard::httproutes::HttpRoute;
 use gateway_api::apis::standard::listenersets::ListenerSet;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{Service, ServiceAccount, ServicePort, ServiceSpec};
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::Api;
@@ -899,6 +899,206 @@ async fn gateway_address_empty_allocates_dynamically() -> anyhow::Result<()> {
         "shared Gateway must advertise its own VIP, not the global --status-address"
     );
 
+    Ok(())
+}
+
+// ── GatewayStaticAddresses (#260) ────────────────────────────────────────────
+
+/// Sad path: a Gateway requesting an address of an unsupported `type`
+/// (`test/fake-invalid-type`) is rejected with
+/// `Accepted=False/UnsupportedAddress`. VIP-type-agnostic.
+#[tokio::test]
+async fn accepted_false_unsupported_address_when_invalid_type() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-static-unsupported").await?;
+    fixtures::apply_fixture(
+        gwa::STATIC_ADDRESS,
+        FixtureVars::new(&ns.name)
+            .with("ADDR_TYPE", "test/fake-invalid-type")
+            .with("ADDR_VALUE", "fake address teehee"),
+    )
+    .await?;
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        || async {
+            let c = gw_api
+                .get("coxswain-test")
+                .await
+                .ok()
+                .and_then(|gw| gateway_condition(&gw, "Accepted"));
+            format!("Accepted to be False/UnsupportedAddress; observed {c:?}")
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            (gateway_condition(&gw, "Accepted")
+                == Some(("False".to_string(), "UnsupportedAddress".to_string())))
+            .then_some(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Sad path: a Gateway requesting a supported-type IP that coxswain cannot bind
+/// (TEST-NET-1 `192.0.2.1`, outside any Service CIDR — the apiserver rejects it
+/// as a clusterIP under either VIP Service type) stays `Accepted=True` but goes
+/// `Programmed=False/AddressNotUsable`. VIP-type-agnostic.
+#[tokio::test]
+async fn programmed_false_address_not_usable_when_out_of_cidr_ip() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-static-unusable").await?;
+    fixtures::apply_fixture(
+        gwa::STATIC_ADDRESS,
+        FixtureVars::new(&ns.name)
+            .with("ADDR_TYPE", "IPAddress")
+            .with("ADDR_VALUE", "192.0.2.1"),
+    )
+    .await?;
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok();
+            let acc = gw.as_ref().and_then(|g| gateway_condition(g, "Accepted"));
+            let prog = gw.as_ref().and_then(|g| gateway_condition(g, "Programmed"));
+            format!("Accepted=True + Programmed=False/AddressNotUsable; observed Accepted={acc:?} Programmed={prog:?}")
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let accepted = gateway_condition(&gw, "Accepted")?;
+            let programmed = gateway_condition(&gw, "Programmed")?;
+            (accepted == ("True".to_string(), "Accepted".to_string())
+                && programmed == ("False".to_string(), "AddressNotUsable".to_string()))
+            .then_some(())
+        },
+    )
+    .await?;
+    // The rejected address must NOT leak into status.addresses.
+    let gw = gw_api.get("coxswain-test").await?;
+    assert!(
+        !gateway_addresses(&gw).iter().any(|(_, v)| v == "192.0.2.1"),
+        "unusable requested address must not appear in status.addresses"
+    );
+    Ok(())
+}
+
+/// Sad path: requesting two distinct static IPs is inherently unusable — a single
+/// backing Service binds at most one clusterIP, so the second can never be
+/// satisfied → `Programmed=False/AddressNotUsable`. VIP-type-agnostic.
+#[tokio::test]
+async fn programmed_false_address_not_usable_when_two_ips_requested() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-static-two-ips").await?;
+    fixtures::apply_fixture(
+        gwa::STATIC_ADDRESSES_PAIR,
+        FixtureVars::new(&ns.name)
+            .with("ADDR_ONE", "192.0.2.1")
+            .with("ADDR_TWO", "192.0.2.2"),
+    )
+    .await?;
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        || async {
+            let prog = gw_api
+                .get("coxswain-test")
+                .await
+                .ok()
+                .and_then(|g| gateway_condition(&g, "Programmed"));
+            format!("Programmed to be False/AddressNotUsable; observed {prog:?}")
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let accepted = gateway_condition(&gw, "Accepted")?;
+            let programmed = gateway_condition(&gw, "Programmed")?;
+            (accepted.0 == "True"
+                && programmed == ("False".to_string(), "AddressNotUsable".to_string()))
+                .then_some(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Happy path: a Gateway requesting a known-free in-CIDR IP has it honored —
+/// coxswain provisions that Gateway's VIP as a ClusterIP pinned to the requested
+/// IP (apiserver-assigned, deterministic on every cluster), so it surfaces as the
+/// resolved address → `Programmed=True` with the requested IP in
+/// `status.addresses`. Cluster-type-agnostic: the static-IP Gateway is forced to
+/// ClusterIP regardless of the global VIP type.
+#[tokio::test]
+async fn programmed_true_and_address_written_when_usable_clusterip_requested() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-static-usable").await?;
+
+    // Probe a known-free in-CIDR clusterIP: the apiserver assigns one to a
+    // throwaway ClusterIP Service; deleting it frees that exact IP for coxswain
+    // to re-request. clusterIPs are cluster-global, so a test-namespace probe
+    // yields a service-CIDR address.
+    let svc_api: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let probe = Service {
+        metadata: kube::api::ObjectMeta {
+            name: Some("static-addr-probe".to_string()),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            type_: Some("ClusterIP".to_string()),
+            ports: Some(vec![ServicePort {
+                port: 80,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let created = svc_api.create(&Default::default(), &probe).await?;
+    let usable_ip = created
+        .spec
+        .and_then(|s| s.cluster_ip)
+        .filter(|ip| !ip.is_empty() && ip != "None")
+        .ok_or_else(|| anyhow::anyhow!("probe Service got no clusterIP"))?;
+    svc_api
+        .delete("static-addr-probe", &Default::default())
+        .await?;
+
+    fixtures::apply_fixture(
+        gwa::STATIC_ADDRESS,
+        FixtureVars::new(&ns.name)
+            .with("ADDR_TYPE", "IPAddress")
+            .with("ADDR_VALUE", &usable_ip),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let usable_for_assert = usable_ip.clone();
+    wait::poll_until(
+        Duration::from_secs(120),
+        Duration::from_secs(1),
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok();
+            let prog = gw.as_ref().and_then(|g| gateway_condition(g, "Programmed"));
+            let addrs = gw.as_ref().map(gateway_addresses).unwrap_or_default();
+            format!("Programmed=True with requested IP {usable_ip} in addresses; observed Programmed={prog:?} addresses={addrs:?}")
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let accepted = gateway_condition(&gw, "Accepted")?;
+            let programmed = gateway_condition(&gw, "Programmed")?;
+            let has_addr = gateway_addresses(&gw)
+                .iter()
+                .any(|(t, v)| t == "IPAddress" && v == &usable_for_assert);
+            (accepted == ("True".to_string(), "Accepted".to_string())
+                && programmed == ("True".to_string(), "Programmed".to_string())
+                && has_addr)
+                .then_some(())
+        },
+    )
+    .await?;
     Ok(())
 }
 

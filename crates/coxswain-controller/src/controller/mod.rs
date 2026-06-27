@@ -599,7 +599,25 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     .await;
     let owned_status_addr =
         select_shared_gateway_address(&vip, ctx.shared_vip_addressing, ctx.status_address.as_ref());
-    let status_addr = owned_status_addr.as_ref();
+
+    // GatewayStaticAddresses (#260): validate any requested `spec.addresses`
+    // against the address coxswain actually advertises/bound. The advertised
+    // address (`owned_status_addr`) is what the VIP reconciler tried to honor, so
+    // a requested address is usable iff it equals it. `legacy_addr` keeps the
+    // pre-#260 single-address behaviour for Gateways with no static request.
+    let resolved: Vec<_> = owned_status_addr
+        .as_ref()
+        .map(status_address_to_typed)
+        .into_iter()
+        .collect();
+    let static_outcome = crate::status_common::addresses::evaluate_static_addresses(
+        gw.spec.addresses.as_deref().unwrap_or_default(),
+        &resolved,
+    );
+    let decision = gateway_status::SharedAddressDecision {
+        legacy_addr: owned_status_addr,
+        static_outcome,
+    };
 
     // The per-Gateway VIP Service and its LoadBalancer IP are provisioned
     // asynchronously by the separate `run_vip_reconciler` task, which fires no
@@ -615,12 +633,12 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     if ctx.health.is_subsystem_ready("controller") {
         let health_map = ctx.listener_status.load();
         let health = health_map.get(&key).cloned().unwrap_or_default();
-        if gateway_needs_status_patch(gw, &health, status_addr) {
+        if gateway_needs_status_patch(gw, &health, &decision) {
             gateway_events::patch_gateway_status(
                 &ctx.client,
                 gw,
                 &health,
-                status_addr,
+                &decision,
                 ctx.ingress_ports,
             )
             .await;
@@ -635,12 +653,12 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         // status and requeue to revisit `Programmed` once ready. This requeue
         // replaces the old process-wide resync backstop.
         let empty_status = GatewayListenerStatus::default();
-        if gateway_needs_status_patch(gw, &empty_status, status_addr) {
+        if gateway_needs_status_patch(gw, &empty_status, &decision) {
             gateway_events::patch_gateway_status(
                 &ctx.client,
                 gw,
                 &empty_status,
-                status_addr,
+                &decision,
                 ctx.ingress_ports,
             )
             .await;
@@ -736,6 +754,16 @@ async fn resolve_shared_vip_address(
             );
             VipAddress::NotProvisioned
         }
+    }
+}
+
+/// Convert a [`StatusAddress`] (the address coxswain advertises for a Gateway)
+/// into the type-tagged form the static-address validator compares against (#260).
+fn status_address_to_typed(addr: &StatusAddress) -> crate::status_common::addresses::TypedAddress {
+    use crate::status_common::addresses::{SupportedAddressType, TypedAddress};
+    match addr {
+        StatusAddress::Ip(ip) => TypedAddress::new(SupportedAddressType::IpAddress, ip.to_string()),
+        StatusAddress::Hostname(h) => TypedAddress::new(SupportedAddressType::Hostname, h.clone()),
     }
 }
 

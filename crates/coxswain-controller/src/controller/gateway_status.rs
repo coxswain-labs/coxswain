@@ -2,6 +2,7 @@
 
 use super::conditions::{has_condition, make_condition};
 use super::config::StatusAddress;
+use crate::status_common::addresses::StaticAddressOutcome;
 use crate::status_common::{
     OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
 };
@@ -12,18 +13,60 @@ use coxswain_reflector::status::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
+/// The shared-pool address inputs for one Gateway reconcile: the legacy
+/// auto-derived VIP/global address (used when `spec.addresses` is absent or
+/// requests only empty values) plus the validated `GatewayStaticAddresses`
+/// outcome (#260). Grouped into one struct so the patch builder and the
+/// needs-patch check share the same inputs and stay under the 7-arg ceiling.
+pub(super) struct SharedAddressDecision {
+    /// The auto-derived address (per-Gateway VIP or global `--status-address`).
+    /// Written to `status.addresses` only when the static-address feature is not
+    /// engaged.
+    pub(super) legacy_addr: Option<StatusAddress>,
+    /// Result of validating `Gateway.spec.addresses` against the resolved VIP.
+    pub(super) static_outcome: StaticAddressOutcome,
+}
+
+impl SharedAddressDecision {
+    /// Desired `(status, reason)` for the top-level `Accepted` condition:
+    /// `(False, UnsupportedAddress)` when a requested address type is
+    /// unsupported, else the canonical `(True, Accepted)`.
+    fn desired_accepted(&self) -> (&'static str, &'static str) {
+        match self.static_outcome.accepted_override {
+            Some(reason) => ("False", reason),
+            None => ("True", "Accepted"),
+        }
+    }
+
+    /// Desired `(status, reason)` for the top-level `Programmed` condition:
+    /// `(False, AddressNotUsable | Invalid)` when a requested address could not
+    /// be honored, else the canonical `(True, Programmed)`.
+    fn desired_programmed(&self) -> (&'static str, &'static str) {
+        match self.static_outcome.programmed_override {
+            Some(reason) => ("False", reason),
+            None => ("True", "Programmed"),
+        }
+    }
+}
+
 /// Returns true when the Gateway's current status does not yet reflect the
 /// desired state computed from `health`. Prevents redundant patches and
 /// watch-feedback loops.
 pub(super) fn gateway_needs_status_patch(
     gw: &Gateway,
     health: &GatewayListenerStatus,
-    addr: Option<&StatusAddress>,
+    decision: &SharedAddressDecision,
 ) -> bool {
-    if !accepted_is_true(gw) {
+    // GatewayStaticAddresses (#260): Accepted/Programmed are no longer always
+    // True — a requested `spec.addresses` can drive them to False. Compare the
+    // current condition's `(status, reason)` against the desired pair so a
+    // True→False flip (or a reason change) forces a patch.
+    let (want_acc_status, want_acc_reason) = decision.desired_accepted();
+    if !condition_matches(gw, "Accepted", want_acc_status, want_acc_reason) {
         return true;
     }
-    if !super::conditions::gateway_programmed(gw) {
+    let (want_prog_status, want_prog_reason) = decision.desired_programmed();
+    if !condition_matches(gw, "Programmed", want_prog_status, want_prog_reason) {
         return true;
     }
     // The per-Gateway VIP address (#472) is provisioned asynchronously and lands
@@ -33,7 +76,7 @@ pub(super) fn gateway_needs_status_patch(
     // health (e.g. a TLS-passthrough listener whose conditions never flip after
     // the first reconcile) would never get its address written once the VIP
     // resolves on a later reconcile.
-    if !gateway_address_up_to_date(gw, addr) {
+    if !gateway_addresses_up_to_date(gw, decision) {
         return true;
     }
     // GEP-91: a mode flip to/from AllowInsecureFallback must add/remove the
@@ -184,38 +227,54 @@ fn any_status_writer_owned_condition_stale(conditions: &[Condition], expected_ge
         .any(|c| c.observed_generation.unwrap_or(0) < expected_gen)
 }
 
-/// Returns true iff the Gateway's current `Accepted` condition is the canonical
-/// `(True, reason=Accepted)` pair. The shared-pool writer is the sole writer
-/// of `Accepted` for non-dedicated Gateways; any other state requires a patch.
-fn accepted_is_true(gw: &Gateway) -> bool {
+/// Returns true iff the Gateway's current top-level condition named `type_`
+/// matches the desired `(status, reason)` pair. Used for `Accepted`/`Programmed`,
+/// which the static-address feature (#260) can drive to `False`.
+fn condition_matches(gw: &Gateway, type_: &str, want_status: &str, want_reason: &str) -> bool {
     gw.status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
-        .and_then(|cs| cs.iter().find(|c| c.type_ == "Accepted"))
-        .is_some_and(|c| c.status == "True" && c.reason == "Accepted")
+        .and_then(|cs| cs.iter().find(|c| c.type_ == type_))
+        .is_some_and(|c| c.status == want_status && c.reason == want_reason)
 }
 
-/// True iff `gw.status.addresses[0]` already matches the desired `addr`.
+/// True iff `gw.status.addresses` already matches the desired set.
 ///
-/// `addr == None` (feature off, or VIP address still pending) never forces a
-/// patch on address grounds — the status writer simply leaves the address
-/// untouched until the VIP resolves. A `Some` desired address that differs from
-/// (or is absent in) the current status returns false so the patch lands.
-fn gateway_address_up_to_date(gw: &Gateway, addr: Option<&StatusAddress>) -> bool {
-    let Some(desired) = addr else {
+/// When the static-address feature is engaged (#260), the desired set is the
+/// validated `static_outcome.status_addresses` (compared order-independently,
+/// including the empty set so a stale address is cleared). Otherwise the desired
+/// state is the single legacy auto-derived address: `None` (feature off, or VIP
+/// still pending) never forces a patch on address grounds; a `Some` that differs
+/// from the current first address returns false so the patch lands.
+fn gateway_addresses_up_to_date(gw: &Gateway, decision: &SharedAddressDecision) -> bool {
+    let current = gw.status.as_ref().and_then(|s| s.addresses.as_ref());
+    if decision.static_outcome.feature_engaged {
+        use std::collections::BTreeSet;
+        let current_set: BTreeSet<(String, String)> = current
+            .map(|a| {
+                a.iter()
+                    .map(|e| (e.r#type.clone().unwrap_or_default(), e.value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let desired_set: BTreeSet<(String, String)> = decision
+            .static_outcome
+            .status_addresses
+            .iter()
+            .map(|a| (a.type_.as_str().to_string(), a.value.clone()))
+            .collect();
+        return current_set == desired_set;
+    }
+    let Some(desired) = decision.legacy_addr.as_ref() else {
         return true;
     };
     let (desired_type, desired_value) = match desired {
         StatusAddress::Ip(ip) => ("IPAddress", ip.to_string()),
         StatusAddress::Hostname(h) => ("Hostname", h.clone()),
     };
-    gw.status
-        .as_ref()
-        .and_then(|s| s.addresses.as_ref())
-        .and_then(|a| a.first())
-        .is_some_and(|cur| {
-            cur.value == desired_value && cur.r#type.as_deref() == Some(desired_type)
-        })
+    current.and_then(|a| a.first()).is_some_and(|cur| {
+        cur.value == desired_value && cur.r#type.as_deref() == Some(desired_type)
+    })
 }
 
 pub(super) fn build_gateway_status_patch(
@@ -223,7 +282,7 @@ pub(super) fn build_gateway_status_patch(
     health: &GatewayListenerStatus,
     generation: i64,
     now: &Time,
-    addr: Option<&StatusAddress>,
+    decision: &SharedAddressDecision,
     ingress_ports: coxswain_reflector::ingress::IngressPorts,
 ) -> serde_json::Value {
     // Preserve any operator-owned conditions (those whose type starts with
@@ -231,13 +290,25 @@ pub(super) fn build_gateway_status_patch(
     // them. The operator side mirrors the convention by preserving everything
     // NOT prefixed with that domain. See `crate::operator::status` for the
     // counterparty.
+    // GatewayStaticAddresses (#260): a requested `spec.addresses` can drive
+    // Accepted/Programmed to False. `desired_*` returns the canonical True pair
+    // when the feature is not engaged, so the legacy happy path is unchanged.
+    let (acc_status, acc_reason) = decision.desired_accepted();
+    let (prog_status, prog_reason) = decision.desired_programmed();
     let mut conditions = vec![
-        make_condition("Accepted", "True", "Accepted", "", generation, now.clone()),
+        make_condition(
+            "Accepted",
+            acc_status,
+            acc_reason,
+            static_address_message(acc_reason),
+            generation,
+            now.clone(),
+        ),
         make_condition(
             "Programmed",
-            "True",
-            "Programmed",
-            "",
+            prog_status,
+            prog_reason,
+            static_address_message(prog_reason),
             generation,
             now.clone(),
         ),
@@ -317,7 +388,22 @@ pub(super) fn build_gateway_status_patch(
             "attachedListenerSets": attached_listener_sets,
         }
     });
-    if let Some(addr) = addr {
+    if decision.static_outcome.feature_engaged {
+        // GatewayStaticAddresses (#260): publish only the usable bound addresses
+        // (possibly an empty array, which clears any stale auto-derived address).
+        let addrs: Vec<serde_json::Value> = decision
+            .static_outcome
+            .status_addresses
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "type": a.type_.as_str(),
+                    "value": a.value,
+                })
+            })
+            .collect();
+        patch["status"]["addresses"] = serde_json::Value::Array(addrs);
+    } else if let Some(addr) = decision.legacy_addr.as_ref() {
         let (type_str, value_str) = match addr {
             StatusAddress::Ip(ip) => ("IPAddress", ip.to_string()),
             StatusAddress::Hostname(h) => ("Hostname", h.clone()),
@@ -330,9 +416,48 @@ pub(super) fn build_gateway_status_patch(
     patch
 }
 
+/// Human-readable `message` for a static-address condition reason (#260). The
+/// happy-path reasons (`Accepted`/`Programmed`) carry an empty message, matching
+/// the legacy behaviour.
+fn static_address_message(reason: &str) -> &'static str {
+    use crate::status_common::addresses::{
+        REASON_ADDRESS_NOT_USABLE, REASON_INVALID, REASON_UNSUPPORTED_ADDRESS,
+    };
+    if reason == REASON_UNSUPPORTED_ADDRESS {
+        "spec.addresses contains an address type this implementation does not support"
+    } else if reason == REASON_ADDRESS_NOT_USABLE {
+        "one or more requested spec.addresses could not be assigned to the Gateway"
+    } else if reason == REASON_INVALID {
+        "Gateway spec is invalid; see the Accepted condition for details"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::gateway_status::{build_gateway_status_patch, gateway_needs_status_patch};
+    use super::super::config::StatusAddress;
+    use super::super::gateway_status::{
+        SharedAddressDecision, build_gateway_status_patch, gateway_needs_status_patch,
+    };
+    use crate::status_common::addresses::StaticAddressOutcome;
+
+    /// A not-engaged decision with no legacy address — the common case for tests
+    /// that pre-date GatewayStaticAddresses (#260).
+    fn no_addr() -> SharedAddressDecision {
+        SharedAddressDecision {
+            legacy_addr: None,
+            static_outcome: StaticAddressOutcome::not_engaged(),
+        }
+    }
+
+    /// A not-engaged decision carrying a single legacy auto-derived address.
+    fn legacy_addr(addr: StatusAddress) -> SharedAddressDecision {
+        SharedAddressDecision {
+            legacy_addr: Some(addr),
+            static_outcome: StaticAddressOutcome::not_engaged(),
+        }
+    }
     use coxswain_reflector::gw_types::v::gateways::{
         Gateway, GatewaySpec, GatewayStatus, GatewayStatusListeners,
     };
@@ -408,19 +533,31 @@ mod tests {
             status: None,
             ..Default::default()
         };
-        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
+        assert!(gateway_needs_status_patch(
+            &gw,
+            &default_status(),
+            &no_addr()
+        ));
     }
 
     #[test]
     fn needs_patch_when_accepted_missing() {
         let gw = gateway(1, Some(vec![condition("Programmed", 1)]), None);
-        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
+        assert!(gateway_needs_status_patch(
+            &gw,
+            &default_status(),
+            &no_addr()
+        ));
     }
 
     #[test]
     fn needs_patch_when_programmed_missing() {
         let gw = gateway(1, Some(vec![condition("Accepted", 1)]), None);
-        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
+        assert!(gateway_needs_status_patch(
+            &gw,
+            &default_status(),
+            &no_addr()
+        ));
     }
 
     #[test]
@@ -431,7 +568,11 @@ mod tests {
             Some(vec![condition("Accepted", 0), condition("Programmed", 0)]),
             Some(vec![listener_status("http", 2)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
+        assert!(gateway_needs_status_patch(
+            &gw,
+            &default_status(),
+            &no_addr()
+        ));
     }
 
     #[test]
@@ -442,7 +583,11 @@ mod tests {
             Some(vec![condition("Accepted", 2), condition("Programmed", 2)]),
             Some(vec![listener_status("http", 0)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
+        assert!(gateway_needs_status_patch(
+            &gw,
+            &default_status(),
+            &no_addr()
+        ));
     }
 
     #[test]
@@ -453,7 +598,11 @@ mod tests {
             Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
             Some(vec![]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
+        assert!(gateway_needs_status_patch(
+            &gw,
+            &default_status(),
+            &no_addr()
+        ));
     }
 
     #[test]
@@ -463,14 +612,17 @@ mod tests {
             Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
             Some(vec![listener_status("http", 1)]),
         );
-        assert!(!gateway_needs_status_patch(&gw, &default_status(), None));
+        assert!(!gateway_needs_status_patch(
+            &gw,
+            &default_status(),
+            &no_addr()
+        ));
     }
 
     // ── #472 per-Gateway VIP address divergence ──────────────────────────────
 
     #[test]
     fn needs_patch_when_vip_address_not_yet_written() {
-        use super::super::config::StatusAddress;
         // Conditions + listeners fully up to date, but status.addresses is empty
         // while the resolved VIP address is Some — the patch must still fire so
         // the address lands (the TLS-passthrough convergence bug, #472).
@@ -483,13 +635,12 @@ mod tests {
         assert!(gateway_needs_status_patch(
             &gw,
             &default_status(),
-            Some(&addr)
+            &legacy_addr(addr)
         ));
     }
 
     #[test]
     fn no_patch_when_vip_address_already_matches() {
-        use super::super::config::StatusAddress;
         use coxswain_reflector::gw_types::v::gateways::GatewayStatusAddresses;
         let mut gw = gateway(
             1,
@@ -506,7 +657,7 @@ mod tests {
         assert!(!gateway_needs_status_patch(
             &gw,
             &default_status(),
-            Some(&addr)
+            &legacy_addr(addr)
         ));
     }
 
@@ -533,7 +684,7 @@ mod tests {
         assert!(gateway_needs_status_patch(
             &gw,
             &health_with_backend(BackendClientCertOutcome::Resolved),
-            None
+            &no_addr()
         ));
     }
 
@@ -555,7 +706,7 @@ mod tests {
         assert!(gateway_needs_status_patch(
             &gw,
             &health_with_backend(desired),
-            None
+            &no_addr()
         ));
     }
 
@@ -573,7 +724,7 @@ mod tests {
         assert!(!gateway_needs_status_patch(
             &gw,
             &health_with_backend(BackendClientCertOutcome::Resolved),
-            None
+            &no_addr()
         ));
     }
 
@@ -589,7 +740,11 @@ mod tests {
             ]),
             Some(vec![listener_status("http", 1)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
+        assert!(gateway_needs_status_patch(
+            &gw,
+            &default_status(),
+            &no_addr()
+        ));
     }
 
     #[test]
@@ -598,8 +753,14 @@ mod tests {
         let health = health_with_backend(BackendClientCertOutcome::InvalidClientCertificateRef {
             message: "Secret gw-ns/missing: secret not found in store".to_string(),
         });
-        let patch =
-            build_gateway_status_patch(&gw, &health, 1, &epoch(), None, IngressPorts::default());
+        let patch = build_gateway_status_patch(
+            &gw,
+            &health,
+            1,
+            &epoch(),
+            &no_addr(),
+            IngressPorts::default(),
+        );
         let conds = patch["status"]["conditions"]
             .as_array()
             .expect("conditions array");
@@ -621,8 +782,14 @@ mod tests {
     fn patch_emits_resolvedrefs_true_when_resolved() {
         let gw = gateway(1, None, None);
         let health = health_with_backend(BackendClientCertOutcome::Resolved);
-        let patch =
-            build_gateway_status_patch(&gw, &health, 1, &epoch(), None, IngressPorts::default());
+        let patch = build_gateway_status_patch(
+            &gw,
+            &health,
+            1,
+            &epoch(),
+            &no_addr(),
+            IngressPorts::default(),
+        );
         let rr = patch["status"]["conditions"]
             .as_array()
             .expect("conditions array")
@@ -634,6 +801,135 @@ mod tests {
         assert_eq!(rr["reason"], "ResolvedRefs");
     }
 
+    // ── GatewayStaticAddresses (#260) ────────────────────────────────────────
+
+    use crate::status_common::addresses::{SupportedAddressType, TypedAddress};
+
+    fn engaged(
+        accepted_override: Option<&'static str>,
+        programmed_override: Option<&'static str>,
+        status_addresses: Vec<TypedAddress>,
+    ) -> SharedAddressDecision {
+        SharedAddressDecision {
+            legacy_addr: None,
+            static_outcome: StaticAddressOutcome {
+                accepted_override,
+                programmed_override,
+                status_addresses,
+                feature_engaged: true,
+            },
+        }
+    }
+
+    #[test]
+    fn patch_sets_accepted_false_on_unsupported_address() {
+        let gw = gateway(1, None, None);
+        let decision = engaged(Some("UnsupportedAddress"), Some("Invalid"), vec![]);
+        let patch = build_gateway_status_patch(
+            &gw,
+            &default_status(),
+            1,
+            &epoch(),
+            &decision,
+            IngressPorts::default(),
+        );
+        let conds = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        let acc = conds
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted");
+        assert_eq!(acc["status"], "False");
+        assert_eq!(acc["reason"], "UnsupportedAddress");
+        let prog = conds
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed");
+        assert_eq!(prog["status"], "False");
+        assert_eq!(prog["reason"], "Invalid");
+        // No usable address → empty array clears any stale address.
+        assert_eq!(patch["status"]["addresses"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn patch_sets_programmed_address_not_usable_keeping_accepted_true() {
+        let gw = gateway(1, None, None);
+        let decision = engaged(None, Some("AddressNotUsable"), vec![]);
+        let patch = build_gateway_status_patch(
+            &gw,
+            &default_status(),
+            1,
+            &epoch(),
+            &decision,
+            IngressPorts::default(),
+        );
+        let conds = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        let acc = conds
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted");
+        assert_eq!(acc["status"], "True");
+        assert_eq!(acc["reason"], "Accepted");
+        let prog = conds
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed");
+        assert_eq!(prog["status"], "False");
+        assert_eq!(prog["reason"], "AddressNotUsable");
+    }
+
+    #[test]
+    fn patch_publishes_only_usable_static_address() {
+        let gw = gateway(1, None, None);
+        let decision = engaged(
+            None,
+            None,
+            vec![TypedAddress::new(
+                SupportedAddressType::IpAddress,
+                "10.96.0.10",
+            )],
+        );
+        let patch = build_gateway_status_patch(
+            &gw,
+            &default_status(),
+            1,
+            &epoch(),
+            &decision,
+            IngressPorts::default(),
+        );
+        assert_eq!(
+            patch["status"]["addresses"],
+            serde_json::json!([{ "type": "IPAddress", "value": "10.96.0.10" }])
+        );
+        let prog = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed")
+            .clone();
+        assert_eq!(prog["status"], "True");
+    }
+
+    #[test]
+    fn needs_patch_when_accepted_flips_to_unsupported_address() {
+        // Status currently reports Accepted=True but the request is now invalid.
+        let gw = gateway(
+            1,
+            Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
+            Some(vec![listener_status("http", 1)]),
+        );
+        let decision = engaged(Some("UnsupportedAddress"), Some("Invalid"), vec![]);
+        assert!(gateway_needs_status_patch(
+            &gw,
+            &default_status(),
+            &decision
+        ));
+    }
+
     #[test]
     fn patch_omits_resolvedrefs_when_ref_absent() {
         let gw = gateway(1, None, None);
@@ -642,7 +938,7 @@ mod tests {
             &default_status(),
             1,
             &epoch(),
-            None,
+            &no_addr(),
             IngressPorts::default(),
         );
         let conds = patch["status"]["conditions"]

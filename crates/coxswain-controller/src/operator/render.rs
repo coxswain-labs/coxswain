@@ -380,7 +380,16 @@ fn render_service(
     params: &EffectiveParams,
     effective_ports: &[EffectiveListenerPort],
 ) -> Service {
-    let service_type = service_type_to_k8s_string(params.service_type.unwrap_or_default());
+    // GatewayStaticAddresses (#260): a requested static IP is honored as a
+    // ClusterIP (apiserver-assigned, deterministic on every cluster), so force
+    // ClusterIP for a static-IP Gateway regardless of the params service type —
+    // the resolved address then IS the requested clusterIP.
+    let requested_cluster_ip = requested_static_cluster_ip(gateway);
+    let service_type = if requested_cluster_ip.is_some() {
+        service_type_to_k8s_string(ServiceType::ClusterIp)
+    } else {
+        service_type_to_k8s_string(params.service_type.unwrap_or_default())
+    };
     let ports = service_ports(gateway, effective_ports);
     // The Service selects pods by the reserved-set `app.kubernetes.io/name` +
     // `instance` labels — narrower than all four, but the canonical operator
@@ -401,6 +410,7 @@ fn render_service(
             type_: Some(service_type),
             selector: Some(selector),
             ports: Some(ports),
+            cluster_ip: requested_cluster_ip.map(|ip| ip.to_string()),
             ..Default::default()
         }),
         status: None,
@@ -492,6 +502,38 @@ pub(crate) fn shared_gateway_service_name(gw_ns: &str, gw_name: &str) -> String 
     format!("{prefix}-{hash:08x}-shared-gw")
 }
 
+/// The caller-requested static `IPAddress` to pin as the VIP Service
+/// `spec.clusterIP` (GatewayStaticAddresses, #260), or `None` to keep
+/// apiserver auto-allocation.
+///
+/// Returns `None` when any requested address carries an unsupported `type`
+/// (the Gateway is rejected with `UnsupportedAddress`, so there is nothing to
+/// provision). Otherwise the first `IPAddress`-typed entry with a non-empty,
+/// parseable value wins — `Hostname` and empty (auto-assign) entries are
+/// skipped. This is the address the status writer matches against to decide
+/// `AddressNotUsable` vs `Programmed`.
+#[must_use]
+pub(super) fn requested_static_cluster_ip(gw: &Gateway) -> Option<std::net::IpAddr> {
+    let addrs = gw.spec.addresses.as_deref()?;
+    // Don't provision for a Gateway that will be rejected for an unsupported type.
+    if addrs.iter().any(|a| {
+        a.r#type
+            .as_deref()
+            .is_some_and(|t| t != "IPAddress" && t != "Hostname")
+    }) {
+        return None;
+    }
+    addrs.iter().find_map(|a| {
+        if a.r#type.as_deref() == Some("Hostname") {
+            return None;
+        }
+        a.value
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse::<std::net::IpAddr>().ok())
+    })
+}
+
 /// Inputs to [`render_shared_gateway_service`].
 #[non_exhaustive]
 pub(super) struct SharedServiceInputs<'a> {
@@ -515,6 +557,14 @@ pub(super) struct SharedServiceInputs<'a> {
     /// Service type for the VIP — `LoadBalancer` by default so each Gateway
     /// gets its own externally-reachable address.
     pub(super) service_type: ServiceType,
+    /// A caller-requested static `IPAddress` from `Gateway.spec.addresses`
+    /// (GatewayStaticAddresses, #260) to pin as the Service `spec.clusterIP`.
+    /// `None` keeps the apiserver's auto-allocation (the default/legacy path).
+    /// Only meaningful for ClusterIP-typed VIPs — the apiserver assigns the
+    /// requested in-CIDR IP exactly (or rejects an out-of-range one, surfacing
+    /// `AddressNotUsable`). `clusterIP` is immutable, so the reconciler
+    /// delete+recreates the Service when this diverges from the live one.
+    pub(super) requested_cluster_ip: Option<std::net::IpAddr>,
 }
 
 /// Render the per-Gateway Service that exposes a shared-mode Gateway on its own
@@ -574,6 +624,8 @@ pub(super) fn render_shared_gateway_service(inputs: &SharedServiceInputs<'_>) ->
                 inputs.effective_ports,
                 inputs.internal_ports,
             )),
+            // GatewayStaticAddresses (#260): pin a requested IP as the clusterIP.
+            cluster_ip: inputs.requested_cluster_ip.map(|ip| ip.to_string()),
             ..Default::default()
         }),
         status: None,
@@ -850,6 +902,86 @@ mod tests {
             },
             status: None,
         }
+    }
+
+    fn gw_with_addresses(addrs: Vec<(Option<&str>, Option<&str>)>) -> Gateway {
+        use coxswain_reflector::gw_types::v::gateways::GatewayAddresses;
+        let mut gw = make_gateway("ns", "gw", vec![("http", 80, "HTTP")]);
+        gw.spec.addresses = Some(
+            addrs
+                .into_iter()
+                .map(|(t, v)| GatewayAddresses {
+                    r#type: t.map(str::to_string),
+                    value: v.map(str::to_string),
+                })
+                .collect(),
+        );
+        gw
+    }
+
+    #[test]
+    fn requested_static_cluster_ip_picks_first_ip() {
+        // GatewayStaticAddresses (#260): first IPAddress-typed entry wins; the
+        // default (no type) is IPAddress.
+        let gw = gw_with_addresses(vec![(Some("IPAddress"), Some("10.96.0.10"))]);
+        assert_eq!(
+            requested_static_cluster_ip(&gw),
+            Some("10.96.0.10".parse().unwrap())
+        );
+        let gw = gw_with_addresses(vec![(None, Some("10.96.0.11"))]);
+        assert_eq!(
+            requested_static_cluster_ip(&gw),
+            Some("10.96.0.11".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn requested_static_cluster_ip_none_for_unsupported_type() {
+        // An unsupported type rejects the whole Gateway, so nothing is provisioned.
+        let gw = gw_with_addresses(vec![
+            (Some("test/fake"), Some("x")),
+            (Some("IPAddress"), Some("10.96.0.10")),
+        ]);
+        assert_eq!(requested_static_cluster_ip(&gw), None);
+    }
+
+    #[test]
+    fn requested_static_cluster_ip_skips_hostname_and_empty() {
+        let gw = gw_with_addresses(vec![
+            (Some("Hostname"), Some("gw.example.com")),
+            (Some("IPAddress"), None),
+        ]);
+        assert_eq!(requested_static_cluster_ip(&gw), None);
+    }
+
+    #[test]
+    fn dedicated_service_forced_to_clusterip_for_static_ip() {
+        // GatewayStaticAddresses (#260): a requested static IP forces the
+        // dedicated Service to ClusterIP pinned to that IP, overriding the
+        // default LoadBalancer type.
+        let mut gw = make_gateway("ns", "gw", vec![("http", 80, "HTTP")]);
+        gw.spec.addresses = Some(vec![
+            coxswain_reflector::gw_types::v::gateways::GatewayAddresses {
+                r#type: Some("IPAddress".to_string()),
+                value: Some("10.96.0.42".to_string()),
+            },
+        ]);
+        let result = render(&RenderInputs {
+            gateway: &gw,
+            params: &EffectiveParams::default(),
+            controller_image: "ghcr.io/coxswain-labs/coxswain:v0.2",
+            gateway_class_name: "coxswain",
+            discovery_endpoint: "http://d.default.svc:50051",
+            discovery_bootstrap_endpoint: "http://d.default.svc:50052",
+            discovery_sa_token_path: "/t",
+            discovery_ca_bundle_path: "/ca",
+            discovery_trust_domain: "cluster.local",
+            admin_port: 8082,
+            effective_ports: &[],
+        });
+        let spec = result.service.spec.expect("service spec");
+        assert_eq!(spec.type_.as_deref(), Some("ClusterIP"));
+        assert_eq!(spec.cluster_ip.as_deref(), Some("10.96.0.42"));
     }
 
     /// GatewayClass-only defaults: replicas defaults to 1, serviceType to
@@ -1377,6 +1509,7 @@ mod tests {
             effective_ports: &effective_ports,
             internal_ports: &internal,
             service_type: ServiceType::LoadBalancer,
+            requested_cluster_ip: None,
         });
         // Lives WITH the shared proxy pod so the selector resolves + the cloud LB
         // assigns a real address.

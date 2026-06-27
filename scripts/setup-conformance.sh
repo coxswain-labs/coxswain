@@ -123,8 +123,23 @@ kubectl -n coxswain-system rollout status \
   deployment/coxswain-shared-proxy \
   --timeout=180s
 
+# GatewayStaticAddresses (#260): the conformance test needs a "usable" IP that
+# coxswain can actually bind. coxswain honors a requested IPAddress by provisioning
+# that Gateway's VIP as a ClusterIP pinned to it (regardless of the global VIP
+# type), so the usable address must be a free in-CIDR clusterIP. We probe one by
+# creating a throwaway ClusterIP Service, reading its assigned clusterIP, and
+# deleting it. The "unusable" IP is TEST-NET-1, outside any Service CIDR.
+echo ">>> probing a free in-CIDR ClusterIP for GatewayStaticAddresses (#260)"
+PROBE_SVC="coxswain-static-addr-probe"
+kubectl -n coxswain-system create service clusterip "$PROBE_SVC" --tcp=80:80 >/dev/null
+USABLE_ADDR=$(kubectl -n coxswain-system get svc "$PROBE_SVC" \
+  -o jsonpath='{.spec.clusterIP}')
+kubectl -n coxswain-system delete service "$PROBE_SVC" >/dev/null
+echo ">>> usable=$USABLE_ADDR unusable=192.0.2.1"
+STATIC_ADDR_ENV="CONFORMANCE_USABLE_ADDR=$USABLE_ADDR CONFORMANCE_UNUSABLE_ADDR=192.0.2.1 "
+
 echo ">>> ready. Run conformance now:"
-echo "    cd conformance && go test -v -timeout 60m -run TestConformance \\"
+echo "    cd conformance && ${STATIC_ADDR_ENV}go test -v -timeout 60m -run TestConformance \\"
 echo "      -args --organization=coxswain-labs --project=coxswain \\"
 echo "      --url=https://github.com/coxswain-labs/coxswain \\"
 echo "      --version=\"\$(git describe --tags --always)\" \\"

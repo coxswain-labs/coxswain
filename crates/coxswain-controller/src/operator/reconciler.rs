@@ -921,6 +921,11 @@ async fn reconcile_inner(
     // first means the pod mounts it populated from the start.
     copy_trust_bundle(&ctx.client, &gw, &ctx.controller_namespace).await?;
 
+    // GatewayStaticAddresses (#260): when the rendered Service pins a requested
+    // clusterIP that diverges from a live one, delete first — clusterIP is
+    // immutable so SSA cannot mutate it. No-op for Gateways without a static IP.
+    repin_dedicated_clusterip_if_diverged(&ctx.client, &gw, &rendered.service).await;
+
     // Stage 1b — provisioning (Deployment/Service/SA). SSA with force=true
     // re-asserts ownership on every reconcile; the apply order is SA →
     // Service → Deployment. The dedicated proxy is a pure discovery client
@@ -1263,13 +1268,58 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
         }
         let empty_ports = Vec::new();
         let gw_effective_ports = effective_ports.get(&key).unwrap_or(&empty_ports);
+        // GatewayStaticAddresses (#260): honor a requested static IPAddress by
+        // pinning it as the VIP Service `spec.clusterIP`. clusterIP is immutable,
+        // so if a live Service already carries a *different* clusterIP we must
+        // delete it first — SSA cannot mutate the field. An out-of-CIDR requested
+        // IP makes the recreate's apply fail (logged below), leaving no Service so
+        // the status writer reports `AddressNotUsable`.
+        let desired_ip = render::requested_static_cluster_ip(gw);
+        if desired_ip.is_some() {
+            let svc_name = render::shared_gateway_service_name(
+                gw.metadata.namespace.as_deref().unwrap_or_default(),
+                gw.metadata.name.as_deref().unwrap_or_default(),
+            );
+            let live_ip = services
+                .iter()
+                .find(|s| s.metadata.name.as_deref() == Some(svc_name.as_str()))
+                .and_then(|s| s.spec.as_ref())
+                .and_then(|sp| sp.cluster_ip.as_deref())
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok());
+            if live_ip.is_some() && live_ip != desired_ip {
+                let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), ctrl_ns);
+                match ignore_not_found(svc_api.delete(&svc_name, &DeleteParams::default()).await) {
+                    Ok(()) => tracing::info!(
+                        service = %format!("{ctrl_ns}/{svc_name}"),
+                        ?desired_ip,
+                        "operator: deleting VIP Service to repin requested clusterIP (#260)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        service = %format!("{ctrl_ns}/{svc_name}"),
+                        error = %e,
+                        "operator: failed to delete VIP Service for clusterIP repin; will retry"
+                    ),
+                }
+            }
+        }
+        // GatewayStaticAddresses (#260): a requested static IP is honored as a
+        // ClusterIP — the apiserver assigns the exact in-CIDR address (or rejects
+        // an out-of-range one), deterministically on every cluster. Force this
+        // Gateway's VIP to ClusterIP so the resolved address IS the requested IP,
+        // independent of the global (possibly LoadBalancer) VIP type.
+        let vip_type = if desired_ip.is_some() {
+            ServiceType::ClusterIp
+        } else {
+            ctx.shared_vip_service_type
+        };
         let service = render::render_shared_gateway_service(&render::SharedServiceInputs {
             gateway: gw,
             controller_namespace: ctrl_ns,
             shared_proxy_selector: &ctx.shared_proxy_selector,
             effective_ports: gw_effective_ports,
             internal_ports: &internal_ports,
-            service_type: ctx.shared_vip_service_type,
+            service_type: vip_type,
+            requested_cluster_ip: desired_ip,
         });
         if let Err(e) = apply::apply_shared_vip_service(&ctx.client, ctrl_ns, &service).await {
             log_vip_apply_failure(gw, &e, "Service");
@@ -1322,6 +1372,64 @@ fn log_vip_apply_failure(gw: &Gateway, err: &apply::ApplyError, kind: &str) {
             kind,
             "operator: failed to apply shared-mode VIP resource; will retry"
         );
+    }
+}
+
+/// Delete a dedicated-proxy Service whose live `spec.clusterIP` diverges from the
+/// rendered (requested) one (GatewayStaticAddresses, #260). `clusterIP` is
+/// immutable, so the subsequent SSA apply would be rejected without this. Pure
+/// no-op when the rendered Service pins no clusterIP (the common case) or no live
+/// Service exists yet. Best-effort: any API error is logged and retried next
+/// reconcile.
+async fn repin_dedicated_clusterip_if_diverged(
+    client: &kube::Client,
+    gw: &Gateway,
+    rendered_service: &Service,
+) {
+    let Some(desired) = rendered_service
+        .spec
+        .as_ref()
+        .and_then(|s| s.cluster_ip.as_deref())
+    else {
+        return;
+    };
+    let (Some(name), Some(ns)) = (
+        rendered_service.metadata.name.as_deref(),
+        gw.metadata.namespace.as_deref(),
+    ) else {
+        return;
+    };
+    let api: Api<Service> = Api::namespaced(client.clone(), ns);
+    let live_ip = match api.get_opt(name).await {
+        Ok(Some(live)) => live
+            .spec
+            .as_ref()
+            .and_then(|s| s.cluster_ip.clone())
+            .filter(|ip| !ip.is_empty() && ip != "None"),
+        Ok(None) => return,
+        Err(e) => {
+            tracing::debug!(
+                gateway = %gateway_id(gw),
+                error = %e,
+                "operator: dedicated Service clusterIP lookup failed; apply will retry"
+            );
+            return;
+        }
+    };
+    if live_ip.as_deref() == Some(desired) {
+        return;
+    }
+    match ignore_not_found(api.delete(name, &DeleteParams::default()).await) {
+        Ok(()) => tracing::info!(
+            service = %format!("{ns}/{name}"),
+            desired_cluster_ip = desired,
+            "operator: deleting dedicated Service to repin requested clusterIP (#260)"
+        ),
+        Err(e) => tracing::warn!(
+            service = %format!("{ns}/{name}"),
+            error = %e,
+            "operator: failed to delete dedicated Service for clusterIP repin; will retry"
+        ),
     }
 }
 

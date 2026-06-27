@@ -174,6 +174,29 @@ kubectl get gateway my-gateway
 # my-gateway   coxswain   203.0.113.10    True
 ```
 
+### Requesting a static address
+
+Set `spec.addresses` to ask coxswain to bind a specific address rather than letting the cluster auto-assign one (Gateway API `GatewayStaticAddresses`):
+
+```yaml
+spec:
+  addresses:
+    - type: IPAddress
+      value: 10.96.0.42
+```
+
+Coxswain honors a requested `IPAddress` by provisioning that Gateway's VIP `Service` as a **`ClusterIP`** pinned to the requested address (overriding the default VIP type for that one Gateway). The apiserver assigns the address exactly when it is a free IP inside the cluster's Service CIDR, and rejects it otherwise — giving a deterministic accept/reject on every cluster. The outcome is reflected in the conditions:
+
+| Requested address | `Accepted` | `Programmed` |
+|-------------------|-----------|--------------|
+| Supported type, bindable value | `True` | `True` — the address appears in `status.addresses` |
+| Supported type, value coxswain cannot bind (out of range / in use) | `True` | `False`, reason `AddressNotUsable` — the value is **not** published |
+| Unsupported `type` (anything but `IPAddress`/`Hostname`) | `False`, reason `UnsupportedAddress` | `False`, reason `Invalid` |
+
+A request for two distinct IPs is always `AddressNotUsable` — one `Service` binds a single `clusterIP`. Leaving `value` empty keeps the auto-assign behaviour (`GatewayAddressEmpty`).
+
+> Because a static-IP Gateway is bound to a `ClusterIP`, its address is **cluster-internal** — coxswain cannot guarantee an arbitrary externally-routable IP across load-balancer providers. Use a static address when you need a stable, predictable in-cluster address; for external exposure, leave `spec.addresses` empty and let the cluster's load balancer assign one.
+
 ### Status conditions
 
 | Condition | True when |

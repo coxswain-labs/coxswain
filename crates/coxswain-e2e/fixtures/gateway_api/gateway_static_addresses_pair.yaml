@@ -1,0 +1,23 @@
+---
+# GatewayStaticAddresses (#260): a shared Gateway requesting TWO distinct static
+# IPs. A single backing Service binds at most one clusterIP, so two distinct
+# requested IPs can never all be satisfied → Programmed=False/AddressNotUsable.
+# VIP-type-agnostic (holds on both ClusterIP and LoadBalancer VIPs).
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  addresses:
+    - type: IPAddress
+      value: ${ADDR_ONE}
+    - type: IPAddress
+      value: ${ADDR_TWO}
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
