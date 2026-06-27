@@ -5,8 +5,11 @@ use super::config::StatusAddress;
 use crate::status_common::{
     OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
 };
+use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::v::gateways::{Gateway, GatewayStatusListeners};
-use coxswain_reflector::status::{GatewayListenerStatus, ListenerStatusKey, ListenerTlsOutcome};
+use coxswain_reflector::status::{
+    GatewayListenerStatus, ListenerSource, ListenerStatusKey, ListenerTlsOutcome,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Returns true when the Gateway's current status does not yet reflect the
@@ -69,6 +72,28 @@ pub(super) fn gateway_needs_status_patch(
                 return true;
             }
         }
+    }
+    // GEP-1713: detect drift in attachedListenerSets count.
+    let desired_attached_ls: i32 = {
+        let mut ls_valid: std::collections::HashMap<&ObjectKey, bool> =
+            std::collections::HashMap::new();
+        for (k, info) in &health.listeners {
+            if let ListenerSource::ListenerSet(ls_key) = &k.source {
+                let has_valid = ls_valid.entry(ls_key).or_insert(false);
+                if !info.conflict.is_conflicted() {
+                    *has_valid = true;
+                }
+            }
+        }
+        ls_valid.values().filter(|&&v| v).count() as i32
+    };
+    let current_attached_ls = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.attached_listener_sets)
+        .unwrap_or(0);
+    if current_attached_ls != desired_attached_ls {
+        return true;
     }
     let current_listener_count = gw
         .status
@@ -268,10 +293,29 @@ pub(super) fn build_gateway_status_patch(
         })
         .collect();
 
+    // GEP-1713: count accepted ListenerSets. A LS is "accepted" iff it has
+    // at least one non-conflicted listener in the merged health map. A LS where
+    // every listener lost a conflict (all programmed=False) reports
+    // Accepted=False/ListenersNotValid and must NOT be counted.
+    let attached_listener_sets: i32 = {
+        let mut ls_valid: std::collections::HashMap<&ObjectKey, bool> =
+            std::collections::HashMap::new();
+        for (k, info) in &health.listeners {
+            if let ListenerSource::ListenerSet(ls_key) = &k.source {
+                let has_valid = ls_valid.entry(ls_key).or_insert(false);
+                if !info.conflict.is_conflicted() {
+                    *has_valid = true;
+                }
+            }
+        }
+        ls_valid.values().filter(|&&v| v).count() as i32
+    };
+
     let mut patch = serde_json::json!({
         "status": {
             "conditions": conditions,
             "listeners": listener_statuses,
+            "attachedListenerSets": attached_listener_sets,
         }
     });
     if let Some(addr) = addr {

@@ -267,6 +267,63 @@ impl FrontendValidationOutcome {
     }
 }
 
+/// Why a listener in the effective set did not program — its port-compatibility
+/// conflict reason (GEP-1713).
+///
+/// Used as a single field replacing the former `(conflicted: bool, protocol_conflict:
+/// bool)` pair so the three-way state is expressed as a closed enum rather than two
+/// independent booleans. The enum is matched exhaustively cross-crate; a future variant
+/// would be a deliberate, breaking model change (hence the opt-out below rather than
+/// `#[non_exhaustive]`).
+// intentionally open: closed enum matched exhaustively cross-crate; adding a variant is a model change.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ConflictReason {
+    /// No conflict — listener is programmed normally (the common case / proto zero-value).
+    #[default]
+    None,
+    /// Two listeners on the same port whose hostnames overlap (empty or identical),
+    /// mapped to the spec condition reason `HostnameConflict`.
+    HostnameConflict,
+    /// Two listeners on the same port with incompatible protocols,
+    /// mapped to the spec condition reason `ProtocolConflict`.
+    ProtocolConflict,
+}
+
+impl ConflictReason {
+    /// Returns `true` when the listener lost a conflict (any variant other than `None`).
+    #[must_use]
+    pub fn is_conflicted(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// The Gateway API condition reason string for this conflict (e.g. `"HostnameConflict"`).
+    ///
+    /// Returns `"NoConflicts"` for [`Self::None`]; callers that already guard on
+    /// [`Self::is_conflicted`] will never see that value from this method.
+    #[must_use]
+    pub fn reason_str(&self) -> &'static str {
+        match self {
+            Self::None => "NoConflicts",
+            Self::HostnameConflict => "HostnameConflict",
+            Self::ProtocolConflict => "ProtocolConflict",
+        }
+    }
+
+    /// Human-readable message for condition bodies.
+    #[must_use]
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::HostnameConflict => {
+                "listener lost a port-compatibility conflict to a higher-precedence listener"
+            }
+            Self::ProtocolConflict => {
+                "listener lost a port-compatibility conflict due to protocol mismatch"
+            }
+        }
+    }
+}
+
 /// Consolidated per-listener metadata for one Gateway listener.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
@@ -305,12 +362,15 @@ pub struct ListenerInfo {
     /// dedicated mode and Ingress-derived listeners keep spec == bind. Read
     /// through [`Self::bind_port`], never directly, so the fallback is honoured.
     pub internal_port: u16,
-    /// GEP-1713: `true` when this listener lost a port-compatibility conflict to a
-    /// higher-precedence listener in the Gateway's effective set and was therefore
-    /// not programmed. Drives the `Conflicted=True` condition on the owning resource
-    /// (the Gateway or the contributing `ListenerSet`). Always `false` for Gateways
-    /// without attached ListenerSets.
-    pub conflicted: bool,
+    /// GEP-1713: why (if at all) this listener lost a port-compatibility conflict to
+    /// a higher-precedence listener in the Gateway's effective set.
+    ///
+    /// [`ConflictReason::None`] means no conflict — the listener is programmed normally.
+    /// Any other variant means the listener was NOT programmed and drives the
+    /// `Conflicted=True` condition with the matching reason string on the owning
+    /// resource (Gateway or `ListenerSet`). Always `None` for Gateways without attached
+    /// ListenerSets.
+    pub conflict: ConflictReason,
 }
 
 impl ListenerInfo {

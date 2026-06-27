@@ -704,6 +704,11 @@ message ListenerInfo {
   // bind a conflicted listener; it is retained only so the controller can emit the
   // Conflicted condition. Additive field; pre-1713 proxies decode it as false.
   bool conflicted = 8;
+  // GEP-1713 — when `conflicted` is true, distinguishes the conflict reason:
+  // false = HostnameConflict; true = ProtocolConflict.
+  // Additive field; pre-1713 decoders read it as false (HostnameConflict), which
+  // is the common case. Wire version stays 1.
+  bool protocol_conflict = 9;
 }
 
 // Mirrors ListenerTlsOutcome.

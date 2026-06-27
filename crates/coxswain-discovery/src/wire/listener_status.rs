@@ -38,7 +38,8 @@
 //! [`Snapshot`]: crate::proto::v1::Snapshot
 
 use coxswain_core::listener_status::{
-    GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey, ListenerTlsOutcome,
+    ConflictReason, GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey,
+    ListenerTlsOutcome,
 };
 use coxswain_core::ownership::ObjectKey;
 
@@ -117,7 +118,8 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         allows_all_namespaces: info.allows_all_namespaces,
         port: u32::from(info.port),
         internal_port: u32::from(info.internal_port),
-        conflicted: info.conflicted,
+        conflicted: info.conflict.is_conflicted(),
+        protocol_conflict: matches!(info.conflict, ConflictReason::ProtocolConflict),
     }
 }
 
@@ -253,17 +255,25 @@ mod tests {
 
         // GEP-1713: a listener contributed by a ListenerSet shares the name "http"
         // with the Gateway's own listener but lives under a distinct ListenerSource
-        // and on a different port. It must survive the round-trip as its own entry,
-        // and a conflicted listener must carry `conflicted=true` across the wire.
+        // and on a different port. It must survive the round-trip as its own entry.
+        // Both ConflictReason variants must round-trip correctly.
         let ls_key = ObjectKey::new("apps", "team-a");
         let mut ls_http = ListenerInfo::default();
         ls_http.tls_outcome = ListenerTlsOutcome::NotApplicable;
         ls_http.attached_routes = 7;
         ls_http.port = 8080;
-        ls_http.conflicted = true;
+        ls_http.conflict = ConflictReason::HostnameConflict;
         status.listeners.insert(
             ListenerStatusKey::listener_set(ls_key.clone(), "http"),
             ls_http,
+        );
+        let mut ls_proto = ListenerInfo::default();
+        ls_proto.tls_outcome = ListenerTlsOutcome::NotApplicable;
+        ls_proto.port = 9090;
+        ls_proto.conflict = ConflictReason::ProtocolConflict;
+        status.listeners.insert(
+            ListenerStatusKey::listener_set(ls_key.clone(), "proto-conflict"),
+            ls_proto,
         );
 
         map.insert(ObjectKey::new("default", "my-gw"), status);
@@ -274,7 +284,7 @@ mod tests {
         let h2 = map2
             .get(&ObjectKey::new("default", "my-gw"))
             .expect("key found");
-        assert_eq!(h2.listeners.len(), 5, "listener count preserved");
+        assert_eq!(h2.listeners.len(), 6, "listener count preserved");
         let gw_http = ListenerStatusKey::gateway("http");
         let gw_https = ListenerStatusKey::gateway("https");
         assert_eq!(
@@ -319,14 +329,25 @@ mod tests {
         );
         // GEP-1713: the ListenerSet-sourced "http" is a distinct entry from the
         // Gateway's own "http", proving (source, name) keying survives the wire.
-        let ls_http_key = ListenerStatusKey::listener_set(ls_key, "http");
+        let ls_http_key = ListenerStatusKey::listener_set(ls_key.clone(), "http");
         assert_eq!(
             h2.listeners[&ls_http_key].attached_routes, 7,
             "ListenerSet listener round-trips under its own source"
         );
         assert!(
-            h2.listeners[&ls_http_key].conflicted,
-            "conflicted flag preserved across the wire"
+            matches!(
+                h2.listeners[&ls_http_key].conflict,
+                ConflictReason::HostnameConflict
+            ),
+            "HostnameConflict preserved across the wire"
+        );
+        let ls_proto_key = ListenerStatusKey::listener_set(ls_key, "proto-conflict");
+        assert!(
+            matches!(
+                h2.listeners[&ls_proto_key].conflict,
+                ConflictReason::ProtocolConflict
+            ),
+            "ProtocolConflict preserved across the wire"
         );
     }
 }

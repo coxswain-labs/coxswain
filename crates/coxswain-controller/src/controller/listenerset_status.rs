@@ -17,7 +17,8 @@ use coxswain_reflector::gw_types::v::listenersets::{
 };
 use coxswain_reflector::ingress::IngressPorts;
 use coxswain_reflector::status::{
-    GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey, ListenerTlsOutcome,
+    ConflictReason, GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey,
+    ListenerTlsOutcome,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
@@ -82,26 +83,36 @@ fn is_passthrough(l: &ListenerSetListeners) -> bool {
 /// [`crate::status_common::listener_route_kind_info`].
 fn route_kind_info(l: &ListenerSetListeners) -> (bool, Vec<(Option<String>, String)>) {
     let passthrough = is_passthrough(l);
-    let default_kind = || {
-        vec![(
-            Some(GW_GROUP.to_string()),
-            if passthrough { "TLSRoute" } else { "HTTPRoute" }.to_string(),
-        )]
+    let default_kinds = || {
+        if passthrough {
+            vec![(Some(GW_GROUP.to_string()), "TLSRoute".to_string())]
+        } else {
+            vec![
+                (Some(GW_GROUP.to_string()), "HTTPRoute".to_string()),
+                (Some(GW_GROUP.to_string()), "GRPCRoute".to_string()),
+            ]
+        }
     };
     let allowed = match l.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_deref()) {
         Some(k) if !k.is_empty() => k,
-        _ => return (false, default_kind()),
+        _ => return (false, default_kinds()),
     };
     let mut has_invalid = false;
     let mut includes_http = false;
+    let mut includes_grpc = false;
     let mut includes_tls = false;
     for k in allowed {
         let group_ok = k
             .group
             .as_deref()
             .is_none_or(|g| g.is_empty() || g == GW_GROUP);
-        if k.kind == "HTTPRoute" && group_ok {
-            includes_http = true;
+        if (k.kind == "HTTPRoute" || k.kind == "GRPCRoute") && group_ok && !passthrough {
+            if k.kind == "HTTPRoute" {
+                includes_http = true;
+            }
+            if k.kind == "GRPCRoute" {
+                includes_grpc = true;
+            }
         } else if k.kind == "TLSRoute" && group_ok && passthrough {
             includes_tls = true;
         } else {
@@ -111,6 +122,9 @@ fn route_kind_info(l: &ListenerSetListeners) -> (bool, Vec<(Option<String>, Stri
     let mut supported = Vec::new();
     if includes_http {
         supported.push((Some(GW_GROUP.to_string()), "HTTPRoute".to_string()));
+    }
+    if includes_grpc {
+        supported.push((Some(GW_GROUP.to_string()), "GRPCRoute".to_string()));
     }
     if includes_tls {
         supported.push((Some(GW_GROUP.to_string()), "TLSRoute".to_string()));
@@ -152,32 +166,38 @@ fn listener_conditions(
             }
         }
     }
-    let conflicted = info.is_some_and(|i| i.conflicted);
-    let (status, reason, msg) = if conflicted {
-        (
+    let conflict = info
+        .map(|i| i.conflict.clone())
+        .unwrap_or(ConflictReason::None);
+    let conflicted = conflict.is_conflicted();
+    if conflicted {
+        let reason = conflict.reason_str();
+        let conflict_msg = conflict.message();
+        for c in conds.iter_mut() {
+            if c.type_ == "Accepted" || c.type_ == "Programmed" {
+                c.status = "False".to_string();
+                c.reason = reason.to_string();
+                c.message = conflict_msg.to_string();
+            }
+        }
+        conds.push(make_condition(
+            "Conflicted",
             "True",
-            "HostnameConflict",
-            "listener lost a port-compatibility conflict to a higher-precedence listener",
-        )
+            reason,
+            conflict_msg,
+            generation,
+            now.clone(),
+        ));
     } else {
-        ("False", "NoConflicts", "")
-    };
-    // A conflicted listener is not programmed; the shared triplet derives Programmed
-    // from the TLS outcome (NotApplicable for a conflicted listener → would read
-    // healthy), so override it here to reflect the conflict.
-    if conflicted && let Some(prog) = conds.iter_mut().find(|c| c.type_ == "Programmed") {
-        prog.status = "False".to_string();
-        prog.reason = "HostnameConflict".to_string();
-        prog.message = msg.to_string();
+        conds.push(make_condition(
+            "Conflicted",
+            "False",
+            "NoConflicts",
+            "",
+            generation,
+            now.clone(),
+        ));
     }
-    conds.push(make_condition(
-        "Conflicted",
-        status,
-        reason,
-        msg,
-        generation,
-        now.clone(),
-    ));
     conds
 }
 
@@ -238,14 +258,35 @@ pub(super) fn build_listenerset_status_patch(
         })
         .collect();
 
-    let (accepted_status, accepted_reason, accepted_msg) = if accepted {
-        ("True", "Accepted", "")
-    } else {
+    // A ListenerSet is Accepted=False/ListenersNotValid when it IS allowed by the
+    // parent's allowedListeners (accepted=true) but every single one of its listeners
+    // is invalid or conflicted (GEP-1713 hostname-conflict conformance).
+    let all_listeners_invalid = accepted
+        && !ls.spec.listeners.is_empty()
+        && listener_statuses.iter().all(|s| {
+            s["conditions"]
+                .as_array()
+                .map(|conds| {
+                    conds
+                        .iter()
+                        .any(|c| c["type"] == "Programmed" && c["status"] == "False")
+                })
+                .unwrap_or(false)
+        });
+    let (accepted_status, accepted_reason, accepted_msg) = if !accepted {
         (
             "False",
             "NotAllowed",
             "the parent Gateway's spec.allowedListeners does not permit this ListenerSet",
         )
+    } else if all_listeners_invalid {
+        (
+            "False",
+            "ListenersNotValid",
+            "all listeners are invalid or conflicted",
+        )
+    } else {
+        ("True", "Accepted", "")
     };
     let (prog_status, prog_reason, prog_msg) = if !accepted {
         // GEP-1713 conformance: a ListenerSet rejected by the parent's
@@ -255,6 +296,12 @@ pub(super) fn build_listenerset_status_patch(
             "False",
             "NotAllowed",
             "ListenerSet not accepted by the parent Gateway",
+        )
+    } else if all_listeners_invalid {
+        (
+            "False",
+            "ListenersNotValid",
+            "all listeners are invalid or conflicted",
         )
     } else if all_programmed {
         ("True", "Programmed", "")
@@ -307,11 +354,26 @@ pub(super) fn listenerset_needs_status_patch(
             .find(|c| c.type_ == type_)
             .is_some_and(|c| c.status == "True")
     };
-    if cond_true(conds, "Accepted") != accepted {
+    let ls_key = listenerset_key(ls);
+    // Recompute desired accepted, mirroring build_listenerset_status_patch.
+    let all_listeners_invalid = accepted && !ls.spec.listeners.is_empty() && {
+        let mut all_bad = true;
+        for l in &ls.spec.listeners {
+            let info = listener_info(parent_health, &ls_key, &l.name);
+            let conflicted = info.is_some_and(|i| i.conflict.is_conflicted());
+            let (has_invalid_kinds, _) = route_kind_info(l);
+            let healthy = info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true);
+            if !conflicted && !has_invalid_kinds && healthy {
+                all_bad = false;
+                break;
+            }
+        }
+        all_bad
+    };
+    let desired_accepted = accepted && !all_listeners_invalid;
+    if cond_true(conds, "Accepted") != desired_accepted {
         return true;
     }
-
-    let ls_key = listenerset_key(ls);
     let current = status.and_then(|s| s.listeners.as_deref()).unwrap_or(&[]);
     if current.len() != ls.spec.listeners.len() {
         return true;
@@ -331,7 +393,7 @@ pub(super) fn listenerset_needs_status_patch(
     for l in &ls.spec.listeners {
         let info = listener_info(parent_health, &ls_key, &l.name);
         let (has_invalid_kinds, _) = route_kind_info(l);
-        let conflicted = info.is_some_and(|i| i.conflicted);
+        let conflicted = info.is_some_and(|i| i.conflict.is_conflicted());
         let healthy = info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true);
         // Desired per-listener condition states (port-conflict is config/spec-driven
         // and only changes on a generation-bumping edit, so it is covered by the
@@ -418,7 +480,11 @@ mod tests {
         let mut info = ListenerInfo::default();
         info.port = port;
         info.attached_routes = 2;
-        info.conflicted = conflicted;
+        info.conflict = if conflicted {
+            ConflictReason::HostnameConflict
+        } else {
+            ConflictReason::None
+        };
         h.listeners.insert(
             ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), name),
             info,
@@ -541,6 +607,7 @@ mod tests {
             .find(|c| c["type"] == "Conflicted")
             .unwrap();
         assert_eq!(conflicted["status"], "True");
+        assert_eq!(conflicted["reason"], "HostnameConflict");
         // A conflicted (unprogrammed) listener drops the ListenerSet to Programmed=False.
         assert_eq!(patch["status"]["conditions"][1]["status"], "False");
     }

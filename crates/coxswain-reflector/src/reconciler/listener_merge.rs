@@ -24,7 +24,7 @@ use crate::gw_types::v::gateways::{
     Gateway, GatewayAllowedListenersNamespacesFrom, GatewayListeners, GatewayListenersTlsMode,
 };
 use crate::gw_types::v::listenersets::{ListenerSetListeners, ListenerSetListenersTlsMode};
-use crate::status::ListenerSource;
+use crate::status::{ConflictReason, ListenerSource};
 use coxswain_core::ownership::ObjectKey;
 
 /// One normalised `certificateRefs` entry (Gateway/ListenerSet share the shape).
@@ -79,9 +79,12 @@ pub(crate) struct EffectiveListener {
     /// default). Carried so route-health can compute per-listener `allows_kind`
     /// for routes attached via this listener (GEP-1713).
     pub allowed_route_kinds: Vec<(Option<String>, String)>,
-    /// `true` when this listener lost a port-compatibility conflict to a
-    /// higher-precedence listener and must NOT be programmed.
-    pub conflicted: bool,
+    /// Port-compatibility conflict reason, if any (GEP-1713).
+    ///
+    /// [`ConflictReason::None`] means the listener programs normally. Any other
+    /// variant means it lost a conflict to a higher-precedence listener and must
+    /// NOT be programmed; the reason drives the per-listener `Conflicted` condition.
+    pub conflict: ConflictReason,
 }
 
 /// An owned Gateway plus its computed effective listener set.
@@ -234,7 +237,7 @@ pub fn effective_listener_ports(
                 std::collections::HashSet::new();
             let mut ports = Vec::new();
             for l in eg.listeners {
-                if l.conflicted {
+                if l.conflict.is_conflicted() {
                     continue;
                 }
                 let Ok(port) = u16::try_from(l.port) else {
@@ -409,7 +412,7 @@ fn from_gateway_listener(l: &GatewayListeners, gw_ns: &str) -> EffectiveListener
                     .collect()
             })
             .unwrap_or_default(),
-        conflicted: false,
+        conflict: ConflictReason::None,
     }
 }
 
@@ -455,7 +458,7 @@ fn from_listenerset_listener(
                     .collect()
             })
             .unwrap_or_default(),
-        conflicted: false,
+        conflict: ConflictReason::None,
     }
 }
 
@@ -496,16 +499,22 @@ fn flag_conflicts(listeners: &mut [EffectiveListener]) {
     for l in listeners.iter_mut() {
         let host = l.hostname.clone().unwrap_or_default();
         let entry = claimed.entry(l.port).or_default();
-        let compatible = entry.iter().all(|(proto, h)| {
+        if entry.iter().all(|(proto, h)| {
             // Compatible only when the protocol matches and both hostnames are
             // non-empty and distinct (an empty hostname matches all SNI/Host and
             // therefore overlaps every sibling on the port).
             proto == &l.protocol && !host.is_empty() && !h.is_empty() && h != &host
-        });
-        if compatible {
+        }) {
             entry.push((l.protocol.clone(), host));
         } else {
-            l.conflicted = true;
+            // Protocol conflict: any winner on this port has a different protocol.
+            // Hostname conflict: all winners share the same protocol but hostnames
+            // overlap (either empty/wildcard or identical).
+            l.conflict = if entry.iter().any(|(proto, _)| proto != &l.protocol) {
+                ConflictReason::ProtocolConflict
+            } else {
+                ConflictReason::HostnameConflict
+            };
         }
     }
 }
@@ -622,7 +631,7 @@ mod tests {
     fn names(eff: &EffectiveGateway) -> Vec<(ListenerSource, String, bool)> {
         eff.listeners
             .iter()
-            .map(|l| (l.source.clone(), l.name.clone(), l.conflicted))
+            .map(|l| (l.source.clone(), l.name.clone(), l.conflict.is_conflicted()))
             .collect()
     }
 
@@ -775,9 +784,12 @@ mod tests {
         );
         let eff = merge_effective_gateways(&[gw], &[ls], &owned(), &empty_ns_store());
         let g = eff.get(&ObjectKey::new("default", "gw")).expect("gateway");
-        assert!(!g.listeners[0].conflicted, "Gateway listener wins");
         assert!(
-            g.listeners[1].conflicted,
+            !g.listeners[0].conflict.is_conflicted(),
+            "Gateway listener wins"
+        );
+        assert!(
+            g.listeners[1].conflict.is_conflicted(),
             "ListenerSet listener loses the port"
         );
     }
@@ -799,7 +811,7 @@ mod tests {
         let eff = merge_effective_gateways(&[gw], &[ls], &owned(), &empty_ns_store());
         let g = eff.get(&ObjectKey::new("default", "gw")).expect("gateway");
         assert!(
-            g.listeners.iter().all(|l| !l.conflicted),
+            g.listeners.iter().all(|l| !l.conflict.is_conflicted()),
             "distinct hostnames share a port"
         );
     }

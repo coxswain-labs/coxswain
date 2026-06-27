@@ -180,7 +180,7 @@ pub(super) fn build_gateway_routes(
             let vip = vip_internal.clone();
             e.listeners
                 .iter()
-                .filter(|l| !l.conflicted)
+                .filter(|l| !l.conflict.is_conflicted())
                 .map(move |l| {
                     // Key by the DECLARING resource so a route's parentRef (Gateway
                     // or ListenerSet) resolves to the right listener and same-named
@@ -528,7 +528,7 @@ pub(super) fn build_tls(
         // the proxy (which checks by the accepted local port) matches it (#472).
         // Conflicted listeners (GEP-1713) are not programmed — skip them.
         for li in health.listeners.values() {
-            if li.conflicted {
+            if li.conflict.is_conflicted() {
                 continue;
             }
             lh_builder.add_listener(
@@ -802,7 +802,7 @@ pub(super) fn build_passthrough_routes(
             }
             // Lost a port-compatibility conflict to a higher-precedence listener
             // (GEP-1713) — not programmed, so no routing entries.
-            if listener.conflicted {
+            if listener.conflict.is_conflicted() {
                 continue;
             }
 
@@ -1236,7 +1236,7 @@ mod tests {
             }),
             allows_all_namespaces: false,
             allowed_route_kinds: vec![],
-            conflicted: true,
+            conflict: crate::status::ConflictReason::HostnameConflict,
         };
         let effective: HashMap<ObjectKey, EffectiveGateway> = std::iter::once((
             gw_key.clone(),

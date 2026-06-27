@@ -19,7 +19,7 @@ use tokio::sync::watch;
 // Re-export the core listener-status types so reflector-internal modules can
 // import everything status-related from one place.
 pub use coxswain_core::listener_status::{
-    BackendClientCertOutcome, FrontendValidationOutcome, FrontendValidationStatus,
+    BackendClientCertOutcome, ConflictReason, FrontendValidationOutcome, FrontendValidationStatus,
     GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey, ListenerTlsOutcome,
     SharedGatewayListenerStatus,
 };

@@ -37,7 +37,7 @@
 //! [`RoutingTable`]: coxswain_core::routing::RoutingTable
 //! [`Snapshot`]: crate::proto::v1::Snapshot
 
-use coxswain_core::listener_status::{ListenerInfo, ListenerTlsOutcome};
+use coxswain_core::listener_status::{ConflictReason, ListenerInfo, ListenerTlsOutcome};
 
 use crate::error::WireError;
 use crate::proto::v1 as p;
@@ -119,7 +119,13 @@ pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerI
     li.allows_all_namespaces = dto.allows_all_namespaces;
     li.port = dto.port as u16;
     li.internal_port = dto.internal_port as u16;
-    li.conflicted = dto.conflicted;
+    li.conflict = if dto.protocol_conflict {
+        ConflictReason::ProtocolConflict
+    } else if dto.conflicted {
+        ConflictReason::HostnameConflict
+    } else {
+        ConflictReason::None
+    };
     Ok(li)
 }
 

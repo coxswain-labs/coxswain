@@ -761,7 +761,7 @@ impl GatewayApiReconciler {
             } else {
                 listener_port
             };
-            let tls_outcome = if listener.conflicted {
+            let tls_outcome = if listener.conflict.is_conflicted() {
                 // Lost a port-compatibility conflict to a higher-precedence
                 // listener (GEP-1713) — not programmed, no cert installed.
                 ListenerTlsOutcome::NotApplicable
@@ -796,7 +796,7 @@ impl GatewayApiReconciler {
             li.allows_all_namespaces = listener.allows_all_namespaces;
             li.port = listener_port;
             li.internal_port = internal_port;
-            li.conflicted = listener.conflicted;
+            li.conflict = listener.conflict.clone();
             map.insert(
                 ListenerStatusKey {
                     source: listener.source.clone(),
@@ -971,6 +971,7 @@ mod tests {
         use crate::reconciler::listener_merge::{
             EffectiveCertRef, EffectiveListener, EffectiveTls,
         };
+        use crate::status::ConflictReason;
         use coxswain_core::ownership::ObjectKey;
         use coxswain_core::reference_grants::ReferenceGrantKey;
 
@@ -993,7 +994,7 @@ mod tests {
             }),
             allows_all_namespaces: false,
             allowed_route_kinds: vec![],
-            conflicted: false,
+            conflict: ConflictReason::None,
         };
 
         let mut secrets_w = reflector::store::Writer::<Secret>::default();

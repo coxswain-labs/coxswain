@@ -159,7 +159,7 @@ pub(super) fn compute_route_health<R: RouteLike>(
             // (the routing builders skip it), so it must not contribute an Accepted
             // parent either — otherwise a route would advertise Accepted while
             // black-holing. Keep the key present but omit the conflicted listener.
-            if l.conflicted {
+            if l.conflict.is_conflicted() {
                 continue;
             }
             let allows_kind = if l.allowed_route_kinds.is_empty() {
