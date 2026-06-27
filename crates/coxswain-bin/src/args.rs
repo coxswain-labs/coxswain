@@ -268,19 +268,6 @@ pub(crate) struct ProxyArgs {
     #[arg(long, env = "COXSWAIN_PROXY_BIND_ADDRESS", default_value = "0.0.0.0")]
     pub proxy_bind_address: IpAddr,
 
-    /// Port for the TLS-passthrough listener (TLSRoute / GEP-2643).
-    ///
-    /// Gateway listeners with `protocol: TLS, tls.mode: Passthrough` are served
-    /// on this port. The proxy peeks the SNI from the ClientHello and forwards
-    /// the raw encrypted stream to the backend — no TLS termination occurs.
-    /// Set to `0` to disable the passthrough listener entirely.
-    #[arg(
-        long,
-        env = "COXSWAIN_PROXY_TLS_PASSTHROUGH_PORT",
-        default_value_t = 8444
-    )]
-    pub proxy_tls_passthrough_port: u16,
-
     /// Timeout for dialling a TLS passthrough backend.
     ///
     /// When a TLS-passthrough connection matches a TLSRoute, the proxy opens a
