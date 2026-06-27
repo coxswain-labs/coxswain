@@ -11,13 +11,10 @@
 use crate::config::SharedProxyConfig;
 use crate::ctx::ProxyCtx;
 use crate::hooks;
-use crate::policy::cache;
 use crate::retry;
 use crate::routing::engine::RoutingEngine;
 use async_trait::async_trait;
 use coxswain_core::routing::Gateway;
-use pingora_cache::key::{CacheKey, HashBinary};
-use pingora_cache::{CacheMeta, ForcedFreshness, HitHandler, RespCacheable};
 use pingora_core::Result;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -60,52 +57,6 @@ impl ProxyHttp for GatewayProxy {
         Self::CTX: Send + Sync,
     {
         hooks::request_filter(&self.engine, &self.cfg, session, ctx).await
-    }
-
-    fn request_cache_filter(&self, session: &mut Session, ctx: &mut ProxyCtx) -> Result<()> {
-        cache::request_cache_filter(self.cfg.cache, session, ctx)
-    }
-
-    fn cache_key_callback(&self, session: &Session, ctx: &mut ProxyCtx) -> Result<CacheKey> {
-        Ok(cache::cache_key_callback(session, ctx))
-    }
-
-    fn response_cache_filter(
-        &self,
-        _session: &Session,
-        resp: &ResponseHeader,
-        _ctx: &mut ProxyCtx,
-    ) -> Result<RespCacheable> {
-        Ok(cache::response_cache_filter(resp))
-    }
-
-    fn cache_vary_filter(
-        &self,
-        meta: &CacheMeta,
-        _ctx: &mut ProxyCtx,
-        req: &RequestHeader,
-    ) -> Option<HashBinary> {
-        cache::cache_vary_filter(meta, req)
-    }
-
-    async fn cache_hit_filter(
-        &self,
-        _session: &mut Session,
-        _meta: &CacheMeta,
-        _hit_handler: &mut HitHandler,
-        _is_fresh: bool,
-        ctx: &mut ProxyCtx,
-    ) -> Result<Option<ForcedFreshness>>
-    where
-        Self::CTX: Send + Sync,
-    {
-        cache::record_cache_hit(ctx);
-        Ok(None)
-    }
-
-    fn cache_miss(&self, session: &mut Session, ctx: &mut ProxyCtx) {
-        cache::record_cache_miss(ctx);
-        session.cache.cache_miss();
     }
 
     async fn request_body_filter(

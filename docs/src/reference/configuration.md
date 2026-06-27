@@ -47,7 +47,6 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_ACCESS_LOG` | `--access-log` | `true` | Emit one structured access-log event per proxied request on the `coxswain_proxy::access` target; set `false` to silence. See [Observability](observability.md#access-logs) |
 | `COXSWAIN_ACCESS_LOG_PATH_MODE` | `--access-log-path-mode` | `full` | What the access-log `path` field records: `full`, `pattern`, or `none` |
 | `COXSWAIN_ADMIN_PORT` | `--admin-port` | `8082` | Port for admin, metrics, and diagnostics endpoints |
-| `COXSWAIN_CACHE_MAX_SIZE` | `--cache-max-size` | `100m` | Maximum total size of the in-memory response cache shared by routes with `ingress.coxswain-labs.dev/cache-enabled`; bare byte count or binary suffix (`k`/`m`/`g`); `0` disables caching. See [Ingress annotations](../guides/ingress-annotations.md#cache-enabled) |
 | `COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL` | `--controller-lease-renew-interval` | `5s` | How often the leader renews its lease; must be ≤ 1/3 of the TTL |
 | `COXSWAIN_CONTROLLER_LEASE_TTL` | `--controller-lease-ttl` | `15s` | How long a lease stays valid without renewal; must be ≥ 3× the renew interval |
 | `COXSWAIN_CONTROLLER_NAME` | `--controller-name` | `coxswain-labs.dev/gateway-controller` | GatewayClass `spec.controllerName` to claim |

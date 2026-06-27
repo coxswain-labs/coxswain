@@ -7,7 +7,6 @@
 use crate::edge::upstream_ca::{BackendClientCertCache, SanCheckHookCache, UpstreamCaCache};
 use crate::policy::circuit_breaker::CircuitBreakerRegistry;
 use crate::policy::rate_limit::RateLimiterRegistry;
-use coxswain_cache::ResponseCache;
 use coxswain_core::routing::RouteTimeouts;
 use coxswain_core::shared::Shared;
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames};
@@ -42,8 +41,6 @@ pub struct SharedProxyConfig {
     pub access_log_enabled: bool,
     /// Controls what the access log emits for the `path` field.
     pub access_log_path_mode: AccessLogPathMode,
-    /// Shared response cache, or `None` when caching is disabled process-wide.
-    pub cache: Option<ResponseCache>,
     /// Shared per-process rate-limiter registry.
     pub rate_limiter: RateLimiterRegistry,
     /// Shared HTTP client for ext_authz sub-requests (#24).
@@ -97,7 +94,6 @@ impl SharedProxyConfig {
         ca_cache: Arc<UpstreamCaCache>,
         access_log_enabled: bool,
         access_log_path_mode: AccessLogPathMode,
-        cache: Option<ResponseCache>,
         rate_limiter: RateLimiterRegistry,
         auth_client: reqwest::Client,
     ) -> Self {
@@ -108,7 +104,6 @@ impl SharedProxyConfig {
             san_hook_cache: Arc::new(SanCheckHookCache::new()),
             access_log_enabled,
             access_log_path_mode,
-            cache,
             rate_limiter,
             auth_client,
             client_certs: SharedClientCertStore::new(),

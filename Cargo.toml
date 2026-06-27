@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/coxswain-bin",
-    "crates/coxswain-cache",
     "crates/coxswain-core",
     "crates/coxswain-controller",
     "crates/coxswain-discovery",
@@ -14,7 +13,6 @@ members = [
 ]
 default-members = [
     "crates/coxswain-bin",
-    "crates/coxswain-cache",
     "crates/coxswain-core",
     "crates/coxswain-controller",
     "crates/coxswain-discovery",
@@ -38,7 +36,6 @@ keywords = ["kubernetes", "ingress", "gateway-api", "pingora", "proxy"]
 
 [workspace.dependencies]
 coxswain-admin      = { path = "./crates/coxswain-admin" }
-coxswain-cache      = { path = "./crates/coxswain-cache" }
 coxswain-core       = { path = "./crates/coxswain-core" }
 coxswain-controller = { path = "./crates/coxswain-controller" }
 coxswain-discovery  = { path = "./crates/coxswain-discovery" }
@@ -84,7 +81,6 @@ nix                = { version = "0.31", features = ["signal", "process"] }
 parking_lot        = { version = "0.12" }
 percent-encoding   = { version = "2.3" }
 pingora            = { version = "0.8", default-features = false }
-pingora-cache      = { version = "0.8", default-features = false }
 pingora-core       = { version = "0.8", default-features = false }
 pingora-http       = { version = "0.8" }
 pingora-proxy      = { version = "0.8", default-features = false }

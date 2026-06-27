@@ -423,7 +423,6 @@ pub(crate) async fn request_filter<K>(
         original_path: effective_path,
         path_pattern: m.path_pattern,
         metric_route_id: m.metric_route_id,
-        cache_enabled: m.cache_enabled,
         access_log_enabled: m.access_log_enabled,
         compression: m.compression,
         circuit_breaker: m.circuit_breaker,

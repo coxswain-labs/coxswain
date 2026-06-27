@@ -248,8 +248,7 @@ impl IngressReconciler {
         // One RouteEntry builder shared by all three insertion sites — rule path,
         // ssl-redirect variant, and spec.defaultBackend. Centralising the chain
         // guarantees every per-route knob is applied uniformly; the defaultBackend
-        // path previously hand-rolled the chain and silently dropped
-        // `with_cache_enabled`, so `cache-enabled` did not apply there (#397).
+        // path previously hand-rolled the chain and silently dropped knobs (#397).
         // Captures the Ingress-wide knobs by reference; callers pass the per-entry
         // group, path pattern, metric id, and filter list.
         let build_route_entry = |group: Arc<BackendGroup>,
@@ -264,7 +263,6 @@ impl IngressReconciler {
                 .with_max_body_size(ann.max_body_size)
                 .with_allow_source_range(allow_source_range.clone())
                 .with_deny_source_range(deny_source_range.clone())
-                .with_cache_enabled(ann.cache_enabled)
                 .with_access_log_enabled(class_access_log_enabled)
                 .with_rate_limit(rate_limit.clone())
                 .with_auth(auth.clone())
@@ -800,52 +798,6 @@ mod tests {
                 .name(),
             "default/default-svc"
         );
-    }
-
-    #[test]
-    fn reconcile_cache_enabled_applies_to_default_backend() {
-        use crate::ingress::annotations::CACHE_ENABLED;
-        use coxswain_core::routing::RouteOutcome;
-
-        let store = slice_store(vec![
-            make_slice("default", "rule-svc", "10.0.0.1"),
-            make_slice("default", "default-svc", "10.0.0.2"),
-        ]);
-        let mut ingress = make_ingress_with_default(
-            "default",
-            Some("a.com"),
-            "/api",
-            "rule-svc",
-            Some("default-svc"),
-        );
-        ingress
-            .metadata
-            .annotations
-            .get_or_insert_with(BTreeMap::new)
-            .insert(CACHE_ENABLED.to_string(), "true".to_string());
-
-        let mut builder = RoutingTableBuilder::new();
-        reconcile_no_default(
-            &ingress,
-            &store,
-            &empty_svc_store(),
-            &owned(&["coxswain"]),
-            &mut builder,
-        );
-        let table = builder.build().unwrap();
-        let ctx = RequestContext::default();
-
-        // Regression (#397): the defaultBackend builder previously omitted
-        // `with_cache_enabled`, so `cache-enabled` silently did not apply to
-        // spec.defaultBackend. An unmatched host falls through to defaultBackend.
-        if let RouteOutcome::Found(m) = table.find(80, "unmatched.example", "/", &ctx) {
-            assert!(
-                m.cache_enabled,
-                "cache-enabled annotation must apply to the spec.defaultBackend route"
-            );
-        } else {
-            panic!("expected defaultBackend route for an unmatched host");
-        }
     }
 
     #[test]
