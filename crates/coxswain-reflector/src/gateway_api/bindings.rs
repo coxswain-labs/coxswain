@@ -83,6 +83,10 @@ pub struct ListenerBinding {
     /// routing table by (#472). Equals the allocated internal port for shared-mode
     /// Gateways, else the spec port. Routes are inserted under this port.
     pub bind_port: u16,
+    /// Resolved `allowedRoutes.namespaces` policy: a route only binds to this
+    /// listener when its namespace is permitted (GEP-1713). Resolved at merge time
+    /// (`Selector` materialised), so the binding check is a pure membership test.
+    pub route_namespaces: coxswain_core::listener_status::RouteNamespaceSet,
 }
 
 /// Returns one entry per (listener hostname, listener port) binding derived from the
@@ -121,11 +125,17 @@ pub(super) fn compute_listener_bindings(
             let source =
                 parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), gw_ns, gw_name);
 
-            // Collect (port, listener_hostname) pairs for this parentRef.
+            // Collect (port, listener_hostname) pairs for this parentRef. A listener
+            // only binds when its `allowedRoutes.namespaces` admits the route's
+            // namespace (GEP-1713) — without this, a route attaches (and serves
+            // traffic) regardless of the listener's namespace scoping.
             let l_bindings: Vec<(u16, &str)> = if let Some(sn) = pr.section_name.as_deref() {
                 let key = listener_key(&source, gw_ns, gw_name, sn);
                 match listener_info.get(&key) {
-                    Some(info) if pr_port_filter.is_none_or(|pp| pp == info.port) => {
+                    Some(info)
+                        if pr_port_filter.is_none_or(|pp| pp == info.port)
+                            && info.route_namespaces.allows(route_ns) =>
+                    {
                         vec![(info.bind_port, info.hostname.as_str())]
                     }
                     _ => vec![],
@@ -137,7 +147,9 @@ pub(super) fn compute_listener_bindings(
                         if k.source != source || k.gw_ns != gw_ns || k.gw_name != gw_name {
                             return None;
                         }
-                        if pr_port_filter.is_none_or(|pp| pp == info.port) {
+                        if pr_port_filter.is_none_or(|pp| pp == info.port)
+                            && info.route_namespaces.allows(route_ns)
+                        {
                             Some((info.bind_port, info.hostname.as_str()))
                         } else {
                             None
@@ -270,10 +282,16 @@ pub(super) fn compute_grpc_listener_bindings(
             let source =
                 parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), gw_ns, gw_name);
 
+            // Namespace scoping mirrors `compute_listener_bindings` (GEP-1713): a
+            // listener binds only when its `allowedRoutes.namespaces` admits the
+            // route's namespace.
             let l_bindings: Vec<(u16, &str)> = if let Some(sn) = pr.section_name.as_deref() {
                 let key = listener_key(&source, gw_ns, gw_name, sn);
                 match listener_info.get(&key) {
-                    Some(info) if pr_port_filter.is_none_or(|pp| pp == info.port) => {
+                    Some(info)
+                        if pr_port_filter.is_none_or(|pp| pp == info.port)
+                            && info.route_namespaces.allows(route_ns) =>
+                    {
                         vec![(info.bind_port, info.hostname.as_str())]
                     }
                     _ => vec![],
@@ -285,7 +303,9 @@ pub(super) fn compute_grpc_listener_bindings(
                         if k.source != source || k.gw_ns != gw_ns || k.gw_name != gw_name {
                             return None;
                         }
-                        if pr_port_filter.is_none_or(|pp| pp == info.port) {
+                        if pr_port_filter.is_none_or(|pp| pp == info.port)
+                            && info.route_namespaces.allows(route_ns)
+                        {
                             Some((info.bind_port, info.hostname.as_str()))
                         } else {
                             None
@@ -392,6 +412,7 @@ mod tests {
                 hostname: String::new(),
                 port: 8001,
                 bind_port: 30001,
+                route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
             },
         );
 
@@ -718,6 +739,7 @@ mod tests {
                 hostname: String::new(),
                 port: 80,
                 bind_port: 80,
+                route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
             },
         );
         info.insert(
@@ -726,6 +748,7 @@ mod tests {
                 hostname: String::new(),
                 port: 8080,
                 bind_port: 8080,
+                route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
             },
         );
 

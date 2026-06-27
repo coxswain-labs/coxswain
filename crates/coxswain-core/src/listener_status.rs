@@ -324,6 +324,57 @@ impl ConflictReason {
     }
 }
 
+/// A listener's resolved `allowedRoutes.namespaces` policy — which namespaces'
+/// routes may attach to it.
+///
+/// The selector is resolved to a concrete set of namespace names **at merge
+/// time** (where the cluster Namespace store is available), so every routing-path
+/// gate — the attached-routes count, the HTTP/GRPC/TLS routing-table attach, and
+/// the route `Accepted` computation — is a pure set-membership check needing no
+/// namespace store. Mapping from `allowedRoutes.namespaces.from`:
+/// `All` → [`Self::All`]; `Same` → `Only({owning_ns})`; `Selector` → `Only(matched)`;
+/// `None`/absent-restrictive → `Only({})`.
+///
+/// NOT carried losslessly on the discovery wire: the proxy receives a pre-built
+/// routing table and never matches namespaces, so the wire collapses this to a
+/// single "all" bit (`Only(_)` → not-all). The reflector always holds the full set
+/// in-process — it never reconstructs this from the wire.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouteNamespaceSet {
+    /// `from: All` — routes from any namespace attach.
+    All,
+    /// Routes only from these (already-resolved) namespace names attach.
+    Only(std::collections::BTreeSet<String>),
+}
+
+impl Default for RouteNamespaceSet {
+    /// `All` — a bare `ListenerInfo::default()` carries no namespace restriction.
+    /// Production listeners ALWAYS get the resolved policy from the merge; the wire
+    /// `from_wire` path maps a non-all listener to `Only({})` explicitly (fail
+    /// closed), so this permissive default only affects test/defensive defaults.
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+impl RouteNamespaceSet {
+    /// Whether a route in namespace `ns` is permitted to attach.
+    #[must_use]
+    pub fn allows(&self, ns: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(set) => set.contains(ns),
+        }
+    }
+
+    /// Whether this policy admits routes from every namespace (`from: All`).
+    #[must_use]
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
 /// Consolidated per-listener metadata for one Gateway listener.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
@@ -345,9 +396,10 @@ pub struct ListenerInfo {
     ///
     /// Used by the route-counting pass to filter routes by hostname.
     pub hostname: String,
-    /// Whether routes from any namespace are allowed (`true`) or only from
-    /// the same namespace as the Gateway (`false`, the spec default).
-    pub allows_all_namespaces: bool,
+    /// Resolved `allowedRoutes.namespaces` policy: which namespaces' routes may
+    /// attach to this listener. Resolved from the listener's `from`(+`selector`)
+    /// at merge time; see [`RouteNamespaceSet`].
+    pub route_namespaces: RouteNamespaceSet,
     /// Listener spec port number — what clients connect to and what
     /// `status.addresses`/listener conditions report.
     pub port: u16,

@@ -1652,3 +1652,135 @@ async fn gateway_listenerset_duplicate_listener_name_both_program() -> anyhow::R
 
     Ok(())
 }
+
+/// `(status, reason)` of a route's parent-status condition `type_` for the parent
+/// whose `parentRef.kind` is `ListenerSet` and name is `ls_name`, or `None`. The
+/// kind match is the point: a ListenerSet parentRef must surface its OWN status
+/// entry (not be folded into / mislabelled as a Gateway parent).
+fn route_listenerset_parent_condition(
+    route: &HttpRoute,
+    ls_name: &str,
+    type_: &str,
+) -> Option<(String, String)> {
+    route.status.as_ref()?.parents.iter().find_map(|p| {
+        (p.parent_ref.kind.as_deref() == Some("ListenerSet") && p.parent_ref.name == ls_name)
+            .then(|| {
+                p.conditions
+                    .iter()
+                    .find(|c| c.type_ == type_)
+                    .map(|c| (c.status.clone(), c.reason.clone()))
+            })
+            .flatten()
+    })
+}
+
+/// GEP-1713 conflict-with-survivor: a ListenerSet with one listener that loses a
+/// hostname conflict to the parent Gateway and one that programs cleanly must
+/// still report top-level `Accepted=True`/`Programmed=True`. The losing listener
+/// is individually `Programmed=False/HostnameConflict`; the survivor is
+/// `Programmed=True`. Guards the per-listener-vs-aggregate split: a single losing
+/// listener must NOT drag the whole ListenerSet to `Programmed=False`.
+#[tokio::test]
+async fn gateway_listenerset_one_conflicted_listener_keeps_set_programmed() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-ls-conflict").await?;
+
+    fixtures::apply_fixture(gwa::LISTENERSET_CONFLICT, FixtureVars::new(&ns.name)).await?;
+
+    let api: Api<ListenerSet> = Api::namespaced(h.client.clone(), &ns.name);
+    let ls = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let observed = api.get("team-ls").await.ok().map_or_else(
+                || "<no ListenerSet>".to_string(),
+                |ls| {
+                    format!(
+                        "top Programmed={:?}, ls-conflict.Programmed={:?}, ls-ok.Programmed={:?}",
+                        ls_condition(&ls, "Programmed"),
+                        ls_listener_condition(&ls, "ls-conflict", "Programmed"),
+                        ls_listener_condition(&ls, "ls-ok", "Programmed"),
+                    )
+                },
+            );
+            format!(
+                "ListenerSet team-ls top Programmed=True with one conflicted + one programmed \
+                 listener; observed {observed}"
+            )
+        },
+        || async {
+            let ls = api.get("team-ls").await.ok()?;
+            // Top-level Programmed=True despite one losing listener.
+            let top = ls_condition(&ls, "Programmed")?;
+            // The survivor programs; the conflict-loser does not.
+            let ok = ls_listener_condition(&ls, "ls-ok", "Programmed")?;
+            let lost = ls_listener_condition(&ls, "ls-conflict", "Programmed")?;
+            (top == ("True".to_string(), "Programmed".to_string())
+                && ok.0 == "True"
+                && lost.0 == "False")
+                .then_some(ls)
+        },
+    )
+    .await?;
+
+    // The whole set is Accepted (not all listeners invalid), and the loser is
+    // marked Conflicted=True so operators can see WHY it did not program.
+    assert_eq!(
+        ls_condition(&ls, "Accepted"),
+        Some(("True".to_string(), "Accepted".to_string())),
+        "a ListenerSet with at least one valid listener must be Accepted=True"
+    );
+    assert_eq!(
+        ls_listener_condition(&ls, "ls-conflict", "Conflicted").map(|c| c.0),
+        Some("True".to_string()),
+        "the losing listener must report Conflicted=True"
+    );
+
+    Ok(())
+}
+
+/// GEP-1713: an HTTPRoute attached via `parentRef.kind: ListenerSet` must get its
+/// OWN parent-status entry, keyed by `kind: ListenerSet`, reporting `Accepted` and
+/// `ResolvedRefs`. Without it the route silently lacks status on the ListenerSet
+/// parent (the data plane routes, but the route object never reflects acceptance).
+#[tokio::test]
+async fn httproute_on_listenerset_reports_listenerset_parent_accepted() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-ls-routestatus").await?;
+
+    // ECHO backend so the route's backendRef resolves (ResolvedRefs=True).
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::LISTENERSET_BASIC, FixtureVars::new(&ns.name)).await?;
+
+    let api: Api<HttpRoute> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let observed = api.get("ls-route").await.ok().map_or_else(
+                || "<no HTTPRoute>".to_string(),
+                |r| {
+                    format!(
+                        "ListenerSet-parent Accepted={:?}, ResolvedRefs={:?}",
+                        route_listenerset_parent_condition(&r, "team-ls", "Accepted"),
+                        route_listenerset_parent_condition(&r, "team-ls", "ResolvedRefs"),
+                    )
+                },
+            );
+            format!(
+                "HTTPRoute ls-route to carry a kind=ListenerSet parent (team-ls) with \
+                 Accepted=True/ResolvedRefs=True; observed {observed}"
+            )
+        },
+        || async {
+            let r = api.get("ls-route").await.ok()?;
+            let accepted = route_listenerset_parent_condition(&r, "team-ls", "Accepted")?;
+            let resolved = route_listenerset_parent_condition(&r, "team-ls", "ResolvedRefs")?;
+            (accepted.0 == "True" && resolved.0 == "True").then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}

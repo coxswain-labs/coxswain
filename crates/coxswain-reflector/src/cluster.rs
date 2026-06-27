@@ -515,7 +515,7 @@ mod tests {
         let mut li = ListenerInfo::default();
         li.attached_routes = routes;
         li.hostname = String::new();
-        li.allows_all_namespaces = true;
+        li.route_namespaces = crate::status::RouteNamespaceSet::All;
         li.port = 80;
         listeners.insert(ListenerStatusKey::gateway("default"), li);
         let mut glh = GatewayListenerStatus::default();

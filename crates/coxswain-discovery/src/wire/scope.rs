@@ -37,7 +37,9 @@
 //! [`RoutingTable`]: coxswain_core::routing::RoutingTable
 //! [`Snapshot`]: crate::proto::v1::Snapshot
 
-use coxswain_core::listener_status::{ConflictReason, ListenerInfo, ListenerTlsOutcome};
+use coxswain_core::listener_status::{
+    ConflictReason, ListenerInfo, ListenerTlsOutcome, RouteNamespaceSet,
+};
 
 use crate::error::WireError;
 use crate::proto::v1 as p;
@@ -116,7 +118,14 @@ pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerI
     li.tls_outcome = tls_outcome;
     li.attached_routes = dto.attached_routes;
     li.hostname = dto.hostname.clone();
-    li.allows_all_namespaces = dto.allows_all_namespaces;
+    // Lossy inverse of `to_wire`: a non-all listener becomes `Only({})` (deny all,
+    // fail closed). The proxy never reads this for routing, so loss is harmless;
+    // the reflector always holds the full resolved set in-process.
+    li.route_namespaces = if dto.allows_all_namespaces {
+        RouteNamespaceSet::All
+    } else {
+        RouteNamespaceSet::Only(std::collections::BTreeSet::new())
+    };
     li.port = dto.port as u16;
     li.internal_port = dto.internal_port as u16;
     li.conflict = if dto.protocol_conflict {

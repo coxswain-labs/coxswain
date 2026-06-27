@@ -203,6 +203,7 @@ pub(super) fn build_gateway_routes(
                         hostname: l.hostname.clone().unwrap_or_default(),
                         port: spec_port,
                         bind_port,
+                        route_namespaces: l.route_namespaces.clone(),
                     };
                     (key, binding)
                 })
@@ -708,7 +709,7 @@ pub(super) fn count_attached_routes<R: RouteLike>(
                     let Some(info) = health.listeners.get_mut(&key) else {
                         continue;
                     };
-                    if ref_ns != route_ns && !info.allows_all_namespaces {
+                    if !info.route_namespaces.allows(route_ns) {
                         continue;
                     }
                     if let Some(port) = pr.port
@@ -738,7 +739,7 @@ pub(super) fn count_attached_routes<R: RouteLike>(
                         {
                             continue;
                         }
-                        if ref_ns != route_ns && !info.allows_all_namespaces {
+                        if !info.route_namespaces.allows(route_ns) {
                             continue;
                         }
                         if !listener_accepts(info) {
@@ -816,17 +817,17 @@ pub(super) fn build_passthrough_routes(
                 .copied()
                 .unwrap_or(listener_port);
             let listener_hostname = listener.hostname.as_deref().unwrap_or("");
-            let allows_all_ns = listener.allows_all_namespaces;
-            // `from: Same` is relative to the resource that declared the listener:
-            // the Gateway's namespace for a Gateway listener, the ListenerSet's
-            // namespace for a ListenerSet listener.
-            let owning_ns = listener.owning_namespace.as_str();
+            // `allowedRoutes.namespaces` is resolved to a concrete namespace set at
+            // merge time (`from: Same` → the declaring resource's namespace,
+            // `Selector` → matched namespaces, `All` → any); the attach is a pure
+            // membership check here (GEP-1713).
+            let route_namespaces = &listener.route_namespaces;
             let source = &listener.source;
 
             for route in &tls_routes {
                 let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
 
-                if !allows_all_ns && route_ns != owning_ns {
+                if !route_namespaces.allows(route_ns) {
                     continue;
                 }
 
@@ -1234,7 +1235,7 @@ mod tests {
                 passthrough: true,
                 certificate_refs: vec![],
             }),
-            allows_all_namespaces: false,
+            route_namespaces: crate::status::RouteNamespaceSet::All,
             allowed_route_kinds: vec![],
             conflict: crate::status::ConflictReason::HostnameConflict,
         };

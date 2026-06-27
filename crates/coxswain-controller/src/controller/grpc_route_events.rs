@@ -3,11 +3,11 @@
 //! Sibling of `route_events.rs` — forked for the `GRPCRoute` concrete type per the
 //! no-generic-reconciler constraint in issue #33.
 
-use super::conditions::make_condition;
-use coxswain_core::ownership::{self, ObjectKey};
+use super::conditions::{make_condition, route_parent_gets_status};
+use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::{
     GrpcRoute,
-    v::grpcroutes::{GrpcRouteParentRefs, GrpcRouteStatusParents, GrpcRouteStatusParentsParentRef},
+    v::grpcroutes::{GrpcRouteStatusParents, GrpcRouteStatusParentsParentRef},
 };
 use coxswain_reflector::keys::RouteParentKey;
 use coxswain_reflector::status::{RouteParentStatus, RouteStatusMap};
@@ -35,12 +35,6 @@ pub(super) async fn mark_grpc_route_programmed(
         _ => return,
     };
 
-    let owned_refs = filter_owned_grpc_parent_refs(parent_refs, ns, owned_gateways);
-    if owned_refs.is_empty() {
-        tracing::debug!(name, ns, "Skipping status patch — no owned parentRefs");
-        return;
-    }
-
     let api: Api<GrpcRoute> = Api::namespaced(client.clone(), ns);
     let now = Time(k8s_openapi::jiff::Timestamp::now());
     let Some(observed_gen) = route.metadata.generation else {
@@ -53,13 +47,26 @@ pub(super) async fn mark_grpc_route_programmed(
     };
 
     let default_status = RouteParentStatus::default();
-    let parents: Vec<GrpcRouteStatusParents> = owned_refs
+    let parents: Vec<GrpcRouteStatusParents> = parent_refs
         .iter()
-        .map(|p| {
+        .filter_map(|p| {
             let gw_ns = p.namespace.as_deref().unwrap_or(ns);
             let section = p.section_name.as_deref().unwrap_or("").to_string();
             let health_key = RouteParentKey::new(ns, name, gw_ns, &p.name, section);
-            let health = route_status.get(&health_key).unwrap_or(&default_status);
+            let health_entry = route_status.get(&health_key);
+            // Ownership gate (GEP-1713) — see `conditions::route_parent_gets_status`.
+            if !route_parent_gets_status(
+                p.group.as_deref(),
+                p.kind.as_deref(),
+                p.namespace.as_deref(),
+                &p.name,
+                ns,
+                owned_gateways,
+                health_entry.is_some(),
+            ) {
+                return None;
+            }
+            let health = health_entry.unwrap_or(&default_status);
 
             let (acc_status, acc_reason) = if health.accepted {
                 ("True", health.accepted_reason)
@@ -102,7 +109,7 @@ pub(super) async fn mark_grpc_route_programmed(
                 now.clone(),
             );
 
-            GrpcRouteStatusParents {
+            Some(GrpcRouteStatusParents {
                 controller_name: controller_name.to_string(),
                 parent_ref: GrpcRouteStatusParentsParentRef {
                     group: p.group.clone(),
@@ -113,9 +120,14 @@ pub(super) async fn mark_grpc_route_programmed(
                     section_name: p.section_name.clone(),
                 },
                 conditions: vec![accepted_cond, programmed_cond, resolved_refs_cond],
-            }
+            })
         })
         .collect();
+
+    if parents.is_empty() {
+        tracing::debug!(name, ns, "Skipping status patch — no owned parentRefs");
+        return;
+    }
 
     if route_status_unchanged(
         &parents,
@@ -139,27 +151,6 @@ pub(super) async fn mark_grpc_route_programmed(
         Ok(_) => tracing::info!(name, ns, "GrpcRoute programmed"),
         Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch GrpcRoute status"),
     }
-}
-
-fn filter_owned_grpc_parent_refs(
-    parent_refs: &[GrpcRouteParentRefs],
-    default_ns: &str,
-    owned_gateways: &HashSet<ObjectKey>,
-) -> Vec<GrpcRouteParentRefs> {
-    parent_refs
-        .iter()
-        .filter(|p| {
-            ownership::parent_ref_owned(
-                p.group.as_deref(),
-                p.kind.as_deref(),
-                p.namespace.as_deref(),
-                &p.name,
-                default_ns,
-                owned_gateways,
-            )
-        })
-        .cloned()
-        .collect()
 }
 
 fn route_status_unchanged(

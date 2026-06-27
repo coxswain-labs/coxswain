@@ -115,7 +115,11 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         tls_message: message,
         attached_routes: info.attached_routes,
         hostname: info.hostname.clone(),
-        allows_all_namespaces: info.allows_all_namespaces,
+        // Lossy by design: the proxy never matches namespaces (it gets a pre-built
+        // routing table), so the wire carries only the "all" bit. The reflector
+        // holds the full resolved `RouteNamespaceSet` in-process and never
+        // reconstructs it from the wire.
+        allows_all_namespaces: info.route_namespaces.is_all(),
         port: u32::from(info.port),
         internal_port: u32::from(info.internal_port),
         conflicted: info.conflict.is_conflicted(),
@@ -200,6 +204,7 @@ fn listener_status_from_dto(dto: &p::ListenerStatus) -> Result<GatewayListenerSt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coxswain_core::listener_status::RouteNamespaceSet;
 
     // ── Listener health round-trip ────────────────────────────────────────────
 
@@ -221,7 +226,7 @@ mod tests {
         https_info.tls_outcome = ListenerTlsOutcome::Resolved;
         https_info.attached_routes = 5;
         https_info.hostname = "example.com".to_string();
-        https_info.allows_all_namespaces = true;
+        https_info.route_namespaces = RouteNamespaceSet::All;
         https_info.port = 443;
         // Shared-mode per-Gateway addressing (#472): advertised :443 binds an
         // allocated internal targetPort — it must survive the wire round-trip so

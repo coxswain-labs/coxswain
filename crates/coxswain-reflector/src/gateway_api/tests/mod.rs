@@ -51,6 +51,9 @@ pub(super) fn make_listener_info(
                     port: *port,
                     // Tests don't allocate internal ports; bind == spec.
                     bind_port: *port,
+                    // Helper-built listeners admit any namespace; tests that exercise
+                    // namespace scoping construct bindings explicitly.
+                    route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
                 },
             )
         })

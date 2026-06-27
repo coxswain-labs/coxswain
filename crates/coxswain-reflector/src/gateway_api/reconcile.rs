@@ -793,7 +793,7 @@ impl GatewayApiReconciler {
             li.tls_outcome = tls_outcome;
             li.attached_routes = 0;
             li.hostname = listener.hostname.clone().unwrap_or_default();
-            li.allows_all_namespaces = listener.allows_all_namespaces;
+            li.route_namespaces = listener.route_namespaces.clone();
             li.port = listener_port;
             li.internal_port = internal_port;
             li.conflict = listener.conflict.clone();
@@ -992,7 +992,7 @@ mod tests {
                     namespace: Some("certs".to_string()),
                 }],
             }),
-            allows_all_namespaces: false,
+            route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
             allowed_route_kinds: vec![],
             conflict: ConflictReason::None,
         };

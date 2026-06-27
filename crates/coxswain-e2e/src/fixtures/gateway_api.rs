@@ -69,6 +69,10 @@ pub const LISTENERSET_OPT_OUT: &str = fixture!("listenerset_opt_out.yaml");
 /// GEP-1713: a Gateway listener and a ListenerSet listener share the name "web"
 /// on different ports; both must program (provenance-keyed health).
 pub const LISTENERSET_DUPLICATE_NAME: &str = fixture!("listenerset_duplicate_name.yaml");
+/// GEP-1713 conflict-with-survivor: a ListenerSet with one listener that loses a
+/// hostname conflict to the parent Gateway and one that programs cleanly. The
+/// set must stay `Accepted=True`/`Programmed=True` despite the losing listener.
+pub const LISTENERSET_CONFLICT: &str = fixture!("listenerset_conflict.yaml");
 /// HTTPRoute backend using `kubernetes.io/h2c` app protocol.
 pub const GATEWAY_APP_PROTOCOL_H2C: &str = fixture!("gateway_app_protocol_h2c.yaml");
 /// BackendTLSPolicy test: Gateway + HTTPRoute + ConfigMap CA + policy targeting the TLS echo Service.

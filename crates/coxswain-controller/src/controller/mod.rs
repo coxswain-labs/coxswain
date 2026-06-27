@@ -826,7 +826,12 @@ async fn reconcile_listenerset_inner(ls: &ListenerSet, ctx: &ReconcileContext) -
     let health_map = ctx.listener_status.load();
     let parent_health = health_map.get(&parent_key);
     let accepted = listenerset_status::listenerset_accepted(ls, parent_health);
-    if listenerset_status::listenerset_needs_status_patch(ls, parent_health, accepted) {
+    if listenerset_status::listenerset_needs_status_patch(
+        ls,
+        parent_health,
+        accepted,
+        ctx.ingress_ports,
+    ) {
         listenerset_events::patch_listenerset_status(
             &ctx.client,
             ls,

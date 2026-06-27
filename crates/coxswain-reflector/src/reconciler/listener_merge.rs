@@ -24,7 +24,7 @@ use crate::gw_types::v::gateways::{
     Gateway, GatewayAllowedListenersNamespacesFrom, GatewayListeners, GatewayListenersTlsMode,
 };
 use crate::gw_types::v::listenersets::{ListenerSetListeners, ListenerSetListenersTlsMode};
-use crate::status::{ConflictReason, ListenerSource};
+use crate::status::{ConflictReason, ListenerSource, RouteNamespaceSet};
 use coxswain_core::ownership::ObjectKey;
 
 /// One normalised `certificateRefs` entry (Gateway/ListenerSet share the shape).
@@ -72,9 +72,9 @@ pub(crate) struct EffectiveListener {
     pub hostname: Option<String>,
     /// TLS config when `protocol` is `HTTPS`/`TLS`.
     pub tls: Option<EffectiveTls>,
-    /// Whether routes from any namespace may attach (`allowedRoutes.namespaces.from`
-    /// is anything other than `Same`); mirrors the existing simplified model.
-    pub allows_all_namespaces: bool,
+    /// Resolved `allowedRoutes.namespaces` policy (`from` + `selector`), resolved
+    /// against the cluster Namespace store at merge time — see [`RouteNamespaceSet`].
+    pub route_namespaces: RouteNamespaceSet,
     /// `allowedRoutes.kinds` as `(group, kind)` pairs (empty = use the protocol
     /// default). Carried so route-health can compute per-listener `allows_kind`
     /// for routes attached via this listener (GEP-1713).
@@ -123,7 +123,7 @@ pub(crate) fn merge_effective_gateways(
             .spec
             .listeners
             .iter()
-            .map(|l| from_gateway_listener(l, &ns))
+            .map(|l| from_gateway_listener(l, &ns, namespaces))
             .collect();
         effective.insert(
             key,
@@ -173,8 +173,12 @@ pub(crate) fn merge_effective_gateways(
             let ls_obj_key = ls_object_key(&ls);
             let ls_ns = ls.metadata.namespace.clone().unwrap_or_default();
             for l in &ls.spec.listeners {
-                eff.listeners
-                    .push(from_listenerset_listener(l, &ls_ns, &ls_obj_key));
+                eff.listeners.push(from_listenerset_listener(
+                    l,
+                    &ls_ns,
+                    &ls_obj_key,
+                    namespaces,
+                ));
             }
         }
     }
@@ -341,13 +345,14 @@ fn namespace_labels(
         .unwrap_or_default()
 }
 
-/// Evaluate a Kubernetes label selector (`matchLabels` ANDed with
-/// `matchExpressions`) against a label set. An empty selector matches everything.
-fn selector_matches(
+/// Evaluate a Kubernetes label selector against a label set, on already-normalised
+/// `matchExpressions` (`(key, operator, values)` tuples) ANDed with `matchLabels`.
+/// An empty selector matches everything. Codegen produces a distinct selector type
+/// per call site (Gateway `allowedListeners`, Gateway/ListenerSet `allowedRoutes`),
+/// so callers normalise into this one evaluator.
+fn labels_match_selector(
     match_labels: Option<&std::collections::BTreeMap<String, String>>,
-    match_expressions: Option<
-        &[crate::gw_types::v::gateways::GatewayAllowedListenersNamespacesSelectorMatchExpressions],
-    >,
+    match_expressions: &[(&str, &str, &[String])],
     labels: &std::collections::BTreeMap<String, String>,
 ) -> bool {
     if let Some(ml) = match_labels {
@@ -357,10 +362,9 @@ fn selector_matches(
             }
         }
     }
-    for expr in match_expressions.unwrap_or(&[]) {
-        let present = labels.get(&expr.key);
-        let values = expr.values.as_deref().unwrap_or(&[]);
-        let ok = match expr.operator.as_str() {
+    for (key, operator, values) in match_expressions {
+        let present = labels.get(*key);
+        let ok = match *operator {
             "In" => present.is_some_and(|v| values.iter().any(|x| x == v)),
             "NotIn" => present.is_none_or(|v| !values.iter().any(|x| x == v)),
             "Exists" => present.is_some(),
@@ -375,8 +379,74 @@ fn selector_matches(
     true
 }
 
+/// Evaluate a Gateway `allowedListeners` namespace selector against a label set.
+fn selector_matches(
+    match_labels: Option<&std::collections::BTreeMap<String, String>>,
+    match_expressions: Option<
+        &[crate::gw_types::v::gateways::GatewayAllowedListenersNamespacesSelectorMatchExpressions],
+    >,
+    labels: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    let exprs: Vec<(&str, &str, &[String])> = match_expressions
+        .unwrap_or(&[])
+        .iter()
+        .map(|e| {
+            (
+                e.key.as_str(),
+                e.operator.as_str(),
+                e.values.as_deref().unwrap_or(&[]),
+            )
+        })
+        .collect();
+    labels_match_selector(match_labels, &exprs, labels)
+}
+
+/// Normalised `allowedRoutes.namespaces.from` (Gateway and ListenerSet share these
+/// three values; unlike `allowedListeners` there is no `None`, and absent → `Same`).
+enum RouteNsFrom {
+    All,
+    Same,
+    Selector,
+}
+
+/// Resolve an `allowedRoutes.namespaces` policy to a concrete [`RouteNamespaceSet`]
+/// against the cluster Namespace store. `Selector` is materialised to the set of
+/// matching namespace names NOW; a later namespace label change re-drives the merge
+/// (the Namespace reflector is a rebuild trigger), so the set stays current.
+fn resolve_route_namespaces(
+    from: RouteNsFrom,
+    match_labels: Option<&std::collections::BTreeMap<String, String>>,
+    match_expressions: &[(&str, &str, &[String])],
+    owning_ns: &str,
+    namespaces: &reflector::Store<Namespace>,
+) -> RouteNamespaceSet {
+    match from {
+        RouteNsFrom::All => RouteNamespaceSet::All,
+        RouteNsFrom::Same => {
+            RouteNamespaceSet::Only(std::iter::once(owning_ns.to_string()).collect())
+        }
+        RouteNsFrom::Selector => {
+            let mut set = std::collections::BTreeSet::new();
+            for ns in namespaces.state() {
+                let Some(name) = ns.metadata.name.as_deref() else {
+                    continue;
+                };
+                let labels = ns.metadata.labels.clone().unwrap_or_default();
+                if labels_match_selector(match_labels, match_expressions, &labels) {
+                    set.insert(name.to_string());
+                }
+            }
+            RouteNamespaceSet::Only(set)
+        }
+    }
+}
+
 /// Normalise a Gateway's own listener.
-fn from_gateway_listener(l: &GatewayListeners, gw_ns: &str) -> EffectiveListener {
+fn from_gateway_listener(
+    l: &GatewayListeners,
+    gw_ns: &str,
+    namespaces: &reflector::Store<Namespace>,
+) -> EffectiveListener {
     let tls = l.tls.as_ref().map(|t| EffectiveTls {
         passthrough: matches!(t.mode, Some(GatewayListenersTlsMode::Passthrough)),
         certificate_refs: t
@@ -400,7 +470,7 @@ fn from_gateway_listener(l: &GatewayListeners, gw_ns: &str) -> EffectiveListener
         protocol: l.protocol.clone(),
         hostname: l.hostname.clone(),
         tls,
-        allows_all_namespaces: gw_allows_all_namespaces(l),
+        route_namespaces: gw_route_namespaces(l, gw_ns, namespaces),
         allowed_route_kinds: l
             .allowed_routes
             .as_ref()
@@ -422,6 +492,7 @@ fn from_listenerset_listener(
     l: &ListenerSetListeners,
     ls_ns: &str,
     ls_key: &ObjectKey,
+    namespaces: &reflector::Store<Namespace>,
 ) -> EffectiveListener {
     let tls = l.tls.as_ref().map(|t| EffectiveTls {
         passthrough: matches!(t.mode, Some(ListenerSetListenersTlsMode::Passthrough)),
@@ -446,7 +517,7 @@ fn from_listenerset_listener(
         protocol: l.protocol.clone(),
         hostname: l.hostname.clone(),
         tls,
-        allows_all_namespaces: ls_allows_all_namespaces(l),
+        route_namespaces: ls_route_namespaces(l, ls_ns, namespaces),
         allowed_route_kinds: l
             .allowed_routes
             .as_ref()
@@ -462,24 +533,71 @@ fn from_listenerset_listener(
     }
 }
 
-/// `allowedRoutes.namespaces.from` is anything other than `Same` (Gateway side).
-fn gw_allows_all_namespaces(l: &GatewayListeners) -> bool {
+/// Resolve a Gateway listener's `allowedRoutes.namespaces` to a [`RouteNamespaceSet`].
+fn gw_route_namespaces(
+    l: &GatewayListeners,
+    gw_ns: &str,
+    namespaces: &reflector::Store<Namespace>,
+) -> RouteNamespaceSet {
     use crate::gw_types::v::gateways::GatewayListenersAllowedRoutesNamespacesFrom as F;
-    l.allowed_routes
+    let cfg = l
+        .allowed_routes
         .as_ref()
-        .and_then(|ar| ar.namespaces.as_ref())
-        .and_then(|ns| ns.from.as_ref())
-        .is_some_and(|f| !matches!(f, F::Same))
+        .and_then(|ar| ar.namespaces.as_ref());
+    let from = match cfg.and_then(|ns| ns.from.as_ref()) {
+        Some(F::All) => RouteNsFrom::All,
+        Some(F::Selector) => RouteNsFrom::Selector,
+        // `Some(Same)` or absent → `Same` (the Gateway API default).
+        _ => RouteNsFrom::Same,
+    };
+    let selector = cfg.and_then(|ns| ns.selector.as_ref());
+    let match_labels = selector.and_then(|s| s.match_labels.as_ref());
+    let exprs: Vec<(&str, &str, &[String])> = selector
+        .and_then(|s| s.match_expressions.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .map(|e| {
+            (
+                e.key.as_str(),
+                e.operator.as_str(),
+                e.values.as_deref().unwrap_or(&[]),
+            )
+        })
+        .collect();
+    resolve_route_namespaces(from, match_labels, &exprs, gw_ns, namespaces)
 }
 
-/// `allowedRoutes.namespaces.from` is anything other than `Same` (ListenerSet side).
-fn ls_allows_all_namespaces(l: &ListenerSetListeners) -> bool {
+/// Resolve a ListenerSet listener's `allowedRoutes.namespaces` to a [`RouteNamespaceSet`].
+fn ls_route_namespaces(
+    l: &ListenerSetListeners,
+    ls_ns: &str,
+    namespaces: &reflector::Store<Namespace>,
+) -> RouteNamespaceSet {
     use crate::gw_types::v::listenersets::ListenerSetListenersAllowedRoutesNamespacesFrom as F;
-    l.allowed_routes
+    let cfg = l
+        .allowed_routes
         .as_ref()
-        .and_then(|ar| ar.namespaces.as_ref())
-        .and_then(|ns| ns.from.as_ref())
-        .is_some_and(|f| !matches!(f, F::Same))
+        .and_then(|ar| ar.namespaces.as_ref());
+    let from = match cfg.and_then(|ns| ns.from.as_ref()) {
+        Some(F::All) => RouteNsFrom::All,
+        Some(F::Selector) => RouteNsFrom::Selector,
+        _ => RouteNsFrom::Same,
+    };
+    let selector = cfg.and_then(|ns| ns.selector.as_ref());
+    let match_labels = selector.and_then(|s| s.match_labels.as_ref());
+    let exprs: Vec<(&str, &str, &[String])> = selector
+        .and_then(|s| s.match_expressions.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .map(|e| {
+            (
+                e.key.as_str(),
+                e.operator.as_str(),
+                e.values.as_deref().unwrap_or(&[]),
+            )
+        })
+        .collect();
+    resolve_route_namespaces(from, match_labels, &exprs, ls_ns, namespaces)
 }
 
 /// Flag listeners that are incompatible with a higher-precedence listener on the
@@ -523,7 +641,8 @@ fn flag_conflicts(listeners: &mut [EffectiveListener]) {
 mod tests {
     use super::*;
     use crate::gw_types::v::gateways::{
-        GatewayAllowedListeners, GatewayAllowedListenersNamespaces, GatewaySpec,
+        GatewayAllowedListeners, GatewayAllowedListenersNamespaces,
+        GatewayListenersAllowedRoutesNamespacesFrom, GatewaySpec,
     };
     use crate::gw_types::v::listenersets::{ListenerSetParentRef, ListenerSetSpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
@@ -626,6 +745,85 @@ mod tests {
 
     fn empty_ns_store() -> reflector::Store<Namespace> {
         reflector::store::<Namespace>().0
+    }
+
+    /// A populated Namespace store: `(name, &[(label_key, label_val)])`.
+    fn ns_store_with(specs: &[(&str, &[(&str, &str)])]) -> reflector::Store<Namespace> {
+        let (reader, mut writer) = reflector::store::<Namespace>();
+        for (name, labels) in specs {
+            let ns = Namespace {
+                metadata: ObjectMeta {
+                    name: Some((*name).to_string()),
+                    labels: Some(
+                        labels
+                            .iter()
+                            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                            .collect(),
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            writer.apply_watcher_event(&kube::runtime::watcher::Event::Apply(ns));
+        }
+        reader
+    }
+
+    /// Build a Gateway listener with `allowedRoutes.namespaces.{from,selector}`.
+    fn gw_listener_with_ns(
+        name: &str,
+        from: GatewayListenersAllowedRoutesNamespacesFrom,
+        match_label: Option<(&str, &str)>,
+    ) -> GatewayListeners {
+        use crate::gw_types::v::gateways::{
+            GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesNamespaces,
+            GatewayListenersAllowedRoutesNamespacesSelector,
+        };
+        let selector = match_label.map(|(k, v)| GatewayListenersAllowedRoutesNamespacesSelector {
+            match_labels: Some(std::iter::once((k.to_string(), v.to_string())).collect()),
+            match_expressions: None,
+        });
+        GatewayListeners {
+            allowed_routes: Some(GatewayListenersAllowedRoutes {
+                namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+                    from: Some(from),
+                    selector,
+                }),
+                kinds: None,
+            }),
+            ..gw_listener(name, 80, "HTTP", None)
+        }
+    }
+
+    #[test]
+    fn gw_route_namespaces_resolves_same_all_selector() {
+        use crate::gw_types::v::gateways::GatewayListenersAllowedRoutesNamespacesFrom as F;
+        let store = ns_store_with(&[("team-a", &[("team", "a")]), ("team-b", &[("team", "b")])]);
+
+        // Absent `allowedRoutes` → Same (the Gateway API default) → only the owner ns.
+        assert_eq!(
+            gw_route_namespaces(&gw_listener("l", 80, "HTTP", None), "gw-ns", &store),
+            RouteNamespaceSet::Only(std::iter::once("gw-ns".to_string()).collect()),
+        );
+        // `from: All` → every namespace.
+        assert_eq!(
+            gw_route_namespaces(&gw_listener_with_ns("l", F::All, None), "gw-ns", &store),
+            RouteNamespaceSet::All,
+        );
+        // `from: Same` → only the declaring (owner) namespace.
+        assert_eq!(
+            gw_route_namespaces(&gw_listener_with_ns("l", F::Same, None), "gw-ns", &store),
+            RouteNamespaceSet::Only(std::iter::once("gw-ns".to_string()).collect()),
+        );
+        // `from: Selector team=a` → only the matching namespace (NOT all — the bug).
+        assert_eq!(
+            gw_route_namespaces(
+                &gw_listener_with_ns("l", F::Selector, Some(("team", "a"))),
+                "gw-ns",
+                &store,
+            ),
+            RouteNamespaceSet::Only(std::iter::once("team-a".to_string()).collect()),
+        );
     }
 
     fn names(eff: &EffectiveGateway) -> Vec<(ListenerSource, String, bool)> {
