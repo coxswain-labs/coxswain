@@ -23,9 +23,14 @@ use tokio::sync::watch;
 /// programmed — so per-listener health is keyed by source+name (see [`ListenerHealthKey`])
 /// rather than name alone. The source also lets the controller attribute each
 /// per-listener status back to the resource that declared it.
-// intentionally open: constructed via literal by the reflector merge and the
-// controller status writer, and matched exhaustively in both — a third origin
-// would be a deliberate, breaking model change, not a silently-added variant.
+///
+/// This is deliberately a closed two-variant enum: it is constructed via literal
+/// by the reflector merge and the controller status writer and matched
+/// exhaustively in both, so a third origin would be a deliberate, breaking model
+/// change — never a silently-added variant. Hence the `// intentionally open:`
+/// opt-out below rather than `#[non_exhaustive]` (which would force wildcard arms
+/// and defeat the cross-crate exhaustiveness this relies on).
+// intentionally open: closed enum matched exhaustively cross-crate; see doc above.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ListenerSource {
     /// Declared in the parent Gateway's own `spec.listeners`.
@@ -41,8 +46,7 @@ pub enum ListenerSource {
 /// (Gateway before ListenerSet, then by [`ObjectKey`], then by name) only fixes a
 /// deterministic map/wire iteration order — it is **not** the GEP-1713 merge
 /// precedence (creationTimestamp-first), which is computed explicitly in the merge.
-// intentionally open: constructed via field literal at every producer and lookup
-// site; it carries no invariant a constructor would need to enforce.
+// intentionally open: constructed via field literal at every producer/lookup site; no invariant to enforce.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ListenerHealthKey {
     /// The resource that declared this listener.

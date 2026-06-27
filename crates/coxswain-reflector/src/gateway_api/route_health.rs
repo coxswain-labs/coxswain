@@ -92,11 +92,12 @@ pub(super) fn compute_route_health<R: RouteLike>(
     routes: &[Arc<R>],
     gateways: &[Arc<Gateway>],
     owned_gateways: &HashSet<ObjectKey>,
+    effective: &HashMap<ObjectKey, super::super::reconciler::listener_merge::EffectiveGateway>,
     backend_grants: &HashSet<ReferenceGrantKey>,
     service_store: &reflector::Store<Service>,
     route_kind: &str,
 ) -> RouteHealthMap {
-    let gw_listeners: HashMap<ObjectKey, Vec<ListenerEntry>> = gateways
+    let mut gw_listeners: HashMap<ObjectKey, Vec<ListenerEntry>> = gateways
         .iter()
         .filter_map(|gw| {
             let ns = gw.metadata.namespace.as_deref()?.to_string();
@@ -139,6 +140,33 @@ pub(super) fn compute_route_health<R: RouteLike>(
         })
         .collect();
 
+    // GEP-1713: a route may target a ListenerSet directly (`parentRef.kind:
+    // ListenerSet`). Add each ListenerSet's listeners under the ListenerSet's own
+    // key (mirroring the routing-key provenance) so an LS parentRef resolves to its
+    // listeners, and record those keys as valid parents.
+    let mut ls_keys: HashSet<ObjectKey> = HashSet::new();
+    for eff in effective.values() {
+        for l in &eff.listeners {
+            let crate::tls::ListenerSource::ListenerSet(ls_key) = &l.source else {
+                continue;
+            };
+            let allows_kind = if l.allowed_route_kinds.is_empty() {
+                implicit_allows_kind(&l.protocol, route_kind)
+            } else {
+                l.allowed_route_kinds.iter().any(|(_, k)| k == route_kind)
+            };
+            let entry = ListenerEntry {
+                name: l.name.clone(),
+                hostname: l.hostname.clone().unwrap_or_default(),
+                allows_all: l.allows_all_namespaces,
+                port: l.port as u16,
+                allows_kind,
+            };
+            ls_keys.insert(ls_key.clone());
+            gw_listeners.entry(ls_key.clone()).or_default().push(entry);
+        }
+    }
+
     let mut map = RouteHealthMap::new();
 
     for route in routes {
@@ -152,7 +180,10 @@ pub(super) fn compute_route_health<R: RouteLike>(
             let gw_name = pr.name;
             let gw_key = ObjectKey::new(gw_ns, gw_name);
 
-            if !owned_gateways.contains(&gw_key) {
+            // The parentRef target is valid when it is an owned Gateway or a
+            // ListenerSet attached to one (GEP-1713). For a `kind: ListenerSet`
+            // parentRef, `gw_key` is the ListenerSet's key.
+            if !owned_gateways.contains(&gw_key) && !ls_keys.contains(&gw_key) {
                 continue;
             }
 

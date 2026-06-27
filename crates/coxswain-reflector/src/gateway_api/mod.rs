@@ -47,10 +47,14 @@ pub struct GatewayApiReconciler;
 impl GatewayApiReconciler {
     /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` health from
     /// the current snapshot of reflector stores.
-    pub fn compute_route_health(
+    pub(crate) fn compute_route_health(
         routes: &[Arc<HttpRoute>],
         gateways: &[Arc<Gateway>],
         owned_gateways: &HashSet<ObjectKey>,
+        effective: &std::collections::HashMap<
+            ObjectKey,
+            crate::reconciler::listener_merge::EffectiveGateway,
+        >,
         backend_grants: &HashSet<ReferenceGrantKey>,
         service_store: &reflector::Store<Service>,
     ) -> RouteHealthMap {
@@ -58,6 +62,7 @@ impl GatewayApiReconciler {
             routes,
             gateways,
             owned_gateways,
+            effective,
             backend_grants,
             service_store,
             "HTTPRoute",
@@ -118,10 +123,14 @@ impl GrpcRouteReconciler {
     /// Returns an [`RouteHealthMap`] keyed by [`crate::keys::RouteParentKey`] — the map
     /// type is kind-neutral. Use a **separate** `SharedRouteHealth` instance for grpc health
     /// to avoid `RouteParentKey` collisions with HTTPRoute health (same key shape, different kind).
-    pub fn compute_route_health(
+    pub(crate) fn compute_route_health(
         routes: &[Arc<GrpcRoute>],
         gateways: &[Arc<Gateway>],
         owned_gateways: &HashSet<ObjectKey>,
+        effective: &std::collections::HashMap<
+            ObjectKey,
+            crate::reconciler::listener_merge::EffectiveGateway,
+        >,
         backend_grants: &HashSet<ReferenceGrantKey>,
         service_store: &reflector::Store<Service>,
     ) -> RouteHealthMap {
@@ -129,6 +138,7 @@ impl GrpcRouteReconciler {
             routes,
             gateways,
             owned_gateways,
+            effective,
             backend_grants,
             service_store,
             "GRPCRoute",
@@ -151,10 +161,14 @@ impl TlsRouteReconciler {
     /// listeners receive `Accepted=False, NotAllowedByListeners`. Use a **separate**
     /// [`crate::tls::SharedRouteHealth`] instance to avoid key collisions with
     /// HTTP/GRPC route health (same key shape, different kind).
-    pub fn compute_route_health(
+    pub(crate) fn compute_route_health(
         routes: &[Arc<TlsRoute>],
         gateways: &[Arc<Gateway>],
         owned_gateways: &HashSet<ObjectKey>,
+        effective: &std::collections::HashMap<
+            ObjectKey,
+            crate::reconciler::listener_merge::EffectiveGateway,
+        >,
         backend_grants: &HashSet<ReferenceGrantKey>,
         service_store: &reflector::Store<Service>,
     ) -> RouteHealthMap {
@@ -162,6 +176,7 @@ impl TlsRouteReconciler {
             routes,
             gateways,
             owned_gateways,
+            effective,
             backend_grants,
             service_store,
             "TLSRoute",

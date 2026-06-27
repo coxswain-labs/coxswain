@@ -18,6 +18,7 @@
 use async_trait::async_trait;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
+use coxswain_reflector::gw_types::ListenerSet;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::gw_types::{BackendTlsPolicy, GrpcRoute, HttpRoute, TlsRoute};
@@ -57,6 +58,8 @@ mod grpc_route_events;
 mod ingress_event_recorder;
 mod ingress_events;
 mod ingress_status;
+mod listenerset_events;
+mod listenerset_status;
 mod route_events;
 mod tls_route_events;
 
@@ -192,6 +195,7 @@ impl Controller {
             ingress_classes,
             policies,
             tls_routes,
+            listener_sets,
             ..
         } = subs;
 
@@ -207,7 +211,9 @@ impl Controller {
         let ingresses_reader = ingresses.reader();
         let ingress_classes_reader = ingress_classes.reader();
         let policies_reader = policies.reader();
+        let listener_sets_reader = listener_sets.reader();
         let gateway_classes_for_gateways = gateway_classes.clone();
+        let gateways_for_listener_sets = gateways.clone();
 
         let ctx = Arc::new(ReconcileContext {
             client,
@@ -226,6 +232,7 @@ impl Controller {
             policy_health: self.channels.policy.clone(),
             gateway_classes: gateway_classes_reader,
             ingress_classes: ingress_classes_reader,
+            gateways: gateways_reader.clone(),
         });
 
         // One re-drive channel per work-queue. Each is fed by the relevant
@@ -240,6 +247,7 @@ impl Controller {
         let (tls_route_tx, tls_route_rx) = mpsc::unbounded::<()>();
         let (ing_tx, ing_rx) = mpsc::unbounded::<()>();
         let (pol_tx, pol_rx) = mpsc::unbounded::<()>();
+        let (ls_tx, ls_rx) = mpsc::unbounded::<()>();
         let leadership_txs = vec![
             gw_tx.clone(),
             gc_tx.clone(),
@@ -248,6 +256,7 @@ impl Controller {
             tls_route_tx.clone(),
             ing_tx.clone(),
             pol_tx.clone(),
+            ls_tx.clone(),
         ];
 
         let mut tasks = JoinSet::new();
@@ -284,6 +293,9 @@ impl Controller {
             tls_route_tx,
         );
         spawn_health_forwarder(&mut tasks, self.channels.policy.subscribe(), pol_tx);
+        // GEP-1713: a TLS-health flip changes which listeners (incl. ListenerSet
+        // ones) are programmed, so re-drive ListenerSet status off the same channel.
+        spawn_health_forwarder(&mut tasks, self.channels.tls.subscribe(), ls_tx);
 
         // --- Gateway: primary Gateway, secondary GatewayClass → Gateways in
         // that class, re-driven on TLS-health flips + promotion. ---
@@ -305,6 +317,34 @@ impl Controller {
             .reconcile_all_on(gw_rx)
             .run(reconcile_gateway, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, gateway_ctrl, "Gateway");
+
+        // --- ListenerSet: primary ListenerSet, secondary Gateway → its
+        // ListenerSets (a parent allowedListeners/listeners edit re-drives the
+        // attached ListenerSets), re-driven on TLS-health flips + promotion
+        // (GEP-1713). ---
+        let listenerset_ctrl =
+            KubeController::for_shared_stream(listener_sets, listener_sets_reader.clone())
+                .watches_shared_stream(gateways_for_listener_sets, {
+                    let ls_store = listener_sets_reader.clone();
+                    move |gw: Arc<Gateway>| -> Vec<ObjectRef<ListenerSet>> {
+                        let gw_ns = gw.meta().namespace.clone().unwrap_or_default();
+                        let gw_name = gw.meta().name.clone().unwrap_or_default();
+                        ls_store
+                            .state()
+                            .into_iter()
+                            .filter(|ls| {
+                                let ls_ns = ls.meta().namespace.clone().unwrap_or_default();
+                                let pr = &ls.spec.parent_ref;
+                                let pns = pr.namespace.clone().unwrap_or(ls_ns);
+                                pns == gw_ns && pr.name == gw_name
+                            })
+                            .map(|ls| ObjectRef::from_obj(ls.as_ref()))
+                            .collect()
+                    }
+                })
+                .reconcile_all_on(ls_rx)
+                .run(reconcile_listenerset, error_policy, ctx.clone());
+        spawn_controller_stream(&mut tasks, listenerset_ctrl, "ListenerSet");
 
         // --- GatewayClass: primary only; re-driven on promotion. ---
         let gateway_class_ctrl =
@@ -503,6 +543,9 @@ struct ReconcileContext {
     gateway_classes: kube::runtime::reflector::Store<GatewayClass>,
     /// Synced IngressClass store, read for Ingress ownership at reconcile time.
     ingress_classes: kube::runtime::reflector::Store<IngressClass>,
+    /// Synced Gateway store, read by the ListenerSet reconciler to resolve a
+    /// ListenerSet's parent Gateway and its ownership/mode (GEP-1713).
+    gateways: kube::runtime::reflector::Store<Gateway>,
 }
 
 /// Error policy shared by every work-queue. The status reconcilers are
@@ -731,6 +774,69 @@ fn service_vip_address(svc: &k8s_openapi::api::core::v1::Service) -> Option<Stat
             .map(StatusAddress::Ip),
         _ => None,
     }
+}
+
+async fn reconcile_listenerset(
+    ls: Arc<ListenerSet>,
+    ctx: Arc<ReconcileContext>,
+) -> Result<Action, Infallible> {
+    let started = std::time::Instant::now();
+    let res: Result<Action, Infallible> = Ok(reconcile_listenerset_inner(&ls, &ctx).await);
+    crate::metrics::observe_reconcile("status_writer", started, &res);
+    res
+}
+
+/// GEP-1713: write `ListenerSet.status`. Resolves the ListenerSet's parent Gateway
+/// and writes status only when this controller manages it (owned class) and it
+/// runs on the shared pool — a dedicated-mode Gateway (and its ListenerSets) is
+/// the operator's to write, mirroring [`reconcile_gateway_inner`]'s split.
+async fn reconcile_listenerset_inner(ls: &ListenerSet, ctx: &ReconcileContext) -> Action {
+    if !ctx.leader.load(Ordering::Acquire) {
+        return Action::requeue(NON_LEADER_REQUEUE);
+    }
+
+    let ls_ns = ls.metadata.namespace.as_deref().unwrap_or("default");
+    let parent = &ls.spec.parent_ref;
+    let parent_ns = parent.namespace.as_deref().unwrap_or(ls_ns);
+    let parent_key = ObjectKey::new(parent_ns, parent.name.as_str());
+
+    // Resolve the parent Gateway from the synced store (O(1)). Absent → not yet
+    // observed; the Gateway → ListenerSet secondary watch re-drives this once it lands.
+    let parent_ref = ObjectRef::<Gateway>::new(parent.name.as_str()).within(parent_ns);
+    let Some(parent_gw) = ctx.gateways.get(&parent_ref) else {
+        return Action::await_change();
+    };
+
+    let classes = ctx.gateway_classes.state();
+    let (owned, owned_dedicated) = classify_gateway_classes(&classes, &ctx.controller_name);
+    if !owned.contains(parent_gw.spec.gateway_class_name.as_str()) {
+        return Action::await_change();
+    }
+    if is_dedicated_mode(&parent_gw, &owned_dedicated) {
+        return Action::await_change();
+    }
+
+    if !ctx.health.is_subsystem_ready("controller") {
+        // Defer until the data plane has computed listener health; requeue rather
+        // than await_change so a fresh ListenerSet doesn't stall until an
+        // unrelated edit (mirrors the Gateway path's deferred-Programmed requeue).
+        return Action::requeue(DEFERRED_PROGRAMMED_REQUEUE);
+    }
+
+    let health_map = ctx.listener_health.load();
+    let parent_health = health_map.get(&parent_key);
+    let accepted = listenerset_status::listenerset_accepted(ls, parent_health);
+    if listenerset_status::listenerset_needs_status_patch(ls, parent_health, accepted) {
+        listenerset_events::patch_listenerset_status(
+            &ctx.client,
+            ls,
+            parent_health,
+            accepted,
+            ctx.ingress_ports,
+        )
+        .await;
+    }
+    Action::await_change()
 }
 
 async fn reconcile_gateway_class(

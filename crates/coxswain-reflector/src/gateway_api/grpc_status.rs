@@ -156,6 +156,7 @@ mod tests {
             &[route],
             &[gw],
             &owned,
+            &std::collections::HashMap::new(),
             &HashSet::<ReferenceGrantKey>::new(),
             &services,
             "GRPCRoute",

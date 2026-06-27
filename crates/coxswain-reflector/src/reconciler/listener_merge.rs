@@ -75,6 +75,10 @@ pub(crate) struct EffectiveListener {
     /// Whether routes from any namespace may attach (`allowedRoutes.namespaces.from`
     /// is anything other than `Same`); mirrors the existing simplified model.
     pub allows_all_namespaces: bool,
+    /// `allowedRoutes.kinds` as `(group, kind)` pairs (empty = use the protocol
+    /// default). Carried so route-health can compute per-listener `allows_kind`
+    /// for routes attached via this listener (GEP-1713).
+    pub allowed_route_kinds: Vec<(Option<String>, String)>,
     /// `true` when this listener lost a port-compatibility conflict to a
     /// higher-precedence listener and must NOT be programmed.
     pub conflicted: bool,
@@ -316,6 +320,17 @@ fn from_gateway_listener(l: &GatewayListeners, gw_ns: &str) -> EffectiveListener
         hostname: l.hostname.clone(),
         tls,
         allows_all_namespaces: gw_allows_all_namespaces(l),
+        allowed_route_kinds: l
+            .allowed_routes
+            .as_ref()
+            .and_then(|ar| ar.kinds.as_ref())
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .map(|k| (k.group.clone(), k.kind.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         conflicted: false,
     }
 }
@@ -351,6 +366,17 @@ fn from_listenerset_listener(
         hostname: l.hostname.clone(),
         tls,
         allows_all_namespaces: ls_allows_all_namespaces(l),
+        allowed_route_kinds: l
+            .allowed_routes
+            .as_ref()
+            .and_then(|ar| ar.kinds.as_ref())
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .map(|k| (k.group.clone(), k.kind.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         conflicted: false,
     }
 }

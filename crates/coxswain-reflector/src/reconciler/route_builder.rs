@@ -937,10 +937,16 @@ pub(super) fn build_passthrough_routes(
     }
 
     out.store(Arc::new(builder.build()));
+    // GEP-1713: ListenerSet TLS/Passthrough listener routing is not yet programmed
+    // (deferred with the passthrough-table build above), so pass no effective
+    // ListenerSet listeners here — an LS TLSRoute must not be marked Accepted while
+    // it cannot actually route. HTTP/GRPC route health does receive the effective set.
+    let no_effective = HashMap::new();
     TlsRouteReconciler::compute_route_health(
         &tls_routes,
         &gateways,
         owned_gateways,
+        &no_effective,
         backend_grants,
         stores.services,
     )

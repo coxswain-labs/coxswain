@@ -189,7 +189,15 @@ mod tests {
             .iter()
             .map(|(ns, name)| ObjectKey::new(*ns, *name))
             .collect();
-        compute_route_health(routes, gateways, &owned_set, grants, services, "HTTPRoute")
+        compute_route_health(
+            routes,
+            gateways,
+            &owned_set,
+            &std::collections::HashMap::new(),
+            grants,
+            services,
+            "HTTPRoute",
+        )
     }
 
     fn key(route_ns: &str, route_name: &str, gw_ns: &str, gw_name: &str) -> RouteParentKey {

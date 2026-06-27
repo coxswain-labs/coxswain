@@ -348,6 +348,8 @@ pub struct StatusSubscriptions {
     pub policies: ReflectHandle<BackendTlsPolicy>,
     /// Applied-`TLSRoute` stream + reader.
     pub tls_routes: ReflectHandle<TlsRoute>,
+    /// Applied-`ListenerSet` stream + reader (GEP-1713).
+    pub listener_sets: ReflectHandle<ListenerSet>,
 }
 
 /// Pre-created shared-store writers for the status-relevant types.
@@ -364,6 +366,7 @@ struct StatusStoreWriters {
     ingress_classes: reflector::store::Writer<IngressClass>,
     policies: reflector::store::Writer<BackendTlsPolicy>,
     tls_routes: reflector::store::Writer<TlsRoute>,
+    listener_sets: reflector::store::Writer<ListenerSet>,
 }
 
 impl SharedProxyReconciler {
@@ -410,6 +413,8 @@ impl SharedProxyReconciler {
             let (_, policies) =
                 reflector::store_shared::<BackendTlsPolicy>(STATUS_SUBSCRIBE_BUFFER);
             let (_, tls_routes) = reflector::store_shared::<TlsRoute>(STATUS_SUBSCRIBE_BUFFER);
+            let (_, listener_sets) =
+                reflector::store_shared::<ListenerSet>(STATUS_SUBSCRIBE_BUFFER);
             let subs = StatusSubscriptions {
                 gateways: gateways.subscribe().unwrap_or_else(|| {
                     panic!("invariant: store_shared writer must yield a Gateway subscriber")
@@ -437,6 +442,9 @@ impl SharedProxyReconciler {
                 tls_routes: tls_routes.subscribe().unwrap_or_else(|| {
                     panic!("invariant: store_shared writer must yield a TLSRoute subscriber")
                 }),
+                listener_sets: listener_sets.subscribe().unwrap_or_else(|| {
+                    panic!("invariant: store_shared writer must yield a ListenerSet subscriber")
+                }),
             };
             let writers = StatusStoreWriters {
                 gateways,
@@ -447,6 +455,7 @@ impl SharedProxyReconciler {
                 ingress_classes,
                 policies,
                 tls_routes,
+                listener_sets,
             };
             (Some(writers), Some(subs))
         } else {
@@ -880,6 +889,7 @@ async fn spawn_tasks(
         pre_gateway_classes,
         pre_policies,
         pre_tls_routes,
+        pre_listener_sets,
     ) = match status_writers {
         Some(w) => (
             Some(w.routes),
@@ -890,8 +900,9 @@ async fn spawn_tasks(
             Some(w.gateway_classes),
             Some(w.policies),
             Some(w.tls_routes),
+            Some(w.listener_sets),
         ),
-        None => (None, None, None, None, None, None, None, None),
+        None => (None, None, None, None, None, None, None, None, None),
     };
     let (route_reader, route_writer) = reader_writer::<HttpRoute>(pre_routes);
     let (grpc_route_reader, grpc_route_writer) = reader_writer::<GrpcRoute>(pre_grpc_routes);
@@ -913,7 +924,11 @@ async fn spawn_tasks(
     let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
     let (path_rewrite_reader, path_rewrite_writer) = reflector::store::<PathRewriteRegex>();
     let (tls_route_reader, tls_route_writer) = reader_writer::<TlsRoute>(pre_tls_routes);
-    let (listener_set_reader, listener_set_writer) = reflector::store::<ListenerSet>();
+    // ListenerSet is a status-relevant store: in the controller role its writer is
+    // the shared one pre-created in `new`, so the status-writer's subscription and
+    // the data-plane reader observe the same synced store (GEP-1713).
+    let (listener_set_reader, listener_set_writer) =
+        reader_writer::<ListenerSet>(pre_listener_sets);
     let (namespace_reader, namespace_writer) = reflector::store::<Namespace>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
@@ -1413,6 +1428,7 @@ fn rebuild(
         &routes,
         &gateways,
         &owned_gateways,
+        &effective,
         &backend_grants,
         stores.services,
     );
@@ -1423,6 +1439,7 @@ fn rebuild(
         &grpc_routes,
         &gateways,
         &owned_gateways,
+        &effective,
         &backend_grants,
         stores.services,
     );

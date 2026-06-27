@@ -165,8 +165,44 @@ pub(crate) fn build_listener_status(
     generation: i64,
     now: &Time,
 ) -> GatewayStatusListeners {
-    let outcome = info.map(|i| i.tls_outcome.clone()).unwrap_or_default();
     let (has_invalid_kinds, supported_kinds_list) = listener_route_kind_info(listener);
+    let listener_conditions = listener_condition_triplet(
+        &listener.name,
+        listener.port,
+        info,
+        has_invalid_kinds,
+        ingress_ports,
+        generation,
+        now,
+    );
+    GatewayStatusListeners {
+        name: listener.name.clone(),
+        attached_routes: info.map(|i| i.attached_routes).unwrap_or(0),
+        supported_kinds: Some(supported_kinds_list),
+        conditions: listener_conditions,
+    }
+}
+
+/// Build the `(Accepted, ResolvedRefs, Programmed)` condition triplet for one
+/// listener — the conformance-critical reason mapping shared by the Gateway and
+/// ListenerSet status writers (GEP-1713). The conditions are listener-intrinsic:
+/// they derive only from the listener's port, TLS outcome, GEP-91 frontend
+/// validation outcome, `allowedRoutes.kinds` validity (`has_invalid_kinds`), and
+/// the Ingress data-plane port reservation — none of which depend on whether the
+/// listener belongs to a Gateway or a ListenerSet.
+///
+/// See [`build_listener_status`] for the per-condition semantics.
+#[must_use]
+pub(crate) fn listener_condition_triplet(
+    listener_name: &str,
+    listener_port: i32,
+    info: Option<&ListenerInfo>,
+    has_invalid_kinds: bool,
+    ingress_ports: IngressPorts,
+    generation: i64,
+    now: &Time,
+) -> Vec<Condition> {
+    let outcome = info.map(|i| i.tls_outcome.clone()).unwrap_or_default();
     // GEP-91: this listener's frontend client-cert CA ref (perPort override or
     // gateway default) failed to resolve. It takes precedence over the
     // per-listener cert outcome — even a listener with a valid server
@@ -204,15 +240,15 @@ pub(crate) fn build_listener_status(
     } else {
         ("True", "Accepted", "")
     };
-    // Port-conflict detection (#201): a Gateway listener whose port is
-    // reserved by the Ingress data plane (--proxy-http-port / --proxy-https-port)
-    // cannot be bound by GatewayProxy. Surface Programmed=False with
-    // reason=PortUnavailable so operators see the conflict without trawling logs.
-    let listener_port = u16::try_from(listener.port).unwrap_or(0);
-    let port_conflict =
-        ingress_ports.http == Some(listener_port) || ingress_ports.https == Some(listener_port);
+    // Port-conflict detection (#201): a listener whose port is reserved by the
+    // Ingress data plane (--proxy-http-port / --proxy-https-port) cannot be bound
+    // by GatewayProxy. Surface Programmed=False with reason=PortUnavailable so
+    // operators see the conflict without trawling logs.
+    let listener_port_u16 = u16::try_from(listener_port).unwrap_or(0);
+    let port_conflict = ingress_ports.http == Some(listener_port_u16)
+        || ingress_ports.https == Some(listener_port_u16);
     let port_conflict_msg = format!(
-        "port {listener_port} is reserved by the Ingress proxy (set via --proxy-http-port or --proxy-https-port)"
+        "port {listener_port_u16} is reserved by the Ingress proxy (set via --proxy-http-port or --proxy-https-port)"
     );
     let (listener_prog_status, listener_prog_reason, listener_prog_msg) = if port_conflict {
         ("False", "PortUnavailable", port_conflict_msg.as_str())
@@ -223,16 +259,13 @@ pub(crate) fn build_listener_status(
     } else {
         ("False", outcome.reason(), outcome.message())
     };
-    let attached = info.map(|i| i.attached_routes).unwrap_or(0);
     tracing::debug!(
-        listener = %listener.name,
+        listener = %listener_name,
         resolved_refs = resolved_refs_status,
         programmed = listener_prog_status,
-        attached_routes = attached,
-        supported_kinds = supported_kinds_list.len(),
         "Listener status"
     );
-    let listener_conditions = vec![
+    vec![
         make_condition(
             "Accepted",
             accepted_status,
@@ -257,11 +290,5 @@ pub(crate) fn build_listener_status(
             generation,
             now.clone(),
         ),
-    ];
-    GatewayStatusListeners {
-        name: listener.name.clone(),
-        attached_routes: attached,
-        supported_kinds: Some(supported_kinds_list),
-        conditions: listener_conditions,
-    }
+    ]
 }
