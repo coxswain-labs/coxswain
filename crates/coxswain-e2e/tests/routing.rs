@@ -2083,22 +2083,35 @@ async fn cors_actual_request_injects_allow_origin_header() -> anyhow::Result<()>
 
 // ── RequestMirror tests (#261) ────────────────────────────────────────────────
 
-/// Sum all `coxswain_proxy_mirror_requests_total{…}` counter values from a raw
-/// Prometheus metrics body.  Returns `0.0` when the metric is absent (not yet
-/// incremented).
-fn mirror_dispatch_count(metrics_body: &str) -> f64 {
+/// Sum `coxswain_proxy_mirror_requests_total{…}` counter values for routes in
+/// namespace `route_ns`, from a raw Prometheus metrics body. Returns `0.0` when no
+/// matching series exists (not yet incremented).
+///
+/// The `route` label is `httproute/{ns}/{name}:{rule}` (see the reflector's
+/// `metric_route_id`). The shared proxy serves every concurrent test, so scoping
+/// to the caller's (unique) namespace is what keeps one mirror test's dispatches
+/// from polluting another's before/after delta — the proxy counter is global.
+fn mirror_dispatch_count(metrics_body: &str, route_ns: &str) -> f64 {
+    let ns_marker = format!("/{route_ns}/");
     metrics_body
         .lines()
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| {
             let rest = l.strip_prefix("coxswain_proxy_mirror_requests_total{")?;
-            let (_, value) = rest.split_once('}')?;
+            let (labels, value) = rest.split_once('}')?;
+            if !labels.contains(&ns_marker) {
+                return None;
+            }
             value.trim().parse::<f64>().ok()
         })
         .sum()
 }
 
-async fn fetch_proxy_metrics(client: &reqwest::Client, metrics_url: &str) -> anyhow::Result<f64> {
+async fn fetch_proxy_metrics(
+    client: &reqwest::Client,
+    metrics_url: &str,
+    route_ns: &str,
+) -> anyhow::Result<f64> {
     let body = client
         .get(metrics_url)
         .send()
@@ -2107,7 +2120,7 @@ async fn fetch_proxy_metrics(client: &reqwest::Client, metrics_url: &str) -> any
         .text()
         .await
         .context("read /metrics body")?;
-    Ok(mirror_dispatch_count(&body))
+    Ok(mirror_dispatch_count(&body, route_ns))
 }
 
 #[tokio::test]
@@ -2129,7 +2142,7 @@ async fn mirrored_request_reaches_shadow_while_client_sees_primary() -> anyhow::
         .build()
         .context("build metrics client")?;
 
-    let before = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    let before = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name).await?;
 
     // Send a request through the mirrored rule.
     let (status, body) = gw
@@ -2147,7 +2160,7 @@ async fn mirrored_request_reaches_shadow_while_client_sees_primary() -> anyhow::
             "mirror_requests_total to increment after mirrored GET /mirror/single".to_string()
         },
         || async {
-            let count = fetch_proxy_metrics(&metrics_client, &metrics_url)
+            let count = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name)
                 .await
                 .unwrap_or(0.0);
             (count > before).then_some(())
@@ -2158,11 +2171,11 @@ async fn mirrored_request_reaches_shadow_while_client_sees_primary() -> anyhow::
     // Negative: a sibling route without a mirror filter must not bump the counter.
     // The counter is bumped synchronously before spawn, so a simple before/after
     // check across the request is sufficient.
-    let before2 = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    let before2 = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name).await?;
     let (status2, body2) = gw.request(Method::GET, &host, "/mirror/probe", &[]).await?;
     assert_eq!(status2, 200, "probe route must return 200");
     body2.unwrap().assert_backend("echo-a");
-    let after2 = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    let after2 = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name).await?;
     assert_eq!(
         before2, after2,
         "non-mirrored route must not increment mirror_requests_total"
@@ -2190,7 +2203,7 @@ async fn percent_zero_mirror_never_dispatches() -> anyhow::Result<()> {
         .build()
         .context("build metrics client")?;
 
-    let before = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    let before = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name).await?;
 
     // Send several requests through the percent=0 rule.
     for _ in 0..5u8 {
@@ -2205,7 +2218,7 @@ async fn percent_zero_mirror_never_dispatches() -> anyhow::Result<()> {
 
     // Counter is bumped synchronously before spawn, so checking right after the
     // requests return is deterministic.
-    let after = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    let after = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name).await?;
     assert_eq!(
         before, after,
         "percent=0 mirror must never increment mirror_requests_total"
@@ -2233,7 +2246,7 @@ async fn multiple_mirrors_each_receive_a_copy() -> anyhow::Result<()> {
         .build()
         .context("build metrics client")?;
 
-    let before = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    let before = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name).await?;
 
     // Send a request through the two-mirror rule.
     let (status, body) = gw
@@ -2251,7 +2264,7 @@ async fn multiple_mirrors_each_receive_a_copy() -> anyhow::Result<()> {
                 .to_string()
         },
         || async {
-            let count = fetch_proxy_metrics(&metrics_client, &metrics_url)
+            let count = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name)
                 .await
                 .unwrap_or(0.0);
             (count >= before + 2.0).then_some(())
@@ -2297,7 +2310,7 @@ async fn cross_namespace_mirror_requires_reference_grant() -> anyhow::Result<()>
         .build()
         .context("build metrics client")?;
 
-    let before = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    let before = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name).await?;
 
     // With the grant in place: mirror must fire.
     let (status, body) = gw
@@ -2311,7 +2324,7 @@ async fn cross_namespace_mirror_requires_reference_grant() -> anyhow::Result<()>
         Duration::from_millis(250),
         || async { "mirror_requests_total to increment after cross-ns GET".to_string() },
         || async {
-            let count = fetch_proxy_metrics(&metrics_client, &metrics_url)
+            let count = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name)
                 .await
                 .unwrap_or(0.0);
             (count > before).then_some(())
@@ -2333,14 +2346,40 @@ async fn cross_namespace_mirror_requires_reference_grant() -> anyhow::Result<()>
         .await
         .context("delete ReferenceGrant")?;
 
-    // Wait for the controller to reconcile (the grant deletion is a watch event).
-    wait::wait_for_controller_reconciled(
-        &h.controller_admin_url("/metrics"),
+    // The controller reconciles the grant deletion and pushes a new snapshot, but
+    // the proxy applies it asynchronously over discovery — waiting on the
+    // *controller* (it has reconciled-since-startup from the moment it came up)
+    // races that push. The mirror counter bumps SYNCHRONOUSLY with the primary
+    // request (see `spawn_mirror_dispatch`), so poll by driving requests until one
+    // leaves the counter unchanged: that request was served by the post-removal
+    // snapshot, where the denied cross-ns mirror backend is gone.
+    wait::poll_until(
         Duration::from_secs(30),
+        Duration::from_millis(250),
+        || async { "cross-ns mirror to stop firing after ReferenceGrant removal".to_string() },
+        || async {
+            let before = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name)
+                .await
+                .ok()?;
+            let (status, _) = gw
+                .request(Method::GET, &host, "/mirror-xns/path", &[])
+                .await
+                .ok()?;
+            if status != 200 {
+                return None;
+            }
+            let after = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name)
+                .await
+                .ok()?;
+            // Synchronous counter: equal ⇒ the mirror did not fire ⇒ snapshot applied.
+            (after == before).then_some(())
+        },
     )
     .await?;
 
-    let before_denied = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    // Snapshot is live and the state is monotonic, so these are now deterministic:
+    // the primary still serves echo-a and the denied mirror stays off.
+    let before_denied = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name).await?;
     let (status2, body2) = gw
         .request(Method::GET, &host, "/mirror-xns/path", &[])
         .await?;
@@ -2350,7 +2389,7 @@ async fn cross_namespace_mirror_requires_reference_grant() -> anyhow::Result<()>
     );
     body2.unwrap().assert_backend("echo-a");
 
-    let after_denied = fetch_proxy_metrics(&metrics_client, &metrics_url).await?;
+    let after_denied = fetch_proxy_metrics(&metrics_client, &metrics_url, &ns.name).await?;
     assert_eq!(
         before_denied, after_denied,
         "mirror to denied cross-ns backend must not fire after ReferenceGrant is removed"
