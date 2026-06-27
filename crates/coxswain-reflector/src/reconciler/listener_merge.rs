@@ -184,6 +184,84 @@ pub(crate) fn merge_effective_gateways(
     effective
 }
 
+/// One programmed effective listener's port identity, consumed by the
+/// provisioning operator (GEP-1713, #93).
+///
+/// The operator must expose a Service port and allocate an internal port for the
+/// Gateway's own listeners **and** every attached ListenerSet's listeners — not
+/// just `spec.listeners` — or a ListenerSet listener on a new port is never
+/// reachable. This carries the minimum the operator needs (`name`, `port`,
+/// `protocol`); the heavier [`EffectiveGateway`]/[`EffectiveListener`] stay
+/// crate-private.
+// intentionally open: a port-identity DTO that may gain fields (e.g. appProtocol).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectiveListenerPort {
+    /// ServicePort name — unique within the returned set (collisions from
+    /// duplicate listener names across the Gateway and its ListenerSets are
+    /// resolved by suffixing the port).
+    pub name: String,
+    /// Advertised listener port.
+    pub port: u16,
+    /// Listener protocol (`HTTP`, `HTTPS`, `TLS`, …); carried for parity with the
+    /// existing per-listener Service-port rendering.
+    pub protocol: String,
+}
+
+/// Per owned Gateway, the programmed effective listener ports — the Gateway's own
+/// listeners plus those merged from attached ListenerSets (GEP-1713), in
+/// precedence order, deduplicated on port and with collision-free names.
+///
+/// Reuses [`merge_effective_gateways`] so the provisioning operator and the data
+/// plane derive identical port sets and can never drift. Conflicted listeners
+/// (which lost a port-compatibility conflict and are not programmed) are omitted.
+/// Precedence-first dedup means a Gateway listener's name and port survive over a
+/// same-port ListenerSet listener, so existing Services don't churn — only new
+/// ListenerSet ports are added.
+#[must_use]
+pub fn effective_listener_ports(
+    gateways: &[std::sync::Arc<Gateway>],
+    listener_sets: &[std::sync::Arc<ListenerSet>],
+    owned_gateway_classes: &std::collections::HashSet<String>,
+    namespaces: &reflector::Store<Namespace>,
+) -> HashMap<ObjectKey, Vec<EffectiveListenerPort>> {
+    let effective =
+        merge_effective_gateways(gateways, listener_sets, owned_gateway_classes, namespaces);
+    effective
+        .into_iter()
+        .map(|(key, eg)| {
+            let mut seen_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+            let mut seen_names: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut ports = Vec::new();
+            for l in eg.listeners {
+                if l.conflicted {
+                    continue;
+                }
+                let Ok(port) = u16::try_from(l.port) else {
+                    continue;
+                };
+                if !seen_ports.insert(port) {
+                    continue;
+                }
+                // ServicePort names must be unique within a Service; duplicate
+                // listener names are legal across a Gateway + its ListenerSets, so
+                // suffix the port on collision.
+                let mut name = l.name;
+                if !seen_names.insert(name.clone()) {
+                    name = format!("{name}-{port}");
+                    seen_names.insert(name.clone());
+                }
+                ports.push(EffectiveListenerPort {
+                    name,
+                    port,
+                    protocol: l.protocol,
+                });
+            }
+            (key, ports)
+        })
+        .collect()
+}
+
 /// Resolve a ListenerSet's `spec.parentRef` to the parent Gateway [`ObjectKey`].
 /// `parentRef.namespace` defaults to the ListenerSet's own namespace.
 fn parent_key(ls: &ListenerSet, ls_ns: &str) -> ObjectKey {
@@ -745,6 +823,82 @@ mod tests {
         assert!(
             eff.is_empty(),
             "Gateway of an unowned class is not in the effective map"
+        );
+    }
+
+    // ── effective_listener_ports (operator port provisioning, #93) ────────────
+
+    #[test]
+    fn effective_ports_include_attached_listener_set_ports() {
+        let gw = gateway(
+            "gw",
+            Some(GatewayAllowedListenersNamespacesFrom::All),
+            vec![gw_listener("web", 80, "HTTP", None)],
+        );
+        let ls = listener_set(
+            "team",
+            "apps",
+            "gw",
+            Some(1),
+            vec![ls_listener("extra", 8080, "HTTP", None)],
+        );
+        let map = effective_listener_ports(&[gw], &[ls], &owned(), &empty_ns_store());
+        let ports = map.get(&ObjectKey::new("default", "gw")).expect("gateway");
+        let got: Vec<u16> = ports.iter().map(|p| p.port).collect();
+        assert_eq!(
+            got,
+            vec![80, 8080],
+            "the Gateway's own port AND the attached ListenerSet's new port are provisioned"
+        );
+    }
+
+    #[test]
+    fn effective_ports_omit_unattached_listener_set() {
+        // No allowedListeners → ListenerSet rejected → only the Gateway's port.
+        let gw = gateway("gw", None, vec![gw_listener("web", 80, "HTTP", None)]);
+        let ls = listener_set(
+            "team",
+            "default",
+            "gw",
+            Some(1),
+            vec![ls_listener("extra", 8080, "HTTP", None)],
+        );
+        let map = effective_listener_ports(&[gw], &[ls], &owned(), &empty_ns_store());
+        let ports = map.get(&ObjectKey::new("default", "gw")).expect("gateway");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, 80);
+    }
+
+    #[test]
+    fn effective_ports_give_duplicate_names_unique_serviceport_names() {
+        // Gateway "web":80 + ListenerSet "web":8080 — names legally duplicate, but
+        // ServicePort names must be unique; the later (LS) one is port-suffixed.
+        let gw = gateway(
+            "gw",
+            Some(GatewayAllowedListenersNamespacesFrom::All),
+            vec![gw_listener("web", 80, "HTTP", None)],
+        );
+        let ls = listener_set(
+            "team",
+            "apps",
+            "gw",
+            Some(1),
+            vec![ls_listener("web", 8080, "HTTP", None)],
+        );
+        let map = effective_listener_ports(&[gw], &[ls], &owned(), &empty_ns_store());
+        let ports = map.get(&ObjectKey::new("default", "gw")).expect("gateway");
+        let names: Vec<&str> = ports.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["web", "web-8080"],
+            "duplicate names disambiguated"
+        );
+        // All names unique.
+        let unique: HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "ServicePort names must be unique"
         );
     }
 }

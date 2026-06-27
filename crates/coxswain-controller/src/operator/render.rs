@@ -59,6 +59,7 @@ use super::merge::strategic_merge_pod_template;
 use super::params::EffectiveParams;
 use coxswain_core::crd::ServiceType;
 use coxswain_core::naming::gep1762_resource_name;
+use coxswain_reflector::EffectiveListenerPort;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
@@ -409,6 +410,12 @@ fn service_type_to_k8s_string(t: ServiceType) -> String {
 /// Listeners that share a `(port, protocol)` keep only the first one's
 /// `name`; this matches K8s's requirement that ServicePort names within a
 /// Service be unique and ports be unique by `(port, protocol)`.
+///
+/// NOTE (GEP-1713, #93): this reads `gateway.spec.listeners` only. The
+/// **shared-mode** VIP path provisions effective (Gateway + ListenerSet) ports
+/// via [`shared_service_ports`], but a **dedicated** proxy's Service does not yet
+/// expose ListenerSet listener ports on a *new* port — tracked as a follow-up.
+/// ListenerSet listeners reusing an existing Gateway port work in both modes.
 fn service_ports(gateway: &Gateway) -> Vec<ServicePort> {
     let mut seen: BTreeSet<(i32, &'static str)> = BTreeSet::new();
     let mut out = Vec::new();
@@ -467,6 +474,10 @@ pub(super) struct SharedServiceInputs<'a> {
     pub(super) controller_namespace: &'a str,
     /// Label selector targeting the shared proxy pod.
     pub(super) shared_proxy_selector: &'a BTreeMap<String, String>,
+    /// Effective listener ports (Gateway's own + attached ListenerSets', GEP-1713)
+    /// the Service exposes. Deduplicated, collision-free names. A listener port
+    /// absent from `internal_ports` (range exhausted) is omitted.
+    pub(super) effective_ports: &'a [EffectiveListenerPort],
     /// `listenerPort → internalPort` (the allocated `targetPort` the shared
     /// proxy binds and keys routing on). A listener port absent from this map
     /// got no internal port (range exhausted) and is omitted from the Service.
@@ -529,36 +540,33 @@ pub(super) fn render_shared_gateway_service(inputs: &SharedServiceInputs<'_>) ->
         spec: Some(ServiceSpec {
             type_: Some(service_type_to_k8s_string(inputs.service_type)),
             selector: Some(inputs.shared_proxy_selector.clone()),
-            ports: Some(shared_service_ports(gw, inputs.internal_ports)),
+            ports: Some(shared_service_ports(
+                inputs.effective_ports,
+                inputs.internal_ports,
+            )),
             ..Default::default()
         }),
         status: None,
     }
 }
 
-/// One `ServicePort` per unique listener `(port, TCP)`, mapping the advertised
-/// `port` to its allocated internal `targetPort`. Listener ports without an
-/// allocation (range exhausted) are skipped.
+/// One `ServicePort` per effective listener port (the Gateway's own listeners
+/// plus those merged from attached ListenerSets, GEP-1713), mapping the advertised
+/// `port` to its allocated internal `targetPort`. Ports without an allocation
+/// (range exhausted) are skipped. `effective_ports` is already deduplicated on
+/// port with collision-free names by [`coxswain_reflector::effective_listener_ports`].
 fn shared_service_ports(
-    gateway: &Gateway,
+    effective_ports: &[EffectiveListenerPort],
     internal_ports: &BTreeMap<u16, u16>,
 ) -> Vec<ServicePort> {
-    let mut seen: BTreeSet<i32> = BTreeSet::new();
     let mut out = Vec::new();
-    for listener in &gateway.spec.listeners {
-        let port = listener.port;
-        let Ok(listener_port) = u16::try_from(port) else {
-            continue;
-        };
-        if !seen.insert(port) {
-            continue;
-        }
-        let Some(&internal) = internal_ports.get(&listener_port) else {
+    for listener in effective_ports {
+        let Some(&internal) = internal_ports.get(&listener.port) else {
             continue;
         };
         out.push(ServicePort {
             name: Some(listener.name.clone()),
-            port,
+            port: i32::from(listener.port),
             target_port: Some(IntOrString::Int(i32::from(internal))),
             protocol: Some("TCP".to_string()),
             ..Default::default()
@@ -1309,6 +1317,11 @@ mod tests {
     fn shared_vip_service_lives_in_controller_ns_with_selector_and_maps_ports() {
         let gw = make_gateway("team-a", "gw", vec![("https", 443, "HTTPS")]);
         let internal: BTreeMap<u16, u16> = [(443u16, 30001u16)].into_iter().collect();
+        let effective_ports = vec![EffectiveListenerPort {
+            name: "https".to_string(),
+            port: 443,
+            protocol: "HTTPS".to_string(),
+        }];
         let mut selector = BTreeMap::new();
         selector.insert(
             "app.kubernetes.io/component".to_string(),
@@ -1318,6 +1331,7 @@ mod tests {
             gateway: &gw,
             controller_namespace: "coxswain-system",
             shared_proxy_selector: &selector,
+            effective_ports: &effective_ports,
             internal_ports: &internal,
             service_type: ServiceType::LoadBalancer,
         });

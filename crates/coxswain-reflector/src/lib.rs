@@ -54,6 +54,7 @@ pub use coxswain_core::fleet::SharedFleet;
 pub use crds::gateway_api_crds_present;
 pub use ingress::IngressPorts;
 pub use metrics::{MetricsPrefix, ReflectorMetrics};
+pub use reconciler::listener_merge::{EffectiveListenerPort, effective_listener_ports};
 pub use reconciler::{
     ControllerReconciler, IngressDefaultBackend, IngressDefaultBackendParseError, IngressEvent,
     ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler,

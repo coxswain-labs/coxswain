@@ -42,6 +42,7 @@ use super::{apply, params, render, status};
 use async_trait::async_trait;
 use coxswain_core::crd::{CoxswainGatewayParameters, ServiceType};
 use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::gw_types::ListenerSet;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::ingress::IngressPorts;
@@ -51,7 +52,9 @@ use coxswain_reflector::tls::{
 };
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Node, ObjectReference, Pod, Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{
+    ConfigMap, Namespace, Node, ObjectReference, Pod, Service, ServiceAccount,
+};
 use kube::{
     Api, Client, Resource as _,
     api::{DeleteParams, ObjectMeta, Patch, PatchParams},
@@ -255,6 +258,13 @@ struct ReconcileContext {
     /// the shared-VIP component. Their `targetPort`s are the durable source of
     /// truth for the internal-port allocation across reconciles/restarts (#472).
     services_store: Store<Service>,
+    /// All ListenerSets, cluster-wide (GEP-1713, #93). Merged into each owned
+    /// Gateway's effective listener set so the VIP/dedicated Service and
+    /// internal-port allocation cover ListenerSet listener ports.
+    listener_sets_store: Store<ListenerSet>,
+    /// All Namespaces, cluster-wide. Backs the parent Gateway's
+    /// `allowedListeners.namespaces.from: Selector` gate during the merge (#93).
+    namespaces_store: Store<Namespace>,
     /// Shared proxy pod selector + VIP service type for shared-mode Service
     /// provisioning (#472). See [`OperatorConfig::shared_proxy_selector`].
     shared_proxy_selector: BTreeMap<String, String>,
@@ -399,6 +409,35 @@ impl BackgroundService for Operator {
                 while stream.next().await.is_some() {}
             }
         });
+        // ListenerSet + Namespace reflectors (GEP-1713, #93). The VIP/dedicated
+        // Service and internal-port allocation must cover a Gateway's attached
+        // ListenerSets' listeners, not just `spec.listeners`, or a ListenerSet
+        // listener on a new port is never exposed. The Namespace store backs the
+        // parent Gateway's `allowedListeners.namespaces.from: Selector` gate.
+        let (listener_sets_reader, listener_sets_writer) = reflector::store::<ListenerSet>();
+        tasks.spawn({
+            let api = Api::<ListenerSet>::all(client.clone());
+            async move {
+                let stream = reflector::reflector(
+                    listener_sets_writer,
+                    watcher(api, watcher::Config::default()).default_backoff(),
+                );
+                tokio::pin!(stream);
+                while stream.next().await.is_some() {}
+            }
+        });
+        let (namespaces_reader, namespaces_writer) = reflector::store::<Namespace>();
+        tasks.spawn({
+            let api = Api::<Namespace>::all(client.clone());
+            async move {
+                let stream = reflector::reflector(
+                    namespaces_writer,
+                    watcher(api, watcher::Config::default()).default_backoff(),
+                );
+                tokio::pin!(stream);
+                while stream.next().await.is_some() {}
+            }
+        });
 
         // Wait for every dependency reflector to complete its initial sync
         // before exposing the stores to the reconcile loop, so the first
@@ -428,7 +467,7 @@ impl BackgroundService for Operator {
         // operator is shutting down. We treat those as "synced" because there
         // is nothing left for this reader to deliver; the controller will
         // exit on the next iteration anyway.
-        let (a, b, c, d, e, f) = tokio::join!(
+        let (a, b, c, d, e, f, g, h) = tokio::join!(
             wait_or_name("GatewayClass", class_reader.wait_until_ready(), deadline),
             wait_or_name(
                 "CoxswainGatewayParameters",
@@ -439,8 +478,14 @@ impl BackgroundService for Operator {
             wait_or_name("Node", nodes_reader.wait_until_ready(), deadline),
             wait_or_name("Gateway", gateways_reader.wait_until_ready(), deadline),
             wait_or_name("Service", services_reader.wait_until_ready(), deadline),
+            wait_or_name(
+                "ListenerSet",
+                listener_sets_reader.wait_until_ready(),
+                deadline
+            ),
+            wait_or_name("Namespace", namespaces_reader.wait_until_ready(), deadline),
         );
-        let unsynced: Vec<&'static str> = [a, b, c, d, e, f].into_iter().flatten().collect();
+        let unsynced: Vec<&'static str> = [a, b, c, d, e, f, g, h].into_iter().flatten().collect();
         if !unsynced.is_empty() {
             tracing::warn!(
                 timeout = ?sync_timeout,
@@ -471,6 +516,8 @@ impl BackgroundService for Operator {
             controller_namespace: self.config.controller_namespace.clone(),
             gateways_store: gateways_reader,
             services_store: services_reader,
+            listener_sets_store: listener_sets_reader,
+            namespaces_store: namespaces_reader,
             shared_proxy_selector: self.config.shared_proxy_selector.clone(),
             shared_vip_service_type: self.config.shared_vip_service_type,
             vip_trigger: Arc::new(tokio::sync::Notify::new()),
@@ -1156,7 +1203,25 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
     let is_shared =
         |g: &Gateway| is_owned_shared_mode(g, &classes, &ctx.params_store, &ctx.controller_name);
 
-    let desired = super::shared_alloc::desired_listener_keys(&gateways, is_shared);
+    // Effective listener ports per owned Gateway: its own listeners plus those
+    // merged from attached ListenerSets (GEP-1713, #93). Drives BOTH the
+    // internal-port allocation and the VIP Service ports below, so a ListenerSet
+    // listener on a new port is allocated an internal port and exposed.
+    let owned_classes: std::collections::HashSet<String> = classes
+        .iter()
+        .filter(|gc| gc.spec.controller_name == ctx.controller_name)
+        .filter_map(|gc| gc.meta().name.clone())
+        .collect();
+    let listener_sets = ctx.listener_sets_store.state();
+    let effective_ports = coxswain_reflector::effective_listener_ports(
+        &gateways,
+        &listener_sets,
+        &owned_classes,
+        &ctx.namespaces_store,
+    );
+
+    let desired =
+        super::shared_alloc::desired_listener_keys(&gateways, &effective_ports, is_shared);
     let existing = super::shared_alloc::existing_internal_ports(&services);
     let allocation = allocate_internal_ports(&desired, &existing, DEFAULT_INTERNAL_PORT_RANGE);
 
@@ -1173,10 +1238,13 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
         if internal_ports.is_empty() {
             continue;
         }
+        let empty_ports = Vec::new();
+        let gw_effective_ports = effective_ports.get(&key).unwrap_or(&empty_ports);
         let service = render::render_shared_gateway_service(&render::SharedServiceInputs {
             gateway: gw,
             controller_namespace: ctrl_ns,
             shared_proxy_selector: &ctx.shared_proxy_selector,
+            effective_ports: gw_effective_ports,
             internal_ports: &internal_ports,
             service_type: ctx.shared_vip_service_type,
         });
