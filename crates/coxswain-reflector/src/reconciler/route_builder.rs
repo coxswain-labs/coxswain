@@ -12,7 +12,7 @@ use super::proxy::{
 use crate::endpoints;
 use crate::gateway_api::hostnames_intersect;
 use crate::gateway_api::{
-    GatewayApiReconciler, GrpcRouteReconciler, GrpcRouteResolution, ListenerBinding,
+    GatewayApiReconciler, GrpcRouteReconciler, GrpcRouteResolution, ListenerBinding, RouteLike,
     TlsRouteReconciler,
 };
 use crate::gw_types::v::gateways::{
@@ -23,7 +23,8 @@ use crate::ingress::annotations::AnnotationIssue;
 use crate::ingress::{IngressClassContext, IngressPorts, IngressReconciler, resolve_class_params};
 use crate::keys::ListenerKey;
 use crate::tls::{
-    BackendClientCertOutcome, GatewayListenerHealth, ListenerTlsOutcome, RouteHealthMap,
+    BackendClientCertOutcome, GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome,
+    RouteHealthMap,
 };
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self as reference_grants, ReferenceGrantKey};
@@ -631,46 +632,49 @@ pub(super) fn merge_backend_client_cert_health(
 
 /// Increment `attached_routes` counters for each gateway listener whose hostname
 /// intersects with the route's hostnames. Only owned gateways are counted.
-pub(super) fn count_attached_routes(
-    routes: &[Arc<HttpRoute>],
+///
+/// Generic over [`RouteLike`] so the one algorithm serves every route kind
+/// (HTTPRoute, GRPCRoute, TLSRoute) — GRPC/TLS listeners would otherwise always
+/// report `attachedRoutes: 0` (#470). `passthrough_kind` flips listener
+/// eligibility by kind: TLSRoutes attach **only** to `TlsPassthrough` listeners,
+/// HTTP/GRPC routes attach only to non-passthrough listeners (the
+/// `allowedRoutes.kinds` restriction implied by listener protocol/mode).
+pub(super) fn count_attached_routes<R: RouteLike>(
+    routes: &[Arc<R>],
     owned_gateways: &HashSet<ObjectKey>,
     gateway_listener_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
+    passthrough_kind: bool,
 ) {
-    for route in routes {
-        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-        let route_hostnames: Vec<&str> = route
-            .spec
-            .hostnames
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(String::as_str)
-            .collect();
+    // A listener accepts this route kind when its passthrough-ness matches the
+    // kind: passthrough listeners ↔ TLSRoutes, everything else ↔ HTTP/GRPC.
+    let listener_accepts = |info: &ListenerInfo| {
+        passthrough_kind == matches!(info.tls_outcome, ListenerTlsOutcome::TlsPassthrough)
+    };
 
-        for pr in route.spec.parent_refs.as_deref().unwrap_or(&[]) {
-            let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
-            let gw_name = pr.name.as_str();
-            let key = ObjectKey::new(gw_ns, gw_name);
+    for route in routes {
+        let route_ns = route.route_namespace().unwrap_or("default");
+        let route_hostnames = route.route_hostnames();
+
+        for pr in route.route_parent_refs() {
+            let gw_ns = pr.namespace.unwrap_or(route_ns);
+            let key = ObjectKey::new(gw_ns, pr.name);
             if !owned_gateways.contains(&key) {
                 continue;
             }
             if let Some(health) = gateway_listener_health.get_mut(&key) {
-                let pr_port = pr.port.map(|p| p as u16);
-                if let Some(sn) = pr.section_name.as_deref() {
+                if let Some(sn) = pr.section_name {
                     let Some(info) = health.listeners.get_mut(sn) else {
                         continue;
                     };
                     if gw_ns != route_ns && !info.allows_all_namespaces {
                         continue;
                     }
-                    if let Some(port) = pr_port
+                    if let Some(port) = pr.port
                         && info.port != port
                     {
                         continue;
                     }
-                    // Passthrough listeners only accept TLSRoutes; never count an
-                    // HTTPRoute against them (allowedRoutes.kinds restriction).
-                    if matches!(info.tls_outcome, ListenerTlsOutcome::TlsPassthrough) {
+                    if !listener_accepts(info) {
                         continue;
                     }
                     if hostnames_intersect(&route_hostnames, &info.hostname) {
@@ -682,7 +686,7 @@ pub(super) fn count_attached_routes(
                         let Some(info) = health.listeners.get_mut(&ln) else {
                             continue;
                         };
-                        if let Some(p) = pr_port
+                        if let Some(p) = pr.port
                             && info.port != p
                         {
                             continue;
@@ -690,9 +694,7 @@ pub(super) fn count_attached_routes(
                         if gw_ns != route_ns && !info.allows_all_namespaces {
                             continue;
                         }
-                        // Passthrough listeners only accept TLSRoutes; never count an
-                        // HTTPRoute against them (allowedRoutes.kinds restriction).
-                        if matches!(info.tls_outcome, ListenerTlsOutcome::TlsPassthrough) {
+                        if !listener_accepts(info) {
                             continue;
                         }
                         if hostnames_intersect(&route_hostnames, &info.hostname) {
@@ -893,4 +895,150 @@ pub(super) fn build_passthrough_routes(
         backend_grants,
         stores.services,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gw_types::TlsRoute;
+    use crate::gw_types::v::grpcroutes::{GrpcRouteParentRefs, GrpcRouteSpec};
+    use crate::gw_types::v::httproutes::{HttpRouteParentRefs, HttpRouteSpec};
+    use crate::gw_types::v::tlsroutes::{TlsRouteParentRefs, TlsRouteSpec};
+    use kube::api::ObjectMeta;
+
+    /// One listener entry; `hostname == ""` matches all route hostnames.
+    fn listener(name: &str, tls_outcome: ListenerTlsOutcome, port: u16) -> (String, ListenerInfo) {
+        let mut info = ListenerInfo::default();
+        info.tls_outcome = tls_outcome;
+        info.port = port;
+        (name.to_string(), info)
+    }
+
+    /// A single-Gateway health map keyed `default/gw`.
+    fn health(listeners: Vec<(String, ListenerInfo)>) -> HashMap<ObjectKey, GatewayListenerHealth> {
+        let mut gw = GatewayListenerHealth::default();
+        gw.listeners = listeners.into_iter().collect();
+        std::iter::once((ObjectKey::new("default", "gw"), gw)).collect()
+    }
+
+    fn owned() -> HashSet<ObjectKey> {
+        std::iter::once(ObjectKey::new("default", "gw")).collect()
+    }
+
+    fn http_route() -> Arc<HttpRoute> {
+        Arc::new(HttpRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                parent_refs: Some(vec![HttpRouteParentRefs {
+                    name: "gw".to_string(),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn grpc_route() -> Arc<GrpcRoute> {
+        Arc::new(GrpcRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GrpcRouteSpec {
+                parent_refs: Some(vec![GrpcRouteParentRefs {
+                    name: "gw".to_string(),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn tls_route() -> Arc<TlsRoute> {
+        Arc::new(TlsRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: TlsRouteSpec {
+                parent_refs: Some(vec![TlsRouteParentRefs {
+                    name: "gw".to_string(),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn attached(map: &HashMap<ObjectKey, GatewayListenerHealth>, name: &str) -> i32 {
+        map[&ObjectKey::new("default", "gw")].listeners[name].attached_routes
+    }
+
+    #[test]
+    fn grpc_route_increments_attached_routes_on_http_listener() {
+        let mut map = health(vec![listener(
+            "http",
+            ListenerTlsOutcome::NotApplicable,
+            80,
+        )]);
+        count_attached_routes(&[grpc_route()], &owned(), &mut map, false);
+        assert_eq!(
+            attached(&map, "http"),
+            1,
+            "GRPCRoute must be counted against its HTTP listener"
+        );
+    }
+
+    #[test]
+    fn tls_route_increments_attached_routes_on_passthrough_listener() {
+        let mut map = health(vec![listener(
+            "tls",
+            ListenerTlsOutcome::TlsPassthrough,
+            443,
+        )]);
+        count_attached_routes(&[tls_route()], &owned(), &mut map, true);
+        assert_eq!(
+            attached(&map, "tls"),
+            1,
+            "TLSRoute must be counted against its passthrough listener"
+        );
+    }
+
+    #[test]
+    fn tls_route_not_counted_against_terminate_listener() {
+        let mut map = health(vec![listener("https", ListenerTlsOutcome::Resolved, 443)]);
+        count_attached_routes(&[tls_route()], &owned(), &mut map, true);
+        assert_eq!(
+            attached(&map, "https"),
+            0,
+            "TLSRoute must never attach to a TLS-terminate listener"
+        );
+    }
+
+    #[test]
+    fn http_route_not_counted_against_passthrough_listener() {
+        let mut map = health(vec![listener(
+            "tls",
+            ListenerTlsOutcome::TlsPassthrough,
+            443,
+        )]);
+        count_attached_routes(&[http_route()], &owned(), &mut map, false);
+        assert_eq!(
+            attached(&map, "tls"),
+            0,
+            "HTTPRoute must never attach to a passthrough listener"
+        );
+    }
 }

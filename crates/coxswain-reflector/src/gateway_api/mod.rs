@@ -20,6 +20,7 @@ pub use bindings::ListenerBinding;
 pub use grpc_reconcile::GrpcRouteResolution;
 pub(crate) use hostnames::hostnames_intersect;
 pub use reconcile::RouteResolution;
+pub(crate) use route_health::RouteLike;
 
 #[cfg(test)]
 mod tests;
