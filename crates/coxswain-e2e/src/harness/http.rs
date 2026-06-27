@@ -280,8 +280,8 @@ impl HttpClient {
 
     /// Like [`Self::get_full`], but sends `extra_headers` on the request.
     ///
-    /// Used by caching tests to verify that a request carrying `Authorization`
-    /// bypasses the response cache (no `Age` header on the reply).
+    /// Used by tests that need to drive request-header-dependent behaviour
+    /// (session affinity, basic-auth credentials, consistent-hash keys).
     pub async fn get_full_with_headers(
         &self,
         host: &str,

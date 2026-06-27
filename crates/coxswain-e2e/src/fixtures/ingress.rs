@@ -112,13 +112,6 @@ pub const ANNOTATION_TRUST_FORWARDED_FOR: &str = fixture!("annotation_trust_forw
 /// peer is within the configured CIDR; requests from other peers ignore the header and use the L4 IP.
 pub const ANNOTATION_TRUST_FORWARDED_FOR_CIDRS: &str =
     fixture!("annotation_trust_forwarded_for_cidrs.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/cache-enabled: "true"` plus a
-/// `response-header-set` that injects `Cache-Control: ${CACHE_CONTROL}` (#40).
-/// Used to verify the proxy serves a second identical GET from cache (an `Age`
-/// header appears), respects `no-store`, bypasses the cache for `Authorization`
-/// requests, and honors the admin purge endpoint. Supply `CACHE_CONTROL` via
-/// `FixtureVars::with`.
-pub const ANNOTATION_CACHE_ENABLED: &str = fixture!("annotation_cache_enabled.yaml");
 /// Cookie-mode session affinity (#15): a 3-pod `echo-aff` Service plus an Ingress
 /// carrying `session-affinity: cookie` and a custom `session-cookie-name`
 /// (`SESSIONID`). The proxy injects the cookie on the first response and pins

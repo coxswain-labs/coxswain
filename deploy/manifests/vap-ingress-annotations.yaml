@@ -127,14 +127,6 @@ spec:
         '" — must be "true" or "false"'
 
     - expression: >-
-        !('ingress.coxswain-labs.dev/cache-enabled' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/cache-enabled'].matches('^(?i)(true|false)$')
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/cache-enabled: "' +
-        variables.ann['ingress.coxswain-labs.dev/cache-enabled'] +
-        '" — must be "true" or "false"'
-
-    - expression: >-
         !('ingress.coxswain-labs.dev/compression-gzip' in variables.ann) ||
         variables.ann['ingress.coxswain-labs.dev/compression-gzip'].matches('^(?i)(true|false)$')
       messageExpression: >-

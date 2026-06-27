@@ -24,7 +24,6 @@
 //! `Warning` Kubernetes Events; the proxy discards them silently.
 
 pub(crate) mod auth;
-mod caching;
 pub(crate) mod client_cert;
 pub(crate) mod edge_access;
 mod filters;
@@ -33,7 +32,6 @@ mod session;
 pub(crate) mod traffic_policy;
 
 pub use auth::*;
-pub use caching::*;
 pub use client_cert::*;
 pub use edge_access::*;
 pub use filters::*;
@@ -142,9 +140,6 @@ pub(super) struct IngressAnnotations {
     /// Source-IP block list (CIDR set) from `deny-source-range` (#268).
     /// `None` (the default, or an all-invalid/absent value) blocks nothing.
     pub deny_source_range: Option<Vec<ipnet::IpNet>>,
-    /// RFC 7234 response-cache opt-in from `cache-enabled` (#40).
-    /// `false` (the default, or an invalid value) leaves caching off.
-    pub cache_enabled: bool,
     /// Sticky-session binding from the `session-*` annotations (#15).
     /// `None` (the default, or an invalid/incomplete value) keeps round-robin.
     pub session_affinity: Option<SessionAffinity>,
@@ -430,20 +425,6 @@ impl IngressAnnotations {
         let deny_source_range = get(ann, DENY_SOURCE_RANGE)
             .and_then(|s| parse_deny_source_range(s, route_id, &mut diag));
 
-        // ── Response caching (#40) ────────────────────────────────────────────
-        let cache_enabled = get(ann, CACHE_ENABLED)
-            .and_then(|v| {
-                let b = parse_cache_enabled(v);
-                if b.is_none() {
-                    issue!(
-                        CACHE_ENABLED,
-                        "invalid boolean — treating cache-enabled as false"
-                    );
-                }
-                b
-            })
-            .unwrap_or(false);
-
         // ── Session affinity (#15) ────────────────────────────────────────────
         let session_affinity = parse_session_affinity(ann, route_id, &mut diag);
 
@@ -533,7 +514,6 @@ impl IngressAnnotations {
                 max_body_size,
                 allow_source_range,
                 deny_source_range,
-                cache_enabled,
                 session_affinity,
                 rate_limit,
                 auth,
@@ -1031,37 +1011,6 @@ mod tests {
         let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.max_body_size.is_none());
         assert!(logs_contain("invalid max-body-size"));
-    }
-
-    #[test]
-    fn parse_cache_enabled_true() {
-        let m = ann(&[(CACHE_ENABLED, "true")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(a.cache_enabled);
-    }
-
-    #[test]
-    fn parse_cache_enabled_false_and_absent_default_off() {
-        let m = ann(&[(CACHE_ENABLED, "false")]);
-        assert!(
-            !IngressAnnotations::parse(Some(&m), "default/test")
-                .0
-                .cache_enabled
-        );
-        assert!(
-            !IngressAnnotations::parse(None, "default/test")
-                .0
-                .cache_enabled
-        );
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_cache_enabled_invalid_warns_and_defaults_off() {
-        let m = ann(&[(CACHE_ENABLED, "1")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(!a.cache_enabled);
-        assert!(logs_contain("treating cache-enabled as false"));
     }
 
     // ── path-normalize (#280) ─────────────────────────────────────────────────

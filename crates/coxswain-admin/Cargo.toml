@@ -12,7 +12,6 @@ workspace = true
 [dependencies]
 async-trait   = { workspace = true }
 bytes         = { workspace = true }
-coxswain-cache = { workspace = true }
 coxswain-core = { workspace = true }
 form_urlencoded = { workspace = true }
 futures       = { workspace = true }

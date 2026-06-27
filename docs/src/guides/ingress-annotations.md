@@ -37,7 +37,6 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/trust-forwarded-for` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/forwarded-for-header` | string | `X-Forwarded-For` | `"CF-Connecting-IP"` |
 | `ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs` | cidr-list | _none_ (unconditional) | `"10.0.0.0/8"` |
-| `ingress.coxswain-labs.dev/cache-enabled` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/session-affinity` | `cookie` or `header` | _none_ | `"cookie"` |
 | `ingress.coxswain-labs.dev/session-cookie-name` | string | `__coxswain_session` | `"SESSIONID"` |
 | `ingress.coxswain-labs.dev/session-header` | string | _none_ | `"X-Session-Id"` |
@@ -552,40 +551,6 @@ The value is a comma-separated list of IPv4/IPv6 CIDR blocks (same format as `al
 
 - An invalid CIDR token emits a controller warning and is skipped.
 - If every token is invalid, the CIDR list is treated as absent (unconditional trust) and a controller warning is emitted.
-
-## `cache-enabled`
-
-Opts the Ingress into RFC 7234 HTTP response caching. When `"true"`, the proxy serves cacheable responses from an in-memory cache instead of contacting the upstream on every request — cutting upstream load and client latency for static assets and public API responses.
-
-```yaml
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/cache-enabled: "true"
-```
-
-**What gets cached.** Caching is conservative by design — only responses the upstream explicitly marks fresh are stored:
-
-- Only `GET` and `HEAD` responses are eligible.
-- The response must carry explicit freshness: `Cache-Control: max-age=…` or `Expires`. A response with neither is **not** cached (there is no implicit TTL).
-- `Cache-Control: no-store` and `no-cache` on the response are honoured — such responses are never stored.
-- `Vary` is respected: responses are keyed by the request values of the listed headers, so content negotiation stays correct.
-
-**Bypass.** Requests carrying an `Authorization` or `Cookie` header bypass the cache entirely — per-user responses must never be served to another client.
-
-**Served-from-cache responses** carry an `Age` header (seconds since the entry was stored), per RFC 7234.
-
-**Cache size.** The cache is shared across all cache-enabled routes in a proxy and bounded by `--cache-max-size` (default `100m`, binary units; `0` disables caching). When full, least-recently-used entries are evicted. See the [configuration reference](../reference/configuration.md).
-
-**Purging.** A cached entry can be evicted on demand via the proxy admin port:
-
-```
-DELETE /cache/{host}/{path}
-```
-
-For example `DELETE /cache/cache.example.com/assets/app.js` purges the `GET cache.example.com/assets/app.js` entry. The response reports whether an entry was removed (`{"purged": true}`).
-
-!!! note
-    The Gateway API binding for caching (an `HTTPRoute` `ExtensionRef` filter pointing at a `CoxswainCachePolicy`) is tracked separately; today `cache-enabled` is the Ingress-only entry point.
 
 ## Session affinity (sticky sessions)
 

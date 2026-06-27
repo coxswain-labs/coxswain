@@ -735,7 +735,6 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
- "coxswain-cache",
  "coxswain-core",
  "form_urlencoded",
  "futures",
@@ -763,7 +762,6 @@ dependencies = [
  "async-trait",
  "clap",
  "coxswain-admin",
- "coxswain-cache",
  "coxswain-controller",
  "coxswain-core",
  "coxswain-discovery",
@@ -781,15 +779,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "coxswain-cache"
-version = "0.4.0"
-dependencies = [
- "pingora-cache",
- "prometheus 0.14.0",
- "tokio",
 ]
 
 [[package]]
@@ -919,7 +908,6 @@ dependencies = [
  "bcrypt",
  "bytes",
  "constant_time_eq",
- "coxswain-cache",
  "coxswain-core",
  "criterion",
  "dashmap",
@@ -930,7 +918,6 @@ dependencies = [
  "itoa",
  "parking_lot",
  "percent-encoding",
- "pingora-cache",
  "pingora-core",
  "pingora-http",
  "pingora-proxy",

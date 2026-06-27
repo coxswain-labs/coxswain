@@ -188,7 +188,6 @@ fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteE
         max_body_size: e.max_body_size,
         allow_source_range,
         deny_source_range,
-        cache_enabled: e.cache_enabled,
         access_log_enabled: e.access_log_enabled,
         rate_limit: e.rate_limit.as_deref().map(rate_limit_to_wire),
         auth: e.auth.as_deref().map(auth_to_wire),
@@ -823,9 +822,6 @@ fn build_route_entry(dto: &p::RouteEntry) -> Result<RouteEntry, WireError> {
         entry = entry.with_deny_source_range(Some(Arc::new(nets)));
     }
 
-    if dto.cache_enabled {
-        entry = entry.with_cache_enabled(true);
-    }
     if let Some(enabled) = dto.access_log_enabled {
         entry = entry.with_access_log_enabled(Some(enabled));
     }

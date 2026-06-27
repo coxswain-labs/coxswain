@@ -46,7 +46,6 @@ use crate::args::{
     AccessLogPathMode as BinAccessLogPathMode, CaModeArg, Cli, Commands, CommonArgs,
     ControllerArgs, ControllerRoleArgs, LogFormat, ProxyArgs, ProxyRoleArgs, ProxyScope, Role,
 };
-use coxswain_cache::ResponseCache;
 use coxswain_proxy::AccessLogPathMode;
 
 /// Executes the Coxswain proxy/controller role specified by the CLI arguments.
@@ -297,14 +296,12 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
         build_discovery_client(&args, proxy_handle, Scope::SharedPool)?;
     let listener_status = client.listener_status();
 
-    let cache = build_response_cache(&args.proxy);
     wire_proxy_services(
         &mut server,
         &args.common,
         &args.proxy,
         &client,
         &listener_status,
-        cache,
     )?;
 
     register_discovery_background_services(&mut server, supervisor, bootstrap_runner);
@@ -318,7 +315,6 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
             leader,
             ingress_routes: client.ingress_routes(),
             gateway_routes: client.gateway_routes(),
-            cache,
         },
     );
 
@@ -374,14 +370,12 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
         build_discovery_client(&args, proxy_handle, scope)?;
     let listener_status = client.listener_status();
 
-    let cache = build_response_cache(&args.proxy);
     wire_gateway_only_proxy_services(
         &mut server,
         &args.common,
         &args.proxy,
         &client,
         &listener_status,
-        cache,
     )?;
 
     register_discovery_background_services(&mut server, supervisor, bootstrap_runner);
@@ -395,7 +389,6 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
             leader,
             ingress_routes: client.ingress_routes(),
             gateway_routes: client.gateway_routes(),
-            cache,
         },
     );
 
@@ -447,7 +440,6 @@ fn wire_gateway_only_proxy_services(
     proxy: &ProxyArgs,
     source: &dyn RoutingSource,
     listener_status: &SharedGatewayListenerStatus,
-    cache: Option<ResponseCache>,
 ) -> Result<()> {
     let default_timeouts = RouteTimeouts {
         request: proxy.proxy_default_request_timeout,
@@ -469,7 +461,6 @@ fn wire_gateway_only_proxy_services(
         ca_cache,
         proxy.access_log,
         access_log_path_mode(proxy),
-        cache,
         rate_limiter.clone(),
         auth_client,
     );
@@ -569,13 +560,6 @@ fn access_log_path_mode(proxy: &ProxyArgs) -> AccessLogPathMode {
     }
 }
 
-/// Build the process-wide response cache from `--cache-max-size`, or `None` when
-/// caching is disabled (`0`). The returned handle is `Copy` and shared by every
-/// proxy in the process so they hit one cache, not one per listener.
-fn build_response_cache(proxy: &ProxyArgs) -> Option<ResponseCache> {
-    (proxy.cache_max_size > 0).then(|| ResponseCache::with_max_bytes(proxy.cache_max_size))
-}
-
 /// Register both the Ingress and Gateway dynamic proxy acceptors on the
 /// supplied server.  Shared between `run_proxy_shared` and `run_dev`.
 ///
@@ -590,7 +574,6 @@ fn wire_proxy_services(
     proxy: &ProxyArgs,
     source: &dyn RoutingSource,
     listener_status: &SharedGatewayListenerStatus,
-    cache: Option<ResponseCache>,
 ) -> Result<()> {
     let default_timeouts = RouteTimeouts {
         request: proxy.proxy_default_request_timeout,
@@ -614,7 +597,6 @@ fn wire_proxy_services(
         ca_cache,
         proxy.access_log,
         access_log_path_mode(proxy),
-        cache,
         rate_limiter.clone(),
         auth_client,
     );
@@ -1294,10 +1276,6 @@ struct ManagementServerConfig {
     leader: Arc<AtomicBool>,
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
-    /// Shared response cache for the `DELETE /cache/{host}/{path}` purge
-    /// endpoint, or `None` when caching is disabled. Must be the *same* handle
-    /// the data-plane proxies were built with so a purge hits the live cache.
-    cache: Option<ResponseCache>,
 }
 
 fn wire_management_servers(
@@ -1319,8 +1297,7 @@ fn wire_management_servers(
 
     let admin_addr = SocketAddr::new(common.management_bind_address, common.admin_port);
     let admin = AdminServer::new(config.health, config.leader)
-        .with_routes(config.ingress_routes, config.gateway_routes)
-        .with_cache(config.cache);
+        .with_routes(config.ingress_routes, config.gateway_routes);
     server.add_service(admin.into_service(admin_addr));
 }
 

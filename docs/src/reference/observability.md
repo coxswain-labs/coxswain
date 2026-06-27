@@ -78,21 +78,6 @@ The control-plane gRPC channel between controller (server) and proxies (clients)
 | `coxswain_discovery_client_bootstrap_total` | Client | Counter | `result` (`success`/`failure`) — proxy-side rotation outcome; sustained `failure` means the proxy is serving its last-good SVID toward expiry |
 | `coxswain_discovery_client_svid_expiry_seconds` | Client | Gauge | — (seconds until the proxy's current SVID `notAfter`; approaching `0` means rotation is not keeping up with the TTL) |
 
-### Cache metrics
-
-The response cache runs in the **proxy** process; all cache series are scraped from the proxy `/metrics`. The hit/miss counters predate the proxy subsystem-prefix convention and keep their bare `coxswain_cache_*` names; the depth series added later use the `coxswain_proxy_cache_*` prefix.
-
-| Metric | Type | Labels |
-|--------|------|--------|
-| `coxswain_cache_hits_total` | Counter | `route` |
-| `coxswain_cache_misses_total` | Counter | `route` |
-| `coxswain_proxy_cache_entries` | Gauge | — (entries currently tracked by the cache) |
-| `coxswain_proxy_cache_bytes` | Gauge | — (total body bytes currently held; compare against `--cache-max-size` to spot a cache at capacity) |
-| `coxswain_proxy_cache_evictions_total` | Counter | — (entries evicted under capacity pressure; a climbing rate alongside a full `_bytes` gauge means the cache is thrashing) |
-| `coxswain_proxy_cache_purges_total` | Counter | `result` (`hit` — an entry was removed; `miss` — no matching entry) |
-
-The depth gauges (`entries`, `bytes`, `evictions_total`) are read from the LRU eviction manager at scrape time, so they always reflect live state with no sampling lag.
-
 ### Metric labels per Gateway
 
 When you run a [dedicated proxy pool](../guides/dedicated-mode.md), you usually want to slice its metrics by Gateway. Coxswain does **not** bake the Gateway identity into the emitted series — a `gateway_name` / `gateway_namespace` label on every counter would multiply request-counter cardinality across every dedicated Gateway, and the shared pool has no single Gateway to name.

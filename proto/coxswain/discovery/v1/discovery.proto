@@ -196,17 +196,19 @@ enum RouteKind {
 // `from_wire` replays the appropriate `add_*_route` builder call.
 //
 // Field layout:
-//   identity   1–9 : kind, path, route_id, metric_route_id, cache_enabled
+//   identity   1–9 : kind, path, route_id, metric_route_id
 //   extensions 10–29: per-route config DTOs
 //   optional   30–39: presence-tracked scalars
 //   repeated   40+ : filter lists, CIDR ranges
 message RouteEntry {
+  // Field 5 was `bool cache_enabled` (response caching, #40); removed in #477.
+  reserved 5;
+  reserved "cache_enabled";
   // identity
   RouteKind kind = 1; // which add_*_route method to replay
   string path = 2; // path string, normalised prefix, or regex pattern
   string route_id = 3; // "{namespace}/{name}"
   string metric_route_id = 4; // prometheus route label
-  bool cache_enabled = 5;
   string path_pattern = 6; // matched rule pattern for access-log `pattern` mode
 
   // nested config extensions
