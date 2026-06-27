@@ -1,9 +1,11 @@
 package conformance_test
 
 import (
+	"os"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/util/sets"
+	v1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	"sigs.k8s.io/gateway-api/conformance"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
 	"sigs.k8s.io/gateway-api/pkg/features"
@@ -73,6 +75,12 @@ func TestConformance(t *testing.T) {
 		features.SupportGatewayPort8080,
 		// Extended: empty Gateway address value (#34)
 		features.SupportGatewayAddressEmpty,
+		// Extended: static Gateway addresses — GatewayStaticAddresses (#260).
+		// Coxswain honors a requested IPAddress by pinning it as the per-Gateway
+		// VIP Service clusterIP (deterministic accept/reject vs the apiserver
+		// service-CIDR). Requires UsableNetworkAddresses/UnusableNetworkAddresses
+		// below, injected by scripts/setup-conformance.sh.
+		features.SupportGatewayStaticAddresses,
 		// Standard: backend client-certificate (mTLS to upstream) — GEP-3155 (#87)
 		features.SupportGatewayBackendClientCertificate,
 		// Standard: frontend client-certificate validation — GEP-91 (#86)
@@ -101,6 +109,34 @@ func TestConformance(t *testing.T) {
 		// Standard: ListenerSet — GEP-1713 (#93)
 		features.SupportListenerSet,
 	)
+
+	// GatewayStaticAddresses (#260): the suite overlays these onto the test's
+	// `PLACEHOLDER_USABLE_ADDRS`/`PLACEHOLDER_UNUSABLE_ADDRS` manifest values.
+	// coxswain honors a requested IP by provisioning the Gateway's VIP as a
+	// ClusterIP pinned to it, so the "usable" address must be a free IP inside the
+	// cluster's Service CIDR (the apiserver assigns it exactly); the "unusable"
+	// address is a TEST-NET-1 IP outside any Service CIDR, which the apiserver
+	// rejects → Programmed=False/AddressNotUsable. The CI run-conformance action
+	// and scripts/setup-conformance.sh both probe a free clusterIP and inject it
+	// via env so the usable IP tracks the live cluster.
+	ipType := v1beta1.IPAddressType
+	usable := os.Getenv("CONFORMANCE_USABLE_ADDR")
+	unusable := os.Getenv("CONFORMANCE_UNUSABLE_ADDR")
+	if usable != "" && unusable != "" {
+		opts.UsableNetworkAddresses = []v1beta1.GatewaySpecAddress{
+			{Type: &ipType, Value: usable},
+		}
+		opts.UnusableNetworkAddresses = []v1beta1.GatewaySpecAddress{
+			{Type: &ipType, Value: unusable},
+		}
+	} else {
+		// Without an injected address pool the manifest's placeholder addresses
+		// are stripped and the test's "expected 3 addresses" precondition fails.
+		// CI and setup-conformance.sh always set the env; this skip covers a bare
+		// `go test` run started without the probe. The feature stays advertised on
+		// GatewayClass and is covered by the by-plane e2e suite either way.
+		opts.SkipTests = append(opts.SkipTests, "GatewayStaticAddresses")
+	}
 
 	conformance.RunConformanceWithOptions(t, opts)
 }

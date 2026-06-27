@@ -1,7 +1,6 @@
 //! Kubernetes API calls that write `Gateway` status patches.
 
-use super::config::StatusAddress;
-use super::gateway_status::build_gateway_status_patch;
+use super::gateway_status::{SharedAddressDecision, build_gateway_status_patch};
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::ingress::IngressPorts;
 use coxswain_reflector::status::GatewayListenerStatus;
@@ -18,7 +17,7 @@ pub(super) async fn patch_gateway_status(
     client: &Client,
     gw: &Gateway,
     health: &GatewayListenerStatus,
-    addr: Option<&StatusAddress>,
+    decision: &SharedAddressDecision,
     ingress_ports: IngressPorts,
 ) {
     let name = match gw.metadata.name.as_deref() {
@@ -49,7 +48,7 @@ pub(super) async fn patch_gateway_status(
             "Gateway frontend CA ref unresolvable — proxy fail-closing mTLS handshakes"
         );
     }
-    let patch = build_gateway_status_patch(gw, health, generation, &now, addr, ingress_ports);
+    let patch = build_gateway_status_patch(gw, health, generation, &now, decision, ingress_ports);
     let started = std::time::Instant::now();
     let result = api
         .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))

@@ -46,6 +46,10 @@
 //! owned condition — not just `observed_generation` — to detect a status-only
 //! transition that nonetheless requires repatching.
 
+use crate::status_common::addresses::{
+    REASON_ADDRESS_NOT_USABLE, REASON_UNSUPPORTED_ADDRESS, StaticAddressOutcome,
+    SupportedAddressType, TypedAddress, evaluate_static_addresses,
+};
 use crate::status_common::{
     OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
     make_condition,
@@ -179,9 +183,15 @@ pub(crate) fn build_dedicated_gateway_status_patch(
     now: &Time,
 ) -> serde_json::Value {
     let addresses = compute_addresses(inputs.service, inputs.nodes);
+    let static_outcome = evaluate_dedicated_static(inputs.gw, &addresses);
 
-    let accepted = accepted_outcome(inputs.accepted);
-    let programmed = programmed_outcome(inputs.accepted, inputs.ready_pod_count, &addresses);
+    let accepted = accepted_outcome(inputs.accepted, &static_outcome);
+    let programmed = programmed_outcome(
+        inputs.accepted,
+        inputs.ready_pod_count,
+        &addresses,
+        &static_outcome,
+    );
     let cut_over = cut_over_outcome(inputs.accepted, inputs.ready_pod_count);
 
     let mut conditions = vec![
@@ -249,12 +259,12 @@ pub(crate) fn build_dedicated_gateway_status_patch(
         })
         .collect();
 
-    let address_json: Vec<serde_json::Value> = addresses
-        .iter()
-        .map(|a| {
+    let address_json: Vec<serde_json::Value> = published_addresses(&addresses, &static_outcome)
+        .into_iter()
+        .map(|(type_, value)| {
             serde_json::json!({
-                "type": a.type_.as_str(),
-                "value": a.value,
+                "type": type_,
+                "value": value,
             })
         })
         .collect();
@@ -281,10 +291,15 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
 ) -> bool {
     let expected_gen = inputs.gw.metadata.generation.unwrap_or(0);
     let desired_addresses = compute_addresses(inputs.service, inputs.nodes);
+    let static_outcome = evaluate_dedicated_static(inputs.gw, &desired_addresses);
 
-    let accepted = accepted_outcome(inputs.accepted);
-    let programmed =
-        programmed_outcome(inputs.accepted, inputs.ready_pod_count, &desired_addresses);
+    let accepted = accepted_outcome(inputs.accepted, &static_outcome);
+    let programmed = programmed_outcome(
+        inputs.accepted,
+        inputs.ready_pod_count,
+        &desired_addresses,
+        &static_outcome,
+    );
     let cut_over = cut_over_outcome(inputs.accepted, inputs.ready_pod_count);
 
     let owned_expected = [
@@ -366,16 +381,20 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
         .as_ref()
         .and_then(|s| s.addresses.as_deref())
         .unwrap_or(&[]);
-    if current_addresses.len() != desired_addresses.len() {
+    // #260: compare against the *published* set (gated by the static-address
+    // outcome), not the raw bound addresses, so a request that resolves to an
+    // empty/usable-only set is detected.
+    let desired_published = published_addresses(&desired_addresses, &static_outcome);
+    if current_addresses.len() != desired_published.len() {
         return true;
     }
     let current_set: BTreeSet<(String, String)> = current_addresses
         .iter()
         .map(|a: &GatewayStatusAddresses| (a.r#type.clone().unwrap_or_default(), a.value.clone()))
         .collect();
-    let desired_set: BTreeSet<(String, String)> = desired_addresses
-        .iter()
-        .map(|a| (a.type_.as_str().to_string(), a.value.clone()))
+    let desired_set: BTreeSet<(String, String)> = desired_published
+        .into_iter()
+        .map(|(type_, value)| (type_.to_string(), value))
         .collect();
     if current_set != desired_set {
         return true;
@@ -503,13 +522,29 @@ struct ConditionOutcome {
     message: &'static str,
 }
 
-fn accepted_outcome(accepted: AcceptedOutcome) -> ConditionOutcome {
+fn accepted_outcome(
+    accepted: AcceptedOutcome,
+    static_outcome: &StaticAddressOutcome,
+) -> ConditionOutcome {
     match accepted {
-        AcceptedOutcome::Accepted => ConditionOutcome {
-            status: "True",
-            reason: REASON_ACCEPTED,
-            message: "",
-        },
+        AcceptedOutcome::Accepted => {
+            // GatewayStaticAddresses (#260): a missing parametersRef target is
+            // more fundamental than an address-type problem, so InvalidParameters
+            // already short-circuited above. Here the params resolved, so an
+            // unsupported requested address type is the only Accepted=False cause.
+            if static_outcome.accepted_override.is_some() {
+                return ConditionOutcome {
+                    status: "False",
+                    reason: REASON_UNSUPPORTED_ADDRESS,
+                    message: "spec.addresses contains an address type this implementation does not support",
+                };
+            }
+            ConditionOutcome {
+                status: "True",
+                reason: REASON_ACCEPTED,
+                message: "",
+            }
+        }
         AcceptedOutcome::InvalidParameters => ConditionOutcome {
             status: "False",
             reason: REASON_INVALID_PARAMETERS,
@@ -527,8 +562,12 @@ fn programmed_outcome(
     accepted: AcceptedOutcome,
     ready_pod_count: usize,
     addresses: &[StatusAddress],
+    static_outcome: &StaticAddressOutcome,
 ) -> ConditionOutcome {
-    if accepted == AcceptedOutcome::InvalidParameters {
+    // Accepted=False — either an unresolvable parametersRef or an unsupported
+    // requested address type (#260) — means the Gateway cannot be programmed.
+    if accepted == AcceptedOutcome::InvalidParameters || static_outcome.accepted_override.is_some()
+    {
         return ConditionOutcome {
             status: "False",
             reason: REASON_INVALID,
@@ -540,6 +579,15 @@ fn programmed_outcome(
             status: "False",
             reason: REASON_PENDING,
             message: "Awaiting Ready dedicated-proxy Pod",
+        };
+    }
+    // GatewayStaticAddresses (#260): a requested address of a supported type that
+    // could not be bound to the Service ranks above the generic "no address" case.
+    if static_outcome.programmed_override == Some(REASON_ADDRESS_NOT_USABLE) {
+        return ConditionOutcome {
+            status: "False",
+            reason: REASON_ADDRESS_NOT_USABLE,
+            message: "one or more requested spec.addresses could not be assigned to the Gateway",
         };
     }
     if addresses.is_empty() {
@@ -569,6 +617,46 @@ fn cut_over_outcome(accepted: AcceptedOutcome, ready_pod_count: usize) -> Condit
             reason: REASON_PROVISIONING,
             message: "Dedicated proxy has zero Ready pods",
         }
+    }
+}
+
+impl AddressType {
+    /// Map to the shared static-address validator's type enum (#260).
+    fn to_supported(self) -> SupportedAddressType {
+        match self {
+            Self::IpAddress => SupportedAddressType::IpAddress,
+            Self::Hostname => SupportedAddressType::Hostname,
+        }
+    }
+}
+
+/// Evaluate `Gateway.spec.addresses` (GatewayStaticAddresses, #260) against the
+/// addresses coxswain actually bound to the dedicated Service.
+fn evaluate_dedicated_static(gw: &Gateway, bound: &[StatusAddress]) -> StaticAddressOutcome {
+    let resolved: Vec<TypedAddress> = bound
+        .iter()
+        .map(|a| TypedAddress::new(a.type_.to_supported(), a.value.clone()))
+        .collect();
+    evaluate_static_addresses(gw.spec.addresses.as_deref().unwrap_or_default(), &resolved)
+}
+
+/// The `(type, value)` pairs to publish in `status.addresses`: the gated static
+/// set when the feature is engaged (#260), else the auto-derived bound addresses.
+fn published_addresses(
+    bound: &[StatusAddress],
+    static_outcome: &StaticAddressOutcome,
+) -> Vec<(&'static str, String)> {
+    if static_outcome.feature_engaged {
+        static_outcome
+            .status_addresses
+            .iter()
+            .map(|a| (a.type_.as_str(), a.value.clone()))
+            .collect()
+    } else {
+        bound
+            .iter()
+            .map(|a| (a.type_.as_str(), a.value.clone()))
+            .collect()
     }
 }
 
@@ -1055,6 +1143,104 @@ mod tests {
         assert_eq!(
             condition_of(&patch, "Programmed"),
             Some(("False".to_string(), "Pending".to_string()))
+        );
+    }
+
+    // ============================================================================
+    // GatewayStaticAddresses (#260)
+    // ============================================================================
+
+    fn gateway_with_addresses(addrs: Vec<(Option<&str>, Option<&str>)>) -> Gateway {
+        use coxswain_reflector::gw_types::v::gateways::GatewayAddresses;
+        let mut gw = gateway(1, vec![("http", 80)], None);
+        gw.spec.addresses = Some(
+            addrs
+                .into_iter()
+                .map(|(t, v)| GatewayAddresses {
+                    r#type: t.map(str::to_string),
+                    value: v.map(str::to_string),
+                })
+                .collect(),
+        );
+        gw
+    }
+
+    #[test]
+    fn static_unsupported_type_sets_accepted_false_unsupported_address() {
+        let gw = gateway_with_addresses(vec![(Some("test/fake"), Some("x"))]);
+        let svc = service_clusterip("10.96.7.42");
+        let inputs = inputs(
+            &gw,
+            Some(&svc),
+            &[],
+            empty_status(),
+            AcceptedOutcome::Accepted,
+            1,
+        );
+        let patch = build_dedicated_gateway_status_patch(&inputs, 1, &epoch());
+        assert_eq!(
+            condition_of(&patch, "Accepted"),
+            Some(("False".to_string(), "UnsupportedAddress".to_string()))
+        );
+        assert_eq!(
+            condition_of(&patch, "Programmed"),
+            Some(("False".to_string(), "Invalid".to_string()))
+        );
+        assert!(
+            addresses_of(&patch).is_empty(),
+            "rejected request publishes no address"
+        );
+    }
+
+    #[test]
+    fn static_requested_ip_unbound_is_address_not_usable() {
+        // Requests 192.0.2.1 but the Service bound a different clusterIP.
+        let gw = gateway_with_addresses(vec![(Some("IPAddress"), Some("192.0.2.1"))]);
+        let svc = service_clusterip("10.96.7.42");
+        let inputs = inputs(
+            &gw,
+            Some(&svc),
+            &[],
+            empty_status(),
+            AcceptedOutcome::Accepted,
+            1,
+        );
+        let patch = build_dedicated_gateway_status_patch(&inputs, 1, &epoch());
+        assert_eq!(
+            condition_of(&patch, "Accepted"),
+            Some(("True".to_string(), "Accepted".to_string()))
+        );
+        assert_eq!(
+            condition_of(&patch, "Programmed"),
+            Some(("False".to_string(), "AddressNotUsable".to_string()))
+        );
+        assert!(
+            addresses_of(&patch).is_empty(),
+            "unusable request publishes no address"
+        );
+    }
+
+    #[test]
+    fn static_requested_ip_bound_is_programmed_and_published() {
+        // Requests the very IP the Service bound → honored.
+        let gw = gateway_with_addresses(vec![(Some("IPAddress"), Some("10.96.7.42"))]);
+        let svc = service_clusterip("10.96.7.42");
+        let inputs = inputs(
+            &gw,
+            Some(&svc),
+            &[],
+            empty_status(),
+            AcceptedOutcome::Accepted,
+            1,
+        );
+        let patch = build_dedicated_gateway_status_patch(&inputs, 1, &epoch());
+        assert_eq!(
+            condition_of(&patch, "Programmed"),
+            Some(("True".to_string(), "Programmed".to_string()))
+        );
+        assert_eq!(
+            addresses_of(&patch),
+            vec![("IPAddress".to_string(), "10.96.7.42".to_string())]
         );
     }
 

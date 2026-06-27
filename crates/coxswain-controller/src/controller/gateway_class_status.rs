@@ -21,6 +21,7 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "GatewayHTTPListenerIsolation",
     "GatewayHTTPSListenerDetectMisdirectedRequests",
     "GatewayPort8080",
+    "GatewayStaticAddresses",
     "HTTPRoute",
     "HTTPRoute303RedirectStatusCode",
     "HTTPRoute307RedirectStatusCode",

@@ -1,0 +1,20 @@
+---
+# GatewayStaticAddresses (#260): a shared Gateway requesting a single static
+# address. ADDR_TYPE/ADDR_VALUE are templated per test (unsupported type,
+# out-of-CIDR IP, or a probed free in-CIDR clusterIP).
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  addresses:
+    - type: ${ADDR_TYPE}
+      value: ${ADDR_VALUE}
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

@@ -81,18 +81,11 @@ pub(super) fn gateway_accepted(gw: &Gateway) -> bool {
     )
 }
 
-pub(super) fn gateway_programmed(gw: &Gateway) -> bool {
-    has_condition(
-        gw.status.as_ref().and_then(|s| s.conditions.as_deref()),
-        "Programmed",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        gateway_accepted, gateway_class_accepted, gateway_programmed, has_condition,
-        is_listener_set_ref, make_condition, route_parent_gets_status,
+        gateway_accepted, gateway_class_accepted, has_condition, is_listener_set_ref,
+        make_condition, route_parent_gets_status,
     };
     use coxswain_core::ownership::ObjectKey;
     use coxswain_reflector::gw_types::v::gatewayclasses::{GatewayClass, GatewayClassStatus};
@@ -321,38 +314,5 @@ mod tests {
             ..Default::default()
         };
         assert!(!gateway_accepted(&gw));
-    }
-
-    #[test]
-    fn gateway_programmed_true_when_condition_present() {
-        let gw = Gateway {
-            status: Some(GatewayStatus {
-                conditions: Some(vec![stub_condition("Programmed", "True")]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(gateway_programmed(&gw));
-    }
-
-    #[test]
-    fn gateway_programmed_false_when_absent() {
-        let gw = Gateway {
-            status: Some(GatewayStatus {
-                conditions: Some(vec![stub_condition("Accepted", "True")]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(!gateway_programmed(&gw));
-    }
-
-    #[test]
-    fn gateway_programmed_false_when_no_status() {
-        let gw = Gateway {
-            status: None,
-            ..Default::default()
-        };
-        assert!(!gateway_programmed(&gw));
     }
 }
