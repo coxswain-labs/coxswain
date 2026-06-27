@@ -32,7 +32,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, warn};
 
 use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
-use coxswain_core::listener_health::SharedGatewayListenerHealth;
+use coxswain_core::listener_status::SharedGatewayListenerStatus;
 use coxswain_core::node_registry::{NodeScope, SharedNodeRegistry};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{
@@ -49,7 +49,7 @@ use crate::proto::v1::{
 };
 use crate::version::{ContentHash, WIRE_VERSION};
 use crate::wire::{
-    client_cert_to_wire, gateway_to_wire, ingress_to_wire, listener_health_to_wire,
+    client_cert_to_wire, gateway_to_wire, ingress_to_wire, listener_status_to_wire,
     passthrough_to_wire, port_tls_to_wire, scope_from_wire,
 };
 
@@ -71,10 +71,10 @@ pub struct SnapshotSource {
     pub tls: SharedPortTlsStore,
     /// Client-certificate mTLS config store shared cell.
     pub client_certs: SharedClientCertStore,
-    /// Per-Gateway listener TLS-health map. Serialised into the
-    /// `listener_health` wire field so proxy nodes can drive dynamic
+    /// Per-Gateway listener status map. Serialised into the
+    /// `listener_status` wire field so proxy nodes can drive dynamic
     /// Gateway listener port bind/unbind without Kubernetes API access.
-    pub listener_health: SharedGatewayListenerHealth,
+    pub listener_status: SharedGatewayListenerStatus,
     /// Per-cut-over-Gateway routing snapshots, keyed by Gateway [`ObjectKey`].
     /// Read when a client subscribes with [`Scope::Gateway`]; the five cells
     /// above serve [`Scope::SharedPool`] (and deliberately exclude cut-over
@@ -93,7 +93,7 @@ impl Clone for SnapshotSource {
             gateway: self.gateway.clone(),
             tls: self.tls.clone(),
             client_certs: self.client_certs.clone(),
-            listener_health: self.listener_health.clone(),
+            listener_status: self.listener_status.clone(),
             dedicated: self.dedicated.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
         }
@@ -166,7 +166,7 @@ struct SnapshotContent {
     gateway_routing: p::RoutingTable,
     tls_store: p::PortTlsStore,
     client_cert_store: p::ClientCertStore,
-    listener_health: p::GatewayListenerHealth,
+    listener_status: p::GatewayListenerStatus,
     tls_passthrough: p::TlsPassthroughTable,
 }
 
@@ -180,7 +180,7 @@ impl SnapshotContent {
             gateway_routing: Some(self.gateway_routing),
             tls_store: Some(self.tls_store),
             client_cert_store: Some(self.client_cert_store),
-            listener_health: Some(self.listener_health),
+            listener_status: Some(self.listener_status),
             tls_passthrough: Some(self.tls_passthrough),
         }
     }
@@ -211,7 +211,7 @@ fn build_snapshot(
             let gateway = source.gateway.load();
             let tls = source.tls.load();
             let client_certs = source.client_certs.load();
-            let listener_health = source.listener_health.load();
+            let listener_status = source.listener_status.load();
             let passthrough = source.passthrough_routes.load();
 
             assemble_snapshot(
@@ -219,7 +219,7 @@ fn build_snapshot(
                 gateway_to_wire(&gateway),
                 port_tls_to_wire(&tls),
                 client_cert_to_wire(&client_certs),
-                listener_health_to_wire(&listener_health),
+                listener_status_to_wire(&listener_status),
                 passthrough_to_wire(&passthrough),
             )
         }
@@ -244,7 +244,7 @@ fn build_snapshot(
                             p::RoutingTable::default(),
                             p::PortTlsStore::default(),
                             p::ClientCertStore::default(),
-                            p::GatewayListenerHealth::default(),
+                            p::GatewayListenerStatus::default(),
                             // Dedicated proxies never serve TLS passthrough routes.
                             p::TlsPassthroughTable::default(),
                         );
@@ -255,7 +255,7 @@ fn build_snapshot(
                         gateway_to_wire(&snap.gateway),
                         port_tls_to_wire(&snap.tls),
                         client_cert_to_wire(&snap.client_certs),
-                        listener_health_to_wire(&snap.listener_health),
+                        listener_status_to_wire(&snap.listener_status),
                         // Dedicated proxies never serve TLS passthrough routes.
                         p::TlsPassthroughTable::default(),
                     )
@@ -267,7 +267,7 @@ fn build_snapshot(
                     p::RoutingTable::default(),
                     p::PortTlsStore::default(),
                     p::ClientCertStore::default(),
-                    p::GatewayListenerHealth::default(),
+                    p::GatewayListenerStatus::default(),
                     p::TlsPassthroughTable::default(),
                 ),
             }
@@ -284,7 +284,7 @@ fn assemble_snapshot(
     gateway_dto: p::RoutingTable,
     tls_dto: p::PortTlsStore,
     client_certs_dto: p::ClientCertStore,
-    listener_health_dto: p::GatewayListenerHealth,
+    listener_status_dto: p::GatewayListenerStatus,
     tls_passthrough_dto: p::TlsPassthroughTable,
 ) -> SnapshotContent {
     let hashes = vec![
@@ -300,7 +300,7 @@ fn assemble_snapshot(
         ContentHash::compute(&client_certs_dto.encode_to_vec())
             .as_str()
             .to_owned(),
-        ContentHash::compute(&listener_health_dto.encode_to_vec())
+        ContentHash::compute(&listener_status_dto.encode_to_vec())
             .as_str()
             .to_owned(),
         ContentHash::compute(&tls_passthrough_dto.encode_to_vec())
@@ -315,7 +315,7 @@ fn assemble_snapshot(
         gateway_routing: gateway_dto,
         tls_store: tls_dto,
         client_cert_store: client_certs_dto,
-        listener_health: listener_health_dto,
+        listener_status: listener_status_dto,
         tls_passthrough: tls_passthrough_dto,
     }
 }
@@ -697,7 +697,7 @@ mod tests {
         discovery_server::DiscoveryServer, server_message::Kind as SrvKind,
     };
     use coxswain_core::dedicated_registry::DedicatedRoutingSnapshot;
-    use coxswain_core::listener_health::GatewayListenerHealth;
+    use coxswain_core::listener_status::GatewayListenerStatus;
     use coxswain_core::node_registry::SharedNodeRegistry;
     use coxswain_core::routing::{
         GatewayRoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable,
@@ -728,7 +728,7 @@ mod tests {
             gateway: SharedGatewayRoutingTable::new(),
             tls: SharedPortTlsStore::new(),
             client_certs: SharedClientCertStore::new(),
-            listener_health: SharedGatewayListenerHealth::new(),
+            listener_status: SharedGatewayListenerStatus::new(),
             dedicated: DedicatedRoutingRegistry::new(),
             passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         }
@@ -1122,18 +1122,18 @@ mod tests {
     // ── scope-aware snapshot dispatch (#426) ──────────────────────────────────
 
     /// Build a `SnapshotSource` whose dedicated registry holds one entry for
-    /// `key`, with a listener-health map keyed by that same `ObjectKey`.  The
+    /// `key`, with a listener status map keyed by that same `ObjectKey`.  The
     /// shared cells stay empty, so a SharedPool snapshot and a Gateway snapshot
-    /// are trivially distinguishable by their `listener_health` entry count.
+    /// are trivially distinguishable by their `listener_status` entry count.
     fn source_with_dedicated_entry(key: &ObjectKey) -> SnapshotSource {
         let source = empty_source();
         let mut lh = HashMap::new();
-        lh.insert(key.clone(), GatewayListenerHealth::default());
+        lh.insert(key.clone(), GatewayListenerStatus::default());
         let snap = Arc::new(DedicatedRoutingSnapshot {
             gateway: Arc::new(GatewayRoutingTable::default()),
             tls: Arc::new(PortTlsStore::default()),
             client_certs: Arc::new(ClientCertStore::default()),
-            listener_health: lh,
+            listener_status: lh,
             // Test value; scope-binding tests in tests/scope_binding.rs set the
             // real expected_proxy_sa and exercise the matching logic end-to-end.
             expected_proxy_sa: format!("{}-coxswain", key.name),
@@ -1160,7 +1160,7 @@ mod tests {
             None,
         );
 
-        let lh = snap.listener_health;
+        let lh = snap.listener_status;
         assert_eq!(
             lh.entries.len(),
             1,
@@ -1193,7 +1193,7 @@ mod tests {
         );
 
         assert!(
-            snap.listener_health.entries.is_empty(),
+            snap.listener_status.entries.is_empty(),
             "fail-closed: an absent Gateway receives no routes, not another scope's"
         );
         assert!(snap.gateway_routing.ports.is_empty());
@@ -1210,7 +1210,7 @@ mod tests {
         let snap = build_snapshot(&source, &Scope::SharedPool, None);
 
         assert!(
-            snap.listener_health.entries.is_empty(),
+            snap.listener_status.entries.is_empty(),
             "SharedPool reads the shared cells, never the dedicated registry"
         );
     }

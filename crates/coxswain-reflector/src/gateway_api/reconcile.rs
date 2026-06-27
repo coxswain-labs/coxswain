@@ -15,10 +15,10 @@ use crate::gw_types::{
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
 use crate::reconciler::listener_merge::EffectiveListener;
-use crate::tls::{
-    GatewayListenerHealth, ListenerHealthKey, ListenerInfo, ListenerSource, ListenerTlsOutcome,
-    load_tls_cert,
+use crate::status::{
+    GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey, ListenerTlsOutcome,
 };
+use crate::tls::load_tls_cert;
 use coxswain_core::crd::{PathRewriteRegex, RateLimit};
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
@@ -725,7 +725,7 @@ impl GatewayApiReconciler {
     /// Walks a Gateway's **effective** listeners (its own plus those merged from
     /// attached ListenerSets, GEP-1713), resolves TLS certificates for HTTPS
     /// listeners, and registers them in `builder`. Returns a per-listener health
-    /// map keyed by [`ListenerHealthKey`] so the controller can attribute each
+    /// map keyed by [`ListenerStatusKey`] so the controller can attribute each
     /// listener's status to the resource that declared it.
     ///
     /// `gw_name` is the parent Gateway's name (for log context); each listener's
@@ -748,7 +748,7 @@ impl GatewayApiReconciler {
         ls_cert_grants: &HashSet<ReferenceGrantKey>,
         builder: &mut PortTlsStoreBuilder,
         internal_ports: &HashMap<u16, u16>,
-    ) -> GatewayListenerHealth {
+    ) -> GatewayListenerStatus {
         let mut map = BTreeMap::new();
 
         for listener in listeners {
@@ -798,7 +798,7 @@ impl GatewayApiReconciler {
             li.internal_port = internal_port;
             li.conflicted = listener.conflicted;
             map.insert(
-                ListenerHealthKey {
+                ListenerStatusKey {
                     source: listener.source.clone(),
                     name: listener.name.clone(),
                 },
@@ -806,7 +806,7 @@ impl GatewayApiReconciler {
             );
         }
 
-        let mut glh = GatewayListenerHealth::default();
+        let mut glh = GatewayListenerStatus::default();
         glh.listeners = map;
         glh
     }
@@ -1015,7 +1015,7 @@ mod tests {
             &mut builder,
             &HashMap::new(),
         );
-        let outcome = &health.listeners[&ListenerHealthKey::listener_set(ls_key.clone(), "https")]
+        let outcome = &health.listeners[&ListenerStatusKey::listener_set(ls_key.clone(), "https")]
             .tls_outcome;
         assert!(
             matches!(outcome, ListenerTlsOutcome::RefNotPermitted { .. }),
@@ -1036,7 +1036,7 @@ mod tests {
             &HashMap::new(),
         );
         let outcome2 =
-            &health2.listeners[&ListenerHealthKey::listener_set(ls_key, "https")].tls_outcome;
+            &health2.listeners[&ListenerStatusKey::listener_set(ls_key, "https")].tls_outcome;
         assert!(
             !matches!(outcome2, ListenerTlsOutcome::RefNotPermitted { .. }),
             "a ListenerSet-from grant must permit the cross-ns cert ref, got {outcome2:?}"

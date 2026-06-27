@@ -37,8 +37,8 @@
 //! [`RoutingTable`]: coxswain_core::routing::RoutingTable
 //! [`Snapshot`]: crate::proto::v1::Snapshot
 
-use coxswain_core::listener_health::{
-    GatewayListenerHealth, ListenerHealthKey, ListenerInfo, ListenerSource, ListenerTlsOutcome,
+use coxswain_core::listener_status::{
+    GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey, ListenerTlsOutcome,
 };
 use coxswain_core::ownership::ObjectKey;
 
@@ -49,24 +49,24 @@ use crate::proto::v1 as p;
 // Listener health: to_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Serialise a map of `ObjectKey → GatewayListenerHealth` to its wire DTO.
+/// Serialise a map of `ObjectKey → GatewayListenerStatus` to its wire DTO.
 ///
 /// Entries are sorted by `ObjectKey` string representation for hash determinism.
 #[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn listener_health_to_wire(
-    map: &std::collections::HashMap<ObjectKey, GatewayListenerHealth>,
-) -> p::GatewayListenerHealth {
-    let mut entries: Vec<(&ObjectKey, &GatewayListenerHealth)> = map.iter().collect();
+pub fn listener_status_to_wire(
+    map: &std::collections::HashMap<ObjectKey, GatewayListenerStatus>,
+) -> p::GatewayListenerStatus {
+    let mut entries: Vec<(&ObjectKey, &GatewayListenerStatus)> = map.iter().collect();
     entries.sort_by_key(|(k, _)| k.to_string());
 
-    p::GatewayListenerHealth {
+    p::GatewayListenerStatus {
         entries: entries
             .into_iter()
-            .map(|(key, health)| p::GatewayHealthEntry {
+            .map(|(key, status)| p::GatewayStatusEntry {
                 object_key: key.to_string(),
-                health: Some(p::ListenerHealth {
-                    // BTreeMap<ListenerHealthKey, ListenerInfo> is already sorted by (source, name).
-                    listeners: health
+                status: Some(p::ListenerStatus {
+                    // BTreeMap<ListenerStatusKey, ListenerInfo> is already sorted by (source, name).
+                    listeners: status
                         .listeners
                         .iter()
                         .map(|(key, info)| p::ListenerInfoEntry {
@@ -149,15 +149,15 @@ fn listener_source_from_wire(source: &str) -> Result<ListenerSource, WireError> 
 // Listener health: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Reconstruct a `HashMap<ObjectKey, GatewayListenerHealth>` from its wire DTO.
+/// Reconstruct a `HashMap<ObjectKey, GatewayListenerStatus>` from its wire DTO.
 ///
 /// # Errors
 ///
 /// Returns [`WireError`] if any required field is missing.
-#[must_use = "the rebuilt listener-health map must be stored for the proxy to use it"]
-pub fn listener_health_from_wire(
-    dto: &p::GatewayListenerHealth,
-) -> Result<std::collections::HashMap<ObjectKey, GatewayListenerHealth>, WireError> {
+#[must_use = "the rebuilt listener status map must be stored for the proxy to use it"]
+pub fn listener_status_from_wire(
+    dto: &p::GatewayListenerStatus,
+) -> Result<std::collections::HashMap<ObjectKey, GatewayListenerStatus>, WireError> {
     dto.entries
         .iter()
         .map(|e| {
@@ -165,19 +165,19 @@ pub fn listener_health_from_wire(
                 e.object_key
                     .parse::<ObjectKey>()
                     .map_err(|_| WireError::MissingRequiredField {
-                        field: "gateway_health_entry.object_key",
+                        field: "gateway_status_entry.object_key",
                     })?;
-            let health_dto = e.health.as_ref().ok_or(WireError::MissingRequiredField {
-                field: "gateway_health_entry.health",
+            let status_dto = e.status.as_ref().ok_or(WireError::MissingRequiredField {
+                field: "gateway_status_entry.status",
             })?;
-            let health = listener_health_from_dto(health_dto)?;
-            Ok((key, health))
+            let status_entry = listener_status_from_dto(status_dto)?;
+            Ok((key, status_entry))
         })
         .collect()
 }
 
-fn listener_health_from_dto(dto: &p::ListenerHealth) -> Result<GatewayListenerHealth, WireError> {
-    let mut glh = GatewayListenerHealth::default();
+fn listener_status_from_dto(dto: &p::ListenerStatus) -> Result<GatewayListenerStatus, WireError> {
+    let mut glh = GatewayListenerStatus::default();
     for entry in &dto.listeners {
         let info = entry.info.as_ref().ok_or(WireError::MissingRequiredField {
             field: "listener_info_entry.info",
@@ -185,7 +185,7 @@ fn listener_health_from_dto(dto: &p::ListenerHealth) -> Result<GatewayListenerHe
         let li = crate::wire::listener_info_from_wire(info)?;
         let source = listener_source_from_wire(&entry.source)?;
         glh.listeners.insert(
-            ListenerHealthKey {
+            ListenerStatusKey {
                 source,
                 name: entry.name.clone(),
             },
@@ -202,18 +202,18 @@ mod tests {
     // ── Listener health round-trip ────────────────────────────────────────────
 
     #[test]
-    fn listener_health_round_trips() {
+    fn listener_status_round_trips() {
         let mut map = std::collections::HashMap::new();
-        let mut health = GatewayListenerHealth::default();
+        let mut status = GatewayListenerStatus::default();
 
         let mut http_info = ListenerInfo::default();
         http_info.tls_outcome = ListenerTlsOutcome::NotApplicable;
         http_info.attached_routes = 3;
         http_info.hostname = "example.com".to_string();
         http_info.port = 80;
-        health
+        status
             .listeners
-            .insert(ListenerHealthKey::gateway("http"), http_info);
+            .insert(ListenerStatusKey::gateway("http"), http_info);
 
         let mut https_info = ListenerInfo::default();
         https_info.tls_outcome = ListenerTlsOutcome::Resolved;
@@ -225,9 +225,9 @@ mod tests {
         // allocated internal targetPort — it must survive the wire round-trip so
         // the proxy binds and keys routing on the right port.
         https_info.internal_port = 30007;
-        health
+        status
             .listeners
-            .insert(ListenerHealthKey::gateway("https"), https_info);
+            .insert(ListenerStatusKey::gateway("https"), https_info);
 
         // GEP-2643 (#70): a TLS/Terminate listener resolves to Unsupported, and a
         // TLS/Passthrough listener to TlsPassthrough. Both must survive the wire
@@ -239,15 +239,15 @@ mod tests {
             message: "tls.mode: Terminate is not supported".to_string(),
         };
         terminate_info.port = 8443;
-        health
+        status
             .listeners
-            .insert(ListenerHealthKey::gateway("tls-terminate"), terminate_info);
+            .insert(ListenerStatusKey::gateway("tls-terminate"), terminate_info);
 
         let mut passthrough_info = ListenerInfo::default();
         passthrough_info.tls_outcome = ListenerTlsOutcome::TlsPassthrough;
         passthrough_info.port = 8444;
-        health.listeners.insert(
-            ListenerHealthKey::gateway("tls-passthrough"),
+        status.listeners.insert(
+            ListenerStatusKey::gateway("tls-passthrough"),
             passthrough_info,
         );
 
@@ -261,22 +261,22 @@ mod tests {
         ls_http.attached_routes = 7;
         ls_http.port = 8080;
         ls_http.conflicted = true;
-        health.listeners.insert(
-            ListenerHealthKey::listener_set(ls_key.clone(), "http"),
+        status.listeners.insert(
+            ListenerStatusKey::listener_set(ls_key.clone(), "http"),
             ls_http,
         );
 
-        map.insert(ObjectKey::new("default", "my-gw"), health);
+        map.insert(ObjectKey::new("default", "my-gw"), status);
 
-        let dto = listener_health_to_wire(&map);
-        let map2 = listener_health_from_wire(&dto).expect("from_wire");
+        let dto = listener_status_to_wire(&map);
+        let map2 = listener_status_from_wire(&dto).expect("from_wire");
 
         let h2 = map2
             .get(&ObjectKey::new("default", "my-gw"))
             .expect("key found");
         assert_eq!(h2.listeners.len(), 5, "listener count preserved");
-        let gw_http = ListenerHealthKey::gateway("http");
-        let gw_https = ListenerHealthKey::gateway("https");
+        let gw_http = ListenerStatusKey::gateway("http");
+        let gw_https = ListenerStatusKey::gateway("https");
         assert_eq!(
             h2.listeners[&gw_http].attached_routes, 3,
             "attached_routes preserved"
@@ -304,7 +304,7 @@ mod tests {
         );
         assert!(
             matches!(
-                &h2.listeners[&ListenerHealthKey::gateway("tls-terminate")].tls_outcome,
+                &h2.listeners[&ListenerStatusKey::gateway("tls-terminate")].tls_outcome,
                 ListenerTlsOutcome::Unsupported { message }
                     if message == "tls.mode: Terminate is not supported"
             ),
@@ -312,14 +312,14 @@ mod tests {
         );
         assert!(
             matches!(
-                h2.listeners[&ListenerHealthKey::gateway("tls-passthrough")].tls_outcome,
+                h2.listeners[&ListenerStatusKey::gateway("tls-passthrough")].tls_outcome,
                 ListenerTlsOutcome::TlsPassthrough
             ),
             "TlsPassthrough outcome preserved"
         );
         // GEP-1713: the ListenerSet-sourced "http" is a distinct entry from the
         // Gateway's own "http", proving (source, name) keying survives the wire.
-        let ls_http_key = ListenerHealthKey::listener_set(ls_key, "http");
+        let ls_http_key = ListenerStatusKey::listener_set(ls_key, "http");
         assert_eq!(
             h2.listeners[&ls_http_key].attached_routes, 7,
             "ListenerSet listener round-trips under its own source"

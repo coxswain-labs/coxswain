@@ -24,7 +24,7 @@ use crate::gw_types::v::gateways::{
     Gateway, GatewayAllowedListenersNamespacesFrom, GatewayListeners, GatewayListenersTlsMode,
 };
 use crate::gw_types::v::listenersets::{ListenerSetListeners, ListenerSetListenersTlsMode};
-use crate::tls::ListenerSource;
+use crate::status::ListenerSource;
 use coxswain_core::ownership::ObjectKey;
 
 /// One normalised `certificateRefs` entry (Gateway/ListenerSet share the shape).
@@ -57,7 +57,7 @@ pub(crate) struct EffectiveTls {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveListener {
     /// Which resource declared this listener (drives status attribution + the
-    /// per-listener health [`crate::tls::ListenerHealthKey`]).
+    /// per-listener status key [`crate::status::ListenerStatusKey`]).
     pub source: ListenerSource,
     /// Namespace this listener's `certificateRefs` resolve in: the Gateway's own
     /// namespace for a Gateway listener, the ListenerSet's namespace otherwise.

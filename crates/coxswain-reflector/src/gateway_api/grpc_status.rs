@@ -1,9 +1,9 @@
 //! [`RouteLike`] impl for `GRPCRoute` — the GRPCRoute-specific projections and
 //! filter predicate. The kind-generic `Accepted`/`ResolvedRefs` algorithm lives
-//! in [`super::route_health`]; this realizes the abstraction issue #33 deferred
+//! in [`super::route_status`]; this realizes the abstraction issue #33 deferred
 //! until the second concrete route kind existed.
 
-use super::route_health::{BackendRefView, ParentRefView, RouteLike};
+use super::route_status::{BackendRefView, ParentRefView, RouteLike};
 use crate::gw_types::v::grpcroutes::{GrpcRoute, GrpcRouteRulesFiltersType};
 
 impl RouteLike for GrpcRoute {
@@ -75,7 +75,7 @@ impl RouteLike for GrpcRoute {
 
 #[cfg(test)]
 mod tests {
-    use crate::gateway_api::route_health::compute_route_health;
+    use crate::gateway_api::route_status::compute_route_health;
     use crate::gw_types::GrpcRoute;
     use crate::gw_types::v::gateways::{Gateway, GatewayListeners, GatewaySpec};
     use crate::gw_types::v::grpcroutes::{

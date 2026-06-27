@@ -1,6 +1,6 @@
 //! Internal key types used as `HashMap` keys across the reflector pipeline.
 
-use coxswain_core::listener_health::ListenerSource;
+use coxswain_core::listener_status::ListenerSource;
 use coxswain_core::ownership::ObjectKey;
 
 /// Key for a specific listener in the routing tables, scoped to the resource that

@@ -19,7 +19,7 @@ use coxswain_reflector::gw_types::v::gateways::{
     GatewayStatusListenersSupportedKinds,
 };
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::tls::{FrontendValidationOutcome, ListenerInfo, ListenerTlsOutcome};
+use coxswain_reflector::status::{FrontendValidationOutcome, ListenerInfo, ListenerTlsOutcome};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Conditions whose `type` starts with this prefix are owned by the
@@ -154,7 +154,7 @@ pub(crate) fn listener_route_kind_info(
 /// conformance test asserts.
 ///
 /// `info` is the snapshot for this listener from
-/// `SharedGatewayListenerHealth.load()`; pass `None` for listeners the
+/// `SharedGatewayListenerStatus.load()`; pass `None` for listeners the
 /// reflector hasn't yet computed (initial sync, or a Gateway whose class
 /// isn't claimed) — the defaults degrade to the healthy/empty case.
 #[must_use]

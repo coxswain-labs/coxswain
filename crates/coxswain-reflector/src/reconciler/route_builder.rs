@@ -20,9 +20,9 @@ use crate::gw_types::{GrpcRoute, HttpRoute};
 use crate::ingress::annotations::AnnotationIssue;
 use crate::ingress::{IngressClassContext, IngressPorts, IngressReconciler, resolve_class_params};
 use crate::keys::ListenerKey;
-use crate::tls::{
-    BackendClientCertOutcome, GatewayListenerHealth, ListenerHealthKey, ListenerInfo,
-    ListenerSource, ListenerTlsOutcome, RouteHealthMap,
+use crate::status::{
+    BackendClientCertOutcome, GatewayListenerStatus, ListenerInfo, ListenerSource,
+    ListenerStatusKey, ListenerTlsOutcome, RouteStatusMap,
 };
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self as reference_grants, ReferenceGrantKey};
@@ -449,7 +449,7 @@ fn publish_routes<K>(
 }
 
 /// Build and publish the TLS cert store and the per-port HTTPS listener-hostname
-/// snapshot; returns per-gateway listener health for further use.
+/// snapshot; returns per-gateway listener status for further use.
 ///
 /// `skip_cut_over` drops Gateways whose `DedicatedProxyReady=True` condition
 /// matches their current generation — appropriate for the *shared* reconciler
@@ -465,7 +465,7 @@ pub(super) fn build_tls(
     listener_hostnames_shared: &SharedListenerHostnames,
     skip_cut_over: bool,
     ingress_https_port: u16,
-) -> HashMap<ObjectKey, GatewayListenerHealth> {
+) -> HashMap<ObjectKey, GatewayListenerStatus> {
     let vip_internal = stores.vip_internal;
     // Per-port cert store (#472): the bind port keys each cert so the proxy's
     // per-port SniCertSelector — scoped to the accepted local port — finds it.
@@ -482,7 +482,7 @@ pub(super) fn build_tls(
     }
 
     let mut lh_builder = ListenerHostnamesBuilder::new();
-    let mut gateway_listener_health: HashMap<ObjectKey, GatewayListenerHealth> = HashMap::new();
+    let mut gateway_listener_status: HashMap<ObjectKey, GatewayListenerStatus> = HashMap::new();
     for gw in stores.gateways.state() {
         if !ownership
             .gateway_classes
@@ -537,7 +537,7 @@ pub(super) fn build_tls(
                 li.tls_outcome.is_https_terminate(),
             );
         }
-        gateway_listener_health.insert(gw_key, health);
+        gateway_listener_status.insert(gw_key, health);
     }
 
     let tls_store = tls_builder.build();
@@ -559,7 +559,7 @@ pub(super) fn build_tls(
         tracing::trace!("listener-hostnames snapshot unchanged, skip swap");
     }
 
-    gateway_listener_health
+    gateway_listener_status
 }
 
 /// Build and publish the per-host client-certificate mTLS config store.
@@ -571,8 +571,8 @@ pub(super) fn build_tls(
 /// 2. **Gateway** `spec.tls.frontend.default.validation` (GEP-91, #86) — gateway-wide CA
 ///    sourced from a ConfigMap, keyed by listener hostname.
 ///
-/// The function also annotates `gateway_listener_health` with
-/// [`coxswain_core::listener_health::FrontendValidationHealth`] so the controller can emit
+/// The function also annotates `gateway_listener_status` with
+/// [`coxswain_core::listener_status::FrontendValidationStatus`] so the controller can emit
 /// the `InsecureFrontendValidationMode` condition required by GEP-91.
 ///
 /// Uses a `PartialEq` short-circuit identical to [`build_tls`]: if the new store is byte-for-byte
@@ -583,7 +583,7 @@ pub(super) fn build_client_certs(
     ingresses: &[Arc<Ingress>],
     ownership: &Ownership<'_>,
     client_certs_shared: &SharedClientCertStore,
-    gateway_listener_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
+    gateway_listener_status: &mut HashMap<ObjectKey, GatewayListenerStatus>,
     skip_cut_over: bool,
 ) {
     let mut builder = ClientCertStoreBuilder::new();
@@ -615,7 +615,7 @@ pub(super) fn build_client_certs(
         let key = ObjectKey::new(ns, name);
         // Update the health entry that was created by build_tls for this Gateway.
         // If no entry exists yet (race on first rebuild) create a default one.
-        let health = gateway_listener_health.entry(key).or_default();
+        let health = gateway_listener_status.entry(key).or_default();
         crate::gateway_api::frontend_tls::reconcile_frontend_validation(
             &gw,
             stores.configmaps,
@@ -636,17 +636,17 @@ pub(super) fn build_client_certs(
     }
 }
 
-/// Fold per-Gateway GEP-3155 backend client-cert outcomes into `gateway_listener_health`
+/// Fold per-Gateway GEP-3155 backend client-cert outcomes into `gateway_listener_status`
 /// so the controller can emit the gateway-level `ResolvedRefs` condition.
 ///
 /// Creates a health entry for a Gateway that resolved a backend client cert but has no
 /// TLS listeners (the invalid-config conformance gateways have only an HTTP listener).
 pub(super) fn merge_backend_client_cert_health(
-    gateway_listener_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
+    gateway_listener_status: &mut HashMap<ObjectKey, GatewayListenerStatus>,
     health: &HashMap<ObjectKey, BackendClientCertOutcome>,
 ) {
     for (key, outcome) in health {
-        gateway_listener_health
+        gateway_listener_status
             .entry(key.clone())
             .or_default()
             .backend_client_cert = Some(outcome.clone());
@@ -666,7 +666,7 @@ pub(super) fn count_attached_routes<R: RouteLike>(
     routes: &[Arc<R>],
     owned_gateways: &HashSet<ObjectKey>,
     ls_parent: &HashMap<ObjectKey, ObjectKey>,
-    gateway_listener_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
+    gateway_listener_status: &mut HashMap<ObjectKey, GatewayListenerStatus>,
     passthrough_kind: bool,
 ) {
     // A listener accepts this route kind when its passthrough-ness matches the
@@ -699,9 +699,9 @@ pub(super) fn count_attached_routes<R: RouteLike>(
             if !owned_gateways.contains(&target_gw) {
                 continue;
             }
-            if let Some(health) = gateway_listener_health.get_mut(&target_gw) {
+            if let Some(health) = gateway_listener_status.get_mut(&target_gw) {
                 if let Some(sn) = pr.section_name {
-                    let key = ListenerHealthKey {
+                    let key = ListenerStatusKey {
                         source: source.clone(),
                         name: sn.to_string(),
                     };
@@ -723,7 +723,7 @@ pub(super) fn count_attached_routes<R: RouteLike>(
                         info.attached_routes += 1;
                     }
                 } else {
-                    let matching: Vec<ListenerHealthKey> = health
+                    let matching: Vec<ListenerStatusKey> = health
                         .listeners
                         .keys()
                         .filter(|k| k.source == source)
@@ -768,7 +768,7 @@ pub(super) fn build_passthrough_routes(
     effective: &HashMap<ObjectKey, EffectiveGateway>,
     backend_grants: &HashSet<ReferenceGrantKey>,
     out: &SharedTlsPassthroughTable,
-) -> RouteHealthMap {
+) -> RouteStatusMap {
     let tls_routes = stores.tls_routes.state();
     let gateways = stores.gateways.state();
     let vip_internal = stores.vip_internal;
@@ -991,18 +991,18 @@ mod tests {
         name: &str,
         tls_outcome: ListenerTlsOutcome,
         port: u16,
-    ) -> (ListenerHealthKey, ListenerInfo) {
+    ) -> (ListenerStatusKey, ListenerInfo) {
         let mut info = ListenerInfo::default();
         info.tls_outcome = tls_outcome;
         info.port = port;
-        (ListenerHealthKey::gateway(name), info)
+        (ListenerStatusKey::gateway(name), info)
     }
 
     /// A single-Gateway health map keyed `default/gw`.
     fn health(
-        listeners: Vec<(ListenerHealthKey, ListenerInfo)>,
-    ) -> HashMap<ObjectKey, GatewayListenerHealth> {
-        let mut gw = GatewayListenerHealth::default();
+        listeners: Vec<(ListenerStatusKey, ListenerInfo)>,
+    ) -> HashMap<ObjectKey, GatewayListenerStatus> {
+        let mut gw = GatewayListenerStatus::default();
         gw.listeners = listeners.into_iter().collect();
         std::iter::once((ObjectKey::new("default", "gw"), gw)).collect()
     }
@@ -1068,8 +1068,8 @@ mod tests {
         })
     }
 
-    fn attached(map: &HashMap<ObjectKey, GatewayListenerHealth>, name: &str) -> i32 {
-        map[&ObjectKey::new("default", "gw")].listeners[&ListenerHealthKey::gateway(name)]
+    fn attached(map: &HashMap<ObjectKey, GatewayListenerStatus>, name: &str) -> i32 {
+        map[&ObjectKey::new("default", "gw")].listeners[&ListenerStatusKey::gateway(name)]
             .attached_routes
     }
 
@@ -1130,7 +1130,7 @@ mod tests {
     }
 
     /// A `TLSRoute` whose `parentRef.kind: ListenerSet` targets a passthrough
-    /// listener declared on a ListenerSet (GEP-1713) — the listener health lives
+    /// listener declared on a ListenerSet (GEP-1713) — the listener status lives
     /// under the parent Gateway's key but is provenance-keyed to the ListenerSet,
     /// so it must be counted there and NOT against a same-named Gateway listener.
     #[test]
@@ -1138,7 +1138,7 @@ mod tests {
         let ls_key = ObjectKey::new("default", "ls");
         // Parent Gateway health holds two same-named "tls" passthrough listeners:
         // one its own, one belonging to the ListenerSet.
-        let mut gw = GatewayListenerHealth::default();
+        let mut gw = GatewayListenerStatus::default();
         let mut gw_info = ListenerInfo::default();
         gw_info.tls_outcome = ListenerTlsOutcome::TlsPassthrough;
         gw_info.port = 443;
@@ -1146,15 +1146,15 @@ mod tests {
         ls_info.tls_outcome = ListenerTlsOutcome::TlsPassthrough;
         ls_info.port = 8443;
         gw.listeners = [
-            (ListenerHealthKey::gateway("tls"), gw_info),
+            (ListenerStatusKey::gateway("tls"), gw_info),
             (
-                ListenerHealthKey::listener_set(ls_key.clone(), "tls"),
+                ListenerStatusKey::listener_set(ls_key.clone(), "tls"),
                 ls_info,
             ),
         ]
         .into_iter()
         .collect();
-        let mut map: HashMap<ObjectKey, GatewayListenerHealth> =
+        let mut map: HashMap<ObjectKey, GatewayListenerStatus> =
             std::iter::once((ObjectKey::new("default", "gw"), gw)).collect();
 
         let route = Arc::new(TlsRoute {
@@ -1182,12 +1182,12 @@ mod tests {
 
         let gw_health = &map[&ObjectKey::new("default", "gw")];
         assert_eq!(
-            gw_health.listeners[&ListenerHealthKey::listener_set(ls_key, "tls")].attached_routes,
+            gw_health.listeners[&ListenerStatusKey::listener_set(ls_key, "tls")].attached_routes,
             1,
             "TLSRoute via parentRef.kind: ListenerSet must attach to the ListenerSet's listener"
         );
         assert_eq!(
-            gw_health.listeners[&ListenerHealthKey::gateway("tls")].attached_routes,
+            gw_health.listeners[&ListenerStatusKey::gateway("tls")].attached_routes,
             0,
             "the same-named Gateway listener must NOT absorb a ListenerSet-targeted TLSRoute"
         );

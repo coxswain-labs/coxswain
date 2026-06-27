@@ -6,7 +6,7 @@ use crate::status_common::{
     OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
 };
 use coxswain_reflector::gw_types::v::gateways::{Gateway, GatewayStatusListeners};
-use coxswain_reflector::tls::{GatewayListenerHealth, ListenerHealthKey, ListenerTlsOutcome};
+use coxswain_reflector::status::{GatewayListenerStatus, ListenerStatusKey, ListenerTlsOutcome};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Returns true when the Gateway's current status does not yet reflect the
@@ -14,7 +14,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 /// watch-feedback loops.
 pub(super) fn gateway_needs_status_patch(
     gw: &Gateway,
-    health: &GatewayListenerHealth,
+    health: &GatewayListenerStatus,
     addr: Option<&StatusAddress>,
 ) -> bool {
     if !accepted_is_true(gw) {
@@ -92,7 +92,7 @@ pub(super) fn gateway_needs_status_patch(
         let (has_invalid_kinds, _) = listener_route_kind_info(listener);
         let info = health
             .listeners
-            .get(&ListenerHealthKey::gateway(&listener.name));
+            .get(&ListenerStatusKey::gateway(&listener.name));
         let frontend_impacts = info.is_some_and(|i| i.frontend_outcome.is_failed());
         let desired_healthy = !has_invalid_kinds
             && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true)
@@ -196,7 +196,7 @@ fn gateway_address_up_to_date(gw: &Gateway, addr: Option<&StatusAddress>) -> boo
 
 pub(super) fn build_gateway_status_patch(
     gw: &Gateway,
-    health: &GatewayListenerHealth,
+    health: &GatewayListenerStatus,
     generation: i64,
     now: &Time,
     addr: Option<&StatusAddress>,
@@ -263,7 +263,7 @@ pub(super) fn build_gateway_status_patch(
         .listeners
         .iter()
         .map(|l| {
-            let info = health.listeners.get(&ListenerHealthKey::gateway(&l.name));
+            let info = health.listeners.get(&ListenerStatusKey::gateway(&l.name));
             build_listener_status(l, info, ingress_ports, generation, now)
         })
         .collect();
@@ -294,7 +294,7 @@ mod tests {
         Gateway, GatewaySpec, GatewayStatus, GatewayStatusListeners,
     };
     use coxswain_reflector::ingress::IngressPorts;
-    use coxswain_reflector::tls::{BackendClientCertOutcome, GatewayListenerHealth};
+    use coxswain_reflector::status::{BackendClientCertOutcome, GatewayListenerStatus};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
     fn condition(type_: &str, observed_gen: i64) -> Condition {
@@ -355,8 +355,8 @@ mod tests {
         }
     }
 
-    fn default_health() -> GatewayListenerHealth {
-        GatewayListenerHealth::default()
+    fn default_status() -> GatewayListenerStatus {
+        GatewayListenerStatus::default()
     }
 
     #[test]
@@ -365,19 +365,19 @@ mod tests {
             status: None,
             ..Default::default()
         };
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
     fn needs_patch_when_accepted_missing() {
         let gw = gateway(1, Some(vec![condition("Programmed", 1)]), None);
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
     fn needs_patch_when_programmed_missing() {
         let gw = gateway(1, Some(vec![condition("Accepted", 1)]), None);
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
@@ -388,7 +388,7 @@ mod tests {
             Some(vec![condition("Accepted", 0), condition("Programmed", 0)]),
             Some(vec![listener_status("http", 2)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
@@ -399,7 +399,7 @@ mod tests {
             Some(vec![condition("Accepted", 2), condition("Programmed", 2)]),
             Some(vec![listener_status("http", 0)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
@@ -410,7 +410,7 @@ mod tests {
             Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
             Some(vec![]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
@@ -420,7 +420,7 @@ mod tests {
             Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
             Some(vec![listener_status("http", 1)]),
         );
-        assert!(!gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(!gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     // ── #472 per-Gateway VIP address divergence ──────────────────────────────
@@ -439,7 +439,7 @@ mod tests {
         let addr = StatusAddress::Ip(std::net::IpAddr::from([10, 0, 0, 5]));
         assert!(gateway_needs_status_patch(
             &gw,
-            &default_health(),
+            &default_status(),
             Some(&addr)
         ));
     }
@@ -462,7 +462,7 @@ mod tests {
         let addr = StatusAddress::Ip(std::net::IpAddr::from([10, 0, 0, 5]));
         assert!(!gateway_needs_status_patch(
             &gw,
-            &default_health(),
+            &default_status(),
             Some(&addr)
         ));
     }
@@ -473,8 +473,8 @@ mod tests {
         Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH)
     }
 
-    fn health_with_backend(outcome: BackendClientCertOutcome) -> GatewayListenerHealth {
-        let mut h = GatewayListenerHealth::default();
+    fn health_with_backend(outcome: BackendClientCertOutcome) -> GatewayListenerStatus {
+        let mut h = GatewayListenerStatus::default();
         h.backend_client_cert = Some(outcome);
         h
     }
@@ -546,7 +546,7 @@ mod tests {
             ]),
             Some(vec![listener_status("http", 1)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
@@ -596,7 +596,7 @@ mod tests {
         let gw = gateway(1, None, None);
         let patch = build_gateway_status_patch(
             &gw,
-            &default_health(),
+            &default_status(),
             1,
             &epoch(),
             None,

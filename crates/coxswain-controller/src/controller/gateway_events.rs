@@ -4,7 +4,7 @@ use super::config::StatusAddress;
 use super::gateway_status::build_gateway_status_patch;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::tls::GatewayListenerHealth;
+use coxswain_reflector::status::GatewayListenerStatus;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
     Client,
@@ -17,7 +17,7 @@ use kube::{
 pub(super) async fn patch_gateway_status(
     client: &Client,
     gw: &Gateway,
-    health: &GatewayListenerHealth,
+    health: &GatewayListenerStatus,
     addr: Option<&StatusAddress>,
     ingress_ports: IngressPorts,
 ) {

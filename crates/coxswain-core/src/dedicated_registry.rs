@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::listener_health::GatewayListenerHealth;
+use crate::listener_status::GatewayListenerStatus;
 use crate::ownership::ObjectKey;
 use crate::routing::GatewayRoutingTable;
 use crate::shared::Shared;
@@ -57,8 +57,8 @@ pub struct DedicatedRoutingSnapshot {
     pub tls: Arc<PortTlsStore>,
     /// Client-certificate mTLS config store scoped to this Gateway.
     pub client_certs: Arc<ClientCertStore>,
-    /// Listener-health map containing exactly the owning Gateway's entry.
-    pub listener_health: HashMap<ObjectKey, GatewayListenerHealth>,
+    /// Listener status map containing exactly the owning Gateway's entry.
+    pub listener_status: HashMap<ObjectKey, GatewayListenerStatus>,
     /// ServiceAccount name (GEP-1762 `{gateway-name}-{gatewayclass-name}`) of
     /// the dedicated proxy pod for this Gateway.
     ///
@@ -97,7 +97,7 @@ mod tests {
             gateway: Arc::new(GatewayRoutingTable::default()),
             tls: Arc::new(PortTlsStore::default()),
             client_certs: Arc::new(ClientCertStore::default()),
-            listener_health: HashMap::new(),
+            listener_status: HashMap::new(),
             expected_proxy_sa: "gw-a-coxswain".to_owned(),
         })
     }

@@ -20,8 +20,8 @@ use crate::gw_types::v::gateways::{
     Gateway, GatewayTlsFrontend, GatewayTlsFrontendDefaultValidationMode,
     GatewayTlsFrontendPerPortTlsValidationMode,
 };
-use coxswain_core::listener_health::{
-    FrontendValidationHealth, FrontendValidationOutcome, GatewayListenerHealth, ListenerHealthKey,
+use coxswain_core::listener_status::{
+    FrontendValidationOutcome, FrontendValidationStatus, GatewayListenerStatus, ListenerStatusKey,
 };
 use coxswain_core::reference_grants::{ReferenceGrantKey, backend_ref_allowed};
 use coxswain_core::tls::{ClientCertConfig, ClientCertConfigState, ClientCertStoreBuilder};
@@ -57,7 +57,7 @@ enum CaResolution {
 
 /// Resolve per-listener frontend client-cert validation for one Gateway and
 /// register it in `builder`, annotating per-listener [`FrontendValidationOutcome`]
-/// and the gateway-wide [`FrontendValidationHealth`] in `health`.
+/// and the gateway-wide [`FrontendValidationStatus`] in `health`.
 ///
 /// For every HTTPS listener the effective validation is `perPort[port]` if a
 /// matching entry exists, else `default`. Listeners with no effective validation
@@ -72,7 +72,7 @@ pub(crate) fn reconcile_frontend_validation(
     configmaps: &reflector::Store<ConfigMap>,
     ca_grants: &HashSet<ReferenceGrantKey>,
     builder: &mut ClientCertStoreBuilder,
-    health: &mut GatewayListenerHealth,
+    health: &mut GatewayListenerStatus,
 ) {
     let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
     let gw_name = gateway.metadata.name.as_deref().unwrap_or("unknown");
@@ -135,13 +135,13 @@ pub(crate) fn reconcile_frontend_validation(
         // or_default() keeps this robust if the ordering ever changes.
         health
             .listeners
-            .entry(ListenerHealthKey::gateway(listener.name.clone()))
+            .entry(ListenerStatusKey::gateway(listener.name.clone()))
             .or_default()
             .frontend_outcome = outcome;
     }
 
     if any_validation {
-        let mut fv_health = FrontendValidationHealth::default();
+        let mut fv_health = FrontendValidationStatus::default();
         fv_health.insecure_fallback = any_insecure_fallback;
         fv_health.resolved_refs = !any_failed;
         fv_health.message = if any_failed {
@@ -369,7 +369,7 @@ mod tests {
         let gw = make_gateway("default", "gw", vec![("l1", "example.com")], None, None);
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerHealth::default();
+        let mut health = GatewayListenerStatus::default();
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
         assert!(health.frontend_validation.is_none());
         assert_eq!(builder.build().host_count(), 0);
@@ -387,7 +387,7 @@ mod tests {
         );
         let cms = cm_store_with("default", "my-ca", FAKE_PEM);
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerHealth::default();
+        let mut health = GatewayListenerStatus::default();
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
@@ -414,7 +414,7 @@ mod tests {
         );
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerHealth::default();
+        let mut health = GatewayListenerStatus::default();
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
@@ -442,7 +442,7 @@ mod tests {
         );
         let cms = cm_store_with("default", "my-ca", FAKE_PEM);
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerHealth::default();
+        let mut health = GatewayListenerStatus::default();
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
@@ -504,14 +504,14 @@ mod tests {
         };
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerHealth::default();
+        let mut health = GatewayListenerStatus::default();
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
         assert!(!fv.resolved_refs);
         let outcome = &health
             .listeners
-            .get(&ListenerHealthKey::gateway("l1"))
+            .get(&ListenerStatusKey::gateway("l1"))
             .unwrap()
             .frontend_outcome;
         assert!(
@@ -631,13 +631,13 @@ mod tests {
         );
         let cms = cm_store_with("ns", "pp-ca", PEM); // only the perPort CA exists
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerHealth::default();
+        let mut health = GatewayListenerStatus::default();
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         // The listener resolved against the perPort CA (which exists), not the default.
         let outcome = &health
             .listeners
-            .get(&ListenerHealthKey::gateway("l1"))
+            .get(&ListenerStatusKey::gateway("l1"))
             .unwrap()
             .frontend_outcome;
         assert!(
@@ -666,12 +666,12 @@ mod tests {
         );
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerHealth::default();
+        let mut health = GatewayListenerStatus::default();
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         let outcome = &health
             .listeners
-            .get(&ListenerHealthKey::gateway("l1"))
+            .get(&ListenerStatusKey::gateway("l1"))
             .unwrap()
             .frontend_outcome;
         assert!(
@@ -695,12 +695,12 @@ mod tests {
         let mut grants = HashSet::new();
         grants.insert(ReferenceGrantKey::wildcard("ns", "other-ns"));
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerHealth::default();
+        let mut health = GatewayListenerStatus::default();
         reconcile_frontend_validation(&gw, &cms, &grants, &mut builder, &mut health);
 
         let outcome = &health
             .listeners
-            .get(&ListenerHealthKey::gateway("l1"))
+            .get(&ListenerStatusKey::gateway("l1"))
             .unwrap()
             .frontend_outcome;
         assert!(
@@ -721,12 +721,12 @@ mod tests {
         );
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerHealth::default();
+        let mut health = GatewayListenerStatus::default();
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         let outcome = &health
             .listeners
-            .get(&ListenerHealthKey::gateway("l1"))
+            .get(&ListenerStatusKey::gateway("l1"))
             .unwrap()
             .frontend_outcome;
         assert!(

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coxswain_core::health::SubsystemHandle;
-use coxswain_core::listener_health::SharedGatewayListenerHealth;
+use coxswain_core::listener_status::SharedGatewayListenerStatus;
 use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
 };
@@ -36,7 +36,7 @@ use crate::subscription::Scope;
 use crate::svid::SharedSvid;
 use crate::version::WIRE_VERSION;
 use crate::wire::{
-    client_cert_from_wire, gateway_from_wire, ingress_from_wire, listener_health_from_wire,
+    client_cert_from_wire, gateway_from_wire, ingress_from_wire, listener_status_from_wire,
     passthrough_from_wire, port_tls_from_wire,
 };
 
@@ -119,21 +119,21 @@ impl DiscoveryClientConfig {
 ///
 /// Implements [`coxswain_core::RoutingSource`] so it can be passed directly to
 /// `wire_proxy_services` / `wire_gateway_only_proxy_services` in place of
-/// `KubernetesSource`. The [`listener_health`] accessor provides the fifth cell
+/// `KubernetesSource`. The [`listener_status`] accessor provides the fifth cell
 /// that drives the proxy's dynamic Gateway listener port bind/unbind.
 ///
 /// The [`Shared`] cells are **never zeroed**: the supervisor serves the
 /// last-good snapshot throughout every reconnect window.
 ///
 /// [`Shared`]: coxswain_core::Shared
-/// [`listener_health`]: DiscoveryClient::listener_health
+/// [`listener_status`]: DiscoveryClient::listener_status
 #[non_exhaustive]
 pub struct DiscoveryClient {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
     tls_store: SharedPortTlsStore,
     client_cert_store: SharedClientCertStore,
-    listener_health: SharedGatewayListenerHealth,
+    listener_status: SharedGatewayListenerStatus,
     listener_hostnames: SharedListenerHostnames,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
@@ -186,7 +186,7 @@ impl DiscoveryClient {
         let gateway_routes = SharedGatewayRoutingTable::new();
         let tls_store = SharedPortTlsStore::new();
         let client_cert_store = SharedClientCertStore::new();
-        let listener_health = SharedGatewayListenerHealth::new();
+        let listener_status = SharedGatewayListenerStatus::new();
         let listener_hostnames = SharedListenerHostnames::new();
         let passthrough_routes = SharedTlsPassthroughTable::new();
 
@@ -196,7 +196,7 @@ impl DiscoveryClient {
             gateway: gateway_routes.clone(),
             tls: tls_store.clone(),
             client_certs: client_cert_store.clone(),
-            listener_health: listener_health.clone(),
+            listener_status: listener_status.clone(),
             listener_hostnames: listener_hostnames.clone(),
             passthrough: passthrough_routes.clone(),
             health,
@@ -209,7 +209,7 @@ impl DiscoveryClient {
             gateway_routes,
             tls_store,
             client_cert_store,
-            listener_health,
+            listener_status,
             listener_hostnames,
             passthrough_routes,
         };
@@ -269,18 +269,18 @@ impl DiscoveryClient {
         self.client_cert_store.clone()
     }
 
-    /// Handle to the Gateway listener health map.
+    /// Handle to the Gateway listener status map.
     ///
     /// Used by the proxy's `ListenerSpecsAdapter` to drive dynamic Gateway
     /// listener port bind/unbind without any Kubernetes API access.
     #[must_use]
-    pub fn listener_health(&self) -> SharedGatewayListenerHealth {
-        self.listener_health.clone()
+    pub fn listener_status(&self) -> SharedGatewayListenerStatus {
+        self.listener_status.clone()
     }
 
     /// Handle to the per-port HTTPS listener-hostname snapshot (GEP-3567, #96).
     ///
-    /// Derived from the Gateway listener health that the discovery server
+    /// Derived from the Gateway listener status that the discovery server
     /// transmits; updated atomically with every applied snapshot.
     #[must_use]
     pub fn listener_hostnames(&self) -> SharedListenerHostnames {
@@ -337,7 +337,7 @@ pub struct Supervisor {
     gateway: SharedGatewayRoutingTable,
     tls: SharedPortTlsStore,
     client_certs: SharedClientCertStore,
-    listener_health: SharedGatewayListenerHealth,
+    listener_status: SharedGatewayListenerStatus,
     listener_hostnames: SharedListenerHostnames,
     passthrough: SharedTlsPassthroughTable,
     health: SubsystemHandle,
@@ -515,7 +515,7 @@ impl Supervisor {
                     gateway: &self.gateway,
                     tls: &self.tls,
                     client_certs: &self.client_certs,
-                    health: &self.listener_health,
+                    status: &self.listener_status,
                     listener_hostnames: &self.listener_hostnames,
                     passthrough: &self.passthrough,
                 },
@@ -573,7 +573,7 @@ struct SnapshotCells<'a> {
     gateway: &'a SharedGatewayRoutingTable,
     tls: &'a SharedPortTlsStore,
     client_certs: &'a SharedClientCertStore,
-    health: &'a SharedGatewayListenerHealth,
+    status: &'a SharedGatewayListenerStatus,
     listener_hostnames: &'a SharedListenerHostnames,
     passthrough: &'a SharedTlsPassthroughTable,
 }
@@ -617,11 +617,11 @@ fn apply_snapshot(
             .as_ref()
             .unwrap_or(&p::ClientCertStore::default()),
     )?;
-    let listener_health_map = listener_health_from_wire(
+    let listener_status_map = listener_status_from_wire(
         snapshot
-            .listener_health
+            .listener_status
             .as_ref()
-            .unwrap_or(&p::GatewayListenerHealth::default()),
+            .unwrap_or(&p::GatewayListenerStatus::default()),
     )?;
     let passthrough_table = passthrough_from_wire(
         snapshot
@@ -630,12 +630,12 @@ fn apply_snapshot(
             .unwrap_or(&p::TlsPassthroughTable::default()),
     )?;
 
-    // Derive the per-port HTTPS listener-hostname snapshot from the health map
+    // Derive the per-port HTTPS listener-hostname snapshot from the status map
     // (same data the reflector uses in build_tls) so GEP-3567 misdirected-request
     // detection works in the two-pod shared-proxy deployment (#96).
     let mut lh_builder = ListenerHostnamesBuilder::new();
-    for gw_health in listener_health_map.values() {
-        for li in gw_health.listeners.values() {
+    for gw_status in listener_status_map.values() {
+        for li in gw_status.listeners.values() {
             // Keyed by BIND port (internal port for shared-mode Gateways) so the
             // proxy's misdirected-request check matches by the accepted port (#472).
             lh_builder.add_listener(
@@ -651,7 +651,7 @@ fn apply_snapshot(
     cells.gateway.store(Arc::new(gateway_table));
     cells.tls.store(Arc::new(tls_store));
     cells.client_certs.store(Arc::new(client_cert_store));
-    cells.health.store_and_notify(listener_health_map);
+    cells.status.store_and_notify(listener_status_map);
     cells.passthrough.store(Arc::new(passthrough_table));
 
     Ok(())
@@ -790,7 +790,7 @@ fn splitmix64(mut x: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::proto::v1::{
-        ClientMessage, GatewayListenerHealth, HostEntry, PortEntry, PortTlsStore, RouteEntry,
+        ClientMessage, GatewayListenerStatus, HostEntry, PortEntry, PortTlsStore, RouteEntry,
         RouteKind, RoutingTable, ServerMessage, Snapshot,
         discovery_server::{Discovery, DiscoveryServer},
         host_entry::Pattern,
@@ -899,7 +899,7 @@ mod tests {
                 gateway_routing: Some(RoutingTable::default()),
                 tls_store: Some(PortTlsStore::default()),
                 client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
-                listener_health: Some(GatewayListenerHealth::default()),
+                listener_status: Some(GatewayListenerStatus::default()),
                 tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
             })),
         }
@@ -929,7 +929,7 @@ mod tests {
                 gateway_routing: Some(RoutingTable::default()),
                 tls_store: Some(PortTlsStore::default()),
                 client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
-                listener_health: Some(GatewayListenerHealth::default()),
+                listener_status: Some(GatewayListenerStatus::default()),
                 tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
             })),
         }

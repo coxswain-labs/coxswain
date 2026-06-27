@@ -20,7 +20,7 @@
 
 use crate::gw_types::v::gateways::Gateway;
 use crate::tls::load_tls_cert;
-use coxswain_core::listener_health::BackendClientCertOutcome;
+use coxswain_core::listener_status::BackendClientCertOutcome;
 use coxswain_core::reference_grants::{ReferenceGrantKey, backend_ref_allowed};
 use coxswain_core::routing::BackendClientCert;
 use k8s_openapi::api::core::v1::Secret;

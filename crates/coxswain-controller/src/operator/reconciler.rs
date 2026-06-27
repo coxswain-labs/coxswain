@@ -33,8 +33,8 @@
 //! `AcceptedOverrides` map is needed because the operator is now the sole
 //! writer of `Gateway.status` on dedicated-mode Gateways (the shared-pool
 //! writer skips them via a `parametersRef` group/kind check). Health-channel
-//! retriggers wire [`SharedGatewayListenerHealth`] and
-//! [`SharedRouteHealth`] into [`Controller::reconcile_all_on`] so a
+//! retriggers wire [`SharedGatewayListenerStatus`] and
+//! [`SharedRouteStatus`] into [`Controller::reconcile_all_on`] so a
 //! cert-ref or route-resolution flip kicks every owned Gateway through the
 //! patch path within watch latency.
 
@@ -47,8 +47,8 @@ use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::ingress::IngressPorts;
 use coxswain_reflector::port_alloc::{DEFAULT_INTERNAL_PORT_RANGE, allocate_internal_ports};
-use coxswain_reflector::tls::{
-    GatewayListenerHealth, SharedGatewayListenerHealth, SharedRouteHealth,
+use coxswain_reflector::status::{
+    GatewayListenerStatus, SharedGatewayListenerStatus, SharedRouteStatus,
 };
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
@@ -137,17 +137,17 @@ pub struct OperatorConfig {
     /// for listeners, not TLS: HTTP listeners are present too (with a
     /// `NotApplicable` TLS outcome). Read on every reconcile (the patch builder
     /// maps each listener to its `(tls_outcome, attached_routes)` snapshot) and
-    /// subscribed via [`SharedGatewayListenerHealth::subscribe`] so any health
+    /// subscribed via [`SharedGatewayListenerStatus::subscribe`] so any health
     /// flip (e.g. a TLS-cert resolution change) kicks every owned Gateway through
     /// [`Controller::reconcile_all_on`].
-    pub listener_health: SharedGatewayListenerHealth,
+    pub listener_status: SharedGatewayListenerStatus,
     /// Per-route ResolvedRefs/Accepted health channel. Subscribed for the
-    /// same retrigger reason as [`Self::listener_health`]; the patch builder does
+    /// same retrigger reason as [`Self::listener_status`]; the patch builder does
     /// not consume the snapshot directly (per-listener `ResolvedRefs`
     /// derives from TLS health alone — see the issue-211 grilling notes),
     /// but a route-health flip still warrants re-checking listener
     /// `attached_routes` counts.
-    pub route_health: SharedRouteHealth,
+    pub route_status: SharedRouteStatus,
     /// Ports reserved for the Ingress data plane via `--proxy-http-port` /
     /// `--proxy-https-port`. Forwarded to the listener-status helper so a
     /// dedicated-mode listener whose port collides with the Ingress
@@ -230,7 +230,7 @@ struct ReconcileContext {
     nodes_store: Store<Node>,
     /// Shared per-listener TLS-health channel — read-only snapshot at each
     /// reconcile.
-    listener_health: SharedGatewayListenerHealth,
+    listener_status: SharedGatewayListenerStatus,
     /// Ports reserved for the Ingress data plane via the controller's CLI.
     /// Forwarded to [`super::status::build_dedicated_gateway_status_patch`]
     /// for the listener `PortUnavailable` precedence check.
@@ -505,7 +505,7 @@ impl BackgroundService for Operator {
             params_store: params_reader,
             pods_store: pods_reader,
             nodes_store: nodes_reader,
-            listener_health: self.config.listener_health.clone(),
+            listener_status: self.config.listener_status.clone(),
             ingress_ports: self.config.ingress_ports,
             admin_port: self.config.admin_port,
             discovery_endpoint: self.config.discovery_endpoint.clone(),
@@ -548,7 +548,7 @@ impl BackgroundService for Operator {
         // reconcile-all before any health flip has actually occurred.
         let (trigger_tx, trigger_rx) = futures::channel::mpsc::unbounded::<()>();
         {
-            let mut tls_rx = self.config.listener_health.subscribe();
+            let mut tls_rx = self.config.listener_status.subscribe();
             let tx = trigger_tx.clone();
             tasks.spawn(async move {
                 let _ = tls_rx.borrow_and_update();
@@ -560,7 +560,7 @@ impl BackgroundService for Operator {
             });
         }
         {
-            let mut route_rx = self.config.route_health.subscribe();
+            let mut route_rx = self.config.route_status.subscribe();
             let tx = trigger_tx.clone();
             tasks.spawn(async move {
                 let _ = route_rx.borrow_and_update();
@@ -854,7 +854,7 @@ async fn reconcile_inner(
                 gw: &gw,
                 service: None,
                 nodes: &[],
-                listener_health: &GatewayListenerHealth::default(),
+                listener_status: &GatewayListenerStatus::default(),
                 ingress_ports: ctx.ingress_ports,
                 accepted: status::AcceptedOutcome::InvalidParameters,
                 ready_pod_count: 0,
@@ -952,13 +952,13 @@ async fn reconcile_inner(
         Err(e) => return Err(ReconcileError::Kube(e)),
     };
     let nodes: Vec<Arc<Node>> = ctx.nodes_store.state();
-    let listener_health_map = ctx.listener_health.load();
-    let gateway_health = listener_health_map.get(&key).cloned().unwrap_or_default();
+    let listener_status_map = ctx.listener_status.load();
+    let gateway_health = listener_status_map.get(&key).cloned().unwrap_or_default();
     let inputs = status::DedicatedGatewayStatusInputs {
         gw: &gw,
         service: service.as_ref(),
         nodes: &nodes,
-        listener_health: &gateway_health,
+        listener_status: &gateway_health,
         ingress_ports: ctx.ingress_ports,
         accepted: status::AcceptedOutcome::Accepted,
         ready_pod_count,

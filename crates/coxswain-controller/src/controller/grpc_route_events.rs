@@ -10,7 +10,7 @@ use coxswain_reflector::gw_types::{
     v::grpcroutes::{GrpcRouteParentRefs, GrpcRouteStatusParents, GrpcRouteStatusParentsParentRef},
 };
 use coxswain_reflector::keys::RouteParentKey;
-use coxswain_reflector::tls::{RouteHealthMap, RouteParentHealth};
+use coxswain_reflector::status::{RouteParentStatus, RouteStatusMap};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::{
     Client,
@@ -23,7 +23,7 @@ pub(super) async fn mark_grpc_route_programmed(
     route: &GrpcRoute,
     controller_name: &str,
     owned_gateways: &HashSet<ObjectKey>,
-    route_health: &RouteHealthMap,
+    route_status: &RouteStatusMap,
 ) {
     let name = match route.metadata.name.as_deref() {
         Some(n) => n,
@@ -52,14 +52,14 @@ pub(super) async fn mark_grpc_route_programmed(
         return;
     };
 
-    let default_health = RouteParentHealth::default();
+    let default_status = RouteParentStatus::default();
     let parents: Vec<GrpcRouteStatusParents> = owned_refs
         .iter()
         .map(|p| {
             let gw_ns = p.namespace.as_deref().unwrap_or(ns);
             let section = p.section_name.as_deref().unwrap_or("").to_string();
             let health_key = RouteParentKey::new(ns, name, gw_ns, &p.name, section);
-            let health = route_health.get(&health_key).unwrap_or(&default_health);
+            let health = route_status.get(&health_key).unwrap_or(&default_status);
 
             let (acc_status, acc_reason) = if health.accepted {
                 ("True", health.accepted_reason)

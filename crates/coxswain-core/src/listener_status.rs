@@ -1,10 +1,10 @@
-//! Per-listener health data types shared by the reflector and discovery wire layer.
+//! Per-listener status data types shared by the reflector and discovery wire layer.
 //!
-//! Pure data types ([`GatewayListenerHealth`], [`ListenerInfo`],
+//! Pure data types ([`GatewayListenerStatus`], [`ListenerInfo`],
 //! [`ListenerTlsOutcome`]) are kept here so the discovery wire layer can import
 //! them without pulling in the reflector crate.
 //!
-//! [`SharedGatewayListenerHealth`] is the `ArcSwap` + `watch` wrapper that the
+//! [`SharedGatewayListenerStatus`] is the `ArcSwap` + `watch` wrapper that the
 //! controller writes into and the proxy reads from. It lives here so
 //! `coxswain-discovery` can implement [`crate::RoutingSource`] without
 //! depending on `coxswain-reflector`.
@@ -20,7 +20,7 @@ use tokio::sync::watch;
 /// A Gateway's effective listeners concatenate its own `spec.listeners` with the
 /// listeners contributed by attached `ListenerSet`s. The spec permits the same
 /// listener *name* on a Gateway and on its ListenerSets, and requires both to be
-/// programmed — so per-listener health is keyed by source+name (see [`ListenerHealthKey`])
+/// programmed — so per-listener status is keyed by source+name (see [`ListenerStatusKey`])
 /// rather than name alone. The source also lets the controller attribute each
 /// per-listener status back to the resource that declared it.
 ///
@@ -39,7 +39,7 @@ pub enum ListenerSource {
     ListenerSet(ObjectKey),
 }
 
-/// Provenance-aware identity of one listener within a [`GatewayListenerHealth`].
+/// Provenance-aware identity of one listener within a [`GatewayListenerStatus`].
 ///
 /// Replaces a bare listener-name key: `(source, name)` is unique across a Gateway
 /// and all its attached ListenerSets even when names collide. The derived `Ord`
@@ -48,14 +48,14 @@ pub enum ListenerSource {
 /// precedence (creationTimestamp-first), which is computed explicitly in the merge.
 // intentionally open: constructed via field literal at every producer/lookup site; no invariant to enforce.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ListenerHealthKey {
+pub struct ListenerStatusKey {
     /// The resource that declared this listener.
     pub source: ListenerSource,
     /// The listener's `name`, unique only within its own `source`.
     pub name: String,
 }
 
-impl ListenerHealthKey {
+impl ListenerStatusKey {
     /// Key for a listener declared directly on the parent Gateway.
     #[must_use]
     pub fn gateway(name: impl Into<String>) -> Self {
@@ -335,10 +335,10 @@ impl ListenerInfo {
 ///
 /// Produced during each reconciler rebuild and consumed by the controller's
 /// status writer to emit the `InsecureFrontendValidationMode` condition.
-/// `None` on a [`GatewayListenerHealth`] means no frontend validation is configured.
+/// `None` on a [`GatewayListenerStatus`] means no frontend validation is configured.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
-pub struct FrontendValidationHealth {
+pub struct FrontendValidationStatus {
     /// `true` when the effective mode is `AllowInsecureFallback`.
     ///
     /// Triggers a `InsecureFrontendValidationMode=True/ConfigurationChanged` top-level
@@ -362,7 +362,7 @@ pub struct FrontendValidationHealth {
 /// gateway-scoped outcome (not per-listener): the ref applies to all backend TLS
 /// connections the Gateway makes. The group/kind/missing/malformed failures all map
 /// to the spec's `InvalidClientCertificateRef`; a denied cross-namespace ref maps to
-/// `RefNotPermitted`. `None` on a [`GatewayListenerHealth`] means the ref is absent and
+/// `RefNotPermitted`. `None` on a [`GatewayListenerStatus`] means the ref is absent and
 /// no `ResolvedRefs` condition is emitted.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -425,19 +425,19 @@ impl BackendClientCertOutcome {
     }
 }
 
-/// Per-listener health for one Gateway, keyed by [`ListenerHealthKey`] (source + name).
+/// Per-listener status for one Gateway, keyed by [`ListenerStatusKey`] (source + name).
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
-pub struct GatewayListenerHealth {
+pub struct GatewayListenerStatus {
     /// The Gateway's effective listeners (its own plus those merged from attached
-    /// ListenerSets), keyed by [`ListenerHealthKey`] so same-named listeners from
+    /// ListenerSets), keyed by [`ListenerStatusKey`] so same-named listeners from
     /// different sources stay distinct (GEP-1713).
-    pub listeners: BTreeMap<ListenerHealthKey, ListenerInfo>,
-    /// Frontend client-certificate validation health for this Gateway (GEP-91, #86).
+    pub listeners: BTreeMap<ListenerStatusKey, ListenerInfo>,
+    /// Frontend client-certificate validation status for this Gateway (GEP-91, #86).
     ///
     /// `None` when `spec.tls.frontend.default.validation` is absent.
     /// `Some` when the field is present, regardless of whether refs resolved.
-    pub frontend_validation: Option<FrontendValidationHealth>,
+    pub frontend_validation: Option<FrontendValidationStatus>,
     /// Backend client-certificate resolution outcome for this Gateway (GEP-3155, #87).
     ///
     /// `None` when `spec.tls.backend.clientCertificateRef` is absent (no condition).
@@ -447,14 +447,14 @@ pub struct GatewayListenerHealth {
     pub backend_client_cert: Option<BackendClientCertOutcome>,
 }
 
-// ── SharedGatewayListenerHealth ───────────────────────────────────────────────
+// ── SharedGatewayListenerStatus ───────────────────────────────────────────────
 
-struct GatewayListenerHealthInner {
-    map: ArcSwap<HashMap<ObjectKey, GatewayListenerHealth>>,
+struct GatewayListenerStatusInner {
+    map: ArcSwap<HashMap<ObjectKey, GatewayListenerStatus>>,
     tx: watch::Sender<u64>,
 }
 
-/// Shared handle to the per-Gateway listener health map.
+/// Shared handle to the per-Gateway listener status map.
 ///
 /// Written by the controller's reconciler (via `store_and_notify`) after each
 /// routing-table rebuild; read by the proxy's `ListenerSpecsAdapter` background
@@ -468,32 +468,32 @@ struct GatewayListenerHealthInner {
 /// both requirements that `tokio::sync::Notify` cannot meet simultaneously.
 #[non_exhaustive]
 #[derive(Clone)]
-pub struct SharedGatewayListenerHealth(Arc<GatewayListenerHealthInner>);
+pub struct SharedGatewayListenerStatus(Arc<GatewayListenerStatusInner>);
 
-impl Default for SharedGatewayListenerHealth {
+impl Default for SharedGatewayListenerStatus {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SharedGatewayListenerHealth {
-    /// Construct a new shared health map (initially empty, generation 0).
+impl SharedGatewayListenerStatus {
+    /// Construct a new shared status map (initially empty, generation 0).
     pub fn new() -> Self {
         let (tx, _) = watch::channel(0u64);
-        Self(Arc::new(GatewayListenerHealthInner {
+        Self(Arc::new(GatewayListenerStatusInner {
             map: ArcSwap::from_pointee(HashMap::new()),
             tx,
         }))
     }
 
-    /// Load the current health map snapshot.
-    pub fn load(&self) -> arc_swap::Guard<Arc<HashMap<ObjectKey, GatewayListenerHealth>>> {
+    /// Load the current listener status map snapshot.
+    pub fn load(&self) -> arc_swap::Guard<Arc<HashMap<ObjectKey, GatewayListenerStatus>>> {
         self.0.map.load()
     }
 
-    /// Store a new health map and notify every subscribed `Receiver` that the
-    /// generation has advanced.
-    pub fn store_and_notify(&self, map: HashMap<ObjectKey, GatewayListenerHealth>) {
+    /// Store a new listener status map and notify every subscribed `Receiver` that
+    /// the generation has advanced.
+    pub fn store_and_notify(&self, map: HashMap<ObjectKey, GatewayListenerStatus>) {
         self.0.map.store(Arc::new(map));
         self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
     }
@@ -516,11 +516,11 @@ impl SharedGatewayListenerHealth {
     /// Consumers are notified after the swap.
     pub fn update_scoped(
         &self,
-        updates: HashMap<ObjectKey, GatewayListenerHealth>,
+        updates: HashMap<ObjectKey, GatewayListenerStatus>,
         owns: impl Fn(&ObjectKey) -> bool,
     ) {
         self.0.map.rcu(|current| {
-            let mut next: HashMap<ObjectKey, GatewayListenerHealth> = current
+            let mut next: HashMap<ObjectKey, GatewayListenerStatus> = current
                 .iter()
                 .filter(|(k, _)| !owns(k))
                 .map(|(k, v)| (k.clone(), v.clone()))

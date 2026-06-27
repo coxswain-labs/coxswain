@@ -37,7 +37,7 @@
 //! [`RoutingTable`]: coxswain_core::routing::RoutingTable
 //! [`Snapshot`]: crate::proto::v1::Snapshot
 
-use coxswain_core::listener_health::{ListenerInfo, ListenerTlsOutcome};
+use coxswain_core::listener_status::{ListenerInfo, ListenerTlsOutcome};
 
 use crate::error::WireError;
 use crate::proto::v1 as p;

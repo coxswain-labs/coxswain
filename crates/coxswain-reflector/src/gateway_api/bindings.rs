@@ -4,7 +4,7 @@ use super::hostnames;
 use crate::gw_types::v::grpcroutes::GrpcRouteParentRefs;
 use crate::gw_types::v::httproutes::HttpRouteParentRefs;
 use crate::keys::ListenerKey;
-use crate::tls::ListenerSource;
+use crate::status::ListenerSource;
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use std::collections::{HashMap, HashSet};
 

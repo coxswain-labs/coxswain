@@ -15,7 +15,7 @@
 use crate::gateway_api::hostnames::hostnames_intersect;
 use crate::gw_types::v::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom};
 use crate::keys::RouteParentKey;
-use crate::tls::{RouteHealthMap, RouteParentHealth};
+use crate::status::{RouteParentStatus, RouteStatusMap};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use k8s_openapi::api::core::v1::Service;
@@ -96,7 +96,7 @@ pub(super) fn compute_route_health<R: RouteLike>(
     backend_grants: &HashSet<ReferenceGrantKey>,
     service_store: &reflector::Store<Service>,
     route_kind: &str,
-) -> RouteHealthMap {
+) -> RouteStatusMap {
     let mut gw_listeners: HashMap<ObjectKey, Vec<ListenerEntry>> = gateways
         .iter()
         .filter_map(|gw| {
@@ -147,7 +147,7 @@ pub(super) fn compute_route_health<R: RouteLike>(
     let mut ls_keys: HashSet<ObjectKey> = HashSet::new();
     for eff in effective.values() {
         for l in &eff.listeners {
-            let crate::tls::ListenerSource::ListenerSet(ls_key) = &l.source else {
+            let crate::status::ListenerSource::ListenerSet(ls_key) = &l.source else {
                 continue;
             };
             // Record the LS key as a valid parent and ensure it has an entry list
@@ -177,7 +177,7 @@ pub(super) fn compute_route_health<R: RouteLike>(
         }
     }
 
-    let mut map = RouteHealthMap::new();
+    let mut map = RouteStatusMap::new();
 
     for route in routes {
         let route: &R = route.as_ref();
@@ -215,7 +215,7 @@ pub(super) fn compute_route_health<R: RouteLike>(
                 if blocked {
                     map.insert(
                         health_key,
-                        RouteParentHealth {
+                        RouteParentStatus {
                             accepted: false,
                             accepted_reason: "NotAllowedByListeners",
                             resolved_refs: true,
@@ -242,7 +242,7 @@ pub(super) fn compute_route_health<R: RouteLike>(
 
             map.insert(
                 health_key,
-                RouteParentHealth {
+                RouteParentStatus {
                     resolved_refs,
                     resolved_refs_reason,
                     accepted,

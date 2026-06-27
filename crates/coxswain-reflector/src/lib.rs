@@ -16,13 +16,13 @@
 //! - [`gw_types`] — re-exports Gateway API types from the active channel with
 //!   project-canonical aliases (`HTTPRoute` → `HttpRoute` etc.).
 //! - [`k8s_utils`] — generic helpers like `scoped_api`.
-//! - [`keys`] — `ListenerKey`, `RouteParentKey` used by routing/health maps.
+//! - [`keys`] — `ListenerKey`, `RouteParentKey` used by routing/status maps.
 //! - [`endpoints`] — `EndpointSlice` resolution into backend addresses.
-//! - [`tls`] — `Shared{GatewayListener,HttpRoute,BackendTlsPolicy}Health` types
-//!   plus PEM extraction from `kubernetes.io/tls` Secrets.
+//! - [`tls`] — PEM extraction from `kubernetes.io/tls` Secrets.
+//! - [`status`] — `Shared{GatewayListener,Route,BackendTlsPolicy}Status` types.
 //! - [`ingress`] — `Ingress` → routing-table-entry translation.
 //! - [`gateway_api`] — `HTTPRoute` → routing-table-entry translation, plus
-//!   per-Route and per-Policy health computation.
+//!   per-Route and per-Policy status computation.
 //! - [`reconciler`] — debounced rebuild loop that drives all of the above off
 //!   reflector store snapshots.
 //! - [`reference_grants`] — `ReferenceGrant` flattening consumed by the
@@ -44,6 +44,7 @@ pub mod metrics;
 pub mod port_alloc;
 pub mod reconciler;
 pub mod reference_grants;
+pub mod status;
 pub mod tls;
 
 #[cfg(test)]
@@ -60,7 +61,8 @@ pub use reconciler::{
     ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler,
     StatusSubscriptions,
 };
-pub use tls::{
-    GatewayListenerHealth, ListenerHealthKey, ListenerInfo, ListenerSource, ListenerTlsOutcome,
-    SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedRouteHealth,
+pub use status::{
+    BackendTlsPolicyStatus, BackendTlsPolicyStatusMap, GatewayListenerStatus, ListenerInfo,
+    ListenerSource, ListenerStatusKey, ListenerTlsOutcome, RouteParentStatus, RouteStatusMap,
+    SharedBackendTlsPolicyStatus, SharedGatewayListenerStatus, SharedRouteStatus,
 };

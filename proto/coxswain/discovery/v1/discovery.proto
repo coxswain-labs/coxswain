@@ -131,7 +131,7 @@ message Snapshot {
   // shared-mode Gateway's terminate certs are isolated to its own internal port.
   PortTlsStore tls_store = 12;
   ClientCertStore client_cert_store = 13;
-  GatewayListenerHealth listener_health = 14;
+  GatewayListenerStatus listener_status = 14;
   TlsPassthroughTable tls_passthrough = 15;
   // repeated (reserved for v0.6 delta streaming)
   reserved 40;
@@ -655,23 +655,23 @@ message ClientCertConfig {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// 2b  Gateway listener health DTO
+// 2b  Gateway listener status DTO
 // ────────────────────────────────────────────────────────────────────────────
 
-// Mirrors the HashMap<ObjectKey, GatewayListenerHealth>.
+// Mirrors the HashMap<ObjectKey, GatewayListenerStatus>.
 // Sorted by object key ascending for determinism.
-message GatewayListenerHealth {
-  repeated GatewayHealthEntry entries = 1;
+message GatewayListenerStatus {
+  repeated GatewayStatusEntry entries = 1;
 }
 
-message GatewayHealthEntry {
+message GatewayStatusEntry {
   string object_key = 1; // "{namespace}/{name}"
-  ListenerHealth health = 2;
+  ListenerStatus status = 2;
 }
 
-// Mirrors GatewayListenerHealth.
-// BTreeMap<ListenerHealthKey, ListenerInfo> → already sorted by (source, name).
-message ListenerHealth {
+// Mirrors GatewayListenerStatus.
+// BTreeMap<ListenerStatusKey, ListenerInfo> → already sorted by (source, name).
+message ListenerStatus {
   repeated ListenerInfoEntry listeners = 1;
 }
 

@@ -8,7 +8,7 @@ use clap::Parser;
 use coxswain_admin::{AdminServer, EventSources, OperatorAggregator};
 use coxswain_controller::{
     BootstrapRejectHook, CaMode, ControllerConfig, IngressPorts, KubeTokenAuthenticator,
-    LeaseSettings, Operator, OperatorConfig, SharedGatewayListenerHealth, StatusWriterConfig,
+    LeaseSettings, Operator, OperatorConfig, SharedGatewayListenerStatus, StatusWriterConfig,
     load_or_generate, spawn_status_writer, spawn_trust_publisher,
 };
 use coxswain_core::health::{HealthRegistry, SubsystemHandle};
@@ -26,7 +26,7 @@ use coxswain_proxy::{
     RateLimiterRegistry, RoutingEngine, RoutingSource, SharedProxyConfig, SniCertSelector,
     TrustedSources, UpstreamCaCache,
 };
-use coxswain_reflector::{GatewayListenerHealth, ListenerTlsOutcome};
+use coxswain_reflector::{GatewayListenerStatus, ListenerTlsOutcome};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::server::Server;
 use pingora_core::server::ShutdownWatch;
@@ -118,32 +118,32 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     )?;
 
     // The operator publishes Gateway.status conditions for dedicated-mode
-    // Gateways using the same per-listener TLS / route health channels the
+    // Gateways using the same per-listener TLS / route status channels the
     // shared-pool status writer subscribes to (#211). The bin layer is the
     // sole construction site for both — share the same instances so the
     // operator's reconcile-all retrigger fires off the exact channel the
     // reflector publishes into.
-    let listener_health = status_writer.outputs.listener_health.clone();
-    let route_health = status_writer.reconciler.route_health();
+    let listener_status = status_writer.outputs.listener_status.clone();
+    let route_status = status_writer.reconciler.route_status();
 
     // Capture the fleet handle before the reconciler is moved into its
-    // background service — same pattern as `route_health` above.
+    // background service — same pattern as `route_status` above.
     let fleet = status_writer.reconciler.fleet();
 
     // Event sources for the /api/v1/events SSE stream (#250). Capture the
     // rebuild generation receiver and clones of the fleet / cluster handles
     // before the originals are moved into the operator and aggregator below.
     let events = EventSources::new(
-        route_health.subscribe(),
+        route_status.subscribe(),
         fleet.clone(),
         status_writer.outputs.cluster_summary.clone(),
         args.common.pod_name.clone(),
     );
 
     // Discovery gRPC server: capture a rebuild-generation receiver before
-    // `route_health` is moved into the Operator. Every controller replica
+    // `route_status` is moved into the Operator. Every controller replica
     // runs the discovery server independently (no leader gate).
-    let discovery_rebuild_rx = route_health.subscribe();
+    let discovery_rebuild_rx = route_status.subscribe();
     let node_registry = coxswain_core::node_registry::SharedNodeRegistry::new();
     let node_registry_for_agg = node_registry.clone();
     let discovery_source = coxswain_discovery::SnapshotSource {
@@ -151,7 +151,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         gateway: status_writer.outputs.gateway_routes.clone(),
         tls: status_writer.outputs.tls.clone(),
         client_certs: status_writer.outputs.client_certs.clone(),
-        listener_health: listener_health.clone(),
+        listener_status: listener_status.clone(),
         dedicated: status_writer.outputs.dedicated_registry.clone(),
         passthrough_routes: status_writer.outputs.passthrough_routes.clone(),
     };
@@ -193,8 +193,8 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             controller_name: args.common.controller_name.clone(),
             controller_image: resolve_controller_image(),
             leader: Arc::clone(&status_writer.leader),
-            listener_health,
-            route_health,
+            listener_status,
+            route_status,
             ingress_ports: IngressPorts::new(
                 args.common.ingress_http_port,
                 args.common.ingress_https_port,
@@ -295,7 +295,7 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
 
     let (client, supervisor, bootstrap_runner) =
         build_discovery_client(&args, proxy_handle, Scope::SharedPool)?;
-    let listener_health = client.listener_health();
+    let listener_status = client.listener_status();
 
     let cache = build_response_cache(&args.proxy);
     wire_proxy_services(
@@ -303,7 +303,7 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
         &args.common,
         &args.proxy,
         &client,
-        &listener_health,
+        &listener_status,
         cache,
     )?;
 
@@ -372,7 +372,7 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
     };
     let (client, supervisor, bootstrap_runner) =
         build_discovery_client(&args, proxy_handle, scope)?;
-    let listener_health = client.listener_health();
+    let listener_status = client.listener_status();
 
     let cache = build_response_cache(&args.proxy);
     wire_gateway_only_proxy_services(
@@ -380,7 +380,7 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
         &args.common,
         &args.proxy,
         &client,
-        &listener_health,
+        &listener_status,
         cache,
     )?;
 
@@ -437,7 +437,7 @@ where
 
 /// Wire only the `GatewayProxy` dynamic acceptor for `serve proxy --dedicated`.
 ///
-/// The listener set is driven by `listener_health` via a [`ListenerSpecsAdapter`]
+/// The listener set is driven by `listener_status` via a [`ListenerSpecsAdapter`]
 /// background service — no startup port-discovery query is needed.  The
 /// acceptor starts with an empty listener set and binds ports as the first
 /// reconciler cycle completes.
@@ -446,7 +446,7 @@ fn wire_gateway_only_proxy_services(
     common: &CommonArgs,
     proxy: &ProxyArgs,
     source: &dyn RoutingSource,
-    listener_health: &SharedGatewayListenerHealth,
+    listener_status: &SharedGatewayListenerStatus,
     cache: Option<ResponseCache>,
 ) -> Result<()> {
     let default_timeouts = RouteTimeouts {
@@ -487,11 +487,11 @@ fn wire_gateway_only_proxy_services(
     // This may be empty if the reflector hasn't reconciled yet; the adapter
     // will push the first real set on its first tick.
     let initial_gw_specs = derive_gateway_specs(
-        &listener_health.load(),
+        &listener_status.load(),
         proxy.proxy_bind_address,
         &HashSet::new(),
     );
-    advertised_ports.store(Arc::new(derive_advertised_ports(&listener_health.load())));
+    advertised_ports.store(Arc::new(derive_advertised_ports(&listener_status.load())));
 
     let (gw_tx, gw_rx) = watch::channel(initial_gw_specs.clone());
 
@@ -541,7 +541,7 @@ fn wire_gateway_only_proxy_services(
     server.add_service(background_service(
         "gateway-listener-specs",
         ListenerSpecsAdapter {
-            listener_health: listener_health.clone(),
+            listener_status: listener_status.clone(),
             bind_addr: proxy.proxy_bind_address,
             excluded_ports: HashSet::new(),
             tx: gw_tx,
@@ -582,14 +582,14 @@ fn build_response_cache(proxy: &ProxyArgs) -> Option<ResponseCache> {
 /// - The **Ingress acceptor** binds a static set of ports from
 ///   `--ingress-http-port` / `--ingress-https-port` that never changes.
 /// - The **Gateway acceptor** drives a dynamic port set derived from
-///   `listener_health` via a [`ListenerSpecsAdapter`] background service; ports
+///   `listener_status` via a [`ListenerSpecsAdapter`] background service; ports
 ///   are added or removed in-process with no restart.
 fn wire_proxy_services(
     server: &mut Server,
     common: &CommonArgs,
     proxy: &ProxyArgs,
     source: &dyn RoutingSource,
-    listener_health: &SharedGatewayListenerHealth,
+    listener_status: &SharedGatewayListenerStatus,
     cache: Option<ResponseCache>,
 ) -> Result<()> {
     let default_timeouts = RouteTimeouts {
@@ -633,7 +633,7 @@ fn wire_proxy_services(
     let ingress_ports: HashSet<u16> = ingress_specs.iter().map(|s| s.addr.port()).collect();
 
     let initial_gw_specs = derive_gateway_specs(
-        &listener_health.load(),
+        &listener_status.load(),
         proxy.proxy_bind_address,
         &ingress_ports,
     );
@@ -643,7 +643,7 @@ fn wire_proxy_services(
     // republish it on every tick. `shared_cfg` is cloned (not moved) into the
     // proxies, so its handle stays valid here.
     let advertised_ports = shared_cfg.advertised_ports.clone();
-    advertised_ports.store(Arc::new(derive_advertised_ports(&listener_health.load())));
+    advertised_ports.store(Arc::new(derive_advertised_ports(&listener_status.load())));
 
     if proxy.proxy_accept_proxy_protocol {
         if proxy.proxy_trusted_sources.is_empty() {
@@ -758,7 +758,7 @@ fn wire_proxy_services(
     server.add_service(background_service(
         "gateway-listener-specs",
         ListenerSpecsAdapter {
-            listener_health: listener_health.clone(),
+            listener_status: listener_status.clone(),
             bind_addr: proxy.proxy_bind_address,
             excluded_ports: ingress_ports,
             tx: gw_tx,
@@ -778,7 +778,7 @@ fn wire_proxy_services(
 
 // ── Listener spec adapter ─────────────────────────────────────────────────────
 
-/// Background service that watches [`SharedGatewayListenerHealth`] and
+/// Background service that watches [`SharedGatewayListenerStatus`] and
 /// publishes the derived `HashSet<ListenerSpec>` to a watch channel consumed
 /// by the [`ProxyAcceptor`].
 ///
@@ -786,7 +786,7 @@ fn wire_proxy_services(
 /// acceptor receives the first real spec set as soon as the reflector's
 /// initial reconcile completes.
 struct ListenerSpecsAdapter {
-    listener_health: SharedGatewayListenerHealth,
+    listener_status: SharedGatewayListenerStatus,
     bind_addr: IpAddr,
     /// Ports already owned by a static acceptor (ingress ports in the shared-proxy
     /// case) that must be excluded from the gateway-derived set to avoid conflicts.
@@ -801,7 +801,7 @@ struct ListenerSpecsAdapter {
 #[async_trait]
 impl pingora_core::services::background::BackgroundService for ListenerSpecsAdapter {
     async fn start(&self, mut shutdown: ShutdownWatch) {
-        let mut gen_rx = self.listener_health.subscribe();
+        let mut gen_rx = self.listener_status.subscribe();
         // Fire immediately so the acceptor gets the initial spec set as soon
         // as the reflector reconciles; do NOT fire before the first reconcile
         // (the health map is empty at that point).
@@ -810,7 +810,7 @@ impl pingora_core::services::background::BackgroundService for ListenerSpecsAdap
                 biased;
                 _ = shutdown.changed() => break,
                 Ok(()) = gen_rx.changed() => {
-                    let health = self.listener_health.load();
+                    let health = self.listener_status.load();
                     // Publish the advertised-port map BEFORE the spec set: the spec
                     // set (re)binds listeners, and a request can only arrive once a
                     // listener is bound, so the map must already be current (#472).
@@ -1168,7 +1168,7 @@ impl pingora_core::services::background::BackgroundService for RateLimiterGcServ
     }
 }
 
-/// Derive a `HashSet<ListenerSpec>` from the current gateway listener health map.
+/// Derive a `HashSet<ListenerSpec>` from the current gateway listener status map.
 ///
 /// Excludes ports already in `excluded_ports` (used to prevent the gateway
 /// acceptor from binding ports already owned by the static ingress acceptor).
@@ -1177,7 +1177,7 @@ impl pingora_core::services::background::BackgroundService for RateLimiterGcServ
 /// listeners, it gets a single `TlsHybrid` spec: on accept the handler peeks SNI
 /// and routes to passthrough if matched, otherwise falls through to TLS terminate.
 fn derive_gateway_specs(
-    health: &std::collections::HashMap<ObjectKey, GatewayListenerHealth>,
+    health: &std::collections::HashMap<ObjectKey, GatewayListenerStatus>,
     bind_addr: IpAddr,
     excluded_ports: &HashSet<u16>,
 ) -> HashSet<ListenerSpec> {
@@ -1223,18 +1223,18 @@ fn derive_gateway_specs(
 }
 
 /// Build the `internal bind port → advertised listener port` map (#472) from the
-/// per-Gateway listener health snapshot — the inverse of the binding
+/// per-Gateway listener status snapshot — the inverse of the binding
 /// [`derive_gateway_specs`] performs over the same map.
 ///
 /// The proxy accepts a shared-mode Gateway listener on its allocated internal
 /// port; a `RequestRedirect` that preserves the incoming port must echo the
 /// *advertised* port (what the client connected to via the VIP), not the
 /// internal accept port. Covers every listener regardless of protocol (HTTP
-/// included), because [`GatewayListenerHealth::listeners`] holds them all. When
+/// included), because [`GatewayListenerStatus::listeners`] holds them all. When
 /// no internal port is allocated (dedicated mode / Ingress), `bind_port()` is the
 /// spec port, so the entry maps the advertised port to itself — harmless.
 fn derive_advertised_ports(
-    health: &HashMap<ObjectKey, GatewayListenerHealth>,
+    health: &HashMap<ObjectKey, GatewayListenerStatus>,
 ) -> HashMap<u16, u16> {
     let mut map = HashMap::new();
     for gw_health in health.values() {
@@ -1389,7 +1389,7 @@ mod tests {
 
     #[test]
     fn advertised_ports_map_covers_http_and_https_listeners() {
-        use coxswain_reflector::GatewayListenerHealth;
+        use coxswain_reflector::GatewayListenerStatus;
         use std::collections::BTreeMap;
 
         // An HTTP listener (NotApplicable TLS outcome) and an HTTPS listener, each
@@ -1397,21 +1397,21 @@ mod tests {
         // advertised port from the internal accept port for BOTH — the HTTP one is
         // exactly the redirect path that regressed.
         let mut listeners = BTreeMap::new();
-        let mut http = coxswain_reflector::tls::ListenerInfo::default();
+        let mut http = coxswain_reflector::status::ListenerInfo::default();
         http.port = 80;
         http.internal_port = 30000;
         listeners.insert(
-            coxswain_reflector::tls::ListenerHealthKey::gateway("http"),
+            coxswain_reflector::status::ListenerStatusKey::gateway("http"),
             http,
         );
-        let mut https = coxswain_reflector::tls::ListenerInfo::default();
+        let mut https = coxswain_reflector::status::ListenerInfo::default();
         https.port = 443;
         https.internal_port = 30001;
         listeners.insert(
-            coxswain_reflector::tls::ListenerHealthKey::gateway("https"),
+            coxswain_reflector::status::ListenerStatusKey::gateway("https"),
             https,
         );
-        let mut glh = GatewayListenerHealth::default();
+        let mut glh = GatewayListenerStatus::default();
         glh.listeners = listeners;
 
         let mut health = HashMap::new();
@@ -1428,21 +1428,21 @@ mod tests {
 
     #[test]
     fn advertised_ports_map_is_identity_without_internal_port() {
-        use coxswain_reflector::GatewayListenerHealth;
+        use coxswain_reflector::GatewayListenerStatus;
         use std::collections::BTreeMap;
 
         // Dedicated mode / Ingress: no internal port allocated, so bind_port() is
         // the spec port and the entry maps it to itself — a redirect then preserves
         // the real advertised port unchanged.
         let mut listeners = BTreeMap::new();
-        let mut li = coxswain_reflector::tls::ListenerInfo::default();
+        let mut li = coxswain_reflector::status::ListenerInfo::default();
         li.port = 8080;
         li.internal_port = 0;
         listeners.insert(
-            coxswain_reflector::tls::ListenerHealthKey::gateway("http"),
+            coxswain_reflector::status::ListenerStatusKey::gateway("http"),
             li,
         );
-        let mut glh = GatewayListenerHealth::default();
+        let mut glh = GatewayListenerStatus::default();
         glh.listeners = listeners;
 
         let mut health = HashMap::new();

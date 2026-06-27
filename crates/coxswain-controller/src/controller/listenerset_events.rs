@@ -3,7 +3,7 @@
 use super::listenerset_status::build_listenerset_status_patch;
 use coxswain_reflector::gw_types::ListenerSet;
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::tls::GatewayListenerHealth;
+use coxswain_reflector::status::GatewayListenerStatus;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
     Client,
@@ -16,7 +16,7 @@ use kube::{
 pub(super) async fn patch_listenerset_status(
     client: &Client,
     ls: &ListenerSet,
-    parent_health: Option<&GatewayListenerHealth>,
+    parent_health: Option<&GatewayListenerStatus>,
     accepted: bool,
     ingress_ports: IngressPorts,
 ) {

@@ -1,7 +1,7 @@
 //! [`RouteLike`] impl for `TLSRoute` — the TLSRoute-specific projections.
-//! The kind-generic `Accepted`/`ResolvedRefs` algorithm lives in [`super::route_health`].
+//! The kind-generic `Accepted`/`ResolvedRefs` algorithm lives in [`super::route_status`].
 
-use super::route_health::{BackendRefView, ParentRefView, RouteLike};
+use super::route_status::{BackendRefView, ParentRefView, RouteLike};
 use crate::gw_types::TlsRoute;
 
 impl RouteLike for TlsRoute {

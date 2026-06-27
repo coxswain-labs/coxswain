@@ -16,7 +16,7 @@
 //! ## Event sources
 //!
 //! - **Rebuild** — a `watch::Receiver<u64>` over the reconciler's generation
-//!   counter (from `SharedRouteHealth::subscribe()`). The receiver type keeps
+//!   counter (from `SharedRouteStatus::subscribe()`). The receiver type keeps
 //!   this crate dependent on `coxswain-core` only, never on `coxswain-reflector`.
 //! - **Fleet** — the [`SharedFleet`] cell, polled once per second and diffed
 //!   against the previous snapshot (the cell is a plain `ArcSwap` with no change
@@ -71,7 +71,7 @@ impl EventSources {
     /// Bundle the live event sources for the SSE stream.
     ///
     /// `rebuild_rx` is obtained from the reconciler's
-    /// `SharedRouteHealth::subscribe()`; passing the receiver (not the
+    /// `SharedRouteStatus::subscribe()`; passing the receiver (not the
     /// reflector handle) keeps `coxswain-admin` off the `coxswain-reflector`
     /// dependency edge.
     #[must_use]

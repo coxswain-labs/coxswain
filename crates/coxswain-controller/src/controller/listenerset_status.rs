@@ -2,8 +2,8 @@
 //!
 //! Mirrors [`super::gateway_status`] for the `ListenerSet` resource. A ListenerSet
 //! attaches listeners to a parent Gateway; its per-listener health lives in the
-//! parent Gateway's [`GatewayListenerHealth`] keyed by
-//! [`ListenerHealthKey`]`{ source: ListenerSet(ls_key), name }`. The
+//! parent Gateway's [`GatewayListenerStatus`] keyed by
+//! [`ListenerStatusKey`]`{ source: ListenerSet(ls_key), name }`. The
 //! per-listener `Accepted`/`ResolvedRefs`/`Programmed` conditions reuse the exact
 //! same reason mapping as Gateway listeners via
 //! [`crate::status_common::listener_condition_triplet`]; a `Conflicted` condition
@@ -16,8 +16,8 @@ use coxswain_reflector::gw_types::v::listenersets::{
     ListenerSetListeners, ListenerSetListenersTlsMode,
 };
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::tls::{
-    GatewayListenerHealth, ListenerHealthKey, ListenerInfo, ListenerSource, ListenerTlsOutcome,
+use coxswain_reflector::status::{
+    GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey, ListenerTlsOutcome,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
@@ -39,7 +39,7 @@ fn listenerset_key(ls: &ListenerSet) -> ObjectKey {
 #[must_use]
 pub(super) fn listenerset_accepted(
     ls: &ListenerSet,
-    parent_health: Option<&GatewayListenerHealth>,
+    parent_health: Option<&GatewayListenerStatus>,
 ) -> bool {
     if ls.spec.listeners.is_empty() {
         return true;
@@ -56,12 +56,12 @@ pub(super) fn listenerset_accepted(
 
 /// Look up the health for one ListenerSet listener in its parent Gateway's map.
 fn listener_info<'a>(
-    health: Option<&'a GatewayListenerHealth>,
+    health: Option<&'a GatewayListenerStatus>,
     ls_key: &ObjectKey,
     name: &str,
 ) -> Option<&'a ListenerInfo> {
     health.and_then(|h| {
-        h.listeners.get(&ListenerHealthKey {
+        h.listeners.get(&ListenerStatusKey {
             source: ListenerSource::ListenerSet(ls_key.clone()),
             name: name.to_string(),
         })
@@ -147,7 +147,7 @@ fn listener_conditions(
         for c in conds.iter_mut() {
             if c.type_ == "Accepted" || c.type_ == "Programmed" {
                 c.status = "False".to_string();
-                c.reason = "Pending".to_string();
+                c.reason = "NotAllowed".to_string();
                 c.message = "ListenerSet not accepted by the parent Gateway".to_string();
             }
         }
@@ -190,7 +190,7 @@ fn listener_conditions(
 #[must_use]
 pub(super) fn build_listenerset_status_patch(
     ls: &ListenerSet,
-    parent_health: Option<&GatewayListenerHealth>,
+    parent_health: Option<&GatewayListenerStatus>,
     accepted: bool,
     ingress_ports: IngressPorts,
     generation: i64,
@@ -248,9 +248,12 @@ pub(super) fn build_listenerset_status_patch(
         )
     };
     let (prog_status, prog_reason, prog_msg) = if !accepted {
+        // GEP-1713 conformance: a ListenerSet rejected by the parent's
+        // `allowedListeners` reports Programmed=False with reason `NotAllowed`,
+        // mirroring its Accepted condition (NOT `Pending`).
         (
             "False",
-            "Pending",
+            "NotAllowed",
             "ListenerSet not accepted by the parent Gateway",
         )
     } else if all_programmed {
@@ -294,7 +297,7 @@ pub(super) fn build_listenerset_status_patch(
 #[must_use]
 pub(super) fn listenerset_needs_status_patch(
     ls: &ListenerSet,
-    parent_health: Option<&GatewayListenerHealth>,
+    parent_health: Option<&GatewayListenerStatus>,
     accepted: bool,
 ) -> bool {
     let status = ls.status.as_ref();
@@ -410,14 +413,14 @@ mod tests {
     }
 
     /// Health for the parent Gateway holding this LS's listener, optionally conflicted.
-    fn parent_health(name: &str, port: u16, conflicted: bool) -> GatewayListenerHealth {
-        let mut h = GatewayListenerHealth::default();
+    fn parent_health(name: &str, port: u16, conflicted: bool) -> GatewayListenerStatus {
+        let mut h = GatewayListenerStatus::default();
         let mut info = ListenerInfo::default();
         info.port = port;
         info.attached_routes = 2;
         info.conflicted = conflicted;
         h.listeners.insert(
-            ListenerHealthKey::listener_set(ObjectKey::new("apps", "team"), name),
+            ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), name),
             info,
         );
         h
@@ -578,12 +581,12 @@ mod tests {
             protocol: "HTTPS".to_string(),
             ..Default::default()
         }]);
-        let mut healthy = GatewayListenerHealth::default();
+        let mut healthy = GatewayListenerStatus::default();
         let mut info = ListenerInfo::default();
         info.tls_outcome = ListenerTlsOutcome::Resolved;
         info.port = 8443;
         healthy.listeners.insert(
-            ListenerHealthKey::listener_set(ObjectKey::new("apps", "team"), "web"),
+            ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), "web"),
             info,
         );
 
@@ -600,14 +603,14 @@ mod tests {
         assert!(!listenerset_needs_status_patch(&set, Some(&healthy), true));
 
         // Cert deleted → outcome unhealthy, same generation. Must require a patch.
-        let mut broken = GatewayListenerHealth::default();
+        let mut broken = GatewayListenerStatus::default();
         let mut bad = ListenerInfo::default();
         bad.tls_outcome = ListenerTlsOutcome::InvalidCertificateRef {
             message: "secret missing".to_string(),
         };
         bad.port = 8443;
         broken.listeners.insert(
-            ListenerHealthKey::listener_set(ObjectKey::new("apps", "team"), "web"),
+            ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), "web"),
             bad,
         );
         assert!(

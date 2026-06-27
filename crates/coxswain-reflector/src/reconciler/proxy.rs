@@ -3,8 +3,8 @@
 //!
 //! Owns the debounced watch + rebuild pipeline that turns reflector snapshots
 //! into the full set of outputs the shared pool needs: Ingress + Gateway
-//! routing tables, the TLS cert store, the per-listener health map (consumed
-//! by `HotReloader`), the per-route and per-policy health maps (consumed by
+//! routing tables, the TLS cert store, the per-listener status map (consumed
+//! by `HotReloader`), the per-route and per-policy status maps (consumed by
 //! the controller's status writer), and the cluster summary.
 //!
 //! Sibling reconcilers in this module narrow the scope:
@@ -33,9 +33,9 @@ use crate::k8s_utils::scoped_api;
 use crate::reference_grants::{
     GrantSet, flatten_ca_grants, flatten_grants, flatten_ls_cert_grants,
 };
-use crate::tls::{
-    GatewayListenerHealth, ListenerSource, SharedBackendTlsPolicyHealth,
-    SharedGatewayListenerHealth, SharedRouteHealth,
+use crate::status::{
+    GatewayListenerStatus, ListenerSource, SharedBackendTlsPolicyStatus,
+    SharedGatewayListenerStatus, SharedRouteStatus,
 };
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
@@ -260,22 +260,22 @@ pub struct SharedProxyReconciler {
     client_certs: SharedClientCertStore,
     /// Per-port HTTPS Gateway-listener hostname snapshot (GEP-3567, #96).
     listener_hostnames: SharedListenerHostnames,
-    listener_health: SharedGatewayListenerHealth,
+    listener_status: SharedGatewayListenerStatus,
     cluster_summary: SharedClusterSummary,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
     /// Per-cut-over-Gateway routing snapshots. Written by this reconciler on
     /// every rebuild; read by the discovery server to serve `Scope::Gateway` subscribers.
     dedicated_registry: DedicatedRoutingRegistry,
-    route_health: SharedRouteHealth,
-    /// Per-(GRPCRoute, parent) health — a dedicated instance separate from `route_health`
+    route_status: SharedRouteStatus,
+    /// Per-(GRPCRoute, parent) health — a dedicated instance separate from `route_status`
     /// because `RouteParentKey` is kind-neutral and an HTTPRoute and GRPCRoute with the
     /// same name+ns+gateway would collide in one map.
-    grpc_route_health: SharedRouteHealth,
-    /// Per-(TLSRoute, parent) health — separate from `route_health` and `grpc_route_health`
+    grpc_route_status: SharedRouteStatus,
+    /// Per-(TLSRoute, parent) health — separate from `route_status` and `grpc_route_status`
     /// for the same kind-neutrality reason.
-    tls_route_health: SharedRouteHealth,
-    policy_health: SharedBackendTlsPolicyHealth,
+    tls_route_status: SharedRouteStatus,
+    policy_status: SharedBackendTlsPolicyStatus,
     fleet: SharedFleet,
     owned_gateways: OwnedGateways,
     leader: Arc<AtomicBool>,
@@ -310,7 +310,7 @@ pub struct ReconcilerOutputs {
     /// Per-port HTTPS Gateway-listener hostname snapshot (GEP-3567, #96).
     pub listener_hostnames: SharedListenerHostnames,
     /// Per-listener Gateway health used by status writes and the hot-reloader.
-    pub listener_health: SharedGatewayListenerHealth,
+    pub listener_status: SharedGatewayListenerStatus,
     /// Cluster aggregate (per-Gateway / per-Ingress summary) consumed by the
     /// controller's `/cluster` admin endpoint. Updated on every rebuild.
     pub cluster_summary: SharedClusterSummary,
@@ -392,7 +392,7 @@ impl SharedProxyReconciler {
             tls,
             client_certs,
             listener_hostnames,
-            listener_health,
+            listener_status,
             cluster_summary,
             dedicated_registry,
             passthrough_routes,
@@ -469,14 +469,14 @@ impl SharedProxyReconciler {
             tls,
             client_certs,
             listener_hostnames,
-            listener_health,
+            listener_status,
             cluster_summary,
             dedicated_registry,
             passthrough_routes,
-            route_health: SharedRouteHealth::new(),
-            grpc_route_health: SharedRouteHealth::new(),
-            tls_route_health: SharedRouteHealth::new(),
-            policy_health: SharedBackendTlsPolicyHealth::new(),
+            route_status: SharedRouteStatus::new(),
+            grpc_route_status: SharedRouteStatus::new(),
+            tls_route_status: SharedRouteStatus::new(),
+            policy_status: SharedBackendTlsPolicyStatus::new(),
             fleet: SharedFleet::new(),
             owned_gateways,
             leader,
@@ -497,34 +497,34 @@ impl SharedProxyReconciler {
         self.status_subscriptions.lock().take()
     }
 
-    /// Returns the shared route health handle so other services (e.g. the Controller)
+    /// Returns the shared route status handle so other services (e.g. the Controller)
     /// can subscribe to updates published by this reconciler.
-    pub fn route_health(&self) -> SharedRouteHealth {
-        self.route_health.clone()
+    pub fn route_status(&self) -> SharedRouteStatus {
+        self.route_status.clone()
     }
 
-    /// Returns the shared GRPCRoute health handle so the Controller can subscribe to
+    /// Returns the shared GRPCRoute status handle so the Controller can subscribe to
     /// updates published by this reconciler.
     ///
-    /// Separate from [`Self::route_health`] — `RouteParentKey` is kind-neutral, so
-    /// HTTPRoute and GRPCRoute health maps must never be merged.
-    pub fn grpc_route_health(&self) -> SharedRouteHealth {
-        self.grpc_route_health.clone()
+    /// Separate from [`Self::route_status`] — `RouteParentKey` is kind-neutral, so
+    /// HTTPRoute and GRPCRoute status maps must never be merged.
+    pub fn grpc_route_status(&self) -> SharedRouteStatus {
+        self.grpc_route_status.clone()
     }
 
-    /// Returns the shared TLSRoute health handle so the Controller can subscribe to
+    /// Returns the shared TLSRoute status handle so the Controller can subscribe to
     /// updates published by this reconciler.
     ///
-    /// Separate from [`Self::route_health`] and [`Self::grpc_route_health`] —
-    /// `RouteParentKey` is kind-neutral, so TLSRoute health must live in its own map.
-    pub fn tls_route_health(&self) -> SharedRouteHealth {
-        self.tls_route_health.clone()
+    /// Separate from [`Self::route_status`] and [`Self::grpc_route_status`] —
+    /// `RouteParentKey` is kind-neutral, so TLSRoute status must live in its own map.
+    pub fn tls_route_status(&self) -> SharedRouteStatus {
+        self.tls_route_status.clone()
     }
 
-    /// Returns the shared `BackendTLSPolicy` health handle so the Controller can
+    /// Returns the shared `BackendTLSPolicy` status handle so the Controller can
     /// write `status.ancestors[]` when leader.
-    pub fn policy_health(&self) -> SharedBackendTlsPolicyHealth {
-        self.policy_health.clone()
+    pub fn policy_status(&self) -> SharedBackendTlsPolicyStatus {
+        self.policy_status.clone()
     }
 
     /// Returns the SNI-keyed TLS passthrough routing table (GEP-2643, #70).
@@ -614,13 +614,13 @@ pub(super) struct SharedOutputs<'a> {
     pub(super) tls: &'a SharedPortTlsStore,
     pub(super) client_certs: &'a SharedClientCertStore,
     pub(super) listener_hostnames: &'a SharedListenerHostnames,
-    pub(super) listener_health: &'a SharedGatewayListenerHealth,
+    pub(super) listener_status: &'a SharedGatewayListenerStatus,
     pub(super) cluster_summary: &'a SharedClusterSummary,
     pub(super) dedicated_registry: &'a DedicatedRoutingRegistry,
-    pub(super) route_health: &'a SharedRouteHealth,
-    pub(super) grpc_route_health: &'a SharedRouteHealth,
-    pub(super) tls_route_health: &'a SharedRouteHealth,
-    pub(super) policy_health: &'a SharedBackendTlsPolicyHealth,
+    pub(super) route_status: &'a SharedRouteStatus,
+    pub(super) grpc_route_status: &'a SharedRouteStatus,
+    pub(super) tls_route_status: &'a SharedRouteStatus,
+    pub(super) policy_status: &'a SharedBackendTlsPolicyStatus,
     pub(super) passthrough_routes: &'a SharedTlsPassthroughTable,
     pub(super) ingress_event_tx: Option<&'a tokio::sync::mpsc::Sender<IngressEvent>>,
 }
@@ -770,13 +770,13 @@ impl BackgroundService for SharedProxyReconciler {
             tls: self.tls.clone(),
             client_certs: self.client_certs.clone(),
             listener_hostnames: self.listener_hostnames.clone(),
-            listener_health: self.listener_health.clone(),
+            listener_status: self.listener_status.clone(),
             cluster_summary: self.cluster_summary.clone(),
             dedicated_registry: self.dedicated_registry.clone(),
-            route_health: self.route_health.clone(),
-            grpc_route_health: self.grpc_route_health.clone(),
-            tls_route_health: self.tls_route_health.clone(),
-            policy_health: self.policy_health.clone(),
+            route_status: self.route_status.clone(),
+            grpc_route_status: self.grpc_route_status.clone(),
+            tls_route_status: self.tls_route_status.clone(),
+            policy_status: self.policy_status.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
             fleet: self.fleet.clone(),
             owned_gateways: self.owned_gateways.clone(),
@@ -812,13 +812,13 @@ struct SharedHandles {
     tls: SharedPortTlsStore,
     client_certs: SharedClientCertStore,
     listener_hostnames: SharedListenerHostnames,
-    listener_health: SharedGatewayListenerHealth,
+    listener_status: SharedGatewayListenerStatus,
     cluster_summary: SharedClusterSummary,
     dedicated_registry: DedicatedRoutingRegistry,
-    route_health: SharedRouteHealth,
-    grpc_route_health: SharedRouteHealth,
-    tls_route_health: SharedRouteHealth,
-    policy_health: SharedBackendTlsPolicyHealth,
+    route_status: SharedRouteStatus,
+    grpc_route_status: SharedRouteStatus,
+    tls_route_status: SharedRouteStatus,
+    policy_status: SharedBackendTlsPolicyStatus,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
     /// Populated by the fleet task when `watch_fleet` is enabled; carried here
@@ -860,13 +860,13 @@ async fn spawn_tasks(
         tls,
         client_certs,
         listener_hostnames,
-        listener_health,
+        listener_status,
         cluster_summary,
         dedicated_registry,
-        route_health,
-        grpc_route_health,
-        tls_route_health,
-        policy_health,
+        route_status,
+        grpc_route_status,
+        tls_route_status,
+        policy_status,
         passthrough_routes,
         fleet,
         owned_gateways,
@@ -1205,13 +1205,13 @@ async fn spawn_tasks(
                 tls: &tls,
                 client_certs: &client_certs,
                 listener_hostnames: &listener_hostnames,
-                listener_health: &listener_health,
+                listener_status: &listener_status,
                 cluster_summary: &cluster_summary,
                 dedicated_registry: &dedicated_registry,
-                route_health: &route_health,
-                grpc_route_health: &grpc_route_health,
-                tls_route_health: &tls_route_health,
-                policy_health: &policy_health,
+                route_status: &route_status,
+                grpc_route_status: &grpc_route_status,
+                tls_route_status: &tls_route_status,
+                policy_status: &policy_status,
                 passthrough_routes: &passthrough_routes,
                 ingress_event_tx: ingress_event_tx.as_ref(),
             };
@@ -1295,12 +1295,12 @@ fn rebuild(
     );
 
     // `policy_index` is built first because `Ownership` now carries a borrow of it.
-    let (policy_index, mut policy_health_map) =
+    let (policy_index, mut policy_status_map) =
         build_backend_tls_index(stores.policies, stores.configmaps, stores.services);
 
     // GEP-3155: resolve each Gateway's backend client cert once. `certs` is attached
     // to UpstreamTls during the route build; `health` feeds the gateway-level
-    // ResolvedRefs condition merged into `gateway_listener_health` below.
+    // ResolvedRefs condition merged into `gateway_listener_status` below.
     let backend_client_certs =
         resolve_backend_client_certs(stores, &owned_gateway_classes, &cert_grants, true);
 
@@ -1343,7 +1343,7 @@ fn rebuild(
         outputs,
     );
 
-    let mut gateway_listener_health = build_tls(
+    let mut gateway_listener_status = build_tls(
         stores,
         &ingresses,
         &ownership,
@@ -1357,10 +1357,10 @@ fn rebuild(
         &ingresses,
         &ownership,
         outputs.client_certs,
-        &mut gateway_listener_health,
+        &mut gateway_listener_status,
         true,
     );
-    merge_backend_client_cert_health(&mut gateway_listener_health, &backend_client_certs.health);
+    merge_backend_client_cert_health(&mut gateway_listener_status, &backend_client_certs.health);
 
     let tls_routes = stores.tls_routes.state();
     // GEP-1713: ListenerSet → parent Gateway map so a `parentRef.kind: ListenerSet`
@@ -1378,21 +1378,21 @@ fn rebuild(
         &routes,
         &owned_gateways,
         &ls_parent,
-        &mut gateway_listener_health,
+        &mut gateway_listener_status,
         false,
     );
     count_attached_routes(
         &grpc_routes,
         &owned_gateways,
         &ls_parent,
-        &mut gateway_listener_health,
+        &mut gateway_listener_status,
         false,
     );
     count_attached_routes(
         &tls_routes,
         &owned_gateways,
         &ls_parent,
-        &mut gateway_listener_health,
+        &mut gateway_listener_status,
         true,
     );
 
@@ -1432,7 +1432,7 @@ fn rebuild(
     // Per-(route, parent) health feeds both the route-status writer and the
     // cluster summary's traffic-served HTTPRoute status, so compute it before
     // publishing the summary.
-    let route_health_map = GatewayApiReconciler::compute_route_health(
+    let route_status_map = GatewayApiReconciler::compute_route_health(
         &routes,
         &gateways,
         &owned_gateways,
@@ -1443,7 +1443,7 @@ fn rebuild(
 
     // GRPCRoute health uses a separate map and channel — RouteParentKey is kind-neutral
     // and an HTTPRoute + GRPCRoute with the same name/ns/gateway would collide.
-    let grpc_route_health_map = GrpcRouteReconciler::compute_route_health(
+    let grpc_route_status_map = GrpcRouteReconciler::compute_route_health(
         &grpc_routes,
         &gateways,
         &owned_gateways,
@@ -1452,8 +1452,8 @@ fn rebuild(
         stores.services,
     );
 
-    // Publish the cluster summary while we still have access to gateway_listener_health
-    // (it's moved into `listener_health.store_and_notify` next). Reads from already-
+    // Publish the cluster summary while we still have access to gateway_listener_status
+    // (it's moved into `listener_status.store_and_notify` next). Reads from already-
     // materialised state: nothing kube-side, no allocations beyond the summary.
     // Routing-table conflicts/dead-routes are overlaid in the UI from the
     // cross-proxy `/api/v1/problems` aggregate (the controller's table excludes
@@ -1467,13 +1467,13 @@ fn rebuild(
             dedicated_gateway_class_names: &dedicated_gateway_class_names,
             owned_ingress_classes: &owned_ingress_classes,
             default_ingress_class: owned_default_ingress_class.as_deref(),
-            gateway_listener_health: &gateway_listener_health,
+            gateway_listener_status: &gateway_listener_status,
             routes: &routes,
-            route_health: &route_health_map,
+            route_status: &route_status_map,
             leader,
         })));
 
-    // Merge the shared pool's (non-cut-over) listener health into the cell
+    // Merge the shared pool's (non-cut-over) listener status into the cell
     // without clobbering the cut-over Gateways' entries, which the dedicated
     // reconcilers own. A full replace here would transiently drop a dedicated
     // Gateway's listener under concurrent reconciles, making its proxy unbind
@@ -1488,12 +1488,12 @@ fn rebuild(
         })
         .collect();
     outputs
-        .listener_health
-        .update_scoped(gateway_listener_health, |k| !cut_over_keys.contains(k));
-    outputs.route_health.store_and_notify(route_health_map);
+        .listener_status
+        .update_scoped(gateway_listener_status, |k| !cut_over_keys.contains(k));
+    outputs.route_status.store_and_notify(route_status_map);
     outputs
-        .grpc_route_health
-        .store_and_notify(grpc_route_health_map);
+        .grpc_route_status
+        .store_and_notify(grpc_route_status_map);
 
     // Compute per-policy ancestor lists and merge with the validity health from index build.
     let ancestor_health = GatewayApiReconciler::compute_policy_health(
@@ -1503,10 +1503,10 @@ fn rebuild(
         &owned_gateways,
     );
     for (key, ah) in ancestor_health {
-        let entry = policy_health_map.entry(key).or_default();
+        let entry = policy_status_map.entry(key).or_default();
         entry.ancestors = ah.ancestors;
     }
-    outputs.policy_health.store_and_notify(policy_health_map);
+    outputs.policy_status.store_and_notify(policy_status_map);
 
     // Build per-cut-over-Gateway snapshots for the dedicated registry (#426).
     //
@@ -1603,7 +1603,7 @@ fn rebuild(
         );
 
         // Retain only the health entry for the owning Gateway.
-        let listener_health: HashMap<ObjectKey, GatewayListenerHealth> = dedicated_listener_health
+        let listener_status: HashMap<ObjectKey, GatewayListenerStatus> = dedicated_listener_health
             .into_iter()
             .filter(|(k, _)| k == &key)
             .collect();
@@ -1613,7 +1613,7 @@ fn rebuild(
             gateway: gw_routes_cell.load(),
             tls: tls_cell.load(),
             client_certs: client_certs_cell.load(),
-            listener_health,
+            listener_status,
             // GEP-1762: the dedicated proxy runs as ServiceAccount `{gw}-{class}`.
             // Stamped here using the same formula the operator uses to provision the
             // ServiceAccount so the discovery binding check can never disagree.
@@ -1627,7 +1627,7 @@ fn rebuild(
     // TLS/Passthrough listeners on owned Gateways and their attached ListenerSets
     // (GEP-2643 #70, GEP-1713 #93). Also returns per-(TLSRoute, parentRef) health
     // for status condition writes.
-    let tls_route_health_map = build_passthrough_routes(
+    let tls_route_status_map = build_passthrough_routes(
         stores,
         &owned_gateways,
         &effective,
@@ -1635,8 +1635,8 @@ fn rebuild(
         outputs.passthrough_routes,
     );
     outputs
-        .tls_route_health
-        .store_and_notify(tls_route_health_map);
+        .tls_route_status
+        .store_and_notify(tls_route_status_map);
 
     routes_published
 }
