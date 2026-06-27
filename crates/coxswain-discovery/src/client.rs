@@ -641,7 +641,7 @@ fn apply_snapshot(
             lh_builder.add_listener(
                 li.bind_port(),
                 &li.hostname,
-                li.tls_outcome.is_https_terminate(),
+                li.readiness.is_https_terminate(),
             );
         }
     }

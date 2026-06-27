@@ -21,8 +21,8 @@ use crate::ingress::annotations::AnnotationIssue;
 use crate::ingress::{IngressClassContext, IngressPorts, IngressReconciler, resolve_class_params};
 use crate::keys::ListenerKey;
 use crate::status::{
-    BackendClientCertOutcome, GatewayListenerStatus, ListenerInfo, ListenerSource,
-    ListenerStatusKey, ListenerTlsOutcome, RouteStatusMap,
+    BackendClientCertOutcome, GatewayListenerStatus, ListenerInfo, ListenerReadiness,
+    ListenerSource, ListenerStatusKey, RouteStatusMap,
 };
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self as reference_grants, ReferenceGrantKey};
@@ -535,7 +535,7 @@ pub(super) fn build_tls(
             lh_builder.add_listener(
                 li.bind_port(),
                 &li.hostname,
-                li.tls_outcome.is_https_terminate(),
+                li.readiness.is_https_terminate(),
             );
         }
         gateway_listener_status.insert(gw_key, health);
@@ -673,7 +673,7 @@ pub(super) fn count_attached_routes<R: RouteLike>(
     // A listener accepts this route kind when its passthrough-ness matches the
     // kind: passthrough listeners ↔ TLSRoutes, everything else ↔ HTTP/GRPC.
     let listener_accepts = |info: &ListenerInfo| {
-        passthrough_kind == matches!(info.tls_outcome, ListenerTlsOutcome::TlsPassthrough)
+        passthrough_kind == matches!(info.readiness, ListenerReadiness::TlsPassthrough)
     };
 
     for route in routes {
@@ -990,11 +990,11 @@ mod tests {
     /// One Gateway-owned listener entry; `hostname == ""` matches all route hostnames.
     fn listener(
         name: &str,
-        tls_outcome: ListenerTlsOutcome,
+        readiness: ListenerReadiness,
         port: u16,
     ) -> (ListenerStatusKey, ListenerInfo) {
         let mut info = ListenerInfo::default();
-        info.tls_outcome = tls_outcome;
+        info.readiness = readiness;
         info.port = port;
         (ListenerStatusKey::gateway(name), info)
     }
@@ -1076,11 +1076,7 @@ mod tests {
 
     #[test]
     fn grpc_route_increments_attached_routes_on_http_listener() {
-        let mut map = health(vec![listener(
-            "http",
-            ListenerTlsOutcome::NotApplicable,
-            80,
-        )]);
+        let mut map = health(vec![listener("http", ListenerReadiness::NotApplicable, 80)]);
         count_attached_routes(&[grpc_route()], &owned(), &HashMap::new(), &mut map, false);
         assert_eq!(
             attached(&map, "http"),
@@ -1093,7 +1089,7 @@ mod tests {
     fn tls_route_increments_attached_routes_on_passthrough_listener() {
         let mut map = health(vec![listener(
             "tls",
-            ListenerTlsOutcome::TlsPassthrough,
+            ListenerReadiness::TlsPassthrough,
             443,
         )]);
         count_attached_routes(&[tls_route()], &owned(), &HashMap::new(), &mut map, true);
@@ -1106,7 +1102,7 @@ mod tests {
 
     #[test]
     fn tls_route_not_counted_against_terminate_listener() {
-        let mut map = health(vec![listener("https", ListenerTlsOutcome::Resolved, 443)]);
+        let mut map = health(vec![listener("https", ListenerReadiness::Resolved, 443)]);
         count_attached_routes(&[tls_route()], &owned(), &HashMap::new(), &mut map, true);
         assert_eq!(
             attached(&map, "https"),
@@ -1119,7 +1115,7 @@ mod tests {
     fn http_route_not_counted_against_passthrough_listener() {
         let mut map = health(vec![listener(
             "tls",
-            ListenerTlsOutcome::TlsPassthrough,
+            ListenerReadiness::TlsPassthrough,
             443,
         )]);
         count_attached_routes(&[http_route()], &owned(), &HashMap::new(), &mut map, false);
@@ -1141,10 +1137,10 @@ mod tests {
         // one its own, one belonging to the ListenerSet.
         let mut gw = GatewayListenerStatus::default();
         let mut gw_info = ListenerInfo::default();
-        gw_info.tls_outcome = ListenerTlsOutcome::TlsPassthrough;
+        gw_info.readiness = ListenerReadiness::TlsPassthrough;
         gw_info.port = 443;
         let mut ls_info = ListenerInfo::default();
-        ls_info.tls_outcome = ListenerTlsOutcome::TlsPassthrough;
+        ls_info.readiness = ListenerReadiness::TlsPassthrough;
         ls_info.port = 8443;
         gw.listeners = [
             (ListenerStatusKey::gateway("tls"), gw_info),

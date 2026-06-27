@@ -28,7 +28,7 @@ pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writ
 // without forcing every site to learn the new crate name.
 pub use coxswain_core::cluster::SharedClusterSummary;
 pub use coxswain_reflector::{
-    GatewayListenerStatus, IngressPorts, ListenerInfo, ListenerTlsOutcome,
+    GatewayListenerStatus, IngressPorts, ListenerInfo, ListenerReadiness,
     SharedBackendTlsPolicyStatus, SharedGatewayListenerStatus, SharedRouteStatus,
     gateway_api_crds_present,
 };

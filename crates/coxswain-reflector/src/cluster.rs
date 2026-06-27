@@ -182,8 +182,8 @@ fn gateway_severity(gw: &Gateway, listener_status: Option<&GatewayListenerStatus
     {
         return Severity::Error;
     }
-    let any_listener_unhealthy = listener_status
-        .is_some_and(|h| h.listeners.values().any(|li| !li.tls_outcome.is_healthy()));
+    let any_listener_unhealthy =
+        listener_status.is_some_and(|h| h.listeners.values().any(|li| !li.readiness.is_healthy()));
     if any_listener_unhealthy {
         Severity::Warn
     } else {
@@ -310,7 +310,7 @@ fn listener_path_severity(
             .find(|(k, _)| k.name == section)
             .map(|(_, li)| li)
         {
-            Some(li) if li.tls_outcome.is_healthy() => Severity::Ok,
+            Some(li) if li.readiness.is_healthy() => Severity::Ok,
             Some(_) => Severity::Error,
             None => Severity::Ok, // unmatched section is reflected in own_ok, not here
         };
@@ -321,7 +321,7 @@ fn listener_path_severity(
     let healthy = health
         .listeners
         .values()
-        .filter(|li| li.tls_outcome.is_healthy())
+        .filter(|li| li.readiness.is_healthy())
         .count();
     if healthy == health.listeners.len() {
         Severity::Ok
@@ -920,12 +920,12 @@ mod tests {
     // ── traffic-served health (#301) ───────────────────────────────────────────
 
     use crate::cluster::{gateway_severity, listener_path_severity, reduce_paths};
-    use crate::status::ListenerTlsOutcome;
+    use crate::status::ListenerReadiness;
     use coxswain_core::cluster::Severity;
 
-    fn listener(name: &str, outcome: ListenerTlsOutcome) -> (ListenerStatusKey, ListenerInfo) {
+    fn listener(name: &str, outcome: ListenerReadiness) -> (ListenerStatusKey, ListenerInfo) {
         let mut li = ListenerInfo::default();
-        li.tls_outcome = outcome;
+        li.readiness = outcome;
         (ListenerStatusKey::gateway(name), li)
     }
 
@@ -957,10 +957,10 @@ mod tests {
     #[test]
     fn listener_path_severity_is_listener_precise() {
         let health = health_with(vec![
-            listener("web", ListenerTlsOutcome::Resolved),
+            listener("web", ListenerReadiness::Resolved),
             listener(
                 "secure",
-                ListenerTlsOutcome::Invalid {
+                ListenerReadiness::Invalid {
                     message: "bad cert".to_string(),
                 },
             ),
@@ -1022,7 +1022,7 @@ mod tests {
         // Healthy conditions but a listener with a bad cert → warn (binding up, partial).
         let bad = health_with(vec![listener(
             "l",
-            ListenerTlsOutcome::Invalid {
+            ListenerReadiness::Invalid {
                 message: "x".to_string(),
             },
         )]);

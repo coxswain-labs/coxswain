@@ -19,7 +19,7 @@ use coxswain_reflector::gw_types::v::gateways::{
     GatewayStatusListenersSupportedKinds,
 };
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::status::{FrontendValidationOutcome, ListenerInfo, ListenerTlsOutcome};
+use coxswain_reflector::status::{FrontendValidationOutcome, ListenerInfo, ListenerReadiness};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Conditions whose `type` starts with this prefix are owned by the
@@ -202,7 +202,7 @@ pub(crate) fn listener_condition_triplet(
     generation: i64,
     now: &Time,
 ) -> Vec<Condition> {
-    let outcome = info.map(|i| i.tls_outcome.clone()).unwrap_or_default();
+    let outcome = info.map(|i| i.readiness.clone()).unwrap_or_default();
     // GEP-91: this listener's frontend client-cert CA ref (perPort override or
     // gateway default) failed to resolve. It takes precedence over the
     // per-listener cert outcome — even a listener with a valid server
@@ -235,7 +235,7 @@ pub(crate) fn listener_condition_triplet(
     // failed to resolve, or True/Accepted otherwise.
     let (accepted_status, accepted_reason, accepted_msg) = if frontend_ca_failed {
         ("False", "NoValidCACertificate", frontend_msg)
-    } else if let ListenerTlsOutcome::Unsupported { message } = &outcome {
+    } else if let ListenerReadiness::Unsupported { message } = &outcome {
         ("False", "UnsupportedValue", message.as_str())
     } else {
         ("True", "Accepted", "")

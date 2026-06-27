@@ -38,8 +38,8 @@
 //! [`Snapshot`]: crate::proto::v1::Snapshot
 
 use coxswain_core::listener_status::{
-    ConflictReason, GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey,
-    ListenerTlsOutcome,
+    ConflictReason, GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerSource,
+    ListenerStatusKey,
 };
 use coxswain_core::ownership::ObjectKey;
 
@@ -83,36 +83,31 @@ pub fn listener_status_to_wire(
 }
 
 fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
-    let (outcome, message) = match &info.tls_outcome {
-        ListenerTlsOutcome::NotApplicable => (p::ListenerTlsOutcome::NotApplicable, String::new()),
-        ListenerTlsOutcome::Resolved => (p::ListenerTlsOutcome::Resolved, String::new()),
-        ListenerTlsOutcome::RefNotPermitted { message } => {
-            (p::ListenerTlsOutcome::RefNotPermitted, message.clone())
+    let (outcome, message) = match &info.readiness {
+        ListenerReadiness::NotApplicable => (p::ListenerReadiness::NotApplicable, String::new()),
+        ListenerReadiness::Resolved => (p::ListenerReadiness::Resolved, String::new()),
+        ListenerReadiness::RefNotPermitted { message } => {
+            (p::ListenerReadiness::RefNotPermitted, message.clone())
         }
-        ListenerTlsOutcome::InvalidCertificateRef { message } => (
-            p::ListenerTlsOutcome::InvalidCertificateRef,
-            message.clone(),
-        ),
-        ListenerTlsOutcome::Invalid { message } => {
-            (p::ListenerTlsOutcome::Invalid, message.clone())
+        ListenerReadiness::InvalidCertificateRef { message } => {
+            (p::ListenerReadiness::InvalidCertificateRef, message.clone())
         }
-        ListenerTlsOutcome::ResolvedPartial { message } => {
-            (p::ListenerTlsOutcome::ResolvedPartial, message.clone())
+        ListenerReadiness::Invalid { message } => (p::ListenerReadiness::Invalid, message.clone()),
+        ListenerReadiness::ResolvedPartial { message } => {
+            (p::ListenerReadiness::ResolvedPartial, message.clone())
         }
-        ListenerTlsOutcome::TlsPassthrough => {
-            (p::ListenerTlsOutcome::TlsPassthrough, String::new())
-        }
-        ListenerTlsOutcome::Unsupported { message } => {
-            (p::ListenerTlsOutcome::Unsupported, message.clone())
+        ListenerReadiness::TlsPassthrough => (p::ListenerReadiness::TlsPassthrough, String::new()),
+        ListenerReadiness::Unsupported { message } => {
+            (p::ListenerReadiness::Unsupported, message.clone())
         }
         &_ => unreachable!(
-            "invariant: all ListenerTlsOutcome variants handled; \
+            "invariant: all ListenerReadiness variants handled; \
              add a new arm when the core type gains a variant"
         ),
     };
     p::ListenerInfo {
-        tls_outcome: outcome as i32,
-        tls_message: message,
+        readiness: outcome as i32,
+        detail: message,
         attached_routes: info.attached_routes,
         hostname: info.hostname.clone(),
         // Lossy by design: the proxy never matches namespaces (it gets a pre-built
@@ -214,7 +209,7 @@ mod tests {
         let mut status = GatewayListenerStatus::default();
 
         let mut http_info = ListenerInfo::default();
-        http_info.tls_outcome = ListenerTlsOutcome::NotApplicable;
+        http_info.readiness = ListenerReadiness::NotApplicable;
         http_info.attached_routes = 3;
         http_info.hostname = "example.com".to_string();
         http_info.port = 80;
@@ -223,7 +218,7 @@ mod tests {
             .insert(ListenerStatusKey::gateway("http"), http_info);
 
         let mut https_info = ListenerInfo::default();
-        https_info.tls_outcome = ListenerTlsOutcome::Resolved;
+        https_info.readiness = ListenerReadiness::Resolved;
         https_info.attached_routes = 5;
         https_info.hostname = "example.com".to_string();
         https_info.route_namespaces = RouteNamespaceSet::All;
@@ -242,7 +237,7 @@ mod tests {
         // `unreachable!()` in `listener_info_to_wire` and crashed the controller's
         // discovery server, starving the proxy of every snapshot.
         let mut terminate_info = ListenerInfo::default();
-        terminate_info.tls_outcome = ListenerTlsOutcome::Unsupported {
+        terminate_info.readiness = ListenerReadiness::Unsupported {
             message: "tls.mode: Terminate is not supported".to_string(),
         };
         terminate_info.port = 8443;
@@ -251,7 +246,7 @@ mod tests {
             .insert(ListenerStatusKey::gateway("tls-terminate"), terminate_info);
 
         let mut passthrough_info = ListenerInfo::default();
-        passthrough_info.tls_outcome = ListenerTlsOutcome::TlsPassthrough;
+        passthrough_info.readiness = ListenerReadiness::TlsPassthrough;
         passthrough_info.port = 8444;
         status.listeners.insert(
             ListenerStatusKey::gateway("tls-passthrough"),
@@ -264,7 +259,7 @@ mod tests {
         // Both ConflictReason variants must round-trip correctly.
         let ls_key = ObjectKey::new("apps", "team-a");
         let mut ls_http = ListenerInfo::default();
-        ls_http.tls_outcome = ListenerTlsOutcome::NotApplicable;
+        ls_http.readiness = ListenerReadiness::NotApplicable;
         ls_http.attached_routes = 7;
         ls_http.port = 8080;
         ls_http.conflict = ConflictReason::HostnameConflict;
@@ -273,7 +268,7 @@ mod tests {
             ls_http,
         );
         let mut ls_proto = ListenerInfo::default();
-        ls_proto.tls_outcome = ListenerTlsOutcome::NotApplicable;
+        ls_proto.readiness = ListenerReadiness::NotApplicable;
         ls_proto.port = 9090;
         ls_proto.conflict = ConflictReason::ProtocolConflict;
         status.listeners.insert(
@@ -298,10 +293,10 @@ mod tests {
         );
         assert!(
             matches!(
-                h2.listeners[&gw_https].tls_outcome,
-                ListenerTlsOutcome::Resolved
+                h2.listeners[&gw_https].readiness,
+                ListenerReadiness::Resolved
             ),
-            "tls_outcome preserved"
+            "readiness preserved"
         );
         assert_eq!(
             h2.listeners[&gw_https].internal_port, 30007,
@@ -319,16 +314,16 @@ mod tests {
         );
         assert!(
             matches!(
-                &h2.listeners[&ListenerStatusKey::gateway("tls-terminate")].tls_outcome,
-                ListenerTlsOutcome::Unsupported { message }
+                &h2.listeners[&ListenerStatusKey::gateway("tls-terminate")].readiness,
+                ListenerReadiness::Unsupported { message }
                     if message == "tls.mode: Terminate is not supported"
             ),
             "Unsupported outcome + message preserved"
         );
         assert!(
             matches!(
-                h2.listeners[&ListenerStatusKey::gateway("tls-passthrough")].tls_outcome,
-                ListenerTlsOutcome::TlsPassthrough
+                h2.listeners[&ListenerStatusKey::gateway("tls-passthrough")].readiness,
+                ListenerReadiness::TlsPassthrough
             ),
             "TlsPassthrough outcome preserved"
         );

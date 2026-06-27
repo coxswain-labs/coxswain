@@ -8,7 +8,7 @@ use crate::status_common::{
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::v::gateways::{Gateway, GatewayStatusListeners};
 use coxswain_reflector::status::{
-    GatewayListenerStatus, ListenerSource, ListenerStatusKey, ListenerTlsOutcome,
+    GatewayListenerStatus, ListenerReadiness, ListenerSource, ListenerStatusKey,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
@@ -120,7 +120,7 @@ pub(super) fn gateway_needs_status_patch(
             .get(&ListenerStatusKey::gateway(&listener.name));
         let frontend_impacts = info.is_some_and(|i| i.frontend_outcome.is_failed());
         let desired_healthy = !has_invalid_kinds
-            && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true)
+            && info.map(|i| i.readiness.is_healthy()).unwrap_or(true)
             && !frontend_impacts;
         let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);
         let current_resolved = current_listener
@@ -135,8 +135,7 @@ pub(super) fn gateway_needs_status_patch(
         // Accepted logic (frontend CA failure or an Unsupported outcome → False) so
         // the transition True→False is detected and patched, not left stuck.
         let desired_accepted_false = frontend_impacts
-            || info
-                .is_some_and(|i| matches!(i.tls_outcome, ListenerTlsOutcome::Unsupported { .. }));
+            || info.is_some_and(|i| matches!(i.readiness, ListenerReadiness::Unsupported { .. }));
         let current_accepted_false = current_listener
             .and_then(|sl| sl.conditions.iter().find(|c| c.type_ == "Accepted"))
             .is_some_and(|c| c.status != "True");

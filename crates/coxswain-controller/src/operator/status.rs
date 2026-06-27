@@ -332,7 +332,7 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
             .listeners
             .get(&ListenerStatusKey::gateway(&listener.name));
         let desired_healthy =
-            !has_invalid_kinds && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true);
+            !has_invalid_kinds && info.map(|i| i.readiness.is_healthy()).unwrap_or(true);
         let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);
         let current_resolved = current_listener
             .map(|sl| {

@@ -26,7 +26,7 @@ use coxswain_proxy::{
     RateLimiterRegistry, RoutingEngine, RoutingSource, SharedProxyConfig, SniCertSelector,
     TrustedSources, UpstreamCaCache,
 };
-use coxswain_reflector::{GatewayListenerStatus, ListenerTlsOutcome};
+use coxswain_reflector::{GatewayListenerStatus, ListenerReadiness};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::server::Server;
 use pingora_core::server::ShutdownWatch;
@@ -1193,9 +1193,9 @@ fn derive_gateway_specs(
             if excluded_ports.contains(&port) {
                 continue;
             }
-            let new_proto = match info.tls_outcome {
-                ListenerTlsOutcome::NotApplicable => ListenerProtocol::Http,
-                ListenerTlsOutcome::TlsPassthrough => ListenerProtocol::TlsPassthrough,
+            let new_proto = match info.readiness {
+                ListenerReadiness::NotApplicable => ListenerProtocol::Http,
+                ListenerReadiness::TlsPassthrough => ListenerProtocol::TlsPassthrough,
                 _ => ListenerProtocol::Https,
             };
             port_proto

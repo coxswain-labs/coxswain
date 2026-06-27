@@ -136,7 +136,7 @@ pub struct OperatorConfig {
     /// attached-route count, and advertised/internal port mapping (#472). Named
     /// for listeners, not TLS: HTTP listeners are present too (with a
     /// `NotApplicable` TLS outcome). Read on every reconcile (the patch builder
-    /// maps each listener to its `(tls_outcome, attached_routes)` snapshot) and
+    /// maps each listener to its `(readiness, attached_routes)` snapshot) and
     /// subscribed via [`SharedGatewayListenerStatus::subscribe`] so any health
     /// flip (e.g. a TLS-cert resolution change) kicks every owned Gateway through
     /// [`Controller::reconcile_all_on`].

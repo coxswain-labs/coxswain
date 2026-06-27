@@ -1,7 +1,7 @@
 //! Per-listener status data types shared by the reflector and discovery wire layer.
 //!
 //! Pure data types ([`GatewayListenerStatus`], [`ListenerInfo`],
-//! [`ListenerTlsOutcome`]) are kept here so the discovery wire layer can import
+//! [`ListenerReadiness`]) are kept here so the discovery wire layer can import
 //! them without pulling in the reflector crate.
 //!
 //! [`SharedGatewayListenerStatus`] is the `ArcSwap` + `watch` wrapper that the
@@ -75,11 +75,18 @@ impl ListenerStatusKey {
     }
 }
 
-/// Outcome of resolving one HTTPS listener's TLS configuration during a rebuild.
+/// A listener's readiness outcome, computed during a rebuild.
+///
+/// Despite the variants' TLS-specific failure causes, this models whether a
+/// listener of ANY protocol is ready to serve — not just TLS. A plain HTTP
+/// listener has nothing to resolve and is [`Self::NotApplicable`] (healthy); the
+/// remaining variants record the TLS/certificate states that are the only way a
+/// listener fails readiness today. [`Self::is_healthy`] gates the per-listener
+/// `Programmed` condition for every listener, HTTP included.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
-pub enum ListenerTlsOutcome {
-    /// Non-HTTPS listener — no TLS check performed.
+pub enum ListenerReadiness {
+    /// Non-HTTPS listener (or otherwise nothing to resolve) — ready by default.
     #[default]
     NotApplicable,
     /// HTTPS listener; certificate resolved and installed in the TLS store.
@@ -130,7 +137,7 @@ pub enum ListenerTlsOutcome {
     TlsPassthrough,
 }
 
-impl ListenerTlsOutcome {
+impl ListenerReadiness {
     /// Returns `true` when this listener is an HTTPS listener that is serving
     /// at least one certificate.
     ///
@@ -379,8 +386,10 @@ impl RouteNamespaceSet {
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct ListenerInfo {
-    /// TLS resolution outcome for this listener.
-    pub tls_outcome: ListenerTlsOutcome,
+    /// Readiness outcome for this listener — gates its `Programmed` condition.
+    /// `NotApplicable` for listeners with nothing to resolve (e.g. plain HTTP);
+    /// see [`ListenerReadiness`].
+    pub readiness: ListenerReadiness,
     /// GEP-91 frontend client-cert validation outcome for this listener (#86).
     ///
     /// Computed in the controller's reconcile (not transported over the

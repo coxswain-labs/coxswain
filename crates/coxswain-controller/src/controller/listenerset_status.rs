@@ -423,7 +423,7 @@ pub(super) fn listenerset_needs_status_patch(
 mod tests {
     use super::*;
     use coxswain_reflector::gw_types::v::listenersets::{ListenerSetParentRef, ListenerSetSpec};
-    use coxswain_reflector::status::ListenerTlsOutcome;
+    use coxswain_reflector::status::ListenerReadiness;
     use kube::api::ObjectMeta;
 
     fn ls(listeners: Vec<ListenerSetListeners>) -> ListenerSet {
@@ -699,7 +699,7 @@ mod tests {
         }]);
         let mut healthy = GatewayListenerStatus::default();
         let mut info = ListenerInfo::default();
-        info.tls_outcome = ListenerTlsOutcome::Resolved;
+        info.readiness = ListenerReadiness::Resolved;
         info.port = 8443;
         healthy.listeners.insert(
             ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), "web"),
@@ -726,7 +726,7 @@ mod tests {
         // Cert deleted → outcome unhealthy, same generation. Must require a patch.
         let mut broken = GatewayListenerStatus::default();
         let mut bad = ListenerInfo::default();
-        bad.tls_outcome = ListenerTlsOutcome::InvalidCertificateRef {
+        bad.readiness = ListenerReadiness::InvalidCertificateRef {
             message: "secret missing".to_string(),
         };
         bad.port = 8443;

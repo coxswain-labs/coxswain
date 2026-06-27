@@ -20,7 +20,7 @@ use tokio::sync::watch;
 // import everything status-related from one place.
 pub use coxswain_core::listener_status::{
     BackendClientCertOutcome, ConflictReason, FrontendValidationOutcome, FrontendValidationStatus,
-    GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey, ListenerTlsOutcome,
+    GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerSource, ListenerStatusKey,
     RouteNamespaceSet, SharedGatewayListenerStatus,
 };
 
