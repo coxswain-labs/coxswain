@@ -739,17 +739,14 @@ pub(crate) async fn upstream_peer(
 
     let protocol = resolved.backend_group.protocol();
 
-    // BackendTLSPolicy overrides appProtocol-derived TLS decisions.
+    // Upstream TLS is originated solely by a BackendTLSPolicy (GEP-1897); the
+    // `appProtocol`-derived protocol carries no TLS semantics.
     let btls_opt = resolved.backend_group.upstream_tls();
     let (is_tls, sni_host, group_key) = if let Some(btls) = btls_opt {
         // SNI must be an owned `String`: `HttpPeer::new` takes ownership, so a
         // fresh allocation is unavoidable here regardless of any cache (#397).
         // This is once per outbound TLS connection, not per request.
         (true, btls.sni.to_string(), btls.group_key)
-    } else if protocol.is_tls() {
-        // appProtocol-driven TLS: use the request Host as SNI (existing behaviour).
-        // Owned for the same `HttpPeer::new` reason as the BackendTLSPolicy arm.
-        (true, resolved.original_host.to_string(), 0u64)
     } else {
         (false, String::new(), 0u64)
     };

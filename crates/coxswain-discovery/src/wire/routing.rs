@@ -634,8 +634,6 @@ fn protocol_to_wire(proto: BackendProtocol) -> p::BackendProtocol {
         BackendProtocol::Http1 => p::BackendProtocol::Http1,
         BackendProtocol::H2c => p::BackendProtocol::H2c,
         BackendProtocol::WebSocket => p::BackendProtocol::WebSocket,
-        BackendProtocol::Https => p::BackendProtocol::Https,
-        BackendProtocol::WebSocketTls => p::BackendProtocol::WebSocketTls,
         _ => unreachable!(
             "invariant: all BackendProtocol variants handled; update wire.rs when adding new variants"
         ),
@@ -1395,8 +1393,6 @@ fn protocol_from_wire(v: i32) -> Result<BackendProtocol, WireError> {
         p::BackendProtocol::Unspecified | p::BackendProtocol::Http1 => Ok(BackendProtocol::Http1),
         p::BackendProtocol::H2c => Ok(BackendProtocol::H2c),
         p::BackendProtocol::WebSocket => Ok(BackendProtocol::WebSocket),
-        p::BackendProtocol::Https => Ok(BackendProtocol::Https),
-        p::BackendProtocol::WebSocketTls => Ok(BackendProtocol::WebSocketTls),
     }
 }
 

@@ -69,8 +69,6 @@ spec:
     - name: https-1
       port: 443
       targetPort: 8443
-      appProtocol: https
     - name: https-2
       port: 8443
       targetPort: 8443
-      appProtocol: https

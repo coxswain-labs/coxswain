@@ -276,15 +276,6 @@ spec:
     # ── Enum annotations ──────────────────────────────────────────────────────
 
     - expression: >-
-        !('ingress.coxswain-labs.dev/backend-protocol' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/backend-protocol'].lowerAscii() in
-          ['http', 'https', 'grpc']
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/backend-protocol: "' +
-        variables.ann['ingress.coxswain-labs.dev/backend-protocol'] +
-        '" — must be one of: HTTP, HTTPS, GRPC (case-insensitive)'
-
-    - expression: >-
         !('ingress.coxswain-labs.dev/session-affinity' in variables.ann) ||
         variables.ann['ingress.coxswain-labs.dev/session-affinity'].lowerAscii() in
           ['cookie', 'header']

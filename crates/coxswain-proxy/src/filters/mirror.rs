@@ -9,7 +9,6 @@
 
 use crate::ctx::MirrorDispatch;
 use bytes::Bytes;
-use coxswain_core::routing::BackendProtocol;
 
 /// Dispatch a fire-and-forget mirror request, discarding the response.
 ///
@@ -49,9 +48,12 @@ pub(crate) fn spawn_mirror_dispatch(
             return;
         };
 
-        let scheme = match dispatch.backend.protocol() {
-            BackendProtocol::Https => "https",
-            _ => "http",
+        // TLS is originated solely by a BackendTLSPolicy (GEP-1897); the mirror
+        // URL scheme follows the upstream TLS context, not the wire protocol.
+        let scheme = if dispatch.backend.upstream_tls().is_some() {
+            "https"
+        } else {
+            "http"
         };
 
         use std::fmt::Write;

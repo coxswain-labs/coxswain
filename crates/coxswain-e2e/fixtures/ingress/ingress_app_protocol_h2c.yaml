@@ -1,0 +1,71 @@
+# Ingress upstream wire-protocol via Service `appProtocol` (GEP-1911).
+# Reuses the h2c-echo Deployment (apply backends::H2C_ECHO first): container port
+# 3001 speaks HTTP/2 cleartext (h2c, prior knowledge) and rejects HTTP/1.1.
+#
+# Two Services target the same pods on 3001; they differ ONLY in appProtocol, so
+# the proxy's upstream wire protocol is governed solely by the Service field
+# (coxswain has no `backend-protocol` annotation — upstream protocol is GEP-1911):
+#
+#   * appproto-h2c.TESTNS.local   → Service appProtocol kubernetes.io/h2c
+#       → BackendProtocol::H2c → proxy speaks h2c → 3001 serves (2xx echo).
+#   * appproto-http1.TESTNS.local → Service with no appProtocol
+#       → BackendProtocol::Http1 → proxy speaks HTTP/1.1 → 3001 rejects — the negative.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: h2c-echo-appproto
+spec:
+  selector:
+    app: h2c-echo
+  ports:
+    - port: 3001
+      targetPort: 3001
+      appProtocol: kubernetes.io/h2c
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: h2c-echo-plain
+spec:
+  selector:
+    app: h2c-echo
+  ports:
+    - port: 3001
+      targetPort: 3001
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: appproto-h2c-ingress
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: appproto-h2c.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: h2c-echo-appproto
+                port:
+                  number: 3001
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: appproto-http1-ingress
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: appproto-http1.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: h2c-echo-plain
+                port:
+                  number: 3001

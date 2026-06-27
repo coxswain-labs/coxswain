@@ -60,10 +60,19 @@ pub const SERVING_DRAIN: &str = fixture!("serving_drain.yaml");
 /// HTTPRoute with a `parentRef.port` selector.
 pub const PARENT_REF_PORT: &str = fixture!("parent_ref_port.yaml");
 /// HTTPRoute backend using `kubernetes.io/h2c` app protocol.
-pub const BACKEND_PROTOCOL_H2C: &str = fixture!("backend_protocol_h2c.yaml");
+pub const GATEWAY_APP_PROTOCOL_H2C: &str = fixture!("gateway_app_protocol_h2c.yaml");
 /// BackendTLSPolicy test: Gateway + HTTPRoute + ConfigMap CA + policy targeting the TLS echo Service.
 /// Requires `CA_PEM`, `TLS_HOSTNAME` substitutions.
 pub const BACKEND_TLS_POLICY: &str = fixture!("backend_tls_policy.yaml");
+/// Gateway + HTTPRoute to the TLS-only echo backend (port 8443) with NO
+/// BackendTLSPolicy. The Service declares `appProtocol: https`, which no longer
+/// originates upstream TLS (#466) — the proxy connects cleartext and the request
+/// fails. Proves a BackendTLSPolicy is required for upstream TLS.
+pub const BACKEND_TLS_NO_POLICY: &str = fixture!("backend_tls_no_policy.yaml");
+/// h2-over-TLS via BackendTLSPolicy: an `appProtocol: kubernetes.io/h2c` Service over
+/// the echo-tls pods + a BackendTLSPolicy. The proxy originates TLS and negotiates
+/// HTTP/2 over it (#466). Requires `CA_PEM`, `TLS_HOSTNAME` substitutions.
+pub const BACKEND_TLS_H2: &str = fixture!("backend_tls_h2.yaml");
 
 /// BackendTLSPolicy with an invalid CA cert ref (ConfigMap that does NOT exist).
 /// Used to verify `Accepted=False/NoValidCACertificate` + 5xx routing.

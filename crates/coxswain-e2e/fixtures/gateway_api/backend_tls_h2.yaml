@@ -1,0 +1,74 @@
+# h2-over-TLS via BackendTLSPolicy (#466).
+# The echo-tls pods (apply backends::ECHO_TLS first) serve HTTP/2 over TLS on 8443
+# (Go's TLS server auto-negotiates h2 via ALPN). A dedicated Service declares
+# `appProtocol: kubernetes.io/h2c`, so the backend protocol is BackendProtocol::H2c.
+# With a BackendTLSPolicy attached, the proxy originates TLS AND — because the
+# protocol stays H2c (the former `protocol = Https` force was removed) — negotiates
+# HTTP/2 over that TLS connection. This is the latent improvement #466 unlocked:
+# previously a policy forced Https → http/1.1-over-TLS, breaking real gRPC backends.
+# Substitutions:
+#   * TLS_HOSTNAME — cert SAN / policy validation hostname
+#   * CA_PEM       — raw CA cert PEM (indented for the block scalar)
+#   * GATEWAY_HTTP_PORT — proxy HTTP listener port (filled by Harness::apply)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: echo-tls-ca
+data:
+  ca.crt: |
+    ${CA_PEM}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-tls-h2c
+spec:
+  selector:
+    app: echo-tls
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+      appProtocol: kubernetes.io/h2c
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: h2-tls-gw
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: h2-tls-route
+spec:
+  parentRefs:
+    - name: h2-tls-gw
+  hostnames:
+    - h2-tls.${TESTNS}.local
+  rules:
+    - backendRefs:
+        - name: echo-tls-h2c
+          port: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: echo-tls-h2c-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-tls-h2c
+  validation:
+    hostname: ${TLS_HOSTNAME}
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: echo-tls-ca

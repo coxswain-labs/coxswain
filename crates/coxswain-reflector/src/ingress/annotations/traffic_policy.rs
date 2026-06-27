@@ -1,13 +1,11 @@
 //! Traffic-policy annotation constants and low-level parse helpers.
 //!
-//! Covers: connection/read/send timeouts, retry budget + conditions, and backend
-//! wire-protocol override. All helpers emit a structured `WARN` on invalid input
-//! and return `None` (or the empty default) so the affected annotation is treated
-//! as absent — the Ingress keeps serving.
+//! Covers: connection/read/send timeouts and retry budget + conditions. All
+//! helpers emit a structured `WARN` on invalid input and return `None` (or the
+//! empty default) so the affected annotation is treated as absent — the Ingress
+//! keeps serving.
 
-use coxswain_core::routing::{
-    BackendProtocol, CompressionConfig, HashSource, LoadBalance, RetryOn,
-};
+use coxswain_core::routing::{CompressionConfig, HashSource, LoadBalance, RetryOn};
 use http::HeaderName;
 use std::sync::Arc;
 
@@ -26,11 +24,6 @@ pub const SEND_TIMEOUT: &str = "ingress.coxswain-labs.dev/send-timeout";
 pub const MAX_RETRIES: &str = "ingress.coxswain-labs.dev/max-retries";
 /// Comma-separated retry conditions: `connect-failure`, `timeout`, `5xx`.
 pub const RETRY_ON: &str = "ingress.coxswain-labs.dev/retry-on";
-
-// ── Backend-protocol annotation key ──────────────────────────────────────────
-
-/// Override upstream wire protocol: `HTTP` (default), `HTTPS`, or `GRPC`.
-pub const BACKEND_PROTOCOL: &str = "ingress.coxswain-labs.dev/backend-protocol";
 
 // ── Max-body-size annotation key ─────────────────────────────────────────────
 
@@ -188,27 +181,6 @@ pub fn parse_byte_size(s: &str) -> Option<u64> {
             tracing::warn!(value = s, "invalid max-body-size annotation value");
             None
         })
-}
-
-/// Parse the `backend-protocol` annotation value.
-///
-/// Valid values: `HTTP` (default), `HTTPS`, `GRPC` — case-insensitive.
-/// `GRPC` maps to [`BackendProtocol::H2c`] — cleartext HTTP/2 prior knowledge.
-/// Unknown values emit a `WARN` and return `None` (keep the `appProtocol`-derived default).
-#[must_use]
-pub fn parse_backend_protocol(s: &str) -> Option<BackendProtocol> {
-    match s.trim().to_ascii_uppercase().as_str() {
-        "HTTP" => Some(BackendProtocol::Http1),
-        "HTTPS" => Some(BackendProtocol::Https),
-        "GRPC" => Some(BackendProtocol::H2c),
-        _ => {
-            tracing::warn!(
-                value = s,
-                "unknown backend-protocol value — valid values are HTTP, HTTPS, GRPC (case-insensitive)"
-            );
-            None
-        }
-    }
 }
 
 // ── Compression parser ────────────────────────────────────────────────────────
@@ -751,7 +723,6 @@ mod tests {
         let _ = READ_TIMEOUT;
         let _ = SEND_TIMEOUT;
         let _ = MAX_RETRIES;
-        let _ = BACKEND_PROTOCOL;
 
         let r = parse_retry_on("connect-failure,timeout,5xx");
         assert!(r.contains(RetryOn::CONNECT_FAILURE));
@@ -779,29 +750,6 @@ mod tests {
         let r = parse_retry_on("connect-failure,bogus");
         assert!(r.contains(RetryOn::CONNECT_FAILURE));
         assert!(logs_contain("unknown retry-on condition"));
-    }
-
-    #[test]
-    fn parse_backend_protocol_valid() {
-        assert_eq!(parse_backend_protocol("HTTP"), Some(BackendProtocol::Http1));
-        assert_eq!(parse_backend_protocol("http"), Some(BackendProtocol::Http1));
-        assert_eq!(
-            parse_backend_protocol("HTTPS"),
-            Some(BackendProtocol::Https)
-        );
-        assert_eq!(
-            parse_backend_protocol("https"),
-            Some(BackendProtocol::Https)
-        );
-        assert_eq!(parse_backend_protocol("GRPC"), Some(BackendProtocol::H2c));
-        assert_eq!(parse_backend_protocol("grpc"), Some(BackendProtocol::H2c));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_backend_protocol_unknown_warns() {
-        assert_eq!(parse_backend_protocol("h2c"), None);
-        assert!(logs_contain("unknown backend-protocol value"));
     }
 
     #[test]

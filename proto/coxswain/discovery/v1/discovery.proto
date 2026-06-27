@@ -271,14 +271,17 @@ message PerBackendFiltersEntry {
   repeated FilterAction filters = 2;
 }
 
-// Mirrors BackendProtocol.
+// Mirrors BackendProtocol — a pure wire-protocol hint (GEP-1911). It carries no
+// TLS semantics: upstream TLS is originated solely by a BackendTLSPolicy
+// (GEP-1897), surfaced via the UpstreamTls message. Tags 4/5 held the former
+// HTTPS / WSS TLS-implying values (issue #466) and are reserved to prevent reuse.
 enum BackendProtocol {
+  reserved 4, 5;
+  reserved "BACKEND_PROTOCOL_HTTPS", "BACKEND_PROTOCOL_WEB_SOCKET_TLS";
   BACKEND_PROTOCOL_UNSPECIFIED = 0;
   BACKEND_PROTOCOL_HTTP1 = 1;
   BACKEND_PROTOCOL_H2C = 2;
   BACKEND_PROTOCOL_WEB_SOCKET = 3;
-  BACKEND_PROTOCOL_HTTPS = 4;
-  BACKEND_PROTOCOL_WEB_SOCKET_TLS = 5;
 }
 
 // Mirrors UpstreamTls.

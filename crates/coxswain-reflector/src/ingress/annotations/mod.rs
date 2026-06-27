@@ -2,7 +2,7 @@
 //!
 //! The module is split into domain submodules re-exported here:
 //!
-//! - [`traffic_policy`] — timeout, retry, and backend-protocol annotations.
+//! - [`traffic_policy`] — timeout and retry annotations.
 //! - [`routing`] — path rewrite and regex opt-in annotations.
 //! - [`filters`] — request/response header modifiers, redirect, and ssl-redirect annotations.
 //! - [`edge_access`] — source-IP allow/deny, forwarded-for trust, rate limiting.
@@ -43,9 +43,9 @@ pub use traffic_policy::*;
 
 use auth::AuthAnnotation;
 use coxswain_core::routing::{
-    BackendProtocol, CircuitBreakerConfig, CompressionConfig, FilterAction, ForwardedForConfig,
-    HeaderMod, LoadBalance, NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicy,
-    RouteTimeouts, SessionAffinity,
+    CircuitBreakerConfig, CompressionConfig, FilterAction, ForwardedForConfig, HeaderMod,
+    LoadBalance, NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicy, RouteTimeouts,
+    SessionAffinity,
 };
 use std::collections::BTreeMap;
 
@@ -115,8 +115,6 @@ pub(super) struct IngressAnnotations {
     /// reconciler rebuilds it as [`PathModifier::RegexReplace`] against that path's
     /// own compiled pattern so capture groups (`$1`…`$n`) resolve per-path.
     pub rewrite: Option<PathModifier>,
-    /// Explicit backend-protocol override, or `None` to keep the `appProtocol`-derived default.
-    pub backend_protocol: Option<BackendProtocol>,
     /// `use-regex` opt-in: interpret `pathType: ImplementationSpecific` paths as regex.
     pub use_regex: bool,
     /// Request header modifier from `request-header-{set,add,remove}` annotations (#79).
@@ -305,18 +303,6 @@ impl IngressAnnotations {
                 b
             })
             .unwrap_or(false);
-
-        // ── Backend protocol ──────────────────────────────────────────────────
-        let backend_protocol = get(ann, BACKEND_PROTOCOL).and_then(|v| {
-            let p = parse_backend_protocol(v);
-            if p.is_none() {
-                issue!(
-                    BACKEND_PROTOCOL,
-                    "unknown protocol — using appProtocol-derived default"
-                );
-            }
-            p
-        });
 
         // ── Request header modifier (#79) ─────────────────────────────────────
         let request_headers = build_header_mod(
@@ -538,7 +524,6 @@ impl IngressAnnotations {
                 },
                 retries,
                 rewrite,
-                backend_protocol,
                 use_regex,
                 request_headers,
                 response_headers,
@@ -699,7 +684,6 @@ mod tests {
         assert!(a.timeouts.connect.is_none());
         assert!(a.retries.is_disabled());
         assert!(a.rewrite.is_none());
-        assert!(a.backend_protocol.is_none());
     }
 
     #[test]
@@ -792,32 +776,6 @@ mod tests {
             Some(PathModifier::ReplaceFullPath(s)) => assert_eq!(s, "/api"),
             _ => panic!("expected ReplaceFullPath"),
         }
-    }
-
-    #[test]
-    fn parse_backend_protocol_https() {
-        let m = ann(&[(BACKEND_PROTOCOL, "HTTPS")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert_eq!(a.backend_protocol, Some(BackendProtocol::Https));
-    }
-
-    #[test]
-    fn parse_backend_protocol_lowercase_accepted() {
-        let m = ann(&[(BACKEND_PROTOCOL, "https")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert_eq!(a.backend_protocol, Some(BackendProtocol::Https));
-        let m = ann(&[(BACKEND_PROTOCOL, "grpc")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert_eq!(a.backend_protocol, Some(BackendProtocol::H2c));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_backend_protocol_unknown_annotation_warns() {
-        let m = ann(&[(BACKEND_PROTOCOL, "h2c")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(a.backend_protocol.is_none());
-        assert!(logs_contain("unknown backend-protocol value"));
     }
 
     #[test]
