@@ -16,7 +16,8 @@ use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
 use crate::reconciler::listener_merge::EffectiveListener;
 use crate::tls::{
-    GatewayListenerHealth, ListenerHealthKey, ListenerInfo, ListenerTlsOutcome, load_tls_cert,
+    GatewayListenerHealth, ListenerHealthKey, ListenerInfo, ListenerSource, ListenerTlsOutcome,
+    load_tls_cert,
 };
 use coxswain_core::crd::{PathRewriteRegex, RateLimit};
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
@@ -742,6 +743,7 @@ impl GatewayApiReconciler {
         listeners: &[EffectiveListener],
         secrets: &reflector::Store<Secret>,
         cert_grants: &HashSet<ReferenceGrantKey>,
+        ls_cert_grants: &HashSet<ReferenceGrantKey>,
         builder: &mut PortTlsStoreBuilder,
         internal_ports: &HashMap<u16, u16>,
     ) -> GatewayListenerHealth {
@@ -776,7 +778,14 @@ impl GatewayApiReconciler {
             } else if listener.protocol != "HTTPS" {
                 ListenerTlsOutcome::NotApplicable
             } else {
-                resolve_listener_tls(gw_name, listener, secrets, cert_grants, builder, bind_port)
+                // A ListenerSet listener's cross-namespace cert is permitted by a
+                // `from.kind: ListenerSet` grant; a Gateway listener's by
+                // `from.kind: Gateway` (GEP-1713). Pick the matching grant set.
+                let grants = match &listener.source {
+                    ListenerSource::Gateway => cert_grants,
+                    ListenerSource::ListenerSet(_) => ls_cert_grants,
+                };
+                resolve_listener_tls(gw_name, listener, secrets, grants, builder, bind_port)
             };
             let mut li = ListenerInfo::default();
             li.tls_outcome = tls_outcome;
@@ -949,6 +958,88 @@ fn resolve_listener_tls(
 mod tests {
     use super::*;
     use crate::gateway_api::tests::*;
+
+    // ── GEP-1713: ListenerSet cross-namespace cert grant selection ────────────
+
+    /// A ListenerSet HTTPS listener whose `certificateRefs` points at a Secret in
+    /// another namespace must be permitted by a `from.kind: ListenerSet` grant —
+    /// NOT a `from.kind: Gateway` grant (which only permits Gateway listeners).
+    #[test]
+    fn listener_set_cross_namespace_cert_requires_listenerset_from_grant() {
+        use crate::reconciler::listener_merge::{
+            EffectiveCertRef, EffectiveListener, EffectiveTls,
+        };
+        use coxswain_core::ownership::ObjectKey;
+        use coxswain_core::reference_grants::ReferenceGrantKey;
+
+        let ls_key = ObjectKey::new("team-a", "ls");
+        let listener = EffectiveListener {
+            source: ListenerSource::ListenerSet(ls_key.clone()),
+            owning_namespace: "team-a".to_string(),
+            name: "https".to_string(),
+            port: 8443,
+            protocol: "HTTPS".to_string(),
+            hostname: None,
+            tls: Some(EffectiveTls {
+                passthrough: false,
+                certificate_refs: vec![EffectiveCertRef {
+                    group: None,
+                    kind: None,
+                    name: "cert".to_string(),
+                    namespace: Some("certs".to_string()),
+                }],
+            }),
+            allows_all_namespaces: false,
+            allowed_route_kinds: vec![],
+            conflicted: false,
+        };
+
+        let mut secrets_w = reflector::store::Writer::<Secret>::default();
+        secrets_w.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
+        let secrets = secrets_w.as_reader();
+
+        // The grant lives in the WRONG set (Gateway-from). The cross-namespace
+        // check must ignore it → RefNotPermitted.
+        let grant: HashSet<ReferenceGrantKey> =
+            std::iter::once(ReferenceGrantKey::specific("team-a", "certs", "cert")).collect();
+        let empty = HashSet::new();
+        let mut builder = PortTlsStoreBuilder::new();
+        let health = GatewayApiReconciler::reconcile_tls(
+            "gw",
+            std::slice::from_ref(&listener),
+            &secrets,
+            &grant, // cert_grants (Gateway-from) — must NOT permit an LS listener
+            &empty, // ls_cert_grants empty
+            &mut builder,
+            &HashMap::new(),
+        );
+        let outcome = &health.listeners[&ListenerHealthKey::listener_set(ls_key.clone(), "https")]
+            .tls_outcome;
+        assert!(
+            matches!(outcome, ListenerTlsOutcome::RefNotPermitted { .. }),
+            "a Gateway-from grant must not permit a ListenerSet listener's cross-ns cert, got {outcome:?}"
+        );
+
+        // Same grant placed in the ListenerSet-from set → the cross-namespace
+        // check passes; the (absent) Secret then fails as InvalidCertificateRef,
+        // proving the grant was accepted (no longer RefNotPermitted).
+        let mut builder2 = PortTlsStoreBuilder::new();
+        let health2 = GatewayApiReconciler::reconcile_tls(
+            "gw",
+            std::slice::from_ref(&listener),
+            &secrets,
+            &empty, // cert_grants empty
+            &grant, // ls_cert_grants (ListenerSet-from) — permits the LS listener
+            &mut builder2,
+            &HashMap::new(),
+        );
+        let outcome2 =
+            &health2.listeners[&ListenerHealthKey::listener_set(ls_key, "https")].tls_outcome;
+        assert!(
+            !matches!(outcome2, ListenerTlsOutcome::RefNotPermitted { .. }),
+            "a ListenerSet-from grant must permit the cross-ns cert ref, got {outcome2:?}"
+        );
+    }
 
     // ── Original path-matching tests (unchanged behaviour) ────────────────────
 

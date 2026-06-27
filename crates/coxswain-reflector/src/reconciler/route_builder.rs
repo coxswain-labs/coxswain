@@ -5,7 +5,7 @@
 //! ([`ReflectorStores`], [`Ownership`], [`SharedOutputs`], [`IngressBuildConfig`])
 //! defined alongside the loop.
 
-use super::listener_merge::EffectiveListener;
+use super::listener_merge::{EffectiveGateway, EffectiveListener};
 use super::proxy::{
     IngressBuildConfig, IngressDefaultBackend, IngressEvent, Ownership, ReflectorStores,
     SharedOutputs, gateway_is_cut_over,
@@ -14,10 +14,7 @@ use crate::endpoints;
 use crate::gateway_api::hostnames_intersect;
 use crate::gateway_api::{
     GatewayApiReconciler, GrpcRouteReconciler, GrpcRouteResolution, ListenerBinding, RouteLike,
-    TlsRouteReconciler,
-};
-use crate::gw_types::v::gateways::{
-    GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode,
+    TlsRouteReconciler, parent_listener_source,
 };
 use crate::gw_types::{GrpcRoute, HttpRoute};
 use crate::ingress::annotations::AnnotationIssue;
@@ -522,6 +519,7 @@ pub(super) fn build_tls(
             listeners,
             stores.secrets,
             ownership.cert_grants,
+            ownership.ls_cert_grants,
             &mut tls_builder,
             &gw_internal,
         );
@@ -767,6 +765,7 @@ pub(super) fn count_attached_routes<R: RouteLike>(
 pub(super) fn build_passthrough_routes(
     stores: &ReflectorStores<'_>,
     owned_gateways: &HashSet<ObjectKey>,
+    effective: &HashMap<ObjectKey, EffectiveGateway>,
     backend_grants: &HashSet<ReferenceGrantKey>,
     out: &SharedTlsPassthroughTable,
 ) -> RouteHealthMap {
@@ -784,45 +783,72 @@ pub(super) fn build_passthrough_routes(
             continue;
         }
 
-        for listener in &gw.spec.listeners {
+        // Iterate the effective listener set — the Gateway's own listeners plus
+        // any attached ListenerSets' (GEP-1713), each tagged with its source —
+        // so a TLSRoute can attach to a TLS/Passthrough listener regardless of
+        // which resource declared it. Falls back to nothing if the merge has no
+        // entry for this owned Gateway (defensive; should not happen).
+        let Some(eff) = effective.get(&gw_key) else {
+            continue;
+        };
+
+        for listener in &eff.listeners {
             if listener.protocol != "TLS" {
                 continue;
             }
-            let is_passthrough = listener
-                .tls
-                .as_ref()
-                .and_then(|t| t.mode.as_ref())
-                .is_some_and(|m| matches!(m, GatewayListenersTlsMode::Passthrough));
+            let is_passthrough = listener.tls.as_ref().is_some_and(|t| t.passthrough);
             if !is_passthrough {
+                continue;
+            }
+            // Lost a port-compatibility conflict to a higher-precedence listener
+            // (GEP-1713) — not programmed, so no routing entries.
+            if listener.conflicted {
                 continue;
             }
 
             let listener_port = listener.port as u16;
             // Spec port (above) matches the TLSRoute's parentRef.port; the bind
             // port (below) is what the proxy accepts on and keys routing by (#472).
+            // A ListenerSet listener merges onto the parent Gateway's VIP, so the
+            // bind port is still keyed by the parent Gateway's key.
             let bind_port = vip_internal
                 .get(&(gw_key.clone(), listener_port))
                 .copied()
                 .unwrap_or(listener_port);
             let listener_hostname = listener.hostname.as_deref().unwrap_or("");
-            let allows_all_ns = listener
-                .allowed_routes
-                .as_ref()
-                .and_then(|ar| ar.namespaces.as_ref())
-                .and_then(|ns| ns.from.as_ref())
-                .is_some_and(|f| !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same));
+            let allows_all_ns = listener.allows_all_namespaces;
+            // `from: Same` is relative to the resource that declared the listener:
+            // the Gateway's namespace for a Gateway listener, the ListenerSet's
+            // namespace for a ListenerSet listener.
+            let owning_ns = listener.owning_namespace.as_str();
+            let source = &listener.source;
 
             for route in &tls_routes {
                 let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
 
-                if !allows_all_ns && route_ns != gw_ns {
+                if !allows_all_ns && route_ns != owning_ns {
                     continue;
                 }
 
                 let parent_refs = route.spec.parent_refs.as_deref().unwrap_or(&[]);
                 let binds = parent_refs.iter().any(|pr| {
                     let pr_ns = pr.namespace.as_deref().unwrap_or(route_ns);
-                    if pr_ns != gw_ns || pr.name != gw_name {
+                    // Resolve the parentRef's target source (Gateway vs a specific
+                    // ListenerSet) and require it to match the listener's source.
+                    let pr_source = parent_listener_source(
+                        pr.group.as_deref(),
+                        pr.kind.as_deref(),
+                        pr_ns,
+                        &pr.name,
+                    );
+                    let target_ok = match (source, &pr_source) {
+                        (ListenerSource::Gateway, ListenerSource::Gateway) => {
+                            pr_ns == gw_ns && pr.name == gw_name
+                        }
+                        (ListenerSource::ListenerSet(a), ListenerSource::ListenerSet(b)) => a == b,
+                        _ => false,
+                    };
+                    if !target_ok {
                         return false;
                     }
                     if let Some(sn) = pr.section_name.as_deref()
@@ -937,16 +963,15 @@ pub(super) fn build_passthrough_routes(
     }
 
     out.store(Arc::new(builder.build()));
-    // GEP-1713: ListenerSet TLS/Passthrough listener routing is not yet programmed
-    // (deferred with the passthrough-table build above), so pass no effective
-    // ListenerSet listeners here — an LS TLSRoute must not be marked Accepted while
-    // it cannot actually route. HTTP/GRPC route health does receive the effective set.
-    let no_effective = HashMap::new();
+    // Pass the effective set so a TLSRoute attached to a ListenerSet's
+    // TLS/Passthrough listener (`parentRef.kind: ListenerSet`, GEP-1713) is keyed
+    // under the ListenerSet and evaluated for Accepted/ResolvedRefs against its
+    // listeners — matching the routing entries built above.
     TlsRouteReconciler::compute_route_health(
         &tls_routes,
         &gateways,
         owned_gateways,
-        &no_effective,
+        effective,
         backend_grants,
         stores.services,
     )
@@ -1102,5 +1127,173 @@ mod tests {
             0,
             "HTTPRoute must never attach to a passthrough listener"
         );
+    }
+
+    /// A `TLSRoute` whose `parentRef.kind: ListenerSet` targets a passthrough
+    /// listener declared on a ListenerSet (GEP-1713) — the listener health lives
+    /// under the parent Gateway's key but is provenance-keyed to the ListenerSet,
+    /// so it must be counted there and NOT against a same-named Gateway listener.
+    #[test]
+    fn tls_route_attaches_to_listener_set_passthrough_listener() {
+        let ls_key = ObjectKey::new("default", "ls");
+        // Parent Gateway health holds two same-named "tls" passthrough listeners:
+        // one its own, one belonging to the ListenerSet.
+        let mut gw = GatewayListenerHealth::default();
+        let mut gw_info = ListenerInfo::default();
+        gw_info.tls_outcome = ListenerTlsOutcome::TlsPassthrough;
+        gw_info.port = 443;
+        let mut ls_info = ListenerInfo::default();
+        ls_info.tls_outcome = ListenerTlsOutcome::TlsPassthrough;
+        ls_info.port = 8443;
+        gw.listeners = [
+            (ListenerHealthKey::gateway("tls"), gw_info),
+            (
+                ListenerHealthKey::listener_set(ls_key.clone(), "tls"),
+                ls_info,
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut map: HashMap<ObjectKey, GatewayListenerHealth> =
+            std::iter::once((ObjectKey::new("default", "gw"), gw)).collect();
+
+        let route = Arc::new(TlsRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: TlsRouteSpec {
+                parent_refs: Some(vec![TlsRouteParentRefs {
+                    group: Some("gateway.networking.k8s.io".to_string()),
+                    kind: Some("ListenerSet".to_string()),
+                    name: "ls".to_string(),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let ls_parent: HashMap<ObjectKey, ObjectKey> =
+            std::iter::once((ls_key.clone(), ObjectKey::new("default", "gw"))).collect();
+        count_attached_routes(&[route], &owned(), &ls_parent, &mut map, true);
+
+        let gw_health = &map[&ObjectKey::new("default", "gw")];
+        assert_eq!(
+            gw_health.listeners[&ListenerHealthKey::listener_set(ls_key, "tls")].attached_routes,
+            1,
+            "TLSRoute via parentRef.kind: ListenerSet must attach to the ListenerSet's listener"
+        );
+        assert_eq!(
+            gw_health.listeners[&ListenerHealthKey::gateway("tls")].attached_routes,
+            0,
+            "the same-named Gateway listener must NOT absorb a ListenerSet-targeted TLSRoute"
+        );
+    }
+
+    /// A TLSRoute attached to a ListenerSet passthrough listener that LOST a
+    /// port-compatibility conflict must NOT be marked `Accepted` — the listener is
+    /// not programmed, so advertising Accepted would black-hole. Regression for the
+    /// route-health/routing-table consistency gap (the routing builder skips
+    /// conflicted listeners; route-health must too).
+    #[test]
+    fn tls_route_on_conflicted_listener_set_listener_is_not_accepted() {
+        use crate::gw_types::v::gateways::{Gateway, GatewaySpec};
+        use crate::keys::RouteParentKey;
+        use crate::reconciler::listener_merge::{
+            EffectiveGateway, EffectiveListener, EffectiveTls,
+        };
+
+        let gw_key = ObjectKey::new("default", "gw");
+        let ls_key = ObjectKey::new("default", "ls");
+
+        let gw = Arc::new(Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "coxswain".to_string(),
+                ..Default::default()
+            },
+            status: None,
+        });
+
+        // The ListenerSet's only passthrough listener is conflicted (lost the port).
+        let conflicted = EffectiveListener {
+            source: ListenerSource::ListenerSet(ls_key.clone()),
+            owning_namespace: "default".to_string(),
+            name: "ls-web".to_string(),
+            port: 443,
+            protocol: "TLS".to_string(),
+            hostname: None,
+            tls: Some(EffectiveTls {
+                passthrough: true,
+                certificate_refs: vec![],
+            }),
+            allows_all_namespaces: false,
+            allowed_route_kinds: vec![],
+            conflicted: true,
+        };
+        let effective: HashMap<ObjectKey, EffectiveGateway> = std::iter::once((
+            gw_key.clone(),
+            EffectiveGateway {
+                gateway: Arc::clone(&gw),
+                listeners: vec![conflicted],
+            },
+        ))
+        .collect();
+
+        let route = Arc::new(TlsRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: TlsRouteSpec {
+                parent_refs: Some(vec![TlsRouteParentRefs {
+                    group: Some("gateway.networking.k8s.io".to_string()),
+                    kind: Some("ListenerSet".to_string()),
+                    name: "ls".to_string(),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut svc =
+            kube::runtime::reflector::store::Writer::<k8s_openapi::api::core::v1::Service>::default(
+            );
+        svc.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
+        let services = svc.as_reader();
+
+        let map = TlsRouteReconciler::compute_route_health(
+            &[route],
+            &[gw],
+            &owned(),
+            &effective,
+            &HashSet::new(),
+            &services,
+        );
+
+        let h = map
+            .get(&RouteParentKey::new(
+                "default",
+                "route",
+                "default",
+                "ls",
+                String::new(),
+            ))
+            .expect("health entry for the (route, ListenerSet) pair");
+        assert!(
+            !h.accepted,
+            "TLSRoute on a conflicted ListenerSet listener must not be Accepted"
+        );
+        assert_eq!(h.accepted_reason, "NoMatchingParent");
     }
 }

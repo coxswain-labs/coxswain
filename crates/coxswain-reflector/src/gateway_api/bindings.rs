@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 /// (GEP-1713). `kind: ListenerSet` in the Gateway API group targets that
 /// ListenerSet's listeners; anything else (`Gateway`, or unspecified) targets the
 /// Gateway. `(ref_ns, ref_name)` identify the referenced resource.
-fn parent_listener_source(
+pub(crate) fn parent_listener_source(
     group: Option<&str>,
     kind: Option<&str>,
     ref_ns: &str,

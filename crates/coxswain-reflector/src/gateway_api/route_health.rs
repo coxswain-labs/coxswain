@@ -150,20 +150,30 @@ pub(super) fn compute_route_health<R: RouteLike>(
             let crate::tls::ListenerSource::ListenerSet(ls_key) = &l.source else {
                 continue;
             };
+            // Record the LS key as a valid parent and ensure it has an entry list
+            // (possibly empty) so `compute_accepted` evaluates against its listeners
+            // rather than hitting the absent-key "lenient accept" fallback.
+            ls_keys.insert(ls_key.clone());
+            let entries = gw_listeners.entry(ls_key.clone()).or_default();
+            // A listener that lost a port-compatibility conflict is not programmed
+            // (the routing builders skip it), so it must not contribute an Accepted
+            // parent either — otherwise a route would advertise Accepted while
+            // black-holing. Keep the key present but omit the conflicted listener.
+            if l.conflicted {
+                continue;
+            }
             let allows_kind = if l.allowed_route_kinds.is_empty() {
                 implicit_allows_kind(&l.protocol, route_kind)
             } else {
                 l.allowed_route_kinds.iter().any(|(_, k)| k == route_kind)
             };
-            let entry = ListenerEntry {
+            entries.push(ListenerEntry {
                 name: l.name.clone(),
                 hostname: l.hostname.clone().unwrap_or_default(),
                 allows_all: l.allows_all_namespaces,
                 port: l.port as u16,
                 allows_kind,
-            };
-            ls_keys.insert(ls_key.clone());
-            gw_listeners.entry(ls_key.clone()).or_default().push(entry);
+            });
         }
     }
 

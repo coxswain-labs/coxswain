@@ -41,6 +41,16 @@ pub fn flatten_ca_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
     flatten(grants, "Gateway", "ConfigMap")
 }
 
+/// Flatten the `ListenerSet → Secret` grants used when a `ListenerSet` HTTPS
+/// listener's `certificateRefs` points at a Secret in another namespace
+/// (GEP-1713, #93). A ListenerSet attaches its own listeners, so its
+/// cross-namespace cert grant's `from.kind` is `ListenerSet` — not `Gateway`
+/// (which [`flatten_grants`] handles for Gateway-owned listeners).
+#[must_use]
+pub fn flatten_ls_cert_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
+    flatten(grants, "ListenerSet", "Secret")
+}
+
 fn flatten(grants: &[Arc<ReferenceGrant>], from_kind: &str, to_kind: &str) -> GrantSet {
     grants
         .iter()

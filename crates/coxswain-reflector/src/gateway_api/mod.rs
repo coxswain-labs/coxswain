@@ -17,6 +17,7 @@ mod tls_status;
 
 pub use backend_tls::{BackendTlsIndex, build_backend_tls_index};
 pub use bindings::ListenerBinding;
+pub(crate) use bindings::parent_listener_source;
 pub use grpc_reconcile::GrpcRouteResolution;
 pub(crate) use hostnames::hostnames_intersect;
 pub use reconcile::RouteResolution;

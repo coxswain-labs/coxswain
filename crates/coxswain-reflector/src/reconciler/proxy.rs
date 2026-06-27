@@ -30,7 +30,9 @@ use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
 use crate::ingress::IngressPorts;
 use crate::k8s_utils::scoped_api;
-use crate::reference_grants::{GrantSet, flatten_ca_grants, flatten_grants};
+use crate::reference_grants::{
+    GrantSet, flatten_ca_grants, flatten_grants, flatten_ls_cert_grants,
+};
 use crate::tls::{
     GatewayListenerHealth, ListenerSource, SharedBackendTlsPolicyHealth,
     SharedGatewayListenerHealth, SharedRouteHealth,
@@ -630,6 +632,10 @@ pub(super) struct Ownership<'a> {
     pub(super) gateway_classes: &'a HashSet<String>,
     pub(super) backend_grants: &'a GrantSet,
     pub(super) cert_grants: &'a GrantSet,
+    /// `ListenerSet → Secret` grants for GEP-1713 ListenerSet HTTPS listeners whose
+    /// `certificateRefs` point at a Secret in another namespace (#93). Distinct from
+    /// `cert_grants` because the grant's `from.kind` is `ListenerSet`, not `Gateway`.
+    pub(super) ls_cert_grants: &'a GrantSet,
     /// `Gateway → ConfigMap` grants for GEP-91 frontend client-cert validation
     /// CA refs that point at a ConfigMap in another namespace (#86).
     pub(super) ca_grants: &'a GrantSet,
@@ -1278,6 +1284,7 @@ fn rebuild(
     let grants_snapshot = stores.grants.state();
     let (backend_grants, cert_grants) = flatten_grants(&grants_snapshot);
     let ca_grants = flatten_ca_grants(&grants_snapshot);
+    let ls_cert_grants = flatten_ls_cert_grants(&grants_snapshot);
 
     tracing::debug!(
         http_routes = routes.len(),
@@ -1315,6 +1322,7 @@ fn rebuild(
         gateway_classes: &owned_gateway_classes,
         backend_grants: &backend_grants,
         cert_grants: &cert_grants,
+        ls_cert_grants: &ls_cert_grants,
         ca_grants: &ca_grants,
         policy_index: &policy_index,
         backend_client_certs: &backend_client_certs.certs,
@@ -1540,6 +1548,7 @@ fn rebuild(
             gateway_classes: &owned_gateway_classes,
             backend_grants: &backend_grants,
             cert_grants: &cert_grants,
+            ls_cert_grants: &ls_cert_grants,
             ca_grants: &ca_grants,
             policy_index: &policy_index,
             backend_client_certs: &dedicated_backend_client_certs.certs,
@@ -1615,11 +1624,13 @@ fn rebuild(
     outputs.dedicated_registry.store(Arc::new(registry_map));
 
     // Build the SNI-keyed TLS passthrough table from TLSRoutes bound to
-    // TLS/Passthrough listeners on owned Gateways (GEP-2643, #70). Also
-    // returns per-(TLSRoute, parentRef) health for status condition writes.
+    // TLS/Passthrough listeners on owned Gateways and their attached ListenerSets
+    // (GEP-2643 #70, GEP-1713 #93). Also returns per-(TLSRoute, parentRef) health
+    // for status condition writes.
     let tls_route_health_map = build_passthrough_routes(
         stores,
         &owned_gateways,
+        &effective,
         &backend_grants,
         outputs.passthrough_routes,
     );
