@@ -9,7 +9,7 @@ use coxswain_reflector::gw_types::BackendTlsPolicy;
 use coxswain_reflector::gw_types::v::backendtlspolicies::{
     BackendTlsPolicyStatusAncestors, BackendTlsPolicyStatusAncestorsAncestorRef,
 };
-use coxswain_reflector::tls::{BackendTlsPolicyHealth, BackendTlsPolicyHealthMap};
+use coxswain_reflector::status::{BackendTlsPolicyStatus, BackendTlsPolicyStatusMap};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
     Client,
@@ -24,7 +24,7 @@ pub(super) async fn patch_backend_tls_policy_status(
     client: &Client,
     policy: &BackendTlsPolicy,
     controller_name: &str,
-    policy_health: &BackendTlsPolicyHealthMap,
+    policy_status: &BackendTlsPolicyStatusMap,
 ) {
     let name = match policy.metadata.name.as_deref() {
         Some(n) => n,
@@ -33,7 +33,7 @@ pub(super) async fn patch_backend_tls_policy_status(
     let ns = policy.metadata.namespace.as_deref().unwrap_or("default");
     let policy_key = ObjectKey::new(ns, name);
 
-    let Some(health) = policy_health.get(&policy_key) else {
+    let Some(health) = policy_status.get(&policy_key) else {
         return;
     };
 
@@ -70,7 +70,7 @@ pub(super) async fn patch_backend_tls_policy_status(
 /// When `health.ancestors` is empty but the policy was rejected (e.g. `Conflicted`),
 /// we write a single entry with an empty ancestor ref so the condition is visible.
 fn build_ancestors(
-    health: &BackendTlsPolicyHealth,
+    health: &BackendTlsPolicyStatus,
     controller_name: &str,
     observed_gen: i64,
     now: Time,

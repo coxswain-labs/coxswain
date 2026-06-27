@@ -8,11 +8,47 @@
 use coxswain_core::ownership::{self, ObjectKey};
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
-use coxswain_reflector::gw_types::v::httproutes::HttpRouteParentRefs;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use std::collections::HashSet;
 
 pub(super) use crate::status_common::make_condition;
+
+/// Gateway API group, the default for an unset `parentRef.group`.
+const GW_GROUP: &str = "gateway.networking.k8s.io";
+
+/// `true` when a `parentRef` targets a `ListenerSet` (GEP-1713): `kind:
+/// ListenerSet` in the standard Gateway API group (the group defaults to the
+/// standard group when unset). ListenerSet refs are written to route status only
+/// when the reflector recorded a health entry for them (see `route_events`).
+#[must_use]
+pub(super) fn is_listener_set_ref(group: Option<&str>, kind: Option<&str>) -> bool {
+    let group = group.unwrap_or(GW_GROUP);
+    group == GW_GROUP && kind == Some("ListenerSet")
+}
+
+/// Decide whether a route `parentRef` should receive a status entry written by
+/// this controller (GEP-1713). A Gateway parentRef is ours iff we own the
+/// Gateway. A ListenerSet parentRef is ours iff the reflector recorded a health
+/// entry for it (`health_present`) — it does so only for ListenerSets attached
+/// to an owned Gateway, so a recorded entry IS the ownership proof. This keeps
+/// the HTTP and GRPC status writers' ownership logic identical and unit-testable
+/// without a Kubernetes client.
+#[must_use]
+pub(super) fn route_parent_gets_status(
+    group: Option<&str>,
+    kind: Option<&str>,
+    namespace: Option<&str>,
+    name: &str,
+    default_ns: &str,
+    owned_gateways: &HashSet<ObjectKey>,
+    health_present: bool,
+) -> bool {
+    if is_listener_set_ref(group, kind) {
+        health_present
+    } else {
+        ownership::parent_ref_owned(group, kind, namespace, name, default_ns, owned_gateways)
+    }
+}
 
 pub(super) fn has_condition(conditions: Option<&[Condition]>, type_: &str) -> bool {
     has_condition_at_gen(conditions, type_, 0)
@@ -52,52 +88,18 @@ pub(super) fn gateway_programmed(gw: &Gateway) -> bool {
     )
 }
 
-/// Returns the subset of `parent_refs` that point to a Coxswain-managed Gateway.
-pub(super) fn filter_owned_parent_refs(
-    parent_refs: &[HttpRouteParentRefs],
-    default_ns: &str,
-    owned_gateways: &HashSet<ObjectKey>,
-) -> Vec<HttpRouteParentRefs> {
-    parent_refs
-        .iter()
-        .filter(|p| {
-            ownership::parent_ref_owned(
-                p.group.as_deref(),
-                p.kind.as_deref(),
-                p.namespace.as_deref(),
-                &p.name,
-                default_ns,
-                owned_gateways,
-            )
-        })
-        .cloned()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_owned_parent_refs, gateway_accepted, gateway_class_accepted, gateway_programmed,
-        has_condition, make_condition,
+        gateway_accepted, gateway_class_accepted, gateway_programmed, has_condition,
+        is_listener_set_ref, make_condition, route_parent_gets_status,
     };
     use coxswain_core::ownership::ObjectKey;
     use coxswain_reflector::gw_types::v::gatewayclasses::{GatewayClass, GatewayClassStatus};
     use coxswain_reflector::gw_types::v::gateways::{Gateway, GatewayStatus};
-    use coxswain_reflector::gw_types::v::httproutes::HttpRouteParentRefs;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use kube::api::ObjectMeta;
     use std::collections::HashSet;
-
-    fn owned(ns: &str, name: &str) -> HashSet<ObjectKey> {
-        [ObjectKey::new(ns, name)].into()
-    }
-
-    fn owned_pairs(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {
-        pairs
-            .iter()
-            .map(|(ns, name)| ObjectKey::new(*ns, *name))
-            .collect()
-    }
 
     fn stub_condition(
         type_: &str,
@@ -178,28 +180,73 @@ mod tests {
     }
 
     #[test]
-    fn filter_owned_empty_input_returns_empty() {
-        let set = owned("default", "gw");
-        assert!(filter_owned_parent_refs(&[], "default", &set).is_empty());
+    fn is_listener_set_ref_matches_standard_group_kind() {
+        // Explicit standard group + ListenerSet kind.
+        assert!(is_listener_set_ref(
+            Some("gateway.networking.k8s.io"),
+            Some("ListenerSet")
+        ));
+        // Group defaults to the standard group when unset.
+        assert!(is_listener_set_ref(None, Some("ListenerSet")));
     }
 
     #[test]
-    fn filter_owned_keeps_all_when_all_owned() {
-        let set: HashSet<ObjectKey> = [ObjectKey::new("ns", "a"), ObjectKey::new("ns", "b")].into();
-        let refs = vec![
-            HttpRouteParentRefs {
-                name: "a".to_string(),
-                namespace: Some("ns".to_string()),
-                ..Default::default()
-            },
-            HttpRouteParentRefs {
-                name: "b".to_string(),
-                namespace: Some("ns".to_string()),
-                ..Default::default()
-            },
-        ];
-        let result = filter_owned_parent_refs(&refs, "ns", &set);
-        assert_eq!(result.len(), 2);
+    fn route_parent_gets_status_owned_gateway_and_listenerset() {
+        let owned: HashSet<ObjectKey> = [ObjectKey::new("infra", "gw")].into();
+        // Owned Gateway parentRef (default kind) → written regardless of health.
+        assert!(route_parent_gets_status(
+            None,
+            None,
+            Some("infra"),
+            "gw",
+            "apps",
+            &owned,
+            false,
+        ));
+        // Unowned Gateway parentRef → never written.
+        assert!(!route_parent_gets_status(
+            None,
+            None,
+            Some("infra"),
+            "other-gw",
+            "apps",
+            &owned,
+            true, // even if a stale health entry somehow existed
+        ));
+        // ListenerSet parentRef WITH a reflector health entry → written (kind echoed
+        // by the caller). The Gateway-ownership set is irrelevant here.
+        assert!(route_parent_gets_status(
+            Some("gateway.networking.k8s.io"),
+            Some("ListenerSet"),
+            Some("apps"),
+            "ls",
+            "apps",
+            &owned,
+            true,
+        ));
+        // ListenerSet parentRef WITHOUT a health entry → not ours → skipped.
+        assert!(!route_parent_gets_status(
+            None,
+            Some("ListenerSet"),
+            Some("apps"),
+            "ls",
+            "apps",
+            &owned,
+            false,
+        ));
+    }
+
+    #[test]
+    fn is_listener_set_ref_rejects_gateway_and_foreign_group() {
+        // A Gateway ref (default kind) is not a ListenerSet.
+        assert!(!is_listener_set_ref(None, Some("Gateway")));
+        // Unset kind defaults to Gateway elsewhere — here it simply isn't ListenerSet.
+        assert!(!is_listener_set_ref(None, None));
+        // Right kind, wrong group (e.g. a CRD impersonating the name).
+        assert!(!is_listener_set_ref(
+            Some("example.com"),
+            Some("ListenerSet")
+        ));
     }
 
     // ── Stub-condition-driven tests (migrated from controller/tests/controller.rs) ─
@@ -241,50 +288,6 @@ mod tests {
             ..Default::default()
         };
         assert!(!gateway_class_accepted(&gc));
-    }
-
-    #[test]
-    fn filter_owned_parent_refs_keeps_owned_only() {
-        let set = owned_pairs(&[("default", "gw")]);
-        let refs = vec![
-            HttpRouteParentRefs {
-                name: "gw".to_string(),
-                namespace: Some("default".to_string()),
-                ..Default::default()
-            },
-            HttpRouteParentRefs {
-                name: "envoy-gw".to_string(),
-                namespace: Some("default".to_string()),
-                ..Default::default()
-            },
-        ];
-        let filtered = filter_owned_parent_refs(&refs, "default", &set);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].name, "gw");
-    }
-
-    #[test]
-    fn filter_owned_parent_refs_returns_empty_when_none_owned() {
-        let set = owned_pairs(&[("default", "gw")]);
-        let refs = vec![HttpRouteParentRefs {
-            name: "foreign-gw".to_string(),
-            namespace: Some("default".to_string()),
-            ..Default::default()
-        }];
-        let filtered = filter_owned_parent_refs(&refs, "default", &set);
-        assert!(filtered.is_empty());
-    }
-
-    #[test]
-    fn filter_owned_parent_refs_applies_default_namespace() {
-        let set = owned_pairs(&[("apps", "gw")]);
-        let refs = vec![HttpRouteParentRefs {
-            name: "gw".to_string(),
-            namespace: None,
-            ..Default::default()
-        }];
-        let filtered = filter_owned_parent_refs(&refs, "apps", &set);
-        assert_eq!(filtered.len(), 1);
     }
 
     #[test]

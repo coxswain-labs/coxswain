@@ -1,13 +1,13 @@
 //! Kubernetes API calls that write `HTTPRoute` status patches.
 
-use super::conditions::{filter_owned_parent_refs, make_condition};
+use super::conditions::{make_condition, route_parent_gets_status};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::{
     HttpRoute,
     v::httproutes::{HttpRouteStatusParents, HttpRouteStatusParentsParentRef},
 };
 use coxswain_reflector::keys::RouteParentKey;
-use coxswain_reflector::tls::{RouteHealthMap, RouteParentHealth};
+use coxswain_reflector::status::{RouteParentStatus, RouteStatusMap};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::{
     Client,
@@ -20,7 +20,7 @@ pub(super) async fn mark_http_route_programmed(
     route: &HttpRoute,
     controller_name: &str,
     owned_gateways: &HashSet<ObjectKey>,
-    route_health: &RouteHealthMap,
+    route_status: &RouteStatusMap,
 ) {
     let name = match route.metadata.name.as_deref() {
         Some(n) => n,
@@ -31,12 +31,6 @@ pub(super) async fn mark_http_route_programmed(
         Some(refs) if !refs.is_empty() => refs,
         _ => return,
     };
-
-    let owned_refs = filter_owned_parent_refs(parent_refs, ns, owned_gateways);
-    if owned_refs.is_empty() {
-        tracing::debug!(name, ns, "Skipping status patch — no owned parentRefs");
-        return;
-    }
 
     let api: Api<HttpRoute> = Api::namespaced(client.clone(), ns);
     let now = Time(k8s_openapi::jiff::Timestamp::now());
@@ -49,14 +43,27 @@ pub(super) async fn mark_http_route_programmed(
         return;
     };
 
-    let default_health = RouteParentHealth::default();
-    let parents: Vec<HttpRouteStatusParents> = owned_refs
+    let default_status = RouteParentStatus::default();
+    let parents: Vec<HttpRouteStatusParents> = parent_refs
         .iter()
-        .map(|p| {
+        .filter_map(|p| {
             let gw_ns = p.namespace.as_deref().unwrap_or(ns);
             let section = p.section_name.as_deref().unwrap_or("").to_string();
             let health_key = RouteParentKey::new(ns, name, gw_ns, &p.name, section);
-            let health = route_health.get(&health_key).unwrap_or(&default_health);
+            let health_entry = route_status.get(&health_key);
+            // Ownership gate (GEP-1713) — see `conditions::route_parent_gets_status`.
+            if !route_parent_gets_status(
+                p.group.as_deref(),
+                p.kind.as_deref(),
+                p.namespace.as_deref(),
+                &p.name,
+                ns,
+                owned_gateways,
+                health_entry.is_some(),
+            ) {
+                return None;
+            }
+            let health = health_entry.unwrap_or(&default_status);
 
             let (acc_status, acc_reason) = if health.accepted {
                 ("True", health.accepted_reason)
@@ -99,7 +106,7 @@ pub(super) async fn mark_http_route_programmed(
                 now.clone(),
             );
 
-            HttpRouteStatusParents {
+            Some(HttpRouteStatusParents {
                 controller_name: controller_name.to_string(),
                 parent_ref: HttpRouteStatusParentsParentRef {
                     group: p.group.clone(),
@@ -110,9 +117,14 @@ pub(super) async fn mark_http_route_programmed(
                     section_name: p.section_name.clone(),
                 },
                 conditions: vec![accepted_cond, programmed_cond, resolved_refs_cond],
-            }
+            })
         })
         .collect();
+
+    if parents.is_empty() {
+        tracing::debug!(name, ns, "Skipping status patch — no owned parentRefs");
+        return;
+    }
 
     // Idempotency gate. The status-writer funnels both spec-change events and
     // route-health re-drives through this one call, so it must be safe to

@@ -4,7 +4,68 @@ use super::hostnames;
 use crate::gw_types::v::grpcroutes::GrpcRouteParentRefs;
 use crate::gw_types::v::httproutes::HttpRouteParentRefs;
 use crate::keys::ListenerKey;
+use crate::status::ListenerSource;
+use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use std::collections::{HashMap, HashSet};
+
+/// Whether a route `parentRef` attaches to a listener this controller serves
+/// (GEP-1713). A `kind: Gateway` (or unspecified) ref attaches when it names an
+/// owned Gateway; a `kind: ListenerSet` ref attaches when that ListenerSet
+/// contributed at least one listener to `listener_info` (which is built only from
+/// owned Gateways' effective sets, so an unattached/rejected ListenerSet has no
+/// entry). Replaces a bare [`parent_ref_owned`] check that silently dropped every
+/// `kind: ListenerSet` route.
+pub(crate) fn parent_ref_attaches(
+    group: Option<&str>,
+    kind: Option<&str>,
+    namespace: Option<&str>,
+    name: &str,
+    route_ns: &str,
+    owned_gateways: &HashSet<ObjectKey>,
+    listener_info: &HashMap<ListenerKey, ListenerBinding>,
+) -> bool {
+    let ref_ns = namespace.unwrap_or(route_ns);
+    match parent_listener_source(group, kind, ref_ns, name) {
+        ListenerSource::Gateway => {
+            parent_ref_owned(group, kind, namespace, name, route_ns, owned_gateways)
+        }
+        ListenerSource::ListenerSet(ls_key) => listener_info
+            .keys()
+            .any(|k| matches!(&k.source, ListenerSource::ListenerSet(k2) if *k2 == ls_key)),
+    }
+}
+
+/// Resolve a route `parentRef`'s `(group, kind)` to the listener source it targets
+/// (GEP-1713). `kind: ListenerSet` in the Gateway API group targets that
+/// ListenerSet's listeners; anything else (`Gateway`, or unspecified) targets the
+/// Gateway. `(ref_ns, ref_name)` identify the referenced resource.
+pub(crate) fn parent_listener_source(
+    group: Option<&str>,
+    kind: Option<&str>,
+    ref_ns: &str,
+    ref_name: &str,
+) -> ListenerSource {
+    let gw_api_group = group.is_none_or(|g| g.is_empty() || g == "gateway.networking.k8s.io");
+    if gw_api_group && kind == Some("ListenerSet") {
+        ListenerSource::ListenerSet(ObjectKey::new(ref_ns, ref_name))
+    } else {
+        ListenerSource::Gateway
+    }
+}
+
+/// Build the [`ListenerKey`] for a `(source, ref_ns, ref_name, listener)` tuple.
+/// For a ListenerSet source the `(ns, name)` slots come from the source's key.
+fn listener_key(
+    source: &ListenerSource,
+    ref_ns: &str,
+    ref_name: &str,
+    listener: &str,
+) -> ListenerKey {
+    match source {
+        ListenerSource::Gateway => ListenerKey::new(ref_ns, ref_name, listener),
+        ListenerSource::ListenerSet(k) => ListenerKey::for_listener_set(k, listener),
+    }
+}
 
 /// Resolved hostname and port for a single Gateway listener, indexed by [`ListenerKey`].
 ///
@@ -22,6 +83,10 @@ pub struct ListenerBinding {
     /// routing table by (#472). Equals the allocated internal port for shared-mode
     /// Gateways, else the spec port. Routes are inserted under this port.
     pub bind_port: u16,
+    /// Resolved `allowedRoutes.namespaces` policy: a route only binds to this
+    /// listener when its namespace is permitted (GEP-1713). Resolved at merge time
+    /// (`Selector` materialised), so the binding check is a pure membership test.
+    pub route_namespaces: coxswain_core::listener_status::RouteNamespaceSet,
 }
 
 /// Returns one entry per (listener hostname, listener port) binding derived from the
@@ -56,12 +121,21 @@ pub(super) fn compute_listener_bindings(
             let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
             let gw_name = pr.name.as_str();
             let pr_port_filter = pr.port.map(|p| p as u16);
+            // GEP-1713: the parentRef may target a Gateway or a ListenerSet.
+            let source =
+                parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), gw_ns, gw_name);
 
-            // Collect (port, listener_hostname) pairs for this parentRef.
+            // Collect (port, listener_hostname) pairs for this parentRef. A listener
+            // only binds when its `allowedRoutes.namespaces` admits the route's
+            // namespace (GEP-1713) — without this, a route attaches (and serves
+            // traffic) regardless of the listener's namespace scoping.
             let l_bindings: Vec<(u16, &str)> = if let Some(sn) = pr.section_name.as_deref() {
-                let key = ListenerKey::new(gw_ns, gw_name, sn);
+                let key = listener_key(&source, gw_ns, gw_name, sn);
                 match listener_info.get(&key) {
-                    Some(info) if pr_port_filter.is_none_or(|pp| pp == info.port) => {
+                    Some(info)
+                        if pr_port_filter.is_none_or(|pp| pp == info.port)
+                            && info.route_namespaces.allows(route_ns) =>
+                    {
                         vec![(info.bind_port, info.hostname.as_str())]
                     }
                     _ => vec![],
@@ -70,10 +144,12 @@ pub(super) fn compute_listener_bindings(
                 listener_info
                     .iter()
                     .filter_map(|(k, info)| {
-                        if k.gw_ns != gw_ns || k.gw_name != gw_name {
+                        if k.source != source || k.gw_ns != gw_ns || k.gw_name != gw_name {
                             return None;
                         }
-                        if pr_port_filter.is_none_or(|pp| pp == info.port) {
+                        if pr_port_filter.is_none_or(|pp| pp == info.port)
+                            && info.route_namespaces.allows(route_ns)
+                        {
                             Some((info.bind_port, info.hostname.as_str()))
                         } else {
                             None
@@ -133,14 +209,19 @@ pub(super) fn compute_listener_bindings(
                 };
                 let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
                 let gw_name = pr.name.as_str();
+                // Isolation is scoped to listeners declared by the SAME resource
+                // (the parentRef's Gateway or ListenerSet), GEP-1713.
+                let source =
+                    parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), gw_ns, gw_name);
                 let our_spec = listener_info
-                    .get(&ListenerKey::new(gw_ns, gw_name, our_sn))
+                    .get(&listener_key(&source, gw_ns, gw_name, our_sn))
                     .map(|info| hostnames::listener_specificity(&info.hostname))
                     .unwrap_or(0);
                 let e_is_wildcard = e.starts_with("*.");
                 listener_info.iter().any(|(k, info)| {
                     let h_other = &info.hostname;
-                    k.gw_ns == gw_ns
+                    k.source == source
+                        && k.gw_ns == gw_ns
                         && k.gw_name == gw_name
                         && k.listener.as_str() != our_sn
                         && hostnames::listener_specificity(h_other) > our_spec
@@ -197,11 +278,20 @@ pub(super) fn compute_grpc_listener_bindings(
             let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
             let gw_name = pr.name.as_str();
             let pr_port_filter = pr.port.map(|p| p as u16);
+            // GEP-1713: the parentRef may target a Gateway or a ListenerSet.
+            let source =
+                parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), gw_ns, gw_name);
 
+            // Namespace scoping mirrors `compute_listener_bindings` (GEP-1713): a
+            // listener binds only when its `allowedRoutes.namespaces` admits the
+            // route's namespace.
             let l_bindings: Vec<(u16, &str)> = if let Some(sn) = pr.section_name.as_deref() {
-                let key = ListenerKey::new(gw_ns, gw_name, sn);
+                let key = listener_key(&source, gw_ns, gw_name, sn);
                 match listener_info.get(&key) {
-                    Some(info) if pr_port_filter.is_none_or(|pp| pp == info.port) => {
+                    Some(info)
+                        if pr_port_filter.is_none_or(|pp| pp == info.port)
+                            && info.route_namespaces.allows(route_ns) =>
+                    {
                         vec![(info.bind_port, info.hostname.as_str())]
                     }
                     _ => vec![],
@@ -210,10 +300,12 @@ pub(super) fn compute_grpc_listener_bindings(
                 listener_info
                     .iter()
                     .filter_map(|(k, info)| {
-                        if k.gw_ns != gw_ns || k.gw_name != gw_name {
+                        if k.source != source || k.gw_ns != gw_ns || k.gw_name != gw_name {
                             return None;
                         }
-                        if pr_port_filter.is_none_or(|pp| pp == info.port) {
+                        if pr_port_filter.is_none_or(|pp| pp == info.port)
+                            && info.route_namespaces.allows(route_ns)
+                        {
                             Some((info.bind_port, info.hostname.as_str()))
                         } else {
                             None
@@ -269,14 +361,17 @@ pub(super) fn compute_grpc_listener_bindings(
                 };
                 let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
                 let gw_name = pr.name.as_str();
+                let source =
+                    parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), gw_ns, gw_name);
                 let our_spec = listener_info
-                    .get(&ListenerKey::new(gw_ns, gw_name, our_sn))
+                    .get(&listener_key(&source, gw_ns, gw_name, our_sn))
                     .map(|info| hostnames::listener_specificity(&info.hostname))
                     .unwrap_or(0);
                 let e_is_wildcard = e.starts_with("*.");
                 listener_info.iter().any(|(k, info)| {
                     let h_other = &info.hostname;
-                    k.gw_ns == gw_ns
+                    k.source == source
+                        && k.gw_ns == gw_ns
                         && k.gw_name == gw_name
                         && k.listener.as_str() != our_sn
                         && hostnames::listener_specificity(h_other) > our_spec
@@ -303,6 +398,65 @@ pub(super) fn compute_grpc_listener_bindings(
 mod tests {
     use super::*;
     use crate::gateway_api::tests::*;
+
+    // ── parentRef attachment (GEP-1713) ──────────────────────────────────────────
+
+    #[test]
+    fn parent_ref_attaches_resolves_gateway_and_listener_set_refs() {
+        let owned: HashSet<ObjectKey> = std::iter::once(ObjectKey::new("default", "gw")).collect();
+        let ls_key = ObjectKey::new("default", "team-ls");
+        let mut listener_info: HashMap<ListenerKey, ListenerBinding> = HashMap::new();
+        listener_info.insert(
+            ListenerKey::for_listener_set(&ls_key, "ls-http"),
+            ListenerBinding {
+                hostname: String::new(),
+                port: 8001,
+                bind_port: 30001,
+                route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
+            },
+        );
+
+        // kind: Gateway (unspecified) naming an owned Gateway → attaches.
+        assert!(parent_ref_attaches(
+            None,
+            None,
+            Some("default"),
+            "gw",
+            "default",
+            &owned,
+            &listener_info
+        ));
+        // kind: ListenerSet whose listeners are in listener_info → attaches.
+        assert!(parent_ref_attaches(
+            Some("gateway.networking.k8s.io"),
+            Some("ListenerSet"),
+            Some("default"),
+            "team-ls",
+            "default",
+            &owned,
+            &listener_info
+        ));
+        // Unknown Gateway → does not attach.
+        assert!(!parent_ref_attaches(
+            None,
+            None,
+            Some("default"),
+            "other",
+            "default",
+            &owned,
+            &listener_info
+        ));
+        // kind: ListenerSet not present in listener_info (unattached/rejected) → no.
+        assert!(!parent_ref_attaches(
+            Some("gateway.networking.k8s.io"),
+            Some("ListenerSet"),
+            Some("default"),
+            "absent-ls",
+            "default",
+            &owned,
+            &listener_info
+        ));
+    }
 
     // ── Listener isolation tests ──────────────────────────────────────────────────
 
@@ -567,6 +721,60 @@ mod tests {
                 .route(8080, "h.example.com", "/", &ctx_get())
                 .is_none(),
             "sectionName=a + port=8080 must not appear under 8080 either"
+        );
+    }
+
+    // ── GEP-1713: ListenerSet parentRef resolution ────────────────────────────────
+
+    #[test]
+    fn listener_set_parent_ref_resolves_to_its_own_listener_without_colliding() {
+        // A Gateway listener "web":80 and a ListenerSet ("apps/team") listener "web"
+        // :8080 share a name but live under distinct sources — they must NOT collide,
+        // and each parentRef kind must resolve to its own listener's port.
+        let ls_key = ObjectKey::new("apps", "team");
+        let mut info: HashMap<ListenerKey, ListenerBinding> = HashMap::new();
+        info.insert(
+            ListenerKey::new("default", "gw", "web"),
+            ListenerBinding {
+                hostname: String::new(),
+                port: 80,
+                bind_port: 80,
+                route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
+            },
+        );
+        info.insert(
+            ListenerKey::for_listener_set(&ls_key, "web"),
+            ListenerBinding {
+                hostname: String::new(),
+                port: 8080,
+                bind_port: 8080,
+                route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
+            },
+        );
+
+        let gw_pr = vec![HttpRouteParentRefs {
+            name: "gw".to_string(),
+            namespace: Some("default".to_string()),
+            section_name: Some("web".to_string()),
+            ..Default::default()
+        }];
+        assert_eq!(
+            compute_listener_bindings(&[], &gw_pr, "default", &info),
+            vec![(None, 80u16)],
+            "Gateway parentRef binds the Gateway's own web:80, not the ListenerSet's"
+        );
+
+        let ls_pr = vec![HttpRouteParentRefs {
+            kind: Some("ListenerSet".to_string()),
+            name: "team".to_string(),
+            namespace: Some("apps".to_string()),
+            section_name: Some("web".to_string()),
+            ..Default::default()
+        }];
+        assert_eq!(
+            compute_listener_bindings(&[], &ls_pr, "default", &info),
+            vec![(None, 8080u16)],
+            "ListenerSet parentRef binds the ListenerSet's web:8080"
         );
     }
 }

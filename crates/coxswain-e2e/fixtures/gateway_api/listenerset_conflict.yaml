@@ -1,0 +1,50 @@
+---
+# GEP-1713 conflict-with-survivor: the parent Gateway serves an HTTP listener on
+# its port + hostname. The ListenerSet declares TWO listeners: one duplicates the
+# Gateway's port + hostname (a hostname conflict the Gateway wins, so the
+# ListenerSet listener loses and is NOT programmed) and one on a distinct port
+# (no conflict, programs cleanly). The ListenerSet must still report top-level
+# Accepted=True / Programmed=True — a single losing listener does not block the
+# whole set. Regression guard for the per-listener-vs-aggregate Programmed split.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  allowedListeners:
+    namespaces:
+      from: Same
+  listeners:
+    - name: gw-http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      hostname: "a.${TESTNS}.local"
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: team-ls
+spec:
+  parentRef:
+    name: coxswain-test
+  listeners:
+    # Duplicates the Gateway's port + hostname → loses the conflict (Gateway wins).
+    - name: ls-conflict
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      hostname: "a.${TESTNS}.local"
+      allowedRoutes:
+        namespaces:
+          from: Same
+    # Distinct port → no conflict → programs.
+    - name: ls-ok
+      port: 8002
+      protocol: HTTP
+      hostname: "b.${TESTNS}.local"
+      allowedRoutes:
+        namespaces:
+          from: Same

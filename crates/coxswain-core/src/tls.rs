@@ -1,4 +1,13 @@
-//! TLS certificate store and builder — maps SNI host patterns to PEM cert/key pairs.
+//! TLS material stores for the data plane.
+//!
+//! Three families live here:
+//! - **Server cert stores** ([`TlsStore`], [`PortTlsStore`]) — SNI host-pattern → PEM
+//!   cert/key pairs, indexed per-port for the frontend TLS handshake.
+//! - **Client-cert / mTLS stores** ([`ClientCertStore`], [`ClientCertConfig`]) — per-SNI
+//!   mTLS policy (CA bundle, insecure fallback, peer verification).
+//! - **Listener-hostname maps** ([`ListenerHostnames`], [`ListenerHostnamesBuilder`]) —
+//!   SNI host patterns accepted by each bind port, used for GEP-3567 misdirected-request
+//!   detection.
 
 use crate::shared::Shared;
 use std::cmp::Reverse;

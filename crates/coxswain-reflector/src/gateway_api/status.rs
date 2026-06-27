@@ -1,8 +1,8 @@
 //! [`RouteLike`] impl for `HTTPRoute` — the HTTPRoute-specific projections and
 //! filter predicates. The kind-generic `Accepted`/`ResolvedRefs` algorithm lives
-//! in [`super::route_health`].
+//! in [`super::route_status`].
 
-use super::route_health::{BackendRefView, ParentRefView, RouteLike};
+use super::route_status::{BackendRefView, ParentRefView, RouteLike};
 use crate::gw_types::v::httproutes::{HttpRoute, HttpRouteRulesFiltersType};
 
 impl RouteLike for HttpRoute {
@@ -35,6 +35,8 @@ impl RouteLike for HttpRoute {
                 name: pr.name.as_str(),
                 section_name: pr.section_name.as_deref(),
                 port: pr.port.map(|p| p as u16),
+                group: pr.group.as_deref(),
+                kind: pr.kind.as_deref(),
             })
             .collect()
     }
@@ -83,14 +85,14 @@ impl RouteLike for HttpRoute {
 
 #[cfg(test)]
 mod tests {
-    use crate::gateway_api::route_health::compute_route_health;
+    use crate::gateway_api::route_status::compute_route_health;
     use crate::gateway_api::tests::*;
     use crate::gw_types::v::gateways::{Gateway, GatewayListeners, GatewaySpec};
     use crate::gw_types::v::httproutes::{
         HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteSpec,
     };
     use crate::keys::RouteParentKey;
-    use crate::tls::RouteHealthMap;
+    use crate::status::RouteStatusMap;
     use coxswain_core::ownership::ObjectKey;
     use coxswain_core::reference_grants::ReferenceGrantKey;
     use k8s_openapi::api::core::v1::Service;
@@ -182,12 +184,20 @@ mod tests {
         owned: &[(&str, &str)],
         grants: &HashSet<ReferenceGrantKey>,
         services: &reflector::Store<Service>,
-    ) -> RouteHealthMap {
+    ) -> RouteStatusMap {
         let owned_set: HashSet<ObjectKey> = owned
             .iter()
             .map(|(ns, name)| ObjectKey::new(*ns, *name))
             .collect();
-        compute_route_health(routes, gateways, &owned_set, grants, services, "HTTPRoute")
+        compute_route_health(
+            routes,
+            gateways,
+            &owned_set,
+            &std::collections::HashMap::new(),
+            grants,
+            services,
+            "HTTPRoute",
+        )
     }
 
     fn key(route_ns: &str, route_name: &str, gw_ns: &str, gw_name: &str) -> RouteParentKey {

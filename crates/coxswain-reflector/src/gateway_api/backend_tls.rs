@@ -11,7 +11,7 @@ use crate::gw_types::{
     },
 };
 use crate::k8s_utils::metadata_created_at;
-use crate::tls::{BackendTlsPolicyHealth, BackendTlsPolicyHealthMap};
+use crate::status::{BackendTlsPolicyStatus, BackendTlsPolicyStatusMap};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{SubjectAltName, UpstreamCa, UpstreamTls};
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
@@ -57,7 +57,7 @@ pub fn build_backend_tls_index(
     policies: &reflector::Store<BackendTlsPolicy>,
     configmaps: &reflector::Store<ConfigMap>,
     services: &reflector::Store<Service>,
-) -> (BackendTlsIndex, BackendTlsPolicyHealthMap) {
+) -> (BackendTlsIndex, BackendTlsPolicyStatusMap) {
     // Group policies by their (svc_key, optional section_name) scope. Per GEP-1897,
     // two policies on the same Service only conflict when they target the same
     // sectionName (or both target the Service as a whole with no sectionName).
@@ -80,7 +80,7 @@ pub fn build_backend_tls_index(
     }
 
     let mut index: BackendTlsIndex = HashMap::new();
-    let mut health: BackendTlsPolicyHealthMap = HashMap::new();
+    let mut health: BackendTlsPolicyStatusMap = HashMap::new();
 
     for ((svc_key, scope), mut competing) in candidates {
         // Conflict resolution: oldest first, then lexicographic {ns}/{name}.
@@ -236,7 +236,7 @@ pub fn compute_policy_health(
     policies: &reflector::Store<BackendTlsPolicy>,
     routes: &[Arc<HttpRoute>],
     owned_gateways: &HashSet<ObjectKey>,
-) -> BackendTlsPolicyHealthMap {
+) -> BackendTlsPolicyStatusMap {
     // First, for each policy in the cluster, collect every (svc_ns, svc_name) it
     // targets. We need this for losers, since `index` only carries winners.
     let mut targets_per_policy: HashMap<ObjectKey, HashSet<ObjectKey>> = HashMap::new();
@@ -305,7 +305,7 @@ pub fn compute_policy_health(
     ancestors_per_policy
         .into_iter()
         .map(|(policy_key, gw_set)| {
-            let mut health = BackendTlsPolicyHealth::default();
+            let mut health = BackendTlsPolicyStatus::default();
             let mut ancestors: Vec<ObjectKey> = gw_set.into_iter().collect();
             ancestors.sort_by(|a, b| a.ns.cmp(&b.ns).then(a.name.cmp(&b.name)));
             health.ancestors = ancestors;

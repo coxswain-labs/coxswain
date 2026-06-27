@@ -1,0 +1,747 @@
+//! `ListenerSet.status` patch builder and staleness check (GEP-1713).
+//!
+//! Mirrors [`super::gateway_status`] for the `ListenerSet` resource. A ListenerSet
+//! attaches listeners to a parent Gateway; its per-listener health lives in the
+//! parent Gateway's [`GatewayListenerStatus`] keyed by
+//! [`ListenerStatusKey`]`{ source: ListenerSet(ls_key), name }`. The
+//! per-listener `Accepted`/`ResolvedRefs`/`Programmed` conditions reuse the exact
+//! same reason mapping as Gateway listeners via
+//! [`crate::status_common::listener_condition_triplet`]; a `Conflicted` condition
+//! is added on top, and the ListenerSet carries top-level `Accepted`/`Programmed`.
+
+use crate::status_common::{listener_condition_triplet, make_condition};
+use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::gw_types::ListenerSet;
+use coxswain_reflector::gw_types::v::listenersets::{
+    ListenerSetListeners, ListenerSetListenersTlsMode,
+};
+use coxswain_reflector::ingress::IngressPorts;
+use coxswain_reflector::status::{
+    ConflictReason, GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+
+const GW_GROUP: &str = "gateway.networking.k8s.io";
+
+/// The ListenerSet's own `{namespace}/{name}` key.
+fn listenerset_key(ls: &ListenerSet) -> ObjectKey {
+    ObjectKey::new(
+        ls.metadata.namespace.clone().unwrap_or_default(),
+        ls.metadata.name.clone().unwrap_or_default(),
+    )
+}
+
+/// `true` when this ListenerSet was accepted (merged) by its parent Gateway: the
+/// parent's health holds at least one listener tagged with this ListenerSet's
+/// source, or the ListenerSet declares no listeners (vacuously accepted). A
+/// ListenerSet rejected by the parent's `allowedListeners` contributes no health
+/// entries, so its absence signals rejection (GEP-1713 opt-in gate).
+#[must_use]
+pub(super) fn listenerset_accepted(
+    ls: &ListenerSet,
+    parent_health: Option<&GatewayListenerStatus>,
+) -> bool {
+    if ls.spec.listeners.is_empty() {
+        return true;
+    }
+    let ls_key = listenerset_key(ls);
+    let Some(health) = parent_health else {
+        return false;
+    };
+    health
+        .listeners
+        .keys()
+        .any(|k| k.source == ListenerSource::ListenerSet(ls_key.clone()))
+}
+
+/// Look up the health for one ListenerSet listener in its parent Gateway's map.
+fn listener_info<'a>(
+    health: Option<&'a GatewayListenerStatus>,
+    ls_key: &ObjectKey,
+    name: &str,
+) -> Option<&'a ListenerInfo> {
+    health.and_then(|h| {
+        h.listeners.get(&ListenerStatusKey {
+            source: ListenerSource::ListenerSet(ls_key.clone()),
+            name: name.to_string(),
+        })
+    })
+}
+
+/// Whether a ListenerSet listener is `protocol: TLS, tls.mode: Passthrough`.
+fn is_passthrough(l: &ListenerSetListeners) -> bool {
+    l.protocol == "TLS"
+        && l.tls
+            .as_ref()
+            .and_then(|t| t.mode.as_ref())
+            .is_some_and(|m| matches!(m, ListenerSetListenersTlsMode::Passthrough))
+}
+
+/// `(has_any_invalid, supported_kinds)` for a ListenerSet listener's
+/// `allowedRoutes.kinds` — the ListenerSet analogue of
+/// [`crate::status_common::listener_route_kind_info`].
+fn route_kind_info(l: &ListenerSetListeners) -> (bool, Vec<(Option<String>, String)>) {
+    let passthrough = is_passthrough(l);
+    let default_kinds = || {
+        if passthrough {
+            vec![(Some(GW_GROUP.to_string()), "TLSRoute".to_string())]
+        } else {
+            vec![
+                (Some(GW_GROUP.to_string()), "HTTPRoute".to_string()),
+                (Some(GW_GROUP.to_string()), "GRPCRoute".to_string()),
+            ]
+        }
+    };
+    let allowed = match l.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_deref()) {
+        Some(k) if !k.is_empty() => k,
+        _ => return (false, default_kinds()),
+    };
+    let mut has_invalid = false;
+    let mut includes_http = false;
+    let mut includes_grpc = false;
+    let mut includes_tls = false;
+    for k in allowed {
+        let group_ok = k
+            .group
+            .as_deref()
+            .is_none_or(|g| g.is_empty() || g == GW_GROUP);
+        if (k.kind == "HTTPRoute" || k.kind == "GRPCRoute") && group_ok && !passthrough {
+            if k.kind == "HTTPRoute" {
+                includes_http = true;
+            }
+            if k.kind == "GRPCRoute" {
+                includes_grpc = true;
+            }
+        } else if k.kind == "TLSRoute" && group_ok && passthrough {
+            includes_tls = true;
+        } else {
+            has_invalid = true;
+        }
+    }
+    let mut supported = Vec::new();
+    if includes_http {
+        supported.push((Some(GW_GROUP.to_string()), "HTTPRoute".to_string()));
+    }
+    if includes_grpc {
+        supported.push((Some(GW_GROUP.to_string()), "GRPCRoute".to_string()));
+    }
+    if includes_tls {
+        supported.push((Some(GW_GROUP.to_string()), "TLSRoute".to_string()));
+    }
+    (has_invalid, supported)
+}
+
+/// Build the per-listener condition list (the shared triplet plus a `Conflicted`
+/// condition) for one ListenerSet listener.
+fn listener_conditions(
+    l: &ListenerSetListeners,
+    info: Option<&ListenerInfo>,
+    accepted: bool,
+    has_invalid_kinds: bool,
+    ingress_ports: IngressPorts,
+    generation: i64,
+    now: &Time,
+) -> Vec<Condition> {
+    let mut conds = listener_condition_triplet(
+        &l.name,
+        l.port,
+        info,
+        has_invalid_kinds,
+        ingress_ports,
+        generation,
+        now,
+    );
+    // A rejected ListenerSet (parent `allowedListeners` denied it) has no entry in
+    // the parent's effective set, so `info` is `None` and the shared triplet would
+    // optimistically read Accepted/Programmed=True. The listener is neither
+    // attached nor programmed — force both False so the status doesn't claim a
+    // listener the data plane never serves.
+    if !accepted {
+        for c in conds.iter_mut() {
+            if c.type_ == "Accepted" || c.type_ == "Programmed" {
+                c.status = "False".to_string();
+                c.reason = "NotAllowed".to_string();
+                c.message = "ListenerSet not accepted by the parent Gateway".to_string();
+            }
+        }
+    }
+    let conflict = info
+        .map(|i| i.conflict.clone())
+        .unwrap_or(ConflictReason::None);
+    let conflicted = conflict.is_conflicted();
+    if conflicted {
+        let reason = conflict.reason_str();
+        let conflict_msg = conflict.message();
+        for c in conds.iter_mut() {
+            if c.type_ == "Accepted" || c.type_ == "Programmed" {
+                c.status = "False".to_string();
+                c.reason = reason.to_string();
+                c.message = conflict_msg.to_string();
+            }
+        }
+        conds.push(make_condition(
+            "Conflicted",
+            "True",
+            reason,
+            conflict_msg,
+            generation,
+            now.clone(),
+        ));
+    } else {
+        conds.push(make_condition(
+            "Conflicted",
+            "False",
+            "NoConflicts",
+            "",
+            generation,
+            now.clone(),
+        ));
+    }
+    conds
+}
+
+/// Build the desired `ListenerSet.status` JSON merge patch (GEP-1713).
+///
+/// `accepted` is the parent Gateway's `allowedListeners` decision (see
+/// [`listenerset_accepted`]); `parent_health` is the parent Gateway's listener
+/// health snapshot, from which each ListenerSet listener's per-listener health is
+/// read by source-tagged key.
+#[must_use]
+pub(super) fn build_listenerset_status_patch(
+    ls: &ListenerSet,
+    parent_health: Option<&GatewayListenerStatus>,
+    accepted: bool,
+    ingress_ports: IngressPorts,
+    generation: i64,
+    now: &Time,
+) -> serde_json::Value {
+    let ls_key = listenerset_key(ls);
+
+    let listener_statuses: Vec<serde_json::Value> = ls
+        .spec
+        .listeners
+        .iter()
+        .map(|l| {
+            let info = listener_info(parent_health, &ls_key, &l.name);
+            let (has_invalid_kinds, supported_kinds) = route_kind_info(l);
+            let conds = listener_conditions(
+                l,
+                info,
+                accepted,
+                has_invalid_kinds,
+                ingress_ports,
+                generation,
+                now,
+            );
+            let supported: Vec<serde_json::Value> = supported_kinds
+                .into_iter()
+                .map(|(group, kind)| serde_json::json!({ "group": group, "kind": kind }))
+                .collect();
+            // ListenerSetStatusListeners has no `port` field (only name,
+            // attachedRoutes, conditions, supportedKinds) — emitting one would be
+            // rejected by the CRD's structural schema.
+            serde_json::json!({
+                "name": l.name,
+                "attachedRoutes": info.map(|i| i.attached_routes).unwrap_or(0),
+                "supportedKinds": supported,
+                "conditions": conds,
+            })
+        })
+        .collect();
+
+    // A ListenerSet is Accepted=False/ListenersNotValid when it IS allowed by the
+    // parent's allowedListeners (accepted=true) but every single one of its listeners
+    // is invalid or conflicted (GEP-1713 hostname-conflict conformance).
+    let all_listeners_invalid = accepted
+        && !ls.spec.listeners.is_empty()
+        && listener_statuses.iter().all(|s| {
+            s["conditions"]
+                .as_array()
+                .map(|conds| {
+                    conds
+                        .iter()
+                        .any(|c| c["type"] == "Programmed" && c["status"] == "False")
+                })
+                .unwrap_or(false)
+        });
+    let (accepted_status, accepted_reason, accepted_msg) = if !accepted {
+        (
+            "False",
+            "NotAllowed",
+            "the parent Gateway's spec.allowedListeners does not permit this ListenerSet",
+        )
+    } else if all_listeners_invalid {
+        (
+            "False",
+            "ListenersNotValid",
+            "all listeners are invalid or conflicted",
+        )
+    } else {
+        ("True", "Accepted", "")
+    };
+    let (prog_status, prog_reason, prog_msg) = if !accepted {
+        // GEP-1713 conformance: a ListenerSet rejected by the parent's
+        // `allowedListeners` reports Programmed=False with reason `NotAllowed`,
+        // mirroring its Accepted condition (NOT `Pending`).
+        (
+            "False",
+            "NotAllowed",
+            "ListenerSet not accepted by the parent Gateway",
+        )
+    } else if all_listeners_invalid {
+        (
+            "False",
+            "ListenersNotValid",
+            "all listeners are invalid or conflicted",
+        )
+    } else {
+        // GEP-1713: a ListenerSet is Programmed once it is accepted and NOT all of
+        // its listeners are invalid/conflicted. A single conflicted listener (whose
+        // own `Programmed=False/Conflicted` condition records the loss) does NOT
+        // drag the whole set to Programmed=False — mirrors the Gateway-level rule
+        // and the protocol/hostname-conflict conformance expectations.
+        ("True", "Programmed", "")
+    };
+    let conditions = vec![
+        make_condition(
+            "Accepted",
+            accepted_status,
+            accepted_reason,
+            accepted_msg,
+            generation,
+            now.clone(),
+        ),
+        make_condition(
+            "Programmed",
+            prog_status,
+            prog_reason,
+            prog_msg,
+            generation,
+            now.clone(),
+        ),
+    ];
+
+    serde_json::json!({
+        "status": {
+            "conditions": conditions,
+            "listeners": listener_statuses,
+        }
+    })
+}
+
+/// Returns true when the ListenerSet's current status does not yet reflect the
+/// desired state — prevents redundant patches and watch-feedback loops.
+#[must_use]
+pub(super) fn listenerset_needs_status_patch(
+    ls: &ListenerSet,
+    parent_health: Option<&GatewayListenerStatus>,
+    accepted: bool,
+    ingress_ports: IngressPorts,
+) -> bool {
+    let status = ls.status.as_ref();
+    let conds = status.and_then(|s| s.conditions.as_deref()).unwrap_or(&[]);
+    let cond_true = |cs: &[Condition], type_: &str| {
+        cs.iter()
+            .find(|c| c.type_ == type_)
+            .is_some_and(|c| c.status == "True")
+    };
+    let ls_key = listenerset_key(ls);
+    let expected_gen = ls.metadata.generation.unwrap_or(0);
+    // Timestamp is irrelevant here — only condition statuses are compared.
+    let now = Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH);
+
+    let current = status.and_then(|s| s.listeners.as_deref()).unwrap_or(&[]);
+    if current.len() != ls.spec.listeners.len() {
+        return true;
+    }
+    if conds
+        .iter()
+        .any(|c| c.observed_generation.unwrap_or(0) < expected_gen)
+    {
+        return true;
+    }
+
+    // Derive each listener's desired conditions from `listener_conditions` — the
+    // SAME function the patch builder uses — so the staleness check can never
+    // diverge from what gets written (a divergence loops forever re-patching).
+    // `all_listeners_invalid` is then exactly "every listener's Programmed=False",
+    // matching `build_listenerset_status_patch`.
+    let mut all_listeners_invalid = !ls.spec.listeners.is_empty();
+    for l in &ls.spec.listeners {
+        let info = listener_info(parent_health, &ls_key, &l.name);
+        let (has_invalid_kinds, _) = route_kind_info(l);
+        let desired = listener_conditions(
+            l,
+            info,
+            accepted,
+            has_invalid_kinds,
+            ingress_ports,
+            expected_gen,
+            &now,
+        );
+        let dstat = |type_: &str| {
+            desired
+                .iter()
+                .find(|c| c.type_ == type_)
+                .is_some_and(|c| c.status == "True")
+        };
+        if dstat("Programmed") {
+            all_listeners_invalid = false;
+        }
+        let desired_attached = info.map(|i| i.attached_routes).unwrap_or(0);
+
+        let Some(cur) = current.iter().find(|sl| sl.name == l.name) else {
+            return true;
+        };
+        if cur.attached_routes != desired_attached {
+            return true;
+        }
+        for type_ in ["ResolvedRefs", "Accepted", "Programmed", "Conflicted"] {
+            if cond_true(&cur.conditions, type_) != dstat(type_) {
+                return true;
+            }
+        }
+        if cur
+            .conditions
+            .iter()
+            .any(|c| c.observed_generation.unwrap_or(0) < expected_gen)
+        {
+            return true;
+        }
+    }
+
+    // Top-level Accepted/Programmed both follow `accepted && !all_listeners_invalid`.
+    let desired_top = accepted && !all_listeners_invalid;
+    if cond_true(conds, "Accepted") != desired_top || cond_true(conds, "Programmed") != desired_top
+    {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coxswain_reflector::gw_types::v::listenersets::{ListenerSetParentRef, ListenerSetSpec};
+    use coxswain_reflector::status::ListenerReadiness;
+    use kube::api::ObjectMeta;
+
+    fn ls(listeners: Vec<ListenerSetListeners>) -> ListenerSet {
+        ListenerSet {
+            metadata: ObjectMeta {
+                name: Some("team".to_string()),
+                namespace: Some("apps".to_string()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: ListenerSetSpec {
+                parent_ref: ListenerSetParentRef {
+                    name: "gw".to_string(),
+                    namespace: Some("infra".to_string()),
+                    ..Default::default()
+                },
+                listeners,
+            },
+            status: None,
+        }
+    }
+
+    fn http_listener(name: &str, port: i32) -> ListenerSetListeners {
+        ListenerSetListeners {
+            name: name.to_string(),
+            port,
+            protocol: "HTTP".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Health for the parent Gateway holding this LS's listener, optionally conflicted.
+    fn parent_health(name: &str, port: u16, conflicted: bool) -> GatewayListenerStatus {
+        let mut h = GatewayListenerStatus::default();
+        let mut info = ListenerInfo::default();
+        info.port = port;
+        info.attached_routes = 2;
+        info.conflict = if conflicted {
+            ConflictReason::HostnameConflict
+        } else {
+            ConflictReason::None
+        };
+        h.listeners.insert(
+            ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), name),
+            info,
+        );
+        h
+    }
+
+    fn now() -> Time {
+        Time(k8s_openapi::jiff::Timestamp::from_second(0).expect("epoch"))
+    }
+
+    #[test]
+    fn accepted_reflects_health_presence() {
+        let set = ls(vec![http_listener("web", 8080)]);
+        let health = parent_health("web", 8080, false);
+        assert!(listenerset_accepted(&set, Some(&health)));
+        assert!(!listenerset_accepted(&set, None));
+        // A ListenerSet with no listeners is vacuously accepted.
+        assert!(listenerset_accepted(&ls(vec![]), None));
+    }
+
+    #[test]
+    fn accepted_listener_set_programs_and_reports_no_conflict() {
+        let set = ls(vec![http_listener("web", 8080)]);
+        let health = parent_health("web", 8080, false);
+        let patch = build_listenerset_status_patch(
+            &set,
+            Some(&health),
+            true,
+            IngressPorts::new(None, None),
+            1,
+            &now(),
+        );
+        let conds = &patch["status"]["conditions"];
+        assert_eq!(conds[0]["type"], "Accepted");
+        assert_eq!(conds[0]["status"], "True");
+        assert_eq!(conds[1]["type"], "Programmed");
+        assert_eq!(conds[1]["status"], "True");
+        let l0 = &patch["status"]["listeners"][0];
+        assert_eq!(l0["name"], "web");
+        assert_eq!(l0["attachedRoutes"], 2);
+        let conflicted = l0["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "Conflicted")
+            .unwrap();
+        assert_eq!(conflicted["status"], "False");
+    }
+
+    #[test]
+    fn rejected_listener_set_is_not_accepted() {
+        let set = ls(vec![http_listener("web", 8080)]);
+        let patch = build_listenerset_status_patch(
+            &set,
+            None,
+            false,
+            IngressPorts::new(None, None),
+            1,
+            &now(),
+        );
+        assert_eq!(patch["status"]["conditions"][0]["status"], "False");
+        assert_eq!(patch["status"]["conditions"][0]["reason"], "NotAllowed");
+        assert_eq!(patch["status"]["conditions"][1]["status"], "False");
+
+        // The rejected ListenerSet's listener must NOT be programmed (its listeners
+        // are never served). The shared triplet would optimistically read True with
+        // no health info — the `accepted=false` override must force it False.
+        let listener_conds = &patch["status"]["listeners"][0]["conditions"];
+        let prog = listener_conds
+            .as_array()
+            .expect("listener conditions")
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed condition");
+        assert_eq!(
+            prog["status"], "False",
+            "rejected LS listener must not program"
+        );
+        let acc = listener_conds
+            .as_array()
+            .expect("listener conditions")
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted condition");
+        assert_eq!(
+            acc["status"], "False",
+            "rejected LS listener is not accepted"
+        );
+
+        // Idempotency: after writing this patch back as the ListenerSet's status,
+        // `needs_patch` must be false — otherwise the desired/current divergence
+        // would drive an infinite patch loop.
+        let mut applied = set.clone();
+        applied.status =
+            Some(serde_json::from_value(patch["status"].clone()).expect("status deserializes"));
+        assert!(
+            !listenerset_needs_status_patch(&applied, None, false, IngressPorts::new(None, None)),
+            "rejected-LS status must be stable (no patch loop)"
+        );
+    }
+
+    #[test]
+    fn conflicted_listener_reports_conflicted_true_and_blocks_programmed() {
+        let set = ls(vec![http_listener("dup", 80)]);
+        let health = parent_health("dup", 80, true);
+        let patch = build_listenerset_status_patch(
+            &set,
+            Some(&health),
+            true,
+            IngressPorts::new(None, None),
+            1,
+            &now(),
+        );
+        let l0 = &patch["status"]["listeners"][0];
+        let conflicted = l0["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "Conflicted")
+            .unwrap();
+        assert_eq!(conflicted["status"], "True");
+        assert_eq!(conflicted["reason"], "HostnameConflict");
+        // This set has a SINGLE listener and it is conflicted, so EVERY listener is
+        // invalid → the ListenerSet is not programmed (all_listeners_invalid).
+        assert_eq!(patch["status"]["conditions"][1]["status"], "False");
+        assert_eq!(
+            patch["status"]["conditions"][1]["reason"],
+            "ListenersNotValid"
+        );
+    }
+
+    #[test]
+    fn mixed_set_with_one_conflict_stays_programmed() {
+        // GEP-1713: a ListenerSet with one healthy and one conflicted listener is
+        // Programmed=True — a single losing listener does NOT drag down the set
+        // (matches the protocol/hostname-conflict conformance expectations).
+        let set = ls(vec![http_listener("ok", 80), http_listener("dup", 81)]);
+        let mut health = parent_health("ok", 80, false);
+        // Add a second, conflicted listener "dup" under the same ListenerSet source
+        // key the `parent_health` helper uses (ObjectKey "apps"/"team").
+        let mut dup = ListenerInfo::default();
+        dup.port = 81;
+        dup.conflict = ConflictReason::HostnameConflict;
+        health.listeners.insert(
+            ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), "dup"),
+            dup,
+        );
+        let patch = build_listenerset_status_patch(
+            &set,
+            Some(&health),
+            true,
+            IngressPorts::new(None, None),
+            1,
+            &now(),
+        );
+        let conds = patch["status"]["conditions"].as_array().unwrap();
+        assert_eq!(conds[1]["type"], "Programmed");
+        assert_eq!(conds[1]["status"], "True");
+        assert_eq!(conds[1]["reason"], "Programmed");
+        // Acceptance also holds: not all listeners are invalid.
+        assert_eq!(conds[0]["type"], "Accepted");
+        assert_eq!(conds[0]["status"], "True");
+        // The conflicted listener still individually reports Programmed=False.
+        let dup = patch["status"]["listeners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["name"] == "dup")
+            .expect("dup listener present");
+        let dup_prog = dup["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .unwrap();
+        assert_eq!(dup_prog["status"], "False");
+        // And the staleness check is satisfied by the written patch.
+        let mut applied = set.clone();
+        applied.status =
+            Some(serde_json::from_value(patch["status"].clone()).expect("status deserializes"));
+        assert!(!listenerset_needs_status_patch(
+            &applied,
+            Some(&health),
+            true,
+            IngressPorts::new(None, None),
+        ));
+    }
+
+    #[test]
+    fn needs_patch_true_on_empty_status_false_when_current() {
+        let set = ls(vec![http_listener("web", 8080)]);
+        let health = parent_health("web", 8080, false);
+        assert!(listenerset_needs_status_patch(
+            &set,
+            Some(&health),
+            true,
+            IngressPorts::new(None, None)
+        ));
+
+        // Apply the desired patch into the object, then it should be satisfied.
+        let patch = build_listenerset_status_patch(
+            &set,
+            Some(&health),
+            true,
+            IngressPorts::new(None, None),
+            1,
+            &now(),
+        );
+        let mut applied = set.clone();
+        applied.status =
+            Some(serde_json::from_value(patch["status"].clone()).expect("status deserializes"));
+        assert!(!listenerset_needs_status_patch(
+            &applied,
+            Some(&health),
+            true,
+            IngressPorts::new(None, None),
+        ));
+    }
+
+    #[test]
+    fn needs_patch_detects_tls_health_flip_without_generation_bump() {
+        // An HTTPS LS listener that was healthy, then its cert is deleted: the TLS
+        // outcome flips to unhealthy WITHOUT a generation bump. Status must re-patch
+        // (the bug the C7 review caught — needs_patch ignored health-derived flips).
+        let mut set = ls(vec![ListenerSetListeners {
+            name: "web".to_string(),
+            port: 8443,
+            protocol: "HTTPS".to_string(),
+            ..Default::default()
+        }]);
+        let mut healthy = GatewayListenerStatus::default();
+        let mut info = ListenerInfo::default();
+        info.readiness = ListenerReadiness::Resolved;
+        info.port = 8443;
+        healthy.listeners.insert(
+            ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), "web"),
+            info,
+        );
+
+        let patch = build_listenerset_status_patch(
+            &set,
+            Some(&healthy),
+            true,
+            IngressPorts::new(None, None),
+            1,
+            &now(),
+        );
+        set.status =
+            Some(serde_json::from_value(patch["status"].clone()).expect("status deserializes"));
+        assert!(!listenerset_needs_status_patch(
+            &set,
+            Some(&healthy),
+            true,
+            IngressPorts::new(None, None)
+        ));
+
+        // Cert deleted → outcome unhealthy, same generation. Must require a patch.
+        let mut broken = GatewayListenerStatus::default();
+        let mut bad = ListenerInfo::default();
+        bad.readiness = ListenerReadiness::InvalidCertificateRef {
+            message: "secret missing".to_string(),
+        };
+        bad.port = 8443;
+        broken.listeners.insert(
+            ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), "web"),
+            bad,
+        );
+        assert!(
+            listenerset_needs_status_patch(
+                &set,
+                Some(&broken),
+                true,
+                IngressPorts::new(None, None)
+            ),
+            "a TLS-health flip without a generation bump must re-patch status"
+        );
+    }
+}

@@ -1,0 +1,51 @@
+---
+# GEP-1713: a Gateway that opts into same-namespace ListenerSets, a ListenerSet
+# adding a listener on a NEW port (8001, not served by the Gateway itself), and
+# an HTTPRoute attaching to that ListenerSet listener via parentRef.kind.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  allowedListeners:
+    namespaces:
+      from: Same
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: team-ls
+spec:
+  parentRef:
+    name: coxswain-test
+  listeners:
+    - name: ls-http
+      port: 8001
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ls-route
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: ListenerSet
+      name: team-ls
+  hostnames:
+    - "ls.${TESTNS}.local"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000

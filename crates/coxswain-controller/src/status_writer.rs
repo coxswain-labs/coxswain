@@ -12,7 +12,7 @@
 //! per-role arg validation — defense in depth for the read-only-proxy
 //! invariant.
 
-use crate::{Controller, ControllerConfig, StatusHealthChannels};
+use crate::{Controller, ControllerConfig, StatusChannels};
 use coxswain_core::DedicatedRoutingRegistry;
 use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::health::HealthRegistry;
@@ -20,7 +20,7 @@ use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames};
 use coxswain_reflector::{
     ControllerReconciler, IngressEvent, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
-    SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedRouteHealth,
+    SharedBackendTlsPolicyStatus, SharedGatewayListenerStatus, SharedRouteStatus,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -113,7 +113,7 @@ pub fn spawn_status_writer(
     let tls_store = coxswain_core::tls::SharedPortTlsStore::new();
     let client_cert_store = SharedClientCertStore::new();
     let listener_hostnames = SharedListenerHostnames::new();
-    let gateway_listener_health = SharedGatewayListenerHealth::new();
+    let gateway_listener_status = SharedGatewayListenerStatus::new();
     let cluster_summary = SharedClusterSummary::new();
     let leader = Arc::new(AtomicBool::new(false));
     let owned_gateways = OwnedGateways::new();
@@ -130,6 +130,8 @@ pub fn spawn_status_writer(
             "ingress_class_parameters",
             "gateway",
             "gateway_class",
+            "listener_set",
+            "namespace",
             "endpoint_slice",
             "reference_grant",
             "secret",
@@ -153,7 +155,7 @@ pub fn spawn_status_writer(
         tls: tls_store,
         client_certs: client_cert_store,
         listener_hostnames,
-        listener_health: gateway_listener_health.clone(),
+        listener_status: gateway_listener_status.clone(),
         cluster_summary,
         dedicated_registry,
         passthrough_routes: passthrough_routes.clone(),
@@ -172,7 +174,7 @@ pub fn spawn_status_writer(
             tls: outputs.tls.clone(),
             client_certs: outputs.client_certs.clone(),
             listener_hostnames: outputs.listener_hostnames.clone(),
-            listener_health: outputs.listener_health.clone(),
+            listener_status: outputs.listener_status.clone(),
             cluster_summary: outputs.cluster_summary.clone(),
             dedicated_registry: outputs.dedicated_registry.clone(),
             passthrough_routes: passthrough_routes.clone(),
@@ -197,10 +199,10 @@ pub fn spawn_status_writer(
         },
     );
 
-    let route_health: SharedRouteHealth = reconciler.route_health();
-    let grpc_route_health: SharedRouteHealth = reconciler.grpc_route_health();
-    let tls_route_health: SharedRouteHealth = reconciler.tls_route_health();
-    let policy_health: SharedBackendTlsPolicyHealth = reconciler.policy_health();
+    let route_status: SharedRouteStatus = reconciler.route_status();
+    let grpc_route_status: SharedRouteStatus = reconciler.grpc_route_status();
+    let tls_route_status: SharedRouteStatus = reconciler.tls_route_status();
+    let policy_status: SharedBackendTlsPolicyStatus = reconciler.policy_status();
 
     // Take the shared-informer subscriptions the reconciler created (it must
     // hand them over since we set `status_subscriptions = true` above).
@@ -212,12 +214,12 @@ pub fn spawn_status_writer(
         health,
         leader.clone(),
         owned_gateways,
-        StatusHealthChannels {
-            tls: gateway_listener_health,
-            route: route_health,
-            grpc_route: grpc_route_health,
-            tls_route: tls_route_health,
-            policy: policy_health,
+        StatusChannels {
+            tls: gateway_listener_status,
+            route: route_status,
+            grpc_route: grpc_route_status,
+            tls_route: tls_route_status,
+            policy: policy_status,
         },
         subscriptions,
         controller,

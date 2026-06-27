@@ -13,9 +13,11 @@
 //! gate, and backend-ref validation) runs once here.
 
 use crate::gateway_api::hostnames::hostnames_intersect;
-use crate::gw_types::v::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom};
+use crate::gw_types::v::gateways::{
+    Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
+};
 use crate::keys::RouteParentKey;
-use crate::tls::{RouteHealthMap, RouteParentHealth};
+use crate::status::{RouteNamespaceSet, RouteParentStatus, RouteStatusMap};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use k8s_openapi::api::core::v1::Service;
@@ -26,7 +28,10 @@ use std::sync::Arc;
 struct ListenerEntry {
     name: String,
     hostname: String,
-    allows_all: bool,
+    /// Resolved `allowedRoutes.namespaces` policy (sourced from the merge's
+    /// EffectiveListener so `Selector` is materialised), used to decide whether a
+    /// route's namespace is permitted to attach for the `Accepted` computation.
+    route_namespaces: RouteNamespaceSet,
     port: u16,
     /// Pre-computed: does this listener allow the route kind being evaluated?
     ///
@@ -43,6 +48,10 @@ pub(crate) struct ParentRefView<'a> {
     pub name: &'a str,
     pub section_name: Option<&'a str>,
     pub port: Option<u16>,
+    /// `parentRef.group`; `None`/empty → the Gateway API group (GEP-1713).
+    pub group: Option<&'a str>,
+    /// `parentRef.kind`; `Some("ListenerSet")` targets a ListenerSet, else a Gateway.
+    pub kind: Option<&'a str>,
 }
 
 /// Normalized view of one backend ref to validate for `ResolvedRefs`, with the
@@ -84,15 +93,36 @@ pub(crate) trait RouteLike {
 /// (explicit) and the implicit protocol→kind default mapping.  Routes attached to
 /// listeners that do not allow the kind receive `Accepted=False,
 /// Reason=NotAllowedByListeners`.
+/// Fallback `allowedRoutes.namespaces` resolution for [`compute_route_health`] when
+/// the merge produced no EffectiveListener for a Gateway listener (test/defensive;
+/// production always has one). Resolves the simple `All`/`Same` cases from the spec;
+/// `Selector` can't be materialised without the Namespace store, so it denies.
+fn spec_route_namespaces_fallback(l: &GatewayListeners, gw_ns: &str) -> RouteNamespaceSet {
+    match l
+        .allowed_routes
+        .as_ref()
+        .and_then(|ar| ar.namespaces.as_ref())
+        .and_then(|ns| ns.from.as_ref())
+    {
+        Some(GatewayListenersAllowedRoutesNamespacesFrom::All) => RouteNamespaceSet::All,
+        Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector) => {
+            RouteNamespaceSet::Only(std::collections::BTreeSet::new())
+        }
+        // `Same` or absent (the Gateway API default).
+        _ => RouteNamespaceSet::Only(std::iter::once(gw_ns.to_string()).collect()),
+    }
+}
+
 pub(super) fn compute_route_health<R: RouteLike>(
     routes: &[Arc<R>],
     gateways: &[Arc<Gateway>],
     owned_gateways: &HashSet<ObjectKey>,
+    effective: &HashMap<ObjectKey, super::super::reconciler::listener_merge::EffectiveGateway>,
     backend_grants: &HashSet<ReferenceGrantKey>,
     service_store: &reflector::Store<Service>,
     route_kind: &str,
-) -> RouteHealthMap {
-    let gw_listeners: HashMap<ObjectKey, Vec<ListenerEntry>> = gateways
+) -> RouteStatusMap {
+    let mut gw_listeners: HashMap<ObjectKey, Vec<ListenerEntry>> = gateways
         .iter()
         .filter_map(|gw| {
             let ns = gw.metadata.namespace.as_deref()?.to_string();
@@ -101,18 +131,28 @@ pub(super) fn compute_route_health<R: RouteLike>(
             if !owned_gateways.contains(&key) {
                 return None;
             }
+            // Resolved `allowedRoutes.namespaces` comes from the merge's
+            // EffectiveListener (where `Selector` is materialised against the
+            // Namespace store) — keyed by the Gateway source + listener name.
+            let eff_listeners = effective.get(&key).map(|e| e.listeners.as_slice());
             let listeners = gw
                 .spec
                 .listeners
                 .iter()
                 .map(|l| {
-                    let allows_all = l
-                        .allowed_routes
-                        .as_ref()
-                        .and_then(|ar| ar.namespaces.as_ref())
-                        .and_then(|ns| ns.from.as_ref())
-                        .map(|f| !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same))
-                        .unwrap_or(false);
+                    let route_namespaces = eff_listeners
+                        .and_then(|ls| {
+                            ls.iter().find(|el| {
+                                matches!(el.source, crate::status::ListenerSource::Gateway)
+                                    && el.name == l.name
+                            })
+                        })
+                        .map(|el| el.route_namespaces.clone())
+                        // Production always has an EffectiveListener; this fallback
+                        // (no merge entry) derives the simple `All`/`Same` cases from
+                        // the spec. `Selector` can't be materialised without the
+                        // Namespace store here, so it denies — unreachable in prod.
+                        .unwrap_or_else(|| spec_route_namespaces_fallback(l, &ns));
                     // Explicit allowedRoutes.kinds takes precedence; fall back to the
                     // implicit protocol→kind mapping when none are declared.
                     let allows_kind = l
@@ -125,7 +165,7 @@ pub(super) fn compute_route_health<R: RouteLike>(
                     ListenerEntry {
                         name: l.name.clone(),
                         hostname: l.hostname.as_deref().unwrap_or("").to_string(),
-                        allows_all,
+                        route_namespaces,
                         port: l.port as u16,
                         allows_kind,
                     }
@@ -135,7 +175,44 @@ pub(super) fn compute_route_health<R: RouteLike>(
         })
         .collect();
 
-    let mut map = RouteHealthMap::new();
+    // GEP-1713: a route may target a ListenerSet directly (`parentRef.kind:
+    // ListenerSet`). Add each ListenerSet's listeners under the ListenerSet's own
+    // key (mirroring the routing-key provenance) so an LS parentRef resolves to its
+    // listeners, and record those keys as valid parents.
+    let mut ls_keys: HashSet<ObjectKey> = HashSet::new();
+    for eff in effective.values() {
+        for l in &eff.listeners {
+            let crate::status::ListenerSource::ListenerSet(ls_key) = &l.source else {
+                continue;
+            };
+            // Record the LS key as a valid parent and ensure it has an entry list
+            // (possibly empty) so `compute_accepted` evaluates against its listeners
+            // rather than hitting the absent-key "lenient accept" fallback.
+            ls_keys.insert(ls_key.clone());
+            let entries = gw_listeners.entry(ls_key.clone()).or_default();
+            // A listener that lost a port-compatibility conflict is not programmed
+            // (the routing builders skip it), so it must not contribute an Accepted
+            // parent either — otherwise a route would advertise Accepted while
+            // black-holing. Keep the key present but omit the conflicted listener.
+            if l.conflict.is_conflicted() {
+                continue;
+            }
+            let allows_kind = if l.allowed_route_kinds.is_empty() {
+                implicit_allows_kind(&l.protocol, route_kind)
+            } else {
+                l.allowed_route_kinds.iter().any(|(_, k)| k == route_kind)
+            };
+            entries.push(ListenerEntry {
+                name: l.name.clone(),
+                hostname: l.hostname.clone().unwrap_or_default(),
+                route_namespaces: l.route_namespaces.clone(),
+                port: l.port as u16,
+                allows_kind,
+            });
+        }
+    }
+
+    let mut map = RouteStatusMap::new();
 
     for route in routes {
         let route: &R = route.as_ref();
@@ -148,7 +225,10 @@ pub(super) fn compute_route_health<R: RouteLike>(
             let gw_name = pr.name;
             let gw_key = ObjectKey::new(gw_ns, gw_name);
 
-            if !owned_gateways.contains(&gw_key) {
+            // The parentRef target is valid when it is an owned Gateway or a
+            // ListenerSet attached to one (GEP-1713). For a `kind: ListenerSet`
+            // parentRef, `gw_key` is the ListenerSet's key.
+            if !owned_gateways.contains(&gw_key) && !ls_keys.contains(&gw_key) {
                 continue;
             }
 
@@ -156,7 +236,14 @@ pub(super) fn compute_route_health<R: RouteLike>(
             let health_key =
                 RouteParentKey::new(route_ns, route_name, gw_ns, gw_name, section.clone());
 
-            if gw_ns != route_ns {
+            // A route is blocked (NotAllowedByListeners) when every relevant listener's
+            // resolved `allowedRoutes.namespaces` excludes the route's namespace. This
+            // runs for SAME-namespace routes too: with `Selector` materialised to a
+            // concrete set, a listener may legitimately exclude its own namespace, and
+            // reporting Accepted=True there would advertise a route the data plane
+            // black-holes. `Same`/`All` admit the same namespace, so legitimate same-ns
+            // routes are unaffected.
+            {
                 let blocked = gw_listeners.get(&gw_key).is_some_and(|ls| {
                     let relevant: Vec<_> = if section.is_empty() {
                         ls.iter().filter(|l| l.allows_kind).collect()
@@ -165,12 +252,15 @@ pub(super) fn compute_route_health<R: RouteLike>(
                             .filter(|l| l.name.as_str() == section && l.allows_kind)
                             .collect()
                     };
-                    !relevant.is_empty() && relevant.iter().all(|l| !l.allows_all)
+                    !relevant.is_empty()
+                        && relevant
+                            .iter()
+                            .all(|l| !l.route_namespaces.allows(route_ns))
                 });
                 if blocked {
                     map.insert(
                         health_key,
-                        RouteParentHealth {
+                        RouteParentStatus {
                             accepted: false,
                             accepted_reason: "NotAllowedByListeners",
                             resolved_refs: true,
@@ -197,7 +287,7 @@ pub(super) fn compute_route_health<R: RouteLike>(
 
             map.insert(
                 health_key,
-                RouteParentHealth {
+                RouteParentStatus {
                     resolved_refs,
                     resolved_refs_reason,
                     accepted,

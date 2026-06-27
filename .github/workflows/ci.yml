@@ -52,6 +52,7 @@ jobs:
               - 'Cargo.toml'
               - 'scripts/check-module-headers.sh'
               - 'scripts/check-no-anyhow-libs.sh'
+              - 'scripts/check-reflector-health-checks.sh'
               - 'scripts/check-workspace-lints-decl.sh'
               - 'scripts/check-no-per-site-allow.sh'
               - 'scripts/check-must-use-builders.sh'
@@ -178,6 +179,8 @@ jobs:
         run: bash scripts/check-module-headers.sh
       - name: No anyhow in library crates
         run: bash scripts/check-no-anyhow-libs.sh
+      - name: Reflector readiness checks are registered on the controller subsystem
+        run: bash scripts/check-reflector-health-checks.sh
       - name: Every crate Cargo.toml declares [lints] workspace = true
         run: bash scripts/check-workspace-lints-decl.sh
       - name: No per-site #[allow] / #[expect] in non-test source

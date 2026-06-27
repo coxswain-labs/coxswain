@@ -18,12 +18,13 @@
 use async_trait::async_trait;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
+use coxswain_reflector::gw_types::ListenerSet;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::gw_types::{BackendTlsPolicy, GrpcRoute, HttpRoute, TlsRoute};
-use coxswain_reflector::tls::{
-    GatewayListenerHealth, SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth,
-    SharedRouteHealth,
+use coxswain_reflector::status::{
+    GatewayListenerStatus, SharedBackendTlsPolicyStatus, SharedGatewayListenerStatus,
+    SharedRouteStatus,
 };
 use coxswain_reflector::{IngressEvent, StatusSubscriptions};
 use futures::StreamExt;
@@ -57,6 +58,8 @@ mod grpc_route_events;
 mod ingress_event_recorder;
 mod ingress_events;
 mod ingress_status;
+mod listenerset_events;
+mod listenerset_status;
 mod route_events;
 mod tls_route_events;
 
@@ -83,7 +86,7 @@ const ERROR_REQUEUE: Duration = Duration::from_secs(15);
 /// because the `controller` subsystem has not finished its first data-plane
 /// rebuild. Replaces the old `STATUS_RESYNC_INTERVAL` backstop: instead of a
 /// process-wide periodic scan, only the Gateways actually waiting on readiness
-/// requeue, and only until the subsystem flips ready (then the `listener_health`
+/// requeue, and only until the subsystem flips ready (then the `listener_status`
 /// re-drive and normal events take over).
 const DEFERRED_PROGRAMMED_REQUEUE: Duration = Duration::from_secs(2);
 
@@ -92,22 +95,22 @@ const DEFERRED_PROGRAMMED_REQUEUE: Duration = Duration::from_secs(2);
 /// affected work-queue when a TLS-resolution / route-health / policy-health
 /// outcome flips).
 // intentionally open: field-literal constructed in crate::spawn_status_writer.
-pub struct StatusHealthChannels {
+pub struct StatusChannels {
     /// Per-listener Gateway TLS health.
-    pub tls: SharedGatewayListenerHealth,
+    pub tls: SharedGatewayListenerStatus,
     /// Per-HTTPRoute Accepted/ResolvedRefs health.
-    pub route: SharedRouteHealth,
+    pub route: SharedRouteStatus,
     /// Per-GRPCRoute Accepted/ResolvedRefs health.
     ///
     /// Separate from `route` — `RouteParentKey` is kind-neutral and an HTTPRoute + GRPCRoute
     /// with the same name/ns/gateway would collide in one map.
-    pub grpc_route: SharedRouteHealth,
+    pub grpc_route: SharedRouteStatus,
     /// Per-TLSRoute Accepted/ResolvedRefs health.
     ///
     /// Separate from `route` and `grpc_route` for the same kind-neutrality reason.
-    pub tls_route: SharedRouteHealth,
+    pub tls_route: SharedRouteStatus,
     /// Per-`BackendTLSPolicy` ancestor health.
-    pub policy: SharedBackendTlsPolicyHealth,
+    pub policy: SharedBackendTlsPolicyStatus,
 }
 
 /// Leader-elected status writer. Registered as a Pingora `BackgroundService`
@@ -118,7 +121,7 @@ pub struct Controller {
     health: HealthRegistry,
     leader: Arc<AtomicBool>,
     owned_gateways: OwnedGateways,
-    channels: StatusHealthChannels,
+    channels: StatusChannels,
     config: ControllerConfig,
     /// Shared-informer subscriptions handed over by the reflector; taken once
     /// in `start` (the handles are independent broadcast subscribers and must
@@ -136,7 +139,7 @@ impl Controller {
         health: HealthRegistry,
         leader: Arc<AtomicBool>,
         owned_gateways: OwnedGateways,
-        channels: StatusHealthChannels,
+        channels: StatusChannels,
         subscriptions: StatusSubscriptions,
         config: ControllerConfig,
         ingress_event_rx: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
@@ -192,6 +195,7 @@ impl Controller {
             ingress_classes,
             policies,
             tls_routes,
+            listener_sets,
             ..
         } = subs;
 
@@ -207,7 +211,9 @@ impl Controller {
         let ingresses_reader = ingresses.reader();
         let ingress_classes_reader = ingress_classes.reader();
         let policies_reader = policies.reader();
+        let listener_sets_reader = listener_sets.reader();
         let gateway_classes_for_gateways = gateway_classes.clone();
+        let gateways_for_listener_sets = gateways.clone();
 
         let ctx = Arc::new(ReconcileContext {
             client,
@@ -219,13 +225,14 @@ impl Controller {
             controller_namespace: self.config.pod_namespace.clone(),
             ingress_ports: self.config.ingress_ports,
             owned_gateways: self.owned_gateways.clone(),
-            listener_health: self.channels.tls.clone(),
-            route_health: self.channels.route.clone(),
-            grpc_route_health: self.channels.grpc_route.clone(),
-            tls_route_health: self.channels.tls_route.clone(),
-            policy_health: self.channels.policy.clone(),
+            listener_status: self.channels.tls.clone(),
+            route_status: self.channels.route.clone(),
+            grpc_route_status: self.channels.grpc_route.clone(),
+            tls_route_status: self.channels.tls_route.clone(),
+            policy_status: self.channels.policy.clone(),
             gateway_classes: gateway_classes_reader,
             ingress_classes: ingress_classes_reader,
+            gateways: gateways_reader.clone(),
         });
 
         // One re-drive channel per work-queue. Each is fed by the relevant
@@ -240,6 +247,7 @@ impl Controller {
         let (tls_route_tx, tls_route_rx) = mpsc::unbounded::<()>();
         let (ing_tx, ing_rx) = mpsc::unbounded::<()>();
         let (pol_tx, pol_rx) = mpsc::unbounded::<()>();
+        let (ls_tx, ls_rx) = mpsc::unbounded::<()>();
         let leadership_txs = vec![
             gw_tx.clone(),
             gc_tx.clone(),
@@ -248,6 +256,7 @@ impl Controller {
             tls_route_tx.clone(),
             ing_tx.clone(),
             pol_tx.clone(),
+            ls_tx.clone(),
         ];
 
         let mut tasks = JoinSet::new();
@@ -284,6 +293,9 @@ impl Controller {
             tls_route_tx,
         );
         spawn_health_forwarder(&mut tasks, self.channels.policy.subscribe(), pol_tx);
+        // GEP-1713: a TLS-health flip changes which listeners (incl. ListenerSet
+        // ones) are programmed, so re-drive ListenerSet status off the same channel.
+        spawn_health_forwarder(&mut tasks, self.channels.tls.subscribe(), ls_tx);
 
         // --- Gateway: primary Gateway, secondary GatewayClass → Gateways in
         // that class, re-driven on TLS-health flips + promotion. ---
@@ -305,6 +317,34 @@ impl Controller {
             .reconcile_all_on(gw_rx)
             .run(reconcile_gateway, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, gateway_ctrl, "Gateway");
+
+        // --- ListenerSet: primary ListenerSet, secondary Gateway → its
+        // ListenerSets (a parent allowedListeners/listeners edit re-drives the
+        // attached ListenerSets), re-driven on TLS-health flips + promotion
+        // (GEP-1713). ---
+        let listenerset_ctrl =
+            KubeController::for_shared_stream(listener_sets, listener_sets_reader.clone())
+                .watches_shared_stream(gateways_for_listener_sets, {
+                    let ls_store = listener_sets_reader.clone();
+                    move |gw: Arc<Gateway>| -> Vec<ObjectRef<ListenerSet>> {
+                        let gw_ns = gw.meta().namespace.clone().unwrap_or_default();
+                        let gw_name = gw.meta().name.clone().unwrap_or_default();
+                        ls_store
+                            .state()
+                            .into_iter()
+                            .filter(|ls| {
+                                let ls_ns = ls.meta().namespace.clone().unwrap_or_default();
+                                let pr = &ls.spec.parent_ref;
+                                let pns = pr.namespace.clone().unwrap_or(ls_ns);
+                                pns == gw_ns && pr.name == gw_name
+                            })
+                            .map(|ls| ObjectRef::from_obj(ls.as_ref()))
+                            .collect()
+                    }
+                })
+                .reconcile_all_on(ls_rx)
+                .run(reconcile_listenerset, error_policy, ctx.clone());
+        spawn_controller_stream(&mut tasks, listenerset_ctrl, "ListenerSet");
 
         // --- GatewayClass: primary only; re-driven on promotion. ---
         let gateway_class_ctrl =
@@ -494,15 +534,18 @@ struct ReconcileContext {
     controller_namespace: String,
     ingress_ports: coxswain_reflector::ingress::IngressPorts,
     owned_gateways: OwnedGateways,
-    listener_health: SharedGatewayListenerHealth,
-    route_health: SharedRouteHealth,
-    grpc_route_health: SharedRouteHealth,
-    tls_route_health: SharedRouteHealth,
-    policy_health: SharedBackendTlsPolicyHealth,
+    listener_status: SharedGatewayListenerStatus,
+    route_status: SharedRouteStatus,
+    grpc_route_status: SharedRouteStatus,
+    tls_route_status: SharedRouteStatus,
+    policy_status: SharedBackendTlsPolicyStatus,
     /// Synced GatewayClass store, read for Gateway ownership at reconcile time.
     gateway_classes: kube::runtime::reflector::Store<GatewayClass>,
     /// Synced IngressClass store, read for Ingress ownership at reconcile time.
     ingress_classes: kube::runtime::reflector::Store<IngressClass>,
+    /// Synced Gateway store, read by the ListenerSet reconciler to resolve a
+    /// ListenerSet's parent Gateway and its ownership/mode (GEP-1713).
+    gateways: kube::runtime::reflector::Store<Gateway>,
 }
 
 /// Error policy shared by every work-queue. The status reconcilers are
@@ -570,7 +613,7 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         gw.metadata.name.clone().unwrap_or_default(),
     );
     if ctx.health.is_subsystem_ready("controller") {
-        let health_map = ctx.listener_health.load();
+        let health_map = ctx.listener_status.load();
         let health = health_map.get(&key).cloned().unwrap_or_default();
         if gateway_needs_status_patch(gw, &health, status_addr) {
             gateway_events::patch_gateway_status(
@@ -591,12 +634,12 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         // Before the data plane is synced, write the minimal Accepted-oriented
         // status and requeue to revisit `Programmed` once ready. This requeue
         // replaces the old process-wide resync backstop.
-        let empty_health = GatewayListenerHealth::default();
-        if gateway_needs_status_patch(gw, &empty_health, status_addr) {
+        let empty_status = GatewayListenerStatus::default();
+        if gateway_needs_status_patch(gw, &empty_status, status_addr) {
             gateway_events::patch_gateway_status(
                 &ctx.client,
                 gw,
-                &empty_health,
+                &empty_status,
                 status_addr,
                 ctx.ingress_ports,
             )
@@ -733,6 +776,74 @@ fn service_vip_address(svc: &k8s_openapi::api::core::v1::Service) -> Option<Stat
     }
 }
 
+async fn reconcile_listenerset(
+    ls: Arc<ListenerSet>,
+    ctx: Arc<ReconcileContext>,
+) -> Result<Action, Infallible> {
+    let started = std::time::Instant::now();
+    let res: Result<Action, Infallible> = Ok(reconcile_listenerset_inner(&ls, &ctx).await);
+    crate::metrics::observe_reconcile("status_writer", started, &res);
+    res
+}
+
+/// GEP-1713: write `ListenerSet.status`. Resolves the ListenerSet's parent Gateway
+/// and writes status only when this controller manages it (owned class) and it
+/// runs on the shared pool — a dedicated-mode Gateway (and its ListenerSets) is
+/// the operator's to write, mirroring [`reconcile_gateway_inner`]'s split.
+async fn reconcile_listenerset_inner(ls: &ListenerSet, ctx: &ReconcileContext) -> Action {
+    if !ctx.leader.load(Ordering::Acquire) {
+        return Action::requeue(NON_LEADER_REQUEUE);
+    }
+
+    let ls_ns = ls.metadata.namespace.as_deref().unwrap_or("default");
+    let parent = &ls.spec.parent_ref;
+    let parent_ns = parent.namespace.as_deref().unwrap_or(ls_ns);
+    let parent_key = ObjectKey::new(parent_ns, parent.name.as_str());
+
+    // Resolve the parent Gateway from the synced store (O(1)). Absent → not yet
+    // observed; the Gateway → ListenerSet secondary watch re-drives this once it lands.
+    let parent_ref = ObjectRef::<Gateway>::new(parent.name.as_str()).within(parent_ns);
+    let Some(parent_gw) = ctx.gateways.get(&parent_ref) else {
+        return Action::await_change();
+    };
+
+    let classes = ctx.gateway_classes.state();
+    let (owned, owned_dedicated) = classify_gateway_classes(&classes, &ctx.controller_name);
+    if !owned.contains(parent_gw.spec.gateway_class_name.as_str()) {
+        return Action::await_change();
+    }
+    if is_dedicated_mode(&parent_gw, &owned_dedicated) {
+        return Action::await_change();
+    }
+
+    if !ctx.health.is_subsystem_ready("controller") {
+        // Defer until the data plane has computed listener status; requeue rather
+        // than await_change so a fresh ListenerSet doesn't stall until an
+        // unrelated edit (mirrors the Gateway path's deferred-Programmed requeue).
+        return Action::requeue(DEFERRED_PROGRAMMED_REQUEUE);
+    }
+
+    let health_map = ctx.listener_status.load();
+    let parent_health = health_map.get(&parent_key);
+    let accepted = listenerset_status::listenerset_accepted(ls, parent_health);
+    if listenerset_status::listenerset_needs_status_patch(
+        ls,
+        parent_health,
+        accepted,
+        ctx.ingress_ports,
+    ) {
+        listenerset_events::patch_listenerset_status(
+            &ctx.client,
+            ls,
+            parent_health,
+            accepted,
+            ctx.ingress_ports,
+        )
+        .await;
+    }
+    Action::await_change()
+}
+
 async fn reconcile_gateway_class(
     gc: Arc<GatewayClass>,
     ctx: Arc<ReconcileContext>,
@@ -783,7 +894,7 @@ async fn reconcile_route_inner(route: &HttpRoute, ctx: &ReconcileContext) -> Act
     // call on both spec-change events and route-health re-drives without
     // churning `lastTransitionTime`.
     let owned = ctx.owned_gateways.load();
-    let rh = ctx.route_health.load();
+    let rh = ctx.route_status.load();
     route_events::mark_http_route_programmed(&ctx.client, route, &ctx.controller_name, &owned, &rh)
         .await;
     Action::await_change()
@@ -804,7 +915,7 @@ async fn reconcile_grpc_route_inner(route: &GrpcRoute, ctx: &ReconcileContext) -
         return Action::requeue(NON_LEADER_REQUEUE);
     }
     let owned = ctx.owned_gateways.load();
-    let rh = ctx.grpc_route_health.load();
+    let rh = ctx.grpc_route_status.load();
     grpc_route_events::mark_grpc_route_programmed(
         &ctx.client,
         route,
@@ -831,7 +942,7 @@ async fn reconcile_tls_route_inner(route: &TlsRoute, ctx: &ReconcileContext) -> 
         return Action::requeue(NON_LEADER_REQUEUE);
     }
     let owned = ctx.owned_gateways.load();
-    let rh = ctx.tls_route_health.load();
+    let rh = ctx.tls_route_status.load();
     tls_route_events::mark_tls_route_programmed(
         &ctx.client,
         route,
@@ -886,7 +997,7 @@ async fn reconcile_policy_inner(policy: &BackendTlsPolicy, ctx: &ReconcileContex
     if !ctx.leader.load(Ordering::Acquire) {
         return Action::requeue(NON_LEADER_REQUEUE);
     }
-    let ph = ctx.policy_health.load();
+    let ph = ctx.policy_status.load();
     backend_tls_events::patch_backend_tls_policy_status(
         &ctx.client,
         policy,

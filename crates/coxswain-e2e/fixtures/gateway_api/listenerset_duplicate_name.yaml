@@ -1,0 +1,36 @@
+---
+# GEP-1713: a Gateway listener and a ListenerSet listener share the name "web" on
+# DIFFERENT ports. Duplicate names across the Gateway and its ListenerSets are
+# legal; both must be programmed, each attributed to its own resource — this
+# proves the provenance-keyed listener health (a name-keyed model would collide).
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  allowedListeners:
+    namespaces:
+      from: Same
+  listeners:
+    - name: web
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: team-ls
+spec:
+  parentRef:
+    name: coxswain-test
+  listeners:
+    - name: web
+      port: 8001
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

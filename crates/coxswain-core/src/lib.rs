@@ -3,7 +3,7 @@
 //! Provides the routing table, atomic [`Shared<T>`] snapshot wrapper, TLS cert
 //! store, Kubernetes ownership helpers, `ReferenceGrant` evaluation logic, the
 //! fleet discovery snapshot, the [`RoutingSource`] trait, the
-//! [`SharedGatewayListenerHealth`] shared cell, and the
+//! [`SharedGatewayListenerStatus`] shared cell, and the
 //! [`DedicatedRoutingRegistry`] per-Gateway snapshot registry — all used by
 //! both the controller and proxy crates.
 
@@ -13,7 +13,7 @@ pub mod dedicated_registry;
 pub mod fleet;
 pub mod health;
 pub mod identity;
-pub mod listener_health;
+pub mod listener_status;
 pub mod naming;
 pub mod node_registry;
 pub mod ownership;
@@ -30,7 +30,7 @@ pub use identity::{
     AuthnError, CsrPem, IssuedSvid, IssuerError, SpiffeId, SpiffeIdError, SvidIssuer,
     TokenAuthenticator,
 };
-pub use listener_health::SharedGatewayListenerHealth;
+pub use listener_status::SharedGatewayListenerStatus;
 pub use node_registry::{NodeEntry, NodeRegistry, NodeScope, SharedNodeRegistry};
 pub use shared::Shared;
 pub use source::RoutingSource;

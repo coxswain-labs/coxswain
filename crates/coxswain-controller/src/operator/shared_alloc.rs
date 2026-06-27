@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::EffectiveListenerPort;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::port_alloc::{ListenerKey, read_vip_internal_ports};
 use k8s_openapi::api::core::v1::Service;
@@ -26,8 +27,14 @@ use k8s_openapi::api::core::v1::Service;
 /// Enumerate the `(Gateway, listenerPort)` pairs needing an internal port across
 /// every owned shared-mode Gateway. `is_owned_shared` filters to Gateways this
 /// controller owns that are NOT in dedicated mode.
+///
+/// `effective_ports` (GEP-1713, #93) maps each owned Gateway to its effective
+/// listener ports — its own plus those merged from attached ListenerSets — so a
+/// ListenerSet listener on a new port is allocated an internal port too. Falls
+/// back to `gw.spec.listeners` when the merge produced no entry (defensive).
 pub(super) fn desired_listener_keys(
     gateways: &[Arc<Gateway>],
+    effective_ports: &HashMap<ObjectKey, Vec<EffectiveListenerPort>>,
     is_owned_shared: impl Fn(&Gateway) -> bool,
 ) -> Vec<ListenerKey> {
     let mut out = Vec::new();
@@ -42,9 +49,18 @@ pub(super) fn desired_listener_keys(
             continue;
         };
         let key = ObjectKey::new(ns, name);
-        for listener in &gw.spec.listeners {
-            if let Ok(port) = u16::try_from(listener.port) {
-                out.push((key.clone(), port));
+        match effective_ports.get(&key) {
+            Some(ports) => {
+                for p in ports {
+                    out.push((key.clone(), p.port));
+                }
+            }
+            None => {
+                for listener in &gw.spec.listeners {
+                    if let Ok(port) = u16::try_from(listener.port) {
+                        out.push((key.clone(), port));
+                    }
+                }
             }
         }
     }
@@ -137,10 +153,42 @@ mod tests {
     #[test]
     fn desired_keys_cover_only_owned_shared_gateways() {
         let gateways = vec![gw("default", "a", &[80, 443]), gw("default", "b", &[443])];
-        let desired = desired_listener_keys(&gateways, |g| g.metadata.name.as_deref() == Some("a"));
+        // Empty effective map → fall back to spec.listeners.
+        let desired = desired_listener_keys(&gateways, &HashMap::new(), |g| {
+            g.metadata.name.as_deref() == Some("a")
+        });
         assert_eq!(desired.len(), 2, "only gateway a's two listeners");
         assert!(desired.contains(&(ObjectKey::new("default", "a"), 80)));
         assert!(desired.contains(&(ObjectKey::new("default", "a"), 443)));
+    }
+
+    #[test]
+    fn desired_keys_include_effective_listener_set_ports() {
+        // Effective map adds a ListenerSet port (8080) the Gateway spec lacks
+        // (GEP-1713) → the allocator must reserve an internal port for it.
+        let gateways = vec![gw("default", "a", &[80])];
+        let mut effective = HashMap::new();
+        effective.insert(
+            ObjectKey::new("default", "a"),
+            vec![
+                EffectiveListenerPort {
+                    name: "web".to_string(),
+                    port: 80,
+                    protocol: "HTTP".to_string(),
+                },
+                EffectiveListenerPort {
+                    name: "ls".to_string(),
+                    port: 8080,
+                    protocol: "HTTP".to_string(),
+                },
+            ],
+        );
+        let desired = desired_listener_keys(&gateways, &effective, |_| true);
+        assert!(desired.contains(&(ObjectKey::new("default", "a"), 80)));
+        assert!(
+            desired.contains(&(ObjectKey::new("default", "a"), 8080)),
+            "the attached ListenerSet's new port is allocated an internal port"
+        );
     }
 
     #[test]
@@ -177,7 +225,7 @@ mod tests {
     fn round_trip_existing_keeps_allocation_stable() {
         // Provision → read back the Service ports → re-allocate → identical map.
         let gateways = vec![gw("default", "a", &[80, 443])];
-        let desired = desired_listener_keys(&gateways, |_| true);
+        let desired = desired_listener_keys(&gateways, &HashMap::new(), |_| true);
         let first = allocate_internal_ports(&desired, &HashMap::new(), DEFAULT_INTERNAL_PORT_RANGE);
         let a = ObjectKey::new("default", "a");
         let mappings: Vec<(i32, i32)> = first

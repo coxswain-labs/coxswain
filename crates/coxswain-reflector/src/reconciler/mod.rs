@@ -20,6 +20,7 @@
 //! orchestration.
 
 pub mod controller;
+pub(crate) mod listener_merge;
 pub mod proxy;
 mod route_builder;
 

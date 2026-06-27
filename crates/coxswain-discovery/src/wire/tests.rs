@@ -9,7 +9,7 @@ pub use std::sync::Arc;
 pub use std::net::SocketAddr;
 pub use std::num::NonZeroU32;
 
-pub use coxswain_core::listener_health::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome};
+pub use coxswain_core::listener_status::{GatewayListenerStatus, ListenerInfo, ListenerReadiness};
 pub use coxswain_core::ownership::ObjectKey;
 pub use coxswain_core::routing::{
     BackendGroup, CompressionConfig, FilterAction, GatewayRoutingTableBuilder,

@@ -18,7 +18,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Endpoint, Server};
 
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
-use coxswain_core::listener_health::{GatewayListenerHealth, SharedGatewayListenerHealth};
+use coxswain_core::listener_status::{GatewayListenerStatus, SharedGatewayListenerStatus};
 use coxswain_core::node_registry::SharedNodeRegistry;
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{
@@ -57,7 +57,7 @@ fn source_with_two_gateways() -> SnapshotSource {
         gateway: SharedGatewayRoutingTable::new(),
         tls: SharedPortTlsStore::new(),
         client_certs: SharedClientCertStore::new(),
-        listener_health: SharedGatewayListenerHealth::new(),
+        listener_status: SharedGatewayListenerStatus::new(),
         dedicated: DedicatedRoutingRegistry::new(),
         passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
     };
@@ -68,27 +68,27 @@ fn source_with_two_gateways() -> SnapshotSource {
     let mut map = HashMap::new();
 
     let mut lh_a = HashMap::new();
-    lh_a.insert(gw_a_key.clone(), GatewayListenerHealth::default());
+    lh_a.insert(gw_a_key.clone(), GatewayListenerStatus::default());
     map.insert(
         gw_a_key,
         Arc::new(DedicatedRoutingSnapshot {
             gateway: Arc::new(GatewayRoutingTable::default()),
             tls: Arc::new(PortTlsStore::default()),
             client_certs: Arc::new(ClientCertStore::default()),
-            listener_health: lh_a,
+            listener_status: lh_a,
             expected_proxy_sa: "gw-a-coxswain".to_owned(),
         }),
     );
 
     let mut lh_other = HashMap::new();
-    lh_other.insert(other_key.clone(), GatewayListenerHealth::default());
+    lh_other.insert(other_key.clone(), GatewayListenerStatus::default());
     map.insert(
         other_key,
         Arc::new(DedicatedRoutingSnapshot {
             gateway: Arc::new(GatewayRoutingTable::default()),
             tls: Arc::new(PortTlsStore::default()),
             client_certs: Arc::new(ClientCertStore::default()),
-            listener_health: lh_other,
+            listener_status: lh_other,
             expected_proxy_sa: "other-gw-coxswain".to_owned(),
         }),
     );

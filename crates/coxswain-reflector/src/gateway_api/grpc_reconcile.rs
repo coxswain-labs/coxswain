@@ -18,7 +18,7 @@ use crate::gw_types::{
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
-use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
+use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, FilterAction, GatewayRoutingTableBuilder, HeaderMod,
@@ -83,13 +83,14 @@ pub(super) fn reconcile(
         .unwrap_or(&[])
         .iter()
         .any(|p| {
-            parent_ref_owned(
+            super::bindings::parent_ref_attaches(
                 p.group.as_deref(),
                 p.kind.as_deref(),
                 p.namespace.as_deref(),
                 &p.name,
                 route_ns,
                 owned_gateways,
+                listener_info,
             )
         });
 

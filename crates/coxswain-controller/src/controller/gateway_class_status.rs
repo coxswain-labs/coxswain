@@ -45,6 +45,7 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteRequestTimeout",
     "HTTPRouteResponseHeaderModification",
     "HTTPRouteSchemeRedirect",
+    "ListenerSet",
     "ReferenceGrant",
     "TLSRoute",
 ];

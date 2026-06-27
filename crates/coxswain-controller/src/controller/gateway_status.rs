@@ -5,8 +5,11 @@ use super::config::StatusAddress;
 use crate::status_common::{
     OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
 };
+use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::v::gateways::{Gateway, GatewayStatusListeners};
-use coxswain_reflector::tls::{GatewayListenerHealth, ListenerTlsOutcome};
+use coxswain_reflector::status::{
+    GatewayListenerStatus, ListenerReadiness, ListenerSource, ListenerStatusKey,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Returns true when the Gateway's current status does not yet reflect the
@@ -14,7 +17,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 /// watch-feedback loops.
 pub(super) fn gateway_needs_status_patch(
     gw: &Gateway,
-    health: &GatewayListenerHealth,
+    health: &GatewayListenerStatus,
     addr: Option<&StatusAddress>,
 ) -> bool {
     if !accepted_is_true(gw) {
@@ -70,6 +73,28 @@ pub(super) fn gateway_needs_status_patch(
             }
         }
     }
+    // GEP-1713: detect drift in attachedListenerSets count.
+    let desired_attached_ls: i32 = {
+        let mut ls_valid: std::collections::HashMap<&ObjectKey, bool> =
+            std::collections::HashMap::new();
+        for (k, info) in &health.listeners {
+            if let ListenerSource::ListenerSet(ls_key) = &k.source {
+                let has_valid = ls_valid.entry(ls_key).or_insert(false);
+                if !info.conflict.is_conflicted() {
+                    *has_valid = true;
+                }
+            }
+        }
+        ls_valid.values().filter(|&&v| v).count() as i32
+    };
+    let current_attached_ls = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.attached_listener_sets)
+        .unwrap_or(0);
+    if current_attached_ls != desired_attached_ls {
+        return true;
+    }
     let current_listener_count = gw
         .status
         .as_ref()
@@ -90,10 +115,12 @@ pub(super) fn gateway_needs_status_patch(
     // desired-health comparison or a frontend-only failure would never patch.
     for listener in &gw.spec.listeners {
         let (has_invalid_kinds, _) = listener_route_kind_info(listener);
-        let info = health.listeners.get(&listener.name);
+        let info = health
+            .listeners
+            .get(&ListenerStatusKey::gateway(&listener.name));
         let frontend_impacts = info.is_some_and(|i| i.frontend_outcome.is_failed());
         let desired_healthy = !has_invalid_kinds
-            && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true)
+            && info.map(|i| i.readiness.is_healthy()).unwrap_or(true)
             && !frontend_impacts;
         let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);
         let current_resolved = current_listener
@@ -108,8 +135,7 @@ pub(super) fn gateway_needs_status_patch(
         // Accepted logic (frontend CA failure or an Unsupported outcome → False) so
         // the transition True→False is detected and patched, not left stuck.
         let desired_accepted_false = frontend_impacts
-            || info
-                .is_some_and(|i| matches!(i.tls_outcome, ListenerTlsOutcome::Unsupported { .. }));
+            || info.is_some_and(|i| matches!(i.readiness, ListenerReadiness::Unsupported { .. }));
         let current_accepted_false = current_listener
             .and_then(|sl| sl.conditions.iter().find(|c| c.type_ == "Accepted"))
             .is_some_and(|c| c.status != "True");
@@ -194,7 +220,7 @@ fn gateway_address_up_to_date(gw: &Gateway, addr: Option<&StatusAddress>) -> boo
 
 pub(super) fn build_gateway_status_patch(
     gw: &Gateway,
-    health: &GatewayListenerHealth,
+    health: &GatewayListenerStatus,
     generation: i64,
     now: &Time,
     addr: Option<&StatusAddress>,
@@ -261,15 +287,34 @@ pub(super) fn build_gateway_status_patch(
         .listeners
         .iter()
         .map(|l| {
-            let info = health.listeners.get(&l.name);
+            let info = health.listeners.get(&ListenerStatusKey::gateway(&l.name));
             build_listener_status(l, info, ingress_ports, generation, now)
         })
         .collect();
+
+    // GEP-1713: count accepted ListenerSets. A LS is "accepted" iff it has
+    // at least one non-conflicted listener in the merged health map. A LS where
+    // every listener lost a conflict (all programmed=False) reports
+    // Accepted=False/ListenersNotValid and must NOT be counted.
+    let attached_listener_sets: i32 = {
+        let mut ls_valid: std::collections::HashMap<&ObjectKey, bool> =
+            std::collections::HashMap::new();
+        for (k, info) in &health.listeners {
+            if let ListenerSource::ListenerSet(ls_key) = &k.source {
+                let has_valid = ls_valid.entry(ls_key).or_insert(false);
+                if !info.conflict.is_conflicted() {
+                    *has_valid = true;
+                }
+            }
+        }
+        ls_valid.values().filter(|&&v| v).count() as i32
+    };
 
     let mut patch = serde_json::json!({
         "status": {
             "conditions": conditions,
             "listeners": listener_statuses,
+            "attachedListenerSets": attached_listener_sets,
         }
     });
     if let Some(addr) = addr {
@@ -292,7 +337,7 @@ mod tests {
         Gateway, GatewaySpec, GatewayStatus, GatewayStatusListeners,
     };
     use coxswain_reflector::ingress::IngressPorts;
-    use coxswain_reflector::tls::{BackendClientCertOutcome, GatewayListenerHealth};
+    use coxswain_reflector::status::{BackendClientCertOutcome, GatewayListenerStatus};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
     fn condition(type_: &str, observed_gen: i64) -> Condition {
@@ -353,8 +398,8 @@ mod tests {
         }
     }
 
-    fn default_health() -> GatewayListenerHealth {
-        GatewayListenerHealth::default()
+    fn default_status() -> GatewayListenerStatus {
+        GatewayListenerStatus::default()
     }
 
     #[test]
@@ -363,19 +408,19 @@ mod tests {
             status: None,
             ..Default::default()
         };
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
     fn needs_patch_when_accepted_missing() {
         let gw = gateway(1, Some(vec![condition("Programmed", 1)]), None);
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
     fn needs_patch_when_programmed_missing() {
         let gw = gateway(1, Some(vec![condition("Accepted", 1)]), None);
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
@@ -386,7 +431,7 @@ mod tests {
             Some(vec![condition("Accepted", 0), condition("Programmed", 0)]),
             Some(vec![listener_status("http", 2)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
@@ -397,7 +442,7 @@ mod tests {
             Some(vec![condition("Accepted", 2), condition("Programmed", 2)]),
             Some(vec![listener_status("http", 0)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
@@ -408,7 +453,7 @@ mod tests {
             Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
             Some(vec![]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
@@ -418,7 +463,7 @@ mod tests {
             Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
             Some(vec![listener_status("http", 1)]),
         );
-        assert!(!gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(!gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     // ── #472 per-Gateway VIP address divergence ──────────────────────────────
@@ -437,7 +482,7 @@ mod tests {
         let addr = StatusAddress::Ip(std::net::IpAddr::from([10, 0, 0, 5]));
         assert!(gateway_needs_status_patch(
             &gw,
-            &default_health(),
+            &default_status(),
             Some(&addr)
         ));
     }
@@ -460,7 +505,7 @@ mod tests {
         let addr = StatusAddress::Ip(std::net::IpAddr::from([10, 0, 0, 5]));
         assert!(!gateway_needs_status_patch(
             &gw,
-            &default_health(),
+            &default_status(),
             Some(&addr)
         ));
     }
@@ -471,8 +516,8 @@ mod tests {
         Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH)
     }
 
-    fn health_with_backend(outcome: BackendClientCertOutcome) -> GatewayListenerHealth {
-        let mut h = GatewayListenerHealth::default();
+    fn health_with_backend(outcome: BackendClientCertOutcome) -> GatewayListenerStatus {
+        let mut h = GatewayListenerStatus::default();
         h.backend_client_cert = Some(outcome);
         h
     }
@@ -544,7 +589,7 @@ mod tests {
             ]),
             Some(vec![listener_status("http", 1)]),
         );
-        assert!(gateway_needs_status_patch(&gw, &default_health(), None));
+        assert!(gateway_needs_status_patch(&gw, &default_status(), None));
     }
 
     #[test]
@@ -594,7 +639,7 @@ mod tests {
         let gw = gateway(1, None, None);
         let patch = build_gateway_status_patch(
             &gw,
-            &default_health(),
+            &default_status(),
             1,
             &epoch(),
             None,

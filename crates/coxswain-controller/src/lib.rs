@@ -18,7 +18,7 @@ mod status_writer;
 
 pub use controller::{
     Controller, ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress,
-    StatusHealthChannels,
+    StatusChannels,
 };
 pub use operator::{Operator, OperatorConfig};
 pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writer};
@@ -28,8 +28,8 @@ pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writ
 // without forcing every site to learn the new crate name.
 pub use coxswain_core::cluster::SharedClusterSummary;
 pub use coxswain_reflector::{
-    GatewayListenerHealth, IngressPorts, ListenerInfo, ListenerTlsOutcome,
-    SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth, SharedRouteHealth,
+    GatewayListenerStatus, IngressPorts, ListenerInfo, ListenerReadiness,
+    SharedBackendTlsPolicyStatus, SharedGatewayListenerStatus, SharedRouteStatus,
     gateway_api_crds_present,
 };
 

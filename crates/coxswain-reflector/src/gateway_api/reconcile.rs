@@ -7,7 +7,6 @@ use super::bindings::{ListenerBinding, compute_listener_bindings};
 use crate::endpoints;
 use crate::gw_types::{
     HttpRoute,
-    v::gateways::{Gateway, GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersTlsMode},
     v::httproutes::{
         HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesFiltersType,
         HttpRouteRulesMatchesPathType,
@@ -15,7 +14,11 @@ use crate::gw_types::{
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
-use crate::tls::{GatewayListenerHealth, ListenerInfo, ListenerTlsOutcome, load_tls_cert};
+use crate::reconciler::listener_merge::EffectiveListener;
+use crate::status::{
+    GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerSource, ListenerStatusKey,
+};
+use crate::tls::load_tls_cert;
 use coxswain_core::crd::{PathRewriteRegex, RateLimit};
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
@@ -100,7 +103,8 @@ impl GatewayApiReconciler {
         let route_id = format!("{route_ns}/{route_name}");
         let created_at = metadata_created_at(&route.metadata);
 
-        // Only reconcile routes attached to at least one Gateway we manage.
+        // Only reconcile routes attached to at least one listener we serve — an
+        // owned Gateway, or a ListenerSet attached to one (GEP-1713).
         let has_owned_parent = route
             .spec
             .parent_refs
@@ -108,13 +112,14 @@ impl GatewayApiReconciler {
             .unwrap_or(&[])
             .iter()
             .any(|p| {
-                parent_ref_owned(
+                super::bindings::parent_ref_attaches(
                     p.group.as_deref(),
                     p.kind.as_deref(),
                     p.namespace.as_deref(),
                     &p.name,
                     route_ns,
                     owned_gateways,
+                    listener_info,
                 )
             });
 
@@ -717,18 +722,36 @@ impl GatewayApiReconciler {
     /// terminate certs key under that port in the per-port store and the proxy's
     /// per-port `SniCertSelector` finds them. Listeners absent from the map
     /// (dedicated mode, Ingress) key under their spec port (internal == spec).
-    pub fn reconcile_tls(
-        gateway: &Gateway,
+    /// Walks a Gateway's **effective** listeners (its own plus those merged from
+    /// attached ListenerSets, GEP-1713), resolves TLS certificates for HTTPS
+    /// listeners, and registers them in `builder`. Returns a per-listener health
+    /// map keyed by [`ListenerStatusKey`] so the controller can attribute each
+    /// listener's status to the resource that declared it.
+    ///
+    /// `gw_name` is the parent Gateway's name (for log context); each listener's
+    /// `certificateRefs` resolve in its OWN `owning_namespace` — the Gateway's
+    /// namespace for a Gateway listener, the ListenerSet's for a ListenerSet
+    /// listener. A `conflicted` listener (lost a port-compatibility conflict) is
+    /// recorded with `conflicted=true` but installs no cert and is not programmed.
+    ///
+    /// Only `protocol: HTTPS` with `tls.mode: Terminate` (the default) installs a
+    /// cert here. `protocol: TLS, tls.mode: Passthrough` listeners are handled by
+    /// `build_passthrough_routes`; `TLS/Terminate` is `Unsupported`. Non-HTTPS
+    /// listeners are `NotApplicable`. Cross-namespace `certificateRefs` require a
+    /// matching entry in `cert_grants`. `internal_ports` maps `listenerPort →
+    /// internalPort` (#472) for shared-mode VIP isolation.
+    pub(crate) fn reconcile_tls(
+        gw_name: &str,
+        listeners: &[EffectiveListener],
         secrets: &reflector::Store<Secret>,
         cert_grants: &HashSet<ReferenceGrantKey>,
+        ls_cert_grants: &HashSet<ReferenceGrantKey>,
         builder: &mut PortTlsStoreBuilder,
         internal_ports: &HashMap<u16, u16>,
-    ) -> GatewayListenerHealth {
-        let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
-        let gw_name = gateway.metadata.name.as_deref().unwrap_or("unknown");
-        let mut listeners = BTreeMap::new();
+    ) -> GatewayListenerStatus {
+        let mut map = BTreeMap::new();
 
-        for listener in &gateway.spec.listeners {
+        for listener in listeners {
             let listener_port = listener.port as u16;
             let internal_port = internal_ports.get(&listener_port).copied().unwrap_or(0);
             // Bind port the proxy accepts this listener on (= internal port when
@@ -738,79 +761,80 @@ impl GatewayApiReconciler {
             } else {
                 listener_port
             };
-            let tls_outcome = if listener.protocol == "TLS"
-                && listener
-                    .tls
-                    .as_ref()
-                    .and_then(|t| t.mode.as_ref())
-                    .is_some_and(|m| matches!(m, GatewayListenersTlsMode::Passthrough))
+            let readiness = if listener.conflict.is_conflicted() {
+                // Lost a port-compatibility conflict to a higher-precedence
+                // listener (GEP-1713) — not programmed, no cert installed.
+                ListenerReadiness::NotApplicable
+            } else if listener.protocol == "TLS"
+                && listener.tls.as_ref().is_some_and(|t| t.passthrough)
             {
                 // TLS passthrough: proxy peeks SNI and forwards raw stream; no cert needed.
-                ListenerTlsOutcome::TlsPassthrough
+                ListenerReadiness::TlsPassthrough
             } else if listener.protocol == "TLS" {
                 // TLS/Terminate is not supported — only tls.mode: Passthrough is (GEP-2643).
-                ListenerTlsOutcome::Unsupported {
+                ListenerReadiness::Unsupported {
                     message: "TLS listeners require tls.mode: Passthrough; \
                               tls.mode: Terminate is not supported by this implementation"
                         .to_string(),
                 }
             } else if listener.protocol != "HTTPS" {
-                ListenerTlsOutcome::NotApplicable
+                ListenerReadiness::NotApplicable
             } else {
-                resolve_listener_tls(
-                    gw_ns,
-                    gw_name,
-                    listener,
-                    secrets,
-                    cert_grants,
-                    builder,
-                    bind_port,
-                )
+                // A ListenerSet listener's cross-namespace cert is permitted by a
+                // `from.kind: ListenerSet` grant; a Gateway listener's by
+                // `from.kind: Gateway` (GEP-1713). Pick the matching grant set.
+                let grants = match &listener.source {
+                    ListenerSource::Gateway => cert_grants,
+                    ListenerSource::ListenerSet(_) => ls_cert_grants,
+                };
+                resolve_listener_tls(gw_name, listener, secrets, grants, builder, bind_port)
             };
-            let hostname = listener.hostname.as_deref().unwrap_or("").to_string();
-            let allows_all_namespaces = listener
-                .allowed_routes
-                .as_ref()
-                .and_then(|ar| ar.namespaces.as_ref())
-                .and_then(|ns| ns.from.as_ref())
-                .map(|f| !matches!(f, GatewayListenersAllowedRoutesNamespacesFrom::Same))
-                .unwrap_or(false); // default per spec is Same
             let mut li = ListenerInfo::default();
-            li.tls_outcome = tls_outcome;
+            li.readiness = readiness;
             li.attached_routes = 0;
-            li.hostname = hostname;
-            li.allows_all_namespaces = allows_all_namespaces;
+            li.hostname = listener.hostname.clone().unwrap_or_default();
+            li.route_namespaces = listener.route_namespaces.clone();
             li.port = listener_port;
             li.internal_port = internal_port;
-            listeners.insert(listener.name.clone(), li);
+            li.conflict = listener.conflict.clone();
+            map.insert(
+                ListenerStatusKey {
+                    source: listener.source.clone(),
+                    name: listener.name.clone(),
+                },
+                li,
+            );
         }
 
-        let mut glh = GatewayListenerHealth::default();
-        glh.listeners = listeners;
+        let mut glh = GatewayListenerStatus::default();
+        glh.listeners = map;
         glh
     }
 }
 
 fn resolve_listener_tls(
-    gw_ns: &str,
     gw_name: &str,
-    listener: &crate::gw_types::v::gateways::GatewayListeners,
+    listener: &EffectiveListener,
     secrets: &reflector::Store<Secret>,
     cert_grants: &HashSet<ReferenceGrantKey>,
     builder: &mut PortTlsStoreBuilder,
     bind_port: u16,
-) -> ListenerTlsOutcome {
+) -> ListenerReadiness {
+    // ListenerSet listeners resolve their certificateRefs in the ListenerSet's own
+    // namespace (GEP-1713), not the parent Gateway's; Gateway listeners use the
+    // Gateway namespace. Both are carried as `owning_namespace`.
+    let owning_ns = listener.owning_namespace.as_str();
     let tls = match &listener.tls {
         Some(t) => t,
         None => {
-            return ListenerTlsOutcome::InvalidCertificateRef {
+            return ListenerReadiness::InvalidCertificateRef {
                 message: "HTTPS listener has no tls configuration".to_string(),
             };
         }
     };
 
-    if matches!(tls.mode, Some(GatewayListenersTlsMode::Passthrough)) {
-        return ListenerTlsOutcome::Invalid {
+    if tls.passthrough {
+        return ListenerReadiness::Invalid {
             message: "tls.mode: Passthrough is not supported; use Terminate".to_string(),
         };
     }
@@ -822,9 +846,9 @@ fn resolve_listener_tls(
         .filter(|h| !h.is_empty())
         .unwrap_or("");
 
-    let refs = tls.certificate_refs.as_deref().unwrap_or(&[]);
+    let refs = tls.certificate_refs.as_slice();
     if refs.is_empty() {
-        return ListenerTlsOutcome::InvalidCertificateRef {
+        return ListenerReadiness::InvalidCertificateRef {
             message: "tls.certificateRefs is empty".to_string(),
         };
     }
@@ -848,13 +872,18 @@ fn resolve_listener_tls(
             continue;
         }
 
-        let ref_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
+        let ref_ns = cert_ref.namespace.as_deref().unwrap_or(owning_ns);
 
-        if ref_ns != gw_ns
-            && !reference_grants::backend_ref_allowed(gw_ns, ref_ns, &cert_ref.name, cert_grants)
+        if ref_ns != owning_ns
+            && !reference_grants::backend_ref_allowed(
+                owning_ns,
+                ref_ns,
+                &cert_ref.name,
+                cert_grants,
+            )
         {
             tracing::warn!(
-                gateway = %format!("{gw_ns}/{gw_name}"),
+                gateway = %format!("{gw_name}"),
                 listener = %listener.name,
                 secret = %format!("{ref_ns}/{}", cert_ref.name),
                 "Cross-namespace certificateRef denied — no matching ReferenceGrant"
@@ -872,7 +901,7 @@ fn resolve_listener_tls(
                 builder.add_cert(bind_port, hostname, Arc::new(cert));
                 resolved_count += 1;
                 tracing::debug!(
-                    gateway = %format!("{gw_ns}/{gw_name}"),
+                    gateway = %format!("{gw_name}"),
                     listener = %listener.name,
                     secret = %format!("{ref_ns}/{}", cert_ref.name),
                     hostname,
@@ -881,7 +910,7 @@ fn resolve_listener_tls(
             }
             Err(e) => {
                 tracing::warn!(
-                    gateway = %format!("{gw_ns}/{gw_name}"),
+                    gateway = %format!("{gw_name}"),
                     listener = %listener.name,
                     secret = %format!("{ref_ns}/{}", cert_ref.name),
                     error = %e,
@@ -900,9 +929,9 @@ fn resolve_listener_tls(
         let messages: Vec<String> = failures.into_iter().map(|(m, _)| m).collect();
         let message = messages.join("; ");
         if any_ref_not_permitted {
-            return ListenerTlsOutcome::RefNotPermitted { message };
+            return ListenerReadiness::RefNotPermitted { message };
         }
-        return ListenerTlsOutcome::InvalidCertificateRef { message };
+        return ListenerReadiness::InvalidCertificateRef { message };
     }
 
     if !failures.is_empty() {
@@ -916,21 +945,104 @@ fn resolve_listener_tls(
             messages.join("; ")
         );
         tracing::warn!(
-            gateway = %format!("{gw_ns}/{gw_name}"),
+            gateway = %format!("{gw_name}"),
             listener = %listener.name,
             ?message,
             "Listener is serving only a subset of its certificateRefs (ResolvedPartial)"
         );
-        return ListenerTlsOutcome::ResolvedPartial { message };
+        return ListenerReadiness::ResolvedPartial { message };
     }
 
-    ListenerTlsOutcome::Resolved
+    ListenerReadiness::Resolved
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gateway_api::tests::*;
+
+    // ── GEP-1713: ListenerSet cross-namespace cert grant selection ────────────
+
+    /// A ListenerSet HTTPS listener whose `certificateRefs` points at a Secret in
+    /// another namespace must be permitted by a `from.kind: ListenerSet` grant —
+    /// NOT a `from.kind: Gateway` grant (which only permits Gateway listeners).
+    #[test]
+    fn listener_set_cross_namespace_cert_requires_listenerset_from_grant() {
+        use crate::reconciler::listener_merge::{
+            EffectiveCertRef, EffectiveListener, EffectiveTls,
+        };
+        use crate::status::ConflictReason;
+        use coxswain_core::ownership::ObjectKey;
+        use coxswain_core::reference_grants::ReferenceGrantKey;
+
+        let ls_key = ObjectKey::new("team-a", "ls");
+        let listener = EffectiveListener {
+            source: ListenerSource::ListenerSet(ls_key.clone()),
+            owning_namespace: "team-a".to_string(),
+            name: "https".to_string(),
+            port: 8443,
+            protocol: "HTTPS".to_string(),
+            hostname: None,
+            tls: Some(EffectiveTls {
+                passthrough: false,
+                certificate_refs: vec![EffectiveCertRef {
+                    group: None,
+                    kind: None,
+                    name: "cert".to_string(),
+                    namespace: Some("certs".to_string()),
+                }],
+            }),
+            route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
+            allowed_route_kinds: vec![],
+            conflict: ConflictReason::None,
+        };
+
+        let mut secrets_w = reflector::store::Writer::<Secret>::default();
+        secrets_w.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
+        let secrets = secrets_w.as_reader();
+
+        // The grant lives in the WRONG set (Gateway-from). The cross-namespace
+        // check must ignore it → RefNotPermitted.
+        let grant: HashSet<ReferenceGrantKey> =
+            std::iter::once(ReferenceGrantKey::specific("team-a", "certs", "cert")).collect();
+        let empty = HashSet::new();
+        let mut builder = PortTlsStoreBuilder::new();
+        let health = GatewayApiReconciler::reconcile_tls(
+            "gw",
+            std::slice::from_ref(&listener),
+            &secrets,
+            &grant, // cert_grants (Gateway-from) — must NOT permit an LS listener
+            &empty, // ls_cert_grants empty
+            &mut builder,
+            &HashMap::new(),
+        );
+        let outcome =
+            &health.listeners[&ListenerStatusKey::listener_set(ls_key.clone(), "https")].readiness;
+        assert!(
+            matches!(outcome, ListenerReadiness::RefNotPermitted { .. }),
+            "a Gateway-from grant must not permit a ListenerSet listener's cross-ns cert, got {outcome:?}"
+        );
+
+        // Same grant placed in the ListenerSet-from set → the cross-namespace
+        // check passes; the (absent) Secret then fails as InvalidCertificateRef,
+        // proving the grant was accepted (no longer RefNotPermitted).
+        let mut builder2 = PortTlsStoreBuilder::new();
+        let health2 = GatewayApiReconciler::reconcile_tls(
+            "gw",
+            std::slice::from_ref(&listener),
+            &secrets,
+            &empty, // cert_grants empty
+            &grant, // ls_cert_grants (ListenerSet-from) — permits the LS listener
+            &mut builder2,
+            &HashMap::new(),
+        );
+        let outcome2 =
+            &health2.listeners[&ListenerStatusKey::listener_set(ls_key, "https")].readiness;
+        assert!(
+            !matches!(outcome2, ListenerReadiness::RefNotPermitted { .. }),
+            "a ListenerSet-from grant must permit the cross-ns cert ref, got {outcome2:?}"
+        );
+    }
 
     // ── Original path-matching tests (unchanged behaviour) ────────────────────
 

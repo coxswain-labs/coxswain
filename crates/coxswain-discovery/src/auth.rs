@@ -675,7 +675,7 @@ pub(crate) mod tests {
                             gateway_routing: None,
                             tls_store: None,
                             client_cert_store: None,
-                            listener_health: None,
+                            listener_status: None,
                             tls_passthrough: None,
                         })),
                     };

@@ -54,7 +54,7 @@ use coxswain_reflector::gw_types::v::gateways::{
     Gateway, GatewayStatusAddresses, GatewayStatusListeners,
 };
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::tls::GatewayListenerHealth;
+use coxswain_reflector::status::{GatewayListenerStatus, ListenerStatusKey};
 use k8s_openapi::api::core::v1::{Node, Service, ServiceSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::Client;
@@ -153,10 +153,10 @@ pub(crate) struct DedicatedGatewayStatusInputs<'a> {
     /// the Service is `NodePort`-typed; pass `&[]` on other paths.
     pub(crate) nodes: &'a [Arc<Node>],
     /// Listener-health snapshot for this Gateway — read from
-    /// `SharedGatewayListenerHealth.load().get(&object_key)`. Pass
-    /// `&GatewayListenerHealth::default()` when the reflector hasn't yet
+    /// `SharedGatewayListenerStatus.load().get(&object_key)`. Pass
+    /// `&GatewayListenerStatus::default()` when the reflector hasn't yet
     /// computed an entry; per-listener helpers degrade to healthy defaults.
-    pub(crate) listener_health: &'a GatewayListenerHealth,
+    pub(crate) listener_status: &'a GatewayListenerStatus,
     /// Ports reserved for the Ingress data plane via the controller's CLI.
     /// Forwarded to `build_listener_status` to detect `PortUnavailable`.
     pub(crate) ingress_ports: IngressPorts,
@@ -241,7 +241,10 @@ pub(crate) fn build_dedicated_gateway_status_patch(
         .listeners
         .iter()
         .map(|l| {
-            let info = inputs.listener_health.listeners.get(&l.name);
+            let info = inputs
+                .listener_status
+                .listeners
+                .get(&ListenerStatusKey::gateway(&l.name));
             build_listener_status(l, info, inputs.ingress_ports, generation, now)
         })
         .collect();
@@ -324,9 +327,12 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
     }
     for listener in &inputs.gw.spec.listeners {
         let (has_invalid_kinds, _) = listener_route_kind_info(listener);
-        let info = inputs.listener_health.listeners.get(&listener.name);
+        let info = inputs
+            .listener_status
+            .listeners
+            .get(&ListenerStatusKey::gateway(&listener.name));
         let desired_healthy =
-            !has_invalid_kinds && info.map(|i| i.tls_outcome.is_healthy()).unwrap_or(true);
+            !has_invalid_kinds && info.map(|i| i.readiness.is_healthy()).unwrap_or(true);
         let current_listener = current_listeners.iter().find(|sl| sl.name == listener.name);
         let current_resolved = current_listener
             .map(|sl| {
@@ -692,7 +698,7 @@ mod tests {
         GatewayStatusListeners,
     };
     use coxswain_reflector::ingress::IngressPorts;
-    use coxswain_reflector::tls::GatewayListenerHealth;
+    use coxswain_reflector::status::GatewayListenerStatus;
     use k8s_openapi::api::core::v1::{
         LoadBalancerIngress, LoadBalancerStatus, Node, NodeAddress, NodeStatus, Service,
         ServiceSpec, ServiceStatus,
@@ -794,17 +800,17 @@ mod tests {
         })
     }
 
-    fn empty_health() -> &'static GatewayListenerHealth {
+    fn empty_status() -> &'static GatewayListenerStatus {
         use std::sync::OnceLock;
-        static H: OnceLock<GatewayListenerHealth> = OnceLock::new();
-        H.get_or_init(GatewayListenerHealth::default)
+        static H: OnceLock<GatewayListenerStatus> = OnceLock::new();
+        H.get_or_init(GatewayListenerStatus::default)
     }
 
     fn inputs<'a>(
         gw: &'a Gateway,
         service: Option<&'a Service>,
         nodes: &'a [Arc<Node>],
-        health: &'a GatewayListenerHealth,
+        health: &'a GatewayListenerStatus,
         accepted: AcceptedOutcome,
         ready_pods: usize,
     ) -> DedicatedGatewayStatusInputs<'a> {
@@ -812,7 +818,7 @@ mod tests {
             gw,
             service,
             nodes,
-            listener_health: health,
+            listener_status: health,
             ingress_ports: IngressPorts::new(None, None),
             accepted,
             ready_pod_count: ready_pods,
@@ -866,7 +872,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -889,7 +895,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -908,7 +914,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -927,7 +933,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -953,7 +959,7 @@ mod tests {
             &gw,
             Some(&svc),
             &nodes,
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -975,7 +981,7 @@ mod tests {
             &gw,
             Some(&svc),
             &nodes,
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -998,7 +1004,7 @@ mod tests {
             &gw,
             Some(&svc),
             &nodes,
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -1017,7 +1023,7 @@ mod tests {
             &gw,
             None,
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::InvalidParameters,
             0,
         );
@@ -1041,7 +1047,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             0,
         );
@@ -1061,7 +1067,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -1080,7 +1086,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -1107,7 +1113,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             2,
         );
@@ -1122,7 +1128,7 @@ mod tests {
     #[test]
     fn dedicated_proxy_ready_false_when_no_ready_pod() {
         let gw = gateway(1, vec![("http", 80)], None);
-        let inputs = inputs(&gw, None, &[], empty_health(), AcceptedOutcome::Accepted, 0);
+        let inputs = inputs(&gw, None, &[], empty_status(), AcceptedOutcome::Accepted, 0);
         let patch = build_dedicated_gateway_status_patch(&inputs, 1, &epoch());
         assert_eq!(
             condition_of(&patch, DEDICATED_PROXY_READY_CONDITION_TYPE),
@@ -1139,7 +1145,7 @@ mod tests {
             &gw,
             None,
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::InvalidParameters,
             1,
         );
@@ -1177,7 +1183,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -1243,7 +1249,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -1276,7 +1282,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -1318,7 +1324,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -1353,7 +1359,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );
@@ -1386,7 +1392,7 @@ mod tests {
             &gw,
             Some(&svc),
             &[],
-            empty_health(),
+            empty_status(),
             AcceptedOutcome::Accepted,
             1,
         );

@@ -10,24 +10,25 @@ mod grpc_reconcile;
 mod grpc_status;
 mod hostnames;
 mod reconcile;
-mod route_health;
+mod route_status;
 mod status;
 mod timeouts;
 mod tls_status;
 
 pub use backend_tls::{BackendTlsIndex, build_backend_tls_index};
 pub use bindings::ListenerBinding;
+pub(crate) use bindings::parent_listener_source;
 pub use grpc_reconcile::GrpcRouteResolution;
 pub(crate) use hostnames::hostnames_intersect;
 pub use reconcile::RouteResolution;
-pub(crate) use route_health::RouteLike;
+pub(crate) use route_status::RouteLike;
 
 #[cfg(test)]
 mod tests;
 
 use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::{GrpcRoute, HttpRoute, TlsRoute};
-use crate::tls::{BackendTlsPolicyHealthMap, RouteHealthMap};
+use crate::status::{BackendTlsPolicyStatusMap, RouteStatusMap};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::ReferenceGrantKey;
 use k8s_openapi::api::core::v1::Service;
@@ -45,32 +46,37 @@ use std::sync::Arc;
 pub struct GatewayApiReconciler;
 
 impl GatewayApiReconciler {
-    /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` health from
+    /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` status from
     /// the current snapshot of reflector stores.
-    pub fn compute_route_health(
+    pub(crate) fn compute_route_health(
         routes: &[Arc<HttpRoute>],
         gateways: &[Arc<Gateway>],
         owned_gateways: &HashSet<ObjectKey>,
+        effective: &std::collections::HashMap<
+            ObjectKey,
+            crate::reconciler::listener_merge::EffectiveGateway,
+        >,
         backend_grants: &HashSet<ReferenceGrantKey>,
         service_store: &reflector::Store<Service>,
-    ) -> RouteHealthMap {
-        route_health::compute_route_health(
+    ) -> RouteStatusMap {
+        route_status::compute_route_health(
             routes,
             gateways,
             owned_gateways,
+            effective,
             backend_grants,
             service_store,
             "HTTPRoute",
         )
     }
 
-    /// Compute per-policy health from the pre-built index and the policy reflector.
+    /// Compute per-policy status from the pre-built index and the policy reflector.
     pub fn compute_policy_health(
         index: &BackendTlsIndex,
         policies: &kube::runtime::reflector::Store<crate::gw_types::BackendTlsPolicy>,
         routes: &[Arc<HttpRoute>],
         owned_gateways: &HashSet<ObjectKey>,
-    ) -> BackendTlsPolicyHealthMap {
+    ) -> BackendTlsPolicyStatusMap {
         backend_tls::compute_policy_health(index, policies, routes, owned_gateways)
     }
 }
@@ -113,22 +119,27 @@ impl GrpcRouteReconciler {
         )
     }
 
-    /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` health for `GRPCRoute`s.
+    /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` status for `GRPCRoute`s.
     ///
-    /// Returns an [`RouteHealthMap`] keyed by [`crate::keys::RouteParentKey`] — the map
-    /// type is kind-neutral. Use a **separate** `SharedRouteHealth` instance for grpc health
-    /// to avoid `RouteParentKey` collisions with HTTPRoute health (same key shape, different kind).
-    pub fn compute_route_health(
+    /// Returns a [`RouteStatusMap`] keyed by [`crate::keys::RouteParentKey`] — the map
+    /// type is kind-neutral. Use a **separate** `SharedRouteStatus` instance for GRPCRoute status
+    /// to avoid `RouteParentKey` collisions with HTTPRoute status (same key shape, different kind).
+    pub(crate) fn compute_route_health(
         routes: &[Arc<GrpcRoute>],
         gateways: &[Arc<Gateway>],
         owned_gateways: &HashSet<ObjectKey>,
+        effective: &std::collections::HashMap<
+            ObjectKey,
+            crate::reconciler::listener_merge::EffectiveGateway,
+        >,
         backend_grants: &HashSet<ReferenceGrantKey>,
         service_store: &reflector::Store<Service>,
-    ) -> RouteHealthMap {
-        route_health::compute_route_health(
+    ) -> RouteStatusMap {
+        route_status::compute_route_health(
             routes,
             gateways,
             owned_gateways,
+            effective,
             backend_grants,
             service_store,
             "GRPCRoute",
@@ -145,23 +156,28 @@ impl GrpcRouteReconciler {
 pub struct TlsRouteReconciler;
 
 impl TlsRouteReconciler {
-    /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` health for `TLSRoute`s.
+    /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` status for `TLSRoute`s.
     ///
     /// Only `protocol: TLS` listeners are considered — routes attached to HTTP/HTTPS
     /// listeners receive `Accepted=False, NotAllowedByListeners`. Use a **separate**
-    /// [`crate::tls::SharedRouteHealth`] instance to avoid key collisions with
-    /// HTTP/GRPC route health (same key shape, different kind).
-    pub fn compute_route_health(
+    /// [`crate::status::SharedRouteStatus`] instance to avoid key collisions with
+    /// HTTP/GRPC route status (same key shape, different kind).
+    pub(crate) fn compute_route_health(
         routes: &[Arc<TlsRoute>],
         gateways: &[Arc<Gateway>],
         owned_gateways: &HashSet<ObjectKey>,
+        effective: &std::collections::HashMap<
+            ObjectKey,
+            crate::reconciler::listener_merge::EffectiveGateway,
+        >,
         backend_grants: &HashSet<ReferenceGrantKey>,
         service_store: &reflector::Store<Service>,
-    ) -> RouteHealthMap {
-        route_health::compute_route_health(
+    ) -> RouteStatusMap {
+        route_status::compute_route_health(
             routes,
             gateways,
             owned_gateways,
+            effective,
             backend_grants,
             service_store,
             "TLSRoute",

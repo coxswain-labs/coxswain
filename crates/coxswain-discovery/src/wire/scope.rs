@@ -37,7 +37,9 @@
 //! [`RoutingTable`]: coxswain_core::routing::RoutingTable
 //! [`Snapshot`]: crate::proto::v1::Snapshot
 
-use coxswain_core::listener_health::{ListenerInfo, ListenerTlsOutcome};
+use coxswain_core::listener_status::{
+    ConflictReason, ListenerInfo, ListenerReadiness, RouteNamespaceSet,
+};
 
 use crate::error::WireError;
 use crate::proto::v1 as p;
@@ -87,38 +89,52 @@ pub fn scope_from_wire(dto: &p::Scope) -> Result<Scope, WireError> {
 }
 
 pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerInfo, WireError> {
-    let tls_outcome = match p::ListenerTlsOutcome::try_from(dto.tls_outcome)
-        .unwrap_or(p::ListenerTlsOutcome::Unspecified)
+    let readiness = match p::ListenerReadiness::try_from(dto.readiness)
+        .unwrap_or(p::ListenerReadiness::Unspecified)
     {
-        p::ListenerTlsOutcome::Unspecified | p::ListenerTlsOutcome::NotApplicable => {
-            ListenerTlsOutcome::NotApplicable
+        p::ListenerReadiness::Unspecified | p::ListenerReadiness::NotApplicable => {
+            ListenerReadiness::NotApplicable
         }
-        p::ListenerTlsOutcome::Resolved => ListenerTlsOutcome::Resolved,
-        p::ListenerTlsOutcome::RefNotPermitted => ListenerTlsOutcome::RefNotPermitted {
-            message: dto.tls_message.clone(),
+        p::ListenerReadiness::Resolved => ListenerReadiness::Resolved,
+        p::ListenerReadiness::RefNotPermitted => ListenerReadiness::RefNotPermitted {
+            message: dto.detail.clone(),
         },
-        p::ListenerTlsOutcome::InvalidCertificateRef => ListenerTlsOutcome::InvalidCertificateRef {
-            message: dto.tls_message.clone(),
+        p::ListenerReadiness::InvalidCertificateRef => ListenerReadiness::InvalidCertificateRef {
+            message: dto.detail.clone(),
         },
-        p::ListenerTlsOutcome::Invalid => ListenerTlsOutcome::Invalid {
-            message: dto.tls_message.clone(),
+        p::ListenerReadiness::Invalid => ListenerReadiness::Invalid {
+            message: dto.detail.clone(),
         },
-        p::ListenerTlsOutcome::ResolvedPartial => ListenerTlsOutcome::ResolvedPartial {
-            message: dto.tls_message.clone(),
+        p::ListenerReadiness::ResolvedPartial => ListenerReadiness::ResolvedPartial {
+            message: dto.detail.clone(),
         },
-        p::ListenerTlsOutcome::TlsPassthrough => ListenerTlsOutcome::TlsPassthrough,
-        p::ListenerTlsOutcome::Unsupported => ListenerTlsOutcome::Unsupported {
-            message: dto.tls_message.clone(),
+        p::ListenerReadiness::TlsPassthrough => ListenerReadiness::TlsPassthrough,
+        p::ListenerReadiness::Unsupported => ListenerReadiness::Unsupported {
+            message: dto.detail.clone(),
         },
     };
 
     let mut li = ListenerInfo::default();
-    li.tls_outcome = tls_outcome;
+    li.readiness = readiness;
     li.attached_routes = dto.attached_routes;
     li.hostname = dto.hostname.clone();
-    li.allows_all_namespaces = dto.allows_all_namespaces;
+    // Lossy inverse of `to_wire`: a non-all listener becomes `Only({})` (deny all,
+    // fail closed). The proxy never reads this for routing, so loss is harmless;
+    // the reflector always holds the full resolved set in-process.
+    li.route_namespaces = if dto.allows_all_namespaces {
+        RouteNamespaceSet::All
+    } else {
+        RouteNamespaceSet::Only(std::collections::BTreeSet::new())
+    };
     li.port = dto.port as u16;
     li.internal_port = dto.internal_port as u16;
+    li.conflict = if dto.protocol_conflict {
+        ConflictReason::ProtocolConflict
+    } else if dto.conflicted {
+        ConflictReason::HostnameConflict
+    } else {
+        ConflictReason::None
+    };
     Ok(li)
 }
 

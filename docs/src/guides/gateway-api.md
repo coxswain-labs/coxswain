@@ -1,6 +1,6 @@
 # Gateway API guide
 
-Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) standard channel. It supports `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, and `TLSRoute` resources.
+Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) standard channel. It supports `GatewayClass`, `Gateway`, `ListenerSet`, `HTTPRoute`, `GRPCRoute`, and `TLSRoute` resources.
 
 ## Supported resources
 
@@ -8,6 +8,7 @@ Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io
 |----------|-------------|---------|
 | `GatewayClass` | `gateway.networking.k8s.io/v1` | Full |
 | `Gateway` | `gateway.networking.k8s.io/v1` | HTTP, HTTPS, and TLS passthrough listeners |
+| `ListenerSet` | `gateway.networking.k8s.io/v1` | Attach listeners to a Gateway across namespaces — see the [ListenerSet guide](listener-sets.md) |
 | `HTTPRoute` | `gateway.networking.k8s.io/v1` | Path, header, method, and query matching; weighted traffic split |
 | `GRPCRoute` | `gateway.networking.k8s.io/v1` | Service and method matching; cleartext h2c backends |
 | `TLSRoute` | `gateway.networking.k8s.io/v1alpha2` | SNI-keyed L4 passthrough; no TLS termination at proxy |

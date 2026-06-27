@@ -33,6 +33,13 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
+  # Read Namespaces to evaluate ListenerSet cross-namespace attachment — GEP-1713
+  # (#93). The parent Gateway's `allowedListeners.namespaces.from: Selector` gate
+  # matches against Namespace labels; the data-plane reflector keeps a Namespace
+  # store for it. No write verbs.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
   # `configmaps` carries write verbs (in addition to BackendTLSPolicy CA reads)
   # because the trust-bundle publisher (#423) server-side-applies the
   # `coxswain-discovery-trust` ConfigMap so proxies mount the public CA roots
@@ -66,9 +73,13 @@ rules:
   - apiGroups: ["coxswain-labs.dev"]
     resources: ["ratelimits", "pathrewriteregexes"]
     verbs: ["get", "list", "watch"]
+  # `listenersets` (GEP-1713, #93): the reflector reads them to merge their
+  # listeners into the parent Gateway's effective set; the leader writes
+  # `listenersets/status` (below) with Accepted/Programmed/Conflicted. Standard
+  # channel — `gateway.networking.k8s.io/v1`.
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
-      ["gatewayclasses", "httproutes", "grpcroutes", "tlsroutes", "referencegrants", "backendtlspolicies"]
+      ["gatewayclasses", "httproutes", "grpcroutes", "tlsroutes", "referencegrants", "backendtlspolicies", "listenersets"]
     verbs: ["get", "list", "watch"]
   # `gateways` has `patch` / `update` on the main resource (in addition to the
   # /status subresource) so the controller can manage a finalizer for
@@ -81,7 +92,7 @@ rules:
     verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources:
-      ["gatewayclasses/status", "gateways/status", "httproutes/status", "grpcroutes/status", "tlsroutes/status", "backendtlspolicies/status"]
+      ["gatewayclasses/status", "gateways/status", "httproutes/status", "grpcroutes/status", "tlsroutes/status", "backendtlspolicies/status", "listenersets/status"]
     verbs: ["patch", "update"]
   # Read CoxswainGatewayParameters so the provisioning operator (#207) can
   # resolve `parametersRef`s from Gateway and GatewayClass. No write verbs:
