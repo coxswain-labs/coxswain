@@ -32,7 +32,10 @@
 use crate::config::AccessLogPathMode;
 use crate::ctx::{CONN_INFO, MirrorDispatch, ProxyCtx, ResolvedRoute};
 use crate::edge::tls::ConnTlsInfo;
-use crate::edge::upstream_ca::{BackendClientCertCache, UpstreamCaCache, apply_upstream_tls};
+use crate::edge::upstream_ca::{
+    BackendClientCertCache, SanCheckHookCache, UpstreamCaCache, UpstreamSanMismatch,
+    apply_upstream_tls,
+};
 use crate::filters::TrafficFilter;
 use crate::filters::cors::try_cors_preflight;
 use crate::filters::redirect::{extract_host, try_redirect};
@@ -676,6 +679,7 @@ pub(crate) fn request_body_filter(
 pub(crate) async fn upstream_peer(
     ca_cache: &UpstreamCaCache,
     backend_client_cert_cache: &BackendClientCertCache,
+    san_hook_cache: &SanCheckHookCache,
     circuit_breakers: &crate::policy::circuit_breaker::CircuitBreakerRegistry,
     ctx: &mut ProxyCtx,
 ) -> Result<Box<HttpPeer>> {
@@ -757,7 +761,13 @@ pub(crate) async fn upstream_peer(
     peer.options.verify_cert = is_tls;
     peer.options.verify_hostname = is_tls;
     if let Some(btls) = btls_opt {
-        apply_upstream_tls(&mut peer, btls, ca_cache, backend_client_cert_cache)?;
+        apply_upstream_tls(
+            &mut peer,
+            btls,
+            ca_cache,
+            backend_client_cert_cache,
+            san_hook_cache,
+        )?;
     }
     if protocol.is_h2() {
         peer.options.set_http_version(2, 2);
@@ -935,18 +945,51 @@ pub(crate) async fn upstream_request_filter(
     Ok(())
 }
 
-/// Pingora `connected_to_upstream` body: record whether the connection to the
-/// upstream was freshly established or reused from the keepalive pool.
+/// Pingora `connected_to_upstream` body: enforce the GEP-1897 backend SAN check
+/// and record keepalive state metrics.
 ///
-/// Increments [`crate::metrics::upstream_connections_total`] with
-/// `state="reused"` or `state="new"` — the only labels that make this metric
-/// meaningful for keepalive observability. No allocation: the label values are
-/// `'static` string literals.
-pub(crate) fn connected_to_upstream(reused: bool) {
+/// **SAN mismatch rejection.** When `subjectAltNames` were configured, the
+/// post-handshake [`HandshakeCompleteHook`] in `apply_upstream_tls` records an
+/// [`UpstreamSanMismatch`] marker in the connection's `SslDigest.extension` on
+/// failure.  This function reads that marker and returns a 502 before any request
+/// bytes are sent upstream — the connection is returned as non-reusable and is
+/// never pooled.  Matched connections carry no marker and are unaffected.
+///
+/// **Metric.** Increments [`crate::metrics::upstream_connections_total`] with
+/// `state="reused"` or `state="new"` on success.
+///
+/// # Errors
+///
+/// Returns a `502` error when the peer leaf cert's SANs do not match the
+/// `BackendTLSPolicy.spec.validation.subjectAltNames` constraints.
+pub(crate) fn connected_to_upstream(
+    reused: bool,
+    digest: Option<&pingora_core::protocols::Digest>,
+) -> Result<()> {
+    // Check for a SAN mismatch recorded by the handshake hook.
+    let mismatch = digest
+        .and_then(|d| d.ssl_digest.as_ref())
+        .and_then(|sd| sd.extension.get::<UpstreamSanMismatch>())
+        .is_some();
+    if mismatch {
+        tracing::warn!(
+            "upstream SAN mismatch: peer cert does not satisfy BackendTLSPolicy \
+                         subjectAltNames — rejecting connection with 502"
+        );
+        crate::metrics::upstream_connections_total()
+            .with_label_values(&["san_mismatch"])
+            .inc();
+        return Err(pingora_core::Error::explain(
+            HTTPStatus(502),
+            "backend cert SAN does not match BackendTLSPolicy subjectAltNames",
+        ));
+    }
+
     let state = if reused { "reused" } else { "new" };
     crate::metrics::upstream_connections_total()
         .with_label_values(&[state])
         .inc();
+    Ok(())
 }
 
 /// Pingora `upstream_response_filter` body: apply rule-level response filters and

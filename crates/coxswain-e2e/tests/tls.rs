@@ -1566,6 +1566,121 @@ async fn backend_tls_policy_hostname_mismatch_fails_handshake() -> anyhow::Resul
     Ok(())
 }
 
+/// `BackendTLSPolicy` subjectAltNames — happy path (GEP-1897 #133):
+/// backend cert carries a URI SAN matching the policy's `subjectAltNames` entry →
+/// proxy enforces the identity and forwards the request successfully (200).
+///
+/// Chain validation runs (`verify_cert=true`); `verify_hostname` is disabled because
+/// authentication is by SAN list, not by hostname per the spec.
+#[tokio::test]
+async fn backend_san_validation_allows_matching_uri_san() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-san-valid").await?;
+
+    // Generate a cert with both a DNS SAN (for hostname selection) and a URI SAN (SPIFFE ID).
+    let tls_hostname = format!("echo-tls.{}.local", ns.name);
+    let spiffe_uri = format!("spiffe://cluster.local/ns/{}/sa/echo", ns.name);
+    let cert = GeneratedCert::for_host_with_uri_san(&tls_hostname, &spiffe_uri);
+
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    let host = format!("backend-tls-san.{}.local", ns.name);
+
+    // Apply Gateway + HTTPRoute + ConfigMap CA + BackendTLSPolicy with the matching URI SAN.
+    fixtures::apply_fixture(
+        gwa::BACKEND_TLS_POLICY_SAN,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", cert.cert_pem.clone()) // self-signed: cert IS the CA
+            .with("SPIFFE_URI", &spiffe_uri),
+    )
+    .await?;
+
+    // SAN matches → proxy allows connection → 200 echo response.
+    let gw = h.gateway_http(&ns.name).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-tls");
+
+    // Controller must have written Accepted=True / ResolvedRefs=True on the policy.
+    let controller_name = "coxswain-labs.dev/gateway-controller";
+    wait::wait_for_backend_tls_policy_condition(
+        &h.client,
+        "echo-tls-san-policy",
+        &ns.name,
+        controller_name,
+        "Accepted",
+        "True",
+        Duration::from_secs(30),
+    )
+    .await?;
+    wait::wait_for_backend_tls_policy_condition(
+        &h.client,
+        "echo-tls-san-policy",
+        &ns.name,
+        controller_name,
+        "ResolvedRefs",
+        "True",
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// `BackendTLSPolicy` subjectAltNames — sad path (GEP-1897 #133):
+/// backend cert URI SAN does NOT match the policy's `subjectAltNames` entry →
+/// post-handshake rejection in `connected_to_upstream` returns 502.
+///
+/// Chain validation still succeeds (the CA is valid); only the SAN identity check
+/// fails.  Distinct from `backend_tls_policy_hostname_mismatch_fails_handshake`,
+/// where the *TLS handshake itself* fails.  Here the handshake completes and the
+/// rejection happens before any HTTP bytes are sent.
+#[tokio::test]
+async fn backend_san_validation_rejects_mismatched_san() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-san-mismatch").await?;
+
+    // Backend cert URI SAN is the real SPIFFE ID…
+    let tls_hostname = format!("echo-tls.{}.local", ns.name);
+    let real_spiffe_uri = format!("spiffe://cluster.local/ns/{}/sa/echo", ns.name);
+    let cert = GeneratedCert::for_host_with_uri_san(&tls_hostname, &real_spiffe_uri);
+
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    let host = format!("backend-tls-san.{}.local", ns.name);
+
+    // …but the policy lists a different URI → identity mismatch.
+    let wrong_spiffe_uri = format!("spiffe://cluster.local/ns/{}/sa/OTHER", ns.name);
+    fixtures::apply_fixture(
+        gwa::BACKEND_TLS_POLICY_SAN,
+        FixtureVars::new(&ns.name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", cert.cert_pem.clone())
+            .with("SPIFFE_URI", &wrong_spiffe_uri),
+    )
+    .await?;
+
+    // SAN mismatch → connected_to_upstream rejects → 502.
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route_status(&gw, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
 /// Verifies that `ingress.coxswain-labs.dev/ssl-redirect: "true"` (with default code 308)
 /// causes the HTTP listener to issue a 308 redirect whose Location starts with `https://`
 /// and preserves the original host and path.

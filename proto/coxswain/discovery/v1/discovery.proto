@@ -284,6 +284,18 @@ enum BackendProtocol {
   BACKEND_PROTOCOL_WEB_SOCKET = 3;
 }
 
+// Mirrors SubjectAltName — one entry from BackendTLSPolicy.spec.validation.subjectAltNames.
+message SubjectAltName {
+  enum Kind {
+    // DNS-type SAN (policy type: Hostname). Matched with RFC 6125 single-label wildcard rules.
+    HOSTNAME = 0;
+    // URI-type SAN (policy type: URI, e.g. SPIFFE ID). Matched exactly (case-sensitive).
+    URI = 1;
+  }
+  Kind kind = 1;
+  string value = 2;
+}
+
 // Mirrors UpstreamTls.
 message UpstreamTls {
   string sni = 1;
@@ -297,6 +309,10 @@ message UpstreamTls {
   bytes client_cert_pem = 5;
   bytes client_cert_key = 6;
   string client_cert_source = 7;
+  // GEP-1897 subjectAltNames — identity the upstream leaf cert must present.
+  // Empty = feature off (hostname-based verification). Non-empty = hostname
+  // verification disabled; proxy checks >=1 SAN entry matches. Added in v0.5 (field 8).
+  repeated SubjectAltName subject_alt_names = 8;
 }
 
 // Mirrors RetryPolicy.

@@ -1,0 +1,58 @@
+# BackendTLSPolicy subjectAltNames test fixture (GEP-1897 #133).
+# Substitutions (see fixtures::gateway_api::BACKEND_TLS_POLICY_SAN callers):
+#   * TLS_HOSTNAME — hostname used in the backend cert's DNS SAN and the policy's `hostname`
+#   * CA_PEM       — raw PEM text of the CA certificate
+#   * SPIFFE_URI   — URI SAN the policy lists in validation.subjectAltNames
+#   * proxy HTTP listener port (filled by Harness::apply)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: echo-tls-san-ca
+data:
+  ca.crt: |
+    ${CA_PEM}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: backend-tls-san-gw
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend-tls-san-route
+spec:
+  parentRefs:
+    - name: backend-tls-san-gw
+  hostnames:
+    - backend-tls-san.${TESTNS}.local
+  rules:
+    - backendRefs:
+        - name: echo-tls
+          port: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: echo-tls-san-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-tls
+  validation:
+    hostname: ${TLS_HOSTNAME}
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: echo-tls-san-ca
+    subjectAltNames:
+      - type: URI
+        uri: ${SPIFFE_URI}

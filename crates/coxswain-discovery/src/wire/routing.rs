@@ -49,8 +49,8 @@ use coxswain_core::routing::{
     HostRouter, HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable,
     LoadBalance, MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier,
     PortRoutingTable, QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry, RouteKind,
-    RouteTimeouts, RouterError, SessionAffinity, TlsPassthroughTable, TlsPassthroughTableBuilder,
-    UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
+    RouteTimeouts, RouterError, SessionAffinity, SubjectAltName, TlsPassthroughTable,
+    TlsPassthroughTableBuilder, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
 };
 
 use crate::error::WireError;
@@ -262,6 +262,25 @@ fn upstream_tls_to_wire(tls: &UpstreamTls) -> p::UpstreamTls {
         ),
         None => (Vec::new(), Vec::new(), String::new()),
     };
+    let subject_alt_names = tls
+        .subject_alt_names()
+        .iter()
+        .filter_map(|san| match san {
+            SubjectAltName::Hostname(h) => Some(p::SubjectAltName {
+                kind: p::subject_alt_name::Kind::Hostname.into(),
+                value: h.to_string(),
+            }),
+            SubjectAltName::Uri(u) => Some(p::SubjectAltName {
+                kind: p::subject_alt_name::Kind::Uri.into(),
+                value: u.to_string(),
+            }),
+            // Forward-compatible: unknown variants added in future releases are dropped
+            // (they were added after this binary was compiled; a rolling upgrade is safe
+            // because the SAN set must contain at least one recognisable entry to enforce
+            // — an empty residual is caught by from_wire's fail-closed path).
+            _ => None,
+        })
+        .collect();
     p::UpstreamTls {
         sni: tls.sni.to_string(),
         ca: Some(ca),
@@ -269,6 +288,7 @@ fn upstream_tls_to_wire(tls: &UpstreamTls) -> p::UpstreamTls {
         client_cert_pem,
         client_cert_key,
         client_cert_source,
+        subject_alt_names,
     }
 }
 
@@ -927,6 +947,43 @@ fn upstream_tls_from_wire(dto: &p::UpstreamTls) -> Result<UpstreamTls, WireError
             Arc::from(dto.client_cert_source.as_str()),
         )));
     }
+    // Deserialise SANs with direct field assignment — not with_subject_alt_names() —
+    // so the wire group_key is preserved verbatim (the builder re-folds the hash and
+    // diverges from the sender's pool key, breaking connection-pool isolation).
+    if !dto.subject_alt_names.is_empty() {
+        // Drop unknown SAN kinds gracefully — consistent with to_wire's _ => None.
+        // This prevents a future proto Kind from being coerced to the default (Hostname=0)
+        // and producing a spurious SAN mismatch / silent auth downgrade on rolling upgrades.
+        // Drop unknown SAN kinds gracefully — consistent with to_wire's _ => None.
+        // This prevents a future proto Kind from being coerced to the default (Hostname=0)
+        // and producing a spurious SAN mismatch on rolling upgrades.
+        let sans: Arc<[SubjectAltName]> = dto
+            .subject_alt_names
+            .iter()
+            .filter_map(|san| {
+                let kind = p::subject_alt_name::Kind::try_from(san.kind).ok()?;
+                Some(match kind {
+                    p::subject_alt_name::Kind::Hostname => {
+                        SubjectAltName::Hostname(Arc::from(san.value.as_str()))
+                    }
+                    p::subject_alt_name::Kind::Uri => {
+                        SubjectAltName::Uri(Arc::from(san.value.as_str()))
+                    }
+                })
+            })
+            .collect();
+        if sans.is_empty() {
+            // All SAN entries had unrecognised kinds (e.g. a future proto variant
+            // sent by a newer controller). Fail closed: silently skipping the SAN
+            // check would downgrade auth to hostname-only, which is incorrect.
+            let bad_kind = dto.subject_alt_names.first().map_or(-1, |s| s.kind);
+            return Err(WireError::InvalidEnumValue {
+                value: bad_kind,
+                field: "UpstreamTls.subject_alt_names[*].kind",
+            });
+        }
+        tls.subject_alt_names = sans;
+    }
     Ok(tls)
 }
 
@@ -1562,6 +1619,46 @@ mod tests {
             "absent client cert must stay absent (empty source)"
         );
         assert_eq!(back.group_key, 0x99);
+    }
+
+    // ── UpstreamTls subject-alt-names (GEP-1897) ──────────────────────────────
+
+    #[test]
+    fn upstream_tls_subject_alt_names_round_trips() {
+        let sans: Arc<[SubjectAltName]> = Arc::from([
+            SubjectAltName::Uri(Arc::from("spiffe://cluster.local/ns/default/sa/svc")),
+            SubjectAltName::Hostname(Arc::from("svc.default.svc.cluster.local")),
+        ]);
+        // Apply SANs before client_cert (canonical reflector order).
+        let base_key: u64 = 0xABCD;
+        let tls = UpstreamTls::new(Arc::from("svc.example.com"), UpstreamCa::System, base_key)
+            .with_subject_alt_names(sans.clone());
+        let san_mixed_key = tls.group_key;
+        assert_ne!(san_mixed_key, base_key, "SAN list must perturb group_key");
+
+        let back = upstream_tls_from_wire(&upstream_tls_to_wire(&tls)).expect("from_wire");
+        assert_eq!(
+            back.subject_alt_names(),
+            sans.as_ref(),
+            "SAN entries must survive round-trip"
+        );
+        // Critical: from_wire must preserve the sender's group_key verbatim —
+        // using with_subject_alt_names() in from_wire would re-fold and diverge.
+        assert_eq!(
+            back.group_key, san_mixed_key,
+            "from_wire must preserve group_key, not re-mix it with SANs"
+        );
+    }
+
+    #[test]
+    fn upstream_tls_empty_subject_alt_names_round_trips() {
+        let tls = UpstreamTls::new(Arc::from("svc.example.com"), UpstreamCa::System, 0x42);
+        let back = upstream_tls_from_wire(&upstream_tls_to_wire(&tls)).expect("from_wire");
+        assert!(
+            back.subject_alt_names().is_empty(),
+            "absent SANs must round-trip as empty"
+        );
+        assert_eq!(back.group_key, 0x42);
     }
 
     // ── 1. Ingress exact route ────────────────────────────────────────────────
