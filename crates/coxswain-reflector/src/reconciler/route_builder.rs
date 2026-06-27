@@ -185,7 +185,18 @@ pub(super) fn build_gateway_routes(
                 .iter()
                 .filter(|l| !l.conflicted)
                 .map(move |l| {
-                    let key = ListenerKey::new(ns.clone(), name.clone(), l.name.clone());
+                    // Key by the DECLARING resource so a route's parentRef (Gateway
+                    // or ListenerSet) resolves to the right listener and same-named
+                    // listeners across sources don't collide (GEP-1713). The bind
+                    // port is still the parent Gateway's VIP slot for this spec port.
+                    let key = match &l.source {
+                        ListenerSource::Gateway => {
+                            ListenerKey::new(ns.clone(), name.clone(), l.name.clone())
+                        }
+                        ListenerSource::ListenerSet(ls_key) => {
+                            ListenerKey::for_listener_set(ls_key, l.name.clone())
+                        }
+                    };
                     let spec_port = l.port as u16;
                     let bind_port = vip
                         .get(&(gw_key.clone(), spec_port))
@@ -656,6 +667,7 @@ pub(super) fn merge_backend_client_cert_health(
 pub(super) fn count_attached_routes<R: RouteLike>(
     routes: &[Arc<R>],
     owned_gateways: &HashSet<ObjectKey>,
+    ls_parent: &HashMap<ObjectKey, ObjectKey>,
     gateway_listener_health: &mut HashMap<ObjectKey, GatewayListenerHealth>,
     passthrough_kind: bool,
 ) {
@@ -670,22 +682,35 @@ pub(super) fn count_attached_routes<R: RouteLike>(
         let route_hostnames = route.route_hostnames();
 
         for pr in route.route_parent_refs() {
-            let gw_ns = pr.namespace.unwrap_or(route_ns);
-            let key = ObjectKey::new(gw_ns, pr.name);
-            if !owned_gateways.contains(&key) {
+            let ref_ns = pr.namespace.unwrap_or(route_ns);
+            // GEP-1713: a parentRef targets either a Gateway or a ListenerSet. Resolve
+            // the owning Gateway whose health holds the listener, plus the source to
+            // match — a ListenerSet parentRef counts only against its own listeners.
+            let gw_api_group = pr
+                .group
+                .is_none_or(|g| g.is_empty() || g == "gateway.networking.k8s.io");
+            let (target_gw, source) = if gw_api_group && pr.kind == Some("ListenerSet") {
+                let ls_key = ObjectKey::new(ref_ns, pr.name);
+                match ls_parent.get(&ls_key) {
+                    Some(gw) => (gw.clone(), ListenerSource::ListenerSet(ls_key)),
+                    None => continue,
+                }
+            } else {
+                (ObjectKey::new(ref_ns, pr.name), ListenerSource::Gateway)
+            };
+            if !owned_gateways.contains(&target_gw) {
                 continue;
             }
-            if let Some(health) = gateway_listener_health.get_mut(&key) {
-                // This parentRef targets the Gateway itself, so it attaches only to
-                // the Gateway's own listeners (source = Gateway), never to listeners
-                // contributed by an attached ListenerSet — those require a
-                // `parentRef.kind: ListenerSet` (handled separately, GEP-1713).
+            if let Some(health) = gateway_listener_health.get_mut(&target_gw) {
                 if let Some(sn) = pr.section_name {
-                    let Some(info) = health.listeners.get_mut(&ListenerHealthKey::gateway(sn))
-                    else {
+                    let key = ListenerHealthKey {
+                        source: source.clone(),
+                        name: sn.to_string(),
+                    };
+                    let Some(info) = health.listeners.get_mut(&key) else {
                         continue;
                     };
-                    if gw_ns != route_ns && !info.allows_all_namespaces {
+                    if ref_ns != route_ns && !info.allows_all_namespaces {
                         continue;
                     }
                     if let Some(port) = pr.port
@@ -700,13 +725,13 @@ pub(super) fn count_attached_routes<R: RouteLike>(
                         info.attached_routes += 1;
                     }
                 } else {
-                    let gateway_listeners: Vec<ListenerHealthKey> = health
+                    let matching: Vec<ListenerHealthKey> = health
                         .listeners
                         .keys()
-                        .filter(|k| matches!(k.source, ListenerSource::Gateway))
+                        .filter(|k| k.source == source)
                         .cloned()
                         .collect();
-                    for ln in gateway_listeners {
+                    for ln in matching {
                         let Some(info) = health.listeners.get_mut(&ln) else {
                             continue;
                         };
@@ -715,7 +740,7 @@ pub(super) fn count_attached_routes<R: RouteLike>(
                         {
                             continue;
                         }
-                        if gw_ns != route_ns && !info.allows_all_namespaces {
+                        if ref_ns != route_ns && !info.allows_all_namespaces {
                             continue;
                         }
                         if !listener_accepts(info) {
@@ -1024,7 +1049,7 @@ mod tests {
             ListenerTlsOutcome::NotApplicable,
             80,
         )]);
-        count_attached_routes(&[grpc_route()], &owned(), &mut map, false);
+        count_attached_routes(&[grpc_route()], &owned(), &HashMap::new(), &mut map, false);
         assert_eq!(
             attached(&map, "http"),
             1,
@@ -1039,7 +1064,7 @@ mod tests {
             ListenerTlsOutcome::TlsPassthrough,
             443,
         )]);
-        count_attached_routes(&[tls_route()], &owned(), &mut map, true);
+        count_attached_routes(&[tls_route()], &owned(), &HashMap::new(), &mut map, true);
         assert_eq!(
             attached(&map, "tls"),
             1,
@@ -1050,7 +1075,7 @@ mod tests {
     #[test]
     fn tls_route_not_counted_against_terminate_listener() {
         let mut map = health(vec![listener("https", ListenerTlsOutcome::Resolved, 443)]);
-        count_attached_routes(&[tls_route()], &owned(), &mut map, true);
+        count_attached_routes(&[tls_route()], &owned(), &HashMap::new(), &mut map, true);
         assert_eq!(
             attached(&map, "https"),
             0,
@@ -1065,7 +1090,7 @@ mod tests {
             ListenerTlsOutcome::TlsPassthrough,
             443,
         )]);
-        count_attached_routes(&[http_route()], &owned(), &mut map, false);
+        count_attached_routes(&[http_route()], &owned(), &HashMap::new(), &mut map, false);
         assert_eq!(
             attached(&map, "tls"),
             0,

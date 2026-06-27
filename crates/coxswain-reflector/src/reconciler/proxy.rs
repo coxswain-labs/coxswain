@@ -32,8 +32,8 @@ use crate::ingress::IngressPorts;
 use crate::k8s_utils::scoped_api;
 use crate::reference_grants::{GrantSet, flatten_ca_grants, flatten_grants};
 use crate::tls::{
-    GatewayListenerHealth, SharedBackendTlsPolicyHealth, SharedGatewayListenerHealth,
-    SharedRouteHealth,
+    GatewayListenerHealth, ListenerSource, SharedBackendTlsPolicyHealth,
+    SharedGatewayListenerHealth, SharedRouteHealth,
 };
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
@@ -1340,21 +1340,35 @@ fn rebuild(
     merge_backend_client_cert_health(&mut gateway_listener_health, &backend_client_certs.health);
 
     let tls_routes = stores.tls_routes.state();
+    // GEP-1713: ListenerSet → parent Gateway map so a `parentRef.kind: ListenerSet`
+    // route counts against the listener on its parent Gateway's health entry.
+    let ls_parent: HashMap<ObjectKey, ObjectKey> = effective
+        .iter()
+        .flat_map(|(gw_key, eff)| {
+            eff.listeners.iter().filter_map(move |l| match &l.source {
+                ListenerSource::ListenerSet(ls_key) => Some((ls_key.clone(), gw_key.clone())),
+                ListenerSource::Gateway => None,
+            })
+        })
+        .collect();
     count_attached_routes(
         &routes,
         &owned_gateways,
+        &ls_parent,
         &mut gateway_listener_health,
         false,
     );
     count_attached_routes(
         &grpc_routes,
         &owned_gateways,
+        &ls_parent,
         &mut gateway_listener_health,
         false,
     );
     count_attached_routes(
         &tls_routes,
         &owned_gateways,
+        &ls_parent,
         &mut gateway_listener_health,
         true,
     );

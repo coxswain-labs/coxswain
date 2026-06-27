@@ -379,6 +379,13 @@ fn ls_allows_all_namespaces(l: &ListenerSetListeners) -> bool {
 /// same port. `listeners` is already in precedence order; the first listener to
 /// claim a `(port)` wins, and a later listener on that port conflicts unless it
 /// is compatible (same protocol AND a distinct, non-empty hostname).
+///
+/// Known limitation (GEP-3567 × GEP-1713): two compatible same-port listeners from
+/// *different* sources (a Gateway listener and one of its ListenerSet's listeners)
+/// both program and share the parent Gateway's bind port, but the routing-table
+/// listener-isolation pass scopes misdirected-request (421) isolation per source.
+/// So a route on the broader listener is not isolated from a more-specific
+/// sibling on the other source. Accepted as a follow-up; not "cannot happen".
 fn flag_conflicts(listeners: &mut [EffectiveListener]) {
     // Winners per port: (protocol, hostname) of every listener that programmed.
     let mut claimed: HashMap<i32, Vec<(String, String)>> = HashMap::new();

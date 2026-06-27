@@ -43,6 +43,10 @@ pub(crate) struct ParentRefView<'a> {
     pub name: &'a str,
     pub section_name: Option<&'a str>,
     pub port: Option<u16>,
+    /// `parentRef.group`; `None`/empty → the Gateway API group (GEP-1713).
+    pub group: Option<&'a str>,
+    /// `parentRef.kind`; `Some("ListenerSet")` targets a ListenerSet, else a Gateway.
+    pub kind: Option<&'a str>,
 }
 
 /// Normalized view of one backend ref to validate for `ResolvedRefs`, with the
