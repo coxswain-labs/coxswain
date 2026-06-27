@@ -5,8 +5,35 @@ use crate::gw_types::v::grpcroutes::GrpcRouteParentRefs;
 use crate::gw_types::v::httproutes::HttpRouteParentRefs;
 use crate::keys::ListenerKey;
 use crate::tls::ListenerSource;
-use coxswain_core::ownership::ObjectKey;
+use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use std::collections::{HashMap, HashSet};
+
+/// Whether a route `parentRef` attaches to a listener this controller serves
+/// (GEP-1713). A `kind: Gateway` (or unspecified) ref attaches when it names an
+/// owned Gateway; a `kind: ListenerSet` ref attaches when that ListenerSet
+/// contributed at least one listener to `listener_info` (which is built only from
+/// owned Gateways' effective sets, so an unattached/rejected ListenerSet has no
+/// entry). Replaces a bare [`parent_ref_owned`] check that silently dropped every
+/// `kind: ListenerSet` route.
+pub(crate) fn parent_ref_attaches(
+    group: Option<&str>,
+    kind: Option<&str>,
+    namespace: Option<&str>,
+    name: &str,
+    route_ns: &str,
+    owned_gateways: &HashSet<ObjectKey>,
+    listener_info: &HashMap<ListenerKey, ListenerBinding>,
+) -> bool {
+    let ref_ns = namespace.unwrap_or(route_ns);
+    match parent_listener_source(group, kind, ref_ns, name) {
+        ListenerSource::Gateway => {
+            parent_ref_owned(group, kind, namespace, name, route_ns, owned_gateways)
+        }
+        ListenerSource::ListenerSet(ls_key) => listener_info
+            .keys()
+            .any(|k| matches!(&k.source, ListenerSource::ListenerSet(k2) if *k2 == ls_key)),
+    }
+}
 
 /// Resolve a route `parentRef`'s `(group, kind)` to the listener source it targets
 /// (GEP-1713). `kind: ListenerSet` in the Gateway API group targets that
@@ -351,6 +378,64 @@ pub(super) fn compute_grpc_listener_bindings(
 mod tests {
     use super::*;
     use crate::gateway_api::tests::*;
+
+    // ── parentRef attachment (GEP-1713) ──────────────────────────────────────────
+
+    #[test]
+    fn parent_ref_attaches_resolves_gateway_and_listener_set_refs() {
+        let owned: HashSet<ObjectKey> = std::iter::once(ObjectKey::new("default", "gw")).collect();
+        let ls_key = ObjectKey::new("default", "team-ls");
+        let mut listener_info: HashMap<ListenerKey, ListenerBinding> = HashMap::new();
+        listener_info.insert(
+            ListenerKey::for_listener_set(&ls_key, "ls-http"),
+            ListenerBinding {
+                hostname: String::new(),
+                port: 8001,
+                bind_port: 30001,
+            },
+        );
+
+        // kind: Gateway (unspecified) naming an owned Gateway → attaches.
+        assert!(parent_ref_attaches(
+            None,
+            None,
+            Some("default"),
+            "gw",
+            "default",
+            &owned,
+            &listener_info
+        ));
+        // kind: ListenerSet whose listeners are in listener_info → attaches.
+        assert!(parent_ref_attaches(
+            Some("gateway.networking.k8s.io"),
+            Some("ListenerSet"),
+            Some("default"),
+            "team-ls",
+            "default",
+            &owned,
+            &listener_info
+        ));
+        // Unknown Gateway → does not attach.
+        assert!(!parent_ref_attaches(
+            None,
+            None,
+            Some("default"),
+            "other",
+            "default",
+            &owned,
+            &listener_info
+        ));
+        // kind: ListenerSet not present in listener_info (unattached/rejected) → no.
+        assert!(!parent_ref_attaches(
+            Some("gateway.networking.k8s.io"),
+            Some("ListenerSet"),
+            Some("default"),
+            "absent-ls",
+            "default",
+            &owned,
+            &listener_info
+        ));
+    }
 
     // ── Listener isolation tests ──────────────────────────────────────────────────
 

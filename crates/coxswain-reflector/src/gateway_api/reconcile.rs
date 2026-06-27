@@ -103,7 +103,8 @@ impl GatewayApiReconciler {
         let route_id = format!("{route_ns}/{route_name}");
         let created_at = metadata_created_at(&route.metadata);
 
-        // Only reconcile routes attached to at least one Gateway we manage.
+        // Only reconcile routes attached to at least one listener we serve — an
+        // owned Gateway, or a ListenerSet attached to one (GEP-1713).
         let has_owned_parent = route
             .spec
             .parent_refs
@@ -111,13 +112,14 @@ impl GatewayApiReconciler {
             .unwrap_or(&[])
             .iter()
             .any(|p| {
-                parent_ref_owned(
+                super::bindings::parent_ref_attaches(
                     p.group.as_deref(),
                     p.kind.as_deref(),
                     p.namespace.as_deref(),
                     &p.name,
                     route_ns,
                     owned_gateways,
+                    listener_info,
                 )
             });
 
