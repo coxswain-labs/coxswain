@@ -7,12 +7,13 @@ use crate::gw_types::{
     BackendTlsPolicy, HttpRoute,
     v::backendtlspolicies::{
         BackendTlsPolicyTargetRefs, BackendTlsPolicyValidationCaCertificateRefs,
+        BackendTlsPolicyValidationSubjectAltNames, BackendTlsPolicyValidationSubjectAltNamesType,
     },
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::tls::{BackendTlsPolicyHealth, BackendTlsPolicyHealthMap};
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::routing::{UpstreamCa, UpstreamTls};
+use coxswain_core::routing::{SubjectAltName, UpstreamCa, UpstreamTls};
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
@@ -161,11 +162,40 @@ pub fn build_backend_tls_index(
         match resolve_ca(policy_ns, &winner.spec.validation, configmaps) {
             Ok(ca) => {
                 let group_key = compute_group_key(&sni, &ca);
-                let tls = Arc::new(UpstreamTls::new(sni, ca, group_key));
+                let mut tls = UpstreamTls::new(sni, ca, group_key);
+
+                // Resolve subjectAltNames (GEP-1897 §Extended-conformance).
+                // A wholly-invalid non-empty block is fail-closed: emit tls=None +
+                // Accepted=False rather than silently downgrading to hostname auth.
+                match resolve_subject_alt_names(winner.spec.validation.subject_alt_names.as_deref())
+                {
+                    Ok(sans) if !sans.is_empty() => {
+                        tls = tls.with_subject_alt_names(sans);
+                    }
+                    Ok(_) => { /* empty list = feature off; keep hostname-based auth */ }
+                    Err(san_reason) => {
+                        // Wholly-invalid SAN block — fail-closed (same Accepted=False
+                        // pattern as an unresolvable CA ref).
+                        index.insert(
+                            (svc_key.clone(), port_scope),
+                            ResolvedPolicy {
+                                tls: None,
+                                policy_key: winner_key.clone(),
+                            },
+                        );
+                        let entry = health.entry(winner_key).or_default();
+                        entry.accepted = false;
+                        entry.accepted_reason = "InvalidSubjectAltNames";
+                        entry.resolved_refs = false;
+                        entry.resolved_refs_reason = san_reason;
+                        continue;
+                    }
+                }
+
                 index.insert(
                     (svc_key.clone(), port_scope),
                     ResolvedPolicy {
-                        tls: Some(tls),
+                        tls: Some(Arc::new(tls)),
                         policy_key: winner_key.clone(),
                     },
                 );
@@ -384,6 +414,64 @@ fn resolve_ca_from_ref(
     }
 
     Ok(UpstreamCa::Bundle(Arc::from(pem)))
+}
+
+/// Resolve `spec.validation.subjectAltNames` into a `Vec<SubjectAltName>`.
+///
+/// An absent or empty list → `Ok(vec![])` (feature off).
+/// A non-empty list where at least one entry is valid → `Ok(entries)` (invalid
+/// entries within the list are dropped with a warning).
+/// A non-empty list where **every** entry is invalid → `Err("InvalidSubjectAltNames")`
+/// (fail-closed: returning an empty list would silently downgrade identity auth to
+/// hostname auth — CEL admission prevents this in practice, but defence-in-depth).
+fn resolve_subject_alt_names(
+    raw: Option<&[BackendTlsPolicyValidationSubjectAltNames]>,
+) -> Result<Vec<SubjectAltName>, &'static str> {
+    let Some(entries) = raw else {
+        return Ok(vec![]);
+    };
+    if entries.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let sans: Vec<SubjectAltName> = entries
+        .iter()
+        .filter_map(|entry| match entry.r#type {
+            BackendTlsPolicyValidationSubjectAltNamesType::Hostname => {
+                match entry.hostname.as_deref() {
+                    Some(h) if !h.is_empty() => Some(SubjectAltName::Hostname(Arc::from(h))),
+                    _ => {
+                        tracing::warn!(
+                            "BackendTLSPolicy subjectAltNames entry type=Hostname \
+                                 is missing its hostname field — entry skipped"
+                        );
+                        None
+                    }
+                }
+            }
+            BackendTlsPolicyValidationSubjectAltNamesType::Uri => match entry.uri.as_deref() {
+                Some(u) if !u.is_empty() => Some(SubjectAltName::Uri(Arc::from(u))),
+                _ => {
+                    tracing::warn!(
+                        "BackendTLSPolicy subjectAltNames entry type=URI \
+                                 is missing its uri field — entry skipped"
+                    );
+                    None
+                }
+            },
+        })
+        .collect();
+
+    if sans.is_empty() {
+        // Input was non-empty but every entry was invalid — fail-closed.
+        tracing::warn!(
+            "BackendTLSPolicy subjectAltNames is non-empty but contains no valid entries — \
+             policy rejected (InvalidSubjectAltNames)"
+        );
+        return Err("InvalidSubjectAltNames");
+    }
+
+    Ok(sans)
 }
 
 /// Compute a stable `u64` pool-isolation key from SNI and CA content.

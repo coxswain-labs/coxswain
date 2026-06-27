@@ -129,6 +129,7 @@ impl ProxyHttp for GatewayProxy {
         hooks::upstream_peer(
             &self.cfg.ca_cache,
             &self.cfg.backend_client_cert_cache,
+            &self.cfg.san_hook_cache,
             &self.cfg.circuit_breakers,
             ctx,
         )
@@ -157,8 +158,7 @@ impl ProxyHttp for GatewayProxy {
     where
         Self::CTX: Send + Sync,
     {
-        hooks::connected_to_upstream(reused);
-        Ok(())
+        hooks::connected_to_upstream(reused, _digest)
     }
 
     async fn upstream_response_filter(

@@ -4,15 +4,111 @@
 //! `group_key`. The Mutex is never held across an `.await` point — `upstream_peer`
 //! calls `get_or_parse` synchronously.
 
-use coxswain_core::routing::{UpstreamCa, UpstreamTls};
+use coxswain_core::routing::{SubjectAltName, UpstreamCa, UpstreamTls, san_set_matches};
 use parking_lot::Mutex;
 use pingora_core::protocols::tls::CaType;
+use pingora_core::protocols::tls::HandshakeCompleteHook;
 use pingora_core::tls::{pkey::PKey, x509::X509};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
 use pingora_core::{HTTPStatus, Result};
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Zero-size type placed in a connection's `SslDigest.extension` when the
+/// post-handshake SAN check fails.
+///
+/// `apply_upstream_tls` installs a [`HandshakeCompleteHook`] that returns
+/// `Some(Arc::new(UpstreamSanMismatch))` on a mismatch.  The
+/// `connected_to_upstream` hook reads the extension and returns a 502 before
+/// any request bytes are sent upstream — the connection is never pooled.
+pub(crate) struct UpstreamSanMismatch;
+
+/// Thread-safe cache mapping `group_key` → pre-built [`HandshakeCompleteHook`]
+/// for the backend SAN check (GEP-1897 `subjectAltNames`).
+///
+/// `upstream_peer` / `apply_upstream_tls` run once **per request/retry**, so
+/// allocating a fresh `Arc<closure>` each time would hit the hot path.  This
+/// cache ensures the `Arc` is built at most once per distinct SAN policy
+/// (`group_key`).  The Mutex is never held across an `.await` point.
+#[non_exhaustive]
+#[derive(Default)]
+pub struct SanCheckHookCache {
+    inner: Mutex<HashMap<u64, HandshakeCompleteHook>>,
+}
+
+impl SanCheckHookCache {
+    /// Construct an empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the cached hook for `group_key`, or build it from `sans` on first access.
+    pub fn get_or_build(
+        &self,
+        group_key: u64,
+        sans: Arc<[SubjectAltName]>,
+    ) -> HandshakeCompleteHook {
+        {
+            let guard = self.inner.lock();
+            if let Some(hook) = guard.get(&group_key) {
+                return Arc::clone(hook);
+            }
+        }
+        let hook: HandshakeCompleteHook = Arc::new(move |ssl| {
+            // Pull the peer leaf cert from the completed handshake.
+            let cert = match ssl.peer_certificate() {
+                Some(c) => c,
+                // No leaf — fail-closed (verify_cert=true normally rejects this
+                // earlier, but the closure must not assume that).
+                None => {
+                    tracing::warn!(
+                        "upstream SAN check: peer sent no certificate — marking mismatch"
+                    );
+                    return Some(Arc::new(UpstreamSanMismatch) as Arc<dyn Any + Send + Sync>);
+                }
+            };
+
+            // Extract DNS and URI SANs from the leaf cert's SAN extension.
+            let san_stack = cert.subject_alt_names();
+            let mut dns_sans: Vec<&str> = Vec::new();
+            let mut uri_sans: Vec<&str> = Vec::new();
+            if let Some(ref stack) = san_stack {
+                for name in stack {
+                    if let Some(d) = name.dnsname() {
+                        dns_sans.push(d);
+                    } else if let Some(u) = name.uri() {
+                        uri_sans.push(u);
+                    }
+                }
+            }
+
+            if san_stack.is_none() || (dns_sans.is_empty() && uri_sans.is_empty()) {
+                // Cert has no usable SANs — fail-closed.
+                tracing::warn!(
+                    "upstream SAN check: peer cert has no DNS or URI SANs — marking mismatch"
+                );
+                return Some(Arc::new(UpstreamSanMismatch) as Arc<dyn Any + Send + Sync>);
+            }
+
+            if san_set_matches(&sans, &dns_sans, &uri_sans) {
+                // Match — return None (no marker; connection proceeds normally).
+                None
+            } else {
+                tracing::warn!(
+                    dns_sans = ?dns_sans,
+                    uri_sans = ?uri_sans,
+                    "upstream SAN check: peer cert SANs do not match BackendTLSPolicy \
+                     subjectAltNames — marking mismatch"
+                );
+                Some(Arc::new(UpstreamSanMismatch) as Arc<dyn Any + Send + Sync>)
+            }
+        });
+        let mut guard = self.inner.lock();
+        Arc::clone(guard.entry(group_key).or_insert(hook))
+    }
+}
 
 /// Thread-safe cache mapping `group_key` → parsed `CaType`.
 ///
@@ -105,11 +201,21 @@ impl BackendClientCertCache {
     }
 }
 
-/// Apply all `BackendTLSPolicy`-driven TLS material to `peer`: CA bundle and
-/// (when present) the GEP-3155 backend client certificate.
+/// Apply all `BackendTLSPolicy`-driven TLS material to `peer`: CA bundle,
+/// (when present) the GEP-3155 backend client certificate, and (when present)
+/// the GEP-1897 `subjectAltNames` identity check.
 ///
-/// Both caches ensure the crypto work runs at most once per distinct
+/// All three caches ensure the crypto work runs at most once per distinct
 /// `group_key`; subsequent connections return the cached parsed objects.
+///
+/// When `subjectAltNames` is non-empty:
+/// - Pingora's built-in hostname check is **disabled** (`verify_hostname=false`).
+///   Chain validation (`verify_cert=true`) still runs via CA; `hostname` is used
+///   only for SNI and cert selection per GEP-1897.
+/// - A [`HandshakeCompleteHook`] is installed that inspects the peer leaf cert's
+///   SAN extension and records [`UpstreamSanMismatch`] on failure. The
+///   [`hooks::connected_to_upstream`](crate::hooks::connected_to_upstream) hook
+///   reads the marker and returns a 502 before sending any request bytes upstream.
 ///
 /// # Errors
 ///
@@ -119,6 +225,7 @@ pub(crate) fn apply_upstream_tls(
     btls: &UpstreamTls,
     ca_cache: &UpstreamCaCache,
     client_cert_cache: &BackendClientCertCache,
+    san_hook_cache: &SanCheckHookCache,
 ) -> Result<()> {
     if let UpstreamCa::Bundle(pem) = &btls.ca {
         let ca = ca_cache.get_or_parse(btls.group_key, pem).ok_or_else(|| {
@@ -136,6 +243,14 @@ pub(crate) fn apply_upstream_tls(
                 )
             })?;
         peer.client_cert_key = Some(cert_key);
+    }
+    if !btls.subject_alt_names().is_empty() {
+        // Disable hostname-based authentication — the SAN check handles identity.
+        // Chain validation (`verify_cert`) remains on so the CA still validates.
+        peer.options.verify_hostname = false;
+        let sans = Arc::clone(&btls.subject_alt_names);
+        let hook = san_hook_cache.get_or_build(btls.group_key, sans);
+        peer.options.upstream_tls_handshake_complete_hook = Some(hook);
     }
     Ok(())
 }

@@ -42,7 +42,8 @@ pub use common::rate_limit::{RateLimitConfig, RateLimitKey};
 pub use common::retry::{RetryOn, RetryPolicy};
 pub use common::table::{RouteOutcome, RouterError, RoutingTable, RoutingTableBuilder};
 pub use common::upstream_tls::{
-    BackendClientCert, BackendProtocol, UpstreamCa, UpstreamTls, parse_app_protocol,
+    BackendClientCert, BackendProtocol, SubjectAltName, UpstreamCa, UpstreamTls,
+    parse_app_protocol, san_set_matches,
 };
 
 pub use gateway::{

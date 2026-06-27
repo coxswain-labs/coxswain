@@ -11,6 +11,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 /// `opts.SupportedFeatures` in `conformance/main_test.go`.
 pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "BackendTLSPolicy",
+    "BackendTLSPolicySANValidation",
     "GRPCRoute",
     "Gateway",
     "GatewayAddressEmpty",

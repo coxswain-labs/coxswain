@@ -86,8 +86,9 @@ func TestConformance(t *testing.T) {
 		features.SupportHTTPRouteBackendProtocolH2C,
 		features.SupportHTTPRouteBackendProtocolWebSocket,
 		// Core: BackendTLSPolicy — GEP-1897 (#16)
-		// SupportBackendTLSPolicySANValidation is Extended and not yet implemented.
+		// Extended: BackendTLSPolicy subjectAltNames — GEP-1897 (#133)
 		features.SupportBackendTLSPolicy,
+		features.SupportBackendTLSPolicySANValidation,
 		// Standard: ReferenceGrant — GEP-709 (#3, declaration: #166)
 		// Implementation in coxswain-core/src/reference_grants.rs is already complete;
 		// previously omitted from the SupportedFeatures set, so the GatewayClass status

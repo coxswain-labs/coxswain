@@ -361,6 +361,65 @@ Connections already in flight use the cert that was in effect when the connectio
 |---------|--------|
 | Cross-namespace `clientCertificateRef` | Planned — requires a `ReferenceGrant`; without one the Gateway surfaces `ResolvedRefs=False/RefNotPermitted` |
 
+## BackendTLSPolicy subjectAltNames (GEP-1897 Extended)
+
+`BackendTLSPolicy.spec.validation.subjectAltNames` pins the identity the upstream's leaf
+certificate must present, independent of the `hostname` used for SNI and certificate
+selection.  This satisfies the GEP-1897 Extended-conformance feature
+`BackendTLSPolicySANValidation`.
+
+### How it works
+
+When `subjectAltNames` is set:
+
+- `hostname` is used **only** for SNI and cert selection — not for authentication.
+- The proxy verifies the leaf cert's SAN extension against every entry in the list.
+- A request is forwarded if **at least one** listed SAN matches a SAN in the presented
+  cert (any-of semantics, matching the Gateway API spec).
+- If no entry matches, the connection is rejected with **502** and the TLS connection
+  is discarded before any HTTP bytes are sent to the backend.
+- Chain validation (`verify_cert`) still runs — the cert must chain to the configured CA.
+
+### Configuration
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: my-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: my-service
+  validation:
+    hostname: my-service.internal        # used for SNI, not for auth
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: my-ca
+    subjectAltNames:
+      # Match a SPIFFE workload identity (URI SAN)
+      - type: URI
+        uri: spiffe://cluster.local/ns/my-ns/sa/my-service
+      # Optionally also accept a DNS SAN
+      - type: Hostname
+        hostname: my-service.internal
+```
+
+Supported `type` values are `Hostname` (matched against DNS SANs in the leaf cert) and
+`URI` (matched byte-for-byte against URI SANs).  DNS matching follows RFC 6125: a
+single-label wildcard in the **certificate** (`*.example.com`) matches one non-empty
+left-most label of the expected name (`my-service.example.com`).
+
+### Fail-closed behaviour
+
+- **All entries invalid** at reconcile time (empty `subjectAltNames` block that cannot be
+  parsed) → the policy is marked `Accepted=False/InvalidSubjectAltNames`; the route
+  falls back to cleartext (same behaviour as a missing CA).
+- **SAN mismatch at runtime** → 502; the connection is never pooled.
+- **No leaf cert or no SANs in cert** → same as a mismatch; the request is rejected.
+
 ## Wildcard TLS
 
 For wildcard hostname TLS (e.g. `*.example.com`), the TLS Secret's `tls.crt` must include a wildcard SAN. Coxswain follows RFC 6125 for TLS matching: a single-label wildcard (`*.example.com`) matches `foo.example.com` but not `foo.bar.example.com`.

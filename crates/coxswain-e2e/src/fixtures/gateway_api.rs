@@ -86,6 +86,11 @@ pub const BACKEND_TLS_POLICY_SECTION_NAME: &str = fixture!("backend_tls_policy_s
 /// `sectionName`. Requires `TLS_HOSTNAME`, `CA_PEM`.
 pub const BACKEND_TLS_POLICY_CONFLICT: &str = fixture!("backend_tls_policy_conflict.yaml");
 
+/// BackendTLSPolicy with `subjectAltNames` (GEP-1897 Extended, #133).
+/// Requires `TLS_HOSTNAME`, `CA_PEM`, `SPIFFE_URI`.
+/// Shared by the happy (matching URI) and sad (wrong URI) paths.
+pub const BACKEND_TLS_POLICY_SAN: &str = fixture!("backend_tls_policy_san.yaml");
+
 /// Minimal single-listener Gateway used by the listener-drain traffic tests (#231).
 /// Declares one HTTP listener on `GATEWAY_HTTP_PORT`.
 pub const LISTENER_DRAIN: &str = fixture!("listener_drain.yaml");

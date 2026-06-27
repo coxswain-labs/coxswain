@@ -4,7 +4,7 @@
 //! `coxswain-bin`) and stored on the proxy instances. They are intentionally
 //! independent of the bin crate so the proxy crate remains self-contained.
 
-use crate::edge::upstream_ca::{BackendClientCertCache, UpstreamCaCache};
+use crate::edge::upstream_ca::{BackendClientCertCache, SanCheckHookCache, UpstreamCaCache};
 use crate::policy::circuit_breaker::CircuitBreakerRegistry;
 use crate::policy::rate_limit::RateLimiterRegistry;
 use coxswain_cache::ResponseCache;
@@ -32,6 +32,12 @@ pub struct SharedProxyConfig {
     /// Parse cache for GEP-3155 backend client certificates from
     /// `Gateway.spec.tls.backend.clientCertificateRef` (one entry per distinct cert identity).
     pub backend_client_cert_cache: Arc<BackendClientCertCache>,
+    /// Pre-built [`HandshakeCompleteHook`] cache for GEP-1897 `subjectAltNames` SAN checks
+    /// (one entry per distinct SAN policy `group_key`).
+    ///
+    /// `upstream_peer` runs once per request/retry, so allocating a fresh `Arc<closure>` each
+    /// call would hit the hot path. This cache ensures each SAN policy's hook is built once.
+    pub san_hook_cache: Arc<SanCheckHookCache>,
     /// Whether to emit one access-log event per request.
     pub access_log_enabled: bool,
     /// Controls what the access log emits for the `path` field.
@@ -99,6 +105,7 @@ impl SharedProxyConfig {
             default_timeouts,
             ca_cache,
             backend_client_cert_cache: Arc::new(BackendClientCertCache::new()),
+            san_hook_cache: Arc::new(SanCheckHookCache::new()),
             access_log_enabled,
             access_log_path_mode,
             cache,
