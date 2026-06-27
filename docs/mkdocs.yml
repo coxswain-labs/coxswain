@@ -84,6 +84,7 @@ nav:
       - Annotations: guides/ingress-annotations.md
     - Gateway API:
       - Overview: guides/gateway-api.md
+      - ListenerSets: guides/listener-sets.md
       - Dedicated proxy pools: guides/dedicated-mode.md
     - Operations:
       - Running in production: guides/running-in-production.md
