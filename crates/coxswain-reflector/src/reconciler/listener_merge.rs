@@ -618,10 +618,14 @@ fn flag_conflicts(listeners: &mut [EffectiveListener]) {
         let host = l.hostname.clone().unwrap_or_default();
         let entry = claimed.entry(l.port).or_default();
         if entry.iter().all(|(proto, h)| {
-            // Compatible only when the protocol matches and both hostnames are
-            // non-empty and distinct (an empty hostname matches all SNI/Host and
-            // therefore overlaps every sibling on the port).
-            proto == &l.protocol && !host.is_empty() && !h.is_empty() && h != &host
+            // Compatible when the protocol matches and the hostnames are DISTINCT
+            // strings. Gateway API allows many listeners on one port as long as
+            // each has a different `hostname` — including an empty (catch-all)
+            // hostname alongside specific ones (GEP-3567 listener isolation routes
+            // by most-specific match, then 421s misdirected requests). Only an
+            // identical hostname (two empties, or two equal hosts) overlaps and
+            // conflicts; overlapping-but-distinct hosts (`*.x` vs `a.x`) do not.
+            proto == &l.protocol && h != &host
         }) {
             entry.push((l.protocol.clone(), host));
         } else {
@@ -1011,6 +1015,35 @@ mod tests {
         assert!(
             g.listeners.iter().all(|l| !l.conflict.is_conflicted()),
             "distinct hostnames share a port"
+        );
+    }
+
+    #[test]
+    fn shared_port_empty_catchall_coexists_with_specific_hostnames() {
+        // GEP-3567 listener isolation: an empty (catch-all) hostname listener on a
+        // port coexists with specific- and wildcard-hostname listeners — all
+        // program. Routing picks the most specific; misdirected requests 421. Only
+        // an IDENTICAL hostname conflicts. Regression: the old rule flagged any
+        // empty-hostname listener as conflicting, leaving the Gateway not Programmed
+        // and breaking GatewayHTTPListenerIsolation conformance.
+        let gw = gateway(
+            "gw",
+            Some(GatewayAllowedListenersNamespacesFrom::All),
+            vec![
+                gw_listener("wild", 80, "HTTP", Some("*.example.com")),
+                gw_listener("foo", 80, "HTTP", Some("foo.example.com")),
+                gw_listener("catchall", 80, "HTTP", None),
+            ],
+        );
+        let eff = merge_effective_gateways(&[gw], &[], &owned(), &empty_ns_store());
+        let g = eff.get(&ObjectKey::new("default", "gw")).expect("gateway");
+        assert!(
+            g.listeners.iter().all(|l| !l.conflict.is_conflicted()),
+            "empty catch-all + distinct specific/wildcard hostnames must all program; got {:?}",
+            g.listeners
+                .iter()
+                .map(|l| (l.name.clone(), l.conflict.clone()))
+                .collect::<Vec<_>>()
         );
     }
 
