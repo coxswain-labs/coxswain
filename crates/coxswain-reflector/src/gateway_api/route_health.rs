@@ -38,7 +38,7 @@ struct ListenerEntry {
 
 /// Normalized view of one of a route's `parentRefs`, projected by the per-kind
 /// [`RouteLike`] impl so the shared algorithm need not know the concrete type.
-pub(super) struct ParentRefView<'a> {
+pub(crate) struct ParentRefView<'a> {
     pub namespace: Option<&'a str>,
     pub name: &'a str,
     pub section_name: Option<&'a str>,
@@ -48,7 +48,7 @@ pub(super) struct ParentRefView<'a> {
 /// Normalized view of one backend ref to validate for `ResolvedRefs`, with the
 /// per-kind rule-skipping (HTTP drops `RequestRedirect` rules) already applied by
 /// [`RouteLike::health_backend_refs`].
-pub(super) struct BackendRefView<'a> {
+pub(crate) struct BackendRefView<'a> {
     pub kind: &'a str,
     pub group: &'a str,
     pub namespace: Option<&'a str>,
@@ -63,7 +63,7 @@ pub(super) struct BackendRefView<'a> {
 /// `has_unsupported_filter` predicate (which `FilterAction`s force
 /// `Accepted=UnsupportedValue`), and `health_backend_refs` (the backend refs to
 /// validate, after applying any kind-specific rule skip).
-pub(super) trait RouteLike {
+pub(crate) trait RouteLike {
     fn route_namespace(&self) -> Option<&str>;
     fn route_name(&self) -> Option<&str>;
     fn route_hostnames(&self) -> Vec<&str>;

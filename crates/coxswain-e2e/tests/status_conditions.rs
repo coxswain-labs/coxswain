@@ -18,7 +18,7 @@
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, GeneratedCert, Harness, MtlsCerts, NamespaceGuard,
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress},
-    harness::wait,
+    harness::{GATEWAY_TLS_PASSTHROUGH_PORT, wait},
 };
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::grpcroutes::GrpcRoute;
@@ -1241,6 +1241,153 @@ fn grpcroute_parent_condition(route: &GrpcRoute, type_: &str) -> Option<(String,
             .find(|c| c.type_ == type_)
             .map(|c| (c.status.clone(), c.reason.clone()))
     })
+}
+
+// ── listener attachedRoutes across route kinds (#470) ─────────────────────────
+
+/// `status.listeners[name].attachedRoutes` for the named listener, or `None` if
+/// the Gateway has no status yet or no listener by that name.
+fn listener_attached_routes(gw: &Gateway, listener: &str) -> Option<i32> {
+    gw.status
+        .as_ref()?
+        .listeners
+        .as_deref()?
+        .iter()
+        .find(|l| l.name == listener)
+        .map(|l| l.attached_routes)
+}
+
+/// Both GRPCRoutes in the fixture attach to the Gateway's HTTP listener, so its
+/// `attachedRoutes` reaches 2. Guards the GRPCRoute arm of [#470]: before the
+/// fix the counter only walked HTTPRoutes, so GRPC-only listeners reported 0.
+#[tokio::test]
+async fn grpc_routes_counted_in_listener_attached_routes() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-grpc-attached").await?;
+
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_ROUTE_STATUS, FixtureVars::new(&ns.name)).await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let observed = gw_api
+                .get("coxswain-grpc-status-gw")
+                .await
+                .ok()
+                .map_or_else(
+                    || "<could not fetch Gateway>".to_string(),
+                    |gw| format!("attachedRoutes={:?}", listener_attached_routes(&gw, "http")),
+                );
+            format!(
+                "Gateway coxswain-grpc-status-gw listener 'http' to report attachedRoutes=2 \
+                 (both GRPCRoutes attach); observed {observed}"
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-grpc-status-gw").await.ok()?;
+            (listener_attached_routes(&gw, "http") == Some(2)).then_some(())
+        },
+    )
+    .await
+}
+
+/// A TLSRoute on a `TLS/Passthrough` listener bumps that listener's
+/// `attachedRoutes` to 1. Before [#470] passthrough listeners were never
+/// counted (the HTTPRoute-only counter skipped passthrough listeners), so this
+/// always read 0.
+#[tokio::test]
+async fn tls_passthrough_route_counted_in_listener_attached_routes() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-tls-attached").await?;
+    let hostname = format!("passthrough.{}.local", ns.name);
+
+    fixtures::apply_fixture(
+        gwa::TLS_PASSTHROUGH,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("PASSTHROUGH_HOSTNAME", &hostname),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let observed = gw_api
+                .get("coxswain-passthrough-gw")
+                .await
+                .ok()
+                .map_or_else(
+                    || "<could not fetch Gateway>".to_string(),
+                    |gw| {
+                        format!(
+                            "attachedRoutes={:?}",
+                            listener_attached_routes(&gw, "tls-passthrough")
+                        )
+                    },
+                );
+            format!(
+                "Gateway coxswain-passthrough-gw listener 'tls-passthrough' to report \
+                 attachedRoutes=1; observed {observed}"
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-passthrough-gw").await.ok()?;
+            (listener_attached_routes(&gw, "tls-passthrough") == Some(1)).then_some(())
+        },
+    )
+    .await
+}
+
+/// Sad path: a `TLS/Passthrough` listener with no TLSRoute reports
+/// `attachedRoutes=0` — the counter must not over-count, and a passthrough
+/// listener still gets a status entry once the Gateway is Programmed.
+#[tokio::test]
+async fn tls_passthrough_listener_without_route_reports_zero_attached_routes() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-tls-noroute-attached").await?;
+    let hostname = format!("passthrough.{}.local", ns.name);
+
+    fixtures::apply_fixture(
+        gwa::TLS_PASSTHROUGH_GW_ONLY,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("PASSTHROUGH_HOSTNAME", &hostname),
+    )
+    .await?;
+
+    // Programmed=True proves the controller reconciled and wrote listener status.
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-passthrough-gw-only",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let gw = gw_api.get("coxswain-passthrough-gw-only").await?;
+    assert_eq!(
+        listener_attached_routes(&gw, "tls-passthrough"),
+        Some(0),
+        "passthrough listener with no TLSRoute must report attachedRoutes=0"
+    );
+
+    Ok(())
 }
 
 // ── GEP-91 InsecureFrontendValidationMode condition (#86) ─────────────────────

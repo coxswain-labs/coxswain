@@ -169,14 +169,6 @@ impl ListenerSpec {
         }
     }
 
-    /// Create a TLS passthrough listener spec for the given address (TLSRoute / GEP-2643).
-    pub fn tls_passthrough(addr: SocketAddr) -> Self {
-        Self {
-            addr,
-            protocol: ListenerProtocol::TlsPassthrough,
-        }
-    }
-
     /// Create a hybrid TLS listener spec for a port shared between TLS passthrough and HTTPS.
     ///
     /// Peeks the ClientHello SNI on accept: routes to passthrough if matched,

@@ -1285,7 +1285,25 @@ fn rebuild(
     );
     merge_backend_client_cert_health(&mut gateway_listener_health, &backend_client_certs.health);
 
-    count_attached_routes(&routes, &owned_gateways, &mut gateway_listener_health);
+    let tls_routes = stores.tls_routes.state();
+    count_attached_routes(
+        &routes,
+        &owned_gateways,
+        &mut gateway_listener_health,
+        false,
+    );
+    count_attached_routes(
+        &grpc_routes,
+        &owned_gateways,
+        &mut gateway_listener_health,
+        false,
+    );
+    count_attached_routes(
+        &tls_routes,
+        &owned_gateways,
+        &mut gateway_listener_health,
+        true,
+    );
 
     let gateways = stores.gateways.state();
 
