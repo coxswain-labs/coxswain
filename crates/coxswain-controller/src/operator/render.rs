@@ -48,12 +48,13 @@
 //!
 //! ## Service ports
 //!
-//! Each listener in `gateway.spec.listeners` becomes one entry on the
-//! Service. Listeners that share a `(port, protocol)` tuple are
-//! deduplicated — only the first listener at each unique tuple contributes
-//! a port entry (its `name` is used). Container ports mirror the Service
-//! ports. Protocol is always `TCP` (HTTP/HTTPS/TLS all ride TCP at the
-//! Service layer; the proxy distinguishes them at L7 by listener config).
+//! Each effective listener — the Gateway's own `spec.listeners` plus those
+//! merged from attached ListenerSets (GEP-1713, #93) — becomes one entry on the
+//! Service, deduplicated on port (the effective set already is, with
+//! collision-free names). When the effective set is empty the renderer falls
+//! back to `gateway.spec.listeners`. Container ports mirror the Service ports.
+//! Protocol is always `TCP` (HTTP/HTTPS/TLS all ride TCP at the Service layer;
+//! the proxy distinguishes them at L7 by listener config).
 
 use super::merge::strategic_merge_pod_template;
 use super::params::EffectiveParams;
@@ -128,6 +129,11 @@ pub(super) struct RenderInputs<'a> {
     /// Admin server port rendered as the `gateway.coxswain-labs.dev/admin-port`
     /// annotation on the pod template so fleet discovery can reach this pod.
     pub(super) admin_port: u16,
+    /// Effective listener ports (Gateway's own + attached ListenerSets', GEP-1713)
+    /// the dedicated proxy's Service and container expose. Empty falls back to
+    /// `gateway.spec.listeners` — so a ListenerSet listener on a new port is
+    /// served by the dedicated proxy too.
+    pub(super) effective_ports: &'a [EffectiveListenerPort],
 }
 
 /// Name of the projected ServiceAccount-token volume mounted into every
@@ -204,7 +210,12 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
 
     RenderedSpecs {
         service_account: render_service_account(&common),
-        service: render_service(&common, inputs.gateway, inputs.params),
+        service: render_service(
+            &common,
+            inputs.gateway,
+            inputs.params,
+            inputs.effective_ports,
+        ),
         deployment: render_deployment(&common, inputs),
     }
 }
@@ -363,9 +374,14 @@ fn render_service_account(common: &Common<'_>) -> ServiceAccount {
     }
 }
 
-fn render_service(common: &Common<'_>, gateway: &Gateway, params: &EffectiveParams) -> Service {
+fn render_service(
+    common: &Common<'_>,
+    gateway: &Gateway,
+    params: &EffectiveParams,
+    effective_ports: &[EffectiveListenerPort],
+) -> Service {
     let service_type = service_type_to_k8s_string(params.service_type.unwrap_or_default());
-    let ports = service_ports(gateway);
+    let ports = service_ports(gateway, effective_ports);
     // The Service selects pods by the reserved-set `app.kubernetes.io/name` +
     // `instance` labels — narrower than all four, but the canonical operator
     // pattern. Reserved-set means a user infrastructure label cannot break
@@ -406,34 +422,48 @@ fn service_type_to_k8s_string(t: ServiceType) -> String {
         .unwrap_or_else(|| "LoadBalancer".to_string())
 }
 
-/// One ServicePort per Gateway listener, deduplicated on `(port, protocol)`.
-/// Listeners that share a `(port, protocol)` keep only the first one's
-/// `name`; this matches K8s's requirement that ServicePort names within a
-/// Service be unique and ports be unique by `(port, protocol)`.
-///
-/// NOTE (GEP-1713, #93): this reads `gateway.spec.listeners` only. The
-/// **shared-mode** VIP path provisions effective (Gateway + ListenerSet) ports
-/// via [`shared_service_ports`], but a **dedicated** proxy's Service does not yet
-/// expose ListenerSet listener ports on a *new* port — tracked as a follow-up.
-/// ListenerSet listeners reusing an existing Gateway port work in both modes.
-fn service_ports(gateway: &Gateway) -> Vec<ServicePort> {
-    let mut seen: BTreeSet<(i32, &'static str)> = BTreeSet::new();
+/// The listener `(name, port)` pairs a dedicated proxy exposes: the effective set
+/// (Gateway's own + attached ListenerSets', GEP-1713) when present, else the
+/// Gateway's own `spec.listeners`. Deduplicated on port (the effective set already
+/// is, with collision-free names; the fallback dedups here keeping the first name).
+fn listener_name_ports(
+    gateway: &Gateway,
+    effective_ports: &[EffectiveListenerPort],
+) -> Vec<(String, u16)> {
+    if !effective_ports.is_empty() {
+        return effective_ports
+            .iter()
+            .map(|l| (l.name.clone(), l.port))
+            .collect();
+    }
+    let mut seen: BTreeSet<u16> = BTreeSet::new();
     let mut out = Vec::new();
     for listener in &gateway.spec.listeners {
-        let port = listener.port;
-        let protocol = "TCP";
-        if !seen.insert((port, protocol)) {
+        let Ok(port) = u16::try_from(listener.port) else {
             continue;
+        };
+        if seen.insert(port) {
+            out.push((listener.name.clone(), port));
         }
-        out.push(ServicePort {
-            name: Some(listener.name.clone()),
-            port,
-            target_port: Some(IntOrString::Int(port)),
-            protocol: Some(protocol.to_string()),
-            ..Default::default()
-        });
     }
     out
+}
+
+/// One ServicePort per effective listener port (Gateway's own + attached
+/// ListenerSets', GEP-1713), deduplicated on port. ServicePort names are unique
+/// (K8s requires it within a Service). Falls back to `gateway.spec.listeners` when
+/// `effective_ports` is empty.
+fn service_ports(gateway: &Gateway, effective_ports: &[EffectiveListenerPort]) -> Vec<ServicePort> {
+    listener_name_ports(gateway, effective_ports)
+        .into_iter()
+        .map(|(name, port)| ServicePort {
+            name: Some(name),
+            port: i32::from(port),
+            target_port: Some(IntOrString::Int(i32::from(port))),
+            protocol: Some("TCP".to_string()),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// `app.kubernetes.io/component` value stamped on the per-Gateway shared-mode
@@ -627,7 +657,7 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         name: "coxswain".to_string(),
         image: Some(image),
         args: Some(args),
-        ports: Some(container_ports(inputs.gateway)),
+        ports: Some(container_ports(inputs.gateway, inputs.effective_ports)),
         resources: inputs.params.resources.clone(),
         volume_mounts: Some(discovery_volume_mounts()),
         ..Default::default()
@@ -734,16 +764,17 @@ fn discovery_volume_mounts() -> Vec<VolumeMount> {
     ]
 }
 
-fn container_ports(gateway: &Gateway) -> Vec<ContainerPort> {
+fn container_ports(
+    gateway: &Gateway,
+    effective_ports: &[EffectiveListenerPort],
+) -> Vec<ContainerPort> {
     let mut seen: BTreeSet<i32> = BTreeSet::new();
     let mut out = Vec::new();
-    for listener in &gateway.spec.listeners {
-        let port = listener.port;
-        if !seen.insert(port) {
-            continue;
-        }
+    for (name, port) in listener_name_ports(gateway, effective_ports) {
+        let port = i32::from(port);
+        seen.insert(port);
         out.push(ContainerPort {
-            name: Some(listener.name.clone()),
+            name: Some(name),
             container_port: port,
             protocol: Some("TCP".to_string()),
             ..Default::default()
@@ -838,6 +869,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
 
         // Names per GEP-1762.
@@ -891,6 +923,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         assert_eq!(result.deployment.spec.unwrap().replicas, Some(5));
         assert_eq!(
@@ -916,6 +949,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         let container = &pod_spec.containers[0];
@@ -982,6 +1016,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2);
@@ -1016,6 +1051,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2, "the two HTTP:80 listeners dedupe");
@@ -1048,6 +1084,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod_spec.containers.len(), 2, "coxswain + sidecar");
@@ -1094,6 +1131,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         for labels in [
             result.deployment.metadata.labels.as_ref(),
@@ -1136,6 +1174,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(
@@ -1166,6 +1205,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         for meta in [
             &result.deployment.metadata,
@@ -1211,6 +1251,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         for meta in [
             &result.deployment.metadata,
@@ -1255,6 +1296,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         let labels = result.deployment.metadata.labels.as_ref().expect("labels");
         assert_eq!(
@@ -1295,6 +1337,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         for meta in [
             &result.deployment.metadata,
@@ -1383,5 +1426,49 @@ mod tests {
         assert!(a.len() <= 63, "within the DNS label limit");
         // Deterministic (the status writer recomputes it).
         assert_eq!(a, shared_gateway_service_name("team-a", "gw"));
+    }
+
+    // ── GEP-1713: dedicated proxy exposes effective (ListenerSet) ports ───────
+
+    #[test]
+    fn dedicated_ports_include_effective_listener_set_ports_with_spec_fallback() {
+        let gw = make_gateway("team-a", "gw", vec![("http", 8000, "HTTP")]);
+        let effective = vec![
+            EffectiveListenerPort {
+                name: "http".to_string(),
+                port: 8000,
+                protocol: "HTTP".to_string(),
+            },
+            EffectiveListenerPort {
+                name: "ls".to_string(),
+                port: 8001,
+                protocol: "HTTP".to_string(),
+            },
+        ];
+
+        // Service exposes both the Gateway port and the ListenerSet's new port.
+        let svc_ports = service_ports(&gw, &effective);
+        let ports: Vec<i32> = svc_ports.iter().map(|p| p.port).collect();
+        assert!(
+            ports.contains(&8000) && ports.contains(&8001),
+            "dedicated Service must expose the ListenerSet listener port, got {ports:?}"
+        );
+
+        // The proxy container binds the ListenerSet port too (plus health/admin).
+        let cports = container_ports(&gw, &effective);
+        let cp: Vec<i32> = cports.iter().map(|c| c.container_port).collect();
+        assert!(
+            cp.contains(&8001),
+            "container must bind the ListenerSet port"
+        );
+        assert!(
+            cp.contains(&8081) && cp.contains(&8082),
+            "health/admin container ports preserved"
+        );
+
+        // Empty effective → fall back to spec.listeners (existing behaviour).
+        let fallback = service_ports(&gw, &[]);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].port, 8000);
     }
 }

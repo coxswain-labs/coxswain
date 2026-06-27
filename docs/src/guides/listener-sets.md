@@ -189,7 +189,3 @@ kubectl describe listenerset team-a-listeners -n team-a
   listener share the same port with distinct hostnames, both program and share the
   same bind slot; request isolation is enforced per source. Mixing same-port listeners
   from different owners with overlapping hostnames is not recommended.
-- **Dedicated proxies and new ports.** A ListenerSet listener on a **new** port
-  (one the parent Gateway does not already serve) is exposed in the default
-  **shared** deployment but not yet on a **dedicated** per-Gateway proxy. A
-  ListenerSet listener that reuses an existing Gateway port works in both modes.

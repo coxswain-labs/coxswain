@@ -2358,3 +2358,36 @@ async fn cross_namespace_mirror_requires_reference_grant() -> anyhow::Result<()>
 
     Ok(())
 }
+
+/// GEP-1713: an HTTPRoute attaches to a ListenerSet listener on a NEW port the
+/// parent Gateway does not itself serve. Proves the full path: the parent opts
+/// in (`allowedListeners`), the merge attaches the ListenerSet, the operator
+/// provisions the new port on the per-Gateway VIP (G3), and traffic routes.
+#[tokio::test]
+async fn gateway_listenerset_routes_to_backend_on_new_port() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-ls").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::LISTENERSET_BASIC, FixtureVars::new(&ns.name)).await?;
+
+    // The ListenerSet listener is on port 8001 — a port the Gateway itself does
+    // not serve. Resolve the per-Gateway VIP on that port (G3 must expose it).
+    const LS_PORT: u16 = 8001;
+    let addr = wait::wait_for_gateway_address(
+        &h.client,
+        "coxswain-test",
+        &ns.name,
+        LS_PORT,
+        Duration::from_secs(120),
+    )
+    .await?;
+    let gw = HttpClient::new(addr)?;
+
+    let host = format!("ls.{}.local", ns.name);
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    Ok(())
+}

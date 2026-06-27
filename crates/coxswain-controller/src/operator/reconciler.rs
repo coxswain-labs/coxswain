@@ -872,6 +872,28 @@ async fn reconcile_inner(
         return Ok(Action::requeue(POST_FINALIZER_REQUEUE));
     }
 
+    // Effective listener ports for THIS dedicated Gateway: its own listeners plus
+    // those merged from attached ListenerSets (GEP-1713, #93), so the dedicated
+    // proxy's Service and container expose ListenerSet listener ports too.
+    let dedicated_listener_sets = ctx.listener_sets_store.state();
+    let dedicated_owned_classes: std::collections::HashSet<String> = ctx
+        .class_store
+        .state()
+        .iter()
+        .filter(|gc| gc.spec.controller_name == ctx.controller_name)
+        .filter_map(|gc| gc.meta().name.clone())
+        .collect();
+    let dedicated_effective = coxswain_reflector::effective_listener_ports(
+        std::slice::from_ref(&gw),
+        &dedicated_listener_sets,
+        &dedicated_owned_classes,
+        &ctx.namespaces_store,
+    );
+    let empty_effective_ports = Vec::new();
+    let dedicated_ports = dedicated_effective
+        .get(&gateway_key(&gw))
+        .unwrap_or(&empty_effective_ports);
+
     let rendered = render::render(&render::RenderInputs {
         gateway: &gw,
         params: &effective,
@@ -883,6 +905,7 @@ async fn reconcile_inner(
         discovery_ca_bundle_path: &ctx.discovery_ca_bundle_path,
         discovery_trust_domain: &ctx.discovery_trust_domain,
         admin_port: ctx.admin_port,
+        effective_ports: dedicated_ports,
     });
 
     // Stage 1a — make the controller's CA trust bundle reachable from the
@@ -1697,6 +1720,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         let r_b = render::render(&render::RenderInputs {
             gateway: &gw,
@@ -1709,6 +1733,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         });
         assert_ne!(
             hash_rendered(&r_a),
@@ -1749,6 +1774,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            effective_ports: &[],
         };
         let r1 = render::render(&inputs);
         let r2 = render::render(&inputs);

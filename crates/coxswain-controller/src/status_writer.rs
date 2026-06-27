@@ -130,6 +130,8 @@ pub fn spawn_status_writer(
             "ingress_class_parameters",
             "gateway",
             "gateway_class",
+            "listener_set",
+            "namespace",
             "endpoint_slice",
             "reference_grant",
             "secret",

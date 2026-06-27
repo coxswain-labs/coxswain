@@ -59,6 +59,16 @@ pub const WEIGHTED_SPLIT: &str = fixture!("weighted_split.yaml");
 pub const SERVING_DRAIN: &str = fixture!("serving_drain.yaml");
 /// HTTPRoute with a `parentRef.port` selector.
 pub const PARENT_REF_PORT: &str = fixture!("parent_ref_port.yaml");
+/// GEP-1713: Gateway opting into same-ns ListenerSets + a ListenerSet adding a
+/// listener on a NEW port (8001) + an HTTPRoute attaching via `parentRef.kind:
+/// ListenerSet`. Happy path for ListenerSet routing + new-port provisioning.
+pub const LISTENERSET_BASIC: &str = fixture!("listenerset_basic.yaml");
+/// GEP-1713 sad path: the Gateway sets no `allowedListeners` (defaults to None),
+/// so the ListenerSet is rejected (`Accepted=False/NotAllowed`).
+pub const LISTENERSET_OPT_OUT: &str = fixture!("listenerset_opt_out.yaml");
+/// GEP-1713: a Gateway listener and a ListenerSet listener share the name "web"
+/// on different ports; both must program (provenance-keyed health).
+pub const LISTENERSET_DUPLICATE_NAME: &str = fixture!("listenerset_duplicate_name.yaml");
 /// HTTPRoute backend using `kubernetes.io/h2c` app protocol.
 pub const GATEWAY_APP_PROTOCOL_H2C: &str = fixture!("gateway_app_protocol_h2c.yaml");
 /// BackendTLSPolicy test: Gateway + HTTPRoute + ConfigMap CA + policy targeting the TLS echo Service.
