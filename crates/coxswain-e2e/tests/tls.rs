@@ -225,6 +225,93 @@ async fn cert_manager_ingress_provisioning() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Verifies the HTTP-01 ACME challenge passthrough end-to-end (#184):
+/// 1. Pebble (a test ACME server) runs in the test namespace.
+/// 2. An `Ingress` with a cert-manager `Issuer` annotation triggers an HTTP-01 Order.
+/// 3. cert-manager creates a temporary solver `Ingress` (copying `ingressClassName`);
+///    Coxswain picks it up and routes `/.well-known/acme-challenge/<token>` to the
+///    cert-manager solver pod.
+/// 4. Pebble validates the challenge by connecting to the proxy FQDN on port 80 — the
+///    FQDN resolves via cluster DNS to the proxy's ClusterIP, so no external DNS is needed.
+/// 5. cert-manager creates the `kubernetes.io/tls` Secret and deletes the solver `Ingress`.
+/// 6. Coxswain serves TLS using the Pebble-issued certificate.
+///
+/// `--status-address` is a hard requirement: Coxswain only patches
+/// `Ingress.status.loadBalancer` when a status address is configured (the
+/// reconciler returns early and writes nothing when it is absent). cert-manager's
+/// HTTP-01 controller waits for `Ingress.status.loadBalancer.ingress` to be
+/// populated before presenting the challenge to Pebble. Here `status_address` is
+/// the proxy's in-cluster FQDN; Pebble resolves it via cluster DNS.
+#[tokio::test]
+async fn cert_manager_http01_challenge_issues_and_serves_certificate() -> anyhow::Result<()> {
+    // The proxy's in-cluster FQDN serves three roles simultaneously:
+    //   • the Ingress `host` / TLS SNI name (what we request)
+    //   • the `status_address` Coxswain writes into Ingress.status (hostname form)
+    //   • the domain Pebble resolves via cluster DNS to reach the challenge endpoint
+    const PROXY_FQDN: &str = "coxswain-shared-proxy.coxswain-system.svc.cluster.local";
+
+    let h = Harness::start_with_options(ControllerOptions {
+        status_address: Some(PROXY_FQDN.to_string()),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-ing-acme-h1").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Generate a self-signed cert whose SAN is Pebble's in-cluster DNS name.
+    // The same PEM is used as the cert-manager Issuer's caBundle, so cert-manager
+    // trusts Pebble's ACME directory TLS endpoint without a cluster-wide CA change.
+    let pebble_sni = format!("pebble.{}.svc.cluster.local", ns.name);
+    let pebble_cert = GeneratedCert::for_host(&pebble_sni);
+
+    fixtures::apply_fixture(
+        ingress::ACME_PEBBLE,
+        FixtureVars::new(&ns.name)
+            .with("PEBBLE_CERT_B64", &pebble_cert.cert_b64())
+            .with("PEBBLE_KEY_B64", &pebble_cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["pebble"]).await?;
+
+    let secret_name = "acme-http01-tls";
+    fixtures::apply_fixture(
+        ingress::ACME_HTTP01_INGRESS,
+        FixtureVars::new(&ns.name)
+            .with("PROXY_FQDN", PROXY_FQDN)
+            .with("PEBBLE_CA_B64", &pebble_cert.cert_b64())
+            .with("SECRET_NAME", secret_name)
+            .with("BACKEND_NAME", "echo-a"),
+    )
+    .await?;
+
+    // Wait for cert-manager to complete the HTTP-01 flow through Coxswain.
+    // Full chain: Issuer registers with Pebble → Order → Challenge → solver Ingress
+    // (ingressClassName: coxswain) → Coxswain routes /.well-known/acme-challenge/<token>
+    // → cert-manager solver pod → Pebble validates via proxy FQDN → Secret created.
+    wait::wait_for_tls_secret(&h.client, secret_name, &ns.name, Duration::from_secs(180)).await?;
+
+    // Coxswain picks up the Secret via its Secret watch; wait for HTTPS to become live.
+    let resp =
+        wait::wait_for_https_route(h.tls_addr, PROXY_FQDN, "/", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    // Negative: cert-manager deletes the solver Ingress after issuance.
+    // The challenge path now falls through to the parent Ingress's `/` Prefix rule
+    // (echo-a) — confirming the solver route was removed and did not leak.
+    let (status, body) =
+        http::https_get(PROXY_FQDN, "/.well-known/acme-challenge/probe", h.tls_addr).await?;
+    assert_eq!(
+        status, 200,
+        "expected 200 from parent Ingress after solver Ingress cleanup; got {status}"
+    );
+    body.expect("expected echo-a JSON body on challenge path after solver cleanup")
+        .assert_backend("echo-a");
+
+    Ok(())
+}
+
 /// Verifies PROXY protocol v1 on the plain-HTTP listener:
 /// - Controller started with --proxy-accept-proxy-protocol and 127.0.0.1/32 trusted.
 /// - Raw TCP connection sends "PROXY TCP4 198.51.100.42 ... \r\n" then HTTP/1.1 GET.
