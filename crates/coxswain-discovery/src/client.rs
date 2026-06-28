@@ -63,6 +63,17 @@ pub struct DiscoveryClientConfig {
     /// HTTP/2 keep-alive timeout: how long to wait for the ping response before
     /// treating the connection as dead (default: 5 s).
     pub keep_alive_timeout: Duration,
+    /// Maximum time a single TCP+TLS connect attempt may take before it is
+    /// treated as failed and the supervisor backs off (default: 5 s).
+    ///
+    /// The discovery endpoint is a Service ClusterIP. During a controller
+    /// rollout that ClusterIP can momentarily route to a terminating pod (the
+    /// SYN is black-holed) — without an explicit bound the connect hangs on the
+    /// OS default (tens of seconds), so the reconnect supervisor cannot cycle
+    /// and the proxy stays `Degraded` long after the controller is back. A short
+    /// bound makes a wasted attempt fail fast and the next retry hit a live
+    /// endpoint.
+    pub connect_timeout: Duration,
     /// Initial backoff duration; doubles on each failed attempt (default: 250 ms).
     pub backoff_base: Duration,
     /// Maximum backoff ceiling; full-jitter stays within `[0, cap]` (default: 30 s).
@@ -103,6 +114,7 @@ impl DiscoveryClientConfig {
             scope: Scope::SharedPool,
             http2_keep_alive_interval: Duration::from_secs(30),
             keep_alive_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(5),
             backoff_base: Duration::from_millis(250),
             backoff_cap: Duration::from_secs(30),
             tls: None,
@@ -736,7 +748,8 @@ fn build_channel(config: &DiscoveryClientConfig) -> Result<Channel, DiscoveryErr
             })?
             .http2_keep_alive_interval(config.http2_keep_alive_interval)
             .keep_alive_timeout(config.keep_alive_timeout)
-            .keep_alive_while_idle(true);
+            .keep_alive_while_idle(true)
+            .connect_timeout(config.connect_timeout);
         match &resolved_tls {
             Some(tls) => Ok(tls.apply(ep)?),
             None => Ok(ep),
@@ -971,6 +984,7 @@ mod tests {
             scope: Scope::SharedPool,
             http2_keep_alive_interval: Duration::from_secs(30),
             keep_alive_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(5),
             // Tiny backoff so reconnect tests complete quickly.
             backoff_base: Duration::from_millis(10),
             backoff_cap: Duration::from_millis(50),

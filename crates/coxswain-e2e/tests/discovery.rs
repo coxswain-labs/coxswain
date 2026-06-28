@@ -349,14 +349,46 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
     )
     .await?;
 
-    // Definitive reconnection proof — lead with the data plane. A route created
-    // *after* the restart is compiled by the new controller and only serves once
-    // the shared proxy has reconnected and applied the fresh snapshot. This
-    // single assertion subsumes "did the proxy reconnect": if `echo-b` answers on
-    // a brand-new host, the discovery stream is provably live end-to-end. The
-    // window is generous because the proxy's reconnect backoff can be at its 30 s
-    // cap when the controller returns (it climbed during the downtime); this
-    // mirrors the controller-restart catch-up assertions in `resilience.rs`.
+    // Gate on the proxy actually reconnecting BEFORE creating the post-restart
+    // route: poll until shared-proxy health clears Degraded and returns to
+    // `ready`, which happens only once the discovery client has reconnected and
+    // applied a post-reconnect snapshot. The proxy's reconnect backoff can sit at
+    // its 30 s full-jitter cap when the controller returns (it climbed during the
+    // downtime), so this window is generous. Sequencing recovery first — rather
+    // than racing it against a freshly-applied route — keeps the route assertion
+    // below on the same apply→serve path every steady-state routing test uses,
+    // instead of coupling two independent async convergences (reconnect + push)
+    // into one bounded wait.
+    let proxy_health_url2 = h2.admin_url("/api/v1/health");
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || {
+            let url = proxy_health_url2.clone();
+            async move {
+                let state = proxy_health_state(&url).await;
+                format!(
+                    "shared proxy subsystems.proxy.state to return to 'ready' \
+                     (discovery client reconnected); currently: {state:?}"
+                )
+            }
+        },
+        || {
+            let url = proxy_health_url2.clone();
+            async move {
+                let state = proxy_health_state(&url).await?;
+                (state == "ready").then_some(())
+            }
+        },
+    )
+    .await
+    .context("shared proxy did not return to Ready after controller restart")?;
+
+    // With the stream provably live, create a brand-new route and confirm it
+    // serves end-to-end. `echo-b` answering on a host that never existed before
+    // the restart proves the reconnected discovery stream delivers fresh
+    // snapshots — the data-plane half of recovery. Mirrors the controller-restart
+    // catch-up assertions in `resilience.rs`.
     let fresh_host = format!("disc-restart-fresh.{}.local", ns.name);
     let fresh_ingress = json!({
         "apiVersion": "networking.k8s.io/v1",
@@ -391,34 +423,6 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
 
     // The pre-existing route still serves too.
     wait::wait_for_backend(&h2.http, &host, "/a", "echo-a", Duration::from_secs(30)).await?;
-
-    // Proxy health has returned to Ready — corroborates the degraded→ready
-    // transition on the discovery client (serving a fresh route means a
-    // post-reconnect snapshot was applied, which clears Degraded).
-    let proxy_health_url2 = h2.admin_url("/api/v1/health");
-    wait::poll_until(
-        Duration::from_secs(30),
-        wait::POLL,
-        || {
-            let url = proxy_health_url2.clone();
-            async move {
-                let state = proxy_health_state(&url).await;
-                format!(
-                    "shared proxy subsystems.proxy.state to return to 'ready'; \
-                     currently: {state:?}"
-                )
-            }
-        },
-        || {
-            let url = proxy_health_url2.clone();
-            async move {
-                let state = proxy_health_state(&url).await?;
-                (state == "ready").then_some(())
-            }
-        },
-    )
-    .await
-    .context("shared proxy did not return to Ready after controller restart")?;
 
     // Final confirmation of the server-side discovery metric: now that the data
     // plane has proven the stream is live, the controller's gauge must report the
