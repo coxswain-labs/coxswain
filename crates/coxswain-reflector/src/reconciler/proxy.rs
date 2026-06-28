@@ -2126,7 +2126,10 @@ mod tests {
         assert!(r.default_ingress_class.is_none());
         assert!(r.gateway_classes.is_empty());
         assert!(r.gateways.is_empty());
-        assert!(handle.load().is_empty(), "side-effect: owned gateways handle must be empty");
+        assert!(
+            handle.load().is_empty(),
+            "side-effect: owned gateways handle must be empty"
+        );
     }
 
     #[test]
@@ -2139,7 +2142,10 @@ mod tests {
             "cox",
             &handle,
         );
-        assert!(r.ingress_classes.contains("nginx"), "owned IC must appear in ingress_classes");
+        assert!(
+            r.ingress_classes.contains("nginx"),
+            "owned IC must appear in ingress_classes"
+        );
         assert!(r.default_ingress_class.is_none());
         assert!(r.gateway_classes.is_empty(), "no GatewayClasses in store");
     }
@@ -2154,7 +2160,10 @@ mod tests {
             "cox",
             &handle,
         );
-        assert!(r.ingress_classes.is_empty(), "IC from foreign controller must be excluded");
+        assert!(
+            r.ingress_classes.is_empty(),
+            "IC from foreign controller must be excluded"
+        );
     }
 
     #[test]
@@ -2200,9 +2209,15 @@ mod tests {
             "cox",
             &handle,
         );
-        assert!(r.gateway_classes.contains("cox-class"), "gateway_classes must contain owned class");
         assert!(
-            r.gateways.contains(&coxswain_core::ownership::ObjectKey::new("default", "my-gw")),
+            r.gateway_classes.contains("cox-class"),
+            "gateway_classes must contain owned class"
+        );
+        assert!(
+            r.gateways
+                .contains(&coxswain_core::ownership::ObjectKey::new(
+                    "default", "my-gw"
+                )),
             "gateways must contain the owned gateway"
         );
         assert!(r.ingress_classes.is_empty(), "no IngressClasses in store");
