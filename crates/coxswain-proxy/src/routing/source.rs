@@ -30,6 +30,7 @@ pub struct KubernetesSource {
     client_cert_store: SharedClientCertStore,
     listener_hostnames: SharedListenerHostnames,
     passthrough_routes: SharedTlsPassthroughTable,
+    terminate_routes: SharedTlsPassthroughTable,
 }
 
 impl KubernetesSource {
@@ -42,6 +43,7 @@ impl KubernetesSource {
         client_cert_store: SharedClientCertStore,
         listener_hostnames: SharedListenerHostnames,
         passthrough_routes: SharedTlsPassthroughTable,
+        terminate_routes: SharedTlsPassthroughTable,
     ) -> Self {
         Self {
             ingress_routes,
@@ -50,6 +52,7 @@ impl KubernetesSource {
             client_cert_store,
             listener_hostnames,
             passthrough_routes,
+            terminate_routes,
         }
     }
 }
@@ -77,5 +80,9 @@ impl RoutingSource for KubernetesSource {
 
     fn passthrough_routes(&self) -> SharedTlsPassthroughTable {
         self.passthrough_routes.clone()
+    }
+
+    fn terminate_routes(&self) -> SharedTlsPassthroughTable {
+        self.terminate_routes.clone()
     }
 }

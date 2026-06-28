@@ -17,8 +17,7 @@
 pub(crate) mod addresses;
 
 use coxswain_reflector::gw_types::v::gateways::{
-    GatewayListeners, GatewayListenersTlsMode, GatewayStatusListeners,
-    GatewayStatusListenersSupportedKinds,
+    GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
 use coxswain_reflector::ingress::IngressPorts;
 use coxswain_reflector::status::{FrontendValidationOutcome, ListenerInfo, ListenerReadiness};
@@ -65,11 +64,11 @@ pub(crate) fn make_condition(
 ///   controller. When true, `ResolvedRefs: False, reason: InvalidRouteKinds`
 ///   must be set on the listener.
 /// - `supported_kinds`: intersection of the listed kinds with what we support
-///   (`HTTPRoute`, and `TLSRoute` on TLS/Passthrough listeners). Empty list
-///   when all listed kinds are unsupported. When `allowedRoutes.kinds` is
-///   absent or empty, returns the default kind for the listener protocol
-///   (`TLSRoute` for TLS/Passthrough, `HTTPRoute` otherwise) with
-///   `has_any_invalid=false`.
+///   (`HTTPRoute`, and `TLSRoute` on `protocol: TLS` listeners regardless of
+///   mode). Empty list when all listed kinds are unsupported. When
+///   `allowedRoutes.kinds` is absent or empty, returns the default kind for
+///   the listener protocol (`TLSRoute` for `protocol: TLS`, `HTTPRoute`
+///   otherwise) with `has_any_invalid=false`.
 pub(crate) fn listener_route_kind_info(
     listener: &GatewayListeners,
 ) -> (bool, Vec<GatewayStatusListenersSupportedKinds>) {
@@ -82,14 +81,11 @@ pub(crate) fn listener_route_kind_info(
         group: Some(GW_GROUP.to_string()),
         kind: "TLSRoute".to_string(),
     };
-    // Determine whether this is a TLS/Passthrough listener. That listener's
-    // natural default route kind is TLSRoute rather than HTTPRoute.
-    let is_passthrough = listener.protocol == "TLS"
-        && listener
-            .tls
-            .as_ref()
-            .and_then(|t| t.mode.as_ref())
-            .is_some_and(|m| matches!(m, GatewayListenersTlsMode::Passthrough));
+    // Any `protocol: TLS` listener (Passthrough or Terminate) carries TLSRoute
+    // as its natural route kind. `protocol: HTTPS` is distinct — TLS terminated
+    // at the gateway but with HTTP/GRPC parsing — so it falls through to the
+    // HTTPRoute default.
+    let is_tls_listener = listener.protocol == "TLS";
 
     let allowed = match listener
         .allowed_routes
@@ -98,7 +94,7 @@ pub(crate) fn listener_route_kind_info(
     {
         Some(k) if !k.is_empty() => k,
         _ => {
-            if is_passthrough {
+            if is_tls_listener {
                 return (false, vec![tls_route_kind()]);
             }
             return (false, vec![http_route_kind()]);
@@ -114,7 +110,7 @@ pub(crate) fn listener_route_kind_info(
             .is_none_or(|g| g.is_empty() || g == GW_GROUP);
         if k.kind == "HTTPRoute" && group_ok {
             includes_http_route = true;
-        } else if k.kind == "TLSRoute" && group_ok && is_passthrough {
+        } else if k.kind == "TLSRoute" && group_ok && is_tls_listener {
             includes_tls_route = true;
         } else {
             has_invalid = true;

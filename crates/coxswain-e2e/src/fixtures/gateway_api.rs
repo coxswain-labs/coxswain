@@ -261,3 +261,17 @@ pub const TLS_PASSTHROUGH: &str = fixture!("tls_passthrough.yaml");
 /// and that incoming connections are dropped (no backend to forward to).
 /// Placeholders: `GATEWAY_TLS_PASSTHROUGH_PORT`, `PASSTHROUGH_HOSTNAME`.
 pub const TLS_PASSTHROUGH_GW_ONLY: &str = fixture!("tls_passthrough_gw_only.yaml");
+
+// ── TLS terminate (TLSRouteModeTerminate, #481) ───────────────────────────────
+
+/// Gateway with `protocol: TLS, tls.mode: Terminate` + TLSRoute to a plaintext backend.
+/// The proxy terminates TLS using the listener cert and L4-splices to the backend.
+/// Placeholders: `GATEWAY_TLS_PASSTHROUGH_PORT`, `TERMINATE_HOSTNAME`,
+///               `GW_TLS_CRT_B64`, `GW_TLS_KEY_B64`.
+pub const TLS_TERMINATE: &str = fixture!("tls_terminate.yaml");
+
+/// One Gateway with both a Terminate and a Passthrough TLS listener on the same port.
+/// Disambiguated by SNI; each routes to its own isolated backend (TLSRouteModeMixed, #481).
+/// Placeholders: `GATEWAY_TLS_PASSTHROUGH_PORT`, `TERMINATE_HOSTNAME`, `PASSTHROUGH_HOSTNAME`,
+///               `GW_TLS_CRT_B64`, `GW_TLS_KEY_B64`.
+pub const TLS_MIXED: &str = fixture!("tls_mixed.yaml");

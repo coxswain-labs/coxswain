@@ -133,8 +133,15 @@ pub enum ListenerReadiness {
     ///
     /// The proxy peeks the ClientHello SNI and forwards the raw encrypted stream
     /// to the backend — no TLS is terminated at the proxy. The data plane creates
-    /// a `ListenerProtocol::TlsPassthrough` listener on this port.
+    /// a `ListenerProtocol::TlsL4` listener on this port.
     TlsPassthrough,
+    /// `protocol: TLS, tls.mode: Terminate` listener (TLSRouteModeMixed / TLSRouteModeTerminate).
+    ///
+    /// The proxy terminates TLS using the listener cert selected by SNI, then
+    /// L4-splices the decrypted plaintext stream to the backend over plain TCP —
+    /// no HTTP parsing. The certificate is resolved into the per-port TLS store
+    /// exactly as for HTTPS; routing is by SNI hostname, not HTTP headers.
+    TlsTerminate,
 }
 
 impl ListenerReadiness {
@@ -153,14 +160,14 @@ impl ListenerReadiness {
     /// Returns `true` for outcomes the controller should treat as healthy.
     ///
     /// `NotApplicable` (non-HTTPS listener), `Resolved` (all refs resolved),
-    /// and `TlsPassthrough` (SNI-peek path, no cert needed) are healthy.
-    /// `ResolvedPartial` is **not** healthy — it carries a degraded
-    /// `ResolvedRefs=False` condition — even though the listener is still serving.
+    /// `TlsPassthrough`, and `TlsTerminate` are healthy. `ResolvedPartial` is
+    /// **not** healthy — it carries a degraded `ResolvedRefs=False` condition —
+    /// even though the listener is still serving.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         matches!(
             self,
-            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough
+            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough | Self::TlsTerminate
         )
     }
 
@@ -174,7 +181,9 @@ impl ListenerReadiness {
             }
             Self::Invalid { .. } => "Invalid",
             Self::Unsupported { .. } => "UnsupportedValue",
-            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough => "Resolved",
+            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough | Self::TlsTerminate => {
+                "Resolved"
+            }
         }
     }
 
@@ -188,17 +197,25 @@ impl ListenerReadiness {
             | Self::Invalid { message }
             | Self::Unsupported { message }
             | Self::ResolvedPartial { message } => message.as_str(),
-            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough => "",
+            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough | Self::TlsTerminate => "",
         }
     }
 
     /// Returns `true` when this is a `TLS/Passthrough` listener (GEP-2643).
     ///
-    /// Used by the bin layer to create a `ListenerProtocol::TlsPassthrough`
-    /// listener spec for these ports instead of `Http` or `Https`.
+    /// Used by the bin layer to drive a `TlsL4`-protocol listener on this port.
     #[must_use]
     pub fn is_tls_passthrough(&self) -> bool {
         matches!(self, Self::TlsPassthrough)
+    }
+
+    /// Returns `true` when this is a `TLS/Terminate` listener (TLSRouteModeTerminate).
+    ///
+    /// Used by the bin layer to drive a `TlsL4`-protocol listener on this port
+    /// alongside or instead of passthrough listeners.
+    #[must_use]
+    pub fn is_tls_terminate(&self) -> bool {
+        matches!(self, Self::TlsTerminate)
     }
 }
 

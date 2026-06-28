@@ -13,8 +13,9 @@
 //!   tables or TLS store; status-only output set.
 
 use super::route_builder::{
-    build_client_certs, build_gateway_routes, build_passthrough_routes, build_routes, build_tls,
-    count_attached_routes, merge_backend_client_cert_health, resolve_backend_client_certs,
+    build_client_certs, build_gateway_routes, build_passthrough_routes, build_routes,
+    build_terminate_routes, build_tls, count_attached_routes, merge_backend_client_cert_health,
+    resolve_backend_client_certs,
 };
 use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
 use crate::gateway_api::{
@@ -264,6 +265,8 @@ pub struct SharedProxyReconciler {
     cluster_summary: SharedClusterSummary,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
+    /// SNI-keyed TLS terminate routing table for TLSRouteModeTerminate (#481).
+    terminate_routes: SharedTlsPassthroughTable,
     /// Per-cut-over-Gateway routing snapshots. Written by this reconciler on
     /// every rebuild; read by the discovery server to serve `Scope::Gateway` subscribers.
     dedicated_registry: DedicatedRoutingRegistry,
@@ -320,6 +323,12 @@ pub struct ReconcilerOutputs {
     pub dedicated_registry: DedicatedRoutingRegistry,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     pub passthrough_routes: SharedTlsPassthroughTable,
+    /// SNI-keyed TLS terminate routing table for TLSRouteModeTerminate (#481).
+    ///
+    /// The proxy terminates TLS on accept, then L4-splices the decrypted stream to
+    /// the backend over plain TCP. Isolated from the passthrough table so Mixed-mode
+    /// listeners on the same port cannot cross-leak routes.
+    pub terminate_routes: SharedTlsPassthroughTable,
 }
 
 /// Shared-store subscriptions the controller's status-writer consumes to drive
@@ -396,6 +405,7 @@ impl SharedProxyReconciler {
             cluster_summary,
             dedicated_registry,
             passthrough_routes,
+            terminate_routes,
         } = outputs;
         // When the controller role asks for status subscriptions, back the
         // status-relevant stores with shared informers now (sync) so the
@@ -473,6 +483,7 @@ impl SharedProxyReconciler {
             cluster_summary,
             dedicated_registry,
             passthrough_routes,
+            terminate_routes,
             route_status: SharedRouteStatus::new(),
             grpc_route_status: SharedRouteStatus::new(),
             tls_route_status: SharedRouteStatus::new(),
@@ -533,6 +544,14 @@ impl SharedProxyReconciler {
     /// to pick a backend by SNI without terminating TLS.
     pub fn passthrough_routes(&self) -> SharedTlsPassthroughTable {
         self.passthrough_routes.clone()
+    }
+
+    /// Returns the SNI-keyed TLS terminate routing table (TLSRouteModeTerminate, #481).
+    ///
+    /// The proxy terminates TLS on accept and L4-splices the decrypted stream to the
+    /// backend. Isolated from the passthrough table for Mixed-mode correctness.
+    pub fn terminate_routes(&self) -> SharedTlsPassthroughTable {
+        self.terminate_routes.clone()
     }
 
     /// Returns the fleet snapshot handle so the admin API can read the current
@@ -622,6 +641,7 @@ pub(super) struct SharedOutputs<'a> {
     pub(super) tls_route_status: &'a SharedRouteStatus,
     pub(super) policy_status: &'a SharedBackendTlsPolicyStatus,
     pub(super) passthrough_routes: &'a SharedTlsPassthroughTable,
+    pub(super) terminate_routes: &'a SharedTlsPassthroughTable,
     pub(super) ingress_event_tx: Option<&'a tokio::sync::mpsc::Sender<IngressEvent>>,
 }
 
@@ -778,6 +798,7 @@ impl BackgroundService for SharedProxyReconciler {
             tls_route_status: self.tls_route_status.clone(),
             policy_status: self.policy_status.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
+            terminate_routes: self.terminate_routes.clone(),
             fleet: self.fleet.clone(),
             owned_gateways: self.owned_gateways.clone(),
             leader: Arc::clone(&self.leader),
@@ -821,6 +842,8 @@ struct SharedHandles {
     policy_status: SharedBackendTlsPolicyStatus,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
+    /// SNI-keyed TLS terminate routing table for TLSRouteModeTerminate (#481).
+    terminate_routes: SharedTlsPassthroughTable,
     /// Populated by the fleet task when `watch_fleet` is enabled; carried here
     /// so the fleet-rebuild task can publish into the same cell that callers
     /// obtain via [`SharedProxyReconciler::fleet`].
@@ -868,6 +891,7 @@ async fn spawn_tasks(
         tls_route_status,
         policy_status,
         passthrough_routes,
+        terminate_routes,
         fleet,
         owned_gateways,
         leader,
@@ -1213,6 +1237,7 @@ async fn spawn_tasks(
                 tls_route_status: &tls_route_status,
                 policy_status: &policy_status,
                 passthrough_routes: &passthrough_routes,
+                terminate_routes: &terminate_routes,
                 ingress_event_tx: ingress_event_tx.as_ref(),
             };
             let rebuild_start = std::time::Instant::now();
@@ -1625,15 +1650,31 @@ fn rebuild(
 
     // Build the SNI-keyed TLS passthrough table from TLSRoutes bound to
     // TLS/Passthrough listeners on owned Gateways and their attached ListenerSets
-    // (GEP-2643 #70, GEP-1713 #93). Also returns per-(TLSRoute, parentRef) health
-    // for status condition writes.
-    let tls_route_status_map = build_passthrough_routes(
+    // (GEP-2643 #70, GEP-1713 #93).
+    let passthrough_status_map = build_passthrough_routes(
         stores,
         &owned_gateways,
         &effective,
         &backend_grants,
         outputs.passthrough_routes,
     );
+    // Build the SNI-keyed TLS terminate table from TLSRoutes bound to
+    // TLS/Terminate listeners (TLSRouteModeTerminate, #481). The two tables are
+    // isolated so Mixed-mode ports can carry both listener types without cross-leak.
+    // Route health is merged: a TLSRoute may bind to both a passthrough and a
+    // terminate listener (different parentRef.sectionName) so the union is the full
+    // health picture.
+    let terminate_status_map = build_terminate_routes(
+        stores,
+        &owned_gateways,
+        &effective,
+        &backend_grants,
+        outputs.terminate_routes,
+    );
+    // Merge both status maps (passthrough wins on key collision — same route,
+    // same parent can't bind to both modes simultaneously per GW-API invariant).
+    let mut tls_route_status_map = passthrough_status_map;
+    tls_route_status_map.extend(terminate_status_map);
     outputs
         .tls_route_status
         .store_and_notify(tls_route_status_map);

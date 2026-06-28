@@ -1268,14 +1268,13 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
         }
         let empty_ports = Vec::new();
         let gw_effective_ports = effective_ports.get(&key).unwrap_or(&empty_ports);
-        // GatewayStaticAddresses (#260): honor a requested static IPAddress by
-        // pinning it as the VIP Service `spec.clusterIP`. clusterIP is immutable,
-        // so if a live Service already carries a *different* clusterIP we must
-        // delete it first — SSA cannot mutate the field. An out-of-CIDR requested
-        // IP makes the recreate's apply fail (logged below), leaving no Service so
-        // the status writer reports `AddressNotUsable`.
-        let desired_ip = render::requested_static_cluster_ip(gw);
-        if desired_ip.is_some() {
+        // GatewayStaticAddresses (#260): honor requested static IPAddresses by
+        // pinning one as the VIP Service `spec.clusterIP`. With several requested,
+        // bind the first the apiserver accepts (see `bind_static_vip_service`) so a
+        // usable address that follows an unusable one still binds — the conformance
+        // ladder reads `status.addresses` from the multi-address window.
+        let candidates = render::requested_static_cluster_ips(gw);
+        if !candidates.is_empty() {
             let svc_name = render::shared_gateway_service_name(
                 gw.metadata.namespace.as_deref().unwrap_or_default(),
                 gw.metadata.name.as_deref().unwrap_or_default(),
@@ -1286,40 +1285,28 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
                 .and_then(|s| s.spec.as_ref())
                 .and_then(|sp| sp.cluster_ip.as_deref())
                 .and_then(|s| s.parse::<std::net::IpAddr>().ok());
-            if live_ip.is_some() && live_ip != desired_ip {
-                let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), ctrl_ns);
-                match ignore_not_found(svc_api.delete(&svc_name, &DeleteParams::default()).await) {
-                    Ok(()) => tracing::info!(
-                        service = %format!("{ctrl_ns}/{svc_name}"),
-                        ?desired_ip,
-                        "operator: deleting VIP Service to repin requested clusterIP (#260)"
-                    ),
-                    Err(e) => tracing::warn!(
-                        service = %format!("{ctrl_ns}/{svc_name}"),
-                        error = %e,
-                        "operator: failed to delete VIP Service for clusterIP repin; will retry"
-                    ),
-                }
-            }
+            bind_static_vip_service(StaticVipBinding {
+                ctx,
+                gw,
+                ctrl_ns,
+                candidates: &candidates,
+                effective_ports: gw_effective_ports,
+                internal_ports: &internal_ports,
+                live_ip,
+            })
+            .await;
+            continue;
         }
-        // GatewayStaticAddresses (#260): a requested static IP is honored as a
-        // ClusterIP — the apiserver assigns the exact in-CIDR address (or rejects
-        // an out-of-range one), deterministically on every cluster. Force this
-        // Gateway's VIP to ClusterIP so the resolved address IS the requested IP,
-        // independent of the global (possibly LoadBalancer) VIP type.
-        let vip_type = if desired_ip.is_some() {
-            ServiceType::ClusterIp
-        } else {
-            ctx.shared_vip_service_type
-        };
+        // Auto-address (legacy/default) path: no static IP requested, so keep the
+        // apiserver's auto-allocation and the configured VIP Service type.
         let service = render::render_shared_gateway_service(&render::SharedServiceInputs {
             gateway: gw,
             controller_namespace: ctrl_ns,
             shared_proxy_selector: &ctx.shared_proxy_selector,
             effective_ports: gw_effective_ports,
             internal_ports: &internal_ports,
-            service_type: vip_type,
-            requested_cluster_ip: desired_ip,
+            service_type: ctx.shared_vip_service_type,
+            requested_cluster_ip: None,
         });
         if let Err(e) = apply::apply_shared_vip_service(&ctx.client, ctrl_ns, &service).await {
             log_vip_apply_failure(gw, &e, "Service");
@@ -1353,6 +1340,109 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
             ),
         }
     }
+}
+
+/// Parameters for [`bind_static_vip_service`], grouped to keep the call within
+/// the project's argument-count budget.
+struct StaticVipBinding<'a> {
+    /// The whole-VIP reconcile context (client, shared-proxy selector, …).
+    ctx: &'a ReconcileContext,
+    /// The shared-mode Gateway whose VIP is being bound.
+    gw: &'a Gateway,
+    /// Controller namespace — where the VIP Service lives (#472).
+    ctrl_ns: &'a str,
+    /// Requested static `IPAddress` candidates, in `spec.addresses` order.
+    candidates: &'a [std::net::IpAddr],
+    /// Effective listener ports the VIP Service exposes.
+    effective_ports: &'a [coxswain_reflector::EffectiveListenerPort],
+    /// `listenerPort → internalPort` map for the rendered Service.
+    internal_ports: &'a BTreeMap<u16, u16>,
+    /// The live VIP Service's `spec.clusterIP`, if one exists.
+    live_ip: Option<std::net::IpAddr>,
+}
+
+/// Bind a static-address Gateway's VIP Service to the first requested clusterIP
+/// the apiserver accepts (GatewayStaticAddresses, #260).
+///
+/// `clusterIP` is immutable, so:
+/// - if the live Service already holds a requested address, keep it (re-pinning
+///   would needlessly churn) and SSA the rest idempotently;
+/// - otherwise free any live Service whose clusterIP is not requested, then try
+///   each candidate in order — an out-of-CIDR candidate's SSA is rejected
+///   (creating nothing), so a usable address that follows an unusable one still
+///   binds. The live clusterIP then *is* a requested address, which the status
+///   writer matches to publish `status.addresses` and decide
+///   `AddressNotUsable` vs `Programmed`.
+///
+/// If no candidate binds (all out-of-CIDR), no Service is left and the status
+/// writer reports `AddressNotUsable`; the next pass retries.
+async fn bind_static_vip_service(b: StaticVipBinding<'_>) {
+    let svc_name = render::shared_gateway_service_name(
+        b.gw.metadata.namespace.as_deref().unwrap_or_default(),
+        b.gw.metadata.name.as_deref().unwrap_or_default(),
+    );
+
+    if let Some(ip) = b.live_ip {
+        if b.candidates.contains(&ip) {
+            // Already bound to a requested address — keep the immutable clusterIP.
+            if let Err(e) = apply_static_vip_candidate(&b, ip).await {
+                log_vip_apply_failure(b.gw, &e, "Service");
+            }
+            return;
+        }
+        // Live clusterIP is not requested (auto-assigned, or a stale pin from a
+        // prior spec) — free it so a requested candidate can bind.
+        let svc_api: Api<Service> = Api::namespaced(b.ctx.client.clone(), b.ctrl_ns);
+        match ignore_not_found(svc_api.delete(&svc_name, &DeleteParams::default()).await) {
+            Ok(()) => tracing::info!(
+                service = %format!("{}/{svc_name}", b.ctrl_ns),
+                "operator: deleting VIP Service to repin requested clusterIP (#260)"
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    service = %format!("{}/{svc_name}", b.ctrl_ns),
+                    error = %e,
+                    "operator: failed to delete VIP Service for clusterIP repin; will retry"
+                );
+                // Try to bind anyway next pass once the delete lands.
+                return;
+            }
+        }
+    }
+
+    for &cand in b.candidates {
+        match apply_static_vip_candidate(&b, cand).await {
+            Ok(()) => return,
+            Err(e) => tracing::debug!(
+                service = %format!("{}/{svc_name}", b.ctrl_ns),
+                candidate = %cand,
+                error = %e,
+                "operator: requested clusterIP not usable; trying next (#260)"
+            ),
+        }
+    }
+    // No candidate bound: leave no Service so the status writer reports
+    // AddressNotUsable. Retried next pass.
+}
+
+/// Render and SSA the static-address Gateway's VIP Service with `cluster_ip`
+/// pinned (always ClusterIP-typed so the resolved address IS the requested IP,
+/// independent of the global VIP type). Returns the apiserver's verdict so the
+/// caller can fall through to the next candidate on rejection (#260).
+async fn apply_static_vip_candidate(
+    b: &StaticVipBinding<'_>,
+    cluster_ip: std::net::IpAddr,
+) -> Result<(), apply::ApplyError> {
+    let service = render::render_shared_gateway_service(&render::SharedServiceInputs {
+        gateway: b.gw,
+        controller_namespace: b.ctrl_ns,
+        shared_proxy_selector: &b.ctx.shared_proxy_selector,
+        effective_ports: b.effective_ports,
+        internal_ports: b.internal_ports,
+        service_type: ServiceType::ClusterIp,
+        requested_cluster_ip: Some(cluster_ip),
+    });
+    apply::apply_shared_vip_service(&b.ctx.client, b.ctrl_ns, &service).await
 }
 
 /// Log a VIP Service apply failure. A `NamespaceTerminating` 403 (mid-deletion)

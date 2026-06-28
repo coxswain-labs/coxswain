@@ -1,0 +1,84 @@
+# One Gateway with both Terminate and Passthrough TLS listeners on the same port.
+# Disambiguated by SNI/hostname — no cross-leak between the two modes (#481,
+# TLSRouteModeMixed).
+#
+# Substitutions (via FixtureVars::with):
+#   GATEWAY_TLS_PASSTHROUGH_PORT - port shared by both listeners
+#   TERMINATE_HOSTNAME           - SNI hostname for the Terminate listener
+#   PASSTHROUGH_HOSTNAME         - SNI hostname for the Passthrough listener
+#   GW_TLS_CRT_B64              - base64-encoded PEM certificate for the Terminate listener
+#   GW_TLS_KEY_B64              - base64-encoded PEM private key for the Terminate listener
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tls-terminate-cert
+  namespace: ${TESTNS}
+type: kubernetes.io/tls
+data:
+  tls.crt: ${GW_TLS_CRT_B64}
+  tls.key: ${GW_TLS_KEY_B64}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-mixed-gw
+  namespace: ${TESTNS}
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: tls-terminate
+      port: ${GATEWAY_TLS_PASSTHROUGH_PORT}
+      protocol: TLS
+      hostname: "${TERMINATE_HOSTNAME}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: tls-terminate-cert
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: tls-passthrough
+      port: ${GATEWAY_TLS_PASSTHROUGH_PORT}
+      protocol: TLS
+      hostname: "${PASSTHROUGH_HOSTNAME}"
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: tls-terminate-route
+  namespace: ${TESTNS}
+spec:
+  parentRefs:
+    - name: coxswain-mixed-gw
+      namespace: ${TESTNS}
+      sectionName: tls-terminate
+  hostnames:
+    - "${TERMINATE_HOSTNAME}"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: tls-passthrough-route
+  namespace: ${TESTNS}
+spec:
+  parentRefs:
+    - name: coxswain-mixed-gw
+      namespace: ${TESTNS}
+      sectionName: tls-passthrough
+  hostnames:
+    - "${PASSTHROUGH_HOSTNAME}"
+  rules:
+    - backendRefs:
+        - name: echo-tls
+          port: 8443

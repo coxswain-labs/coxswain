@@ -149,6 +149,7 @@ pub fn spawn_status_writer(
     let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
     let passthrough_routes = coxswain_core::routing::SharedTlsPassthroughTable::new();
+    let terminate_routes = coxswain_core::routing::SharedTlsPassthroughTable::new();
     let outputs = ReconcilerOutputs {
         ingress_routes,
         gateway_routes,
@@ -159,6 +160,7 @@ pub fn spawn_status_writer(
         cluster_summary,
         dedicated_registry,
         passthrough_routes: passthrough_routes.clone(),
+        terminate_routes: terminate_routes.clone(),
     };
 
     // Create the ingress-event channel before the reconciler, so the sender can
@@ -178,6 +180,7 @@ pub fn spawn_status_writer(
             cluster_summary: outputs.cluster_summary.clone(),
             dedicated_registry: outputs.dedicated_registry.clone(),
             passthrough_routes: passthrough_routes.clone(),
+            terminate_routes: terminate_routes.clone(),
         },
         owned_gateways.clone(),
         Arc::clone(&leader),

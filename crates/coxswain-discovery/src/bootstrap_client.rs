@@ -283,7 +283,11 @@ async fn do_bootstrap(
         })?
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_timeout(Duration::from_secs(5))
-        .keep_alive_while_idle(true);
+        .keep_alive_while_idle(true)
+        // Bound a connect to the discovery ClusterIP so a SYN black-holed by a
+        // mid-rollout controller endpoint fails fast and the bootstrap retry
+        // loop cycles, instead of hanging on the OS default.
+        .connect_timeout(Duration::from_secs(5));
 
     let ep = bootstrap_tls.apply(ep).map_err(|e| {
         warn!(error = %e, "bootstrap: failed to configure TLS");

@@ -96,6 +96,7 @@ nav:
   - Reference:
     - Configuration: reference/configuration.md
     - Observability: reference/observability.md
+    - Conformance: reference/conformance.md
   - Architecture: architecture.md
   - FAQ: faq.md
 

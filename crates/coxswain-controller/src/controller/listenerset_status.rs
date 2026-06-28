@@ -12,9 +12,7 @@
 use crate::status_common::{listener_condition_triplet, make_condition};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::ListenerSet;
-use coxswain_reflector::gw_types::v::listenersets::{
-    ListenerSetListeners, ListenerSetListenersTlsMode,
-};
+use coxswain_reflector::gw_types::v::listenersets::ListenerSetListeners;
 use coxswain_reflector::ingress::IngressPorts;
 use coxswain_reflector::status::{
     ConflictReason, GatewayListenerStatus, ListenerInfo, ListenerSource, ListenerStatusKey,
@@ -68,22 +66,19 @@ fn listener_info<'a>(
     })
 }
 
-/// Whether a ListenerSet listener is `protocol: TLS, tls.mode: Passthrough`.
-fn is_passthrough(l: &ListenerSetListeners) -> bool {
+/// Whether a ListenerSet listener is `protocol: TLS` (Passthrough or Terminate).
+/// Both modes carry TLSRoute as their natural route kind.
+fn is_tls_listener(l: &ListenerSetListeners) -> bool {
     l.protocol == "TLS"
-        && l.tls
-            .as_ref()
-            .and_then(|t| t.mode.as_ref())
-            .is_some_and(|m| matches!(m, ListenerSetListenersTlsMode::Passthrough))
 }
 
 /// `(has_any_invalid, supported_kinds)` for a ListenerSet listener's
 /// `allowedRoutes.kinds` — the ListenerSet analogue of
 /// [`crate::status_common::listener_route_kind_info`].
 fn route_kind_info(l: &ListenerSetListeners) -> (bool, Vec<(Option<String>, String)>) {
-    let passthrough = is_passthrough(l);
+    let tls = is_tls_listener(l);
     let default_kinds = || {
-        if passthrough {
+        if tls {
             vec![(Some(GW_GROUP.to_string()), "TLSRoute".to_string())]
         } else {
             vec![
@@ -105,14 +100,14 @@ fn route_kind_info(l: &ListenerSetListeners) -> (bool, Vec<(Option<String>, Stri
             .group
             .as_deref()
             .is_none_or(|g| g.is_empty() || g == GW_GROUP);
-        if (k.kind == "HTTPRoute" || k.kind == "GRPCRoute") && group_ok && !passthrough {
+        if (k.kind == "HTTPRoute" || k.kind == "GRPCRoute") && group_ok && !tls {
             if k.kind == "HTTPRoute" {
                 includes_http = true;
             }
             if k.kind == "GRPCRoute" {
                 includes_grpc = true;
             }
-        } else if k.kind == "TLSRoute" && group_ok && passthrough {
+        } else if k.kind == "TLSRoute" && group_ok && tls {
             includes_tls = true;
         } else {
             has_invalid = true;

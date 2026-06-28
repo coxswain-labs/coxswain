@@ -100,6 +100,7 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         ListenerReadiness::Unsupported { message } => {
             (p::ListenerReadiness::Unsupported, message.clone())
         }
+        ListenerReadiness::TlsTerminate => (p::ListenerReadiness::TlsTerminate, String::new()),
         &_ => unreachable!(
             "invariant: all ListenerReadiness variants handled; \
              add a new arm when the core type gains a variant"

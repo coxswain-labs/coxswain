@@ -677,6 +677,7 @@ pub(crate) mod tests {
                             client_cert_store: None,
                             listener_status: None,
                             tls_passthrough: None,
+                            tls_terminate: None,
                         })),
                     };
                     let _ = tx.send(Ok(snap)).await;

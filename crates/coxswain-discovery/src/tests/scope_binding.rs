@@ -60,6 +60,7 @@ fn source_with_two_gateways() -> SnapshotSource {
         listener_status: SharedGatewayListenerStatus::new(),
         dedicated: DedicatedRoutingRegistry::new(),
         passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
+        terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
     };
 
     let gw_a_key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
