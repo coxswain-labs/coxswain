@@ -16,6 +16,7 @@ use crate::gateway_api::{
     GatewayApiReconciler, GrpcRouteReconciler, GrpcRouteResolution, ListenerBinding, RouteLike,
     TlsRouteReconciler, parent_listener_source,
 };
+use crate::gw_types::v::tlsroutes::TlsRouteParentRefs;
 use crate::gw_types::{GrpcRoute, HttpRoute};
 use crate::ingress::annotations::AnnotationIssue;
 use crate::ingress::{IngressClassContext, IngressPorts, IngressReconciler, resolve_class_params};
@@ -543,19 +544,15 @@ pub(super) fn build_tls(
 
     let tls_store = tls_builder.build();
     let ports = tls_store.port_count();
-    let current = tls_shared.load();
-    if *current != tls_store {
+    if tls_shared.store_if_changed(tls_store) {
         tracing::debug!(ports, "per-port TLS cert store swapped");
-        tls_shared.store(Arc::new(tls_store));
     } else {
         tracing::trace!(ports, "per-port TLS cert store unchanged, skip swap");
     }
 
     let lh = lh_builder.build();
-    let current_lh = listener_hostnames_shared.load();
-    if *current_lh != lh {
+    if listener_hostnames_shared.store_if_changed(lh) {
         tracing::debug!("listener-hostnames snapshot swapped");
-        listener_hostnames_shared.store(Arc::new(lh));
     } else {
         tracing::trace!("listener-hostnames snapshot unchanged, skip swap");
     }
@@ -628,10 +625,8 @@ pub(super) fn build_client_certs(
 
     let store = builder.build();
     let count = store.host_count();
-    let current = client_certs_shared.load();
-    if *current != store {
+    if client_certs_shared.store_if_changed(store) {
         tracing::debug!(count, "Client-cert store swapped");
-        client_certs_shared.store(Arc::new(store));
     } else {
         tracing::trace!(count, "Client-cert store unchanged, skip swap");
     }
@@ -802,6 +797,81 @@ pub(super) fn build_terminate_routes(
     )
 }
 
+/// Returns `true` if a TLSRoute `parentRef` (`pr`) binds to the given listener.
+///
+/// Checks, in order:
+/// 1. The parentRef's resolved source (Gateway vs ListenerSet) matches the listener's source.
+/// 2. The `sectionName`, if set, matches the listener's name.
+/// 3. The `port`, if set, matches the listener's spec port.
+fn tls_route_binds(
+    pr: &TlsRouteParentRefs,
+    source: &ListenerSource,
+    gw_ns: &str,
+    gw_name: &str,
+    listener_name: &str,
+    listener_port: u16,
+    route_ns: &str,
+) -> bool {
+    let pr_ns = pr.namespace.as_deref().unwrap_or(route_ns);
+    let pr_source =
+        parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), pr_ns, &pr.name);
+    let target_ok = match (source, &pr_source) {
+        (ListenerSource::Gateway, ListenerSource::Gateway) => pr_ns == gw_ns && pr.name == gw_name,
+        (ListenerSource::ListenerSet(a), ListenerSource::ListenerSet(b)) => a == b,
+        _ => false,
+    };
+    if !target_ok {
+        return false;
+    }
+    if let Some(sn) = pr.section_name.as_deref()
+        && sn != listener_name
+    {
+        return false;
+    }
+    if let Some(port) = pr.port
+        && port as u16 != listener_port
+    {
+        return false;
+    }
+    true
+}
+
+/// Compute the effective SNI patterns for a TLSRoute attached to a listener.
+///
+/// Returns the intersection of `route_hostnames` and `listener_hostname`, with
+/// the more-specific hostname winning on wildcard overlaps (GEP-1713 / RFC 6125).
+/// Returns a single empty string when both sides are empty (wildcard match-all).
+fn effective_sni_patterns(route_hostnames: &[&str], listener_hostname: &str) -> Vec<String> {
+    if route_hostnames.is_empty() {
+        if listener_hostname.is_empty() {
+            vec![String::new()]
+        } else {
+            vec![listener_hostname.to_string()]
+        }
+    } else if listener_hostname.is_empty() {
+        route_hostnames.iter().map(|s| s.to_string()).collect()
+    } else {
+        route_hostnames
+            .iter()
+            .filter(|rh| hostnames_intersect(&[rh], listener_hostname))
+            .map(|rh| {
+                // The more-specific hostname is the effective SNI pattern.
+                if rh.starts_with("*.") && !listener_hostname.starts_with("*.") {
+                    listener_hostname.to_string()
+                } else if rh.starts_with("*.")
+                    && listener_hostname.starts_with("*.")
+                    && listener_hostname.len() > rh.len()
+                {
+                    // Both wildcards: the listener is more specific (longer suffix).
+                    listener_hostname.to_string()
+                } else {
+                    rh.to_string()
+                }
+            })
+            .collect()
+    }
+}
+
 /// Core implementation for [`build_passthrough_routes`] and [`build_terminate_routes`].
 ///
 /// When `passthrough` is `true` only `tls.mode: Passthrough` listeners are processed;
@@ -876,37 +946,18 @@ fn build_tls_l4_routes(
                 }
 
                 let parent_refs = route.spec.parent_refs.as_deref().unwrap_or(&[]);
+                // `allowedRoutes.namespaces` already gates by namespace above; here
+                // we check that at least one parentRef targets this specific listener.
                 let binds = parent_refs.iter().any(|pr| {
-                    let pr_ns = pr.namespace.as_deref().unwrap_or(route_ns);
-                    // Resolve the parentRef's target source (Gateway vs a specific
-                    // ListenerSet) and require it to match the listener's source.
-                    let pr_source = parent_listener_source(
-                        pr.group.as_deref(),
-                        pr.kind.as_deref(),
-                        pr_ns,
-                        &pr.name,
-                    );
-                    let target_ok = match (source, &pr_source) {
-                        (ListenerSource::Gateway, ListenerSource::Gateway) => {
-                            pr_ns == gw_ns && pr.name == gw_name
-                        }
-                        (ListenerSource::ListenerSet(a), ListenerSource::ListenerSet(b)) => a == b,
-                        _ => false,
-                    };
-                    if !target_ok {
-                        return false;
-                    }
-                    if let Some(sn) = pr.section_name.as_deref()
-                        && sn != listener.name
-                    {
-                        return false;
-                    }
-                    if let Some(port) = pr.port
-                        && port as u16 != listener_port
-                    {
-                        return false;
-                    }
-                    true
+                    tls_route_binds(
+                        pr,
+                        source,
+                        gw_ns,
+                        gw_name,
+                        &listener.name,
+                        listener_port,
+                        route_ns,
+                    )
                 });
                 if !binds {
                     continue;
@@ -919,35 +970,7 @@ fn build_tls_l4_routes(
                 }
 
                 // Effective SNI patterns: intersection of route hostnames and listener hostname.
-                let effective: Vec<String> = if route_hostnames.is_empty() {
-                    if listener_hostname.is_empty() {
-                        vec![String::new()]
-                    } else {
-                        vec![listener_hostname.to_string()]
-                    }
-                } else if listener_hostname.is_empty() {
-                    route_hostnames.iter().map(|s| s.to_string()).collect()
-                } else {
-                    route_hostnames
-                        .iter()
-                        .filter(|rh| hostnames_intersect(&[rh], listener_hostname))
-                        .map(|rh| {
-                            // The more-specific hostname is the effective SNI pattern.
-                            if rh.starts_with("*.") && !listener_hostname.starts_with("*.") {
-                                listener_hostname.to_string()
-                            } else if rh.starts_with("*.")
-                                && listener_hostname.starts_with("*.")
-                                && listener_hostname.len() > rh.len()
-                            {
-                                // Both wildcards: the listener is more specific
-                                // (longer suffix) → use the listener hostname.
-                                listener_hostname.to_string()
-                            } else {
-                                rh.to_string()
-                            }
-                        })
-                        .collect()
-                };
+                let effective = effective_sni_patterns(&route_hostnames, listener_hostname);
 
                 for rule in &route.spec.rules {
                     let weighted: Vec<(Vec<std::net::SocketAddr>, u16)> = rule
@@ -1352,5 +1375,85 @@ mod tests {
             "TLSRoute on a conflicted ListenerSet listener must not be Accepted"
         );
         assert_eq!(h.accepted_reason, "NoMatchingParent");
+    }
+
+    // ── effective_sni_patterns ────────────────────────────────────────────────
+    // Tests are grouped here to directly verify the extraction's branching logic
+    // rather than relying solely on build_tls_l4_routes integration tests.
+
+    #[test]
+    fn both_empty_returns_wildcard_sentinel() {
+        // Both route hostnames and listener hostname absent → match-all sentinel.
+        assert_eq!(effective_sni_patterns(&[], ""), vec!["".to_string()]);
+    }
+
+    #[test]
+    fn empty_route_hostnames_uses_listener_hostname() {
+        // Route has no hostnames; effective pattern is the listener's hostname.
+        assert_eq!(
+            effective_sni_patterns(&[], "foo.example.com"),
+            vec!["foo.example.com".to_string()],
+        );
+    }
+
+    #[test]
+    fn empty_listener_hostname_uses_all_route_hostnames() {
+        // Listener is a catch-all; route patterns pass through unchanged.
+        let got = effective_sni_patterns(&["a.com", "b.com"], "");
+        assert_eq!(got, vec!["a.com".to_string(), "b.com".to_string()]);
+    }
+
+    #[test]
+    fn exact_match_returns_route_hostname() {
+        // Both sides exact and equal → route hostname wins (same as listener).
+        assert_eq!(
+            effective_sni_patterns(&["svc.internal"], "svc.internal"),
+            vec!["svc.internal".to_string()],
+        );
+    }
+
+    #[test]
+    fn non_intersecting_hostnames_return_empty() {
+        // Route and listener hostnames have no overlap → no SNI patterns.
+        assert_eq!(
+            effective_sni_patterns(&["other.com"], "exact.com"),
+            Vec::<String>::new(),
+        );
+    }
+
+    #[test]
+    fn route_wildcard_listener_exact_uses_listener() {
+        // Route `*.foo.com` + listener `bar.foo.com`: listener is more specific.
+        assert_eq!(
+            effective_sni_patterns(&["*.foo.com"], "bar.foo.com"),
+            vec!["bar.foo.com".to_string()],
+        );
+    }
+
+    #[test]
+    fn route_exact_listener_wildcard_uses_route() {
+        // Route `bar.foo.com` + listener `*.foo.com`: route is more specific.
+        assert_eq!(
+            effective_sni_patterns(&["bar.foo.com"], "*.foo.com"),
+            vec!["bar.foo.com".to_string()],
+        );
+    }
+
+    #[test]
+    fn both_wildcards_longer_listener_suffix_wins() {
+        // `*.foo.com` + `*.bar.foo.com`: listener has a longer (more-specific) suffix.
+        assert_eq!(
+            effective_sni_patterns(&["*.foo.com"], "*.bar.foo.com"),
+            vec!["*.bar.foo.com".to_string()],
+        );
+    }
+
+    #[test]
+    fn both_wildcards_same_length_uses_route() {
+        // Same-length wildcards: neither is strictly more specific, so route wins.
+        assert_eq!(
+            effective_sni_patterns(&["*.foo.com"], "*.bar.com"),
+            Vec::<String>::new(), // they don't intersect (different domains)
+        );
     }
 }

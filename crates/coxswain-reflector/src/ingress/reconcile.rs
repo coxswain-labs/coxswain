@@ -9,7 +9,7 @@ use super::ports::IngressPorts;
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
 use coxswain_core::routing::{
-    BackendGroup, BasicCredential, ExtAuthConfig, ExtAuthTransport, FilterAction,
+    BackendGroup, BackendProtocol, BasicCredential, ExtAuthConfig, ExtAuthTransport, FilterAction,
     HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTableBuilder,
     NormalizeLevel, PathModifier, RouteEntry, WildcardKind, compile_path_regex,
 };
@@ -18,6 +18,7 @@ use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// The IngressClass-ownership context threaded into [`IngressReconciler::reconcile`].
@@ -165,56 +166,12 @@ impl IngressReconciler {
         // Uses the same endpoint-resolution path as the primary backend. An absent/invalid
         // Service WARNs and skips the mirror filter — the Ingress keeps serving normally.
         // An empty-endpoint group is installed (proxy WARNs on dispatch and drops the mirror).
-        if let Some(ref mirror_ref) = ann.mirror_target {
-            // Cross-namespace mirror references are rejected: an Ingress author can only
-            // mirror to Services in the same namespace as the Ingress itself.  Allowing
-            // cross-namespace references would let any Ingress owner redirect (and potentially
-            // leak credentials from) traffic to services in namespaces they don't control.
-            if mirror_ref.namespace != ns {
-                tracing::warn!(
-                    ingress = %route_id,
-                    mirror_namespace = %mirror_ref.namespace,
-                    ingress_namespace = %ns,
-                    "mirror-target namespace differs from Ingress namespace — cross-namespace \
-                     mirror references are not permitted; mirror disabled"
-                );
-            } else {
-                let mirror_ns = &mirror_ref.namespace;
-                let resolved = endpoints::resolve(
-                    mirror_ns,
-                    &mirror_ref.service,
-                    i32::from(mirror_ref.port),
-                    slices,
-                    services,
-                );
-                if !resolved.service_exists {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        service = %mirror_ref.service,
-                        namespace = %mirror_ns,
-                        port = mirror_ref.port,
-                        "mirror-target Service not found — mirror disabled"
-                    );
-                } else {
-                    if resolved.addrs.is_empty() {
-                        tracing::warn!(
-                            ingress = %route_id,
-                            service = %mirror_ref.service,
-                            namespace = %mirror_ns,
-                            port = mirror_ref.port,
-                            "mirror-target has no ready endpoints"
-                        );
-                    }
-                    let mirror_group = Arc::new(BackendGroup::new(
-                        format!("{mirror_ns}/{}", mirror_ref.service),
-                        resolved.addrs,
-                    ));
-                    base_filters.push(FilterAction::Mirror {
-                        backend: mirror_group,
-                        fraction: None, // annotation mirror always sends 100%
-                    });
-                }
-            } // end cross-namespace else
+        if let Some(filter) = ann
+            .mirror_target
+            .as_ref()
+            .and_then(|m| resolve_mirror_filter(m, ns, &route_id, slices, services))
+        {
+            base_filters.push(filter);
         }
 
         // ssl-redirect fires only on the HTTP listener; it is suppressed when an explicit
@@ -321,15 +278,13 @@ impl IngressReconciler {
                     );
                 }
                 // Backend wire protocol comes from the Service port `appProtocol` (GEP-1911).
-                let protocol = resolved.app_protocol;
-                let group = Arc::new(
-                    BackendGroup::new(format!("{ns}/{}", svc.name), resolved.addrs)
-                        .with_protocol(protocol)
-                        .with_retries(ann.retries)
-                        .with_session_affinity(ann.session_affinity.clone())
-                        .with_keepalive_timeout(ann.keepalive_timeout)
-                        .with_load_balance(ann.load_balance.clone()),
-                );
+                let group = Arc::new(build_ingress_backend_group(
+                    ns,
+                    &svc.name,
+                    resolved.addrs,
+                    resolved.app_protocol,
+                    &ann,
+                ));
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
                 // Every Ingress path must be absolute — the Kubernetes API server
@@ -483,15 +438,13 @@ impl IngressReconciler {
                         );
                     } else {
                         // Backend wire protocol comes from the Service port `appProtocol` (GEP-1911).
-                        let protocol = resolved.app_protocol;
-                        let group = Arc::new(
-                            BackendGroup::new(format!("{ns}/{}", default_svc.name), resolved.addrs)
-                                .with_protocol(protocol)
-                                .with_retries(ann.retries)
-                                .with_session_affinity(ann.session_affinity.clone())
-                                .with_keepalive_timeout(ann.keepalive_timeout)
-                                .with_load_balance(ann.load_balance.clone()),
-                        );
+                        let group = Arc::new(build_ingress_backend_group(
+                            ns,
+                            &default_svc.name,
+                            resolved.addrs,
+                            resolved.app_protocol,
+                            &ann,
+                        ));
                         let default_metric_route_id: Arc<str> =
                             Arc::from(format!("ingress/{ns}/{ingress_name}:default"));
                         // Build the defaultBackend filter vec (same base as rule-path
@@ -548,6 +501,93 @@ impl IngressReconciler {
         }
         annotation_issues
     }
+}
+
+// ── Backend group construction ────────────────────────────────────────────────
+
+/// Build a [`BackendGroup`] from resolved endpoints and Ingress-wide traffic-policy
+/// annotations.
+///
+/// Used by both the per-rule path loop and `spec.defaultBackend` — centralises the
+/// builder chain so annotation knobs are applied uniformly to every backend.
+fn build_ingress_backend_group(
+    ns: &str,
+    svc_name: &str,
+    addrs: Vec<SocketAddr>,
+    protocol: BackendProtocol,
+    ann: &super::annotations::IngressAnnotations,
+) -> BackendGroup {
+    BackendGroup::new(format!("{ns}/{svc_name}"), addrs)
+        .with_protocol(protocol)
+        .with_retries(ann.retries)
+        .with_session_affinity(ann.session_affinity.clone())
+        .with_keepalive_timeout(ann.keepalive_timeout)
+        .with_load_balance(ann.load_balance.clone())
+}
+
+// ── Mirror filter resolution ──────────────────────────────────────────────────
+
+/// Resolve a mirror-target annotation into a [`FilterAction::Mirror`].
+///
+/// Returns `None` (and emits a `WARN`) when:
+/// - the mirror namespace differs from the Ingress namespace (cross-namespace refs forbidden)
+/// - the target Service does not exist in the store
+///
+/// Returns `Some(FilterAction::Mirror { … })` — with an empty [`BackendGroup`] and its
+/// own `WARN` — when the Service exists but has no ready endpoints, so the proxy can
+/// install the mirror entry and warn at dispatch time rather than silently dropping it.
+fn resolve_mirror_filter(
+    mirror_ref: &super::annotations::traffic_policy::MirrorTargetRef,
+    ns: &str,
+    route_id: &str,
+    slices: &reflector::Store<EndpointSlice>,
+    services: &reflector::Store<Service>,
+) -> Option<FilterAction> {
+    if mirror_ref.namespace != ns {
+        tracing::warn!(
+            ingress = %route_id,
+            mirror_namespace = %mirror_ref.namespace,
+            ingress_namespace = %ns,
+            "mirror-target namespace differs from Ingress namespace — cross-namespace \
+             mirror references are not permitted; mirror disabled"
+        );
+        return None;
+    }
+    let mirror_ns = &mirror_ref.namespace;
+    let resolved = endpoints::resolve(
+        mirror_ns,
+        &mirror_ref.service,
+        i32::from(mirror_ref.port),
+        slices,
+        services,
+    );
+    if !resolved.service_exists {
+        tracing::warn!(
+            ingress = %route_id,
+            service = %mirror_ref.service,
+            namespace = %mirror_ns,
+            port = mirror_ref.port,
+            "mirror-target Service not found — mirror disabled"
+        );
+        return None;
+    }
+    if resolved.addrs.is_empty() {
+        tracing::warn!(
+            ingress = %route_id,
+            service = %mirror_ref.service,
+            namespace = %mirror_ns,
+            port = mirror_ref.port,
+            "mirror-target has no ready endpoints"
+        );
+    }
+    let mirror_group = Arc::new(BackendGroup::new(
+        format!("{mirror_ns}/{}", mirror_ref.service),
+        resolved.addrs,
+    ));
+    Some(FilterAction::Mirror {
+        backend: mirror_group,
+        fraction: None, // annotation mirror always sends 100%
+    })
 }
 
 // ── Auth resolution ───────────────────────────────────────────────────────────

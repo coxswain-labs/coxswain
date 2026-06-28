@@ -1,6 +1,7 @@
 //! Kubernetes ownership helpers — object identity keys and Gateway ownership tracking.
 
 use crate::shared::Shared;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::HashSet;
 
 /// A key identifying a specific Kubernetes object by namespace and name.
@@ -23,6 +24,18 @@ impl ObjectKey {
             ns: ns.into(),
             name: name.into(),
         }
+    }
+
+    /// Construct an [`ObjectKey`] from a Kubernetes [`ObjectMeta`], returning
+    /// `None` if either `namespace` or `name` is absent.
+    ///
+    /// Convenience for the common `filter_map` pattern:
+    /// ```ignore
+    /// resources.filter_map(|r| ObjectKey::from_meta(&r.metadata))
+    /// ```
+    #[must_use]
+    pub fn from_meta(meta: &ObjectMeta) -> Option<Self> {
+        Some(Self::new(meta.namespace.as_deref()?, meta.name.as_deref()?))
     }
 }
 
