@@ -1,0 +1,62 @@
+# cert-manager Issuer + Ingress for the HTTP-01 challenge passthrough test.
+#
+# The Issuer points at the in-namespace Pebble ACME server; the Ingress triggers
+# an HTTP-01 challenge that routes through Coxswain to cert-manager's solver pod.
+#
+# --status-address is a hard requirement for this flow:
+#   cert-manager's HTTP-01 solver reads Ingress.status.loadBalancer.ingress[0]
+#   to discover the proxy's address before sending the challenge to the ACME
+#   server. Coxswain only writes Ingress status when --status-address is
+#   configured (reconcile_ingress_inner returns early when status_address is None).
+#   Without it the solver Ingress has no loadBalancer entry and cert-manager
+#   never advances the Order -- the TLS Secret is never created.
+#
+# Placeholders replaced at test runtime:
+#   TESTNS        - test namespace (always substituted by apply_fixture)
+#   PROXY_FQDN    - in-cluster FQDN of the Coxswain proxy (the challenge domain
+#                   and the Ingress rule host)
+#   PEBBLE_CA_B64 - base64-encoded PEM of Pebble's self-signed TLS certificate;
+#                   used as the Issuer's caBundle so cert-manager trusts Pebble's
+#                   ACME directory endpoint
+#   SECRET_NAME   - name of the kubernetes.io/tls Secret cert-manager will create
+#   BACKEND_NAME  - backend Service name (must already exist in TESTNS)
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: pebble-issuer
+spec:
+  acme:
+    server: https://pebble.${TESTNS}.svc.cluster.local:14000/dir
+    email: e2e-test@coxswain-labs.dev
+    caBundle: ${PEBBLE_CA_B64}
+    privateKeySecretRef:
+      name: pebble-issuer-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: coxswain
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: acme-http01-ingress
+  annotations:
+    cert-manager.io/issuer: pebble-issuer
+spec:
+  ingressClassName: coxswain
+  tls:
+    - hosts:
+        - ${PROXY_FQDN}
+      secretName: ${SECRET_NAME}
+  rules:
+    - host: ${PROXY_FQDN}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ${BACKEND_NAME}
+                port:
+                  number: 3000

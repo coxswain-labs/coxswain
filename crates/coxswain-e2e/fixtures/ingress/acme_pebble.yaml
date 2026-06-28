@@ -1,0 +1,107 @@
+# Pebble ACME test-server stack for the HTTP-01 challenge passthrough test.
+#
+# Deploys Pebble into the test namespace as a namespace-scoped singleton.
+# cert-manager's Issuer points at this instance; Pebble validates HTTP-01
+# challenges by connecting to the Coxswain proxy at httpPort=80 (see ConfigMap).
+#
+# Placeholders replaced at test runtime:
+#   TESTNS         - test namespace (always substituted by apply_fixture)
+#   PEBBLE_IMAGE   - pinned Pebble image ref (from fixtures/images.rs)
+#   PEBBLE_CERT_B64 - base64-encoded PEM of Pebble's TLS certificate
+#   PEBBLE_KEY_B64  - base64-encoded PEM of Pebble's TLS private key
+#
+# Design notes:
+#   - httpPort: 80  — Pebble's validation authority (VA) sends HTTP-01 challenge
+#     requests to the challenge domain on this port. The challenge domain is the
+#     Coxswain proxy FQDN (coxswain-shared-proxy.coxswain-system.svc.cluster.local),
+#     which binds port 80 in-cluster. Must be 80; Pebble's default of 5002 would
+#     miss the proxy.
+#   - PEBBLE_VA_NOSLEEP=1 removes Pebble's artificial inter-validation delay so
+#     the challenge round-trip completes promptly in CI.
+#   - The certificate/key pair is a test-generated self-signed cert (SAN = Pebble's
+#     in-cluster FQDN). The cert's PEM is also used as the Issuer's caBundle so
+#     cert-manager trusts Pebble's ACME directory TLS endpoint.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pebble-config
+data:
+  pebble-config.json: |
+    {
+      "pebble": {
+        "listenAddress": "0.0.0.0:14000",
+        "managementListenAddress": "0.0.0.0:15000",
+        "certificate": "/certs/tls.crt",
+        "privateKey": "/certs/tls.key",
+        "httpPort": 80,
+        "tlsPort": 443,
+        "ocspResponderURL": ""
+      }
+    }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pebble-tls
+type: kubernetes.io/tls
+data:
+  tls.crt: ${PEBBLE_CERT_B64}
+  tls.key: ${PEBBLE_KEY_B64}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pebble
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pebble
+  template:
+    metadata:
+      labels:
+        app: pebble
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: pebble
+          image: ${PEBBLE_IMAGE}
+          args:
+            - -config
+            - /config/pebble-config.json
+          env:
+            - name: PEBBLE_VA_NOSLEEP
+              value: "1"
+          ports:
+            - name: acme
+              containerPort: 14000
+            - name: mgmt
+              containerPort: 15000
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: tls
+              mountPath: /certs
+      volumes:
+        - name: config
+          configMap:
+            name: pebble-config
+        - name: tls
+          secret:
+            secretName: pebble-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pebble
+spec:
+  selector:
+    app: pebble
+  ports:
+    - name: acme
+      port: 14000
+      targetPort: 14000
+    - name: mgmt
+      port: 15000
+      targetPort: 15000
