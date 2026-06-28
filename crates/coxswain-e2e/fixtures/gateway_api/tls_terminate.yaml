@@ -1,0 +1,56 @@
+# Gateway with `protocol: TLS, tls.mode: Terminate` + TLSRoute to a plaintext backend.
+# The proxy terminates TLS using the listener certificate and L4-splices the
+# decrypted stream to the backend over plain TCP (TLSRouteModeTerminate, #481).
+#
+# Substitutions (via FixtureVars::with):
+#   GATEWAY_TLS_PASSTHROUGH_PORT - port for the TLS listener
+#   TERMINATE_HOSTNAME           - SNI hostname for the gateway listener + TLSRoute rule
+#   GW_TLS_CRT_B64              - base64-encoded PEM certificate for the gateway listener
+#   GW_TLS_KEY_B64              - base64-encoded PEM private key for the gateway listener
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tls-terminate-cert
+  namespace: ${TESTNS}
+type: kubernetes.io/tls
+data:
+  tls.crt: ${GW_TLS_CRT_B64}
+  tls.key: ${GW_TLS_KEY_B64}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-terminate-gw
+  namespace: ${TESTNS}
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: tls-terminate
+      port: ${GATEWAY_TLS_PASSTHROUGH_PORT}
+      protocol: TLS
+      hostname: "${TERMINATE_HOSTNAME}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: tls-terminate-cert
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: tls-terminate-route
+  namespace: ${TESTNS}
+spec:
+  parentRefs:
+    - name: coxswain-terminate-gw
+      namespace: ${TESTNS}
+  hostnames:
+    - "${TERMINATE_HOSTNAME}"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000

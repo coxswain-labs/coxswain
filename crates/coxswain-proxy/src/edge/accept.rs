@@ -52,6 +52,7 @@ use coxswain_core::routing::SharedTlsPassthroughTable;
 use crate::SniCertSelector;
 use crate::ctx::{CONN_INFO, ConnectionInfo};
 use crate::edge::passthrough::{handle_passthrough, peek_sni};
+use crate::edge::terminate::handle_terminate;
 use crate::metrics;
 
 /// Maximum number of in-flight per-connection tasks per listener.
@@ -90,18 +91,22 @@ pub(crate) enum ProxyHeaderError {
     UnknownProtocol(String),
 }
 
-/// Groups the TLS-passthrough parameters for [`ProxyAcceptor::new`].
+/// Groups the TLS L4 parameters for [`ProxyAcceptor::new`].
 ///
 /// Extracted into a struct so `ProxyAcceptor::new` stays under the 7-argument
 /// workspace limit enforced by `clippy::too_many_arguments`.
 // intentionally open: callers construct this directly in coxswain-bin.
 pub struct PassthroughConfig {
-    /// SNI-keyed routing table for `TlsPassthrough` listeners.
+    /// SNI-keyed routing table for TLSRoute `mode: Passthrough` listeners.
     ///
     /// An empty table causes all passthrough connections to be closed
     /// immediately (no matching backend).
     pub table: SharedTlsPassthroughTable,
-    /// How long to wait when connecting to a passthrough backend.
+    /// SNI-keyed routing table for TLSRoute `mode: Terminate` listeners (#481).
+    ///
+    /// An empty table causes all terminate connections to be closed immediately.
+    pub terminate_table: SharedTlsPassthroughTable,
+    /// How long to wait when connecting to a passthrough or terminate backend.
     pub dial_timeout: Duration,
 }
 
@@ -123,7 +128,7 @@ impl TrustedSources {
     }
 }
 
-/// Whether a listener speaks plain HTTP, HTTPS, or TLS passthrough.
+/// Whether a listener speaks plain HTTP, HTTPS, or TLS L4 (passthrough and/or terminate).
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ListenerProtocol {
@@ -131,14 +136,16 @@ pub enum ListenerProtocol {
     Http,
     /// HTTPS with SNI-based certificate selection.
     Https,
-    /// Raw TLS passthrough: route by SNI without terminating TLS (TLSRoute / GEP-2643).
-    TlsPassthrough,
-    /// Port shared between TLS passthrough (TLSRoute) and HTTPS terminate listeners.
+    /// Raw TLS L4: peek SNI, consult the passthrough and/or terminate routing
+    /// tables, splice to the matched backend.  Never falls through to HTTP.
+    /// Covers TLSRoute `mode: Passthrough`, `mode: Terminate`, or both on the
+    /// same port (TLSRouteModeTerminate / TLSRouteModeMixed, #481).
+    TlsL4,
+    /// Port shared between TLS L4 (TLSRoute) and HTTPS terminate listeners.
     ///
     /// On accept: peek the ClientHello SNI via MSG_PEEK. If the SNI matches a
-    /// `TlsPassthrough` route, splice to that backend (bytes stay in the kernel
-    /// queue — no replay needed). If not, fall through to standard TLS-terminate
-    /// processing (`Https`).
+    /// passthrough or terminate TLSRoute, handle it as L4. If not, fall through
+    /// to standard TLS-terminate processing (`Https`).
     TlsHybrid,
 }
 
@@ -169,10 +176,21 @@ impl ListenerSpec {
         }
     }
 
-    /// Create a hybrid TLS listener spec for a port shared between TLS passthrough and HTTPS.
+    /// Create a TLS L4 listener spec for a port serving TLSRoute passthrough and/or terminate.
     ///
-    /// Peeks the ClientHello SNI on accept: routes to passthrough if matched,
-    /// falls through to TLS-terminate otherwise.
+    /// Peeks the ClientHello SNI on accept: routes to the matching passthrough or
+    /// terminate backend.  Never falls through to HTTP.
+    pub fn tls_l4(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            protocol: ListenerProtocol::TlsL4,
+        }
+    }
+
+    /// Create a hybrid TLS listener spec for a port shared between TLS L4 and HTTPS.
+    ///
+    /// Peeks the ClientHello SNI on accept: routes to passthrough or terminate if
+    /// matched, falls through to TLS-terminate (HTTPS) otherwise.
     pub fn tls_hybrid(addr: SocketAddr) -> Self {
         Self {
             addr,
@@ -211,10 +229,12 @@ where
     trusted: Option<Arc<TrustedSources>>,
     tls_selector: SniCertSelector,
     drain_timeout: Duration,
-    /// SNI-keyed passthrough routing table for `TlsPassthrough` listeners.
+    /// SNI-keyed passthrough routing table for TLSRoute passthrough listeners.
     passthrough_table: SharedTlsPassthroughTable,
-    /// Timeout for dialling a passthrough backend.
-    passthrough_dial_timeout: Duration,
+    /// SNI-keyed terminate routing table for TLSRoute terminate listeners (#481).
+    terminate_table: SharedTlsPassthroughTable,
+    /// Timeout for dialling a passthrough or terminate backend.
+    l4_dial_timeout: Duration,
 }
 
 impl<P> ProxyAcceptor<P>
@@ -229,8 +249,8 @@ where
     /// * `specs_rx` — if `Some`, the acceptor watches this receiver for
     ///   desired-set changes and reconciles dynamically.  Pass `None` for a
     ///   static listener set.
-    /// * `passthrough` — routing table and dial timeout for
-    ///   `TlsPassthrough` listeners; see [`PassthroughConfig`].
+    /// * `passthrough` — routing tables (passthrough + terminate) and dial
+    ///   timeout for TLS L4 listeners; see [`PassthroughConfig`].
     ///
     /// # Errors
     ///
@@ -267,7 +287,8 @@ where
             tls_selector,
             drain_timeout,
             passthrough_table: passthrough.table,
-            passthrough_dial_timeout: passthrough.dial_timeout,
+            terminate_table: passthrough.terminate_table,
+            l4_dial_timeout: passthrough.dial_timeout,
         })
     }
 }
@@ -294,7 +315,8 @@ where
             tls_selector: self.tls_selector.clone(),
             drain_timeout: self.drain_timeout,
             passthrough_table: self.passthrough_table.clone(),
-            passthrough_dial_timeout: self.passthrough_dial_timeout,
+            terminate_table: self.terminate_table.clone(),
+            l4_dial_timeout: self.l4_dial_timeout,
         };
 
         // Bind the initial desired set.
@@ -393,7 +415,8 @@ where
     tls_selector: SniCertSelector,
     drain_timeout: Duration,
     passthrough_table: SharedTlsPassthroughTable,
-    passthrough_dial_timeout: Duration,
+    terminate_table: SharedTlsPassthroughTable,
+    l4_dial_timeout: Duration,
 }
 
 /// Per-connection handler state: the proxy, trust policy, and TLS selector
@@ -410,7 +433,8 @@ where
     local_addr: SocketAddr,
     protocol: ListenerProtocol,
     passthrough_table: SharedTlsPassthroughTable,
-    passthrough_dial_timeout: Duration,
+    terminate_table: SharedTlsPassthroughTable,
+    l4_dial_timeout: Duration,
 }
 
 // ── Reconcile helpers ─────────────────────────────────────────────────────────
@@ -536,7 +560,8 @@ async fn reconcile_listeners<P>(
             tls_selector: cfg.tls_selector.clone(),
             drain_timeout: cfg.drain_timeout,
             passthrough_table: cfg.passthrough_table.clone(),
-            passthrough_dial_timeout: cfg.passthrough_dial_timeout,
+            terminate_table: cfg.terminate_table.clone(),
+            l4_dial_timeout: cfg.l4_dial_timeout,
         };
         let addr = spec.addr;
 
@@ -625,7 +650,8 @@ async fn run_listener<P>(
                                     local_addr: addr,
                                     protocol,
                                     passthrough_table: cfg.passthrough_table.clone(),
-                                    passthrough_dial_timeout: cfg.passthrough_dial_timeout,
+                                    terminate_table: cfg.terminate_table.clone(),
+                                    l4_dial_timeout: cfg.l4_dial_timeout,
                                 };
                                 let conn_sd = conn_shutdown_rx.clone();
                                 conn_set.spawn(async move {
@@ -693,10 +719,105 @@ async fn run_listener<P>(
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
+/// Dispatch one connection on a TLS L4 port (passthrough or terminate, no HTTP layer).
+///
+/// Peeks the ClientHello SNI via MSG_PEEK (bytes stay in the kernel queue).
+/// Checks the passthrough table first, then the terminate table. When
+/// `allow_https_fallthrough` is `true` (hybrid port) and neither table
+/// matches, falls through to HTTPS only if the port has a certificate for
+/// this SNI — otherwise drops the connection (GEP-2643 hostname-intersection).
+///
+/// Returns `None` when the connection is fully handled (consumed or dropped),
+/// or `Some(tcp)` when the caller should fall through to the HTTPS path
+/// (only possible when `allow_https_fallthrough` is `true`).
+async fn dispatch_tls_l4<P>(
+    tcp: TcpStream,
+    peer_addr: SocketAddr,
+    handler: &ConnHandler<P>,
+    allow_https_fallthrough: bool,
+) -> Option<TcpStream>
+where
+    P: ProxyHttp + Send + Sync + 'static,
+    <P as ProxyHttp>::CTX: Send + Sync,
+{
+    let port = handler.local_addr.port();
+    let sni = match peek_sni(&tcp).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(
+                peer = %peer_addr,
+                error = %e,
+                "TLS L4 dispatch: failed to read ClientHello SNI — dropping connection"
+            );
+            return None;
+        }
+    };
+
+    // Check passthrough table.
+    {
+        let snapshot = handler.passthrough_table.load();
+        let has_match = snapshot
+            .port(port)
+            .is_some_and(|r| r.match_sni(sni.as_deref()).is_some());
+        if has_match {
+            handle_passthrough(
+                tcp,
+                peer_addr,
+                &handler.passthrough_table,
+                port,
+                handler.l4_dial_timeout,
+            )
+            .await;
+            return None;
+        }
+    }
+
+    // Check terminate table (#481).
+    {
+        let snapshot = handler.terminate_table.load();
+        let has_match = snapshot
+            .port(port)
+            .is_some_and(|r| r.match_sni(sni.as_deref()).is_some());
+        if has_match {
+            handle_terminate(
+                tcp,
+                peer_addr,
+                &handler.terminate_table,
+                &handler.tls_selector,
+                port,
+                handler.l4_dial_timeout,
+            )
+            .await;
+            return None;
+        }
+    }
+
+    // No L4 route matched. On a hybrid port, fall through to HTTPS only when a
+    // certificate is configured for this SNI; otherwise reject by dropping.
+    if allow_https_fallthrough {
+        if handler
+            .tls_selector
+            .for_port(port)
+            .has_cert_for(sni.as_deref())
+        {
+            // Peeked bytes are still in the kernel queue — no replay needed.
+            return Some(tcp);
+        }
+        tracing::debug!(
+            port,
+            sni = ?sni,
+            "Hybrid port: no L4 route and no terminate cert for SNI — rejecting connection"
+        );
+    }
+    // TlsL4 (non-hybrid) with no match: drop by returning None without a handler.
+    None
+}
+
 /// Handle one accepted TCP connection.
 ///
 /// Dispatches based on protocol and trust configuration:
-/// - `TlsPassthrough`: peek SNI, match routing table, splice to backend — no HTTP involved.
+/// - `TlsL4`: peek SNI, match passthrough or terminate routing table, splice — no HTTP.
+/// - `TlsHybrid`: same as `TlsL4` but falls through to HTTPS if no L4 route matches.
 /// - PROXY-protocol path (when `trusted` is `Some`): read PROXY header, run HTTP/1.1 loop.
 /// - Standard Pingora path (when `trusted` is `None`): ALPN, HTTP/1.1 and HTTP/2.
 async fn handle_connection<P>(
@@ -710,65 +831,23 @@ async fn handle_connection<P>(
 {
     let _conn_guard = ConnectionGuard::new(handler.local_addr.port());
 
-    // TLS passthrough is independent of the PROXY-protocol setting — it never runs
-    // through the HTTP proxy layer.
-    if handler.protocol == ListenerProtocol::TlsPassthrough {
-        handle_passthrough(
-            tcp,
-            peer_addr,
-            &handler.passthrough_table,
-            handler.local_addr.port(),
-            handler.passthrough_dial_timeout,
-        )
-        .await;
-        return;
-    }
-
-    // Hybrid port: peek SNI (MSG_PEEK — bytes stay in kernel queue) and route to
-    // passthrough if a TLSRoute matches. Otherwise fall through as HTTPS terminate.
-    if handler.protocol == ListenerProtocol::TlsHybrid {
-        let port = handler.local_addr.port();
-        let sni = peek_sni(&tcp).await.ok().flatten();
-        let snapshot = handler.passthrough_table.load();
-        let has_passthrough_match = snapshot
-            .port(port)
-            .is_some_and(|router| router.match_sni(sni.as_deref()).is_some());
-        if has_passthrough_match {
-            handle_passthrough(
-                tcp,
-                peer_addr,
-                &handler.passthrough_table,
-                port,
-                handler.passthrough_dial_timeout,
-            )
-            .await;
-            return;
+    // TLS L4 and hybrid ports are independent of the PROXY-protocol setting — they
+    // never run through the HTTP proxy layer.
+    let tcp = if matches!(
+        handler.protocol,
+        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid
+    ) {
+        let allow_https_fallthrough = handler.protocol == ListenerProtocol::TlsHybrid;
+        match dispatch_tls_l4(tcp, peer_addr, &handler, allow_https_fallthrough).await {
+            None => return,
+            // Hybrid fallthrough: no L4 match, SNI has a terminate cert — proceed as HTTPS.
+            Some(fallthrough_tcp) => fallthrough_tcp,
         }
-        // No passthrough route matched. Fall through to TLS terminate only if a
-        // real HTTPS listener serves this SNI; otherwise no Gateway listener on
-        // this hybrid port accepts the connection, so reject it by dropping the
-        // socket (the client observes a connection reset / EOF). Answering with
-        // the TLS context's default cert instead would leave a non-matching SNI
-        // looking "connectable", which GEP-2643 hostname-intersection forbids
-        // (TLSRoute-standard: a request must reach a backend only for an
-        // intersecting hostname).
-        if !handler
-            .tls_selector
-            .for_port(port)
-            .has_cert_for(sni.as_deref())
-        {
-            tracing::debug!(
-                port,
-                sni = ?sni,
-                "Hybrid port: no passthrough route and no terminate cert for SNI — rejecting connection"
-            );
-            return;
-        }
-        // SNI has a terminate cert: fall through to TLS terminate.
-        // Peeked bytes are still in the kernel queue — no replay needed.
-    }
+    } else {
+        tcp
+    };
 
-    // For TlsHybrid that fell through (no passthrough match), treat as Https.
+    // For TlsHybrid that fell through (no L4 route match), treat as Https.
     let effective_protocol = match handler.protocol {
         ListenerProtocol::TlsHybrid => ListenerProtocol::Https,
         p => p,
@@ -852,7 +931,7 @@ impl Drop for ConnectionGuard {
 /// only after the request layer extracts the digest; surfacing it here is a
 /// follow-up. Operators still get the `result` dimension (ok vs fail) which
 /// is the higher-value signal during incidents.
-fn observe_tls_handshake(result: &'static str) {
+pub(crate) fn observe_tls_handshake(result: &'static str) {
     metrics::tls_handshakes_total()
         .with_label_values(&[result, "unknown"])
         .inc();
@@ -951,8 +1030,8 @@ async fn handle_standard<P>(
             // works correctly), ALPN, keepalive, and shutdown.
             let _ = proxy.process_new(stream, &conn_shutdown).await;
         }
-        // Passthrough and hybrid connections are dispatched before reaching this function.
-        ListenerProtocol::TlsPassthrough | ListenerProtocol::TlsHybrid => {}
+        // L4 and hybrid connections are dispatched before reaching this function.
+        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid => {}
     }
 }
 
@@ -1007,7 +1086,7 @@ async fn handle_proxy_protocol<P>(
         ListenerProtocol::Http => "http",
         ListenerProtocol::Https => "https",
         // Passthrough / hybrid connections are dispatched before reaching this function.
-        ListenerProtocol::TlsPassthrough | ListenerProtocol::TlsHybrid => return,
+        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid => return,
     };
     let conn_info = ConnectionInfo {
         real_addr,
@@ -1043,7 +1122,7 @@ async fn handle_proxy_protocol<P>(
         }
         ListenerProtocol::Http => Box::new(L4Stream::from(tcp)),
         // Passthrough / hybrid connections are dispatched before reaching this function.
-        ListenerProtocol::TlsPassthrough | ListenerProtocol::TlsHybrid => return,
+        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid => return,
     };
 
     let mut session = ServerSession::new_http1(stream);
@@ -1071,9 +1150,9 @@ async fn handle_proxy_protocol<P>(
 
 /// Bundled TLS acceptor + SNI callbacks for HTTPS listeners.
 #[derive(Clone)]
-struct TlsContext {
-    acceptor: Arc<SslAcceptor>,
-    callbacks: Arc<pingora_core::listeners::TlsAcceptCallbacks>,
+pub(crate) struct TlsContext {
+    pub(crate) acceptor: Arc<SslAcceptor>,
+    pub(crate) callbacks: Arc<pingora_core::listeners::TlsAcceptCallbacks>,
 }
 
 /// Build a TLS acceptor for an HTTPS listener.
@@ -1082,7 +1161,7 @@ struct TlsContext {
 /// callback that prefers `h2` over `http/1.1`, enabling transparent HTTP/2
 /// negotiation with TLS clients.  Pass `false` for the PROXY-protocol path,
 /// which runs an h1-only keepalive loop and must not advertise h2.
-fn build_tls_context(
+pub(crate) fn build_tls_context(
     selector: &SniCertSelector,
     advertise_h2: bool,
 ) -> Result<TlsContext, AcceptorBuildError> {

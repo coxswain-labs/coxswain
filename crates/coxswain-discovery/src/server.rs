@@ -84,6 +84,10 @@ pub struct SnapshotSource {
     /// Only populated for [`Scope::SharedPool`] subscribers; dedicated proxies
     /// receive an empty table (TLSRoutes are shared-pool only).
     pub passthrough_routes: SharedTlsPassthroughTable,
+    /// SNI-keyed TLS terminate routing table for TLSRouteModeTerminate (#481).
+    /// Only populated for [`Scope::SharedPool`] subscribers; dedicated proxies
+    /// receive an empty table (TLSRoutes are shared-pool only).
+    pub terminate_routes: SharedTlsPassthroughTable,
 }
 
 impl Clone for SnapshotSource {
@@ -96,6 +100,7 @@ impl Clone for SnapshotSource {
             listener_status: self.listener_status.clone(),
             dedicated: self.dedicated.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
+            terminate_routes: self.terminate_routes.clone(),
         }
     }
 }
@@ -168,6 +173,7 @@ struct SnapshotContent {
     client_cert_store: p::ClientCertStore,
     listener_status: p::GatewayListenerStatus,
     tls_passthrough: p::TlsPassthroughTable,
+    tls_terminate: p::TlsPassthroughTable,
 }
 
 impl SnapshotContent {
@@ -182,6 +188,7 @@ impl SnapshotContent {
             client_cert_store: Some(self.client_cert_store),
             listener_status: Some(self.listener_status),
             tls_passthrough: Some(self.tls_passthrough),
+            tls_terminate: Some(self.tls_terminate),
         }
     }
 }
@@ -213,6 +220,7 @@ fn build_snapshot(
             let client_certs = source.client_certs.load();
             let listener_status = source.listener_status.load();
             let passthrough = source.passthrough_routes.load();
+            let terminate = source.terminate_routes.load();
 
             assemble_snapshot(
                 ingress_to_wire(&ingress),
@@ -221,6 +229,7 @@ fn build_snapshot(
                 client_cert_to_wire(&client_certs),
                 listener_status_to_wire(&listener_status),
                 passthrough_to_wire(&passthrough),
+                passthrough_to_wire(&terminate),
             )
         }
         Scope::Gateway { name, namespace } => {
@@ -247,6 +256,8 @@ fn build_snapshot(
                             p::GatewayListenerStatus::default(),
                             // Dedicated proxies never serve TLS passthrough routes.
                             p::TlsPassthroughTable::default(),
+                            // Dedicated proxies never serve TLS terminate routes.
+                            p::TlsPassthroughTable::default(),
                         );
                     }
                     assemble_snapshot(
@@ -258,6 +269,8 @@ fn build_snapshot(
                         listener_status_to_wire(&snap.listener_status),
                         // Dedicated proxies never serve TLS passthrough routes.
                         p::TlsPassthroughTable::default(),
+                        // Dedicated proxies never serve TLS terminate routes.
+                        p::TlsPassthroughTable::default(),
                     )
                 }
                 // Fail closed: the Gateway is not (yet) cut over, so this proxy
@@ -268,6 +281,7 @@ fn build_snapshot(
                     p::PortTlsStore::default(),
                     p::ClientCertStore::default(),
                     p::GatewayListenerStatus::default(),
+                    p::TlsPassthroughTable::default(),
                     p::TlsPassthroughTable::default(),
                 ),
             }
@@ -286,6 +300,7 @@ fn assemble_snapshot(
     client_certs_dto: p::ClientCertStore,
     listener_status_dto: p::GatewayListenerStatus,
     tls_passthrough_dto: p::TlsPassthroughTable,
+    tls_terminate_dto: p::TlsPassthroughTable,
 ) -> SnapshotContent {
     let hashes = vec![
         ContentHash::compute(&ingress_dto.encode_to_vec())
@@ -306,6 +321,9 @@ fn assemble_snapshot(
         ContentHash::compute(&tls_passthrough_dto.encode_to_vec())
             .as_str()
             .to_owned(),
+        ContentHash::compute(&tls_terminate_dto.encode_to_vec())
+            .as_str()
+            .to_owned(),
     ];
     let version = ContentHash::from_per_resource(hashes).as_str().to_owned();
 
@@ -317,6 +335,7 @@ fn assemble_snapshot(
         client_cert_store: client_certs_dto,
         listener_status: listener_status_dto,
         tls_passthrough: tls_passthrough_dto,
+        tls_terminate: tls_terminate_dto,
     }
 }
 
@@ -731,6 +750,7 @@ mod tests {
             listener_status: SharedGatewayListenerStatus::new(),
             dedicated: DedicatedRoutingRegistry::new(),
             passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
+            terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         }
     }
 

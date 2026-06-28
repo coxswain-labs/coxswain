@@ -137,6 +137,8 @@ pub struct DiscoveryClient {
     listener_hostnames: SharedListenerHostnames,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
+    /// SNI-keyed TLS terminate routing table for TLSRouteModeTerminate (#481).
+    terminate_routes: SharedTlsPassthroughTable,
 }
 
 impl DiscoveryClient {
@@ -189,6 +191,7 @@ impl DiscoveryClient {
         let listener_status = SharedGatewayListenerStatus::new();
         let listener_hostnames = SharedListenerHostnames::new();
         let passthrough_routes = SharedTlsPassthroughTable::new();
+        let terminate_routes = SharedTlsPassthroughTable::new();
 
         let supervisor = Supervisor {
             config,
@@ -199,6 +202,7 @@ impl DiscoveryClient {
             listener_status: listener_status.clone(),
             listener_hostnames: listener_hostnames.clone(),
             passthrough: passthrough_routes.clone(),
+            terminate: terminate_routes.clone(),
             health,
             health_check: health_check.to_owned(),
             has_snapshot: false,
@@ -212,6 +216,7 @@ impl DiscoveryClient {
             listener_status,
             listener_hostnames,
             passthrough_routes,
+            terminate_routes,
         };
 
         Ok((client, supervisor))
@@ -294,6 +299,14 @@ impl DiscoveryClient {
     pub fn passthrough_routes(&self) -> SharedTlsPassthroughTable {
         self.passthrough_routes.clone()
     }
+
+    /// Handle to the TLS terminate routing table snapshot for TLSRouteModeTerminate (#481).
+    ///
+    /// Updated atomically with every applied snapshot from the controller.
+    #[must_use]
+    pub fn terminate_routes(&self) -> SharedTlsPassthroughTable {
+        self.terminate_routes.clone()
+    }
 }
 
 impl coxswain_core::RoutingSource for DiscoveryClient {
@@ -320,6 +333,10 @@ impl coxswain_core::RoutingSource for DiscoveryClient {
     fn passthrough_routes(&self) -> SharedTlsPassthroughTable {
         self.passthrough_routes.clone()
     }
+
+    fn terminate_routes(&self) -> SharedTlsPassthroughTable {
+        self.terminate_routes.clone()
+    }
 }
 
 // ── supervisor ──────────────────────────────────────────────────────────────
@@ -340,6 +357,7 @@ pub struct Supervisor {
     listener_status: SharedGatewayListenerStatus,
     listener_hostnames: SharedListenerHostnames,
     passthrough: SharedTlsPassthroughTable,
+    terminate: SharedTlsPassthroughTable,
     health: SubsystemHandle,
     health_check: String,
     has_snapshot: bool,
@@ -518,6 +536,7 @@ impl Supervisor {
                     status: &self.listener_status,
                     listener_hostnames: &self.listener_hostnames,
                     passthrough: &self.passthrough,
+                    terminate: &self.terminate,
                 },
             ) {
                 Ok(()) => {
@@ -576,6 +595,7 @@ struct SnapshotCells<'a> {
     status: &'a SharedGatewayListenerStatus,
     listener_hostnames: &'a SharedListenerHostnames,
     passthrough: &'a SharedTlsPassthroughTable,
+    terminate: &'a SharedTlsPassthroughTable,
 }
 
 /// Decode all routing cells from a snapshot DTO and atomically publish them.
@@ -629,6 +649,12 @@ fn apply_snapshot(
             .as_ref()
             .unwrap_or(&p::TlsPassthroughTable::default()),
     )?;
+    let terminate_table = passthrough_from_wire(
+        snapshot
+            .tls_terminate
+            .as_ref()
+            .unwrap_or(&p::TlsPassthroughTable::default()),
+    )?;
 
     // Derive the per-port HTTPS listener-hostname snapshot from the status map
     // (same data the reflector uses in build_tls) so GEP-3567 misdirected-request
@@ -653,6 +679,7 @@ fn apply_snapshot(
     cells.client_certs.store(Arc::new(client_cert_store));
     cells.status.store_and_notify(listener_status_map);
     cells.passthrough.store(Arc::new(passthrough_table));
+    cells.terminate.store(Arc::new(terminate_table));
 
     Ok(())
 }
@@ -901,6 +928,7 @@ mod tests {
                 client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
                 listener_status: Some(GatewayListenerStatus::default()),
                 tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
+                tls_terminate: Some(crate::proto::v1::TlsPassthroughTable::default()),
             })),
         }
     }
@@ -931,6 +959,7 @@ mod tests {
                 client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
                 listener_status: Some(GatewayListenerStatus::default()),
                 tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
+                tls_terminate: Some(crate::proto::v1::TlsPassthroughTable::default()),
             })),
         }
     }

@@ -106,6 +106,10 @@ func TestConformance(t *testing.T) {
 		features.SupportGRPCRoute,
 		// Standard: TLSRoute passthrough — GEP-2643 (#70)
 		features.SupportTLSRoute,
+		// Extended: TLSRoute terminate mode — #481
+		features.SupportTLSRouteModeTerminate,
+		// Extended: TLSRoute mixed (passthrough+terminate on same port) — #481
+		features.SupportTLSRouteModeMixed,
 		// Standard: ListenerSet — GEP-1713 (#93)
 		features.SupportListenerSet,
 	)

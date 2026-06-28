@@ -771,11 +771,17 @@ impl GatewayApiReconciler {
                 // TLS passthrough: proxy peeks SNI and forwards raw stream; no cert needed.
                 ListenerReadiness::TlsPassthrough
             } else if listener.protocol == "TLS" {
-                // TLS/Terminate is not supported — only tls.mode: Passthrough is (GEP-2643).
-                ListenerReadiness::Unsupported {
-                    message: "TLS listeners require tls.mode: Passthrough; \
-                              tls.mode: Terminate is not supported by this implementation"
-                        .to_string(),
+                // TLS/Terminate (TLSRouteModeTerminate, #481): resolve the cert exactly as for
+                // HTTPS and install it into the per-port TLS store so the proxy's SniCertSelector
+                // finds it. Remap Resolved → TlsTerminate so the bin layer creates a TlsL4
+                // proxy port (L4 splice) rather than an HTTPS (L7 HTTP) listener.
+                let grants = match &listener.source {
+                    ListenerSource::Gateway => cert_grants,
+                    ListenerSource::ListenerSet(_) => ls_cert_grants,
+                };
+                match resolve_listener_tls(gw_name, listener, secrets, grants, builder, bind_port) {
+                    ListenerReadiness::Resolved => ListenerReadiness::TlsTerminate,
+                    other => other,
                 }
             } else if listener.protocol != "HTTPS" {
                 ListenerReadiness::NotApplicable

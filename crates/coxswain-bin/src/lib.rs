@@ -153,6 +153,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         listener_status: listener_status.clone(),
         dedicated: status_writer.outputs.dedicated_registry.clone(),
         passthrough_routes: status_writer.outputs.passthrough_routes.clone(),
+        terminate_routes: status_writer.outputs.terminate_routes.clone(),
     };
     let discovery_service = coxswain_discovery::DiscoveryService::new(
         discovery_source,
@@ -505,6 +506,7 @@ fn wire_gateway_only_proxy_services(
                 proxy.proxy_listener_drain_timeout,
                 PassthroughConfig {
                     table: source.passthrough_routes(),
+                    terminate_table: source.terminate_routes(),
                     dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
                 },
             )
@@ -522,6 +524,7 @@ fn wire_gateway_only_proxy_services(
                 proxy.proxy_listener_drain_timeout,
                 PassthroughConfig {
                     table: source.passthrough_routes(),
+                    terminate_table: source.terminate_routes(),
                     dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
                 },
             )
@@ -655,6 +658,7 @@ fn wire_proxy_services(
                     proxy.proxy_listener_drain_timeout,
                     PassthroughConfig {
                         table: source.passthrough_routes(),
+                        terminate_table: source.terminate_routes(),
                         dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
                     },
                 )
@@ -680,6 +684,7 @@ fn wire_proxy_services(
                 proxy.proxy_listener_drain_timeout,
                 PassthroughConfig {
                     table: source.passthrough_routes(),
+                    terminate_table: source.terminate_routes(),
                     dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
                 },
             )
@@ -705,6 +710,7 @@ fn wire_proxy_services(
                     proxy.proxy_listener_drain_timeout,
                     PassthroughConfig {
                         table: source.passthrough_routes(),
+                        terminate_table: source.terminate_routes(),
                         dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
                     },
                 )
@@ -730,6 +736,7 @@ fn wire_proxy_services(
                 proxy.proxy_listener_drain_timeout,
                 PassthroughConfig {
                     table: source.passthrough_routes(),
+                    terminate_table: source.terminate_routes(),
                     dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
                 },
             )
@@ -1155,16 +1162,18 @@ impl pingora_core::services::background::BackgroundService for RateLimiterGcServ
 /// Excludes ports already in `excluded_ports` (used to prevent the gateway
 /// acceptor from binding ports already owned by the static ingress acceptor).
 ///
-/// When a port appears with both `TlsPassthrough` (TLSRoute) and HTTPS terminate
-/// listeners, it gets a single `TlsHybrid` spec: on accept the handler peeks SNI
-/// and routes to passthrough if matched, otherwise falls through to TLS terminate.
+/// Per-port protocol upgrade rules:
+/// - TLSRoute passthrough or terminate-only → `TlsL4`
+/// - TLSRoute (any) + HTTPS terminate on the same port → `TlsHybrid`
 fn derive_gateway_specs(
     health: &std::collections::HashMap<ObjectKey, GatewayListenerStatus>,
     bind_addr: IpAddr,
     excluded_ports: &HashSet<u16>,
 ) -> HashSet<ListenerSpec> {
-    // Accumulate the effective protocol per port: upgrade to TlsHybrid when the
-    // same port carries both TlsPassthrough and Https outcomes.
+    // Accumulate the effective protocol per port. Rules (commutative):
+    //   TlsL4 + TlsL4   → TlsL4    (passthrough+terminate on same port = Mixed #481)
+    //   TlsL4 + Https   → TlsHybrid
+    //   Https + Https   → Https
     let mut port_proto: HashMap<u16, ListenerProtocol> = HashMap::new();
     for gw_health in health.values() {
         for info in gw_health.listeners.values() {
@@ -1177,20 +1186,23 @@ fn derive_gateway_specs(
             }
             let new_proto = match info.readiness {
                 ListenerReadiness::NotApplicable => ListenerProtocol::Http,
-                ListenerReadiness::TlsPassthrough => ListenerProtocol::TlsPassthrough,
+                ListenerReadiness::TlsPassthrough | ListenerReadiness::TlsTerminate => {
+                    ListenerProtocol::TlsL4
+                }
                 _ => ListenerProtocol::Https,
             };
             port_proto
                 .entry(port)
                 .and_modify(|existing| {
-                    // Upgrade to TlsHybrid when both passthrough and HTTPS terminate share a port.
-                    if (*existing == ListenerProtocol::TlsPassthrough
+                    // Upgrade to TlsHybrid when TLS L4 and HTTPS terminate share a port.
+                    if (*existing == ListenerProtocol::TlsL4
                         && new_proto == ListenerProtocol::Https)
                         || (*existing == ListenerProtocol::Https
-                            && new_proto == ListenerProtocol::TlsPassthrough)
+                            && new_proto == ListenerProtocol::TlsL4)
                     {
                         *existing = ListenerProtocol::TlsHybrid;
                     }
+                    // TlsL4+TlsL4 (Mixed) or Https+Https stay as-is.
                 })
                 .or_insert(new_proto);
         }

@@ -55,4 +55,13 @@ pub trait RoutingSource: Send + Sync {
     fn passthrough_routes(&self) -> SharedTlsPassthroughTable {
         SharedTlsPassthroughTable::new()
     }
+
+    /// Handle to the TLS terminate routing table snapshot for TLSRouteModeTerminate (#481).
+    ///
+    /// The default returns an empty table so existing implementations compile unchanged
+    /// until wired.
+    #[must_use]
+    fn terminate_routes(&self) -> SharedTlsPassthroughTable {
+        SharedTlsPassthroughTable::new()
+    }
 }

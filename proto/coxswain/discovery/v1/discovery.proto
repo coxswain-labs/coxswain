@@ -133,6 +133,9 @@ message Snapshot {
   ClientCertStore client_cert_store = 13;
   GatewayListenerStatus listener_status = 14;
   TlsPassthroughTable tls_passthrough = 15;
+  // TLSRouteModeTerminate (#481): SNI→plaintext-backend table; proxy terminates TLS
+  // on accept and L4-splices the decrypted stream. Reuses TlsPassthroughTable message.
+  TlsPassthroughTable tls_terminate = 16;
   // repeated (reserved for v0.6 delta streaming)
   reserved 40;
   reserved "removed_resources";
@@ -727,9 +730,11 @@ enum ListenerReadiness {
   // protocol: TLS, tls.mode: Passthrough — proxy peeks SNI and splices raw TCP;
   // no TLS termination, no certificateRef needed (GEP-2643 / TLSRoute, #70).
   LISTENER_READINESS_TLS_PASSTHROUGH = 7;
-  // Unsupported protocol/mode combination (e.g. protocol: TLS, tls.mode:
-  // Terminate). Surfaces Accepted=False/UnsupportedValue (GEP-2643 / TLSRoute, #70).
+  // Unsupported protocol/mode combination. Surfaces Accepted=False/UnsupportedValue.
   LISTENER_READINESS_UNSUPPORTED = 8;
+  // protocol: TLS, tls.mode: Terminate — proxy terminates TLS using the listener
+  // cert and L4-splices the decrypted stream to the backend (TLSRouteModeTerminate, #481).
+  LISTENER_READINESS_TLS_TERMINATE = 9;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

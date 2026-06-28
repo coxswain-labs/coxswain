@@ -3036,6 +3036,317 @@ async fn tls_passthrough_listener_without_route_is_programmed_but_drops() -> any
     Ok(())
 }
 
+// ── TLS terminate (TLSRouteModeTerminate, #481) ───────────────────────────────
+
+/// Happy path: a `TLS/Terminate` listener decrypts the TLS stream and forwards
+/// plaintext to the backend (TLSRouteModeTerminate, #481).
+///
+/// Proof that TLS was terminated at the gateway: the backend is a plain HTTP
+/// server with no TLS capability.  If the proxy were doing passthrough instead,
+/// it would forward raw TLS bytes — the backend would not respond with valid
+/// HTTP and the client would get no response body (or a parse error).
+#[tokio::test]
+async fn terminate_route_decrypts_and_reaches_backend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-terminate-happy").await?;
+
+    let hostname = format!("terminate.{}.local", ns.name);
+    let gw_cert = GeneratedCert::for_host(&hostname);
+
+    // Plain HTTP echo backend — only reachable if the proxy terminates TLS.
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["echo-a"]).await?;
+
+    fixtures::apply_fixture(
+        gwa::TLS_TERMINATE,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("TERMINATE_HOSTNAME", &hostname)
+            .with("GW_TLS_CRT_B64", &gw_cert.cert_b64())
+            .with("GW_TLS_KEY_B64", &gw_cert.key_b64()),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-terminate-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let terminate_addr = h.gateway_passthrough_addr(&ns.name).await?;
+    let trusted_ca_der = gw_cert.cert_der();
+    let body = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("TLS terminate route for {hostname} to become live") },
+        || async {
+            try_tls_passthrough(
+                &terminate_addr,
+                &hostname,
+                &trusted_ca_der,
+                "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+
+    assert!(
+        body.contains("namespace"),
+        "expected echo-a JSON body with 'namespace' field, got: {body}",
+    );
+
+    Ok(())
+}
+
+/// Sad path: TLS connection with an SNI that has no matching TLSRoute is dropped.
+///
+/// Establishes the happy-path first as a pre-condition (so the test doesn't pass
+/// vacuously due to the proxy not being ready), then connects with a non-matching
+/// SNI and asserts the connection is rejected.
+#[tokio::test]
+async fn terminate_route_rejects_wrong_sni() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-terminate-nosni").await?;
+
+    let hostname = format!("terminate.{}.local", ns.name);
+    let gw_cert = GeneratedCert::for_host(&hostname);
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["echo-a"]).await?;
+
+    fixtures::apply_fixture(
+        gwa::TLS_TERMINATE,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("TERMINATE_HOSTNAME", &hostname)
+            .with("GW_TLS_CRT_B64", &gw_cert.cert_b64())
+            .with("GW_TLS_KEY_B64", &gw_cert.key_b64()),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-terminate-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let terminate_addr = h.gateway_passthrough_addr(&ns.name).await?;
+    let trusted_ca_der = gw_cert.cert_der();
+
+    // Pre-condition: confirm the configured hostname routes before probing the negative.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("TLS terminate route for {hostname} to become live (pre-condition)") },
+        || async {
+            try_tls_passthrough(
+                &terminate_addr,
+                &hostname,
+                &trusted_ca_der,
+                "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+
+    // Connect with an SNI that has no matching TLSRoute → proxy drops the connection.
+    let unknown = format!("unknown.{}.local", ns.name);
+    let result = try_tls_passthrough(
+        &terminate_addr,
+        &unknown,
+        &trusted_ca_der,
+        "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "expected connection error for non-matching SNI on terminate listener, got success",
+    );
+
+    Ok(())
+}
+
+/// Happy path + isolation: one Gateway, one port, Terminate listener (hostname A) and
+/// Passthrough listener (hostname B) co-exist with no cross-leak (TLSRouteModeMixed, #481).
+///
+/// Isolation proofs:
+/// - SNI A (terminate) is routed to the plaintext backend (echo-a); trusting the
+///   *gateway* cert succeeds, trusting the *backend* cert fails (gateway presented its
+///   own cert, not the backend's).
+/// - SNI B (passthrough) is routed to the TLS backend (echo-tls); trusting the
+///   *backend* cert succeeds, trusting the *gateway* cert fails (backend's cert is
+///   passed through unchanged, not replaced by the gateway's).
+#[tokio::test]
+async fn mixed_terminate_and_passthrough_isolated() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-mixed").await?;
+
+    let terminate_hostname = format!("terminate.{}.local", ns.name);
+    let passthrough_hostname = format!("passthrough.{}.local", ns.name);
+
+    // Gateway cert for the Terminate listener.
+    let gw_cert = GeneratedCert::for_host(&terminate_hostname);
+    // Backend cert for the Passthrough backend (the proxy never sees this; it's
+    // used to verify the client trusts only the backend's cert on the passthrough side).
+    let backend_cert = GeneratedCert::for_host(&passthrough_hostname);
+
+    // Deploy the plaintext echo backend (terminate path) + TLS echo backend (passthrough path).
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", backend_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", backend_cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-a", "echo-tls"]).await?;
+
+    fixtures::apply_fixture(
+        gwa::TLS_MIXED,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("TERMINATE_HOSTNAME", &terminate_hostname)
+            .with("PASSTHROUGH_HOSTNAME", &passthrough_hostname)
+            .with("GW_TLS_CRT_B64", &gw_cert.cert_b64())
+            .with("GW_TLS_KEY_B64", &gw_cert.key_b64()),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-mixed-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let mixed_addr = h.gateway_passthrough_addr(&ns.name).await?;
+    let gw_cert_der = gw_cert.cert_der();
+    let backend_cert_der = backend_cert.cert_der();
+
+    // Wait for both routes to become live.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!("terminate route for {terminate_hostname} to become live (pre-condition)")
+        },
+        || async {
+            try_tls_passthrough(
+                &mixed_addr,
+                &terminate_hostname,
+                &gw_cert_der,
+                "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!("passthrough route for {passthrough_hostname} to become live (pre-condition)")
+        },
+        || async {
+            try_tls_passthrough(
+                &mixed_addr,
+                &passthrough_hostname,
+                &backend_cert_der,
+                "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+
+    // ── Happy-path assertions ──────────────────────────────────────────────────
+
+    // SNI A (terminate): trusting the *gateway* cert → reaches echo-a (plaintext backend).
+    let terminate_body = try_tls_passthrough(
+        &mixed_addr,
+        &terminate_hostname,
+        &gw_cert_der,
+        "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+    )
+    .await?;
+    assert!(
+        terminate_body.contains("namespace"),
+        "expected echo-a JSON body from terminate path, got: {terminate_body}",
+    );
+
+    // SNI B (passthrough): trusting the *backend* cert → reaches echo-tls (TLS backend).
+    let passthrough_body = try_tls_passthrough(
+        &mixed_addr,
+        &passthrough_hostname,
+        &backend_cert_der,
+        "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+    )
+    .await?;
+    assert!(
+        passthrough_body.contains("namespace"),
+        "expected echo-tls JSON body from passthrough path, got: {passthrough_body}",
+    );
+
+    // ── Isolation: no cross-leak ───────────────────────────────────────────────
+
+    // Terminate path with backend cert as root → must fail (gateway presented
+    // its own cert, not the backend's — so the backend cert is not trusted).
+    let cross_a = try_tls_passthrough(
+        &mixed_addr,
+        &terminate_hostname,
+        &backend_cert_der,
+        "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        cross_a.is_err(),
+        "terminate path must not present the backend cert — cross-leak detected",
+    );
+
+    // Passthrough path with gateway cert as root → must fail (backend passed through
+    // its own cert, not the gateway's — so the gateway cert is not trusted).
+    let cross_b = try_tls_passthrough(
+        &mixed_addr,
+        &passthrough_hostname,
+        &gw_cert_der,
+        "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        cross_b.is_err(),
+        "passthrough path must not present the gateway cert — cross-leak detected",
+    );
+
+    Ok(())
+}
+
 /// Open a raw TLS connection to `addr` with `sni` as the ClientHello server_name.
 ///
 /// Verifies the TLS handshake against `trusted_ca_der` (the backend's cert in DER

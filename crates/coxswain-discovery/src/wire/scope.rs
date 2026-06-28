@@ -112,6 +112,7 @@ pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerI
         p::ListenerReadiness::Unsupported => ListenerReadiness::Unsupported {
             message: dto.detail.clone(),
         },
+        p::ListenerReadiness::TlsTerminate => ListenerReadiness::TlsTerminate,
     };
 
     let mut li = ListenerInfo::default();
