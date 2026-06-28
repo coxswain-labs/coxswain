@@ -660,8 +660,8 @@ pub(super) fn merge_backend_client_cert_health(
 /// Generic over [`RouteLike`] so the one algorithm serves every route kind
 /// (HTTPRoute, GRPCRoute, TLSRoute) — GRPC/TLS listeners would otherwise always
 /// report `attachedRoutes: 0` (#470). `passthrough_kind` flips listener
-/// eligibility by kind: TLSRoutes attach **only** to `TlsPassthrough` listeners,
-/// HTTP/GRPC routes attach only to non-passthrough listeners (the
+/// eligibility by kind: TLSRoutes attach to `TlsPassthrough` or `TlsTerminate`
+/// listeners; HTTP/GRPC routes attach only to non-TLS-L4 listeners (the
 /// `allowedRoutes.kinds` restriction implied by listener protocol/mode).
 pub(super) fn count_attached_routes<R: RouteLike>(
     routes: &[Arc<R>],
@@ -670,10 +670,14 @@ pub(super) fn count_attached_routes<R: RouteLike>(
     gateway_listener_status: &mut HashMap<ObjectKey, GatewayListenerStatus>,
     passthrough_kind: bool,
 ) {
-    // A listener accepts this route kind when its passthrough-ness matches the
-    // kind: passthrough listeners ↔ TLSRoutes, everything else ↔ HTTP/GRPC.
+    // TLSRoutes (passthrough_kind=true) attach to any TLS-L4 listener (Passthrough
+    // or Terminate). HTTP/GRPC routes attach only to non-TLS-L4 listeners.
     let listener_accepts = |info: &ListenerInfo| {
-        passthrough_kind == matches!(info.readiness, ListenerReadiness::TlsPassthrough)
+        let is_tls_l4 = matches!(
+            info.readiness,
+            ListenerReadiness::TlsPassthrough | ListenerReadiness::TlsTerminate
+        );
+        passthrough_kind == is_tls_l4
     };
 
     for route in routes {
@@ -1141,13 +1145,29 @@ mod tests {
     }
 
     #[test]
-    fn tls_route_not_counted_against_terminate_listener() {
+    fn tls_route_not_counted_against_https_listener() {
+        // protocol: HTTPS listeners (readiness Resolved) carry HTTPRoute, not TLSRoute.
         let mut map = health(vec![listener("https", ListenerReadiness::Resolved, 443)]);
         count_attached_routes(&[tls_route()], &owned(), &HashMap::new(), &mut map, true);
         assert_eq!(
             attached(&map, "https"),
             0,
-            "TLSRoute must never attach to a TLS-terminate listener"
+            "TLSRoute must not attach to a protocol:HTTPS (L7) listener"
+        );
+    }
+
+    #[test]
+    fn tls_route_increments_attached_routes_on_terminate_listener() {
+        let mut map = health(vec![listener(
+            "tls-terminate",
+            ListenerReadiness::TlsTerminate,
+            8443,
+        )]);
+        count_attached_routes(&[tls_route()], &owned(), &HashMap::new(), &mut map, true);
+        assert_eq!(
+            attached(&map, "tls-terminate"),
+            1,
+            "TLSRoute must be counted against its terminate listener"
         );
     }
 

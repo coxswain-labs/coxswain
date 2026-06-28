@@ -1458,6 +1458,18 @@ fn listener_attached_routes(gw: &Gateway, listener: &str) -> Option<i32> {
         .map(|l| l.attached_routes)
 }
 
+/// `status.listeners[name].supportedKinds[*].kind` for the named listener.
+fn listener_supported_kinds(gw: &Gateway, listener: &str) -> Option<Vec<String>> {
+    gw.status
+        .as_ref()?
+        .listeners
+        .as_deref()?
+        .iter()
+        .find(|l| l.name == listener)
+        .and_then(|l| l.supported_kinds.as_deref())
+        .map(|kinds| kinds.iter().map(|k| k.kind.clone()).collect())
+}
+
 /// Both GRPCRoutes in the fixture attach to the Gateway's HTTP listener, so its
 /// `attachedRoutes` reaches 2. Guards the GRPCRoute arm of [#470]: before the
 /// fix the counter only walked HTTPRoutes, so GRPC-only listeners reported 0.
@@ -1586,6 +1598,101 @@ async fn tls_passthrough_listener_without_route_reports_zero_attached_routes() -
         listener_attached_routes(&gw, "tls-passthrough"),
         Some(0),
         "passthrough listener with no TLSRoute must report attachedRoutes=0"
+    );
+
+    Ok(())
+}
+
+/// A TLSRoute attached to a `TLS/Terminate` listener increments that listener's
+/// `attachedRoutes`. Guards the bug where `count_attached_routes` only counted
+/// TLSRoutes on `TlsPassthrough` listeners, leaving Terminate listeners at 0.
+#[tokio::test]
+async fn tls_terminate_route_counted_in_listener_attached_routes() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-tls-term-attached").await?;
+    let hostname = format!("terminate.{}.local", ns.name);
+    let gw_cert = GeneratedCert::for_host(&hostname);
+
+    fixtures::apply_fixture(
+        gwa::TLS_TERMINATE,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("TERMINATE_HOSTNAME", &hostname)
+            .with("GW_TLS_CRT_B64", &gw_cert.cert_b64())
+            .with("GW_TLS_KEY_B64", &gw_cert.key_b64()),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let observed = gw_api.get("coxswain-terminate-gw").await.ok().map_or_else(
+                || "<could not fetch Gateway>".to_string(),
+                |gw| {
+                    format!(
+                        "attachedRoutes={:?}",
+                        listener_attached_routes(&gw, "tls-terminate")
+                    )
+                },
+            );
+            format!(
+                "Gateway coxswain-terminate-gw listener 'tls-terminate' to report \
+                 attachedRoutes=1; observed {observed}"
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-terminate-gw").await.ok()?;
+            (listener_attached_routes(&gw, "tls-terminate") == Some(1)).then_some(())
+        },
+    )
+    .await
+}
+
+/// A `TLS/Terminate` listener reports `TLSRoute` in its `supportedKinds` —
+/// not `HTTPRoute`. Guards the bug where `listener_route_kind_info` only
+/// recognised Passthrough listeners as TLS-kind listeners, defaulting Terminate
+/// to HTTPRoute and rejecting explicit `allowedRoutes.kinds: [TLSRoute]`.
+#[tokio::test]
+async fn tls_terminate_listener_reports_tls_route_in_supported_kinds() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-tls-term-kinds").await?;
+    let hostname = format!("terminate.{}.local", ns.name);
+    let gw_cert = GeneratedCert::for_host(&hostname);
+
+    fixtures::apply_fixture(
+        gwa::TLS_TERMINATE,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("TERMINATE_HOSTNAME", &hostname)
+            .with("GW_TLS_CRT_B64", &gw_cert.cert_b64())
+            .with("GW_TLS_KEY_B64", &gw_cert.key_b64()),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-terminate-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let gw = gw_api.get("coxswain-terminate-gw").await?;
+    assert_eq!(
+        listener_supported_kinds(&gw, "tls-terminate"),
+        Some(vec!["TLSRoute".to_string()]),
+        "TLS/Terminate listener must report supportedKinds=[TLSRoute], not HTTPRoute"
     );
 
     Ok(())
