@@ -1,0 +1,27 @@
+# Shared-mode Gateway (no parametersRef) declaring GEP-1867 infrastructure
+# metadata. The controller provisions a per-Gateway identity ServiceAccount in
+# this namespace carrying the gateway-name label plus the propagated
+# labels/annotations. The reserved key override below is dropped by the
+# controller; the benign "kept" label survives.
+# TESTNS is substituted at runtime.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: shared-infra-gw
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    labels:
+      team: platform
+      kept: "yes"
+      app.kubernetes.io/name: evil
+    annotations:
+      coxswain.example/owner: tenant-team
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

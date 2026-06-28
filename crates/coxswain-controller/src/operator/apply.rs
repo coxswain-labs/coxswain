@@ -158,3 +158,35 @@ pub(super) async fn apply_shared_vip_service(
         .map_err(ApplyError::Service)?;
     Ok(())
 }
+
+/// Server-side-apply the per-Gateway shared-mode identity `ServiceAccount`
+/// (#482, GEP-1867) into the Gateway's own namespace.
+///
+/// Same `force=true` field-manager contract as [`apply_rendered`]: idempotent on
+/// an unchanged SA, and force-apply prunes any infra label/annotation the
+/// operator removes from `spec.infrastructure` — so add/update/remove all
+/// reconcile through the next apply with no extra bookkeeping.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::ServiceAccount`] if the apiserver rejects the patch.
+///
+/// # Panics
+///
+/// Panics if `sa` has no `metadata.name` — a rendering invariant whose absence
+/// indicates a controller bug.
+pub(super) async fn apply_shared_gateway_service_account(
+    client: &Client,
+    namespace: &str,
+    sa: &ServiceAccount,
+) -> Result<(), ApplyError> {
+    let name = sa.metadata.name.as_deref().unwrap_or_else(|| {
+        panic!("invariant: rendered shared identity ServiceAccount has no name")
+    });
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+    let api: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    api.patch(name, &params, &Patch::Apply(sa))
+        .await
+        .map_err(ApplyError::ServiceAccount)?;
+    Ok(())
+}

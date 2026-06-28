@@ -112,6 +112,11 @@ func TestConformance(t *testing.T) {
 		features.SupportTLSRouteModeMixed,
 		// Standard: ListenerSet — GEP-1713 (#93)
 		features.SupportListenerSet,
+		// Extended: Gateway infrastructure metadata propagation — GEP-1867 (#482).
+		// spec.infrastructure.{labels,annotations} propagate onto provisioned
+		// resources; in shared mode the carrier is a per-Gateway identity
+		// ServiceAccount in the Gateway's namespace.
+		features.SupportGatewayInfrastructurePropagation,
 	)
 
 	// GatewayStaticAddresses (#260): the suite overlays these onto the test's

@@ -29,7 +29,7 @@ use coxswain_e2e::{
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
-use kube::api::{Api, DeleteParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use std::time::Duration;
 
 mod common;
@@ -65,6 +65,13 @@ async fn provisions_resources_for_dedicated_proxy() -> anyhow::Result<()> {
             labels.get("team").map(String::as_str),
             Some("platform"),
             "{kind}: infrastructure.labels.team should merge"
+        );
+        assert_eq!(
+            labels
+                .get("app.kubernetes.io/component")
+                .map(String::as_str),
+            Some("dedicated-proxy"),
+            "{kind}: dedicated-proxy component label survives the infra overlay"
         );
         let annotations = meta.annotations.as_ref().unwrap_or_else(|| {
             panic!("{kind}: annotations missing");
@@ -108,6 +115,184 @@ async fn gateway_deletion_garbage_collects_resources() -> anyhow::Result<()> {
             let svc_gone = services.get(RESOURCE_NAME).await.is_err();
             let sa_gone = sas.get(RESOURCE_NAME).await.is_err();
             (deploy_gone && svc_gone && sa_gone).then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+// ── GEP-1867 infrastructure propagation, shared mode (#482) ──────────────────
+//
+// In shared mode the proxy pod and per-Gateway VIP Service both live in the
+// controller's namespace, so the controller provisions a per-Gateway identity
+// ServiceAccount in the Gateway's OWN namespace as the GEP-1867 carrier (the
+// upstream GatewayInfrastructure conformance test lists SA/Pod/Service in the
+// Gateway namespace by the gateway-name label). Its name is hashed, so tests
+// locate it by that label rather than by a fixed name.
+
+const SHARED_INFRA_GATEWAY: &str = "shared-infra-gw";
+const GATEWAY_NAME_LABEL: &str = "gateway.networking.k8s.io/gateway-name";
+
+/// List ServiceAccounts in `ns` carrying the gateway-name label for
+/// `SHARED_INFRA_GATEWAY`. Mirrors the conformance lister's filter.
+async fn list_identity_sas(h: &Harness, ns: &str) -> anyhow::Result<Vec<ServiceAccount>> {
+    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), ns);
+    let lp = ListParams::default().labels(&format!("{GATEWAY_NAME_LABEL}={SHARED_INFRA_GATEWAY}"));
+    Ok(sas.list(&lp).await?.items)
+}
+
+/// Poll until exactly one identity SA exists for the shared Gateway, returning it.
+async fn wait_for_identity_sa(h: &Harness, ns: &str) -> anyhow::Result<ServiceAccount> {
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async { format!("a per-Gateway identity ServiceAccount labelled {GATEWAY_NAME_LABEL}={SHARED_INFRA_GATEWAY} in {ns}") },
+        || async { list_identity_sas(h, ns).await.ok().and_then(|v| v.into_iter().next()) },
+    )
+    .await
+}
+
+/// 482a — A shared Gateway with `infrastructure.{labels,annotations}` provisions
+/// an identity ServiceAccount in its own namespace carrying the gateway-name
+/// label, the propagated infra label/annotation, the shared-gateway-sa
+/// component, and an owner reference back to the Gateway.
+#[tokio::test]
+async fn shared_gateway_provisions_identity_service_account_when_infra_set() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-shared-infra-sa").await?;
+    fixtures::apply_fixture(dedicated::SHARED_GATEWAY_INFRA, FixtureVars::new(&ns.name)).await?;
+
+    let sa = wait_for_identity_sa(&h, &ns.name).await?;
+
+    let labels = sa.metadata.labels.as_ref().expect("identity SA labels");
+    assert_eq!(
+        labels.get("team").map(String::as_str),
+        Some("platform"),
+        "infrastructure.labels.team must propagate onto the identity SA"
+    );
+    assert_eq!(
+        labels
+            .get("app.kubernetes.io/component")
+            .map(String::as_str),
+        Some("shared-gateway-sa"),
+        "identity SA carries the shared-gateway-sa component"
+    );
+    assert_eq!(
+        labels
+            .get("app.kubernetes.io/managed-by")
+            .map(String::as_str),
+        Some("coxswain")
+    );
+    let anno = sa
+        .metadata
+        .annotations
+        .as_ref()
+        .expect("identity SA annotations");
+    assert_eq!(
+        anno.get("coxswain.example/owner").map(String::as_str),
+        Some("tenant-team"),
+        "infrastructure.annotations must propagate onto the identity SA"
+    );
+    let owners = sa.metadata.owner_references.as_ref().expect("owner refs");
+    assert_eq!(owners.len(), 1, "exactly one owner ref");
+    assert_eq!(owners[0].name, SHARED_INFRA_GATEWAY);
+    assert_eq!(owners[0].kind, "Gateway");
+    assert_eq!(owners[0].controller, Some(true));
+    assert_eq!(owners[0].block_owner_deletion, Some(true));
+
+    Ok(())
+}
+
+/// 482b (sad) — A user `infrastructure.labels` override on a reserved key is
+/// dropped: the live identity SA keeps the controller's value, while a benign
+/// non-reserved label is propagated.
+#[tokio::test]
+async fn shared_gateway_drops_reserved_label_override_keeping_controller_value()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-shared-infra-reserved").await?;
+    fixtures::apply_fixture(dedicated::SHARED_GATEWAY_INFRA, FixtureVars::new(&ns.name)).await?;
+
+    let sa = wait_for_identity_sa(&h, &ns.name).await?;
+    let labels = sa.metadata.labels.as_ref().expect("identity SA labels");
+
+    assert_eq!(
+        labels.get("app.kubernetes.io/name").map(String::as_str),
+        Some("coxswain"),
+        "reserved key app.kubernetes.io/name=evil override must be dropped"
+    );
+    assert_eq!(
+        labels.get(GATEWAY_NAME_LABEL).map(String::as_str),
+        Some(SHARED_INFRA_GATEWAY),
+        "reserved gateway-name label must hold the real Gateway name"
+    );
+    assert_eq!(
+        labels.get("kept").map(String::as_str),
+        Some("yes"),
+        "benign non-reserved label still propagates"
+    );
+
+    Ok(())
+}
+
+/// 482c (remove) — Removing an infra label from the Gateway spec prunes it from
+/// the live identity SA: SSA force-apply re-asserts the full label set, so a
+/// dropped key disappears (the add/update/remove acceptance criterion).
+#[tokio::test]
+async fn shared_gateway_removes_infra_label_from_service_account_on_spec_edit() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-shared-infra-remove").await?;
+    fixtures::apply_fixture(dedicated::SHARED_GATEWAY_INFRA, FixtureVars::new(&ns.name)).await?;
+
+    // Baseline: the identity SA carries the `team` label.
+    let sa = wait_for_identity_sa(&h, &ns.name).await?;
+    assert_eq!(
+        sa.metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("team"))
+            .map(String::as_str),
+        Some("platform"),
+        "precondition: team label present before removal"
+    );
+
+    // Remove `team` from infrastructure.labels via a JSON merge patch (null deletes).
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let patch = serde_json::json!({
+        "spec": { "infrastructure": { "labels": { "team": serde_json::Value::Null } } }
+    });
+    gateways
+        .patch(
+            SHARED_INFRA_GATEWAY,
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+
+    // The next reconcile re-applies the SA without `team`; force-apply prunes it.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            format!(
+                "identity SA in {} to drop the removed 'team' label",
+                ns.name
+            )
+        },
+        || async {
+            let sa = list_identity_sas(&h, &ns.name)
+                .await
+                .ok()?
+                .into_iter()
+                .next()?;
+            let has_team = sa
+                .metadata
+                .labels
+                .as_ref()
+                .is_some_and(|l| l.contains_key("team"));
+            (!has_team).then_some(())
         },
     )
     .await?;
