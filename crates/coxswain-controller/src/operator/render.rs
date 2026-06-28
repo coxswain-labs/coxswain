@@ -502,36 +502,54 @@ pub(crate) fn shared_gateway_service_name(gw_ns: &str, gw_name: &str) -> String 
     format!("{prefix}-{hash:08x}-shared-gw")
 }
 
-/// The caller-requested static `IPAddress` to pin as the VIP Service
-/// `spec.clusterIP` (GatewayStaticAddresses, #260), or `None` to keep
-/// apiserver auto-allocation.
+/// The caller-requested static `IPAddress` candidates to pin as the VIP Service
+/// `spec.clusterIP` (GatewayStaticAddresses, #260), in `spec.addresses` order.
 ///
-/// Returns `None` when any requested address carries an unsupported `type`
-/// (the Gateway is rejected with `UnsupportedAddress`, so there is nothing to
-/// provision). Otherwise the first `IPAddress`-typed entry with a non-empty,
-/// parseable value wins — `Hostname` and empty (auto-assign) entries are
-/// skipped. This is the address the status writer matches against to decide
-/// `AddressNotUsable` vs `Programmed`.
+/// Returns empty when any requested address carries an unsupported `type` (the
+/// Gateway is rejected with `UnsupportedAddress`, so there is nothing to
+/// provision). Otherwise every `IPAddress`-typed entry with a non-empty,
+/// parseable value is a candidate — `Hostname` and empty (auto-assign) entries
+/// are skipped.
+///
+/// The reconciler tries these in order and binds the first the apiserver
+/// accepts: `clusterIP` is immutable and an out-of-CIDR candidate is rejected
+/// (creating nothing), so a *usable* address that follows an *unusable* one
+/// still binds. That is what makes `status.addresses` reflect the usable
+/// address during the transient multi-address window the conformance ladder
+/// (`[unusable, usable] → [usable]`) walks through.
 #[must_use]
-pub(super) fn requested_static_cluster_ip(gw: &Gateway) -> Option<std::net::IpAddr> {
-    let addrs = gw.spec.addresses.as_deref()?;
+pub(super) fn requested_static_cluster_ips(gw: &Gateway) -> Vec<std::net::IpAddr> {
+    let Some(addrs) = gw.spec.addresses.as_deref() else {
+        return Vec::new();
+    };
     // Don't provision for a Gateway that will be rejected for an unsupported type.
     if addrs.iter().any(|a| {
         a.r#type
             .as_deref()
             .is_some_and(|t| t != "IPAddress" && t != "Hostname")
     }) {
-        return None;
+        return Vec::new();
     }
-    addrs.iter().find_map(|a| {
-        if a.r#type.as_deref() == Some("Hostname") {
-            return None;
-        }
-        a.value
-            .as_deref()
-            .filter(|v| !v.is_empty())
-            .and_then(|v| v.parse::<std::net::IpAddr>().ok())
-    })
+    addrs
+        .iter()
+        .filter_map(|a| {
+            if a.r#type.as_deref() == Some("Hostname") {
+                return None;
+            }
+            a.value
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .and_then(|v| v.parse::<std::net::IpAddr>().ok())
+        })
+        .collect()
+}
+
+/// The single static `IPAddress` to pin for paths that bind exactly one
+/// clusterIP (the dedicated-proxy Service render): the first candidate, or
+/// `None` when none is requested. See [`requested_static_cluster_ips`].
+#[must_use]
+pub(super) fn requested_static_cluster_ip(gw: &Gateway) -> Option<std::net::IpAddr> {
+    requested_static_cluster_ips(gw).into_iter().next()
 }
 
 /// Inputs to [`render_shared_gateway_service`].
@@ -936,12 +954,32 @@ mod tests {
     }
 
     #[test]
-    fn requested_static_cluster_ip_none_for_unsupported_type() {
+    fn requested_static_cluster_ips_preserves_spec_order() {
+        // The reconciler tries candidates in order and binds the first the
+        // apiserver accepts, so a usable address after an unusable one still
+        // binds. Ordering must mirror spec.addresses exactly.
+        let gw = gw_with_addresses(vec![
+            (Some("IPAddress"), Some("192.0.2.1")),
+            (Some("Hostname"), Some("gw.example.com")),
+            (None, Some("10.96.0.10")),
+        ]);
+        let want: Vec<std::net::IpAddr> =
+            vec!["192.0.2.1".parse().unwrap(), "10.96.0.10".parse().unwrap()];
+        assert_eq!(
+            requested_static_cluster_ips(&gw),
+            want,
+            "Hostname is skipped; IPAddress entries keep spec order"
+        );
+    }
+
+    #[test]
+    fn requested_static_cluster_ips_empty_for_unsupported_type() {
         // An unsupported type rejects the whole Gateway, so nothing is provisioned.
         let gw = gw_with_addresses(vec![
             (Some("test/fake"), Some("x")),
             (Some("IPAddress"), Some("10.96.0.10")),
         ]);
+        assert!(requested_static_cluster_ips(&gw).is_empty());
         assert_eq!(requested_static_cluster_ip(&gw), None);
     }
 
@@ -952,6 +990,7 @@ mod tests {
             (Some("IPAddress"), None),
         ]);
         assert_eq!(requested_static_cluster_ip(&gw), None);
+        assert!(requested_static_cluster_ips(&gw).is_empty());
     }
 
     #[test]
