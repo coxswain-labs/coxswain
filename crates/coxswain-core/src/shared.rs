@@ -44,6 +44,25 @@ impl<T> Shared<T> {
     pub fn store(&self, value: Arc<T>) {
         self.0.store(value);
     }
+
+    /// Store `new` only if it differs from the current snapshot.
+    ///
+    /// Returns `true` if the snapshot was replaced, `false` if it was unchanged.
+    /// Use this to suppress spurious hot-reloads on the proxy path: ArcSwap
+    /// notifies all readers on every `store`, so skipping equal values prevents
+    /// the data plane from re-applying an identical config.
+    #[must_use = "callers should log or act on whether the snapshot changed"]
+    pub fn store_if_changed(&self, new: T) -> bool
+    where
+        T: PartialEq,
+    {
+        if *self.0.load_full() != new {
+            self.0.store(Arc::new(new));
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl<T: Default> Default for Shared<T> {

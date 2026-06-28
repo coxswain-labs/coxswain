@@ -39,3 +39,11 @@ pub(crate) const PAUSE: &str = "registry.k8s.io/pause:3.10@sha256:ee6521f290b216
 /// steers more requests to the fast one). Used instead of `busybox` `nc/sleep`
 /// because it serves well-formed HTTP/1.1 responses with proper keep-alive.
 pub(crate) const GO_HTTPBIN: &str = "ghcr.io/mccutchen/go-httpbin:latest@sha256:90ac1702685468aa592938e65b2ba1b4757e0c006934a962ef7271a8717aaa3b";
+
+/// `pebble` — Let's Encrypt's test ACME server (RFC 8555). Used by the HTTP-01
+/// challenge passthrough test: runs in-cluster, validates challenges via the
+/// Coxswain proxy, and issues short-lived certificates without a real domain.
+///
+/// GHCR publishes only `:latest` for Pebble; pinned by index digest so a re-push
+/// cannot silently change what the test exercises (rubric #7).
+pub(crate) const PEBBLE: &str = "ghcr.io/letsencrypt/pebble:latest@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199";

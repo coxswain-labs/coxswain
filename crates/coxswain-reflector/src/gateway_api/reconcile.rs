@@ -8,8 +8,8 @@ use crate::endpoints;
 use crate::gw_types::{
     HttpRoute,
     v::httproutes::{
-        HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesFiltersType,
-        HttpRouteRulesMatchesPathType,
+        HttpRouteParentRefs, HttpRouteRulesBackendRefs, HttpRouteRulesFilters,
+        HttpRouteRulesFiltersType, HttpRouteRulesMatchesPathType,
     },
 };
 use crate::k8s_utils::metadata_created_at;
@@ -142,34 +142,13 @@ impl GatewayApiReconciler {
         // rides the route's single shared `BackendGroup`, so per-parent divergence
         // cannot be expressed. Deterministic (parentRefs is an ordered list); the
         // single-Gateway case (and conformance) is unambiguous.
-        // Single pass over owned parents in declaration order: the first one that
-        // has a `clientCertificateRef` — resolved OR failed — wins. A resolved cert
-        // is attached to the route's UpstreamTls; a failed ref fails the route's
-        // BackendTLSPolicy upstreams closed (502) below, so the proxy never connects
-        // without the proxy identity the operator configured.
-        let mut route_client_cert: Option<&Arc<BackendClientCert>> = None;
-        let mut route_client_cert_failed = false;
-        for p in route.spec.parent_refs.as_deref().unwrap_or(&[]).iter() {
-            if !parent_ref_owned(
-                p.group.as_deref(),
-                p.kind.as_deref(),
-                p.namespace.as_deref(),
-                &p.name,
-                route_ns,
-                owned_gateways,
-            ) {
-                continue;
-            }
-            let key = ObjectKey::new(p.namespace.as_deref().unwrap_or(route_ns), p.name.as_str());
-            if let Some(cc) = backend_client_certs.get(&key) {
-                route_client_cert = Some(cc);
-                break;
-            }
-            if backend_client_cert_failures.contains(&key) {
-                route_client_cert_failed = true;
-                break;
-            }
-        }
+        let (route_client_cert, route_client_cert_failed) = resolve_route_client_cert(
+            route.spec.parent_refs.as_deref().unwrap_or(&[]),
+            route_ns,
+            owned_gateways,
+            backend_client_certs,
+            backend_client_cert_failures,
+        );
 
         let rules = match route.spec.rules.as_deref() {
             Some(r) if !r.is_empty() => r,
@@ -345,6 +324,46 @@ impl GatewayApiReconciler {
     }
 }
 
+/// Resolve the GEP-3155 backend client cert inherited by this route from its
+/// owned parent Gateways.
+///
+/// Walks `parent_refs` in declaration order, skipping refs to non-owned Gateways.
+/// Returns `(Some(cert), false)` for the first owned parent with a resolved cert,
+/// `(None, true)` if the first owned parent with a cert ref failed to resolve it,
+/// and `(None, false)` if no owned parent has any cert ref.
+///
+/// Declaration-order precedence is intentional: when a route is attached to multiple
+/// owned Gateways with different certs, the first parentRef wins (the cert rides the
+/// route's single shared `BackendGroup`, so per-parent divergence cannot be expressed).
+fn resolve_route_client_cert<'a>(
+    parent_refs: &[HttpRouteParentRefs],
+    route_ns: &str,
+    owned_gateways: &HashSet<ObjectKey>,
+    backend_client_certs: &'a HashMap<ObjectKey, Arc<BackendClientCert>>,
+    backend_client_cert_failures: &HashSet<ObjectKey>,
+) -> (Option<&'a Arc<BackendClientCert>>, bool) {
+    for p in parent_refs {
+        if !parent_ref_owned(
+            p.group.as_deref(),
+            p.kind.as_deref(),
+            p.namespace.as_deref(),
+            &p.name,
+            route_ns,
+            owned_gateways,
+        ) {
+            continue;
+        }
+        let key = ObjectKey::new(p.namespace.as_deref().unwrap_or(route_ns), p.name.as_str());
+        if let Some(cc) = backend_client_certs.get(&key) {
+            return (Some(cc), false);
+        }
+        if backend_client_cert_failures.contains(&key) {
+            return (None, true);
+        }
+    }
+    (None, false)
+}
+
 /// Resolve each backendRef to `(pod_addresses, weight)`.
 ///
 /// Weight defaults to 1 when absent (per the Gateway API spec). Refs with
@@ -467,6 +486,11 @@ fn apply_rule(
             .with_rate_limit(ctx.rate_limit.clone())
     };
 
+    let backend_stores = super::filters::BackendStores {
+        slices: ctx.slices,
+        services: ctx.services,
+        grants: ctx.grants,
+    };
     match rule.matches.as_deref() {
         None | Some([]) => {
             let filter_list = super::filters::build_filters(
@@ -475,11 +499,7 @@ fn apply_rule(
                 false,
                 ctx.route_ns,
                 ctx.path_rewrites,
-                &super::filters::BackendStores {
-                    slices: ctx.slices,
-                    services: ctx.services,
-                    grants: ctx.grants,
-                },
+                &backend_stores,
             );
             pb.add_prefix_route(
                 "/",
@@ -518,11 +538,7 @@ fn apply_rule(
                     is_prefix,
                     ctx.route_ns,
                     ctx.path_rewrites,
-                    &super::filters::BackendStores {
-                        slices: ctx.slices,
-                        services: ctx.services,
-                        grants: ctx.grants,
-                    },
+                    &backend_stores,
                 );
                 let e =
                     Arc::new(make_entry(predicates, filter_list).with_path_pattern(Arc::from(val)));
@@ -775,10 +791,7 @@ impl GatewayApiReconciler {
                 // HTTPS and install it into the per-port TLS store so the proxy's SniCertSelector
                 // finds it. Remap Resolved → TlsTerminate so the bin layer creates a TlsL4
                 // proxy port (L4 splice) rather than an HTTPS (L7 HTTP) listener.
-                let grants = match &listener.source {
-                    ListenerSource::Gateway => cert_grants,
-                    ListenerSource::ListenerSet(_) => ls_cert_grants,
-                };
+                let grants = grants_for_source(&listener.source, cert_grants, ls_cert_grants);
                 match resolve_listener_tls(gw_name, listener, secrets, grants, builder, bind_port) {
                     ListenerReadiness::Resolved => ListenerReadiness::TlsTerminate,
                     other => other,
@@ -789,10 +802,7 @@ impl GatewayApiReconciler {
                 // A ListenerSet listener's cross-namespace cert is permitted by a
                 // `from.kind: ListenerSet` grant; a Gateway listener's by
                 // `from.kind: Gateway` (GEP-1713). Pick the matching grant set.
-                let grants = match &listener.source {
-                    ListenerSource::Gateway => cert_grants,
-                    ListenerSource::ListenerSet(_) => ls_cert_grants,
-                };
+                let grants = grants_for_source(&listener.source, cert_grants, ls_cert_grants);
                 resolve_listener_tls(gw_name, listener, secrets, grants, builder, bind_port)
             };
             let mut li = ListenerInfo::default();
@@ -815,6 +825,21 @@ impl GatewayApiReconciler {
         let mut glh = GatewayListenerStatus::default();
         glh.listeners = map;
         glh
+    }
+}
+
+/// Select the applicable ReferenceGrant set for a listener based on its source kind.
+///
+/// A `Gateway` listener's cross-namespace cert is permitted by `from.kind: Gateway` grants;
+/// a `ListenerSet` listener's by `from.kind: ListenerSet` grants (GEP-1713).
+fn grants_for_source<'g>(
+    source: &ListenerSource,
+    cert_grants: &'g HashSet<ReferenceGrantKey>,
+    ls_cert_grants: &'g HashSet<ReferenceGrantKey>,
+) -> &'g HashSet<ReferenceGrantKey> {
+    match source {
+        ListenerSource::Gateway => cert_grants,
+        ListenerSource::ListenerSet(_) => ls_cert_grants,
     }
 }
 

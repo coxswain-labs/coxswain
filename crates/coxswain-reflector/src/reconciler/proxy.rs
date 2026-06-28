@@ -13,9 +13,9 @@
 //!   tables or TLS store; status-only output set.
 
 use super::route_builder::{
-    build_client_certs, build_gateway_routes, build_passthrough_routes, build_routes,
-    build_terminate_routes, build_tls, count_attached_routes, merge_backend_client_cert_health,
-    resolve_backend_client_certs,
+    BackendClientCertResolution, build_client_certs, build_gateway_routes,
+    build_passthrough_routes, build_routes, build_terminate_routes, build_tls,
+    count_attached_routes, merge_backend_client_cert_health, resolve_backend_client_certs,
 };
 use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
 use crate::gateway_api::{
@@ -378,6 +378,56 @@ struct StatusStoreWriters {
     policies: reflector::store::Writer<BackendTlsPolicy>,
     tls_routes: reflector::store::Writer<TlsRoute>,
     listener_sets: reflector::store::Writer<ListenerSet>,
+}
+
+/// `Option`-wrapped form of [`StatusStoreWriters`] produced by
+/// [`StatusStoreWriters::into_option_writers`].
+///
+/// Named to avoid a `clippy::type_complexity` violation on the method's return type.
+struct StatusStoreOptionWriters {
+    routes: Option<reflector::store::Writer<HttpRoute>>,
+    grpc_routes: Option<reflector::store::Writer<GrpcRoute>>,
+    ingresses: Option<reflector::store::Writer<Ingress>>,
+    ingress_classes: Option<reflector::store::Writer<IngressClass>>,
+    gateways: Option<reflector::store::Writer<Gateway>>,
+    gateway_classes: Option<reflector::store::Writer<GatewayClass>>,
+    policies: Option<reflector::store::Writer<BackendTlsPolicy>>,
+    tls_routes: Option<reflector::store::Writer<TlsRoute>>,
+    listener_sets: Option<reflector::store::Writer<ListenerSet>>,
+}
+
+impl StatusStoreWriters {
+    /// Unwrap an `Option<Self>` into a [`StatusStoreOptionWriters`].
+    ///
+    /// `None` maps every field to `None`; `Some(w)` wraps each field in `Some`.
+    /// Used in [`spawn_tasks`] to feed the optional pre-created writers into
+    /// [`reader_writer`] without repeating the `None×9` arm.
+    fn into_option_writers(opt: Option<Self>) -> StatusStoreOptionWriters {
+        match opt {
+            Some(w) => StatusStoreOptionWriters {
+                routes: Some(w.routes),
+                grpc_routes: Some(w.grpc_routes),
+                ingresses: Some(w.ingresses),
+                ingress_classes: Some(w.ingress_classes),
+                gateways: Some(w.gateways),
+                gateway_classes: Some(w.gateway_classes),
+                policies: Some(w.policies),
+                tls_routes: Some(w.tls_routes),
+                listener_sets: Some(w.listener_sets),
+            },
+            None => StatusStoreOptionWriters {
+                routes: None,
+                grpc_routes: None,
+                ingresses: None,
+                ingress_classes: None,
+                gateways: None,
+                gateway_classes: None,
+                policies: None,
+                tls_routes: None,
+                listener_sets: None,
+            },
+        }
+    }
 }
 
 impl SharedProxyReconciler {
@@ -910,55 +960,32 @@ async fn spawn_tasks(
     // Status-relevant stores reuse the shared writers pre-created in `new` (so
     // the status-writer's subscriptions observe the same synced stores); the
     // rest are always fresh non-shared stores.
-    let (
-        pre_routes,
-        pre_grpc_routes,
-        pre_ingresses,
-        pre_ingress_classes,
-        pre_gateways,
-        pre_gateway_classes,
-        pre_policies,
-        pre_tls_routes,
-        pre_listener_sets,
-    ) = match status_writers {
-        Some(w) => (
-            Some(w.routes),
-            Some(w.grpc_routes),
-            Some(w.ingresses),
-            Some(w.ingress_classes),
-            Some(w.gateways),
-            Some(w.gateway_classes),
-            Some(w.policies),
-            Some(w.tls_routes),
-            Some(w.listener_sets),
-        ),
-        None => (None, None, None, None, None, None, None, None, None),
-    };
-    let (route_reader, route_writer) = reader_writer::<HttpRoute>(pre_routes);
-    let (grpc_route_reader, grpc_route_writer) = reader_writer::<GrpcRoute>(pre_grpc_routes);
-    let (ingress_reader, ingress_writer) = reader_writer::<Ingress>(pre_ingresses);
-    let (class_reader, class_writer) = reader_writer::<IngressClass>(pre_ingress_classes);
+    let pre = StatusStoreWriters::into_option_writers(status_writers);
+    let (route_reader, route_writer) = reader_writer::<HttpRoute>(pre.routes);
+    let (grpc_route_reader, grpc_route_writer) = reader_writer::<GrpcRoute>(pre.grpc_routes);
+    let (ingress_reader, ingress_writer) = reader_writer::<Ingress>(pre.ingresses);
+    let (class_reader, class_writer) = reader_writer::<IngressClass>(pre.ingress_classes);
     let (class_params_reader, class_params_writer) =
         reflector::store::<CoxswainIngressClassParameters>();
-    let (gateway_reader, gateway_writer) = reader_writer::<Gateway>(pre_gateways);
+    let (gateway_reader, gateway_writer) = reader_writer::<Gateway>(pre.gateways);
     let (gateway_class_reader, gateway_class_writer) =
-        reader_writer::<GatewayClass>(pre_gateway_classes);
+        reader_writer::<GatewayClass>(pre.gateway_classes);
     let (slice_reader, slice_writer) = reflector::store::<EndpointSlice>();
     let (grant_reader, grant_writer) = reflector::store::<ReferenceGrant>();
     let (secret_reader, secret_writer) = reflector::store::<Secret>();
     let (auth_secret_reader, auth_secret_writer) = reflector::store::<Secret>();
     let (auth_tls_secret_reader, auth_tls_secret_writer) = reflector::store::<Secret>();
     let (service_reader, service_writer) = reflector::store::<Service>();
-    let (policy_reader, policy_writer) = reader_writer::<BackendTlsPolicy>(pre_policies);
+    let (policy_reader, policy_writer) = reader_writer::<BackendTlsPolicy>(pre.policies);
     let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
     let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
     let (path_rewrite_reader, path_rewrite_writer) = reflector::store::<PathRewriteRegex>();
-    let (tls_route_reader, tls_route_writer) = reader_writer::<TlsRoute>(pre_tls_routes);
+    let (tls_route_reader, tls_route_writer) = reader_writer::<TlsRoute>(pre.tls_routes);
     // ListenerSet is a status-relevant store: in the controller role its writer is
     // the shared one pre-created in `new`, so the status-writer's subscription and
     // the data-plane reader observe the same synced store (GEP-1713).
     let (listener_set_reader, listener_set_writer) =
-        reader_writer::<ListenerSet>(pre_listener_sets);
+        reader_writer::<ListenerSet>(pre.listener_sets);
     let (namespace_reader, namespace_writer) = reflector::store::<Namespace>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
@@ -1250,23 +1277,8 @@ async fn spawn_tasks(
                 leader.load(Ordering::Acquire),
                 &outputs,
             );
-            metrics.observe_rebuild(
-                rebuild_start.elapsed(),
-                if published { "ok" } else { "error" },
-            );
-            // Mirror the routing-table size gauges from the published snapshots.
-            // Loads via `Shared::load()` are atomic and cheap.
-            let ing_snapshot = outputs.ingress_routes.load();
-            let gw_snapshot = outputs.gateway_routes.load();
-            metrics.set_routing_table(
-                ing_snapshot.host_count() + gw_snapshot.host_count(),
-                ing_snapshot.host_count(),
-                gw_snapshot.host_count(),
-            );
-            let tls_snapshot = outputs.tls.load();
-            let (exact, wildcard, default) = tls_snapshot.cert_counts();
-            let expiries = tls_snapshot.expiries();
-            metrics.set_tls(exact, wildcard, default, &expiries);
+            // Mirror routing-table size gauges and TLS cert counters from published snapshots.
+            record_rebuild_metrics(&metrics, &outputs, rebuild_start.elapsed(), published);
             // First successful publish: flip the readiness checks that gate
             // `/readyz` on having an honest routing table. Subsequent rebuilds
             // do not re-touch the checks — `Ready` is idempotent and there is
@@ -1297,14 +1309,18 @@ fn rebuild(
     let grpc_routes = stores.grpc_routes.state();
     let ingresses = stores.ingresses.state();
 
-    let (owned_ingress_classes, owned_default_ingress_class, owned_gateway_classes, owned_gateways) =
-        compute_ownership(
-            stores.ingress_classes,
-            stores.gateway_classes,
-            stores.gateways,
-            controller_name,
-            owned_gateways_handle,
-        );
+    let OwnedResources {
+        ingress_classes: owned_ingress_classes,
+        default_ingress_class: owned_default_ingress_class,
+        gateway_classes: owned_gateway_classes,
+        gateways: owned_gateways,
+    } = compute_ownership(
+        stores.ingress_classes,
+        stores.gateway_classes,
+        stores.gateways,
+        controller_name,
+        owned_gateways_handle,
+    );
 
     let grants_snapshot = stores.grants.state();
     let (backend_grants, cert_grants) = flatten_grants(&grants_snapshot);
@@ -1447,11 +1463,7 @@ fn rebuild(
     let summary_gateways: HashSet<ObjectKey> = gateways
         .iter()
         .filter(|g| owned_gateway_classes.contains(&g.spec.gateway_class_name))
-        .filter_map(|g| {
-            let ns = g.metadata.namespace.as_deref()?;
-            let name = g.metadata.name.as_deref()?;
-            Some(ObjectKey::new(ns, name))
-        })
+        .filter_map(|g| ObjectKey::from_meta(&g.metadata))
         .collect();
 
     // Per-(route, parent) health feeds both the route-status writer and the
@@ -1506,11 +1518,7 @@ fn rebuild(
     let cut_over_keys: HashSet<ObjectKey> = gateways
         .iter()
         .filter(|g| gateway_is_cut_over(g))
-        .filter_map(|g| {
-            let ns = g.metadata.namespace.clone()?;
-            let name = g.metadata.name.clone()?;
-            Some(ObjectKey::new(ns, name))
-        })
+        .filter_map(|g| ObjectKey::from_meta(&g.metadata))
         .collect();
     outputs
         .listener_status
@@ -1542,110 +1550,24 @@ fn rebuild(
     // delete path.
     // GEP-3155: resolve backend client certs for the dedicated path once, outside
     // the per-Gateway loop. `skip_cut_over=false` — cut-over Gateways are included
-    // (each IS the target Gateway for its dedicated proxy). The result is a HashMap
-    // keyed by Gateway ObjectKey; each iteration below looks up its own entry.
+    // (each IS the target Gateway for its dedicated proxy).
     let dedicated_backend_client_certs =
         resolve_backend_client_certs(stores, &owned_gateway_classes, &cert_grants, false);
-
     let empty_ingress_classes: HashSet<String> = HashSet::new();
-    let mut registry_map: HashMap<ObjectKey, Arc<DedicatedRoutingSnapshot>> = HashMap::new();
-    for gw in stores.gateways.state() {
-        if !owned_gateway_classes.contains(&gw.spec.gateway_class_name) {
-            continue;
-        }
-        if !gateway_is_cut_over(&gw) {
-            continue;
-        }
-        let ns = gw.metadata.namespace.clone().unwrap_or_default();
-        let name = gw.metadata.name.clone().unwrap_or_default();
-        let key = ObjectKey::new(ns, name);
-        let single_gw = HashSet::from([key.clone()]);
-
-        // Narrow ownership to this one Gateway so the builders produce only
-        // its routes and TLS state.  Ingress classes are empty — a dedicated
-        // proxy does not serve Ingress resources.  `gateway_classes` is kept
-        // at the full set so `build_gateway_routes` can read listener metadata
-        // from the Gateway spec; routes are scoped to `single_gw` only.
-        let dedicated_ownership = Ownership {
-            ingress_classes: &empty_ingress_classes,
-            default_ingress_class: None,
-            gateways: &single_gw,
-            gateway_classes: &owned_gateway_classes,
-            backend_grants: &backend_grants,
-            cert_grants: &cert_grants,
-            ls_cert_grants: &ls_cert_grants,
-            ca_grants: &ca_grants,
-            policy_index: &policy_index,
-            backend_client_certs: &dedicated_backend_client_certs.certs,
-            backend_client_cert_failures: &dedicated_backend_client_certs.failures,
-            // Same merged map: the dedicated proxy serves its Gateway's effective
-            // listeners (own + ListenerSet-merged), consistent with the shared path.
-            effective_gateways: &effective,
-        };
-
-        let gw_routes_cell: SharedGatewayRoutingTable = Shared::new();
-        let tls_cell: SharedPortTlsStore = Shared::new();
-        let client_certs_cell: SharedClientCertStore = Shared::new();
-        // Listener-hostnames for the dedicated proxy are not yet wired into the
-        // DedicatedRoutingSnapshot / discovery wire format; the throwaway cell
-        // absorbs the build output until that is extended (#96 follow-up).
-        let listener_hostnames_cell: SharedListenerHostnames = Shared::new();
-
-        build_gateway_routes(
-            stores,
-            &routes,
-            &grpc_routes,
-            &dedicated_ownership,
-            &gw_routes_cell,
-            false,
-        );
-        // `build_tls` with `skip_cut_over=false` includes all owned-class
-        // gateways in the TLS store; the extra certs are harmless because the
-        // dedicated proxy only binds its own listeners.
-        let gw_listener_health = build_tls(
-            stores,
-            &ingresses,
-            &dedicated_ownership,
-            &tls_cell,
-            &listener_hostnames_cell,
-            false,
-            // Dedicated proxies never serve Ingress (empty ingress_classes above),
-            // so no Ingress cert is keyed; the port is immaterial here (#472).
-            443,
-        );
-        let mut dedicated_listener_health = gw_listener_health;
-        build_client_certs(
-            stores,
-            &ingresses,
-            &dedicated_ownership,
-            &client_certs_cell,
-            &mut dedicated_listener_health,
-            false,
-        );
-        merge_backend_client_cert_health(
-            &mut dedicated_listener_health,
-            &dedicated_backend_client_certs.health,
-        );
-
-        // Retain only the health entry for the owning Gateway.
-        let listener_status: HashMap<ObjectKey, GatewayListenerStatus> = dedicated_listener_health
-            .into_iter()
-            .filter(|(k, _)| k == &key)
-            .collect();
-
-        tracing::debug!(?key, "Published dedicated routing snapshot");
-        let snap = Arc::new(DedicatedRoutingSnapshot {
-            gateway: gw_routes_cell.load(),
-            tls: tls_cell.load(),
-            client_certs: client_certs_cell.load(),
-            listener_status,
-            // GEP-1762: the dedicated proxy runs as ServiceAccount `{gw}-{class}`.
-            // Stamped here using the same formula the operator uses to provision the
-            // ServiceAccount so the discovery binding check can never disagree.
-            expected_proxy_sa: gep1762_resource_name(&key.name, &gw.spec.gateway_class_name),
-        });
-        registry_map.insert(key, snap);
-    }
+    let dedicated_inputs = DedicatedBuildInputs {
+        routes: &routes,
+        grpc_routes: &grpc_routes,
+        ingresses: &ingresses,
+        base_ownership: &ownership,
+        dedicated_certs: &dedicated_backend_client_certs,
+        empty_ingress_classes: &empty_ingress_classes,
+    };
+    let registry_map: HashMap<ObjectKey, Arc<DedicatedRoutingSnapshot>> = stores
+        .gateways
+        .state()
+        .iter()
+        .filter_map(|gw| build_dedicated_gateway_snapshot(gw, stores, &dedicated_inputs))
+        .collect();
     outputs.dedicated_registry.store(Arc::new(registry_map));
 
     // Build the SNI-keyed TLS passthrough table from TLSRoutes bound to
@@ -1682,21 +1604,170 @@ fn rebuild(
     routes_published
 }
 
+/// Emit routing-table and TLS size/timing metrics after each rebuild.
+///
+/// Separated from [`rebuild`] so that the debounce loop stays readable and the
+/// metric paths are independently testable.
+fn record_rebuild_metrics(
+    metrics: &crate::ReflectorMetrics,
+    outputs: &SharedOutputs<'_>,
+    elapsed: std::time::Duration,
+    published: bool,
+) {
+    metrics.observe_rebuild(elapsed, if published { "ok" } else { "error" });
+    let ing_snapshot = outputs.ingress_routes.load();
+    let gw_snapshot = outputs.gateway_routes.load();
+    metrics.set_routing_table(
+        ing_snapshot.host_count() + gw_snapshot.host_count(),
+        ing_snapshot.host_count(),
+        gw_snapshot.host_count(),
+    );
+    let tls_snapshot = outputs.tls.load();
+    let (exact, wildcard, default) = tls_snapshot.cert_counts();
+    let expiries = tls_snapshot.expiries();
+    metrics.set_tls(exact, wildcard, default, &expiries);
+}
+
+/// Per-rebuild inputs for [`build_dedicated_gateway_snapshot`].
+///
+/// Grouped to keep that function under the 7-argument project threshold. `stores` is
+/// passed separately (it has a longer independent lifetime from the reflector tasks).
+struct DedicatedBuildInputs<'a> {
+    routes: &'a [Arc<HttpRoute>],
+    grpc_routes: &'a [Arc<GrpcRoute>],
+    ingresses: &'a [Arc<Ingress>],
+    base_ownership: &'a Ownership<'a>,
+    dedicated_certs: &'a BackendClientCertResolution,
+    empty_ingress_classes: &'a HashSet<String>,
+}
+
+/// Build the routing snapshot for a single cut-over dedicated-proxy Gateway.
+///
+/// Returns `None` if `gw` is not owned by a known GatewayClass or has not yet been
+/// cut over to a dedicated proxy (so `filter_map` calls naturally skip such gateways).
+fn build_dedicated_gateway_snapshot(
+    gw: &Arc<Gateway>,
+    stores: &ReflectorStores<'_>,
+    inputs: &DedicatedBuildInputs<'_>,
+) -> Option<(ObjectKey, Arc<DedicatedRoutingSnapshot>)> {
+    let base = inputs.base_ownership;
+    if !base.gateway_classes.contains(&gw.spec.gateway_class_name) {
+        return None;
+    }
+    if !gateway_is_cut_over(gw) {
+        return None;
+    }
+    let ns = gw.metadata.namespace.clone().unwrap_or_default();
+    let name = gw.metadata.name.clone().unwrap_or_default();
+    let key = ObjectKey::new(ns, name);
+    let single_gw = HashSet::from([key.clone()]);
+
+    // Narrow ownership to this one Gateway so the builders produce only its routes and
+    // TLS state.  Ingress classes are empty — a dedicated proxy does not serve Ingress.
+    // `gateway_classes` is kept at the full set so `build_gateway_routes` can read
+    // listener metadata from the Gateway spec; routes are scoped to `single_gw` only.
+    let dedicated_ownership = Ownership {
+        ingress_classes: inputs.empty_ingress_classes,
+        default_ingress_class: None,
+        gateways: &single_gw,
+        gateway_classes: base.gateway_classes,
+        backend_grants: base.backend_grants,
+        cert_grants: base.cert_grants,
+        ls_cert_grants: base.ls_cert_grants,
+        ca_grants: base.ca_grants,
+        policy_index: base.policy_index,
+        backend_client_certs: &inputs.dedicated_certs.certs,
+        backend_client_cert_failures: &inputs.dedicated_certs.failures,
+        // Same merged map: the dedicated proxy serves its Gateway's effective listeners
+        // (own + ListenerSet-merged), consistent with the shared path.
+        effective_gateways: base.effective_gateways,
+    };
+
+    let gw_routes_cell: SharedGatewayRoutingTable = Shared::new();
+    let tls_cell: SharedPortTlsStore = Shared::new();
+    let client_certs_cell: SharedClientCertStore = Shared::new();
+    // Listener-hostnames for the dedicated proxy are not yet wired into the
+    // DedicatedRoutingSnapshot / discovery wire format; the throwaway cell absorbs
+    // the build output until that is extended (#96 follow-up).
+    let listener_hostnames_cell: SharedListenerHostnames = Shared::new();
+
+    build_gateway_routes(
+        stores,
+        inputs.routes,
+        inputs.grpc_routes,
+        &dedicated_ownership,
+        &gw_routes_cell,
+        false,
+    );
+    // `build_tls` with `skip_cut_over=false` includes all owned-class gateways in the
+    // TLS store; the extra certs are harmless because the dedicated proxy only binds
+    // its own listeners.
+    let mut dedicated_listener_health = build_tls(
+        stores,
+        inputs.ingresses,
+        &dedicated_ownership,
+        &tls_cell,
+        &listener_hostnames_cell,
+        false,
+        // Dedicated proxies never serve Ingress (empty ingress_classes above),
+        // so no Ingress cert is keyed; the port is immaterial here (#472).
+        443,
+    );
+    build_client_certs(
+        stores,
+        inputs.ingresses,
+        &dedicated_ownership,
+        &client_certs_cell,
+        &mut dedicated_listener_health,
+        false,
+    );
+    merge_backend_client_cert_health(
+        &mut dedicated_listener_health,
+        &inputs.dedicated_certs.health,
+    );
+
+    // Retain only the health entry for the owning Gateway.
+    let listener_status: HashMap<ObjectKey, GatewayListenerStatus> = dedicated_listener_health
+        .into_iter()
+        .filter(|(k, _)| k == &key)
+        .collect();
+
+    tracing::debug!(?key, "Published dedicated routing snapshot");
+    let snap = Arc::new(DedicatedRoutingSnapshot {
+        gateway: gw_routes_cell.load(),
+        tls: tls_cell.load(),
+        client_certs: client_certs_cell.load(),
+        listener_status,
+        // GEP-1762: the dedicated proxy runs as ServiceAccount `{gw}-{class}`.
+        // Stamped here using the same formula the operator uses to provision the
+        // ServiceAccount so the discovery binding check can never disagree.
+        expected_proxy_sa: gep1762_resource_name(&key.name, &gw.spec.gateway_class_name),
+    });
+    Some((key, snap))
+}
+
+/// Named result of [`compute_ownership`], avoiding positional-tuple ambiguity at call sites.
+pub(super) struct OwnedResources {
+    /// Names of every `IngressClass` whose controller matches ours.
+    pub(super) ingress_classes: HashSet<String>,
+    /// The single owned IngressClass annotated as cluster-default, if any.
+    pub(super) default_ingress_class: Option<String>,
+    /// Names of every `GatewayClass` whose `controllerName` matches ours.
+    pub(super) gateway_classes: HashSet<String>,
+    /// `ObjectKey`s of every `Gateway` whose class is owned AND is not yet cut
+    /// over to a dedicated proxy.
+    pub(super) gateways: HashSet<ObjectKey>,
+}
+
 /// Compute which IngressClasses, GatewayClasses, and Gateways are owned by this controller.
 /// Publishes the owned-gateways snapshot to `owned_gateways_handle` as a side effect.
-/// The fourth element of the returned tuple is the name of the owned default IngressClass (if any).
 pub(super) fn compute_ownership(
     class_store: &reflector::Store<IngressClass>,
     gateway_class_store: &reflector::Store<GatewayClass>,
     gateway_store: &reflector::Store<Gateway>,
     controller_name: &str,
     owned_gateways_handle: &OwnedGateways,
-) -> (
-    HashSet<String>,
-    Option<String>,
-    HashSet<String>,
-    HashSet<ObjectKey>,
-) {
+) -> OwnedResources {
     let owned_class_objs: Vec<_> = class_store
         .state()
         .into_iter()
@@ -1739,20 +1810,16 @@ pub(super) fn compute_ownership(
         // (#210). The dedicated pool's data plane serves them now; the
         // shared pool must drop them from its routing table.
         .filter(|g| !gateway_is_cut_over(g))
-        .filter_map(|g| {
-            let ns = g.metadata.namespace.clone()?;
-            let name = g.metadata.name.clone()?;
-            Some(ObjectKey::new(ns, name))
-        })
+        .filter_map(|g| ObjectKey::from_meta(&g.metadata))
         .collect();
 
     owned_gateways_handle.store(Arc::new(owned_gateways.clone()));
-    (
-        owned_ingress_classes,
-        owned_default_ingress_class,
-        owned_gateway_classes,
-        owned_gateways,
-    )
+    OwnedResources {
+        ingress_classes: owned_ingress_classes,
+        default_ingress_class: owned_default_ingress_class,
+        gateway_classes: owned_gateway_classes,
+        gateways: owned_gateways,
+    }
 }
 
 /// Ingress-specific build configuration grouped to keep `build_routes` under the
@@ -1954,5 +2021,263 @@ mod tests {
         assert_eq!(b.namespace, "ns");
         assert_eq!(b.name, "svc:extra");
         assert_eq!(b.port, 80);
+    }
+
+    // ── compute_ownership ─────────────────────────────────────────────────────
+    // These tests verify both the OwnedResources return value AND the side effect
+    // on OwnedGateways, since higher-level reconcile tests only check routing output.
+
+    use super::compute_ownership;
+    use crate::gw_types::v::gatewayclasses::{GatewayClass, GatewayClassSpec};
+    use crate::gw_types::v::gateways::GatewaySpec;
+    use coxswain_core::ownership::OwnedGateways;
+    use k8s_openapi::api::networking::v1::{IngressClass, IngressClassSpec};
+    use kube::runtime::{reflector, watcher};
+    use std::collections::BTreeMap;
+
+    fn ic_store(classes: Vec<IngressClass>) -> reflector::Store<IngressClass> {
+        let mut w = reflector::store::Writer::<IngressClass>::default();
+        for ic in classes {
+            w.apply_watcher_event(&watcher::Event::Apply(ic));
+        }
+        w.as_reader()
+    }
+
+    fn gc_store(classes: Vec<GatewayClass>) -> reflector::Store<GatewayClass> {
+        let mut w = reflector::store::Writer::<GatewayClass>::default();
+        for gc in classes {
+            w.apply_watcher_event(&watcher::Event::Apply(gc));
+        }
+        w.as_reader()
+    }
+
+    fn gw_store_co(gateways: Vec<Gateway>) -> reflector::Store<Gateway> {
+        let mut w = reflector::store::Writer::<Gateway>::default();
+        for gw in gateways {
+            w.apply_watcher_event(&watcher::Event::Apply(gw));
+        }
+        w.as_reader()
+    }
+
+    fn make_ic(name: &str, controller: &str, default: bool) -> IngressClass {
+        let mut anns: Option<BTreeMap<String, String>> = None;
+        if default {
+            let mut m = BTreeMap::new();
+            m.insert(
+                "ingressclass.kubernetes.io/is-default-class".to_string(),
+                "true".to_string(),
+            );
+            anns = Some(m);
+        }
+        IngressClass {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                annotations: anns,
+                ..Default::default()
+            },
+            spec: Some(IngressClassSpec {
+                controller: Some(controller.to_string()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn make_gc(name: &str, controller: &str) -> GatewayClass {
+        GatewayClass {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            spec: GatewayClassSpec {
+                controller_name: controller.to_string(),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    fn make_gw(ns: &str, name: &str, class: &str) -> Gateway {
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: class.to_string(),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    #[test]
+    fn empty_stores_return_empty_owned_resources() {
+        let handle = OwnedGateways::new();
+        let r = compute_ownership(
+            &ic_store(vec![]),
+            &gc_store(vec![]),
+            &gw_store_co(vec![]),
+            "cox",
+            &handle,
+        );
+        assert!(r.ingress_classes.is_empty());
+        assert!(r.default_ingress_class.is_none());
+        assert!(r.gateway_classes.is_empty());
+        assert!(r.gateways.is_empty());
+        assert!(
+            handle.load().is_empty(),
+            "side-effect: owned gateways handle must be empty"
+        );
+    }
+
+    #[test]
+    fn owned_ingress_class_appears_in_ingress_classes_field() {
+        let handle = OwnedGateways::new();
+        let r = compute_ownership(
+            &ic_store(vec![make_ic("nginx", "cox", false)]),
+            &gc_store(vec![]),
+            &gw_store_co(vec![]),
+            "cox",
+            &handle,
+        );
+        assert!(
+            r.ingress_classes.contains("nginx"),
+            "owned IC must appear in ingress_classes"
+        );
+        assert!(r.default_ingress_class.is_none());
+        assert!(r.gateway_classes.is_empty(), "no GatewayClasses in store");
+    }
+
+    #[test]
+    fn foreign_controller_ingress_class_excluded() {
+        let handle = OwnedGateways::new();
+        let r = compute_ownership(
+            &ic_store(vec![make_ic("nginx", "other-controller", false)]),
+            &gc_store(vec![]),
+            &gw_store_co(vec![]),
+            "cox",
+            &handle,
+        );
+        assert!(
+            r.ingress_classes.is_empty(),
+            "IC from foreign controller must be excluded"
+        );
+    }
+
+    #[test]
+    fn default_annotation_sets_default_ingress_class() {
+        let handle = OwnedGateways::new();
+        let r = compute_ownership(
+            &ic_store(vec![make_ic("nginx", "cox", true)]),
+            &gc_store(vec![]),
+            &gw_store_co(vec![]),
+            "cox",
+            &handle,
+        );
+        assert_eq!(r.default_ingress_class.as_deref(), Some("nginx"));
+    }
+
+    #[test]
+    fn multiple_defaults_picks_lexicographically_lowest() {
+        let handle = OwnedGateways::new();
+        let r = compute_ownership(
+            &ic_store(vec![
+                make_ic("beta", "cox", true),
+                make_ic("alpha", "cox", true),
+            ]),
+            &gc_store(vec![]),
+            &gw_store_co(vec![]),
+            "cox",
+            &handle,
+        );
+        assert_eq!(
+            r.default_ingress_class.as_deref(),
+            Some("alpha"),
+            "lexicographically lowest name must win when multiple defaults exist"
+        );
+    }
+
+    #[test]
+    fn owned_gateway_class_and_gateway_appear_in_their_fields() {
+        let handle = OwnedGateways::new();
+        let r = compute_ownership(
+            &ic_store(vec![]),
+            &gc_store(vec![make_gc("cox-class", "cox")]),
+            &gw_store_co(vec![make_gw("default", "my-gw", "cox-class")]),
+            "cox",
+            &handle,
+        );
+        assert!(
+            r.gateway_classes.contains("cox-class"),
+            "gateway_classes must contain owned class"
+        );
+        assert!(
+            r.gateways
+                .contains(&coxswain_core::ownership::ObjectKey::new(
+                    "default", "my-gw"
+                )),
+            "gateways must contain the owned gateway"
+        );
+        assert!(r.ingress_classes.is_empty(), "no IngressClasses in store");
+    }
+
+    #[test]
+    fn cut_over_gateway_excluded_from_gateways_field() {
+        // A Gateway with DedicatedProxyReady=True is cut over to a dedicated proxy
+        // and must be excluded from the shared-pool `gateways` set.
+        let handle = OwnedGateways::new();
+        let cut_over = Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".to_string()),
+                namespace: Some("default".to_string()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "cox-class".to_string(),
+                ..Default::default()
+            },
+            status: Some(GatewayStatus {
+                conditions: Some(vec![cond(
+                    "gateway.coxswain-labs.dev/DedicatedProxyReady",
+                    "True",
+                    1,
+                )]),
+                ..Default::default()
+            }),
+        };
+        let r = compute_ownership(
+            &ic_store(vec![]),
+            &gc_store(vec![make_gc("cox-class", "cox")]),
+            &gw_store_co(vec![cut_over]),
+            "cox",
+            &handle,
+        );
+        assert!(
+            r.gateways.is_empty(),
+            "cut-over gateway must be excluded from the shared-pool gateways set"
+        );
+    }
+
+    #[test]
+    fn side_effect_publishes_owned_gateways_to_handle() {
+        let handle = OwnedGateways::new();
+        let r = compute_ownership(
+            &ic_store(vec![]),
+            &gc_store(vec![make_gc("cox-class", "cox")]),
+            &gw_store_co(vec![
+                make_gw("ns-a", "gw1", "cox-class"),
+                make_gw("ns-b", "gw2", "cox-class"),
+            ]),
+            "cox",
+            &handle,
+        );
+        let published = handle.load();
+        assert_eq!(
+            *published, r.gateways,
+            "owned_gateways_handle must reflect the same set as the returned OwnedResources"
+        );
     }
 }

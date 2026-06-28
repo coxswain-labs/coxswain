@@ -372,4 +372,28 @@ pub const VAP_VALID_ANNOTATIONS: &str = fixture!("vap_valid_annotations.yaml");
 pub const ANNOTATION_SESSION_COOKIE_NAME_INVALID: &str =
     fixture!("annotation_session_cookie_name_invalid.yaml");
 
+// ── ACME HTTP-01 challenge passthrough (#184) ────────────────────────────────
+
+/// Pebble ACME test-server stack (ConfigMap + TLS Secret + Deployment + Service).
+///
+/// Deploys Pebble into the test namespace. Pebble's VA validates HTTP-01 challenges
+/// by connecting to the challenge domain on port 80 (`httpPort: 80` in its config),
+/// which must be the Coxswain proxy's in-cluster FQDN. Requires `PEBBLE_CERT_B64`
+/// and `PEBBLE_KEY_B64` fixture vars (a self-signed cert whose PEM is also passed
+/// as `PEBBLE_CA_B64` to the cert-manager Issuer).
+pub const ACME_PEBBLE: &str = fixture!("acme_pebble.yaml");
+
+/// cert-manager `Issuer` (namespace-scoped) pointing at the in-namespace Pebble
+/// instance, plus the `Ingress` that triggers an HTTP-01 certificate issuance.
+///
+/// `--status-address` is a hard requirement: without it Coxswain never writes
+/// `Ingress.status.loadBalancer.ingress`, cert-manager's HTTP-01 solver cannot
+/// discover the challenge endpoint, and the TLS Secret is never created.
+///
+/// Required fixture vars: `PROXY_FQDN` (the Ingress rule host and challenge domain —
+/// must be the proxy's in-cluster FQDN reachable by Pebble on port 80), `PEBBLE_CA_B64`
+/// (base64 PEM of Pebble's TLS cert for Issuer caBundle), `SECRET_NAME`,
+/// `BACKEND_NAME`.
+pub const ACME_HTTP01_INGRESS: &str = fixture!("acme_http01_ingress.yaml");
+
 // ── satisfy any/all (#273) ────────────────────────────────────────────────────
