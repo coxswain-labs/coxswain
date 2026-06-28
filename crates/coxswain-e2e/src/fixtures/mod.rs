@@ -155,6 +155,7 @@ fn prepare_fixture_content(path: &Path, vars: FixtureVars) -> anyhow::Result<(St
     content = substitute(&content, "WEBSOCKET_ECHO_IMAGE", images::WEBSOCKET_ECHO);
     content = substitute(&content, "PAUSE_IMAGE", images::PAUSE);
     content = substitute(&content, "GO_HTTPBIN_IMAGE", images::GO_HTTPBIN);
+    content = substitute(&content, "PEBBLE_IMAGE", images::PEBBLE);
 
     // Extra vars (caller-supplied, e.g. `${TLS_HOSTNAME}`, `${CA_PEM}`).
     for (key, val) in &vars.extra {
