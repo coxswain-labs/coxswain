@@ -197,7 +197,7 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
         .unwrap_or_else(|| {
             panic!("invariant: Gateway has no namespace; the API server requires it")
         });
-    let labels = final_labels(inputs.gateway);
+    let labels = final_labels(inputs.gateway, "dedicated-proxy");
     let annotations = final_annotations(inputs.gateway, inputs.admin_port);
     let owner_ref = gateway_owner_reference(inputs.gateway);
     let common = Common {
@@ -234,11 +234,13 @@ pub(super) fn resource_name(gateway: &Gateway, class_name: &str) -> String {
     gep1762_resource_name(gw_name, class_name)
 }
 
-/// Reserved-set GEP-1762 labels for one Gateway. Used internally by
-/// [`final_labels`]; not exposed because callers should always go through
-/// `final_labels`, which also overlays the user-supplied
+/// Reserved-set GEP-1762 labels for one Gateway, stamped with `component` as
+/// the `app.kubernetes.io/component` value (e.g. `dedicated-proxy` for the
+/// dedicated trio, `shared-gateway-sa` for the shared-mode identity SA). Used
+/// internally by [`final_labels`]; not exposed because callers should always go
+/// through `final_labels`, which also overlays the user-supplied
 /// `Gateway.spec.infrastructure.labels`.
-fn standard_labels(gateway: &Gateway) -> BTreeMap<String, String> {
+fn standard_labels(gateway: &Gateway, component: &str) -> BTreeMap<String, String> {
     let gw_name = gateway.metadata.name.clone().unwrap_or_default();
     let mut labels = BTreeMap::new();
     labels.insert(
@@ -253,7 +255,7 @@ fn standard_labels(gateway: &Gateway) -> BTreeMap<String, String> {
     );
     labels.insert(
         "app.kubernetes.io/component".to_string(),
-        "dedicated-proxy".to_string(),
+        component.to_string(),
     );
     labels
 }
@@ -272,10 +274,11 @@ fn standard_annotations(admin_port: u16) -> BTreeMap<String, String> {
 }
 
 /// Merge user-supplied `Gateway.spec.infrastructure.labels` onto the
-/// reserved GEP-1762 label set. User collisions on a reserved key are
+/// reserved GEP-1762 label set, stamping `component` as the
+/// `app.kubernetes.io/component` value. User collisions on a reserved key are
 /// dropped with a WARN log — the reserved set is non-negotiable because the
 /// Service/Deployment selectors depend on it.
-fn final_labels(gateway: &Gateway) -> BTreeMap<String, String> {
+fn final_labels(gateway: &Gateway, component: &str) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     if let Some(user_labels) = gateway
         .spec
@@ -296,16 +299,19 @@ fn final_labels(gateway: &Gateway) -> BTreeMap<String, String> {
             labels.insert(k.clone(), v.clone());
         }
     }
-    labels.extend(standard_labels(gateway));
+    labels.extend(standard_labels(gateway, component));
     labels
 }
 
-/// Build the final annotation map: start with [`standard_annotations`] (which
-/// sets the admin-port annotation) then overlay user-supplied
-/// `Gateway.spec.infrastructure.annotations`. User values win on collision —
-/// annotations don't drive selectors so overrides are safe.
-fn final_annotations(gateway: &Gateway, admin_port: u16) -> BTreeMap<String, String> {
-    let mut annotations = standard_annotations(admin_port);
+/// Overlay user-supplied `Gateway.spec.infrastructure.annotations` (GEP-1867)
+/// onto `base`. User values win on collision — annotations don't drive
+/// selectors so overrides are safe. Shared with both the dedicated trio (whose
+/// `base` is [`standard_annotations`]) and the shared-mode identity SA / VIP
+/// Service (whose `base` is empty — they carry no admin-port annotation).
+fn overlay_infra_annotations(
+    mut base: BTreeMap<String, String>,
+    gateway: &Gateway,
+) -> BTreeMap<String, String> {
     if let Some(user_annotations) = gateway
         .spec
         .infrastructure
@@ -313,10 +319,17 @@ fn final_annotations(gateway: &Gateway, admin_port: u16) -> BTreeMap<String, Str
         .and_then(|i| i.annotations.as_ref())
     {
         for (k, v) in user_annotations {
-            annotations.insert(k.clone(), v.clone());
+            base.insert(k.clone(), v.clone());
         }
     }
-    annotations
+    base
+}
+
+/// Build the final annotation map for the dedicated trio: start with
+/// [`standard_annotations`] (which sets the admin-port annotation) then overlay
+/// user-supplied `Gateway.spec.infrastructure.annotations`.
+fn final_annotations(gateway: &Gateway, admin_port: u16) -> BTreeMap<String, String> {
+    overlay_infra_annotations(standard_annotations(admin_port), gateway)
 }
 
 /// Build the `controller=true, blockOwnerDeletion=true` owner reference back
@@ -482,6 +495,56 @@ fn service_ports(gateway: &Gateway, effective_ports: &[EffectiveListenerPort]) -
 /// Single source of truth in the reflector (also read by `build_tls`).
 pub(super) use coxswain_reflector::port_alloc::SHARED_GATEWAY_VIP_COMPONENT;
 
+/// `app.kubernetes.io/component` value stamped on the per-Gateway shared-mode
+/// identity `ServiceAccount` (#482, GEP-1867) — distinct from `dedicated-proxy`
+/// and the VIP's component so the three per-Gateway artifacts are
+/// independently identifiable.
+const SHARED_GATEWAY_SA_COMPONENT: &str = "shared-gateway-sa";
+
+/// Render the per-Gateway identity `ServiceAccount` for a shared-mode Gateway
+/// (#482, GEP-1867).
+///
+/// In shared mode the data plane (one proxy pod) and the VIP Service both live
+/// in the controller's namespace, so nothing per-Gateway exists in the
+/// Gateway's own namespace. This SA is that per-Gateway artifact: it carries
+/// the reserved GEP-1762 labels (incl. `gateway.networking.k8s.io/gateway-name`)
+/// plus the overlaid `spec.infrastructure.{labels,annotations}`, giving GEP-1867
+/// metadata a home and a stable per-Gateway identity object. It holds zero RBAC
+/// — the shared proxy runs as its own ServiceAccount; this one is identity, not
+/// a pod-run-as.
+///
+/// Owner-reffed to the Gateway (same namespace → legal), so a plain Gateway
+/// delete reclaims it via GC; a shared→dedicated migration prunes it explicitly
+/// (the owning Gateway survives the migration, so GC never fires).
+///
+/// # Panics
+///
+/// Panics if the Gateway has no `metadata.name` or `metadata.namespace` —
+/// apiserver invariants whose absence indicates a controller bug.
+#[must_use]
+pub(super) fn render_shared_gateway_service_account(gateway: &Gateway) -> ServiceAccount {
+    let gw_name =
+        gateway.metadata.name.as_deref().unwrap_or_else(|| {
+            panic!("invariant: Gateway has no name; the API server requires it")
+        });
+    let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or_else(|| {
+        panic!("invariant: Gateway has no namespace; the API server requires it")
+    });
+    let labels = final_labels(gateway, SHARED_GATEWAY_SA_COMPONENT);
+    let annotations = overlay_infra_annotations(BTreeMap::new(), gateway);
+    ServiceAccount {
+        metadata: ObjectMeta {
+            name: Some(shared_gateway_service_account_name(gw_ns, gw_name)),
+            namespace: Some(gw_ns.to_string()),
+            labels: Some(labels),
+            annotations: (!annotations.is_empty()).then_some(annotations),
+            owner_references: Some(vec![gateway_owner_reference(gateway)]),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 /// Name of the per-Gateway shared-mode VIP Service (#472).
 ///
 /// Deliberately distinct from the GEP-1762 dedicated resource name
@@ -491,15 +554,33 @@ pub(super) use coxswain_reflector::port_alloc::SHARED_GATEWAY_VIP_COMPONENT;
 /// Gateway name is long enough to need truncation to the 63-char DNS limit.
 #[must_use]
 pub(crate) fn shared_gateway_service_name(gw_ns: &str, gw_name: &str) -> String {
+    hashed_shared_name(gw_ns, gw_name, "shared-gw")
+}
+
+/// Name of the per-Gateway shared-mode identity `ServiceAccount` (#482),
+/// provisioned in the **Gateway's own** namespace.
+///
+/// Deliberately distinct from both the GEP-1762 dedicated resource name
+/// ([`gep1762_resource_name`]) and the VIP Service name
+/// ([`shared_gateway_service_name`]) so a shared↔dedicated migration never
+/// entangles the three lifecycles. The `-shared-sa` suffix is preserved when
+/// the Gateway name is long enough to need truncation to the 63-char DNS limit.
+#[must_use]
+pub(super) fn shared_gateway_service_account_name(gw_ns: &str, gw_name: &str) -> String {
+    hashed_shared_name(gw_ns, gw_name, "shared-sa")
+}
+
+/// Build a namespace-qualified, collision-free name for a shared-mode
+/// per-Gateway resource: a readable truncated `<ns>-<name>` prefix plus a hash
+/// of `<ns>/<name>` and a role `suffix`, kept within the 63-char DNS limit.
+/// ns/name are RFC 1123 labels (ASCII), so char-truncation is byte-safe.
+fn hashed_shared_name(gw_ns: &str, gw_name: &str, suffix: &str) -> String {
     let mut hasher = DefaultHasher::new();
     format!("{gw_ns}/{gw_name}").hash(&mut hasher);
     let hash = hasher.finish() & 0xffff_ffff;
-    // Readable, truncated prefix + a hash for collision-free uniqueness across
-    // namespaces, kept well within the 63-char DNS limit. ns/name are RFC 1123
-    // labels (ASCII), so char-truncation is byte-safe.
     let prefix: String = format!("{gw_ns}-{gw_name}").chars().take(40).collect();
     let prefix = prefix.trim_end_matches('-');
-    format!("{prefix}-{hash:08x}-shared-gw")
+    format!("{prefix}-{hash:08x}-{suffix}")
 }
 
 /// The caller-requested static `IPAddress` candidates to pin as the VIP Service
@@ -607,32 +688,26 @@ pub(super) fn render_shared_gateway_service(inputs: &SharedServiceInputs<'_>) ->
         panic!("invariant: Gateway has no namespace; the API server requires it")
     });
 
-    let mut labels = BTreeMap::new();
-    labels.insert("app.kubernetes.io/name".to_string(), "coxswain".to_string());
-    labels.insert(
-        "app.kubernetes.io/managed-by".to_string(),
-        "coxswain".to_string(),
-    );
-    labels.insert(
-        "app.kubernetes.io/component".to_string(),
-        SHARED_GATEWAY_VIP_COMPONENT.to_string(),
-    );
-    // The owning Gateway (ns + name) — the VIP lives out-of-namespace, so these
-    // labels are how the reflector and status writer map it back.
-    labels.insert(
-        coxswain_reflector::port_alloc::VIP_GATEWAY_NAME_LABEL.to_string(),
-        gw_name.to_string(),
-    );
+    // GEP-1867 (#482): overlay `spec.infrastructure.{labels,annotations}` so an
+    // operator can stamp cloud-LB annotations (and labels) onto each Gateway's
+    // VIP. `final_labels` provides the reserved GEP-1762 set (name/instance/
+    // managed-by/gateway-name) + the user's non-reserved labels, with reserved
+    // keys protected. The owning-Gateway *namespace* mapping label is not in the
+    // reserved set, so insert it LAST — a user infra label must not be able to
+    // detach the reflector/prune mapping the VIP reconciler keys on.
+    let mut labels = final_labels(gw, SHARED_GATEWAY_VIP_COMPONENT);
     labels.insert(
         coxswain_reflector::port_alloc::VIP_GATEWAY_NAMESPACE_LABEL.to_string(),
         gw_ns.to_string(),
     );
+    let annotations = overlay_infra_annotations(BTreeMap::new(), gw);
 
     Service {
         metadata: ObjectMeta {
             name: Some(shared_gateway_service_name(gw_ns, gw_name)),
             namespace: Some(inputs.controller_namespace.to_string()),
             labels: Some(labels),
+            annotations: (!annotations.is_empty()).then_some(annotations),
             ..Default::default()
         },
         spec: Some(ServiceSpec {
@@ -1585,6 +1660,173 @@ mod tests {
                 .map(String::as_str),
             Some("team-a")
         );
+    }
+
+    #[test]
+    fn shared_vip_service_overlays_infrastructure_labels_and_annotations() {
+        // GEP-1867 (#482): infra labels/annotations land on the VIP Service, but
+        // a user infra label cannot detach the owning-Gateway mapping labels the
+        // VIP reconciler prunes on.
+        let mut gw = make_gateway("team-a", "gw", vec![("https", 443, "HTTPS")]);
+        let mut user_labels = BTreeMap::new();
+        user_labels.insert("team".to_string(), "platform".to_string());
+        // Attempt to hijack the namespace mapping label and a reserved key.
+        user_labels.insert(
+            "gateway.coxswain-labs.dev/gateway-namespace".to_string(),
+            "evil".to_string(),
+        );
+        user_labels.insert("app.kubernetes.io/name".to_string(), "evil".to_string());
+        let mut user_anno = BTreeMap::new();
+        user_anno.insert(
+            "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
+            "nlb".to_string(),
+        );
+        gw.spec.infrastructure = Some(GatewayInfrastructure {
+            labels: Some(user_labels),
+            annotations: Some(user_anno),
+            ..Default::default()
+        });
+        let internal: BTreeMap<u16, u16> = [(443u16, 30001u16)].into_iter().collect();
+        let effective_ports = vec![EffectiveListenerPort {
+            name: "https".to_string(),
+            port: 443,
+            protocol: "HTTPS".to_string(),
+        }];
+        let selector = BTreeMap::new();
+        let svc = render_shared_gateway_service(&SharedServiceInputs {
+            gateway: &gw,
+            controller_namespace: "coxswain-system",
+            shared_proxy_selector: &selector,
+            effective_ports: &effective_ports,
+            internal_ports: &internal,
+            service_type: ServiceType::LoadBalancer,
+            requested_cluster_ip: None,
+        });
+        let labels = svc.metadata.labels.expect("labels");
+        assert_eq!(
+            labels.get("team"),
+            Some(&"platform".to_string()),
+            "infra label applied"
+        );
+        assert_eq!(
+            labels.get("gateway.coxswain-labs.dev/gateway-namespace"),
+            Some(&"team-a".to_string()),
+            "mapping label inserted last; user override ignored"
+        );
+        assert_eq!(
+            labels.get("app.kubernetes.io/name"),
+            Some(&"coxswain".to_string()),
+            "reserved key not overridden"
+        );
+        assert_eq!(
+            labels.get("gateway.networking.k8s.io/gateway-name"),
+            Some(&"gw".to_string()),
+            "owning-Gateway name mapping preserved"
+        );
+        assert_eq!(
+            labels
+                .get("app.kubernetes.io/component")
+                .map(String::as_str),
+            Some(SHARED_GATEWAY_VIP_COMPONENT),
+            "VIP component preserved for the prune mapping"
+        );
+        let anno = svc.metadata.annotations.expect("annotations");
+        assert_eq!(
+            anno.get("service.beta.kubernetes.io/aws-load-balancer-type")
+                .map(String::as_str),
+            Some("nlb")
+        );
+    }
+
+    #[test]
+    fn shared_identity_service_account_carries_gateway_label_infra_and_owner_ref() {
+        // GEP-1867 (#482): the shared-mode identity SA lives in the Gateway's own
+        // namespace, carries the gateway-name label + infra metadata, and is
+        // owner-reffed to the Gateway for GC.
+        let mut gw = make_gateway("team-a", "gw", vec![("http", 80, "HTTP")]);
+        let mut user_labels = BTreeMap::new();
+        user_labels.insert("team".to_string(), "platform".to_string());
+        user_labels.insert("app.kubernetes.io/name".to_string(), "evil".to_string());
+        let mut user_anno = BTreeMap::new();
+        user_anno.insert(
+            "coxswain.example/owner".to_string(),
+            "tenant-team".to_string(),
+        );
+        gw.spec.infrastructure = Some(GatewayInfrastructure {
+            labels: Some(user_labels),
+            annotations: Some(user_anno),
+            ..Default::default()
+        });
+        let sa = render_shared_gateway_service_account(&gw);
+        assert_eq!(
+            sa.metadata.namespace.as_deref(),
+            Some("team-a"),
+            "in Gateway's namespace"
+        );
+        let name = sa.metadata.name.expect("name");
+        assert!(
+            name.ends_with("-shared-sa"),
+            "distinct shared-sa suffix: {name}"
+        );
+        assert!(name.len() <= 63, "within DNS label limit");
+        let labels = sa.metadata.labels.expect("labels");
+        assert_eq!(
+            labels.get("gateway.networking.k8s.io/gateway-name"),
+            Some(&"gw".to_string()),
+            "conformance lister filters on this label"
+        );
+        assert_eq!(labels.get("team"), Some(&"platform".to_string()));
+        assert_eq!(
+            labels.get("app.kubernetes.io/name"),
+            Some(&"coxswain".to_string()),
+            "reserved key not overridden"
+        );
+        assert_eq!(
+            labels
+                .get("app.kubernetes.io/component")
+                .map(String::as_str),
+            Some(SHARED_GATEWAY_SA_COMPONENT)
+        );
+        let anno = sa.metadata.annotations.expect("annotations");
+        assert_eq!(
+            anno.get("coxswain.example/owner"),
+            Some(&"tenant-team".to_string())
+        );
+        // No admin-port annotation (that's a dedicated-pod concern).
+        assert!(!anno.contains_key("gateway.coxswain-labs.dev/admin-port"));
+        let refs = sa.metadata.owner_references.expect("owner refs");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name, "gw");
+        assert_eq!(refs[0].controller, Some(true));
+        assert_eq!(refs[0].block_owner_deletion, Some(true));
+    }
+
+    #[test]
+    fn shared_identity_sa_name_distinct_from_vip_and_dedicated() {
+        let ns = "team-a";
+        let name = "gw";
+        let sa = shared_gateway_service_account_name(ns, name);
+        assert_ne!(
+            sa,
+            shared_gateway_service_name(ns, name),
+            "distinct from VIP name"
+        );
+        assert_ne!(sa, "gw-coxswain", "distinct from GEP-1762 dedicated name");
+        assert!(sa.ends_with("-shared-sa"));
+        assert_eq!(
+            sa,
+            shared_gateway_service_account_name(ns, name),
+            "deterministic"
+        );
+    }
+
+    #[test]
+    fn shared_identity_sa_has_no_annotations_when_infra_absent() {
+        // No infra annotations → annotations field omitted (legal subset of {} for
+        // the conformance check), and no stray admin-port annotation.
+        let gw = make_gateway("team-a", "gw", vec![("http", 80, "HTTP")]);
+        let sa = render_shared_gateway_service_account(&gw);
+        assert!(sa.metadata.annotations.is_none());
     }
 
     #[test]

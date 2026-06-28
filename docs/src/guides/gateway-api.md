@@ -59,6 +59,9 @@ A `Gateway` object defines one or more listeners, each binding a port and protoc
 !!! tip "Dedicated proxy per Gateway"
     A `Gateway` can be opted into its own isolated proxy pool via `spec.infrastructure.parametersRef`. See [Dedicated proxy pools](dedicated-mode.md) for the full walkthrough.
 
+!!! info "Infrastructure metadata propagation (GEP-1867)"
+    `spec.infrastructure.labels` and `spec.infrastructure.annotations` propagate onto the resources Coxswain provisions for the Gateway, in **both** deployment models. In dedicated mode they land on the per-Gateway `Deployment`, `Service`, and `ServiceAccount`; in shared mode they land on the per-Gateway VIP `Service` (e.g. cloud load-balancer annotations) and on a per-Gateway identity `ServiceAccount` provisioned in the Gateway's namespace. The four reserved GEP-1762 label keys (`app.kubernetes.io/{name,instance,managed-by,component}` and `gateway.networking.k8s.io/gateway-name`) cannot be overridden — a collision is dropped with a warning, since the Service/Deployment selectors depend on them.
+
 ### Example
 
 ```yaml

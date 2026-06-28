@@ -20,6 +20,7 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "GatewayFrontendClientCertificateValidationInsecureFallback",
     "GatewayHTTPListenerIsolation",
     "GatewayHTTPSListenerDetectMisdirectedRequests",
+    "GatewayInfrastructurePropagation",
     "GatewayPort8080",
     "GatewayStaticAddresses",
     "HTTPRoute",

@@ -85,6 +85,14 @@ pub const MODE_MIGRATION_SHARED: &str = fixture!("mode_migration_shared.yaml");
 /// Gateway with `infrastructure.parametersRef` set, HTTPRoute attached.
 pub const MODE_MIGRATION_DEDICATED: &str = fixture!("mode_migration_dedicated.yaml");
 
+// ── GEP-1867 infrastructure propagation, shared mode (#482) ──────────────────
+
+/// Shared-mode Gateway (no `parametersRef`) declaring `infrastructure.labels`
+/// (incl. a reserved-key override that must be dropped, and a benign `kept`
+/// label) and `infrastructure.annotations`. Drives the per-Gateway identity
+/// ServiceAccount the controller provisions in the Gateway's namespace.
+pub const SHARED_GATEWAY_INFRA: &str = fixture!("shared_gateway_infra.yaml");
+
 // ── CRD openAPIV3Schema rejection (#335) ─────────────────────────────────────
 
 /// `CoxswainGatewayParameters` with `serviceType: FooBar` — rejected by the

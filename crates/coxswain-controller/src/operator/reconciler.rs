@@ -775,6 +775,18 @@ async fn reconcile_inner(
     }) {
         Ok(Some(e)) => e,
         Ok(None) => {
+            // Shared-mode Gateway. Provision its per-Gateway identity
+            // ServiceAccount in the Gateway's OWN namespace (#482, GEP-1867).
+            // In shared mode the proxy pod and VIP Service both live in the
+            // controller's namespace, so this SA is the only per-Gateway artifact
+            // in the Gateway's namespace — the carrier for the propagated
+            // `spec.infrastructure.{labels,annotations}` and a stable identity
+            // object. SSA force-apply makes add/update/remove of those fields
+            // reconcile for free. Runs for every owned shared Gateway, including
+            // one mid dedicated→shared migration (the dedicated teardown below).
+            let sa = render::render_shared_gateway_service_account(&gw);
+            apply::apply_shared_gateway_service_account(&ctx.client, gw_namespace, &sa).await?;
+
             // The Gateway is no longer in dedicated mode. If we never placed our
             // finalizer there is nothing to undo — it was always shared-pool.
             //
@@ -932,6 +944,15 @@ async fn reconcile_inner(
     // (post-#424) with zero Kubernetes API access, so the rendered SA carries
     // no RoleBindings — it exists only as the pod identity.
     apply::apply_rendered(&ctx.client, &gw, &rendered).await?;
+
+    // A Gateway that migrated shared→dedicated still carries the shared-mode
+    // identity ServiceAccount (#482) in its namespace; owner-ref GC cannot
+    // reclaim it (the owning Gateway survives the migration), so prune it
+    // explicitly. Idempotent NotFound no-op for a Gateway that was always
+    // dedicated. The dedicated trio's own SA (a distinct GEP-1762 name) is
+    // unaffected.
+    let shared_sa_name = render::shared_gateway_service_account_name(gw_namespace, gw_name);
+    delete_shared_gateway_service_account(&ctx.client, gw_namespace, &shared_sa_name).await?;
 
     // Stage 2 — write Gateway.status (#211). One JSON merge patch carries
     // Accepted/Programmed/per-listener/addresses + the
@@ -1642,6 +1663,30 @@ async fn delete_dedicated_resources(
     ignore_not_found(services.delete(name, &dp).await)?;
     ignore_not_found(service_accounts.delete(name, &dp).await)?;
     Ok(())
+}
+
+/// Delete the per-Gateway shared-mode identity `ServiceAccount` (#482) for a
+/// Gateway that has migrated shared→dedicated.
+///
+/// Owner-ref GC cannot reclaim it on a migration — the owning Gateway survives
+/// — so it is deleted explicitly. Idempotent: a `NotFound` (already gone, or a
+/// Gateway that was always dedicated) is treated as success.
+///
+/// # Errors
+///
+/// Returns the underlying [`kube::Error`] for any delete that fails for a reason
+/// other than `NotFound`.
+async fn delete_shared_gateway_service_account(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+) -> Result<(), kube::Error> {
+    let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    ignore_not_found(
+        service_accounts
+            .delete(name, &DeleteParams::default())
+            .await,
+    )
 }
 
 /// Collapse a `404 NotFound` delete result to success; propagate every other
