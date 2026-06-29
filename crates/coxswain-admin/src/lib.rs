@@ -623,6 +623,7 @@ impl AdminServer {
 /// automated tooling can detect Ingress-only or Gateway-API-only deployments
 /// without inspecting flags or Helm values.
 #[derive(Clone, Copy, Serialize)]
+#[non_exhaustive]
 pub struct ApiSurfaces {
     /// `true` when the Gateway API surface (HTTPRoute, GatewayClass, etc.) is
     /// active on this pod. `false` when `--disable-gateway-api` was set.
