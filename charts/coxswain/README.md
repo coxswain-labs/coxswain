@@ -49,6 +49,7 @@ All values can be overridden with `--set key=value` or a custom `values.yaml`.
 | `controller.watchNamespace` | `""` (cluster-wide) | Restrict to a single namespace |
 | `controller.statusAddress` | `""` | External IP/hostname written to Ingress/Gateway status |
 | `controller.ingressDefaultBackend` | `""` | Fallback backend (`<ns>/<svc>:<port>`) |
+| `controller.ingress.enabled` | `true` | Enable Ingress API surface and listener ports |
 | `controller.leaseTtl` | `15s` | Leader lease validity duration |
 | `controller.leaseRenewInterval` | `5s` | Leader lease renewal interval |
 
@@ -58,10 +59,8 @@ All values can be overridden with `--set key=value` or a custom `values.yaml`.
 |-----|---------|-------------|
 | `proxy.threads` | `2` | Worker threads per proxy service |
 | `proxy.bindAddress` | `0.0.0.0` | IP address all listeners bind to |
-| `proxy.http.enabled` | `true` | Enable HTTP listener |
-| `proxy.http.port` | `80` | HTTP listener service port |
-| `proxy.https.enabled` | `true` | Enable HTTPS/TLS listener |
-| `proxy.https.port` | `443` | HTTPS listener service port |
+| `proxy.ingress.http.port` | `80` | Ingress HTTP listener service port |
+| `proxy.ingress.https.port` | `443` | Ingress HTTPS listener service port |
 | `proxy.shutdownGracePeriod` | `30s` | Drain window before final shutdown |
 | `proxy.shutdownTimeout` | `5s` | Hard deadline after grace period |
 | `proxy.acceptProxyProtocol` | `false` | Accept HAProxy PROXY protocol v1/v2 |
@@ -103,7 +102,6 @@ Two Services are created:
 | `service.gateway.loadBalancerIP` | `""` | Pin LB to a specific IP (cloud-dependent) |
 | `service.gateway.loadBalancerSourceRanges` | `[]` | Restrict LB to source CIDRs |
 | `service.gateway.externalTrafficPolicy` | `""` | Set `Local` to preserve client IPs |
-| `service.gateway.additionalPorts` | `[]` | Extra ports for Gateway API listeners |
 | `service.internal.annotations` | `{}` | Annotations for the internal Service |
 
 ### Resources
@@ -120,17 +118,16 @@ resources:
 
 ## Examples
 
-### Gateway API only (no static proxy ports)
+### Gateway API only (no Ingress)
 
 ```yaml
-proxy:
-  http:
-    enabled: false
-  https:
+controller:
+  ingress:
     enabled: false
 ```
 
-Coxswain will discover listener ports from Gateway resources at startup.
+Disables Ingress API processing and the static Ingress listener ports (80/443).
+Gateway listener ports are allocated dynamically via per-Gateway VIP Services.
 
 ### Rootless mode (PSS restricted)
 
@@ -141,27 +138,6 @@ security:
 
 Clients still connect to ports 80/443. The container binds 8080/8443 without
 `NET_BIND_SERVICE`.
-
-### Extra Gateway listener ports
-
-Coxswain dynamically binds and drains Gateway listener ports in-process without
-restarting, but the Kubernetes Service is static. A port bound by the pod is not reachable
-externally until it is also declared in `additionalPorts` and `helm upgrade` is run.
-Use this for ports you know in advance:
-
-```yaml
-service:
-  gateway:
-    additionalPorts:
-      - name: alt-http
-        port: 8080
-        targetPort: 8080
-        protocol: TCP
-```
-
-Automatic Service port management (patching `spec.ports` when Gateway listeners
-change without a manual upgrade) is tracked in
-[#180](https://github.com/coxswain-labs/coxswain/issues/180).
 
 ### Namespace-scoped watch
 

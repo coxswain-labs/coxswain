@@ -42,8 +42,8 @@ helm show values oci://ghcr.io/coxswain-labs/charts/coxswain
 | `image.tag` | _(chart appVersion)_ | Image tag to deploy |
 | `controllerName` | `coxswain-labs.dev/gateway-controller` | GatewayClass `controllerName` to claim |
 | `watchNamespace` | `""` | Restrict watch to a single namespace; empty = cluster-wide |
-| `proxy.http.port` | `80` | HTTP proxy listener port |
-| `proxy.https.port` | `443` | HTTPS proxy listener port |
+| `proxy.ingress.http.port` | `80` | Ingress HTTP listener port |
+| `proxy.ingress.https.port` | `443` | Ingress HTTPS listener port |
 | `proxy.shared.threads` | `2` | Worker threads per shared proxy service |
 | `proxy.shared.resources.requests.cpu` | `100m` | Shared proxy CPU request |
 | `proxy.shared.resources.requests.memory` | `128Mi` | Shared proxy memory request |

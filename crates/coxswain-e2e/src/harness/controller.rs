@@ -10,9 +10,9 @@ use crate::harness::bootstrap::{
     COXSWAIN_NAMESPACE, E2E_IMAGE, GATEWAY_HTTP_PORT, HelmOverrides, helm_install, workspace_root,
 };
 
-/// Fixed port the Helm chart sets for HTTP ingress (`proxy.http.port`).
+/// Fixed port the Helm chart sets for HTTP ingress (`proxy.ingress.http.port`).
 pub const INGRESS_HTTP_PORT: u16 = 80;
-/// Fixed port the Helm chart sets for HTTPS ingress (`proxy.https.port`).
+/// Fixed port the Helm chart sets for HTTPS ingress (`proxy.ingress.https.port`).
 pub const INGRESS_HTTPS_PORT: u16 = 443;
 
 /// Name of the shared-proxy external LoadBalancer Service as rendered by the
@@ -62,17 +62,6 @@ pub struct ControllerProcess {
     pub proxy_addr: SocketAddr,
     /// Bound address for Ingress HTTPS/TLS traffic (`<lb_ip>:443`).
     pub tls_addr: SocketAddr,
-    /// The shared proxy's FIXED Gateway-HTTP port on the shared-proxy
-    /// LoadBalancer IP (`<lb_ip>:GATEWAY_HTTP_PORT`).
-    ///
-    /// This is NOT a per-Gateway VIP (#472) — it is the shared pool's own
-    /// listener. Almost every Gateway test must use `Harness::gateway_http`
-    /// (the per-Gateway VIP) instead. The sole legitimate user is a white-box
-    /// dedicated-crash-loop test that asserts the SHARED pool keeps serving a
-    /// dedicated Gateway (whose own advertised address points at the NotReady
-    /// dedicated Service) until cut-over — it must address the shared pool
-    /// directly, not the Gateway's VIP.
-    pub gateway_http_addr: SocketAddr,
     /// Local port-forwarded address for `/healthz` / `/readyz`.
     pub health_addr: SocketAddr,
     /// Local port-forwarded address for `/metrics` / `/api/v1/routes` /
@@ -134,21 +123,21 @@ impl ControllerProcess {
         let controller_admin_port = free_port()?;
 
         let health_pf = start_port_forward(
-            SHARED_PROXY_INTERNAL_SVC,
+            &format!("svc/{SHARED_PROXY_INTERNAL_SVC}"),
             health_port,
             8081,
             COXSWAIN_NAMESPACE,
         )
         .await?;
         let admin_pf = start_port_forward(
-            SHARED_PROXY_INTERNAL_SVC,
+            &format!("svc/{SHARED_PROXY_INTERNAL_SVC}"),
             admin_port,
             8082,
             COXSWAIN_NAMESPACE,
         )
         .await?;
         let controller_admin_pf = start_port_forward(
-            CONTROLLER_SVC,
+            &format!("svc/{CONTROLLER_SVC}"),
             controller_admin_port,
             8082,
             COXSWAIN_NAMESPACE,
@@ -175,7 +164,6 @@ impl ControllerProcess {
             lb_ip,
             proxy_addr: SocketAddr::new(lb_ip, INGRESS_HTTP_PORT),
             tls_addr: SocketAddr::new(lb_ip, INGRESS_HTTPS_PORT),
-            gateway_http_addr: SocketAddr::new(lb_ip, GATEWAY_HTTP_PORT),
             health_addr,
             admin_addr,
             controller_admin_addr,
@@ -241,6 +229,50 @@ impl Drop for ControllerProcess {
     }
 }
 
+/// RAII guard for a `kubectl port-forward` tunnel to a Gateway listener port
+/// on the shared-proxy pod.
+///
+/// Dropping this kills the tunnel.
+pub struct GatewayPortForward {
+    child: Child,
+    /// Local loopback address the tunnel is bound to.
+    pub addr: SocketAddr,
+}
+
+impl Drop for GatewayPortForward {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+impl ControllerProcess {
+    /// Open a `kubectl port-forward` tunnel to the shared-proxy Deployment's
+    /// `GATEWAY_HTTP_PORT` listener and return an RAII [`GatewayPortForward`].
+    ///
+    /// Dedicated-mode Gateways have no per-Gateway VIP Service (#472), so a
+    /// direct pod port-forward is the only way to reach the shared pool's
+    /// Gateway HTTP listener for the dedicated-crash-loop resilience test.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `kubectl port-forward` fails to start or the tunnel
+    /// does not accept connections within 30 s.
+    pub async fn gateway_http_forward(&self) -> anyhow::Result<GatewayPortForward> {
+        let local_port = free_port()?;
+        let child = start_port_forward(
+            "deployment/coxswain-shared-proxy",
+            local_port,
+            GATEWAY_HTTP_PORT,
+            COXSWAIN_NAMESPACE,
+        )
+        .await?;
+        Ok(GatewayPortForward {
+            child,
+            addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), local_port),
+        })
+    }
+}
+
 /// Poll `Service.status.loadBalancer.ingress[0].ip` for `svc_name` in `namespace`
 /// until an IP is assigned or 60 s elapses.
 ///
@@ -279,16 +311,20 @@ async fn wait_for_lb_ip(svc_name: &str, namespace: &str) -> anyhow::Result<IpAdd
 }
 
 /// Spawn a `kubectl port-forward` tunnel from `127.0.0.1:<local_port>` to
-/// `<svc_name>:<remote_port>` in `namespace`.
+/// `<target>:<remote_port>` in `namespace`.
+///
+/// `target` is passed verbatim to `kubectl port-forward` and may be any valid
+/// resource designator: `svc/<name>`, `deployment/<name>`, `pod/<name>`, etc.
 ///
 /// The returned [`Child`] must be kept alive for the lifetime of the tunnel;
 /// dropping it kills the forward.
 ///
 /// # Errors
 ///
-/// Returns an error if `kubectl port-forward` fails to spawn.
+/// Returns an error if `kubectl port-forward` fails to spawn or the tunnel does
+/// not accept connections within 30 s.
 async fn start_port_forward(
-    svc_name: &str,
+    target: &str,
     local_port: u16,
     remote_port: u16,
     namespace: &str,
@@ -298,14 +334,14 @@ async fn start_port_forward(
             "port-forward",
             "-n",
             namespace,
-            &format!("svc/{svc_name}"),
+            target,
             &format!("{local_port}:{remote_port}"),
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .with_context(|| format!("kubectl port-forward {svc_name} {local_port}:{remote_port}"))?;
+        .with_context(|| format!("kubectl port-forward {target} {local_port}:{remote_port}"))?;
     // Actively poll the loopback port until kubectl has actually bound it AND
     // the underlying pod accepts connections. A fixed sleep races with helm
     // upgrades that briefly leave no Ready endpoint for the Service. Cap the
@@ -326,7 +362,7 @@ async fn start_port_forward(
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "port-forward {svc_name} {local_port}:{remote_port} never accepted connections within 30s"
+                "port-forward {target} {local_port}:{remote_port} never accepted connections within 30s"
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -357,7 +393,8 @@ const CONTROLLER_SVC: &str = "coxswain-controller";
 /// return 200 within 60 s.
 async fn wait_for_controller_ready(controller_svc: &str, namespace: &str) -> anyhow::Result<()> {
     let port = free_port()?;
-    let mut pf = start_port_forward(controller_svc, port, 8081, namespace).await?;
+    let mut pf =
+        start_port_forward(&format!("svc/{controller_svc}"), port, 8081, namespace).await?;
     let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
     let result = crate::harness::wait::wait_for_ready(addr, Duration::from_secs(60))
         .await

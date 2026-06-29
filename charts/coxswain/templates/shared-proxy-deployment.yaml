@@ -60,12 +60,10 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["serve", "proxy", "--shared"]
           ports:
-            {{- if .Values.proxy.http.enabled }}
+            {{- if .Values.controller.ingress.enabled }}
             - name: http
               containerPort: {{ include "coxswain.httpContainerPort" . }}
               protocol: TCP
-            {{- end }}
-            {{- if .Values.proxy.https.enabled }}
             - name: https
               containerPort: {{ include "coxswain.httpsContainerPort" . }}
               protocol: TCP
@@ -101,11 +99,9 @@ spec:
               value: {{ .Values.proxy.shared.bindAddress | quote }}
             - name: COXSWAIN_MANAGEMENT_BIND_ADDRESS
               value: {{ .Values.management.bindAddress | quote }}
-            {{- if .Values.proxy.http.enabled }}
+            {{- if .Values.controller.ingress.enabled }}
             - name: COXSWAIN_INGRESS_HTTP_PORT
               value: {{ include "coxswain.httpContainerPort" . | quote }}
-            {{- end }}
-            {{- if .Values.proxy.https.enabled }}
             - name: COXSWAIN_INGRESS_HTTPS_PORT
               value: {{ include "coxswain.httpsContainerPort" . | quote }}
             {{- end }}

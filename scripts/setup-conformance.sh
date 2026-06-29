@@ -2,9 +2,8 @@
 # Bring a local Kubernetes cluster to the state the Gateway API conformance
 # suite expects: production coxswain image built and loaded, Gateway API
 # CRDs at the pinned version installed, and the Helm release deployed with
-# the conformance-specific overrides (Ingress entry points disabled; gateway
-# Service pre-declares ports 80/443/8080/8090/8443 so every listener in the
-# conformance fixtures gets a reachable LB endpoint).
+# the conformance-specific overrides (Ingress API surface disabled; Gateway
+# listener ports are allocated dynamically via per-Gateway VIP Services).
 #
 # After this script returns, run the conformance suite from the repo root:
 #
@@ -96,26 +95,7 @@ helm install coxswain charts/coxswain \
   --set image.tag=e2e \
   --set image.pullPolicy=IfNotPresent \
   --set "proxy.shared.vipServiceType=$VIP_SERVICE_TYPE" \
-  --set proxy.http.enabled=false \
-  --set proxy.https.enabled=false \
-  --set 'service.gateway.additionalPorts[0].name=gw-http,service.gateway.additionalPorts[0].port=80,service.gateway.additionalPorts[0].targetPort=80,service.gateway.additionalPorts[0].protocol=TCP' \
-  --set 'service.gateway.additionalPorts[1].name=gw-https,service.gateway.additionalPorts[1].port=443,service.gateway.additionalPorts[1].targetPort=443,service.gateway.additionalPorts[1].protocol=TCP' \
-  --set 'service.gateway.additionalPorts[2].name=gw-8080,service.gateway.additionalPorts[2].port=8080,service.gateway.additionalPorts[2].targetPort=8080,service.gateway.additionalPorts[2].protocol=TCP' \
-  --set 'service.gateway.additionalPorts[3].name=gw-8090,service.gateway.additionalPorts[3].port=8090,service.gateway.additionalPorts[3].targetPort=8090,service.gateway.additionalPorts[3].protocol=TCP' \
-  --set 'service.gateway.additionalPorts[4].name=gw-8443,service.gateway.additionalPorts[4].port=8443,service.gateway.additionalPorts[4].targetPort=8443,service.gateway.additionalPorts[4].protocol=TCP'
-
-echo ">>> wait for LoadBalancer IP"
-until [ -n "$(kubectl -n coxswain-system get svc coxswain-shared-proxy \
-    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)" ]; do
-  sleep 2
-done
-LB_IP=$(kubectl -n coxswain-system get svc coxswain-shared-proxy \
-  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-echo ">>> LB IP: $LB_IP"
-
-echo ">>> helm upgrade with --status-address=$LB_IP"
-helm upgrade coxswain charts/coxswain --namespace coxswain-system \
-  --reuse-values --set controller.statusAddress="$LB_IP"
+  --set controller.ingress.enabled=false
 
 echo ">>> wait for rollouts (timeout 180s)"
 kubectl -n coxswain-system rollout status \

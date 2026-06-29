@@ -11,8 +11,8 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
     ```bash
     helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
       --namespace coxswain-system \
-      --set proxy.http.port=80 \
-      --set proxy.https.port=443 \
+      --set proxy.ingress.http.port=80 \
+      --set proxy.ingress.https.port=443 \
       --set watchNamespace=my-namespace
     ```
 
@@ -96,7 +96,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | Discovery (Stream) | `50051` | `COXSWAIN_DISCOVERY_PORT` | _(controller)_ mTLS gRPC routing-snapshot stream |
 | Bootstrap | `50052` | `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | _(controller)_ server-auth gRPC SVID issuance |
 
-The proxy listeners are disabled unless their port is explicitly set. The Helm chart defaults `proxy.http.port` to `80` and `proxy.https.port` to `443`.
+The Ingress proxy listeners are enabled by default (`controller.ingress.enabled=true`). Disable them with `controller.ingress.enabled=false` for Gateway-API-only installs. Port numbers are configured via `proxy.ingress.http.port` (default `80`) and `proxy.ingress.https.port` (default `443`).
 
 ## HTTP/2 support
 

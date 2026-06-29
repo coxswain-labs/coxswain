@@ -67,16 +67,23 @@ runs:
         # with Helm's client-side apply of the crds/ directory).
         kubectl apply --server-side --force-conflicts -f charts/coxswain/crds/
 
-    - name: Install coxswain via Helm (initial — no status-address yet)
+    - name: Install coxswain via Helm
       shell: bash
       run: |
         # The conformance suite declares Gateway listeners on ports 80/443
         # itself. Coxswain's controller surfaces Programmed=False with
         # reason=PortUnavailable when a Gateway listener port collides with
         # the Ingress data-plane reservation, so we must NOT reserve those
-        # ports for Ingress here — disable proxy.http / proxy.https and
-        # surface 80/443 only on the Service so the LB still routes them to
-        # the proxy pod, where Gateway listeners bind them dynamically.
+        # ports for Ingress here — disable the Ingress API surface entirely
+        # via controller.ingress.enabled=false. With it off, neither pod gets
+        # COXSWAIN_INGRESS_HTTP_PORT / COXSWAIN_INGRESS_HTTPS_PORT, so no port
+        # is reserved and the conformance Gateways bind 80/443 dynamically.
+        #
+        # Gateway.status.addresses is populated from each Gateway's own
+        # per-Gateway VIP Service (#472), not a global --status-address, so no
+        # LB-IP probe + status-address upgrade dance is needed. The VIP type
+        # defaults to LoadBalancer; cloud-provider-kind assigns a distinct IP
+        # per VIP Service.
         helm upgrade --install coxswain charts/coxswain \
           --namespace coxswain-system \
           --create-namespace \
@@ -84,89 +91,22 @@ runs:
           --set image.repository=coxswain \
           --set image.tag=e2e \
           --set image.pullPolicy=Never \
-          --set service.gateway.type=LoadBalancer \
           --set controller.coxswainImage=coxswain:e2e \
-          --set proxy.http.enabled=false \
-          --set proxy.https.enabled=false \
-          --set 'service.gateway.additionalPorts[0].name=http,service.gateway.additionalPorts[0].port=80,service.gateway.additionalPorts[0].targetPort=80,service.gateway.additionalPorts[0].protocol=TCP' \
-          --set 'service.gateway.additionalPorts[1].name=https,service.gateway.additionalPorts[1].port=443,service.gateway.additionalPorts[1].targetPort=443,service.gateway.additionalPorts[1].protocol=TCP' \
-          --set 'service.gateway.additionalPorts[2].name=alt-http,service.gateway.additionalPorts[2].port=8080,service.gateway.additionalPorts[2].targetPort=8080,service.gateway.additionalPorts[2].protocol=TCP' \
-          --set 'service.gateway.additionalPorts[3].name=alt-http-2,service.gateway.additionalPorts[3].port=8090,service.gateway.additionalPorts[3].targetPort=8090,service.gateway.additionalPorts[3].protocol=TCP' \
-          --set 'service.gateway.additionalPorts[4].name=alt-https,service.gateway.additionalPorts[4].port=8443,service.gateway.additionalPorts[4].targetPort=8443,service.gateway.additionalPorts[4].protocol=TCP' \
+          --set controller.ingress.enabled=false \
           --skip-crds \
           --wait \
           --timeout 120s
 
-    - name: Wait for LoadBalancer IP
-      id: lb-ip
-      shell: bash
-      run: |
-        # cloud-provider-kind assigns IPs from the kind Docker bridge network.
-        # Poll until the Service has a populated ingress IP.
-        for i in $(seq 1 60); do
-          LB_IP=$(kubectl get svc coxswain-shared-proxy -n coxswain-system \
-            -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-          if [ -n "$LB_IP" ]; then
-            echo "lb-ip=${LB_IP}" >> "$GITHUB_OUTPUT"
-            echo "LoadBalancer IP: ${LB_IP}"
-            break
-          fi
-          sleep 3
-        done
-        if [ -z "$LB_IP" ]; then
-          echo "Timed out waiting for LoadBalancer IP"
-          kubectl get svc coxswain-shared-proxy -n coxswain-system
-          exit 1
-        fi
-
-    - name: Configure status-address and upgrade Helm release
-      shell: bash
-      run: |
-        # Re-upgrade with the confirmed LB IP so the controller populates
-        # Gateway.status.addresses — required by the conformance suite.
-        #
-        # namespace.create=false must be kept on the upgrade. The initial
-        # install used `--create-namespace`, which creates the namespace
-        # outside Helm (no `app.kubernetes.io/managed-by=Helm` label, no
-        # `meta.helm.sh/release-*` annotations). If this upgrade lets the
-        # chart's Namespace template render, Helm tries to take ownership
-        # of the existing namespace and fails with "missing key
-        # app.kubernetes.io/managed-by".
-        # Keep the same proxy.http / proxy.https and Service port overrides
-        # as the initial install (see comment there) so the controller does
-        # not reserve 80/443 for Ingress while the conformance Gateways are
-        # using them.
-        helm upgrade coxswain charts/coxswain \
-          --namespace coxswain-system \
-          --set namespace.create=false \
-          --set image.repository=coxswain \
-          --set image.tag=e2e \
-          --set image.pullPolicy=Never \
-          --set service.gateway.type=LoadBalancer \
-          --set controller.coxswainImage=coxswain:e2e \
-          --set controller.statusAddress=${{ steps.lb-ip.outputs.lb-ip }} \
-          --set proxy.http.enabled=false \
-          --set proxy.https.enabled=false \
-          --set 'service.gateway.additionalPorts[0].name=http,service.gateway.additionalPorts[0].port=80,service.gateway.additionalPorts[0].targetPort=80,service.gateway.additionalPorts[0].protocol=TCP' \
-          --set 'service.gateway.additionalPorts[1].name=https,service.gateway.additionalPorts[1].port=443,service.gateway.additionalPorts[1].targetPort=443,service.gateway.additionalPorts[1].protocol=TCP' \
-          --set 'service.gateway.additionalPorts[2].name=alt-http,service.gateway.additionalPorts[2].port=8080,service.gateway.additionalPorts[2].targetPort=8080,service.gateway.additionalPorts[2].protocol=TCP' \
-          --set 'service.gateway.additionalPorts[3].name=alt-http-2,service.gateway.additionalPorts[3].port=8090,service.gateway.additionalPorts[3].targetPort=8090,service.gateway.additionalPorts[3].protocol=TCP' \
-          --set 'service.gateway.additionalPorts[4].name=alt-https,service.gateway.additionalPorts[4].port=8443,service.gateway.additionalPorts[4].targetPort=8443,service.gateway.additionalPorts[4].protocol=TCP' \
-          --skip-crds \
-          --wait \
-          --timeout 60s
-
     - name: Wait for controller leader handover
       shell: bash
       run: |
-        # `helm --wait` returns once the new controller pod is Ready, but the
-        # OLD pod can still hold the leader-election lease for up to its TTL
-        # (~15 s). During that window the new pod sees objects via InitApply
-        # events with is_leader=false and skips status patches; once it later
-        # becomes leader nothing re-fires for already-known objects. The
-        # conformance suite hits this immediately by creating Gateways during
-        # setup. Block until exactly one controller pod exists and it holds
-        # the lease.
+        # `helm --wait` returns once the controller pod is Ready (readyz), but
+        # readiness does not imply the pod has won leader election yet. Until it
+        # holds the lease it sees objects via InitApply events with
+        # is_leader=false and skips status patches; once it later becomes leader
+        # nothing re-fires for already-known objects. The conformance suite hits
+        # this immediately by creating Gateways during setup. Block until exactly
+        # one controller pod exists and it holds the lease.
         for i in $(seq 1 60); do
           PODS=$(kubectl get pods -n coxswain-system \
             -l app.kubernetes.io/component=controller \

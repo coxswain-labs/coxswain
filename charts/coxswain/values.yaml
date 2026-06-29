@@ -197,6 +197,15 @@ controller:
   # Gateway status. Required for cert-manager HTTP-01 + external-dns.
   statusAddress: ""
 
+  # Enable the Ingress API surface. When false, no Ingress reflectors are
+  # started, COXSWAIN_INGRESS_HTTP_PORT / COXSWAIN_INGRESS_HTTPS_PORT are
+  # not set, and the shared-proxy Service exposes no Ingress ports.
+  # Corresponds to the --enable-ingress / --no-enable-ingress binary flag
+  # added in #492; this Helm value pre-wires the default so #492 can wire
+  # the flag without a values change.
+  ingress:
+    enabled: true
+
 # =============================================================================
 # Discovery control plane — controller-as-CA, SVID bootstrap, mTLS stream (#423).
 # =============================================================================
@@ -359,19 +368,21 @@ proxy:
   # calls, so its ServiceAccount carries no RoleBindings — there are no
   # cluster-wide RBAC objects to render here.
 
-  # HTTP listener. Clients always connect on `port`; the container binds on
-  # `port` normally, or 8080 when security.rootless is true. Both pods take
-  # the value as COXSWAIN_INGRESS_HTTP_PORT: the proxy binds it for data
-  # plane traffic; the controller compares Gateway listener ports against it
-  # for the `PortUnavailable` status condition.
-  http:
-    enabled: true
-    port: 80
+  # Ingress listener settings. Controls the static HTTP/HTTPS listener ports
+  # for classic `Ingress` resources. Gateway listener ports are allocated
+  # dynamically via per-Gateway VIP Services and are independent of this block.
+  ingress:
+    # HTTP listener (port 80). Clients always connect on `port`; the container
+    # binds on `port` normally, or 8080 when security.rootless is true. Both
+    # pods take the value as COXSWAIN_INGRESS_HTTP_PORT: the proxy binds it
+    # for data-plane traffic; the controller compares Gateway listener ports
+    # against it for the `PortUnavailable` status condition.
+    http:
+      port: 80
 
-  # HTTPS / TLS listener. Same dual-pod semantics as `http`.
-  https:
-    enabled: true
-    port: 443
+    # HTTPS / TLS listener (port 443). Same dual-pod semantics as `http`.
+    https:
+      port: 443
 
 # -- Service settings.
 service:
@@ -384,9 +395,6 @@ service:
     loadBalancerSourceRanges: []
     # Set to Local to preserve client IPs at the cost of uneven load distribution.
     externalTrafficPolicy: ""
-    # Pre-declare additional fixed ports for known Gateway API listeners.
-    # Each entry follows the ServicePort schema: name, port, targetPort, protocol.
-    additionalPorts: []
 
   # Internal ClusterIP services exposing health (8081) and admin (8082) on
   # each pod. One Service per pod role; both share the same annotations.

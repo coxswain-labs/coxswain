@@ -22,7 +22,7 @@ Extended features are listed in `conformance/main_test.go` (`opts.SupportedFeatu
 
 ## Setup
 
-`scripts/setup-conformance.sh` resets the cluster, builds the image, installs the Helm chart with conformance-specific overrides (Ingress entry points disabled; all Gateway listener ports pre-declared on the shared-proxy Service), and probes for the free in-CIDR ClusterIP needed by `GatewayStaticAddresses` tests.
+`scripts/setup-conformance.sh` resets the cluster, builds the image, installs the Helm chart with conformance-specific overrides (Ingress API surface disabled; Gateway listener ports allocated dynamically via per-Gateway VIP Services), and probes for the free in-CIDR ClusterIP needed by `GatewayStaticAddresses` tests.
 
 ```bash
 bash scripts/setup-conformance.sh --reset '<cluster-reset-command>'

@@ -284,20 +284,6 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         format!("proxy.shared.vipServiceType={vip_service_type}"),
         "--set".into(),
         format!("controller.coxswainImage={E2E_IMAGE}"),
-        // Pre-declare the fixed gateway ports on the Service so they're reachable
-        // via the LoadBalancer in addition to the standard 80/443.
-        "--set".into(),
-        format!(
-            "service.gateway.additionalPorts[0].name=gw-http,service.gateway.additionalPorts[0].port={GATEWAY_HTTP_PORT},service.gateway.additionalPorts[0].targetPort={GATEWAY_HTTP_PORT},service.gateway.additionalPorts[0].protocol=TCP"
-        ),
-        "--set".into(),
-        format!(
-            "service.gateway.additionalPorts[1].name=gw-https,service.gateway.additionalPorts[1].port={GATEWAY_HTTPS_PORT},service.gateway.additionalPorts[1].targetPort={GATEWAY_HTTPS_PORT},service.gateway.additionalPorts[1].protocol=TCP"
-        ),
-        "--set".into(),
-        format!(
-            "service.gateway.additionalPorts[2].name=gw-passthrough,service.gateway.additionalPorts[2].port={GATEWAY_TLS_PASSTHROUGH_PORT},service.gateway.additionalPorts[2].targetPort={GATEWAY_TLS_PASSTHROUGH_PORT},service.gateway.additionalPorts[2].protocol=TCP"
-        ),
         "--skip-crds".into(), // CRDs are pre-applied with SSA above
         "--wait".into(),
         "--timeout".into(),
